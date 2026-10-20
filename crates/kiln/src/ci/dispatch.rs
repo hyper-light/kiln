@@ -454,6 +454,71 @@ impl PlanSource for Source<'_> {
     }
 }
 
+/// How soon a leg held by its environment's promotion or custom gates is looked at again.
+const GATE_AGAIN_SECS: i64 = 15;
+
+/// Whether a check's conclusion lets a gate pass (a check skipped by its own rules does).
+fn passes(conclusion: &str) -> bool {
+    matches!(conclusion, "success" | "neutral" | "skipped")
+}
+
+/// What an environment's promotion and custom gates find for commit `sha` (W15-R03): when its
+/// deployment to `after` succeeded, and each gate's result. A workflow gate is that workflow's
+/// run for the commit; a check gate is the check run of that name, else the commit status, else
+/// a run or job kiln names so (`smoke`, `smoke/test`).
+async fn gate_facts(hub: &Hub, repo: &Repo, sha: &str, p: &kiln_ci::env::Protection) -> kiln_ci::env::Found {
+    let mut found = kiln_ci::env::Found::default();
+    if let Some(after) = p.after.clone() {
+        let (repo_id, sha) = (repo.id.clone(), sha.to_owned());
+        found.promoted_at = hub
+            .store
+            .call(move |c| {
+                Ok(c.query_row(
+                    "SELECT MAX(s.created_at) FROM ci_deployments d JOIN ci_deployment_statuses s ON s.deployment_id = d.id WHERE d.repo_id = ?1 AND d.environment = ?2 AND d.sha = ?3 AND s.state = 'success'",
+                    rusqlite::params![repo_id, after, sha],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?)
+            })
+            .await
+            .unwrap_or(None);
+    }
+    if p.gates.is_empty() {
+        return found;
+    }
+    let ran = super::review::checks_on(hub, &repo.name, sha).await.unwrap_or_default();
+    for g in &p.gates {
+        let result = match (&g.workflow, &g.check) {
+            (Some(w), _) => ran.get(w).and_then(|c| c.as_deref().map(passes)),
+            (None, Some(name)) => {
+                let (repo_id, sha, n) = (repo.id.clone(), sha.to_owned(), name.clone());
+                // (whether it's done, and how), from a check run or a commit status.
+                let recorded: Option<(bool, String)> = hub
+                    .store
+                    .call(move |c| {
+                        let check: Option<(String, Option<String>)> = c
+                            .query_row("SELECT status, conclusion FROM ci_check_runs WHERE repo_id = ?1 AND head_sha = ?2 AND name = ?3 ORDER BY id DESC LIMIT 1", rusqlite::params![repo_id, sha, n], |r| Ok((r.get(0)?, r.get(1)?)))
+                            .optional()?;
+                        if let Some((status, conclusion)) = check {
+                            return Ok(Some((status == "completed", conclusion.unwrap_or_default())));
+                        }
+                        let state: Option<String> = c.query_row("SELECT state FROM ci_statuses WHERE repo_id = ?1 AND sha = ?2 AND context = ?3 ORDER BY id DESC LIMIT 1", rusqlite::params![repo_id, sha, n], |r| r.get(0)).optional()?;
+                        Ok(state.map(|s| (s != "pending", s)))
+                    })
+                    .await
+                    .unwrap_or(None);
+                match recorded {
+                    Some((false, _)) => None,
+                    Some((true, how)) => Some(passes(&how)),
+                    None => ran.get(name).and_then(|c| c.as_deref().map(passes)),
+                }
+            }
+            (None, None) => None,
+        };
+        found.gates.push((g.name(), result));
+    }
+    found
+}
+
 /// The timing table a run's saved input kept, so a replay shards as the run did.
 fn saved_timing(v: &serde_json::Value) -> Arc<HashMap<String, f64>> {
     Arc::new(v.get("timing").and_then(serde_json::Value::as_object).map(|o| o.iter().filter_map(|(k, x)| Some((k.clone(), x.as_f64()?))).collect()).unwrap_or_default())
@@ -1239,14 +1304,25 @@ impl Dispatch {
     /// saying for what.
     async fn gate(&mut self, id: &str) -> anyhow::Result<()> {
         let Some((env, ready_at)) = self.held.get(id).map(|h| (h.env.clone(), h.ready_at)) else { return Ok(()) };
-        let Some((run, git_ref, repo)) = self.legs.get(id).and_then(|l| self.runs.get(&l.run).map(|r| (l.run.clone(), r.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), r.repo.clone()))) else {
+        let Some((run, git_ref, repo, sha, path)) = self.legs.get(id).and_then(|l| self.runs.get(&l.run).map(|r| (l.run.clone(), r.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), r.repo.clone(), r.event.sha.clone(), r.path.clone()))) else {
             self.held.remove(id);
             return Ok(());
         };
+        let records = self.legs.get(id).and_then(|l| l.spec.environment.as_ref()).is_none_or(|e| e.deployment);
         let def = super::environments::ensure(&self.hub, &repo, &env).await?;
         let reviews = super::environments::reviews(&self.hub, &run, &def.name).await?;
         let now = crate::util::now_unix();
-        match kiln_ci::env::gate(&def.name, &def.protection, &git_ref, ready_at, now, &reviews) {
+        let p = &def.protection;
+        let verdict = if !records && !p.gates.is_empty() {
+            // As GitHub's custom protection rules can't be.
+            kiln_ci::env::Gate::Refused(format!("{} has custom gates, which a job with `deployment: false` can't use", def.name))
+        } else if p.gates.iter().any(|g| g.workflow.as_deref() == Some(path.as_str())) {
+            kiln_ci::env::Gate::Refused(format!("{}'s gate {path} is the workflow deploying to it: it can't pass before this job runs", def.name))
+        } else {
+            let found = if p.after.is_some() || !p.gates.is_empty() { gate_facts(&self.hub, &repo, &sha, p).await } else { kiln_ci::env::Found::default() };
+            kiln_ci::env::gate_with(&def.name, p, &git_ref, ready_at, now, &reviews, &found)
+        };
+        match verdict {
             kiln_ci::env::Gate::Open => {
                 // Its environment's concurrency limit (W15-R01): at most that many deployments
                 // past the gate at once; the rest wait their turn, in the order they got ready.
@@ -1274,13 +1350,19 @@ impl Dispatch {
                 runs::annotation(&self.hub, id, None, "error", None, &m, None, None, None, None, None).await?;
                 Box::pin(self.settled(id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await?;
             }
-            kiln_ci::env::Gate::Waiting { reviewers, until, window } => {
-                let reason = match (reviewers.is_empty(), &window) {
-                    (false, _) => "approval",
-                    (true, Some(_)) => "window",
-                    (true, None) => "wait-timer",
+            kiln_ci::env::Gate::Waiting { reviewers, until, window, promotion, gate } => {
+                let reason = match (reviewers.is_empty(), &window, &promotion, &gate) {
+                    (false, ..) => "approval",
+                    (true, Some(_), ..) => "window",
+                    (true, None, Some(_), _) => "promotion",
+                    (true, None, None, Some(_)) => "gate",
+                    (true, None, None, None) => "wait-timer",
                 };
-                runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until, "window": window })).await?;
+                runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until, "window": window, "promotion": promotion, "gate": gate })).await?;
+                // Promotion and custom gates move as other runs do: it's looked at again shortly.
+                if promotion.is_some() || gate.is_some() {
+                    self.timers.insert((now + GATE_AGAIN_SECS) * 1000);
+                }
                 self.hub.emit_job(id).await;
                 // W19-R06: the first time it waits for a reviewer, who wants to hear of it.
                 if !reviewers.is_empty()

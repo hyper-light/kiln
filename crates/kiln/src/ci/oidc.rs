@@ -246,6 +246,36 @@ fn sign_with(kp: &KeyPair, kid: &str, claims: &serde_json::Map<String, Value>) -
 }
 
 /// The open documents: discovery and keys.
+/// The server's own token for `audience` (W10-R11): `kiln:<server-id>:service:<name>`, for what
+/// it federates into as itself (W11's broker: a secret store, a model provider).
+pub async fn service_token(hub: &Hub, name: &str, audience: &str, ttl: i64) -> anyhow::Result<String> {
+    let id = crate::discovery::instance_id(&hub.cfg.server.data_dir);
+    mint(hub, &rules::service_claims(&id, name, &issuer(hub), audience, &crate::util::random_token(), crate::util::now_unix(), ttl)).await
+}
+
+/// `POST /api/ci/oidc/token` (W10-R11, `ci.oidc.token`): an agent kiln started asks for its own
+/// token, `{ audience, ttl? }`: `kiln:agent:<session>`, acting for whoever started it (ten minutes
+/// by default, an hour at most). Nobody but an agent session has one.
+pub async fn agent_token(hub: &Hub, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let Some(session) = caller.agent.clone() else { return Err((StatusCode::FORBIDDEN, "only an agent kiln started has a workload identity: ask from one".into())) };
+    let audience = body.get("audience").and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty()).ok_or((StatusCode::BAD_REQUEST, "`audience`: who the token is for".to_owned()))?;
+    if !active(hub).await {
+        return Err((StatusCode::CONFLICT, "kiln's OIDC issuer isn't serving: turn it on first (Settings → OIDC)".into()));
+    }
+    let ttl = body.get("ttl").and_then(Value::as_i64).unwrap_or(600);
+    let person = super::diffs::acting_for(&caller.name).unwrap_or_else(|| "owner".to_owned());
+    let (token, claims) = agent_token_for(hub, &session, &person, audience, ttl).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit(caller.name.clone(), "ci.oidc.agent_token".into(), format!("for {audience}")).await;
+    Ok(json!({ "token": token, "subject": claims.get("sub"), "expires_at": claims.get("exp") }))
+}
+
+/// Agent `session`'s token for `audience`, acting for `person`, and its claims.
+async fn agent_token_for(hub: &Hub, session: &str, person: &str, audience: &str, ttl: i64) -> anyhow::Result<(String, serde_json::Map<String, Value>)> {
+    let harness = hub.harness.info(session).map(|i| i.kind);
+    let claims = rules::agent_claims(session, person, harness.as_deref(), &issuer(hub), audience, &crate::util::random_token(), crate::util::now_unix(), ttl);
+    Ok((mint(hub, &claims).await?, claims))
+}
+
 pub async fn document(hub: &Arc<Hub>, which: &str) -> Result<Response, Fail> {
     let i = issuer(hub);
     match which {
@@ -474,6 +504,33 @@ mod tests {
 
     /// W10-R09: a repository's setting, else its organization's, else the server's, else the
     /// configuration; a repository's `use_default` is GitHub's default whatever the others say.
+    /// W10-R11: an agent session gets its own token, acting for whoever started it; a person or a
+    /// plain token doesn't; the server's own token names it and the service.
+    #[test]
+    fn w10_r11_agent_and_service_tokens() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let payload = |token: &str| -> anyhow::Result<Value> {
+                let body = token.split('.').nth(1).ok_or_else(|| anyhow::anyhow!("not a JWT"))?;
+                Ok(serde_json::from_slice(&B64.decode(body)?)?)
+            };
+            let (token, _) = agent_token_for(&hub, "s1abcdef", "user:ada", "api.anthropic.com", 600).await?;
+            let claims = payload(&token)?;
+            assert_eq!((claims.get("sub"), claims.get("aud"), claims.get("kiln_on_behalf_of")), (Some(&json!("kiln:agent:s1abcdef")), Some(&json!("api.anthropic.com")), Some(&json!("user:ada"))));
+            // Who may ask: an agent session, naming an audience; the issuer must be on.
+            let mut agent = crate::authz::Caller::owner();
+            agent.name = "agent:s1abcdef for user:ada".into();
+            agent.agent = Some("s1abcdef".into());
+            assert!(agent_token(&hub, &crate::authz::Caller::owner(), &json!({ "audience": "x" })).await.is_err_and(|(c, _)| c == StatusCode::FORBIDDEN));
+            assert!(agent_token(&hub, &agent, &json!({})).await.is_err_and(|(c, _)| c == StatusCode::BAD_REQUEST));
+            assert!(agent_token(&hub, &agent, &json!({ "audience": "x" })).await.is_err_and(|(c, _)| c == StatusCode::CONFLICT), "the engine is off here");
+            let service = payload(&service_token(&hub, "broker", "vault", 300).await?)?;
+            let id = crate::discovery::instance_id(&hub.cfg.server.data_dir);
+            assert_eq!(service.get("sub"), Some(&json!(format!("kiln:{id}:service:broker"))));
+            Ok(())
+        })
+    }
+
     #[test]
     fn w10_r09_subject_claims_by_scope() {
         let keys = |k: &[&str]| SubjectSetting { use_default: false, keys: k.iter().map(|s| (*s).to_owned()).collect() };

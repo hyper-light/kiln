@@ -10,6 +10,11 @@
 //! - **Wait timer.** The job waits that many minutes after it became ready.
 //! - **Windows** (kiln's, as cd.md's sync windows): the job deploys only while an `allow` window is
 //!   open, and waits while a `deny` window is.
+//! - **Promotion** (kiln's, as cd.md's): `after: staging` deploys only a commit that deployed to
+//!   staging successfully, `soak: 30m` once it has been there that long.
+//! - **Custom gates** (kiln's): `gates: [{ workflow: .kiln/smoke.yaml }, { check: security }]` deploy
+//!   a commit only when that workflow's run, or that check or status (an attached agent's, say),
+//!   passed for it; one that failed fails the job.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +41,42 @@ pub struct Protection {
     pub tags: Option<Vec<String>>,
     /// When it may deploy (kiln's).
     pub windows: Vec<Window>,
+    /// The environment a commit must have deployed to successfully first (kiln's, as cd.md's).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// How long it must have run there (`30m`), with `after`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soak: Option<String>,
+    /// What must have passed for the commit first (kiln's).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<CustomGate>,
+}
+
+/// A custom gate (W15-R03): a workflow, whose run for the commit must succeed, or a check run or
+/// commit status of that name on the commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomGate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+}
+
+impl CustomGate {
+    /// As people name it: the workflow's path, or the check's name.
+    pub fn name(&self) -> String {
+        self.workflow.clone().or_else(|| self.check.clone()).unwrap_or_default()
+    }
+}
+
+/// What the dispatcher found for a commit, for its environment's promotion and custom gates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    /// When its deployment to `after` succeeded, if it did.
+    pub promoted_at: Option<i64>,
+    /// Each custom gate's name and result: passed, failed, or not yet (`None`).
+    pub gates: Vec<(String, Option<bool>)>,
 }
 
 /// A deploy window (W15-R03, as cd.md's sync windows): it opens at each time its five-field
@@ -67,6 +108,11 @@ impl Window {
         let secs = crate::trigger::cron::seconds(&self.duration).and_then(|s| i64::try_from(s).ok()).filter(|s| *s > 0).ok_or_else(|| format!("window `{schedule}`: `{}` isn't a duration (`90m`, `2h`, `1d`)", self.duration))?;
         Ok((cron, tz, secs, deny))
     }
+}
+
+/// A duration's seconds (`30m`).
+fn anyhow_free_seconds(t: &str) -> Option<i64> {
+    crate::trigger::cron::seconds(t).and_then(|s| i64::try_from(s).ok()).filter(|s| *s > 0)
 }
 
 /// Seconds since the epoch, as RFC 3339.
@@ -117,11 +163,28 @@ impl Protection {
         for w in &self.windows {
             w.parts()?;
         }
+        if let Some(t) = &self.soak {
+            anyhow_free_seconds(t).ok_or_else(|| format!("`soak: {t}` isn't a duration (`30m`, `2h`, `1d`)"))?;
+            if self.after.is_none() {
+                return Err("`soak` says how long a commit runs in the environment `after` names: say `after` too".into());
+            }
+        }
+        if self.after.as_deref().is_some_and(|a| a.trim().is_empty()) {
+            return Err("`after` names an environment".into());
+        }
+        for g in &self.gates {
+            match (&g.workflow, &g.check) {
+                (Some(w), None) if w.starts_with(".github/workflows/") || w.starts_with(".kiln/") => {}
+                (Some(w), None) => return Err(format!("gate `{w}`: a workflow's path, under .github/workflows/ or .kiln/")),
+                (None, Some(c)) if !c.trim().is_empty() => {}
+                _ => return Err("a gate is `workflow: <path>` or `check: <name>`".into()),
+            }
+        }
         Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.reviewers.is_empty() && self.wait_timer == 0 && self.branches.is_none() && self.tags.is_none() && self.windows.is_empty()
+        self.reviewers.is_empty() && self.wait_timer == 0 && self.branches.is_none() && self.tags.is_none() && self.windows.is_empty() && self.after.is_none() && self.gates.is_empty()
     }
 }
 
@@ -142,8 +205,9 @@ pub enum Gate {
     /// A reviewer rejected it: the job fails.
     Rejected { by: String, comment: String },
     /// It waits: for one of `reviewers` to approve, or until `until` (Unix seconds), or both;
-    /// `window` says why when a deploy window holds it.
-    Waiting { reviewers: Vec<String>, until: Option<i64>, window: Option<String> },
+    /// `window` says why when a deploy window holds it, `promotion` when the commit hasn't
+    /// deployed to `after` or soaked there, `gate` when a custom gate hasn't passed yet.
+    Waiting { reviewers: Vec<String>, until: Option<i64>, window: Option<String>, promotion: Option<String>, gate: Option<String> },
     /// It may start.
     Open,
 }
@@ -151,6 +215,11 @@ pub enum Gate {
 /// The gate for a job of `git_ref` bound to environment `env`, `ready_at` being when it could
 /// first have started.
 pub fn gate(env: &str, p: &Protection, git_ref: &str, ready_at: i64, now: i64, reviews: &[Review]) -> Gate {
+    gate_with(env, p, git_ref, ready_at, now, reviews, &Found::default())
+}
+
+/// [`gate`], with what was found of the commit's promotion and custom gates.
+pub fn gate_with(env: &str, p: &Protection, git_ref: &str, ready_at: i64, now: i64, reviews: &[Review], found: &Found) -> Gate {
     if p.branches.is_some() || p.tags.is_some() {
         let (what, name, patterns) = match git_ref.strip_prefix("refs/tags/") {
             Some(tag) => ("Tag", tag, &p.tags),
@@ -164,18 +233,31 @@ pub fn gate(env: &str, p: &Protection, git_ref: &str, ready_at: i64, now: i64, r
     if let Some(r) = reviews.iter().filter(|r| !r.approved).max_by_key(|r| r.at) {
         return Gate::Rejected { by: r.by.clone(), comment: r.comment.clone() };
     }
+    // A custom gate that failed fails the job; one not passed yet holds it.
+    let named: Vec<String> = p.gates.iter().map(CustomGate::name).collect();
+    if let Some((name, _)) = found.gates.iter().find(|(n, r)| *r == Some(false) && named.contains(n)) {
+        return Gate::Refused(format!("The deployment to {env} was stopped by its gate {name}: it failed for this commit."));
+    }
+    let open: Vec<&String> = named.iter().filter(|n| !found.gates.iter().any(|(g, r)| g == *n && *r == Some(true))).collect();
+    let gate = (!open.is_empty()).then(|| format!("{} to pass for this commit", open.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")));
+    // Promotion: the commit deployed to `after`, and soaked there.
+    let (promotion, soaked) = match (&p.after, found.promoted_at) {
+        (None, _) => (None, None),
+        (Some(a), None) => (Some(format!("this commit to deploy to {a} first")), None),
+        (Some(a), Some(t)) => match p.soak.as_deref().and_then(anyhow_free_seconds).map(|s| t + s).filter(|until| *until > now) {
+            Some(until) => (Some(format!("this commit to soak in {a} until {}", at(until))), Some(until)),
+            None => (None, None),
+        },
+    };
     let approved = p.reviewers.is_empty() || reviews.iter().any(|r| r.approved);
     let timer = (p.wait_timer > 0).then(|| ready_at + i64::from(p.wait_timer) * 60).filter(|t| *t > now);
     // A closed window holds it until it opens (rules that don't check out were refused earlier).
     let window = closed(&p.windows, now).ok().flatten();
-    if approved && timer.is_none() && window.is_none() {
+    if approved && timer.is_none() && window.is_none() && promotion.is_none() && gate.is_none() {
         return Gate::Open;
     }
-    let until = match (timer, window.as_ref().map(|(t, _)| *t)) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    };
-    Gate::Waiting { reviewers: if approved { Vec::new() } else { p.reviewers.clone() }, until, window: window.map(|(_, why)| why) }
+    let until = [timer, window.as_ref().map(|(t, _)| *t), soaked].into_iter().flatten().max();
+    Gate::Waiting { reviewers: if approved { Vec::new() } else { p.reviewers.clone() }, until, window: window.map(|(_, why)| why), promotion, gate }
 }
 
 /// A job's `deploy: { app, environment, revision, wait, timeout, artifacts }` (kiln dialect,
@@ -219,10 +301,10 @@ mod tests {
     fn w15_ac01_reviewers_and_the_wait_timer() {
         let p = Protection { reviewers: vec!["alice".into(), "team:ops".into()], wait_timer: 10, ..Protection::default() };
         // Ready at 1000: 10 minutes to wait, and a reviewer.
-        assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1000, &[]), Gate::Waiting { reviewers: vec!["alice".into(), "team:ops".into()], until: Some(1600), window: None });
-        assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1200, &[review("alice", true, 1100)]), Gate::Waiting { reviewers: vec![], until: Some(1600), window: None }, "approved, the timer still runs");
+        assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1000, &[]), Gate::Waiting { reviewers: vec!["alice".into(), "team:ops".into()], until: Some(1600), window: None, promotion: None, gate: None });
+        assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1200, &[review("alice", true, 1100)]), Gate::Waiting { reviewers: vec![], until: Some(1600), window: None, promotion: None, gate: None }, "approved, the timer still runs");
         assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1600, &[review("alice", true, 1100)]), Gate::Open);
-        assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1700, &[]), Gate::Waiting { reviewers: vec!["alice".into(), "team:ops".into()], until: None, window: None }, "the timer ran out, the reviewer not yet");
+        assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1700, &[]), Gate::Waiting { reviewers: vec!["alice".into(), "team:ops".into()], until: None, window: None, promotion: None, gate: None }, "the timer ran out, the reviewer not yet");
         assert_eq!(gate("prod", &p, "refs/heads/main", 1000, 1700, &[review("alice", true, 1100), review("bob", false, 1200)]), Gate::Rejected { by: "bob".into(), comment: "not now".into() }, "a rejection wins");
     }
 
@@ -232,7 +314,7 @@ mod tests {
         assert!(Protection { wait_timer: MAX_WAIT_MINUTES + 1, ..Protection::default() }.check().is_err());
         assert!(Protection { wait_timer: MAX_WAIT_MINUTES, reviewers: vec!["a".into()], branches: Some(vec!["main".into()]), ..Protection::default() }.check().is_ok());
         let parsed: Protection = serde_yaml::from_str("reviewers: [alice]\nprevent-self-review: true\nwait-timer: 5\nbranches: [main]\n").unwrap_or_default();
-        assert_eq!(parsed, Protection { reviewers: vec!["alice".into()], prevent_self_review: true, wait_timer: 5, branches: Some(vec!["main".into()]), tags: None, windows: Vec::new() });
+        assert_eq!(parsed, Protection { reviewers: vec!["alice".into()], prevent_self_review: true, wait_timer: 5, branches: Some(vec!["main".into()]), ..Protection::default() });
     }
 
     /// W15-R05: a kiln job's `deploy:` binds it to the environment and deploys after its steps;
@@ -255,6 +337,34 @@ mod tests {
 
     /// W15-R03's windows: a deny window holds a deployment until it closes; with allow windows,
     /// one waits for the next to open. Rules that don't check out are refused.
+    /// W15-R03's promotion and custom gates: a commit deploys after it deployed to `after` and
+    /// soaked there, and once its gates passed; a failed gate fails the job.
+    #[test]
+    fn w15_r03_promotion_and_custom_gates() {
+        let yaml = "after: staging\nsoak: 30m\ngates:\n  - workflow: .kiln/smoke.yaml\n  - check: security\n";
+        let p: Protection = serde_yaml::from_str(yaml).unwrap_or_default();
+        assert_eq!(p.check(), Ok(()));
+        let found = |promoted: Option<i64>, smoke: Option<bool>, security: Option<bool>| Found { promoted_at: promoted, gates: vec![(".kiln/smoke.yaml".into(), smoke), ("security".into(), security)] };
+        let held = |g: Gate| match g {
+            Gate::Waiting { promotion, gate, until, .. } => (promotion, gate, until),
+            other => (Some(format!("{other:?}")), None, None),
+        };
+        // Not in staging yet, nor the gates passed.
+        let (promotion, gate, _) = held(gate_with("production", &p, "refs/heads/main", 0, 10_000, &[], &found(None, None, None)));
+        assert!(promotion.is_some_and(|w| w.contains("deploy to staging first")) && gate.is_some_and(|w| w.contains("`.kiln/smoke.yaml`, `security`")));
+        // In staging since 9,000: it soaks until 10,800.
+        let (promotion, gate, until) = held(gate_with("production", &p, "refs/heads/main", 0, 10_000, &[], &found(Some(9_000), Some(true), None)));
+        assert!(promotion.is_some_and(|w| w.contains("soak in staging")) && gate.is_some_and(|w| w.contains("`security`") && !w.contains("smoke")));
+        assert_eq!(until, Some(10_800));
+        assert_eq!(gate_with("production", &p, "refs/heads/main", 0, 10_800, &[], &found(Some(9_000), Some(true), Some(true))), Gate::Open);
+        assert!(matches!(gate_with("production", &p, "refs/heads/main", 0, 10_800, &[], &found(Some(9_000), Some(false), Some(true))), Gate::Refused(m) if m.contains("stopped by its gate .kiln/smoke.yaml")));
+        // Bad rules are refused.
+        for bad in ["soak: 30m\n", "after: staging\nsoak: soon\n", "gates: [{ workflow: smoke.yaml }]\n", "gates: [{ workflow: .kiln/a.yaml, check: b }]\n", "gates: [{}]\n"] {
+            let p: Protection = serde_yaml::from_str(bad).unwrap_or_else(|_| Protection { gates: vec![CustomGate { workflow: None, check: None }], ..Protection::default() });
+            assert!(p.check().is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn w15_r03_windows() {
         // Saturday 2026-10-17 12:00 UTC, and Monday 2026-10-19 09:30 UTC.

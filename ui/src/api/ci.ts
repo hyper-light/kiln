@@ -504,6 +504,8 @@ export function waitSentence(w: unknown): string | null {
     environment?: string;
     reviewers?: string[];
     window?: string;
+    promotion?: string;
+    gate?: string;
     until?: number | null;
     pool?: string;
     starting?: number;
@@ -539,6 +541,10 @@ export function waitSentence(w: unknown): string | null {
       return `Waiting until ${o.until ? new Date(o.until * 1000).toLocaleTimeString() : "its wait timer ends"} to deploy to ${o.environment ?? "its environment"}.`;
     case "window":
       return `Waiting for a deploy window of ${o.environment ?? "its environment"}: ${o.window ?? "it is closed"}.`;
+    case "promotion":
+      return `Waiting for ${o.promotion ?? "this commit to deploy to the environment before it"}, to deploy to ${o.environment ?? "its environment"}.`;
+    case "gate":
+      return `Waiting for ${o.gate ?? "its environment's gates to pass"}, to deploy to ${o.environment ?? "its environment"}.`;
     default:
       return o.reason ? o.reason.replace(/-/g, " ") : null;
   }

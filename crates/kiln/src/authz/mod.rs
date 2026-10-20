@@ -390,6 +390,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
+    // What notification rules sent (W19-R06), every repository's.
+    r("GET", "/api/ci/notify/deliveries", "settings.manage", At::Server),
     any("/api/ci/secrets", "secrets.manage", At::ScopeQuery),
     any("/api/ci/secrets/**", "secrets.manage", At::ScopeQuery),
     any("/api/ci/variables", "variables.manage", At::ScopeQuery),
@@ -401,6 +403,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/oidc/subject", "runs.read", At::ScopeQuery),
     any("/api/ci/oidc/subject", "settings.manage", At::ScopeQuery),
     any("/api/ci/oidc", "settings.manage", At::Server),
+    // An agent kiln started, its own workload token (W10-R11); the handler refuses anyone else.
+    r("POST", "/api/ci/oidc/token", "agents.run", At::Server),
     any("/api/ci/oidc/**", "settings.manage", At::Server),
     r("GET", "/api/ci/environments", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/environments/**", "runs.read", At::RepoQuery),

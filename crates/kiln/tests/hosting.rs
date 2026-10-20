@@ -2195,6 +2195,87 @@ fn receiver() -> anyhow::Result<(u16, std::sync::Arc<std::sync::Mutex<Vec<String
     Ok((port, got))
 }
 
+/// W15-R03's promotion and custom gates, end to end: production takes a commit only after it
+/// deployed to staging and soaked there, and once its smoke workflow passed for it (the leg waits
+/// with `promotion` and `gate`, then deploys); a commit whose smoke workflow fails never deploys
+/// there, its job failing with why.
+#[test]
+fn w15_r03_promotion_and_custom_gates() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/promoted", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "promoted\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/promoted.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/environments.yaml"), "staging: {}\nproduction:\n  after: staging\n  soak: 4s\n  gates:\n    - workflow: .kiln/smoke.yaml\n")?;
+    std::fs::write(
+        work.join(".kiln/ship.yaml"),
+        "on: push\njobs:\n  staging:\n    runs-on: local\n    checkout: false\n    environment: staging\n    steps: [{run: echo staged}]\n  production:\n    runs-on: local\n    checkout: false\n    needs: staging\n    environment: production\n    steps: [{run: echo shipped}]\n",
+    )?;
+    // The smoke test reads the commit (kiln's implicit checkout).
+    std::fs::write(work.join(".kiln/smoke.yaml"), "on: push\njobs:\n  smoke:\n    runs-on: local\n    steps:\n      - run: sleep 2; test ! -f BROKEN\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "ship it"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let sha = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    // The ship run of a commit, once it's done: its detail.
+    let shipped = |sha: &str| -> anyhow::Result<Option<Value>> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/promoted&limit=20", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let Some(r) = v.get("runs").and_then(Value::as_array).into_iter().flatten().find(|r| text(r, "sha") == sha && text(r, "workflow").ends_with("ship.yaml") && r.get("finished_at").is_some_and(|f| !f.is_null())).cloned() else { return Ok(None) };
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(&r, "id")), &s.admin, None)?;
+        Ok(Some(serde_json::from_str(&detail)?))
+    };
+    let mut done = Value::Null;
+    until(240, "the ship run", || {
+        Ok(match shipped(&sha)? {
+            Some(d) => {
+                done = d;
+                None
+            }
+            None => Some(s.log()),
+        })
+    })?;
+    assert_eq!(done.pointer("/run/conclusion").and_then(Value::as_str), Some("success"), "{done}\n{}", s.log());
+    let production = done.get("legs").and_then(Value::as_array).into_iter().flatten().find(|l| text(l, "job") == "production").cloned().unwrap_or_default();
+    // It waited for staging's soak and the smoke run (seconds by wait reason, W19-R01).
+    let waited = |reason: &str| production.pointer(&format!("/waits/{reason}")).and_then(Value::as_f64).unwrap_or(0.0);
+    assert!(waited("promotion") + waited("gate") >= 3.0, "{production}");
+
+    // A commit whose smoke workflow fails: production refuses it.
+    std::fs::write(work.join("BROKEN"), "1\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "broken"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let broken = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+    until(240, "the broken commit's ship run", || {
+        Ok(match shipped(&broken)? {
+            Some(d) => {
+                done = d;
+                None
+            }
+            None => Some(s.log()),
+        })
+    })?;
+    assert_eq!(done.pointer("/run/conclusion").and_then(Value::as_str), Some("failure"), "{done}");
+    let production = done.get("legs").and_then(Value::as_array).into_iter().flatten().find(|l| text(l, "job") == "production").cloned().unwrap_or_default();
+    assert!(text(&production, "error").contains("stopped by its gate .kiln/smoke.yaml"), "{production}");
+    Ok(())
+}
+
 /// W19-R06's other events reach a channel: a job's failed deployment sends `deploy.failed`, and
 /// a run whose report has a test a retry passed sends `leg.flaky` (a webhook here).
 #[test]

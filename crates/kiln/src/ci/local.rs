@@ -493,6 +493,7 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
         "approval" => (format!("a reviewer's approval to deploy to {} ({})", text("environment"), list("reviewers")), true),
         "wait-timer" => (format!("the wait timer of {}", text("environment")), false),
         "window" => (format!("a deploy window of {}: {}", text("environment"), text("window")), false),
+        "promotion" | "gate" => (format!("{} (to deploy to {})", text(if o.get("reason").and_then(Value::as_str) == Some("gate") { "gate" } else { "promotion" }), text("environment")), false),
         "concurrency" if o.get("environment").is_some() => (format!("{}'s other deployments (at most {} at once)", text("environment"), o.get("limit").and_then(Value::as_u64).unwrap_or(1)), false),
         "concurrency" => (format!("its concurrency group {}", text("group")), false),
         other => (other.replace('-', " "), false),

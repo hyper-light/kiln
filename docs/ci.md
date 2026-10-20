@@ -181,12 +181,12 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins, musl Node left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; S3, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); the other stores, UI left |
-| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use`, row-level lists for scoped callers, passkeys and the Settings pages left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for eight ecosystems (AC03 with the real tools); jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); microVM and k8s executors and pool kinds, the Pools page, UI-made image definitions left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); the rest of the REST left |
-| W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); custom gates, `after:`/`soak:`, previews, pages and board left (with CD) |
+| W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); previews, pages and board left (with CD) |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check for CD (R04's kiln half), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; other registries' referrers, the SBOM diff in review, R04's CD half, AC04, microVM containment (W13) left |
@@ -2997,13 +2997,19 @@ elsewhere (G-24, G-33).
   - Verified end to end: a leg's token said `repo:acme/e2e:ref:refs/heads/main:kiln_trust:trusted`
     under the organization's keys, and GitHub's default again once the repository chose
     `use_default`. The facade answered both in GitHub's shape.
+- *Done.* R11, kiln as a workload: the server's own tokens (`kiln:<server-id>:service:<name>`,
+  the id kept with its data, `kiln_service` naming the service: `ci::oidc::service_token`, for
+  W11's broker) and an agent's (`kiln:agent:<session>`, `kiln_on_behalf_of` the person who
+  started it, `kiln_harness`). An agent asks for its own with `ci.oidc.token` (an MCP tool, code
+  mode's `kiln.ci.oidc.token`, `POST /api/ci/oidc/token`) for the audience it federates into,
+  ten minutes by default and an hour at most; nobody but an agent session gets one. Unit-tested
+  (`w10_r11_service_and_agent_subjects`, `w10_r11_agent_and_service_tokens`).
 - *Left.*
   - Passwords and passkeys per user (users sign in with links), and the Settings pages for
     people and tokens (W21).
   - Lists narrowed row by row for repository-scoped callers: `/api/runs` and `/api/ci/runs` ask
     them for `?repo=`, and the event stream and overview need the server scope.
   - `secrets.use:<name>`.
-  - R11's service and agent subjects (`kiln:<server-id>:service:<name>`, `kiln:agent:<session>`).
   - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
     issuer paths, and the Settings → OIDC page (W21).
   - AC01, AC02, AC04's cloud cases (AWS, Google Cloud, Azure: test tenants, user-assisted).
@@ -4165,9 +4171,25 @@ previews and the board).
   when). It goes when the window opens, after its reviewers and wait timer. Windows that don't
   check out leave the environment's rules refused, as other bad rules do. Unit-tested
   (`w15_r03_windows`: a weekend deny window, office hours).
+- *Done.* R03's promotion and custom gates, in `.kiln/environments.yaml` (CD's `after` and
+  `soak` keys, which its releases already follow):
+  - `after: staging` deploys only a commit whose deployment to staging succeeded, and with
+    `soak: 30m` only once it has been there that long. The job waits (`promotion`, saying for
+    what and until when).
+  - `gates: [{ workflow: .kiln/smoke.yaml }, { check: security }]`: a commit deploys once each
+    passed for it. A workflow gate is that workflow's run for the commit. A check gate is the
+    check run of that name, else the commit status (an attached agent's, say), else a run or job
+    kiln names so (`smoke`, `smoke/test`). Skipped and neutral pass. The job waits (`gate`,
+    naming what hasn't passed); one that failed fails the job, saying which. A gate can't be the
+    workflow that deploys, and, as GitHub's custom protection rules, gates can't take a job's
+    `deployment: false`: either fails the job, saying why.
+  - Held legs are looked at again every 15 seconds. Unit-tested
+    (`w15_r03_promotion_and_custom_gates`), and end to end (the hosting test of that name):
+    production took a commit after staging had it for four seconds and its smoke workflow
+    passed, the leg waiting `promotion` and `gate` meanwhile; a commit whose smoke run failed
+    never deployed there.
 - *Left.*
-  - Custom gates, `after:` and `soak:` (R03, with CD), the environment pages (R08) and the board
-    (R09).
+  - The environment pages (R08) and the board (R09).
   - R02, R07 and AC02 to AC05, which are CD's or shared with it.
 
 ### W16 Test results, flaky tests and benchmarks
@@ -5096,13 +5118,14 @@ R04, R05's `kiln-ci-diagnose`, and R06's rights.
   - `secrets.{list,set}` (names and last use only; setting needs `secrets.manage`),
     `variables.{list,set}`, `integrations.{list,verify}`;
   - `environments.{list,save}`;
-  - `insights.{repos,workflows,runners}`;
+  - `insights.{repos,workflows,runners}`, `notifications.deliveries`;
   - `diffs.{list,get,threads,readiness,comment,reply,resolve,review,submit_patch,land}`, whose
     routes are W14's under `/api` (an operation names its routes' prefix).
 
   What `workflows.edit`, `tests.propose_quarantine` and `images.propose` change goes up as a diff
   of the file (the workflow, `.kiln/quarantine.yaml`, the image's Dockerfile or Agentfile), for
-  review like any other.
+  review like any other. `workflows.edit` answers with the workflow's diagnostics and, R03's
+  loop, the plan a push to the trunk would make of it once it lands.
 
   An operation's route is checked by its segments as the HTTP layer decodes them, so a
   repository's name (`acme/app`) is one segment, as `acme%2Fapp` is in a path.
@@ -5121,8 +5144,7 @@ R04, R05's `kiln-ci-diagnose`, and R06's rights.
   - a code-mode program listed runs and read the leg;
   - a developer's token listed runs but was refused `exec` and `release` (`runs.debug`).
 - *Left*:
-  - R02's `images.build` (with W13-R11's API) and `notifications` (its route has no rule of its
-    own yet);
+  - R02's `images.build` (with W13-R11's API);
   - generating the HTTP routes, the OpenAPI document and the CLI from the registry;
   - R03's diagnostics and preview on writes;
   - the other skills, R07 to R11, and AC01 to AC06.

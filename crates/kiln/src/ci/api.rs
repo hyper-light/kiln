@@ -202,6 +202,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let body: serde_json::Value = if method == Method::PUT { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
             super::oidc::subject(hub, &method, q, body, &by).await
         }
+        // W10-R11: an agent kiln started asks for its own workload token.
+        (&Method::POST, ["oidc", "token"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            Ok(crate::http::server::json(StatusCode::OK, &super::oidc::agent_token(hub, &caller, &body).await?))
+        }
         // W10-R12: the OIDC issuer's status, keys to publish, rotation.
         (_, ["oidc", tail @ ..]) => {
             let body: serde_json::Value = if method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };

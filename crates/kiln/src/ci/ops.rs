@@ -452,12 +452,24 @@ pub fn ops() -> &'static [Op] {
                         return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{file} has errors, so it isn't proposed:\n{}", errors.join("\n"))));
                     }
                     let title = v.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()).map_or_else(|| format!("Edit {file}"), str::to_owned);
+                    let shown = content.clone();
                     let mut out = super::diffs::propose_file(&cx.hub, &repo, &cx.caller, &file, &title, &v, move |_| Ok(content)).await?;
+                    // W20-R03: its effect too, as a push to the trunk plans it once it lands.
+                    let preview = answer(super::preview::of(&cx.hub, Some(&cx.caller), json!({ "repo": repo, "path": file, "content": shown, "event": "push" })).await).await.unwrap_or(Value::Null);
                     if let Some(o) = out.as_object_mut() {
                         o.insert("diagnostics".into(), serde_json::to_value(&checked.diagnostics).unwrap_or(Value::Null));
+                        o.insert("preview".into(), preview);
                     }
                     Ok(out)
                 }),
+            op!("ci.oidc.token", "Your own workload token, as the agent kiln started (W10-R11): `sub` kiln:agent:<session>, acting for whoever started you, for `audience` (a model provider, a secret store, a cloud's STS). Federate with it instead of a stored key.", ro: false, destructive: false,
+                input: || schema(json!({"audience": {"type": "string", "description": "Who it's for, as their trust policy names it."}, "ttl": {"type": "integer", "minimum": 60, "maximum": 3600, "description": "Seconds it lasts (600 by default)."}}), &["audience"]),
+                route: |_| Ok((Method::POST, path(&["oidc", "token"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::oidc::agent_token(&cx.hub, &cx.caller, &v).await }),
+            op!("ci.notifications.deliveries", "What notification rules sent (W19-R06), newest first: each delivery's rule, event, channel, whether it went and why not, and its attempts.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}), &[]),
+                route: |v| Ok((Method::GET, path(&["notify", "deliveries"]), query(v, &["run", "limit"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::notify::deliveries(&cx.hub, &query(&v, &["run", "limit"])).await).await }),
             op!("ci.tests.propose_quarantine", "Propose quarantining a test (W16-R05) as a diff adding it to the trunk's `.kiln/quarantine.yaml`: under `quarantine: enforce`, its failures alone then let a step pass, with a warning. It lands through review.", base: "", ro: false, destructive: false,
                 input: || schema(json!({
                     "repo": {"type": "string", "description": REPO}, "test": {"type": "string", "description": "suite.name, suite::name, the name, or the id; `*` matches any run of characters."},
