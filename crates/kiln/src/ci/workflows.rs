@@ -550,8 +550,14 @@ struct RepoDispatchAsk {
 /// `POST /api/ci/repos/:repo/dispatches { event_type, client_payload }` (W03-R11): GitHub's
 /// `repository_dispatch`. 204, as GitHub answers, whether or not a workflow listens.
 pub async fn repository_dispatch(hub: &Hub, repo: &str, body: Incoming, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
+    let ask: serde_json::Value = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    repository_dispatch_value(hub, repo, ask, started_by).await
+}
+
+/// The same, its request already read (`ci.runs.repository_dispatch`).
+pub async fn repository_dispatch_value(hub: &Hub, repo: &str, ask: serde_json::Value, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
-    let ask: RepoDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    let ask: RepoDispatchAsk = serde_json::from_value(ask).map_err(|e| bad(format!("{e}")))?;
     super::events::repository_dispatch(hub, &repo, &ask.event_type, &ask.client_payload, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }

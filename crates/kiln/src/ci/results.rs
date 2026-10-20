@@ -202,11 +202,14 @@ struct Row {
     quarantined: bool,
 }
 
-/// Each test's flakiness from its history in the repository (its results on `branch`, by input:
-/// the commit and the leg).
-async fn flakiness(hub: &Hub, repo: &str, branch: &str, cases: Vec<String>) -> anyhow::Result<HashMap<String, Flakiness>> {
+/// How many of a test's last results the Tests panel's sparkline shows (W16-R03).
+const SPARK: usize = 20;
+
+/// Each test's last results in the repository on `branch`, oldest first (at most twice
+/// [`WINDOW`]), by its id.
+async fn recent(hub: &Hub, repo: &str, branch: &str, cases: Vec<String>) -> anyhow::Result<BTreeMap<String, Vec<Seen>>> {
     if cases.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(BTreeMap::new());
     }
     let (repo, branch) = (repo.to_owned(), branch.to_owned());
     let rows: Vec<(String, String, String, u32)> = hub
@@ -227,7 +230,29 @@ async fn flakiness(hub: &Hub, repo: &str, branch: &str, cases: Vec<String>) -> a
     for (case, input, outcome, retried) in rows {
         by.entry(case).or_default().push(Seen { input, outcome: Outcome::parse(&outcome).unwrap_or(Outcome::Error), retried });
     }
-    Ok(by.into_iter().map(|(k, seen)| (k, results::flaky(&seen, WINDOW, FLIP_RATE))).collect())
+    Ok(by)
+}
+
+/// Each test's flakiness from its history in the repository (its results on `branch`, by input:
+/// the commit and the leg).
+async fn flakiness(hub: &Hub, repo: &str, branch: &str, cases: Vec<String>) -> anyhow::Result<HashMap<String, Flakiness>> {
+    Ok(recent(hub, repo, branch, cases).await?.into_iter().map(|(k, seen)| (k, results::flaky(&seen, WINDOW, FLIP_RATE))).collect())
+}
+
+/// A test's last [`SPARK`] outcomes, oldest first, a letter each: `p`assed, `f`ailed, `e`rror,
+/// `s`kipped.
+fn spark(seen: &[Seen]) -> String {
+    let from = seen.len().saturating_sub(SPARK);
+    seen.get(from..)
+        .unwrap_or_default()
+        .iter()
+        .map(|s| match s.outcome {
+            Outcome::Passed => 'p',
+            Outcome::Failed => 'f',
+            Outcome::Error => 'e',
+            Outcome::Skipped => 's',
+        })
+        .collect()
 }
 
 /// The tests a run was flaky on, by name (W16-R04's first rule, on its own results): a tool's
@@ -327,14 +352,16 @@ pub async fn of(hub: &Hub, run: Option<&str>, leg: Option<&str>, q: &HashMap<Str
         })
         .await
         .map_err(|e| internal(&e))?;
-    let flaky = match &scope {
+    let (flaky, history): (HashMap<String, Flakiness>, HashMap<String, String>) = match &scope {
         Some((repo, branch)) => {
             let mut cases: Vec<String> = rows.iter().map(|r| r.case.clone()).collect();
             cases.sort();
             cases.dedup();
-            flakiness(hub, repo, branch, cases).await.map_err(|e| internal(&e))?
+            let by = recent(hub, repo, branch, cases).await.map_err(|e| internal(&e))?;
+            let history = by.iter().map(|(k, seen)| (k.clone(), spark(seen))).collect();
+            (by.into_iter().map(|(k, seen)| (k, results::flaky(&seen, WINDOW, FLIP_RATE))).collect(), history)
         }
-        None => HashMap::new(),
+        None => (HashMap::new(), HashMap::new()),
     };
     let rank = |o: &str| match o {
         "failed" | "error" => 0,
@@ -354,10 +381,49 @@ pub async fn of(hub: &Hub, run: Option<&str>, leg: Option<&str>, q: &HashMap<Str
                 "id": r.case, "suite": r.suite, "name": r.name, "file": r.file, "line": r.line, "leg": r.leg, "leg_key": r.leg_key, "attempt": r.attempt,
                 "outcome": r.outcome, "duration_ms": r.duration_ms, "message": r.message, "trace": r.trace, "retried": r.retried, "quarantined": r.quarantined,
                 "flaky": flaky_json(flaky.get(&r.case)),
+                // Its last results on the branch, oldest first (W16-R03's sparkline).
+                "history": history.get(&r.case),
             })
         })
         .collect();
     Ok(srv::json(StatusCode::OK, &json!({ "counts": counts, "tests": tests })))
+}
+
+/// `GET /api/ci/repos/:repo/tests/:id/history?branch=&limit=` (W16-R03): a test's last results on
+/// a branch (the default branch unless said), newest first: each one's run, leg, attempt, commit,
+/// outcome, duration and time.
+pub async fn history(hub: &Hub, repo: &str, case: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    let r = hub.store.repos().await.map_err(|e| internal(&e))?.into_iter().find(|x| x.id == repo || x.name == repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{repo}`")))?;
+    let branch = match q.get("branch").filter(|b| !b.is_empty()) {
+        Some(b) => b.clone(),
+        None => super::events::facts(hub, &r).await.default_branch,
+    };
+    let limit: i64 = q.get("limit").and_then(|d| d.parse().ok()).unwrap_or(30).clamp(1, 500);
+    let (repo_id, b, id) = (r.id.clone(), branch.clone(), case.to_owned());
+    let (test, results): (Option<Value>, Vec<Value>) = hub
+        .store
+        .call(move |c| {
+            let test = c
+                .query_row("SELECT suite, name, file FROM test_cases WHERE repo_id = ?1 AND id = ?2", params![repo_id, id], |x| {
+                    Ok(json!({ "id": id, "suite": x.get::<_, String>(0)?, "name": x.get::<_, String>(1)?, "file": x.get::<_, Option<String>>(2)? }))
+                })
+                .optional()?;
+            let mut st = c.prepare(
+                "SELECT t.run_id, r.number, t.leg, t.leg_key, t.attempt, t.sha, t.outcome, t.duration_ms, t.retried, t.quarantined, t.ts FROM test_results t LEFT JOIN runs r ON r.id = t.run_id
+                 WHERE t.repo_id = ?1 AND t.case_id = ?2 AND t.branch = ?3 ORDER BY t.ts DESC, t.id DESC LIMIT ?4",
+            )?;
+            let rows = st.query_map(params![repo_id, id, b, limit], |x| {
+                Ok(json!({
+                    "run": x.get::<_, String>(0)?, "number": x.get::<_, Option<i64>>(1)?, "leg": x.get::<_, String>(2)?, "leg_key": x.get::<_, String>(3)?, "attempt": x.get::<_, i64>(4)?,
+                    "sha": x.get::<_, String>(5)?, "outcome": x.get::<_, String>(6)?, "duration_ms": x.get::<_, Option<i64>>(7)?, "retried": x.get::<_, i64>(8)?, "quarantined": x.get::<_, bool>(9)?, "ts": x.get::<_, i64>(10)?
+                }))
+            })?;
+            Ok((test, rows.collect::<Result<Vec<_>, _>>()?))
+        })
+        .await
+        .map_err(|e| internal(&e))?;
+    let test = test.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no test `{case}` in {}", r.name)))?;
+    Ok(srv::json(StatusCode::OK, &json!({ "repo": r.name, "branch": branch, "test": test, "results": results })))
 }
 
 /// `GET /api/ci/repos/:repo/tests?sort=failing|slowest|flaky&branch=&days=&limit=`: each test's

@@ -268,6 +268,95 @@ pub(crate) async fn call(registry: &Registry, method: Method, path: &str, scope:
     client()?.request(method, &url).header("accept", ACCEPT).header("authorization", &auth).send().await.with_context(|| format!("{} {url}", method_name(method)))
 }
 
+/// A request with a body (a blob, a manifest), answering the registry's challenge once.
+async fn send(registry: &Registry, method: Method, url: &str, scope: &str, content_type: &str, body: &[u8]) -> anyhow::Result<crate::http::client::Response> {
+    let build = |auth: Option<&str>| -> anyhow::Result<crate::http::client::RequestBuilder<'static>> {
+        let mut r = client()?.request(method, url).header("content-type", content_type).body(body.to_vec());
+        if let Some(a) = auth {
+            r = r.header("authorization", a);
+        }
+        Ok(r)
+    };
+    let first = build(None)?.send().await.with_context(|| format!("{} {url}", method_name(method)))?;
+    if first.status() != 401 {
+        return Ok(first);
+    }
+    let challenge = first.header("www-authenticate").and_then(parse_challenge).context("the registry answered 401 without a challenge")?;
+    let auth = answer(registry, &challenge, scope).await?;
+    build(Some(&auth))?.send().await.with_context(|| format!("{} {url}", method_name(method)))
+}
+
+/// `location` (an upload's), absolute.
+fn absolute(registry: &Registry, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") { location.to_owned() } else { format!("{}{location}", registry.base) }
+}
+
+/// A blob pushed into `repo` (or found there already): its digest and size.
+async fn push_blob(registry: &Registry, repo: &str, bytes: &[u8]) -> anyhow::Result<(String, u64)> {
+    let digest = format!("sha256:{}", crate::util::sha256_hex(bytes));
+    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let scope = format!("repository:{repo}:pull,push");
+    if call(registry, Method::Head, &format!("/v2/{repo}/blobs/{digest}"), &scope).await?.is_success() {
+        return Ok((digest, size));
+    }
+    // A monolithic upload: started, then the blob in one `PUT`.
+    let start = send(registry, Method::Post, &format!("{}/v2/{repo}/blobs/uploads/", registry.base), &scope, "application/octet-stream", &[]).await?;
+    anyhow::ensure!(start.status() == 202, "{} didn't start an upload into {repo} ({})", registry.name, start.status());
+    let at = absolute(registry, start.header("location").context("an upload without a location")?);
+    let url = format!("{at}{}digest={}", if at.contains('?') { "&" } else { "?" }, urlencode(&digest));
+    let put = send(registry, Method::Put, &url, &scope, "application/octet-stream", bytes).await?;
+    anyhow::ensure!(put.status() == 201, "{} didn't take a blob into {repo} ({})", registry.name, put.status());
+    Ok((digest, size))
+}
+
+/// kiln's signed attestation (a Sigstore bundle) attached to `subject` in another registry, as
+/// in kiln's own (docs/ci.md W18-R02): an OCI 1.1 artifact manifest whose `subject` is the image,
+/// and where the registry has no referrers API (its answer to the push has no `OCI-Subject`),
+/// listed in the referrers tag schema's index (`sha256-<hex>`) too. Its digest.
+pub async fn attach(registry: &Registry, repo: &str, subject: &str, bundle: &[u8], predicate_type: &str) -> anyhow::Result<String> {
+    const BUNDLE_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
+    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+    let scope = format!("repository:{repo}:pull,push");
+    // The subject as the registry has it: its media type and size.
+    let head = call(registry, Method::Head, &format!("/v2/{repo}/manifests/{subject}"), &scope).await?;
+    anyhow::ensure!(head.is_success(), "{} has no {repo}@{subject} ({})", registry.name, head.status());
+    let media_type = head.header("content-type").map(|t| t.split(';').next().unwrap_or(t).trim().to_owned()).unwrap_or_else(|| OCI_MANIFEST.to_owned());
+    let size: u64 = head.header("content-length").and_then(|l| l.trim().parse().ok()).context("the subject's size")?;
+    let (cd, cs) = push_blob(registry, repo, b"{}").await?;
+    let (bd, bs) = push_blob(registry, repo, bundle).await?;
+    let annotations = serde_json::json!({ "dev.sigstore.bundle.content": "dsse-envelope", "dev.sigstore.bundle.predicateType": predicate_type });
+    let manifest = serde_json::json!({
+        "schemaVersion": 2, "mediaType": OCI_MANIFEST, "artifactType": BUNDLE_TYPE,
+        "config": { "mediaType": "application/vnd.oci.empty.v1+json", "digest": cd, "size": cs },
+        "layers": [{ "mediaType": BUNDLE_TYPE, "digest": bd, "size": bs }],
+        "subject": { "mediaType": media_type, "digest": subject, "size": size },
+        "annotations": annotations,
+    });
+    let body = serde_json::to_vec(&manifest)?;
+    let digest = format!("sha256:{}", crate::util::sha256_hex(&body));
+    let put = send(registry, Method::Put, &format!("{}/v2/{repo}/manifests/{digest}", registry.base), &scope, OCI_MANIFEST, &body).await?;
+    anyhow::ensure!(put.status() == 201, "{} didn't take the attestation's manifest ({})", registry.name, put.status());
+    if put.header("oci-subject").is_none() {
+        // The referrers tag schema: the subject's referrers in an index at `sha256-<hex>`.
+        let tag = subject.replace(':', "-");
+        let have = call(registry, Method::Get, &format!("/v2/{repo}/manifests/{tag}"), &scope).await?;
+        let mut index = if have.is_success() { have.json::<serde_json::Value>(4 << 20).await.unwrap_or_default() } else { serde_json::Value::Null };
+        if index.get("manifests").and_then(serde_json::Value::as_array).is_none() {
+            index = serde_json::json!({ "schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [] });
+        }
+        let entry = serde_json::json!({ "mediaType": OCI_MANIFEST, "digest": digest, "size": body.len(), "artifactType": BUNDLE_TYPE, "annotations": annotations });
+        if let Some(list) = index.get_mut("manifests").and_then(serde_json::Value::as_array_mut)
+            && !list.iter().any(|m| m.get("digest") == entry.get("digest"))
+        {
+            list.push(entry);
+        }
+        let text = serde_json::to_vec(&index)?;
+        let put = send(registry, Method::Put, &format!("{}/v2/{repo}/manifests/{tag}", registry.base), &scope, "application/vnd.oci.image.index.v1+json", &text).await?;
+        anyhow::ensure!(put.status() == 201, "{} didn't take the referrers index at {tag} ({})", registry.name, put.status());
+    }
+    Ok(digest)
+}
+
 fn method_name(m: Method) -> &'static str {
     match m {
         Method::Get => "GET",
@@ -528,6 +617,93 @@ mod tests {
             let wrong = Registry::for_name(&name, Some(("acme".into(), "wrong".into())), true);
             let err = resolve(&wrong, &parse_reference(&format!("{name}/acme/kiln:other"))?).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
             assert!(err.contains("refused a token"), "{err}");
+            Ok(())
+        })
+    }
+
+    /// W18-R02 in another registry: an attestation pushed as a referrer of its image there (its
+    /// blobs, then its manifest with the image as its `subject`), and, the registry having no
+    /// referrers API, listed in the referrers tag schema's index too; pushed again, not twice.
+    #[test]
+    fn w18_r02_an_attestation_attached_in_another_registry() -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use http_body_util::BodyExt as _;
+
+        use crate::http::server::{self as srv, Request, Response};
+
+        #[derive(Default)]
+        struct Fake {
+            /// Blobs and manifests by digest (and tag), as pushed.
+            blobs: parking_lot::Mutex<BTreeMap<String, Vec<u8>>>,
+            manifests: parking_lot::Mutex<BTreeMap<String, (String, Vec<u8>)>>,
+        }
+        impl srv::Handler for Fake {
+            async fn handle(self: Arc<Self>, req: Request) -> Response {
+                let (method, path, query) = (req.method().clone(), req.uri().path().to_owned(), req.uri().query().unwrap_or_default().to_owned());
+                let ct = srv::header_str(&req, &http::header::CONTENT_TYPE).unwrap_or_default().to_owned();
+                let body = req.into_body().collect().await.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
+                let subject = format!("sha256:{}", "c".repeat(64));
+                match (method.as_str(), path.as_str()) {
+                    ("HEAD", p) if p == format!("/v2/acme/app/manifests/{subject}") => {
+                        let r = srv::with_header(srv::status(http::StatusCode::OK), http::header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json");
+                        srv::with_header(r, http::header::CONTENT_LENGTH, "1234")
+                    }
+                    ("HEAD", p) if p.starts_with("/v2/acme/app/blobs/") => {
+                        let d = p.trim_start_matches("/v2/acme/app/blobs/");
+                        srv::status(if self.blobs.lock().contains_key(d) { http::StatusCode::OK } else { http::StatusCode::NOT_FOUND })
+                    }
+                    ("POST", "/v2/acme/app/blobs/uploads/") => srv::with_header(srv::status(http::StatusCode::ACCEPTED), http::header::LOCATION, "/v2/acme/app/blobs/uploads/u1"),
+                    ("PUT", "/v2/acme/app/blobs/uploads/u1") => {
+                        let d = query.strip_prefix("digest=").map(|d| d.replace("%3A", ":")).unwrap_or_default();
+                        self.blobs.lock().insert(d, body);
+                        srv::status(http::StatusCode::CREATED)
+                    }
+                    ("GET", p) if p.starts_with("/v2/acme/app/manifests/") => match self.manifests.lock().get(p.trim_start_matches("/v2/acme/app/manifests/")) {
+                        Some((t, b)) => srv::response(http::StatusCode::OK, t, srv::full(b.clone())),
+                        None => srv::status(http::StatusCode::NOT_FOUND),
+                    },
+                    // No referrers API: no `OCI-Subject` in its answer.
+                    ("PUT", p) if p.starts_with("/v2/acme/app/manifests/") => {
+                        self.manifests.lock().insert(p.trim_start_matches("/v2/acme/app/manifests/").to_owned(), (ct, body));
+                        srv::status(http::StatusCode::CREATED)
+                    }
+                    _ => srv::status(http::StatusCode::NOT_FOUND),
+                }
+            }
+        }
+
+        crate::rt::block_on(async {
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let fake = Arc::new(Fake::default());
+            let serving = Arc::clone(&fake);
+            crate::rt::spawn(async move {
+                while let Ok(s) = tcp.accept().await {
+                    let (h, r) = (Arc::clone(&serving), s.peer_addr().ok());
+                    crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(s), h, r));
+                }
+            });
+            let registry = Registry::for_name(&format!("{addr}"), None, true);
+            let subject = format!("sha256:{}", "c".repeat(64));
+            let bundle = br#"{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"}"#;
+            let digest = attach(&registry, "acme/app", &subject, bundle, "https://slsa.dev/provenance/v1").await?;
+            let manifests = fake.manifests.lock().clone();
+            let (ct, body) = manifests.get(&digest).cloned().unwrap_or_default();
+            let m: serde_json::Value = serde_json::from_slice(&body)?;
+            assert_eq!(ct, "application/vnd.oci.image.manifest.v1+json");
+            assert_eq!((m.pointer("/subject/digest"), m.pointer("/subject/size")), (Some(&serde_json::json!(subject)), Some(&serde_json::json!(1234))), "{m}");
+            assert_eq!(m.get("artifactType"), Some(&serde_json::json!("application/vnd.dev.sigstore.bundle.v0.3+json")));
+            let layer = m.pointer("/layers/0/digest").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            assert_eq!(fake.blobs.lock().get(&layer).map(Vec::as_slice), Some(&bundle[..]), "the bundle, as a blob");
+            let tag = subject.replace(':', "-");
+            let index: serde_json::Value = serde_json::from_slice(&manifests.get(&tag).map(|(_, b)| b.clone()).unwrap_or_default())?;
+            assert_eq!(index.pointer("/manifests/0/digest"), Some(&serde_json::json!(digest)), "the referrers tag schema's index: {index}");
+            // Again: the same manifest, listed once.
+            assert_eq!(attach(&registry, "acme/app", &subject, bundle, "https://slsa.dev/provenance/v1").await?, digest);
+            let index: serde_json::Value = serde_json::from_slice(&fake.manifests.lock().get(&tag).map(|(_, b)| b.clone()).unwrap_or_default())?;
+            assert_eq!(index.get("manifests").and_then(serde_json::Value::as_array).map(Vec::len), Some(1));
             Ok(())
         })
     }

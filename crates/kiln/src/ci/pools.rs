@@ -237,3 +237,120 @@ pub fn start_ask(hub: &Hub, pool: &str, executor: &str, kind: &str, image: Optio
     json!({ "op": "start", "executor": executor, "pool": pool, "kind": kind, "image": image, "registry": token.as_ref().map(|_| hub.cfg.server.public_url.clone()), "pull_token": token })
 }
 
+
+/// Tells the dispatcher a pool's executor didn't start, and why.
+fn failed(hub: &Hub, executor: &str, error: String) {
+    let said = crate::runner::pool::Said { executor: executor.to_owned(), state: "failed".into(), error: Some(error) };
+    if let Ok(json) = serde_json::to_string(&said) {
+        hub.ci.send(super::dispatch::Msg::Executor { agent: "kubernetes".into(), json });
+    }
+}
+
+/// What a pod made for a leg holds (docs/ci.md W13-R07), evaluated: the job container's image
+/// (else the pool's) and environment, and the services beside it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LegPod {
+    pub image: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub services: Vec<PodService>,
+}
+
+/// A service, as a pod's native sidecar.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PodService {
+    pub id: String,
+    pub image: String,
+    pub env: Vec<(String, String)>,
+    /// The ports it listens on.
+    pub ports: Vec<u16>,
+}
+
+/// Starts a `k8s` pool's executor: its pod (docs/ci.md W13-R07), made for a leg when `pod` says
+/// what it holds, whose own runner says it's ready by connecting. Why one couldn't start fails the
+/// executor, as a host's failure does.
+pub async fn start_pod(hub: &std::sync::Arc<Hub>, pool: &str, executor: &str, kind: &str, pod: Option<LegPod>) {
+    if kind != "k8s" {
+        return failed(hub, executor, format!("a `{kind}` pool's executors are started by their hosts, not this server"));
+    }
+    let Some(k) = hub.k8s.get().and_then(Option::as_ref).cloned() else {
+        return failed(hub, executor, "this server starts no pods: its `[kubernetes]` isn't enabled".into());
+    };
+    let Some(spec) = specs(hub).await.into_iter().find(|p| p.name == pool) else {
+        return failed(hub, executor, format!("no pool `{pool}`"));
+    };
+    match k.launch_executor(hub, executor, &spec, pod.as_ref()).await {
+        Ok(pod) => tracing::info!(pool = %pool, executor = %executor, pod = %pod, "executor pod started"),
+        Err(e) => failed(hub, executor, format!("{e:#}")),
+    }
+}
+
+/// Stops a `k8s` pool's executor: its pod goes (its runner goes with it).
+pub async fn stop_pod(hub: &Hub, executor: &str, runner: &str) {
+    let Some(k) = hub.k8s.get().and_then(Option::as_ref).cloned() else { return };
+    let mut names: Vec<String> = Vec::new();
+    if !executor.is_empty() {
+        names.push(crate::k8s::executor_pod(executor));
+    }
+    if runner.starts_with("kiln-x-") && !names.iter().any(|n| n == runner) {
+        names.push(runner.to_owned());
+    }
+    for n in names {
+        hub.pod_executors.lock().remove(&n);
+        if let Err(e) = k.delete_pod(&n).await {
+            tracing::debug!(pod = %n, error = %format!("{e:#}"), "an executor pod couldn't be deleted");
+        }
+    }
+}
+
+/// The executors the scheduler has now.
+async fn live_executors(hub: &Hub) -> Option<std::collections::HashSet<String>> {
+    let (tx, rx) = async_channel::bounded(1);
+    hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
+    let pools = rx.recv().await.ok()?;
+    Some(
+        pools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|p| p.get("executors").and_then(Value::as_array).cloned().unwrap_or_default())
+            .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect(),
+    )
+}
+
+/// Every 15 s, the executor pods (docs/ci.md W13-R07): one that ended goes; one that can't start
+/// (its image can't be pulled, its container made) for two minutes goes, its executor failed with
+/// why; one whose executor the scheduler hasn't got (stopped, or from before a restart) goes.
+pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
+    let mut stuck_since: HashMap<String, std::time::Instant> = HashMap::new();
+    loop {
+        if !hub.shutdown.sleep(std::time::Duration::from_secs(15)).await {
+            return Ok(());
+        }
+        let Some(k) = hub.k8s.get().and_then(Option::as_ref).cloned() else { continue };
+        let pods = match k.executor_pods().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "executor pods couldn't be listed");
+                continue;
+            }
+        };
+        let Some(live) = live_executors(&hub).await else { continue };
+        stuck_since.retain(|n, _| pods.iter().any(|p| &p.name == n));
+        for p in pods.into_iter().filter(|p| !p.deleting) {
+            let ended = matches!(p.phase.as_str(), "Succeeded" | "Failed");
+            let orphan = !live.contains(&p.executor);
+            let stuck = p.stuck.as_ref().filter(|_| stuck_since.entry(p.name.clone()).or_insert_with(std::time::Instant::now).elapsed() > std::time::Duration::from_secs(120));
+            if let Some(why) = stuck {
+                tracing::warn!(pod = %p.name, reason = %why, "an executor pod can't start");
+                failed(&hub, &p.executor, format!("pod {}: {why}", p.name));
+            }
+            if ended || orphan || stuck.is_some() {
+                hub.pod_executors.lock().remove(&p.name);
+                if let Err(e) = k.delete_pod(&p.name).await {
+                    tracing::debug!(pod = %p.name, error = %format!("{e:#}"), "an executor pod couldn't be deleted");
+                }
+            }
+        }
+    }
+}

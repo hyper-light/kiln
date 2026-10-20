@@ -59,7 +59,7 @@ const ECOS: &[(Eco, &str)] = &[
 ];
 
 impl Eco {
-    fn purl_type(self) -> &'static str {
+    pub fn purl_type(self) -> &'static str {
         ECOS.iter().find(|(e, _)| *e == self).map_or("generic", |(_, t)| t)
     }
 
@@ -534,6 +534,39 @@ pub fn cyclonedx(doc: &Doc, serial: &str) -> Value {
         "components": components,
         "dependencies": [{ "ref": "root", "dependsOn": pkgs.iter().map(|p| p.purl()).collect::<Vec<_>>() }],
     })
+}
+
+/// How one package changed between two lists (W18-R03's review): versions it lost and gained;
+/// a new package gains only, a gone one loses only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Change {
+    /// Its purl type (`cargo`, `npm`, …).
+    pub ecosystem: String,
+    pub name: String,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+}
+
+/// What changed from `old` to `new`, package by package, in name order: added (no `from`),
+/// removed (no `to`), or changed versions.
+pub fn changes(old: &[Package], new: &[Package]) -> Vec<Change> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let index = |list: &[Package]| -> BTreeMap<(Eco, String), BTreeSet<String>> {
+        let mut m: BTreeMap<(Eco, String), BTreeSet<String>> = BTreeMap::new();
+        for p in list {
+            m.entry((p.eco, p.name.clone())).or_default().insert(p.version.clone());
+        }
+        m
+    };
+    let (before, after) = (index(old), index(new));
+    let keys: BTreeSet<&(Eco, String)> = before.keys().chain(after.keys()).collect();
+    let none = BTreeSet::new();
+    keys.into_iter()
+        .filter_map(|k| {
+            let (b, a) = (before.get(k).unwrap_or(&none), after.get(k).unwrap_or(&none));
+            (b != a).then(|| Change { ecosystem: k.0.purl_type().to_owned(), name: k.1.clone(), from: b.difference(a).cloned().collect(), to: a.difference(b).cloned().collect() })
+        })
+        .collect()
 }
 
 #[cfg(test)]

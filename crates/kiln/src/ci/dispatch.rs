@@ -188,6 +188,34 @@ async fn log_hits(hub: &Hub, leg: &str, patterns: &[String]) -> Vec<String> {
     hits
 }
 
+/// The steps that need Docker where they run (W07-R06): `docker://` images and Docker actions,
+/// as they name them.
+fn docker_steps(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTreeMap<String, wire::ActionRef>, out: &mut Vec<String>) {
+    for s in steps {
+        if let Some(u) = s.uses.as_deref().filter(|u| (u.starts_with("docker://") || actions.get(*u).is_some_and(|a| a.docker)) && !out.iter().any(|x| x == u)) {
+            out.push(u.to_owned());
+        }
+        docker_steps(&s.parallel, actions, out);
+    }
+}
+
+/// KCI4032 (W13-R07): a leg with Docker steps whose pool runs it in a `k8s` pod with no Docker
+/// sidecar fails as it's queued, saying where they run, rather than when the step comes.
+fn dockerless_pod(sched: &Scheduler, r: &RunSt, spec: &LegSpec, route: &LegRoute) -> Option<String> {
+    let pool = sched.pool_for(route).filter(|p| p.executor == "k8s" && !p.docker)?;
+    let mut steps = Vec::new();
+    docker_steps(spec.def().map(|j| j.steps.as_slice()).unwrap_or_default(), &r.actions, &mut steps);
+    let named: Vec<String> = steps.iter().map(|u| format!("`{u}`")).collect();
+    (!named.is_empty()).then(|| {
+        format!(
+            "KCI4032: {} {} Docker, and pool `{}` runs this job in Kubernetes pods without it. Docker actions run on the `host` executor where there's Docker, on the `docker` executor, or in a `k8s` pool's pods when the pool has a Docker sidecar (`docker` in its `[[ci.pools]]`).",
+            named.join(", "),
+            if named.len() == 1 { "needs" } else { "need" },
+            pool.name
+        )
+    })
+}
+
 /// `KCI4031` (W07-R11): the scopes a kiln action in `steps` needs that `granted` gives less of.
 fn short_permissions(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTreeMap<String, wire::ActionRef>, granted: &kiln_ci::plan::perms::Resolved) -> Option<String> {
     let mut lines = Vec::new();
@@ -227,10 +255,14 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
     let job = spec.def();
     // Untrusted code runs only where `ci.untrusted` lets it (W18-R07).
     let mut route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, cfg.local, (!r.trusted).then(|| cfg.untrusted.route()));
-    // What kiln actions' steps need of the runner (W07-R11).
+    // What kiln actions' steps need of the runner (W07-R11), and Docker for Docker actions
+    // (W07-R06).
     for step in job.map(|j| j.steps.as_slice()).unwrap_or_default() {
         if let Some(a) = step.uses.as_deref().and_then(|u| r.actions.get(u)) {
             route.requires.extend(a.requires.iter().filter(|q| !route.requires.contains(q)).cloned().collect::<Vec<_>>());
+            if a.docker {
+                route.caps |= u64::from(CAP_DOCKER);
+            }
         }
     }
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
@@ -245,6 +277,8 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         group,
         retry,
         cost: r.costs.get(&spec.job).copied(),
+        // On a `k8s` pool, a pod of its own, its containers in it (W13-R07).
+        own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty()),
         ..LegIn::default()
     }
 }
@@ -579,6 +613,8 @@ struct Dispatch {
     next: Vec<Command>,
     /// The command loop is running: commands made inside it wait in `next` for their turn.
     in_commands: bool,
+    /// The `k8s` pools' executors this server started as pods (W13-R07).
+    pods: std::collections::HashSet<String>,
 }
 
 fn now_ms() -> i64 {
@@ -633,7 +669,18 @@ pub fn spawn(hub: Arc<Hub>) {
         let rules = sources.effective();
         let mut cfg = sched_config(&hub, rules);
         (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(cfg), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(), in_commands: false };
+        let mut d = Dispatch {
+            hub: Arc::clone(&hub),
+            sched: Scheduler::new(cfg),
+            routing: sources,
+            held: HashMap::new(),
+            runs: HashMap::new(),
+            legs: HashMap::new(),
+            timers: BTreeSet::new(),
+            next: Vec::new(),
+            in_commands: false,
+            pods: std::collections::HashSet::new(),
+        };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -809,9 +856,19 @@ impl Dispatch {
         RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
     }
 
+    /// The `k8s` pool's executor a runner is (W13-R07): its pod's, by the name it enrolled
+    /// with; `Some("")` for another ephemeral runner (a v1 job's pod, or an executor's from
+    /// before a restart), which takes no leg of the engine's.
+    fn hosted_executor(&self, agent: &str, ephemeral: bool) -> Option<String> {
+        match self.hub.pod_executors.lock().get(agent) {
+            Some(e) => Some(e.clone()),
+            None => ephemeral.then(String::new),
+        }
+    }
+
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: None };
+        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: None, executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         self.commands(cmds).await;
     }
@@ -829,7 +886,7 @@ impl Dispatch {
             self.hub.send_to_agent(agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await;
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
-        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: None };
+        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: None, executor: self.hosted_executor(agent, a.ephemeral) };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         for (leg, attempt) in gone {
             let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some("the runner lost it".into()), peak_rss: None, cpu_seconds: None };
@@ -1147,7 +1204,7 @@ impl Dispatch {
                     let existing = self.runs.get(run).and_then(|r| r.keys.get(&leg.key).cloned());
                     match existing {
                         Some(id) => {
-                            runs::finish_leg(&self.hub, &id, status_of(conclusion), conclusion.result(), None, Some(reason)).await?;
+                            runs::finish_leg(&self.hub, &id, status_of(conclusion), conclusion.as_str(), None, Some(reason)).await?;
                             self.hub.emit_job(&id).await;
                         }
                         None => {
@@ -1445,8 +1502,13 @@ impl Dispatch {
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
         let leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci);
+        let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
         self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0 });
         self.hub.emit_job(&id).await;
+        if let Some(m) = dockerless {
+            runs::annotation(&self.hub, &id, None, "error", Some("executor".into()), &m, None, None, None, None, None).await?;
+            return Box::pin(self.settled(&id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await;
+        }
         // A leg bound to an environment starts when its protection lets it (W15-R04).
         if let Some(env) = self.legs.get(&id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
             self.held.insert(id.clone(), Held { leg, env, ready_at: crate::util::now_unix(), announced: false });
@@ -1511,7 +1573,32 @@ impl Dispatch {
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
                 Command::Assign { leg, runner, attempt, executor, image, docker, slot } => self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await,
-                Command::StartExecutor { pool, executor, runner, kind, image } => {
+                // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
+                // its containers in it when it has them.
+                Command::StartExecutor { pool, executor, runner, kind, leg, .. } if runner.is_empty() => {
+                    match leg.as_deref().map(|l| (l.to_owned(), self.leg_pod(l))) {
+                        // Its containers can't be said: the leg fails, saying why, and the executor
+                        // made for it goes.
+                        Some((l, Err(why))) => {
+                            let attempt = self.legs.get(&l).map_or(1, |x| x.attempt);
+                            self.next.extend(self.sched.handle(Input::ExecutorFailed { executor: executor.clone(), error: why.clone() }, now_ms()));
+                            self.fail_unstarted(&l, attempt, "k8s", why).await
+                        }
+                        made => {
+                            let pod = made.and_then(|(_, p)| p.ok());
+                            self.pods.insert(executor.clone());
+                            let hub = Arc::clone(&self.hub);
+                            crate::rt::spawn(async move { super::pools::start_pod(&hub, &pool, &executor, &kind, pod).await });
+                            Ok(())
+                        }
+                    }
+                }
+                Command::StopExecutor { executor, runner } if self.pods.remove(&executor) || runner.starts_with("kiln-x-") => {
+                    let hub = Arc::clone(&self.hub);
+                    crate::rt::spawn(async move { super::pools::stop_pod(&hub, &executor, &runner).await });
+                    Ok(())
+                }
+                Command::StartExecutor { pool, executor, runner, kind, image, .. } => {
                     let ask = super::pools::start_ask(&self.hub, &pool, &executor, &kind, image.as_deref());
                     self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
                     Ok(())
@@ -1560,6 +1647,67 @@ impl Dispatch {
             }
         }
         self.in_commands = false;
+    }
+
+    /// What a `k8s` pod made for a leg holds (W13-R07): its `container:` as the job container, its
+    /// `services:` beside it, their keys evaluated as the runner evaluates a job container's (with
+    /// the run's `github`, `vars`, `needs`, `strategy`, `matrix` and `inputs`). Why not, when one of
+    /// them can't be: an expression that fails, or `credentials` (a pod pulls with its namespace's
+    /// image pull secrets).
+    fn leg_pod(&self, leg: &str) -> Result<super::pools::LegPod, String> {
+        use kiln_ci::expr::{self, Budget, MapContexts, Template, Value};
+        use kiln_ci::wf::validate::{Site, options};
+        let l = self.legs.get(leg).ok_or("the leg is gone")?;
+        let r = self.runs.get(&l.run).ok_or("its run is gone")?;
+        let job = l.spec.def().ok_or("its job is gone")?;
+        let dialect = l.spec.workflow.dialect.unwrap_or(expr::Dialect::Gha);
+        let cx = MapContexts::default()
+            .with("github", Value::from_json(&r.github))
+            .with("vars", Value::from_json(&r.vars))
+            .with("needs", Value::from_json(&l.spec.needs))
+            .with("strategy", Value::from_json(&l.spec.strategy))
+            .with("matrix", Value::from_json(&l.spec.matrix))
+            .with("inputs", Value::from_json(&l.spec.inputs));
+        let render = |t: &kiln_ci::wf::ir::Tpl, site: Site, what: &str| -> Result<String, String> {
+            let tpl = Template::parse_with(&t.src, &options(site, dialect)).map_err(|e| format!("{what}: {}", e.message))?;
+            expr::render(&tpl, &cx, &mut Budget::default()).map_err(|e| format!("{what}: {}", e.message))
+        };
+        // `6379`, `8080:80`, `80/tcp`: the port the container listens on (on the pod's
+        // `localhost`, where the job container reaches it).
+        let ports = |c: &kiln_ci::wf::ir::Container| -> Result<Vec<u16>, String> {
+            let mut out = Vec::new();
+            for p in &c.ports {
+                let text = match p {
+                    kiln_ci::wf::ir::YVal::Num(n) => format!("{n}"),
+                    kiln_ci::wf::ir::YVal::Str(t) => render(t, Site::JobServices, "ports")?,
+                    other => return Err(format!("ports: `{}` isn't a port", serde_json::to_string(other).unwrap_or_default())),
+                };
+                let port = text.rsplit(':').next().and_then(|x| x.split('/').next()).and_then(|x| x.trim().parse::<u16>().ok()).ok_or_else(|| format!("ports: `{text}` isn't a port"))?;
+                out.push(port);
+            }
+            Ok(out)
+        };
+        let one = |c: &kiln_ci::wf::ir::Container, site: Site, env_site: Site, what: &str| -> Result<(String, Vec<(String, String)>), String> {
+            if c.credentials.is_some() {
+                return Err(format!("{what}: `credentials` aren't how a k8s pool's pod pulls: give its namespace's service account an image pull secret instead"));
+            }
+            let image = render(&c.image, site, &format!("{what}.image"))?;
+            let env = c.env.iter().map(|(k, v)| render(v, env_site, &format!("{what}.env.{k}")).map(|v| (k.clone(), v))).collect::<Result<Vec<_>, _>>()?;
+            Ok((image, env))
+        };
+        let (image, env) = match &job.container {
+            Some(c) => {
+                let (i, e) = one(c, Site::JobContainer, Site::JobContainerEnv, "container")?;
+                (Some(i), e)
+            }
+            None => (None, Vec::new()),
+        };
+        let mut services = Vec::new();
+        for (id, c) in &job.services {
+            let (image, env) = one(c, Site::JobServices, Site::JobServiceEnv, &format!("services.{id}"))?;
+            services.push(super::pools::PodService { id: id.clone(), image, env, ports: ports(c)? });
+        }
+        Ok(super::pools::LegPod { image, env, services })
     }
 
     /// Sends a leg to its runner (W05, W06).
@@ -1656,7 +1804,10 @@ impl Dispatch {
         if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
             tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
         }
-        runs::claim(&self.hub, leg, runner, executor.as_deref().unwrap_or("host"), attempt).await?;
+        // In a `k8s` pool's pod it runs in the pod's own container (W13-R07): a terminal into it is
+        // an exec into the pod, not a shell on a machine (W17-R01).
+        let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
+        runs::claim(&self.hub, leg, runner, recorded, attempt).await?;
         // The run's first leg to start: `workflow_run` `in_progress`.
         if let Some(run) = self.legs.get(leg).map(|l| l.run.clone()) {
             let first = self.runs.get_mut(&run).is_some_and(|r| !std::mem::replace(&mut r.in_progress, true));
@@ -2095,7 +2246,8 @@ impl Dispatch {
                 crate::rt::spawn(super::notify::deployed(Arc::clone(&self.hub), l.run.clone(), env, c == PlanC::Success));
             }
         }
-        runs::finish_leg(&self.hub, leg, status_of(c), c.result(), outputs, reason).await?;
+        // A timeout stays `timed_out` on the leg (W06-R12); its dependants see a failure.
+        runs::finish_leg(&self.hub, leg, status_of(c), c.as_str(), outputs, reason).await?;
         self.hub.emit_job(leg).await;
         let report = LegReport { conclusion: Some(c), ..l.report };
         // W08-R10: a success of a job that opted in is kept for the legs with its inputs.

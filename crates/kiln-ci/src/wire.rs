@@ -217,11 +217,16 @@ pub struct ActionRef {
     /// up job", and the run's other jobs go on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A Docker container action (`runs.using: docker`), or a composite one with one beneath it:
+    /// where a leg uses it there must be Docker (W07-R06, W13-R07).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub docker: bool,
 }
 
 impl ActionRef {
     /// Its declarations, from its metadata.
     pub fn declares(&mut self, a: &crate::wf::ir::Action) {
+        self.docker = a.runs.using.eq_ignore_ascii_case("docker");
         self.secrets = a.secrets.iter().map(|d| (d.name.to_ascii_uppercase(), d.required)).collect();
         self.requires = a.requires.clone();
         self.permissions = match &a.permissions {

@@ -411,6 +411,9 @@ struct State {
     server_url: String,
     /// The leg's containers (W13-R08): its network, services and job container.
     containers: Option<super::docker::Containers>,
+    /// In a `k8s` pod made for the leg (W13-R07): its services, the pod's sidecars, as
+    /// `job.services` says them.
+    pod_services: Option<serde_json::Value>,
     /// The problem matchers steps added (W06-R06).
     matchers: matchers::Job,
     /// A background step's own stop (`cancel:`, W06-R17).
@@ -572,6 +575,8 @@ impl State {
             let (container, services) = c.contexts();
             job.push(("container".to_owned(), Value::from_json(&container)));
             job.push(("services".to_owned(), Value::from_json(&services)));
+        } else if let Some(services) = &self.pod_services {
+            job.push(("services".to_owned(), Value::from_json(services)));
         }
         values.push(("job", Value::object(job)));
         let steps = Value::object(self.steps.iter().filter_map(|d| {
@@ -1151,6 +1156,7 @@ impl Leg {
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
             containers: None,
+            pod_services: None,
             matchers: matchers::Job::default(),
             stop: None,
             masks_added: Vec::new(),
@@ -1239,20 +1245,27 @@ impl Leg {
         self.pre_steps(&mut st, deadline).await;
         let turns = async_lock::Semaphore::new(MAX_BACKGROUND);
         let mut bg = Background::new(&turns);
+        // Once the leg is cancelled, the steps whose `if` holds under cancellation (`always()`,
+        // `cancelled()`) run to their end, not cut short by the cancel they follow, bounded as the
+        // post steps are (W05-R18).
+        let mut after_cancel: Option<Instant> = None;
         for (idx, step) in a.steps.iter().enumerate() {
             let idx = u32::try_from(idx).unwrap_or(u32::MAX);
             if self.cancel.is_cancelled() {
                 st.cancelled = true;
+                after_cancel.get_or_insert_with(|| Instant::now() + CLEANUP_TIME);
+                st.cleanup = true;
             }
+            let bound = after_cancel.map_or(deadline, |c| c.min(deadline));
             if step.is_control() {
-                self.control(&mut st, &mut bg, idx, step, deadline).await;
+                self.control(&mut st, &mut bg, idx, step, bound).await;
                 continue;
             }
-            if self.background(&mut st, &mut bg, idx, idx, step, deadline) {
+            if self.background(&mut st, &mut bg, idx, idx, step, bound) {
                 bg.kick();
                 continue;
             }
-            let end = bg.drive(self.step(&mut st, idx, step, deadline, false)).await;
+            let end = bg.drive(self.step(&mut st, idx, step, bound, false)).await;
             if end == Some(End::TimedOut) && Instant::now() >= deadline {
                 timed_out = true;
                 st.failed = true;
@@ -1920,7 +1933,45 @@ impl Leg {
         ])
     }
 
+    /// In a `k8s` pod made for the leg (W13-R07), its containers are the pod's: this runner runs in
+    /// the job container, and the services are sidecars on the pod's `localhost`, awaited on their
+    /// ports. Nothing is started.
+    async fn pod_containers(&self, st: &mut State, idx: u32) -> anyhow::Result<()> {
+        let services: BTreeMap<String, Vec<u16>> = std::env::var("KILN_POD_SERVICES").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        self.note(idx, "The job's container is this pod's, and its services are the pod's own.").await;
+        let deadline = Instant::now() + Duration::from_secs(600);
+        for (id, ports) in &services {
+            for port in ports.iter().copied() {
+                self.note(idx, &format!("Waiting for {id} on port {port}")).await;
+                loop {
+                    let listening =
+                        crate::rt::blocking(move || std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(1)).is_ok()).await.unwrap_or(false);
+                    if listening {
+                        break;
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "the service {id} never listened on port {port}");
+                    crate::rt::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+        // `job.services.<id>.ports`: each port as itself, on the pod's `localhost`.
+        let view = services
+            .iter()
+            .map(|(id, ports)| {
+                (
+                    id.clone(),
+                    serde_json::json!({ "id": id, "network": "", "ports": ports.iter().map(|p| (p.to_string(), serde_json::Value::String(p.to_string()))).collect::<serde_json::Map<_, _>>() }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        st.pod_services = Some(serde_json::Value::Object(view));
+        Ok(())
+    }
+
     async fn try_init_containers(&self, st: &mut State, idx: u32) -> anyhow::Result<()> {
+        if std::env::var_os("KILN_POD_CONTAINERS").is_some() {
+            return self.pod_containers(st, idx).await;
+        }
         let a = &self.a;
         // Its pool's executor, started before the leg came (W13-R09): the leg runs in it as it is.
         let warm = self.warm.lock().take();
@@ -2071,6 +2122,7 @@ impl Leg {
         for (k, v) in self.env_vars(st) {
             env.entry(k).or_insert(v);
         }
+        gh_env(&mut env, &self.a.runtime.github_token, &self.a.runtime.facade_url);
         for (k, p) in &files {
             env.insert((*k).to_owned(), p.to_string_lossy().to_string());
         }
@@ -2645,6 +2697,90 @@ fn load_action(dir: &Path) -> anyhow::Result<kiln_ci::wf::Action> {
     a.ok_or_else(|| anyhow::anyhow!("{} is not an action's metadata", file.display()))
 }
 
+/// `GH_HOST` and `GH_ENTERPRISE_TOKEN` for a step that gives `gh` the job's own token
+/// (`GH_TOKEN: ${{ github.token }}`, or `GITHUB_TOKEN`) when the facade is the run's GitHub
+/// (docs/ci.md W14-R11): `gh` takes an Enterprise Server's host and token from them, and would
+/// take the token to github.com without them. Another token is left for github.com; a step's own
+/// `GH_HOST` or `GH_ENTERPRISE_TOKEN` wins.
+fn gh_env(env: &mut BTreeMap<String, String>, token: &str, server: &str) {
+    let host = server.split_once("://").map_or(server, |(_, h)| h).trim_end_matches('/');
+    if token.is_empty() || host.is_empty() || host.eq_ignore_ascii_case("github.com") || env.contains_key("GH_HOST") || env.contains_key("GH_ENTERPRISE_TOKEN") {
+        return;
+    }
+    if ["GH_TOKEN", "GITHUB_TOKEN"].iter().any(|k| env.get(*k).is_some_and(|v| v == token)) {
+        env.insert("GH_HOST".into(), host.to_owned());
+        env.insert("GH_ENTERPRISE_TOKEN".into(), token.to_owned());
+    }
+}
+
+/// The SHA-256 and name of the first file a `SHASUMS256.txt` lists that `want` takes.
+fn listed(sums: &str, want: impl Fn(&str) -> bool) -> Option<(String, String)> {
+    sums.lines().filter_map(|l| l.split_once("  ")).map(|(h, f)| (h.trim().to_owned(), f.trim().to_owned())).find(|(_, f)| want(f))
+}
+
+/// Whether this machine's C library is musl (Alpine's): its dynamic loader is.
+fn host_musl() -> bool {
+    static MUSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MUSL.get_or_init(|| cfg!(target_os = "linux") && std::fs::read_dir("/lib").is_ok_and(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("ld-musl-"))))
+}
+
+/// Whether a step's C library is musl: its job container's, else this machine's.
+fn musl_here(st: &State) -> bool {
+    st.containers.as_ref().and_then(|c| c.job.as_ref()).map_or_else(host_musl, |j| j.musl)
+}
+
+/// `vA.B.C` as numbers, to find the newest.
+fn version_of(tag: &str) -> Option<(u32, u32, u32)> {
+    let mut n = tag.strip_prefix('v')?.splitn(3, '.').map(|x| x.parse::<u32>().ok());
+    Some((n.next()??, n.next()??, n.next()??))
+}
+
+/// Where Node `major` is for musl, as (URL, file, SHA-256), newest first:
+/// - on x86-64, GitHub's own (`actions/alpine_nodejs`, its runner's `node20_alpine`), which needs
+///   nothing but musl, checked against the digest its release lists;
+/// - on arm64, which GitHub has none for, the Node project's unofficial builds, checked against
+///   their `SHASUMS256.txt`; these need the image's `libstdc++` (Alpine's `apk add libstdc++`).
+async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -> anyhow::Result<(String, String, String)> {
+    if arch == "x64" {
+        let list = "https://api.github.com/repos/actions/alpine_nodejs/releases?per_page=100";
+        let resp = http.get(list).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(60)).send().await?;
+        anyhow::ensure!(resp.is_success(), "GitHub's list of its musl Node builds (actions/alpine_nodejs): HTTP {}", resp.status());
+        let releases: serde_json::Value = resp.json(8 << 20).await?;
+        let best = releases
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let tag = r.get("tag_name").and_then(serde_json::Value::as_str)?;
+                let v = version_of(tag).filter(|v| v.0 == major)?;
+                let file = format!("node-{tag}-alpine-x64.tar.gz");
+                let a = r.get("assets").and_then(serde_json::Value::as_array)?.iter().find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(file.as_str()))?;
+                let sha = a.get("digest").and_then(serde_json::Value::as_str)?.strip_prefix("sha256:")?.to_owned();
+                let url = a.get("browser_download_url").and_then(serde_json::Value::as_str)?.to_owned();
+                Some((v, (url, file, sha)))
+            })
+            .max_by_key(|(v, _)| *v);
+        return best.map(|(_, b)| b).ok_or_else(|| anyhow::anyhow!("GitHub has no musl build of Node {major} with a digest (actions/alpine_nodejs)"));
+    }
+    let base = "https://unofficial-builds.nodejs.org/download/release";
+    let index: serde_json::Value = http.get(&format!("{base}/index.json")).timeout(Duration::from_secs(60)).send().await?.json(16 << 20).await?;
+    let kind = format!("linux-{arch}-musl");
+    let version = index
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("files").and_then(serde_json::Value::as_array).is_some_and(|f| f.iter().any(|x| x.as_str() == Some(kind.as_str()))))
+        .filter_map(|r| r.get("version").and_then(serde_json::Value::as_str))
+        .filter_map(|t| version_of(t).filter(|v| v.0 == major).map(|v| (v, t.to_owned())))
+        .max()
+        .map(|(_, t)| t)
+        .ok_or_else(|| anyhow::anyhow!("the Node project has no {kind} build of Node {major}"))?;
+    let sums = http.get(&format!("{base}/{version}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
+    let file = format!("node-{version}-{kind}.tar.gz");
+    let (sha, file) = listed(&String::from_utf8_lossy(&sums), |f| f == file).ok_or_else(|| anyhow::anyhow!("{base}/{version}/SHASUMS256.txt doesn't list {file}"))?;
+    Ok((format!("{base}/{version}/{file}"), file, sha))
+}
+
 /// One Node runtime download at a time (they share `<work>/_externals`).
 static NODE_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 static ACTION_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
@@ -2712,10 +2848,12 @@ impl Leg {
 
     /// A Node runtime for `using` (W07-R05): `node24` on Node 24; `node20`, `node16` and
     /// `node12` on Node 20, as GitHub forces. Official builds from nodejs.org, checked against
-    /// their `SHASUMS256.txt`, kept in `<work>/_externals`.
-    async fn node(&self, using: &str) -> anyhow::Result<PathBuf> {
+    /// their `SHASUMS256.txt`, kept in `<work>/_externals`. Where the C library is musl (an Alpine
+    /// job container, or an Alpine machine), musl builds, kept as GitHub's runner keeps them
+    /// (`node20_alpine`): see [`musl_node`].
+    async fn node(&self, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
         let major = if using == "node24" { 24 } else { 20 };
-        let dir = self.work_dir.join("_externals").join(format!("node{major}"));
+        let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });
         let bin = if cfg!(windows) { dir.join("node.exe") } else { dir.join("bin").join("node") };
         if bin.exists() {
             return Ok(bin);
@@ -2724,38 +2862,39 @@ impl Leg {
         if bin.exists() {
             return Ok(bin);
         }
-        let os = match std::env::consts::OS {
-            "linux" => "linux",
-            "macos" => "darwin",
-            other => anyhow::bail!("no Node {major} build for {other} here yet"),
-        };
         let arch = match std::env::consts::ARCH {
             "x86_64" => "x64",
             "aarch64" => "arm64",
             "arm" => "armv7l",
             other => anyhow::bail!("no Node {major} build for {other}"),
         };
-        let base = format!("https://nodejs.org/dist/latest-v{major}.x");
-        let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
-        let sums = String::from_utf8_lossy(&sums).to_string();
-        let suffix = format!("-{os}-{arch}.tar.gz");
-        let (sha, file) = sums
-            .lines()
-            .filter_map(|l| l.split_once("  "))
-            .find(|(_, f)| f.starts_with("node-v") && f.ends_with(&suffix))
-            .map(|(h, f)| (h.trim().to_owned(), f.trim().to_owned()))
-            .ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
-        let mut resp = self.http.get(&format!("{base}/{file}")).timeout(Duration::from_secs(600)).send().await?;
+        let (url, file, sha) = if musl {
+            musl_node(&self.http, major, arch).await?
+        } else {
+            let os = match std::env::consts::OS {
+                "linux" => "linux",
+                "macos" => "darwin",
+                other => anyhow::bail!("no Node {major} build for {other} here yet"),
+            };
+            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
+            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
+            let suffix = format!("-{os}-{arch}.tar.gz");
+            let (sha, file) =
+                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
+            (format!("{base}/{file}"), file, sha)
+        };
+        let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
         anyhow::ensure!(resp.is_success(), "downloading {file}: HTTP {}", resp.status());
         let mut bytes = Vec::new();
         while let Some(c) = resp.chunk().await? {
             bytes.extend_from_slice(&c);
+            anyhow::ensure!(bytes.len() < 1 << 30, "{file} is over 1 GiB");
         }
         let got = {
             use sha2::Digest as _;
             hex::encode(sha2::Sha256::digest(&bytes))
         };
-        anyhow::ensure!(got == sha, "{file}: SHA-256 {got}, SHASUMS256.txt says {sha}");
+        anyhow::ensure!(got == sha, "{file}: SHA-256 {got}, where it's listed as {sha}");
         let d = dir.clone();
         crate::rt::blocking(move || -> anyhow::Result<()> {
             let tmp = d.with_extension("partial");
@@ -2765,9 +2904,12 @@ impl Leg {
             for entry in ar.entries()? {
                 let mut entry = entry?;
                 let path = entry.path()?.into_owned();
-                // Strip `node-vX.Y.Z-os-arch/`.
-                let rest: PathBuf = path.components().skip(1).collect();
-                if rest.as_os_str().is_empty() {
+                // Strip `node-vX.Y.Z-os-arch/` (GitHub's musl builds have no such folder).
+                let rest: PathBuf = match path.components().next() {
+                    Some(std::path::Component::Normal(top)) if top.to_string_lossy().starts_with("node-v") => path.components().skip(1).collect(),
+                    _ => path.clone(),
+                };
+                if rest.as_os_str().is_empty() || rest.components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
                     continue;
                 }
                 entry.unpack(tmp.join(rest))?;
@@ -2777,6 +2919,7 @@ impl Leg {
             Ok(())
         })
         .await??;
+        anyhow::ensure!(bin.exists(), "{file} has no {}", bin.strip_prefix(&dir).unwrap_or(&bin).display());
         Ok(bin)
     }
 
@@ -2811,6 +2954,12 @@ impl Leg {
     async fn cli(&self, st: &State) -> anyhow::Result<super::docker::Cli> {
         if let Some(c) = &st.containers {
             return Ok(c.cli.clone());
+        }
+        // A `k8s` pool's pod has Docker only in the sidecar its pool opts into (W13-R07).
+        if std::env::var_os("KILN_POD").is_some() && std::env::var_os("KILN_POD_DOCKER").is_none() {
+            anyhow::bail!(
+                "KCI4032: Docker actions don't run in this `k8s` pool's pods, which have no Docker sidecar: run this job where there's Docker (the `host` executor with Docker, or `docker`), or give the pool one (`docker` in its `[[ci.pools]]`)"
+            );
         }
         let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("Docker actions need Docker or Podman, and this runner has neither working"))?;
         let config = st.layout.temp.join("_docker_config");
@@ -3545,7 +3694,7 @@ impl Leg {
         aenv.extend(runs_env(st, action, &inputs));
         match action.runs.using.as_str() {
             "node12" | "node16" | "node20" | "node24" => {
-                let node = self.node(&action.runs.using).await?;
+                let node = self.node(&action.runs.using, musl_here(st)).await?;
                 let main = action.runs.main.as_deref().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.main`"))?;
                 let script = loc.dir.join(main);
                 let (dir, scripts) = (loc.dir.clone(), [Some(main.to_owned()), action.runs.post.clone()].into_iter().flatten().collect::<Vec<_>>());
@@ -3710,7 +3859,7 @@ impl Leg {
                 if crate::rt::blocking(move || refuses_ghes(&dir, &[script.as_str()])).await.unwrap_or(false) {
                     env.insert("GITHUB_SERVER_URL".into(), NOT_GHES.into());
                 }
-                match self.node(&action.runs.using).await {
+                match self.node(&action.runs.using, musl_here(st)).await {
                     Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &ws, env, deadline).await,
                     Err(e) => Err(e),
                 }
@@ -3824,6 +3973,24 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w14_r11_gh_gets_the_facade_for_the_job_s_token() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> { pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect() };
+        let mut e = env(&[("GH_TOKEN", "job-token")]);
+        gh_env(&mut e, "job-token", "https://kiln.example:8443/");
+        assert_eq!((e.get("GH_HOST").map(String::as_str), e.get("GH_ENTERPRISE_TOKEN").map(String::as_str)), (Some("kiln.example:8443"), Some("job-token")));
+        // Another token is for github.com; github.com itself, and a step's own say, are left alone.
+        for (pairs, server) in [
+            (&[("GH_TOKEN", "a-pat")][..], "https://kiln.example"),
+            (&[("GH_TOKEN", "job-token")][..], "https://github.com"),
+            (&[("GITHUB_TOKEN", "job-token"), ("GH_HOST", "github.com")][..], "https://kiln.example"),
+        ] {
+            let mut e = env(pairs);
+            gh_env(&mut e, "job-token", server);
+            assert!(!e.contains_key("GH_ENTERPRISE_TOKEN"), "{pairs:?} {server}");
+        }
+    }
 
     /// W22-AC07: a hostile tarball can't write outside the workspace, through `..`, a link to a
     /// directory outside, or a link where a file goes.

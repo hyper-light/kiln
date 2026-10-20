@@ -137,6 +137,15 @@ pub struct Ci {
     /// max_blob = 21474836480             # bytes a blob may have (20 GiB)
     /// ```
     pub registry: Registry,
+    /// `[ci.advisories]`: the advisory database the dependency graph's compare looks up the
+    /// packages a change adds in (docs/ci.md W14-R11, for `actions/dependency-review-action`). None
+    /// by default: the changes are listed without vulnerabilities, and the answer says so.
+    ///
+    /// ```toml
+    /// [ci.advisories]
+    /// osv = "https://api.osv.dev"   # OSV's API (it carries GitHub's advisories), sent those packages' purls
+    /// ```
+    pub advisories: Advisories,
     /// `[ci.attest]`: how kiln signs attestations (docs/ci.md W18-R02).
     ///
     /// ```toml
@@ -159,6 +168,14 @@ pub struct Ci {
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// `[ci.advisories]`'s settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Advisories {
+    /// OSV's API (`https://api.osv.dev`, or a mirror of it).
+    pub osv: Option<String>,
 }
 
 /// The GitHub App's settings.

@@ -159,11 +159,20 @@ impl Sim {
                     let t = self.now + self.executor_start_ms;
                     if self.failing_hosts.contains(&runner) {
                         self.input(t, Input::ExecutorFailed { executor, error: format!("{runner} couldn't start it") });
+                    } else if runner.is_empty() {
+                        // The server's executor (a `k8s` pool's pod): its own runner connects.
+                        self.input(t, Input::RunnerUp(Box::new(RunnerIn { id: format!("pod-{executor}"), slots: 1, executor: Some(executor), ..RunnerIn::default() })));
                     } else {
                         self.input(t, Input::ExecutorReady { executor });
                     }
                 }
-                Command::StopExecutor { executor, .. } => self.executors_stopped.push((self.now, executor)),
+                Command::StopExecutor { executor, runner } => {
+                    self.executors_stopped.push((self.now, executor));
+                    // A pod goes with its runner.
+                    if runner.starts_with("pod-") {
+                        self.input(self.now, Input::RunnerLost { runner });
+                    }
+                }
                 Command::Settled { leg, outcome, .. } => self.settled.push((self.now, leg, outcome)),
                 Command::Wait { leg, reason } => self.waits.push((self.now, leg, reason)),
                 c @ (Command::StartRun { .. } | Command::CancelRun { .. }) => self.runs.push((self.now, c)),

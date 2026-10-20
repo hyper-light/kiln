@@ -9,7 +9,9 @@
 //!     branches, refs, contents, tarballs and zipballs, compare;
 //!   - what jobs record ([`records`]): commit statuses, check runs, releases and their assets,
 //!     dependency snapshots, deployments and their statuses (and the environments they go to);
-//!   - `/user` and `/rate_limit`.
+//!   - the dependency graph's compare ([`deps`]), for `dependency-review-action`;
+//!   - `/user` and `/rate_limit`;
+//!   - GraphQL ([`graphql`]): the queries and mutations `gh` and the actions that ask GraphQL send.
 //! - Anything else answers 501 with `{"message": "not implemented by kiln: …"}`, and the leg gets
 //!   a warning naming the route, so gaps are visible and get filled.
 //!
@@ -30,6 +32,8 @@ use super::{Fail, runs, token};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
 
+pub mod deps;
+pub mod graphql;
 pub mod pulls;
 pub mod records;
 pub mod repos;
@@ -66,7 +70,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
     let origin = blob::origin(&req);
     // What the job's `permissions` must grant for the route (W10-R04), GitHub's mapping.
     let need = match (&method, rest) {
-        (&Method::GET, ["repos", _, _, "commits", _, "statuses" | "status"]) => Some(("statuses", Level::Read)),
+        (&Method::GET, ["repos", _, _, "commits", _, "statuses" | "status"] | ["repos", _, _, "statuses", _]) => Some(("statuses", Level::Read)),
         (&Method::POST, ["repos", _, _, "statuses", _]) => Some(("statuses", Level::Write)),
         (&Method::GET, ["repos", _, _, "commits", _, "check-runs"] | ["repos", _, _, "check-runs", ..]) => Some(("checks", Level::Read)),
         (&Method::POST | &Method::PATCH, ["repos", _, _, "check-runs", ..]) => Some(("checks", Level::Write)),
@@ -76,6 +80,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::DELETE, ["repos", _, _, "actions", ..]) | (&Method::POST, ["repos", _, _, "actions", "workflows", ..]) => Some(("actions", Level::Write)),
         (&Method::POST, ["repos", _, _, "dispatches"]) => Some(("contents", Level::Write)),
         (&Method::POST, ["repos", _, _, "dependency-graph", "snapshots"]) => Some(("contents", Level::Write)),
+        (&Method::GET, ["repos", _, _, "dependency-graph", ..]) => Some(("contents", Level::Read)),
         (&Method::GET, ["repos", _, _, "deployments" | "environments", ..]) => Some(("deployments", Level::Read)),
         (&Method::POST, ["repos", _, _, "deployments", ..]) => Some(("deployments", Level::Write)),
         (&Method::GET, ["repos", _, _, "attestations", ..]) => Some(("attestations", Level::Read)),
@@ -107,6 +112,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::GET, ["branches", b @ ..]) if !b.is_empty() => Ok(repos::branch(&s, &b.join("/")).await),
             (&Method::GET, ["git", "ref", r @ ..]) => Ok(repos::git_refs(&s, &r.join("/"), true).await),
             (&Method::GET, ["git", "matching-refs", r @ ..]) => Ok(repos::git_refs(&s, &r.join("/"), false).await),
+            (&Method::GET, ["git", "refs", r @ ..]) => Ok(repos::git_refs_older(&s, &r.join("/")).await),
+            (&Method::GET, ["statuses", r]) => records::statuses(&s, r, false).await,
             (&Method::GET, ["contents", path @ ..]) => Ok(repos::contents(&s, &path.join("/"), q.get("ref").map(String::as_str), raw).await),
             (&Method::GET, ["tarball", r @ ..]) => repos::archive(&s, &r.join("/"), false).await,
             (&Method::GET, ["zipball", r @ ..]) => repos::archive(&s, &r.join("/"), true).await,
@@ -123,6 +130,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::DELETE, ["releases", "assets", id]) => records::delete(&s, true, id).await,
             (&Method::DELETE, ["releases", id]) => records::delete(&s, false, id).await,
             (&Method::POST, ["dependency-graph", "snapshots"]) => records::dependency_snapshot(&s, &body(req).await?).await,
+            (&Method::GET, ["dependency-graph", "compare", bh @ ..]) if !bh.is_empty() => deps::compare(&s, &bh.join("/"), q.get("name").map(String::as_str)).await,
             (&Method::GET, ["deployments"]) => records::deployments(&s, None, &q).await,
             (&Method::GET, ["deployments", id]) => records::deployments(&s, Some(id), &q).await,
             (&Method::POST, ["deployments"]) => records::create_deployment(&s, &body(req).await?).await,
@@ -281,10 +289,9 @@ async fn trusted_repo(hub: &Hub, claims: &Job, owner: &str, repo: &str) -> Resul
     Ok(repos.into_iter().find(|r| r.id == claims.repo))
 }
 
-/// `/api/graphql`.
+/// `/api/graphql` ([`graphql`]).
 pub async fn graphql(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
-    let Some(claims) = token::job_of_request(hub, req.headers()).await else { return Ok(message(StatusCode::UNAUTHORIZED, "Bad credentials")) };
-    not_implemented(hub, &claims, req.method(), "/api/graphql").await
+    graphql::serve(hub, req).await
 }
 
 /// 501, and a warning on the leg naming the route.

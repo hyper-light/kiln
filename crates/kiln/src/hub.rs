@@ -171,6 +171,11 @@ pub struct Hub {
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
     pub ephemeral_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    /// One-time enrollment tokens for a `k8s` pool's executor pods (docs/ci.md W13-R07): token →
+    /// (executor, the pod's name, which the runner must take, expiry).
+    pub executor_tokens: Mutex<HashMap<String, (String, String, Instant)>>,
+    /// The executor each executor pod's runner is, by the name it enrolled with.
+    pub pod_executors: Mutex<HashMap<String, String>>,
     /// One-time outpost invites (`POST /api/outposts/invite`).
     pub outpost_invites: OutpostInvites,
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
@@ -257,6 +262,8 @@ impl Hub {
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
+            executor_tokens: Mutex::new(HashMap::new()),
+            pod_executors: Mutex::new(HashMap::new()),
             outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
@@ -2074,6 +2081,7 @@ impl Hub {
             }
         // Expire unused pod enrollment tokens.
         self.ephemeral_tokens.lock().retain(|_, (_, exp)| *exp > Instant::now());
+        self.executor_tokens.lock().retain(|_, (_, _, exp)| *exp > Instant::now());
     }
 
     /// Sample the server host itself for the UI ("server" series).

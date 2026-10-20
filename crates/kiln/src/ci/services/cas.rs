@@ -422,6 +422,47 @@ fn sweep(root: &Path, used: &HashSet<String>) -> (usize, u64, Vec<String>) {
     out
 }
 
+/// What a verification found (`kiln store verify`, W08-R01).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Verified {
+    pub chunks: usize,
+    pub bytes: u64,
+    /// Chunks whose contents aren't their digest: each moved to `<store>/corrupt/`, so the next
+    /// write of it stores it again and a read of it fails rather than returning wrong bytes.
+    pub corrupt: Vec<String>,
+}
+
+/// Re-hashes every chunk on this machine's disk against its name (W08-R01).
+pub async fn verify(hub: &Hub) -> anyhow::Result<Verified> {
+    let root = root(hub);
+    crate::rt::blocking(move || verify_blocking(&root)).await?
+}
+
+fn verify_blocking(root: &Path) -> anyhow::Result<Verified> {
+    let mut out = Verified::default();
+    let mut buf = vec![0u8; 1 << 20];
+    for f in chunk_files(root).into_iter().filter(|f| is_digest(&f.digest)) {
+        let Ok(mut file) = File::open(&f.path) else { continue };
+        let mut h = Sha256::new();
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(buf.get(..n).unwrap_or_default());
+        }
+        out.chunks += 1;
+        out.bytes += f.size;
+        if hex(&h.finalize()) != f.digest {
+            let aside = root.join("corrupt");
+            std::fs::create_dir_all(&aside)?;
+            std::fs::rename(&f.path, aside.join(&f.digest))?;
+            out.corrupt.push(f.digest);
+        }
+    }
+    Ok(out)
+}
+
 /// The store's size on disk: every chunk once.
 pub async fn stored_bytes(hub: &Hub) -> anyhow::Result<u64> {
     hub.store.call(|c| Ok(c.query_row("SELECT COALESCE(SUM(size), 0) FROM cas_chunks", [], |r| r.get::<_, i64>(0)).map(|n| u64::try_from(n).unwrap_or(0))?)).await

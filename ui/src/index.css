@@ -1775,6 +1775,29 @@ html.fills-window body {
   background: transparent;
   box-shadow: inset 0 0 0 1px #7e818a;
 }
+/* A test's last results, oldest first (W16-R03): a bar each, a failure taller and red, a skip
+   hollow. */
+.test-spark {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 10px;
+}
+.test-spark i {
+  width: 3px;
+  height: 6px;
+  border-radius: 1px;
+  background: #a5c8b3;
+}
+.test-spark i[data-o="f"],
+.test-spark i[data-o="e"] {
+  height: 10px;
+  background: #d1aaad;
+}
+.test-spark i[data-o="s"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px #7e818a;
+}
 /* The legs as a grid by their values (dag.tsx): what runs across and down said with it, and a
    combination left out an empty cell. */
 .dag-grid {

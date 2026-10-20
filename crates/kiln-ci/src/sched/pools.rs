@@ -8,6 +8,10 @@
 //! the matching hosts, within `max` and `per_host_max`, the least loaded host first; an executor
 //! idle past `idle_timeout` is stopped while the pool keeps `min_idle`. A host that fails to start
 //! one is left alone for a while (doubling, to [`MAX_BACKOFF_MS`]).
+//!
+//! A `k8s` pool's executors are the server's (W13-R07): each is a pod whose own runner connects
+//! for its one leg, bound to its executor from the start (`RunnerIn::executor`), so it takes that
+//! pool's legs and no other's. Kubernetes places the pods: `hosts` and `per_host_max` don't apply.
 
 use serde::Serialize;
 
@@ -38,6 +42,10 @@ pub struct Pool {
     pub request: Resources,
     /// Capabilities its hosts' runners need (their build starts a pool's executors).
     pub caps: u64,
+    /// Its executors are the server's, each its own runner (`k8s`'s pods), not a host runner's.
+    pub hosted: bool,
+    /// Its pods have a Docker-capable sidecar, for Docker actions (`k8s`, W13-R07).
+    pub docker: bool,
 }
 
 /// What a pool's configuration says, before it's checked.
@@ -56,6 +64,38 @@ pub struct PoolSpec {
     pub resources: Option<ResourceSpec>,
     /// Kept for matching legs in windows (W05-R12): `{ for, cron, duration, timezone }`.
     pub reserve: Option<super::reserve::ReservationSpec>,
+    /// A `k8s` pool's Docker-capable sidecar in each of its pods, for Docker actions (W13-R07).
+    pub docker: Option<PodDocker>,
+}
+
+/// A Docker-capable sidecar in each of a `k8s` pool's pods (W13-R07): `podman` (Podman's Docker
+/// API, the default) or `docker` (rootless Docker), from `image` when given, and the Docker CLI
+/// the pod's runner uses, from `cli_image`. The sidecar runs privileged, which is why a pool opts
+/// in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PodDocker {
+    pub engine: Option<String>,
+    pub image: Option<String>,
+    pub cli_image: Option<String>,
+}
+
+impl PodDocker {
+    /// `podman` or `docker`.
+    pub fn engine(&self) -> &str {
+        self.engine.as_deref().map(str::trim).filter(|e| !e.is_empty()).unwrap_or("podman")
+    }
+
+    /// The sidecar's image.
+    pub fn image(&self) -> String {
+        let default = if self.engine() == "docker" { "docker:dind-rootless" } else { "quay.io/podman/stable" };
+        self.image.as_deref().map(str::trim).filter(|i| !i.is_empty()).unwrap_or(default).to_owned()
+    }
+
+    /// The image the Docker CLI is copied from.
+    pub fn cli_image(&self) -> String {
+        self.cli_image.as_deref().map(str::trim).filter(|i| !i.is_empty()).unwrap_or("docker:cli").to_owned()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
@@ -93,6 +133,14 @@ impl PoolSpec {
         if self.executor != "k8s" && self.image.as_deref().is_none_or(|i| i.trim().is_empty()) {
             return Err(format!("pool `{name}`: `image`, what its executors run"));
         }
+        if let Some(d) = &self.docker {
+            if self.executor != "k8s" {
+                return Err(format!("pool `{name}`: `docker` is a sidecar in a `k8s` pool's pods, and this pool's executors are `{}`", self.executor));
+            }
+            if !matches!(d.engine(), "podman" | "docker") {
+                return Err(format!("pool `{name}`: `docker.engine` is `podman` or `docker`, not `{}`", d.engine()));
+            }
+        }
         let max = self.max.unwrap_or(self.min_idle.max(1));
         if max == 0 || self.min_idle > max {
             return Err(format!("pool `{name}`: `min_idle` ({}) is at most `max` ({max}), which is at least 1", self.min_idle));
@@ -125,6 +173,8 @@ impl PoolSpec {
             idle_timeout_ms: (idle * 1000.0) as i64,
             request,
             caps: 0,
+            hosted: self.executor == "k8s",
+            docker: self.docker.is_some(),
         })
     }
 }
@@ -163,6 +213,10 @@ pub struct Executor {
     /// What it holds of its host, in resource mode.
     #[serde(skip)]
     pub reserved: Resources,
+    /// The leg it was made for (a `k8s` pod with that leg's `container:` and `services:`, W13-R07);
+    /// else any of its pool's legs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg: Option<String>,
 }
 
 /// A pool as the API shows it: its settings and its executors now.

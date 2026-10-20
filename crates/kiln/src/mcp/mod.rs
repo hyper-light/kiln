@@ -396,6 +396,18 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
+/// The most of a run's logs `kiln://runs/<id>/logs` gives at once.
+const RUN_LOGS: usize = 4 << 20;
+
+/// kiln's resources, as templates (docs/ci.md §4.4).
+fn templates() -> Value {
+    json!([
+        {"uriTemplate": "kiln://runs/{run}/logs", "name": "run-logs", "title": "A run's logs", "description": "Every leg's steps' logs, in order.", "mimeType": "text/plain"},
+        {"uriTemplate": "kiln://legs/{leg}/logs/{step}", "name": "step-log", "title": "A step's log", "description": "One step of a leg (its index in ci.legs.get).", "mimeType": "text/plain"},
+        {"uriTemplate": "kiln://workflows/{owner}/{repo}/{path}", "name": "workflow", "title": "A workflow's file", "description": "As the repository's default branch has it.", "mimeType": "application/yaml"},
+    ])
+}
+
 /// The MCP name of an operation: dots become underscores (tool names are `[a-zA-Z0-9_-]`).
 pub fn tool_name(op: &str) -> String {
     op.replace('.', "_")
@@ -448,6 +460,12 @@ impl Server {
             "resources/list" => rpc_ok(id, json!({"resources": skills::resources()})),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+                if uri.starts_with("kiln://") {
+                    return Some(match self.read_kiln(uri).await {
+                        Ok(text) => rpc_ok(id, json!({"contents": [{"uri": uri, "mimeType": if uri.starts_with("kiln://workflows/") { "application/yaml" } else { "text/plain" }, "text": text}]})),
+                        Err(e) => rpc_error(id, -32002, &e),
+                    });
+                }
                 match skills::read(uri) {
                     Some(c) => rpc_ok(id, json!({"contents": [c]})),
                     None => rpc_error(id, -32002, &format!("no resource {uri}")),
@@ -461,10 +479,53 @@ impl Server {
                     None => rpc_error(id, -32002, &format!("no skill {key}")),
                 }
             }
-            "resources/templates/list" => rpc_ok(id, json!({"resourceTemplates": []})),
+            "resources/templates/list" => rpc_ok(id, json!({"resourceTemplates": templates()})),
             "prompts/list" => rpc_ok(id, json!({"prompts": []})),
             other => rpc_error(id, -32601, &format!("method not found: {other}")),
         })
+    }
+
+    /// One of kiln's resources (docs/ci.md §4.4), read through the operations, so the caller
+    /// reads exactly what it may: a run's logs (every leg's steps', in order), a leg's step's
+    /// log, a workflow's file.
+    async fn read_kiln(&self, uri: &str) -> Result<String, String> {
+        let call = |name: &'static str, input: Value| crate::ops::call(self.cx(), name, input);
+        let said = |(_, m): crate::ops::Fail| m;
+        let text = |v: Value| v.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let parts: Vec<&str> = uri.trim_start_matches("kiln://").split('/').collect();
+        match parts.as_slice() {
+            ["legs", leg, "logs", step] => {
+                let step: i64 = step.parse().map_err(|_| format!("{uri}: a step is its index"))?;
+                Ok(text(call("ci.legs.logs", json!({"leg": leg, "step": step})).await.map_err(said)?))
+            }
+            ["runs", run, "logs"] => {
+                let detail = call("ci.runs.get", json!({"run": run})).await.map_err(said)?;
+                let mut out = String::new();
+                for l in detail.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    let Some(leg) = l.get("id").and_then(Value::as_str) else { continue };
+                    let name = l.get("name").and_then(Value::as_str).or_else(|| l.get("key").and_then(Value::as_str)).unwrap_or(leg);
+                    let steps = call("ci.legs.get", json!({"leg": leg})).await.map_err(said)?;
+                    for st in steps.get("steps").and_then(Value::as_array).cloned().unwrap_or_default() {
+                        let idx = st.get("idx").and_then(Value::as_i64).unwrap_or_default();
+                        let log = text(call("ci.legs.logs", json!({"leg": leg, "step": idx})).await.map_err(said)?);
+                        out.push_str(&format!("== {name} · {} ==\n{log}", st.get("name").and_then(Value::as_str).unwrap_or_default()));
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        if out.len() > RUN_LOGS {
+                            out.push_str("… (the rest: read each leg's steps with ci.legs.logs)\n");
+                            return Ok(out);
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            ["workflows", owner, name, path @ ..] if !path.is_empty() => {
+                let v = call("ci.workflows.get", json!({"repo": format!("{owner}/{name}"), "path": path.join("/")})).await.map_err(said)?;
+                Ok(v.get("source").and_then(Value::as_str).unwrap_or_default().to_owned())
+            }
+            _ => Err(format!("no resource {uri}: kiln's are kiln://runs/<id>/logs, kiln://legs/<id>/logs/<step> and kiln://workflows/<owner>/<repo>/<path>")),
+        }
     }
 
     async fn call_tool(&self, name: &str, args: Value) -> Value {
@@ -591,6 +652,92 @@ pub async fn stdio(url: String, token: String) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The operations docs/ci.md §4.1 names, each once: a row's `.x` is the last full name's
+    /// area's `x` (`ci.caches.list`, `.delete`).
+    fn spec_operations(doc: &str) -> Vec<String> {
+        let start = doc.find("### 4.1 Routes").unwrap_or(0);
+        let end = doc.get(start..).and_then(|d| d.find("### 4.2")).map_or(doc.len(), |e| start + e);
+        let mut out: Vec<String> = Vec::new();
+        for line in doc.get(start..end).unwrap_or_default().lines().filter(|l| l.starts_with("| ") && !l.starts_with("| Method") && !l.starts_with("| ---")) {
+            let cells: Vec<String> = line.replace("\\|", "\u{1}").split('|').map(|c| c.trim().to_owned()).collect();
+            let Some(names) = cells.get(3) else { continue };
+            let mut last = String::new();
+            for tick in names.split('`').skip(1).step_by(2) {
+                let name = match tick.strip_prefix('.') {
+                    Some(rest) if !last.is_empty() => format!("{}.{rest}", last.rsplit_once('.').map_or(last.as_str(), |(area, _)| area)),
+                    _ => tick.to_owned(),
+                };
+                let dotted = name.contains('.') && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._*".contains(c));
+                if dotted && !name.starts_with('.') {
+                    if !out.contains(&name) {
+                        out.push(name.clone());
+                    }
+                    last = name;
+                }
+            }
+        }
+        out
+    }
+
+    /// What code mode's `kiln` is made of: its names, and nothing to call.
+    struct Listed(Vec<String>);
+
+    impl code::Host for Listed {
+        fn names(&self) -> Vec<String> {
+            self.0.clone()
+        }
+
+        fn registry(&self) -> Value {
+            Value::Array(Vec::new())
+        }
+
+        fn call(&self, _: &str, _: Value) -> Result<Value, Value> {
+            Err(json!({"error": "not here"}))
+        }
+    }
+
+    /// What §4.1 names that isn't built yet.
+    const LEFT: &[&str] = &[];
+
+    /// W20-AC01: every operation docs/ci.md §4.1 names is in the one registry (what isn't built
+    /// yet, [`LEFT`], aside), and every operation of the registry is an MCP tool and a function of
+    /// code mode's `kiln` by the same name. Each is its HTTP route too, and `kiln op` runs any of
+    /// them: `ops::tests` and `ci::ops::tests` check those.
+    #[test]
+    fn w20_ac01_every_operation_on_every_surface() -> Result<(), String> {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/ci.md")).map_err(|e| e.to_string())?;
+        let named = spec_operations(&doc);
+        assert!(named.len() > 120, "§4.1 read: {named:?}");
+        let ops = crate::ops::listed(true);
+        let names: Vec<&str> = ops.iter().map(|o| o.name).collect();
+        let mut missing: Vec<&str> = named
+            .iter()
+            .map(String::as_str)
+            .filter(|n| match n.strip_suffix(".*") {
+                Some(area) => !names.iter().any(|o| o.starts_with(&format!("{area}."))),
+                None => !names.contains(n),
+            })
+            .collect();
+        missing.sort_unstable();
+        assert_eq!(missing, LEFT, "what §4.1 names and the registry lacks");
+        // Each its tool, and no two the same.
+        let tools: Vec<String> = tools_of(crate::ops::listed(true)).iter().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
+        for n in &names {
+            assert!(tools.contains(&tool_name(n)), "{n} has no tool");
+        }
+        let mut unique = tools.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), tools.len(), "two tools share a name");
+        assert_eq!(tools.len(), names.len() + 2, "code_search and code_run, then one each");
+        // Each a function of code mode's `kiln`, by its name.
+        let all: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        let program = "return input.filter(n => typeof n.split('.').reduce((o, k) => o && o[k], kiln) !== 'function')";
+        let out = code::run_on(std::sync::Arc::new(Listed(all.clone())), code::Mode::Run { input: json!(all) }, program, code::Limits::default()).map_err(|e| e.message)?;
+        assert_eq!(out.get("result").cloned().unwrap_or(out.clone()), json!([]), "not functions of `kiln`");
+        Ok(())
+    }
 
     #[test]
     fn mcp_tokens_verify_only_with_the_key_they_were_minted_with() {

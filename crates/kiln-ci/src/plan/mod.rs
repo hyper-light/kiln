@@ -50,6 +50,15 @@ impl Conclusion {
         }
     }
 
+    /// As kiln keeps a leg's (docs/ci.md W06-R12): a timeout stays `timed_out`, though `needs`
+    /// sees it as a failure ([`Conclusion::result`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Conclusion::TimedOut => "timed_out",
+            c => c.result(),
+        }
+    }
+
     pub fn failed(self) -> bool {
         matches!(self, Conclusion::Failure | Conclusion::TimedOut)
     }

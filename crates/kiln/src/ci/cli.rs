@@ -3,9 +3,10 @@
 //! or `env:<repo>:<environment>`.
 
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::Config;
@@ -360,12 +361,19 @@ pub async fn actions(args: ActionsArgs, cfg: &Config) -> Result<()> {
 }
 
 /// Where the CI API is, for the commands below.
-#[derive(clap::Args)]
+#[derive(clap::Args, Clone)]
 pub struct Conn {
     #[arg(long, env = "KILN_URL", global = true)]
     url: Option<String>,
     #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
     token: Option<String>,
+}
+
+/// Never the token.
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Conn").field("url", &self.url).field("token", &self.token.as_ref().map(|_| "…")).finish()
+    }
 }
 
 impl Conn {
@@ -636,6 +644,484 @@ pub async fn op(args: OpArgs, cfg: &Config) -> Result<()> {
     }
     let out = api.call_api(Method::Post, &format!("/api/ops/{}", enc(&name)), Some(op_input(&args.input)?)).await?;
     println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+/// Runs the registry's operation `name` with `input`, as `kiln op` does (`POST /api/ops/:name`).
+async fn run_op(api: &Api, name: &str, input: Value) -> Result<Value> {
+    api.call_api(Method::Post, &format!("/api/ops/{}", enc(name)), Some(input)).await
+}
+
+/// `kiln integrations`: what jobs and deployments use to reach other systems (W11).
+#[derive(clap::Args)]
+pub struct IntegrationsArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: IntegrationsCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum IntegrationsCmd {
+    /// Every integration: its name, kind and scope (never its secret).
+    List,
+    /// Check one works: its credentials, or a federated exchange as a repository's job (and
+    /// environment) would make it.
+    Verify {
+        name: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        environment: Option<String>,
+    },
+}
+
+pub async fn integrations(args: IntegrationsArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    match args.cmd {
+        IntegrationsCmd::List => {
+            let v = run_op(&api, "ci.integrations.list", json!({})).await?;
+            for i in v.get("integrations").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let checked = i.get("verified_at").and_then(Value::as_i64).map_or_else(|| "never checked".to_owned(), |t| format!("checked {}", when(Some(t))));
+                println!("{:<24} {:<18} {:<28} {checked}", s(&i, "name"), s(&i, "kind"), s(&i, "scope"));
+            }
+        }
+        IntegrationsCmd::Verify { name, repo, environment } => {
+            let mut ask = json!({ "integration": name });
+            if let Some(o) = ask.as_object_mut() {
+                for (k, v) in [("repository", repo), ("environment", environment)] {
+                    if let Some(v) = v {
+                        o.insert(k.into(), json!(v));
+                    }
+                }
+            }
+            let v = run_op(&api, "ci.integrations.verify", ask).await?;
+            if v.get("ok").and_then(Value::as_bool) != Some(true) {
+                bail!("{name} doesn't work: {}", s(&v, "error"));
+            }
+            println!("{name} works: {}", s(&v, "message"));
+        }
+    }
+    Ok(())
+}
+
+/// `kiln pools`: executor pools (W13-R09).
+#[derive(clap::Args)]
+pub struct PoolsArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: PoolsCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum PoolsCmd {
+    /// Every pool: its executor, image, labels, and its executors starting, idle and busy.
+    List,
+    /// Make or change a pool.
+    Set {
+        name: String,
+        /// docker, firecracker, shards or k8s.
+        #[arg(long)]
+        executor: String,
+        #[arg(long)]
+        image: Option<String>,
+        /// A label it carries (repeatable).
+        #[arg(long = "label", required = true)]
+        labels: Vec<String>,
+        #[arg(long)]
+        min_idle: Option<u32>,
+        #[arg(long)]
+        max: Option<u32>,
+    },
+    /// Change how many executors a pool keeps idle at least, and has at most.
+    Scale {
+        name: String,
+        #[arg(long)]
+        min_idle: Option<u32>,
+        #[arg(long)]
+        max: Option<u32>,
+    },
+}
+
+pub async fn pools(args: PoolsArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or_default();
+    let said = |v: &Value| {
+        for w in v.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default() {
+            println!("  warning: {}", w.as_str().unwrap_or_default());
+        }
+    };
+    match args.cmd {
+        PoolsCmd::List => {
+            let v = run_op(&api, "ci.pools.list", json!({})).await?;
+            for p in v.get("pools").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let labels: Vec<&str> = p.get("labels").and_then(Value::as_array).map(|l| l.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                println!(
+                    "{:<16} {:<12} {:<32} [{}]  {} starting, {} idle, {} busy",
+                    s(&p, "name"),
+                    s(&p, "executor"),
+                    s(&p, "image"),
+                    labels.join(", "),
+                    n(&p, "starting"),
+                    n(&p, "idle"),
+                    n(&p, "busy")
+                );
+            }
+        }
+        PoolsCmd::Set { name, executor, image, labels, min_idle, max } => {
+            let mut spec = json!({ "name": name, "executor": executor, "labels": labels });
+            if let Some(o) = spec.as_object_mut() {
+                if let Some(i) = image {
+                    o.insert("image".into(), json!(i));
+                }
+                for (k, v) in [("min_idle", min_idle), ("max", max)] {
+                    if let Some(v) = v {
+                        o.insert(k.into(), json!(v));
+                    }
+                }
+            }
+            let v = run_op(&api, "ci.pools.set", spec).await?;
+            println!("{name} saved");
+            said(&v);
+        }
+        PoolsCmd::Scale { name, min_idle, max } => {
+            if min_idle.is_none() && max.is_none() {
+                bail!("say how: --min-idle, --max or both");
+            }
+            let p = run_op(&api, "ci.pools.get", json!({ "name": name })).await?;
+            let mut spec = json!({ "name": name, "executor": s(&p, "executor"), "labels": p.get("labels").cloned().unwrap_or_else(|| json!([])) });
+            if let Some(o) = spec.as_object_mut() {
+                if let Some(i) = p.get("image").filter(|i| !i.is_null()) {
+                    o.insert("image".into(), i.clone());
+                }
+                o.insert("min_idle".into(), json!(min_idle.map_or_else(|| n(&p, "min_idle"), u64::from)));
+                o.insert("max".into(), json!(max.map_or_else(|| n(&p, "max"), u64::from)));
+            }
+            let v = run_op(&api, "ci.pools.set", spec).await?;
+            println!("{name}: heads for {}", v.pointer("/preview/heading_for").and_then(Value::as_u64).map_or_else(|| "its new size".to_owned(), |h| format!("{h} executors")));
+            said(&v);
+        }
+    }
+    Ok(())
+}
+
+/// `kiln images`: runner images (W13-R11).
+#[derive(clap::Args)]
+pub struct ImagesArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: ImagesCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum ImagesCmd {
+    /// The images a repository may use: names, platforms, digests, where built.
+    List {
+        #[arg(long)]
+        repo: String,
+    },
+    /// Check a Dockerfile (or an Agentfile) as the editor does, each finding with its line.
+    Validate { file: PathBuf },
+    /// Build a definition on a runner (`--on`: a label or a runner's name), and with `--push`
+    /// push it to kiln's registry and register it (the server owner's only).
+    Build {
+        name: String,
+        /// Its Dockerfile or Agentfile.
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        on: String,
+        /// A platform to build for (repeatable): `linux/amd64`, `linux/arm64`.
+        #[arg(long = "platform")]
+        platforms: Vec<String>,
+        #[arg(long)]
+        push: bool,
+    },
+}
+
+/// A definition's kind, by its file's name.
+fn image_kind(file: &std::path::Path) -> &'static str {
+    if file.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("agentfile")) { "agentfile" } else { "dockerfile" }
+}
+
+pub async fn images(args: ImagesArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    match args.cmd {
+        ImagesCmd::List { repo } => {
+            let v = run_op(&api, "ci.images.list", json!({ "repo": repo })).await?;
+            for i in v.get("images").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let platforms: Vec<&str> = i.get("platforms").and_then(Value::as_array).map(|l| l.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                println!("{:<20} {:<28} {}  {}", s(&i, "name"), platforms.join(", "), s(&i, "image"), when(i.get("created_at").and_then(Value::as_i64)));
+            }
+        }
+        ImagesCmd::Validate { file } => {
+            let content = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let v = run_op(&api, "ci.images.validate", json!({ "content": content, "path": file.to_string_lossy(), "kind": image_kind(&file) })).await?;
+            let found = v.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
+            let mut errors = 0;
+            for d in &found {
+                let severity = s(d, "severity");
+                errors += usize::from(severity == "error");
+                println!("{}:{}: {} {}: {}", file.display(), d.pointer("/range/start/line").and_then(Value::as_u64).unwrap_or(1), severity, s(d, "code"), s(d, "message"));
+            }
+            if let Some(note) = v.get("note").and_then(Value::as_str) {
+                println!("{}: {note}", file.display());
+            }
+            if errors > 0 {
+                bail!("{errors} errors");
+            }
+            if found.is_empty() {
+                println!("{}: no findings", file.display());
+            }
+        }
+        ImagesCmd::Build { name, file, repo, on, platforms, push } => {
+            let content = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let v = run_op(&api, "ci.images.build", json!({ "repo": repo, "name": name, "kind": image_kind(&file), "content": content, "runs_on": on, "platforms": platforms, "push": push })).await?;
+            let run = s(&v, "run");
+            println!("building {name} on {on}{}: `kiln logs {run} --follow` follows it", if push { " (then pushed)" } else { "" });
+        }
+    }
+    Ok(())
+}
+
+/// `kiln experiment`: options measured against each other and together (W20-R11).
+#[derive(clap::Args)]
+pub struct ExperimentArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: ExperimentCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum ExperimentCmd {
+    /// Start one: from a file (`--spec`, what `experiments.start` takes, JSON or YAML), or from
+    /// these flags: each option a name and a branch, a commit or a diff (`--option fast=opt-fast`,
+    /// `--option cache=D12`), the workflow that measures them (`--pipeline`, required to pass),
+    /// and the metric to better (`--metric p99_ms`, lower is better; `p99_ms:higher`).
+    Start {
+        #[arg(long)]
+        spec: Option<PathBuf>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// each, all (every combination), pairs, greedy.
+        #[arg(long, default_value = "all")]
+        strategy: String,
+        #[arg(long)]
+        pipeline: Option<String>,
+        #[arg(long)]
+        metric: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        repetitions: usize,
+        #[arg(long, default_value_t = 4)]
+        parallel: usize,
+        /// Take the clear winner instead of bringing the results back.
+        #[arg(long)]
+        auto: bool,
+        #[arg(long)]
+        question: Option<String>,
+    },
+    /// Experiments, newest first.
+    List {
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// One: its variants, what each measured against the baseline, and the recommendation.
+    Get { experiment: String },
+    /// Continue with a variant.
+    Decide { experiment: String, variant: String },
+    /// Stop one: its runs are cancelled.
+    Cancel { experiment: String },
+}
+
+/// An option from the command line: `name=<branch | 40-hex commit | D12>`.
+fn option_of(text: &str) -> Result<Value> {
+    let (name, at) = text.split_once('=').ok_or_else(|| anyhow::anyhow!("`{text}`: an option is name=<branch, commit or diff>"))?;
+    let at = at.trim();
+    let kind = if at.len() == 40 && at.bytes().all(|b| b.is_ascii_hexdigit()) {
+        "commit"
+    } else if at.len() > 1 && at.starts_with('D') && at.get(1..).is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) {
+        "diff"
+    } else {
+        "branch"
+    };
+    Ok(json!({ "name": name.trim(), kind: at }))
+}
+
+pub async fn experiment(args: ExperimentArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    match args.cmd {
+        ExperimentCmd::Start { spec, repo, options, strategy, pipeline, metric, repetitions, parallel, auto, question } => {
+            let ask = match spec {
+                Some(file) => {
+                    let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+                    serde_yaml::from_str::<Value>(&text).with_context(|| format!("{} isn't JSON or YAML", file.display()))?
+                }
+                None => {
+                    let repo = repo.ok_or_else(|| anyhow::anyhow!("say which repository (`--repo`), or give a `--spec`"))?;
+                    let pipeline = pipeline.ok_or_else(|| anyhow::anyhow!("say which workflow measures the variants (`--pipeline .kiln/bench.yaml`)"))?;
+                    let mut criteria = vec![json!({ "name": pipeline.rsplit('/').next().unwrap_or(&pipeline), "kind": "pipeline", "workflow": pipeline, "required": true })];
+                    if let Some(m) = metric {
+                        let (name, better) = m.split_once(':').unwrap_or((m.as_str(), "lower"));
+                        criteria.push(json!({ "name": name, "kind": "metric", "metric": name, "better": better }));
+                    }
+                    let opts: Vec<Value> = options.iter().map(|o| option_of(o)).collect::<Result<_>>()?;
+                    json!({ "repo": repo, "options": opts, "strategy": strategy, "criteria": criteria, "repetitions": repetitions, "max_parallel": parallel, "decide": if auto { "auto" } else { "ask" }, "question": question })
+                }
+            };
+            let v = run_op(&api, "experiments.start", ask).await?;
+            let e = v.get("experiment").cloned().unwrap_or_default();
+            let names: Vec<String> = e.get("variants").and_then(Value::as_array).into_iter().flatten().map(|x| s(x, "name")).collect();
+            println!("{} started on {}: {} variants ({}); `kiln experiment get {}` follows it", s(&e, "id"), s(&e, "repo"), names.len(), names.join(", "), s(&e, "id"));
+        }
+        ExperimentCmd::List { repo } => {
+            let v = run_op(&api, "experiments.list", repo.map_or_else(|| json!({}), |r| json!({ "repo": r }))).await?;
+            for e in v.get("experiments").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let n = |k: &str| e.get(k).and_then(Value::as_u64).unwrap_or_default();
+                let rec = e.get("recommendation").and_then(Value::as_str).map(|r| format!("  recommends {r}")).unwrap_or_default();
+                println!("{:<6} {:<20} {:<10} {}/{} runs{rec}  {}", s(&e, "id"), s(&e, "repo"), s(&e, "state"), n("measured"), n("runs"), s(&e, "question"));
+            }
+        }
+        ExperimentCmd::Get { experiment } => {
+            let v = run_op(&api, "experiments.get", json!({ "experiment": experiment })).await?;
+            let e = v.get("experiment").cloned().unwrap_or_default();
+            println!("{} on {} ({}): {}", s(&e, "id"), s(&e, "repo"), s(&e, "state"), s(&e, "question"));
+            let results = e.get("results").cloned().unwrap_or_default();
+            for b in e.get("variants").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let name = s(&b, "name");
+                let r = results.get("variants").and_then(Value::as_array).and_then(|vs| vs.iter().find(|x| x.get("name").and_then(Value::as_str) == Some(name.as_str())).cloned()).unwrap_or_default();
+                let checks = if r.get("passes").and_then(Value::as_bool) == Some(false) {
+                    "fails a required check"
+                } else if r.is_null() {
+                    ""
+                } else {
+                    "passes"
+                };
+                let metrics: Vec<String> = r
+                    .get("metrics")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|m| match m.get("vs_baseline") {
+                        Some(i) if !i.is_null() => {
+                            let f = |k: &str| i.get(k).and_then(Value::as_f64).unwrap_or_default();
+                            format!("{} ×{:.3} (95% {:.3} to {:.3})", s(m, "name"), f("mid"), f("low"), f("high"))
+                        }
+                        _ => format!("{} {}", s(m, "name"), m.get("median").and_then(Value::as_f64).map(|x| format!("{x}")).unwrap_or_default()),
+                    })
+                    .collect();
+                let state = if s(&b, "state") == "conflict" { format!("conflict: {}", s(&b, "why")) } else { checks.to_owned() };
+                println!("  {name:<16} {state:<24} {}", metrics.join("; "));
+            }
+            if let Some(why) = results.get("why").and_then(Value::as_str) {
+                println!("{why}");
+            }
+            if let Some(d) = e.get("decision").filter(|d| !d.is_null()) {
+                println!("decided: {} ({}) by {}", s(d, "variant"), s(d, "commit").get(..12).unwrap_or_default(), s(d, "by"));
+            }
+        }
+        ExperimentCmd::Decide { experiment, variant } => {
+            let v = run_op(&api, "experiments.decide", json!({ "experiment": experiment, "variant": variant })).await?;
+            println!("{experiment}: continuing with {variant} ({})", v.pointer("/experiment/decision/commit").and_then(Value::as_str).unwrap_or_default());
+        }
+        ExperimentCmd::Cancel { experiment } => {
+            run_op(&api, "experiments.cancel", json!({ "experiment": experiment })).await?;
+            println!("{experiment} cancelled");
+        }
+    }
+    Ok(())
+}
+
+/// `kiln store`: the server's content-addressed store (W08-R01).
+#[derive(clap::Args)]
+pub struct StoreArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: StoreCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum StoreCmd {
+    /// Re-hash every chunk on the server's disk; any whose contents aren't their digest is moved
+    /// aside (exits 1 when one is).
+    Verify,
+    /// Collect now: objects nothing refers to, then chunks no object uses.
+    Gc,
+}
+
+pub async fn store(args: StoreArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or_default();
+    match args.cmd {
+        StoreCmd::Verify => {
+            let v = run_op(&api, "ci.store.verify", json!({})).await?;
+            let bad: Vec<&str> = v.get("corrupt").and_then(Value::as_array).map(|c| c.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            println!("{} chunks, {} bytes", n(&v, "chunks"), n(&v, "bytes"));
+            for d in &bad {
+                println!("corrupt: {d} (moved aside)");
+            }
+            if !bad.is_empty() {
+                bail!("{} chunks weren't what their digest says", bad.len());
+            }
+        }
+        StoreCmd::Gc => {
+            let v = run_op(&api, "ci.store.gc", json!({})).await?;
+            println!(
+                "removed {} objects and {} chunks ({} bytes){}",
+                n(&v, "objects"),
+                n(&v, "chunks"),
+                n(&v, "bytes"),
+                if n(&v, "remote") > 0 { format!("; {} chunks from the bucket", n(&v, "remote")) } else { String::new() }
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `kiln runners facts|probe <name>`: a runner's facts (W13-R01), as it last reported them or
+/// probed again now.
+#[derive(clap::Subcommand, Clone, Debug)]
+pub enum RunnerFacts {
+    /// A runner's facts, as it last reported them.
+    Facts {
+        name: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Have a runner probe its facts again now, and show them.
+    Probe {
+        name: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+}
+
+pub async fn runner_facts(cmd: RunnerFacts, cfg: &Config) -> Result<()> {
+    let facts = match cmd {
+        RunnerFacts::Facts { name, conn } => {
+            let api = conn.api(cfg).await?;
+            let all = run_op(&api, "ci.runners.list", json!({})).await?;
+            let found = all.as_array().into_iter().flatten().find(|r| r.get("name").and_then(Value::as_str) == Some(name.as_str())).cloned().ok_or_else(|| anyhow::anyhow!("no runner `{name}`"))?;
+            found.get("facts").cloned().filter(|f| !f.is_null()).ok_or_else(|| anyhow::anyhow!("{name} hasn't reported its facts: `kiln runners probe {name}` asks"))?
+        }
+        RunnerFacts::Probe { name, conn } => {
+            let api = conn.api(cfg).await?;
+            let v = run_op(&api, "ci.runners.probe", json!({ "runner": name })).await?;
+            v.get("facts").cloned().filter(|f| !f.is_null()).ok_or_else(|| anyhow::anyhow!("{name} was asked; its report hasn't come yet"))?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&facts)?);
     Ok(())
 }
 
@@ -983,6 +1469,33 @@ enum EnvCmd {
         #[arg(long)]
         repo: String,
     },
+    /// Deploy there by hand: the workflow that does (one with `workflow_dispatch` and a job bound
+    /// to the environment), run at `--ref` (the trunk by default). Its job waits for the
+    /// environment's protection as any deployment's does.
+    Deploy {
+        name: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// The workflow, when several deploy there.
+        #[arg(long)]
+        workflow: Option<String>,
+        /// An input, `key=value` (repeatable).
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+    },
+    /// Approve (or reject) a run's deployments waiting for review, as `kiln approve` does.
+    Approve {
+        run: String,
+        /// The environments decided (default: every one the run waits for; repeatable).
+        #[arg(long = "env")]
+        environments: Vec<String>,
+        #[arg(long)]
+        reject: bool,
+        #[arg(long, default_value = "")]
+        comment: String,
+    },
 }
 
 /// `kiln env`.
@@ -1044,6 +1557,21 @@ pub async fn env(args: EnvArgs, cfg: &Config) -> Result<()> {
         EnvCmd::Delete { name, repo } => {
             api.call(Method::Delete, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), None).await?;
             println!("removed {name} from {repo}");
+        }
+        EnvCmd::Deploy { name, repo, git_ref, workflow, inputs } => {
+            let mut ask = json!({ "repo": repo, "name": name, "inputs": op_input(&inputs)? });
+            if let Some(o) = ask.as_object_mut() {
+                for (k, v) in [("ref", git_ref), ("workflow", workflow)] {
+                    if let Some(v) = v {
+                        o.insert(k.into(), json!(v));
+                    }
+                }
+            }
+            let v = run_op(&api, "ci.environments.deploy", ask).await?;
+            println!("{} runs at {} to deploy to {name}: `kiln runs --repo {repo}` follows it", s(&v, "workflow"), s(&v, "ref"));
+        }
+        EnvCmd::Approve { run, environments, reject, comment } => {
+            return approve(ApproveArgs { conn: args.conn, run, environments, reject, comment }, cfg).await;
         }
         EnvCmd::Deployments { name, repo } => {
             let v = api.call(Method::Get, &format!("/environments/{}/deployments?repo={}", enc(&name), enc(&repo)), None).await?;

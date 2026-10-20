@@ -252,3 +252,228 @@ fn w20_ac03_authority() -> anyhow::Result<()> {
     assert!(!failed && said.contains("\"attempt\":2"), "an agent that may: {said}");
     Ok(())
 }
+
+/// The commands docs/ci.md §4.3 lists, each as its words up to its first argument: `kiln secrets
+/// set|list` is `secrets set` and `secrets list`; `kiln clone · submit` is `clone` and `submit`.
+fn listed_commands(doc: &str) -> Vec<Vec<String>> {
+    let start = doc.find("### 4.3 CLI").unwrap_or(0);
+    let end = doc.get(start..).and_then(|d| d.find("### 4.4")).map_or(doc.len(), |e| start + e);
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for line in doc.get(start..end).unwrap_or_default().lines().filter(|l| l.trim_start().starts_with("kiln ")) {
+        // Two commands a line, two or more spaces apart; `·` between commands that share `kiln`.
+        let mut commands: Vec<String> = Vec::new();
+        for part in line.split("  ").map(str::trim).filter(|p| !p.is_empty()) {
+            if part.starts_with("kiln ") {
+                commands.extend(part.split(" · ").map(|c| c.trim_start_matches("kiln ").to_owned()));
+            } else if let Some(last) = commands.last_mut() {
+                // `(in jobs)` and the like belong to the one before.
+                last.push(' ');
+                last.push_str(part);
+            }
+        }
+        for c in commands {
+            let mut words: Vec<Vec<String>> = Vec::new();
+            for w in c.split_whitespace() {
+                let optional = w.starts_with('[') && !w.starts_with("[-");
+                let w = w.trim_matches(|ch| ch == '[' || ch == ']');
+                if w.is_empty() || w.starts_with(['-', '<', '(']) || w.chars().any(|ch| ch.is_ascii_uppercase() || ch == '…' || ch == '@') {
+                    break;
+                }
+                let alternatives: Vec<String> = w.split('|').map(str::to_owned).collect();
+                words.push(if optional { [vec![String::new()], alternatives].concat() } else { alternatives });
+            }
+            // Every combination of the alternatives, a `[…]` one with and without.
+            let mut all: Vec<Vec<String>> = vec![Vec::new()];
+            for alts in words {
+                all = all.iter().flat_map(|prefix| alts.iter().map(move |a| if a.is_empty() { prefix.clone() } else { [prefix.clone(), vec![a.clone()]].concat() })).collect();
+            }
+            for a in all {
+                if !a.is_empty() && !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What §4.3 lists that isn't built yet: nothing now.
+const CLI_LEFT: &[&str] = &[];
+
+/// W20-AC01 for the CLI: every command docs/ci.md §4.3 lists is one of kiln's (its `--help`
+/// works), what isn't built yet ([`CLI_LEFT`]) aside.
+#[test]
+fn w20_ac01_every_command_section_4_3_lists() -> anyhow::Result<()> {
+    let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/ci.md"))?;
+    let commands = listed_commands(&doc);
+    anyhow::ensure!(commands.len() > 60, "§4.3 read: {commands:?}");
+    let home = tempfile::tempdir()?;
+    let mut missing: Vec<String> = Vec::new();
+    for c in &commands {
+        let o = Command::new(env!("CARGO_BIN_EXE_kiln")).args(c).arg("--help").env("HOME", home.path()).env_remove("KILN_URL").env_remove("KILN_ADMIN_TOKEN").output()?;
+        if !o.status.success() {
+            missing.push(c.join(" "));
+        }
+    }
+    missing.sort();
+    assert_eq!(missing, CLI_LEFT, "what §4.3 lists and kiln lacks");
+    Ok(())
+}
+
+/// One MCP request with `token`: its `result`, or why it failed.
+fn rpc(s: &Server, token: &str, method: &str, params: Value) -> anyhow::Result<Value> {
+    let (st, body) = http(s.port, "POST", "/api/mcp", token, Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })))?;
+    anyhow::ensure!(st == 200, "{method}: {st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    v.get("result").cloned().ok_or_else(|| anyhow::anyhow!("{method}: {body}"))
+}
+
+/// An operation over HTTP as the admin: its answer.
+fn op(s: &Server, name: &str, input: Value) -> anyhow::Result<Value> {
+    let (st, body) = http(s.port, "POST", &format!("/api/ops/{name}"), &s.admin, Some(&input))?;
+    anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+    Ok(serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+const REPORTED: &str = r#"on: [push, workflow_dispatch]
+jobs:
+  test:
+    runs-on: local
+    environment: production
+    steps:
+      - name: unit tests
+        test-results: { path: report.xml }
+        run: |
+          printf '%s' '<?xml version="1.0"?><testsuite name="calc" tests="1"><testcase classname="calc" name="adds" time="0.2"/></testsuite>' > report.xml
+          echo "tested the calculator"
+"#;
+
+/// W20-AC01's new surfaces, on a server with a run: §4.4's MCP resources (a run's logs, a step's
+/// log, a workflow's file) as the caller reads them; a runner's facts probed on request
+/// (W13-R01); the store verified, a corrupted chunk found and moved aside (W08-R01); a test's
+/// history (W16-R03); and a deployment by hand, the workflow that deploys there dispatched.
+#[test]
+fn w20_ac01_resources_and_what_was_missing_underneath() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("work-tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let until = |secs: u64, what: &str, f: &mut dyn FnMut() -> anyhow::Result<Option<String>>| -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            match f()? {
+                None => return Ok(()),
+                Some(last) => anyhow::ensure!(Instant::now() < deadline, "{what}: {last}\n{}", s.log()),
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    until(60, "the first poll", &mut || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::write(work.join(".kiln/ci.yaml"), REPORTED)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "ci"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let mut run = String::new();
+    until(240, "the run", &mut || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body)?;
+        run = v.pointer("/runs/0").filter(|r| r.get("conclusion").and_then(Value::as_str) == Some("success")).and_then(|r| r.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok(run.is_empty().then_some(body))
+    })?;
+
+    // The resources: their templates, then each read as the caller.
+    let templates = rpc(&s, &s.admin, "resources/templates/list", json!({}))?;
+    let uris: Vec<&str> = templates.get("resourceTemplates").and_then(Value::as_array).into_iter().flatten().filter_map(|t| t.get("uriTemplate").and_then(Value::as_str)).collect();
+    assert_eq!(uris, ["kiln://runs/{run}/logs", "kiln://legs/{leg}/logs/{step}", "kiln://workflows/{owner}/{repo}/{path}"]);
+    let read =
+        |uri: &str| -> anyhow::Result<String> { Ok(rpc(&s, &s.admin, "resources/read", json!({ "uri": uri }))?.pointer("/contents/0/text").and_then(Value::as_str).unwrap_or_default().to_owned()) };
+    let logs = read(&format!("kiln://runs/{run}/logs"))?;
+    assert!(logs.contains("== test · unit tests ==") && logs.contains("tested the calculator"), "{logs}");
+    let detail = op(&s, "ci.runs.get", json!({ "run": run }))?;
+    let leg = detail.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let steps = op(&s, "ci.legs.get", json!({ "leg": leg }))?;
+    let idx = steps
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|st| st.get("name").and_then(Value::as_str) == Some("unit tests"))
+        .and_then(|st| st.get("idx"))
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
+    assert!(read(&format!("kiln://legs/{leg}/logs/{idx}"))?.contains("tested the calculator"));
+    assert_eq!(read("kiln://workflows/acme/app/.kiln/ci.yaml")?, REPORTED, "the file as the trunk has it");
+    let viewer = {
+        let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": "outsider", "grants": ["viewer@repo:acme/elsewhere"] })))?;
+        anyhow::ensure!((200..300).contains(&st), "{body}");
+        token(&s, json!({ "kind": "pat", "user": "outsider", "grants": ["viewer@repo:acme/elsewhere"] }))?
+    };
+    let (st, body) = http(s.port, "POST", "/api/mcp", &viewer, Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": { "uri": format!("kiln://runs/{run}/logs") } })))?;
+    assert!(st == 200 && body.contains("\"error\"") && !body.contains("tested the calculator"), "what the caller may not read, it doesn't: {body}");
+
+    // A runner's facts, probed again now.
+    let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
+    let runner = serde_json::from_str::<Value>(&body)?.pointer("/0/name").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let before = serde_json::from_str::<Value>(&body)?.pointer("/0/facts/probed_at").and_then(Value::as_i64).unwrap_or_default();
+    std::thread::sleep(Duration::from_millis(1100));
+    let probed = op(&s, "ci.runners.probe", json!({ "runner": runner }))?;
+    assert!(probed.pointer("/facts/probed_at").and_then(Value::as_i64).is_some_and(|t| t > before) && probed.pointer("/facts/os").is_some(), "{probed}");
+
+    // The test's history: this run's result.
+    let tests = op(&s, "ci.tests.repo", json!({ "repo": "acme/app" }))?;
+    let test = tests.pointer("/tests/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let history = op(&s, "ci.tests.history", json!({ "repo": "acme/app", "test": test }))?;
+    assert!(
+        history.pointer("/test/name") == Some(&json!("adds")) && history.pointer("/results/0/run") == Some(&json!(run)) && history.pointer("/results/0/outcome") == Some(&json!("passed")),
+        "{history}"
+    );
+
+    // The store: verified whole, then a chunk spoiled and found.
+    let clean = op(&s, "ci.store.verify", json!({}))?;
+    assert!(clean.get("chunks").and_then(Value::as_u64).is_some_and(|n| n >= 1) && clean.get("corrupt") == Some(&json!([])), "{clean}");
+    let chunk = walk(&dir.path().join("data/cas/chunks")).into_iter().next().ok_or_else(|| anyhow::anyhow!("no chunk on disk"))?;
+    std::fs::write(&chunk, b"not what it was")?;
+    let url = format!("http://127.0.0.1:{}", s.port);
+    let o = Command::new(env!("CARGO_BIN_EXE_kiln")).args(["store", "verify", "--url", &url, "--token", &s.admin]).env("HOME", dir.path()).output()?;
+    let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let name = chunk.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    assert!(!o.status.success() && said.contains(&format!("corrupt: {name}")), "kiln store verify: {said}");
+    assert!(!chunk.exists() && dir.path().join("data/cas/corrupt").join(&name).exists(), "moved aside");
+
+    // A deployment by hand: the workflow that deploys to production, dispatched.
+    let deploy = op(&s, "ci.environments.deploy", json!({ "repo": "acme/app", "name": "production" }))?;
+    assert_eq!(deploy.get("workflow"), Some(&json!(".kiln/ci.yaml")), "{deploy}");
+    until(120, "the deploying run", &mut || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        Ok((!body.contains("\"event\":\"workflow_dispatch\"")).then_some(body))
+    })?;
+    let none = http(s.port, "POST", "/api/ops/ci.environments.deploy", &s.admin, Some(&json!({ "repo": "acme/app", "name": "staging" })))?;
+    assert!(none.0 == 409 && none.1.contains("no workflow at main deploys to staging"), "{none:?}");
+    Ok(())
+}
+
+/// Every file under `dir`.
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

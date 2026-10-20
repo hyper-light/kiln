@@ -17,6 +17,7 @@ fn linux(name: &str, slots: u32) -> RunnerIn {
         view: RunnerView { name: name.into(), labels: vec!["k8s".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, caps: 1 << 10, pool: None },
         slots,
         capacity: None,
+        executor: None,
     }
 }
 
@@ -422,6 +423,103 @@ fn w13_r09_failing_host_backs_off() -> Result<(), String> {
     sim.runner(20_000, docker_host("good"));
     sim.run(40_000);
     assert_eq!(sim.assigned.iter().find(|a| a.leg == "w1").map(|a| a.runner.as_str()), Some("good"));
+    Ok(())
+}
+
+fn pod_pool(min_idle: usize, max: usize) -> Result<super::pools::Pool, String> {
+    PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], min_idle, max: Some(max), idle_timeout: Some("1m".into()), ..PoolSpec::default() }.pool()
+}
+
+fn pod_leg(id: &str) -> LegIn {
+    LegIn { id: id.into(), run: "run-pods".into(), repo: "acme/x".into(), route: LegRoute { labels: vec!["pod".into()], ..LegRoute::default() }, priority: 50, ..LegIn::default() }
+}
+
+/// W13-R07: a `k8s` pool's executors are the server's, each a pod whose own runner, bound to it
+/// as it connects, takes one of the pool's legs and nothing else, `max` of them at once. A runner
+/// with the pool's labels takes none of its legs; a pod the scheduler doesn't know is told to go.
+#[test]
+fn w13_r07_k8s_pool_pods_are_their_own_runners() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pod_pool(0, 3)?], ..Config::default() });
+    let mut lookalike = linux("lookalike", 4);
+    lookalike.view.labels = vec!["pod".into()];
+    sim.runner(0, lookalike);
+    for i in 0..5 {
+        sim.leg(1, pod_leg(&format!("p{i}")), 10_000);
+    }
+    let mut anywhere = leg("anywhere", "acme/x", 50);
+    anywhere.route.labels = vec!["self-hosted".into()];
+    sim.leg(1, anywhere, 10_000);
+    let (mut t, mut peak) = (1, 0);
+    while sim.settled.len() < 6 && t < 5 * MIN {
+        t += 250;
+        sim.run(t);
+        let (s, i, b) = counts(&sim);
+        peak = peak.max(s + i + b);
+    }
+    assert_eq!(sim.settled.len(), 6, "every leg ran: {:?}", sim.settled);
+    assert!(sim.executors_started.iter().all(|(_, _, host)| host.is_empty()), "the server starts them: {:?}", sim.executors_started);
+    assert_eq!(peak, 3, "max at once");
+    let pods: Vec<&str> = sim.assigned.iter().filter(|a| a.leg.starts_with('p')).map(|a| a.runner.as_str()).collect();
+    assert_eq!(pods.len(), 5);
+    assert!(pods.iter().all(|r| r.starts_with("pod-pool-pods-")), "each in a pod: {pods:?}");
+    let mut once = pods.clone();
+    once.sort_unstable();
+    once.dedup();
+    assert_eq!(once.len(), 5, "a pod takes one leg");
+    assert_eq!(sim.assigned.iter().find(|a| a.leg == "anywhere").map(|a| a.runner.as_str()), Some("lookalike"), "no pod takes another leg");
+    sim.run(t + 2 * MIN);
+    assert_eq!(counts(&sim), (0, 0, 0), "each pod went with its leg");
+    // A pod from before a restart: told to go, and given nothing.
+    sim.runner(t + 3 * MIN, RunnerIn { id: "pod-old".into(), slots: 1, executor: Some("pool-pods-old".into()), ..RunnerIn::default() });
+    sim.leg(t + 3 * MIN, pod_leg("late"), 10_000);
+    sim.run(t + 4 * MIN);
+    assert!(sim.executors_stopped.iter().any(|(_, e)| e == "pool-pods-old"), "{:?}", sim.executors_stopped);
+    assert_ne!(sim.assigned.iter().find(|a| a.leg == "late").map(|a| a.runner.as_str()), Some("pod-old"));
+    Ok(())
+}
+
+/// W13-R07: a leg with containers gets a pod made for it on a `k8s` pool (its job container and
+/// services in it), and only that one; the pool's other legs share pods made for none.
+#[test]
+fn w13_r07_a_leg_with_containers_gets_a_pod_of_its_own() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pod_pool(0, 4)?], ..Config::default() });
+    let mut db = pod_leg("with-db");
+    db.own_executor = true;
+    sim.leg(1, db, 10_000);
+    sim.leg(1, pod_leg("plain"), 10_000);
+    sim.run(2 * MIN);
+    assert_eq!(sim.settled.len(), 2, "{:?}", sim.settled);
+    let made: Vec<Option<String>> = sim.sched.pools().first().map(|p| p.executors.iter().map(|e| e.leg.clone()).collect()).unwrap_or_default();
+    assert!(made.is_empty(), "each pod went with its leg: {made:?}");
+    // The leg with containers ran on the pod started for it, the other on one started for none.
+    let pod_of = |leg: &str| sim.assigned.iter().find(|a| a.leg == leg).map(|a| a.runner.clone()).unwrap_or_default();
+    assert_ne!(pod_of("with-db"), pod_of("plain"));
+    assert_eq!(sim.executors_started.len(), 2, "{:?}", sim.executors_started);
+    // Cancelled while its pod starts, the pod made for it goes too.
+    let mut late = pod_leg("late");
+    late.own_executor = true;
+    sim.leg(3 * MIN, late, 10_000);
+    sim.input(3 * MIN + 1, Input::LegCancelled { leg: "late".into(), reason: "cancelled".into() });
+    sim.run(4 * MIN);
+    assert_eq!(counts(&sim), (0, 0, 0), "{:?}", sim.sched.pools());
+    Ok(())
+}
+
+/// W13-R07: a `k8s` pool may have a Docker sidecar in its pods (Podman's by default), which
+/// `pool_for` says of the pool a leg goes to; no other kind of pool has one, nor another engine.
+#[test]
+fn w13_r07_a_pools_docker_sidecar() -> Result<(), String> {
+    let mut spec = PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], docker: Some(super::pools::PodDocker::default()), ..PoolSpec::default() };
+    let docker = spec.docker.clone().unwrap_or_default();
+    assert_eq!((docker.engine(), docker.image(), docker.cli_image()), ("podman", "quay.io/podman/stable".to_owned(), "docker:cli".to_owned()));
+    let sched = Scheduler::new(Config { pools: vec![spec.pool()?, pod_pool(0, 1).map(|p| super::pools::Pool { name: "plain".into(), labels: vec!["plain".into()], ..p })?], ..Config::default() });
+    let route = |label: &str| LegRoute { labels: vec![label.into()], ..LegRoute::default() };
+    assert_eq!(sched.pool_for(&route("pod")).map(|p| (p.name.as_str(), p.docker)), Some(("pods", true)));
+    assert_eq!(sched.pool_for(&route("plain")).map(|p| (p.name.as_str(), p.docker)), Some(("plain", false)));
+    spec.docker = Some(super::pools::PodDocker { engine: Some("containerd".into()), ..super::pools::PodDocker::default() });
+    assert!(spec.pool().is_err_and(|e| e.contains("`podman` or `docker`")));
+    let on_docker = PoolSpec { executor: "docker".into(), image: Some("ubuntu".into()), docker: Some(super::pools::PodDocker::default()), ..spec };
+    assert!(on_docker.pool().is_err_and(|e| e.contains("`k8s` pool's pods")));
     Ok(())
 }
 

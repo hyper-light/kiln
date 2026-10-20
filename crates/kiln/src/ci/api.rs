@@ -262,6 +262,15 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let hub = Arc::clone(hub);
             apart(async move { super::attest::verify_route(&hub, &body).await }).await
         }
+        // W08-R01: the store verified (each chunk re-hashed) or collected.
+        (&Method::POST, ["store", "verify"]) => {
+            let v = boxed(|| super::services::cas::verify(hub)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(crate::http::server::json(StatusCode::OK, &serde_json::to_value(v).unwrap_or_default()))
+        }
+        (&Method::POST, ["store", "gc"]) => {
+            let c = boxed(|| super::services::cas::collect(hub)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "objects": c.objects, "chunks": c.chunks, "bytes": c.bytes, "remote": c.remote })))
+        }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => boxed(|| super::routing::get(hub)).await,
         (&Method::PUT, ["routing", "rules"]) => {
@@ -287,6 +296,14 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         (&Method::GET, ["runs", id]) => boxed(|| super::runs_api::get(hub, id, q)).await,
         (&Method::GET, ["runs", id, "graph"]) => boxed(|| super::runs_api::graph(hub, id, q)).await,
+        // W20: a failure bisected, the run's job run on the commits since it last passed.
+        (&Method::POST, ["runs", id, "bisect"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 1 << 16)).await.unwrap_or(serde_json::Value::Null);
+            boxed(|| super::bisect::start(hub, id, &body, &by)).await
+        }
+        (&Method::GET, ["runs", id, "bisects"]) => boxed(|| super::bisect::list(hub, id, None)).await,
+        (&Method::GET, ["runs", id, "bisects", b]) => boxed(|| super::bisect::list(hub, id, Some(b))).await,
         (&Method::GET, ["runs", id, "flow"]) => boxed(|| super::runs_api::flow(hub, id, q)).await,
         // W19-R03: what changed between two runs or legs (`last-green`: since the last success).
         (&Method::GET, ["runs", id, "compare", other]) => boxed(|| super::compare::runs(hub, id, other)).await,
@@ -296,6 +313,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["runs", id, "tests"]) => boxed(|| super::results::of(hub, Some(id), None, q)).await,
         (&Method::GET, ["legs", id, "tests"]) => boxed(|| super::results::of(hub, None, Some(id), q)).await,
         (&Method::GET, ["repos", repo, "tests"]) => boxed(|| super::results::repo(hub, repo, q)).await,
+        (&Method::GET, ["repos", repo, "tests", id, "history"]) => boxed(|| super::results::history(hub, repo, id, q)).await,
         // W19-R06: what notifications went out.
         (&Method::GET, ["notify", "deliveries"]) => boxed(|| super::notify::deliveries(hub, q)).await,
         // W19-R04: log search across runs, and within a leg.

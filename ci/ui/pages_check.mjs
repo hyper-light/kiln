@@ -2,10 +2,13 @@
 // Chromium and WebKit at 1440×900 and 390×844: each page's primary task end to end, then nothing on
 // it scrolling sideways and nothing fixed but the shell's own (layout.mjs), and a screenshot.
 // - A leg's page: its step's log opened and searched for what the step printed.
+// - A run's tests (W16-R03): each with its last results on the branch, a bar each.
 // - A run's data flow (W04-R23): an output from its step to the job that reads it and where, and
 //   an exported environment and the job that takes it.
 // - Attaching an agent from a run's page (W20-R08): the form open on its workflow, offering what
 //   wakes a workflow's agent.
+// - An experiment (W20-R11): listed with what it recommends; its variants with their intervals on
+//   one scale, and "Continue with this" choosing one in place.
 // - Comparing two runs: what differs, the files changed between them, the steps side by side.
 // - Log search: what every run printed, found among the repository's runs.
 // - The land queue, and a diff's stack.
@@ -84,6 +87,18 @@ for (const [name, type, phone] of [
         await shot("leg");
       });
 
+      await flow(`${who}: a run's tests`, async () => {
+        await page.goto(`${cfg.base}/runs/${run}`);
+        const spark = page.getByRole("img", { name: /^Its last \d+ results: \d+ passed/ }).first();
+        check(
+          who,
+          "a run's tests: each with its last results, a bar each",
+          await until(async () => (await spark.count()) > 0 && (await spark.locator("i").count()) > 1, 20000),
+          await spark.getAttribute("aria-label").catch(() => ""),
+        );
+        await checkLayout(check, `${who}: a run's tests`, page);
+      });
+
       await flow(`${who}: a run's data flow`, async () => {
         await page.goto(`${cfg.base}/runs/${cfg.flow_run}`);
         const panel = page.getByRole("list", { name: "The run's outputs and exports" });
@@ -119,6 +134,35 @@ for (const [name, type, phone] of [
         check(who, "and by how much, once it wakes on it", await until(async () => (await form.getByLabel("Slower than usual by").inputValue()) === "25"), await text(form));
         await checkLayout(check, `${who}: attaching an agent`, page);
         await shot("attach");
+      });
+
+      await flow(`${who}: an experiment`, async () => {
+        await page.goto(`${cfg.base}/agents/experiments`);
+        const list = page.getByRole("list", { name: "Experiments" });
+        // What it recommends, or (once an earlier context chose in place, below) what was chosen.
+        check(
+          who,
+          "experiments: listed, with what each recommends or what was chosen",
+          await until(async () => /recommends fast\+cache|continuing with (fast|cache|fast\+cache)\b/.test(await text(list)), 20000),
+          await text(list),
+        );
+        await page.getByRole("link", { name: cfg.experiment, exact: true }).click();
+        await page.waitForURL(/\/agents\/experiments\//, { timeout: 15000 });
+        const variants = page.getByRole("list", { name: `${cfg.experiment}'s variants` });
+        const rows = variants.getByRole("listitem");
+        check(
+          who,
+          "an experiment: each variant with its interval against the baseline",
+          await until(async () => (await rows.count()) === 4 && /×0\.700 \(95% 0\.700 to 0\.700\)/.test(await text(variants)) && /recommended/i.test(await text(variants)), 20000),
+          await text(variants),
+        );
+        await checkLayout(check, `${who}: an experiment`, page);
+        await shot("experiment");
+        // Chosen in place (each context picks a different one, so every choice is new).
+        const pick = { "chromium-wide": "fast", "chromium-phone": "cache", "webkit-wide": "fast+cache", "webkit-phone": "baseline" }[`${name}-${tag}`];
+        const row = rows.filter({ has: page.locator("code", { hasText: new RegExp(`^${pick.replace("+", "\\+")}$`) }) });
+        await row.getByRole("button", { name: "Continue with this" }).click();
+        check(who, "and a variant chosen in place", await until(async () => /chosen/i.test(await text(row)), 20000), await text(row));
       });
 
       await flow(`${who}: comparing runs`, async () => {

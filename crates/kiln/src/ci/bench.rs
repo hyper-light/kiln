@@ -124,7 +124,13 @@ fn scheduler_once() -> (f64, f64, f64) {
     let mut s = Scheduler::new(Config::default());
     let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
     for i in 0..1_000 {
-        let r = RunnerIn { id: format!("r{i}"), view: RunnerView { name: format!("r{i}"), labels: vec![format!("pool-{}", i % 50)], facts: facts.clone(), caps: 0, pool: None }, slots: 4, capacity: None };
+        let r = RunnerIn {
+            id: format!("r{i}"),
+            view: RunnerView { name: format!("r{i}"), labels: vec![format!("pool-{}", i % 50)], facts: facts.clone(), caps: 0, pool: None },
+            slots: 4,
+            capacity: None,
+            executor: None,
+        };
         s.handle(Input::RunnerUp(Box::new(r)), 0);
     }
     let mut lat: Vec<f64> = Vec::with_capacity(20_000);

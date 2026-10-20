@@ -476,6 +476,7 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
             Ok(srv::json(StatusCode::OK, &v))
         }
         (&Method::GET, [name, "deployments"]) => deployments(hub, &repo, Some(name), q).await,
+        (&Method::POST, [name, "deploy"]) => deploy(hub, &repo, name, &body, caller).await,
         (&Method::POST, []) | (&Method::PUT | &Method::PATCH, [_]) => {
             let b: EnvBody = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
             let name = match tail {
@@ -573,6 +574,46 @@ async fn effect(hub: &Hub, repo: &Repo, d: &EnvDef) -> (Vec<Value>, Value) {
         }
     };
     (diagnostics, json!({ "trunk": trunk, "a_deployment_from_the_trunk": meets }))
+}
+
+/// A deployment to environment `name` by hand (`POST /api/ci/environments/:name/deploy`, §4.1):
+/// the workflow at `ref` (the trunk by default) that deploys there, one with a job bound to it
+/// (`environment: <name>`) and a `workflow_dispatch` trigger (`workflow` when several are),
+/// dispatched with `inputs`. Its job waits for the environment's protection as any deployment's
+/// does.
+async fn deploy(hub: &Hub, repo: &Repo, name: &str, body: &Value, caller: Option<&Caller>) -> Result<Response, Fail> {
+    let git_ref = match body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        Some(r) => r.to_owned(),
+        None => super::events::facts(hub, repo).await.default_branch,
+    };
+    let (_, sha) = super::events::named_ref(hub, repo, &git_ref).await.map_err(|r| (r.status, r.message))?;
+    let commit = super::load::load(hub, repo, &sha).await.map_err(internal)?;
+    let asked = body.get("workflow").and_then(Value::as_str).filter(|w| !w.is_empty());
+    let deploys: Vec<&str> = commit
+        .workflows
+        .iter()
+        .filter(|l| l.runs)
+        .filter_map(|l| {
+            let w = l.workflow.as_ref()?;
+            let by_hand = w.on.iter().any(|t| t.event == "workflow_dispatch");
+            let there = w.jobs.iter().any(|j| j.environment.as_ref().is_some_and(|e| e.name.src.trim().eq_ignore_ascii_case(name)));
+            (by_hand && there).then_some(l.path.as_str())
+        })
+        .filter(|p| asked.is_none_or(|a| *p == a || p.rsplit('/').next() == Some(a)))
+        .collect();
+    let path = match deploys.as_slice() {
+        [one] => (*one).to_owned(),
+        [] => return Err((StatusCode::CONFLICT, format!("no workflow at {git_ref} deploys to {name} by hand: one with `workflow_dispatch` and a job with `environment: {name}`"))),
+        many => return Err((StatusCode::CONFLICT, format!("{} deploy to {name}: say which (`workflow`)", many.join(", ")))),
+    };
+    let inputs = body.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
+    // A repository whose CI is another provider's (W23-R01): that provider starts it.
+    if let Some(started) = super::providers::dispatch(hub, repo, &path, &git_ref, &Value::Object(inputs.clone())).await {
+        started?;
+    } else {
+        super::events::workflow_dispatch(hub, repo, &git_ref, &path, &inputs, "kiln", caller.and_then(Caller::started_by)).await.map_err(|r| (r.status, r.message))?;
+    }
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "environment": name, "workflow": path, "ref": git_ref })))
 }
 
 /// A repository's deployments, newest first: of one environment, or (`?environment=`) any.

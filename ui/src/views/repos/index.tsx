@@ -33,6 +33,7 @@ import { PlaceList, TaskList, taskLine } from "./places";
 import { PutForm, type PutMode } from "./put";
 import { SyncActivity } from "./sync-activity";
 import { ScopeSecrets } from "../settings-ci";
+import { Providers } from "./providers";
 import "./repos.css";
 
 /** Folders kept the same on several machines; read often, they move by the second. */
@@ -576,6 +577,12 @@ function Details({
         <h4 className="field-label">On machines</h4>
         <PlaceList entry={e} machines={machines} synced={e.synced} onStarted={onStarted} />
       </section>
+      {r && (
+        // What runs its CI (W23-R07), when its host makes a choice possible.
+        <Loadable label="what runs its CI" fallback={<></>}>
+          <Providers repo={r.name} />
+        </Loadable>
+      )}
       {r && (
         // Its CI secrets and variables (W09-R11).
         <section className="repo-section" aria-label="Its secrets and variables">

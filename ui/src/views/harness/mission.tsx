@@ -270,6 +270,9 @@ export default function Mission() {
               <Button asChild variant="ghost" size="xs">
                 <Link to="/agents/attached">Attached</Link>
               </Button>
+              <Button asChild variant="ghost" size="xs">
+                <Link to="/agents/experiments">Experiments</Link>
+              </Button>
               <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
                 <Plus />
               </Button>
@@ -281,6 +284,9 @@ export default function Mission() {
               </Button>
               <Button asChild variant="secondary">
                 <Link to="/agents/attached">Attached</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link to="/agents/experiments">Experiments</Link>
               </Button>
               <Button onClick={() => setSpawn(true)}>
                 New agents <Plus />

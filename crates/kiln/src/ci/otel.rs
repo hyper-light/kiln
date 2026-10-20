@@ -81,7 +81,7 @@ fn result_of(conclusion: &str) -> &'static str {
 fn status_of(conclusion: &str) -> Value {
     match result_of(conclusion) {
         "success" => json!({ "code": 1 }),
-        "failure" | "timeout" | "error" => json!({ "code": 2, "message": conclusion }),
+        "failure" | "timed_out" | "timeout" | "error" => json!({ "code": 2, "message": conclusion }),
         _ => json!({ "code": 0 }),
     }
 }

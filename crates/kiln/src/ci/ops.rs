@@ -64,7 +64,7 @@ const LEG: &str = "The leg's id (a job of a run, one matrix combination of it)."
 const REPO: &str = "The repository, `owner/name`.";
 
 /// A handler's response as an operation's answer.
-pub(super) async fn answer(r: Result<Response, Fail>) -> Out {
+pub(crate) async fn answer(r: Result<Response, Fail>) -> Out {
     let resp = r?;
     let status = resp.status();
     let json = resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("json"));
@@ -100,6 +100,32 @@ fn internal(e: anyhow::Error) -> Fail {
 /// A diff route (W14), as its HTTP route answers.
 async fn diffs(cx: &Cx, method: Method, segs: &[&str], q: &HashMap<String, String>, body: &Value) -> Out {
     answer(super::diffs::route(&cx.hub, &method, segs, q, &cx.caller, body).await).await
+}
+
+/// A route of the host's pull requests (W23-R06), as its HTTP route answers.
+async fn pulls(cx: &Cx, method: Method, repo: &str, tail: &[&str], body: Value) -> Out {
+    answer(crate::githost::pulls::route(&cx.hub, &method, repo, tail, body, Some(&cx.caller)).await).await
+}
+
+/// A pull request's number, as its route's segment.
+fn number(v: &Value) -> Result<String, Fail> {
+    v.get("number").and_then(Value::as_u64).map(|n| n.to_string()).ok_or_else(|| bad("`number` is required"))
+}
+
+/// A diff's version, as its route's segment.
+fn version(v: &Value) -> Result<String, Fail> {
+    v.get("version").and_then(Value::as_u64).map(|n| n.to_string()).ok_or_else(|| bad("`version` is required"))
+}
+
+/// Where to download one of a run's artifacts: the signed URL kiln's own download redirects to,
+/// or, for another provider's run, kiln's download route itself.
+async fn artifact_link(cx: &Cx, run: &str, artifact: &str) -> Out {
+    let r = super::runs_api::download(&cx.hub, run, artifact).await?;
+    if let Some(url) = r.headers().get(http::header::LOCATION).and_then(|l| l.to_str().ok()) {
+        return Ok(json!({ "url": url, "expires_in": 60 }));
+    }
+    let base = cx.hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    Ok(json!({ "url": format!("{base}/api/ci/runs/{run}/artifacts/{artifact}/download"), "with_token": true }))
 }
 
 /// A secret or variable scope (`repo:acme/app`, `env:acme/app:production`, …).
@@ -542,6 +568,374 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "caches"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::caches(&cx.hub, &text(&v, "repo")?, None).await).await }),
+            // §4.1's other routes (W20-AC01): every one an operation.
+            op!("ci.caches.delete", "Delete one of a repository's caches (its id, from ci.caches.list).", ro: false, destructive: true,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "cache": {"type": "string", "description": "The cache's id."}}), &["repo", "cache"]),
+                route: |v| Ok((Method::DELETE, path(&["repos", &text(v, "repo")?, "caches", &text(v, "cache")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let id = text(&v, "cache")?; answer(super::runs_api::caches(&cx.hub, &text(&v, "repo")?, Some(id.as_str())).await).await }),
+            op!("ci.tests.history", "A test's last results on a branch (the default branch unless said), newest first: each one's run, leg, attempt, commit, outcome and duration (W16-R03).", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "test": {"type": "string", "description": "The test's id (from ci.tests.*)."}, "branch": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}), &["repo", "test"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "tests", &text(v, "test")?, "history"]), query(v, &["branch", "limit"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::results::history(&cx.hub, &text(&v, "repo")?, &text(&v, "test")?, &query(&v, &["branch", "limit"])).await).await }),
+            op!("ci.runs.bisect", "Bisect a failure: the run's job (the one that failed, by default), run again on the commits between the last it passed on (`good`: the last green run of its workflow on its branch before it, by default) and the run's (`bad`), the range halved each time, until the first commit it fails on is found. Each try is a run of that job at that commit, trusted as the run was. Follow it with ci.runs.bisects.", ro: false, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "job": {"type": "string", "description": "The job's id."}, "good": {"type": "string", "description": "A commit it passes on."}, "bad": {"type": "string", "description": "A commit it fails on."}}), &["run"]),
+                route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "bisect"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::bisect::start(&cx.hub, &text(&v, "run")?, &v, &by(&cx)).await).await }),
+            op!("ci.runs.bisects", "A run's bisections, newest first, or one (`bisect`): the commits between, each tried with its run and conclusion, and the first commit the job fails on once found (`culprit`), or why it couldn't be.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "bisect": {"type": "string", "description": "One's id."}}), &["run"]),
+                route: |v| Ok((Method::GET, match v.get("bisect").and_then(Value::as_str) { Some(b) => path(&["runs", &text(v, "run")?, "bisects", b]), None => path(&["runs", &text(v, "run")?, "bisects"]) }, HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::bisect::list(&cx.hub, &text(&v, "run")?, v.get("bisect").and_then(Value::as_str)).await).await }),
+            op!("experiments.start", "Start an experiment (W20-R11): options measured against each other and together on a base commit (the default branch's head by default). Each option is a `commit`, a `branch` or a `diff`; `strategy` makes the variants: each, all (every combination), pairs, greedy, or custom (`variants`); the baseline is one unless `baseline: false`. `criteria`: each `{name, kind: pipeline (workflow) | command (command, runs-on) | metric (metric, better: lower | higher), required, threshold: {at_most | at_least | better}}`, a metric read from the pipelines' and commands' runs. Each variant is measured `repetitions` times (3), interleaved, `max_parallel` at once (4), within `budget_minutes`. `decide`: ask (bring the results back) or auto (take the clear winner); the agent that asks is told.", base: "", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": "The repository, `owner/name` (the one your folder is a checkout of when left out)."}, "base": {"type": "string"}, "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "commit": {"type": "string"}, "branch": {"type": "string"}, "diff": {"type": "string"}, "implement": {"type": "string", "description": "What the option is, for an agent to implement (instead of a commit, branch or diff)."}}, "required": ["name"]}},
+                    "strategy": {"type": "string", "enum": ["each", "all", "pairs", "greedy", "custom"]}, "variants": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}, "baseline": {"type": "boolean"},
+                    "criteria": {"type": "array", "items": {"type": "object"}}, "repetitions": {"type": "integer", "minimum": 1, "maximum": 20}, "max_parallel": {"type": "integer", "minimum": 1, "maximum": 16},
+                    "budget_minutes": {"type": "integer"}, "decide": {"type": "string", "enum": ["ask", "auto"]}, "agent": {"type": "string", "description": "The agent to tell (you, by default)."},
+                    "harness": {"type": "object", "description": "Where the agents implementing options run: {kind, on?, cwd?, model?}; yours by default."}
+                }), &["options", "criteria"]),
+                route: |_| Ok((Method::POST, path(&["experiments"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::start(&cx.hub, &cx.caller, v).await).await }),
+            op!("experiments.list", "Experiments you may read, newest first (one repository's with `repo`): each one's state, how many of its runs are measured, and its recommendation and decision.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &[]),
+                route: |v| Ok((Method::GET, path(&["experiments"]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::list(&cx.hub, &cx.caller, &query(&v, &["repo"])).await).await }),
+            op!("experiments.get", "An experiment: its options and variants (each one's commit, or why it couldn't be built), its runs, and its results: each variant's required checks, its metrics against the baseline with 95% intervals, each option's main effect, each pair's interaction, and the recommendation.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"experiment": {"type": "string", "description": "Its id: `E12`."}}), &["experiment"]),
+                route: |v| Ok((Method::GET, path(&["experiments", &text(v, "experiment")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::show(&cx.hub, &cx.caller, &text(&v, "experiment")?).await).await }),
+            op!("experiments.decide", "Continue with one of an experiment's variants: the agent that asked is told its commit (`refs/kiln/experiments/<id>/<variant>`).", base: "", ro: false, destructive: false,
+                input: || schema(json!({"experiment": {"type": "string", "description": "Its id: `E12`."}, "variant": {"type": "string", "description": "`a+b`, `baseline`, …"}}), &["experiment", "variant"]),
+                route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "decide"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::decide(&cx.hub, &cx.caller, &text(&v, "experiment")?, &v).await).await }),
+            op!("experiments.cancel", "Stop an experiment: no more runs, and those running are cancelled.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"experiment": {"type": "string", "description": "Its id: `E12`."}}), &["experiment"]),
+                route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "cancel"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::cancel(&cx.hub, &cx.caller, &text(&v, "experiment")?).await).await }),
+            op!("ci.store.verify", "Re-hash every chunk of the store on the server's disk (W08-R01): how many and how much, and any whose contents aren't their digest (each moved aside, so it's stored again on its next write).", ro: false, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::POST, path(&["store", "verify"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { Ok(serde_json::to_value(super::services::cas::verify(&cx.hub).await.map_err(internal)?).unwrap_or_default()) }),
+            op!("ci.store.gc", "Collect the store now: objects nothing refers to (no cache entry, artifact, release asset, test report, registry blob), then chunks no object uses; anything younger than an hour stays.", ro: false, destructive: true,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::POST, path(&["store", "gc"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move {
+                    let c = super::services::cas::collect(&cx.hub).await.map_err(internal)?;
+                    Ok(json!({ "objects": c.objects, "chunks": c.chunks, "bytes": c.bytes, "remote": c.remote }))
+                }),
+            op!("ci.workflows.schema", "The JSON Schema of a workflow file (`gha` or `kiln`), an overlay (`overlay`) or an action (`action`): what editors complete and validate against.", ro: true, destructive: false,
+                input: || schema(json!({"kind": {"type": "string", "enum": ["gha", "kiln", "overlay", "action"]}}), &["kind"]),
+                route: |v| Ok((Method::GET, path(&["schema", &text(v, "kind")?]), HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { answer(super::workflows::schema(&text(&v, "kind")?)).await }),
+            op!("ci.runs.graph", "A run's graph: its jobs (each with its legs, their states and wait reasons, and its span), the edges its needs make, and the critical path.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "attempt": {"type": "integer", "description": "An attempt's (the latest by default)."}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "graph"]), query(v, &["attempt"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::graph(&cx.hub, &text(&v, "run")?, &query(&v, &["attempt"])).await).await }),
+            op!("ci.runs.summary", "A run's job summaries (`$GITHUB_STEP_SUMMARY`), Markdown, by leg and step.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "attempt": {"type": "integer"}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "summary"]), query(v, &["attempt"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::part(&cx.hub, &text(&v, "run")?, "summary", &query(&v, &["attempt"])).await).await }),
+            op!("ci.runs.annotations", "A run's annotations (errors, warnings and notices its steps and tests made), with where in the code each is.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "attempt": {"type": "integer"}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "annotations"]), query(v, &["attempt"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::part(&cx.hub, &text(&v, "run")?, "annotations", &query(&v, &["attempt"])).await).await }),
+            op!("ci.runs.attestations", "The provenance kiln signed for what a run built (W18): each subject's digest, its predicate and signature.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "attestations"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::attest::for_run(&cx.hub, &text(&v, "run")?).await).await }),
+            op!("ci.runs.pending", "What a run waits for, whichever provider runs it: approvals, environments' reviews, runners.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "pending"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::runs_api::pending(&cx.hub, &text(&v, "run")?).await).await }),
+            op!("ci.runs.artifact", "Where to download one of a run's artifacts (its id, from ci.artifacts.list), whichever provider ran it: a URL that works for a minute without a token, or kiln's for another provider's (with your token).", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "artifact": {"type": "string", "description": "The artifact's id."}}), &["run", "artifact"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "artifacts", &text(v, "artifact")?, "download"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { artifact_link(&cx, &text(&v, "run")?, &text(&v, "artifact")?).await }),
+            op!("ci.runs.repository_dispatch", "GitHub's `repository_dispatch`: the default branch's workflows that listen for `event_type` run, with `client_payload` in their event.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "event_type": {"type": "string"}, "client_payload": {"type": "object"}}), &["repo", "event_type"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "repository-dispatch"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let ask = json!({ "event_type": text(&v, "event_type")?, "client_payload": v.get("client_payload").cloned().unwrap_or(Value::Null) });
+                    answer(super::workflows::repository_dispatch_value(&cx.hub, &text(&v, "repo")?, ask, cx.caller.started_by()).await).await
+                }),
+            op!("ci.uploads.heads", "The commits of a repository the server has (its branches' and tags' heads): what a working tree's pack (ci.uploads.pack) can leave out.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "heads"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::uploads::heads(&cx.hub, &text(&v, "repo")?).await).await }),
+            op!("ci.uploads.pack", "Send a commit the server doesn't have as a git pack (base64; thin over ci.uploads.heads' commits), for ci.runs.local to run.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "sha": {"type": "string", "description": "The commit the pack holds: 40 hex digits."}, "pack": {"type": "string", "description": "The pack, base64."}}), &["repo", "sha", "pack"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "packs"]), query(v, &["sha"]))),
+                run: |cx: Cx, v: Value| async move {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(text(&v, "pack")?.trim()).map_err(|e| bad(format!("`pack` isn't base64: {e}")))?;
+                    answer(super::uploads::pack_from(&cx.hub, &text(&v, "repo")?, &query(&v, &["sha"]), super::uploads::PackFrom::Bytes(bytes), &by(&cx)).await).await
+                }),
+            op!("ci.runs.local", "Run a commit's workflows as an event of your choosing, before you push (`kiln workflow run --server`): the commit (sent with ci.uploads.pack, or one the server has), the event and its payload, which workflows, one job, matrix combinations, inputs, variables and secrets for these runs only. Untrusted unless you're the owner.", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "sha": {"type": "string"}, "ref": {"type": "string", "description": "The branch, tag or `refs/…` it stands for; the default branch when left out."},
+                    "event": {"type": "string", "description": "`push` unless said."}, "payload": {"type": "object"}, "workflows": {"type": "array", "items": {"type": "string"}},
+                    "job": {"type": "string"}, "matrix": {"type": "object"}, "inputs": {"type": "object"}, "vars": {"type": "object"}, "secrets": {"type": "object"}
+                }), &["repo", "sha"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "local-runs"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let mut ask = v.clone();
+                    if let Some(o) = ask.as_object_mut() {
+                        o.remove("repo");
+                    }
+                    answer(super::uploads::local_runs_value(&cx.hub, &text(&v, "repo")?, Some(&cx.caller), ask).await).await
+                }),
+            op!("ci.legs.compare", "What changed between two legs (`other`: a leg's id, or `last-green`): their steps side by side, timings, environment, the runner and image, the commits between them.", ro: true, destructive: false,
+                input: || schema(json!({"leg": {"type": "string", "description": LEG}, "other": {"type": "string", "description": "Another leg's id, or `last-green`."}}), &["leg", "other"]),
+                route: |v| Ok((Method::GET, path(&["legs", &text(v, "leg")?, "compare", &text(v, "other")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::compare::legs(&cx.hub, &text(&v, "leg")?, &text(&v, "other")?).await).await }),
+            op!("ci.oidc.subject", "The subject claim of a scope's ID tokens (W10-R09): GitHub's default or the claims it's made of (`include_claim_keys`).", ro: true, destructive: false,
+                input: || schema(json!({"scope": {"type": "string", "description": "`org:<owner>` or `repo:<owner/name>`."}}), &["scope"]),
+                route: |v| Ok((Method::GET, path(&["oidc", "subject"]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::oidc::subject(&cx.hub, &Method::GET, &query(&v, &["scope"]), Value::Null, &by(&cx)).await).await }),
+            op!("ci.oidc.set_subject", "Set the subject claim of a scope's ID tokens: GitHub's default (`use_default`), or the claims it's made of, in order (`include_claim_keys`).", ro: false, destructive: false,
+                input: || schema(json!({"scope": {"type": "string", "description": "`org:<owner>` or `repo:<owner/name>`."}, "use_default": {"type": "boolean"}, "include_claim_keys": {"type": "array", "items": {"type": "string"}}}), &["scope"]),
+                route: |v| Ok((Method::PUT, path(&["oidc", "subject"]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move {
+                    let body = json!({ "use_default": v.get("use_default"), "include_claim_keys": v.get("include_claim_keys") });
+                    answer(super::oidc::subject(&cx.hub, &Method::PUT, &query(&v, &["scope"]), body, &by(&cx)).await).await
+                }),
+            op!("ci.oidc.reset_subject", "A scope's ID tokens' subject back to what it inherits.", ro: false, destructive: false,
+                input: || schema(json!({"scope": {"type": "string", "description": "`org:<owner>` or `repo:<owner/name>`."}}), &["scope"]),
+                route: |v| Ok((Method::DELETE, path(&["oidc", "subject"]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::oidc::subject(&cx.hub, &Method::DELETE, &query(&v, &["scope"]), Value::Null, &by(&cx)).await).await }),
+            op!("ci.oidc.status", "kiln's OIDC issuer: its address, its keys and their ages, whether its discovery document and keys are published where providers read them, and each provider's readiness.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["oidc"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::oidc::admin(&cx.hub, &Method::GET, &[], Value::Null).await).await }),
+            op!("ci.oidc.jwks", "The issuer's discovery document and keys, to publish by hand where providers read them.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["oidc", "jwks-export"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::oidc::admin(&cx.hub, &Method::GET, &["jwks-export"], Value::Null).await).await }),
+            op!("ci.oidc.rotate", "Rotate the issuer's signing key: a new key signs from now on; the old one is still published until tokens it signed have expired.", ro: false, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::POST, path(&["oidc", "rotate"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::oidc::admin(&cx.hub, &Method::POST, &["rotate"], json!({})).await).await }),
+            op!("ci.oidc.publish", "Publish the issuer's discovery document and keys where it's configured to (an object store, a static site).", ro: false, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::POST, path(&["oidc", "publish"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::oidc::admin(&cx.hub, &Method::POST, &["publish"], json!({})).await).await }),
+            op!("ci.secrets.delete", "Delete a secret from a scope.", ro: false, destructive: true,
+                input: || schema(json!({"scope": {"type": "string", "description": SCOPE}, "name": {"type": "string"}}), &["scope", "name"]),
+                route: |v| Ok((Method::DELETE, path(&["secrets", &text(v, "name")?]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move {
+                    let scope = scope_of(&cx, &v).await?;
+                    let gone = super::secrets::delete(&cx.hub, &scope, &text(&v, "name")?).await.map_err(internal)?;
+                    if gone { Ok(json!({ "deleted": true })) } else { Err((StatusCode::NOT_FOUND, format!("no secret {} there", text(&v, "name")?))) }
+                }),
+            op!("ci.variables.delete", "Delete a variable from a scope.", ro: false, destructive: true,
+                input: || schema(json!({"scope": {"type": "string", "description": SCOPE}, "name": {"type": "string"}}), &["scope", "name"]),
+                route: |v| Ok((Method::DELETE, path(&["variables", &text(v, "name")?]), query(v, &["scope"]))),
+                run: |cx: Cx, v: Value| async move {
+                    let scope = scope_of(&cx, &v).await?;
+                    let gone = super::secrets::delete_var(&cx.hub, &scope, &text(&v, "name")?).await.map_err(internal)?;
+                    if gone { Ok(json!({ "deleted": true })) } else { Err((StatusCode::NOT_FOUND, format!("no variable {} there", text(&v, "name")?))) }
+                }),
+            op!("ci.integrations.kinds", "The kinds of integration there are: each one's fields, how it authenticates (a stored secret, or a job's ID token exchanged), and what kiln has built of it.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["integrations", "kinds"]), HashMap::new())),
+                run: |_cx: Cx, _v: Value| async move { Ok(json!({ "kinds": super::integrations::KINDS })) }),
+            op!("ci.integrations.create", "Make an integration: its kind (ci.integrations.kinds), a name, its config, its secret (write-only) and the scope it's for.", ro: false, destructive: false,
+                input: || schema(json!({"kind": {"type": "string"}, "name": {"type": "string"}, "config": {"type": "object"}, "secret": {"type": "string", "description": "Stored encrypted, never shown again."}, "scope": {"type": "string", "description": SCOPE}}), &["kind", "name"]),
+                route: |_| Ok((Method::POST, path(&["integrations"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let config = v.get("config").cloned().filter(|c| !c.is_null()).unwrap_or_else(|| json!({}));
+                    let made = super::integrations::create(&cx.hub, &text(&v, "kind")?, &text(&v, "name")?, config, v.get("secret").and_then(Value::as_str), v.get("scope").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    Ok(serde_json::to_value(made).unwrap_or_default())
+                }),
+            op!("ci.integrations.get", "One integration: its kind, config, scope and what it's for (never its secret).", ro: true, destructive: false,
+                input: || schema(json!({"integration": {"type": "string", "description": "Its name."}}), &["integration"]),
+                route: |v| Ok((Method::GET, path(&["integrations", &text(v, "integration")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let name = text(&v, "integration")?;
+                    super::integrations::get(&cx.hub, &name).await.map_err(internal)?.map(|i| serde_json::to_value(i).unwrap_or_default()).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no integration `{name}`")))
+                }),
+            op!("ci.integrations.update", "Change an integration's config or replace its secret.", ro: false, destructive: false,
+                input: || schema(json!({"integration": {"type": "string", "description": "Its name."}, "config": {"type": "object"}, "secret": {"type": "string"}}), &["integration"]),
+                route: |v| Ok((Method::PATCH, path(&["integrations", &text(v, "integration")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let i = super::integrations::update(&cx.hub, &text(&v, "integration")?, v.get("config").cloned().filter(|c| !c.is_null()), v.get("secret").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    Ok(serde_json::to_value(i).unwrap_or_default())
+                }),
+            op!("ci.integrations.delete", "Delete an integration (jobs and deployments using it fail until another takes its name).", ro: false, destructive: true,
+                input: || schema(json!({"integration": {"type": "string", "description": "Its name."}}), &["integration"]),
+                route: |v| Ok((Method::DELETE, path(&["integrations", &text(v, "integration")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let name = text(&v, "integration")?;
+                    if super::integrations::delete(&cx.hub, &name, &by(&cx)).await.map_err(internal)? { Ok(json!({ "deleted": true })) } else { Err((StatusCode::NOT_FOUND, format!("no integration `{name}`"))) }
+                }),
+            op!("ci.actions.list", "The actions catalog (W07-R12): the mirrored actions and their versions and pinned commits, searched by `q`.", ro: true, destructive: false,
+                input: || schema(json!({"q": {"type": "string"}}), &[]),
+                route: |v| Ok((Method::GET, path(&["actions"]), query(v, &["q"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::actions::route(&cx.hub, &Method::GET, &[], &query(&v, &["q"]), Value::Null).await).await }),
+            op!("ci.actions.kiln", "kiln's own actions (`kiln/<name>@v1`): what each does and takes.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["actions", "kiln"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::actions::route(&cx.hub, &Method::GET, &["kiln"], &HashMap::new(), Value::Null).await).await }),
+            op!("ci.actions.sync", "Mirror the server's prefetched actions now (`[ci.actions] prefetch`), each pinned to its commit.", ro: false, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::POST, path(&["actions", "sync"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { answer(super::actions::route(&cx.hub, &Method::POST, &["sync"], &HashMap::new(), json!({})).await).await }),
+            op!("ci.runners.probe", "Have a runner probe its facts again now (W13-R01): its OS, CPU, memory and disk, GPUs, executors, tools. Answers with its new report once it comes.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"runner": {"type": "string", "description": "The runner's name."}}), &["runner"]),
+                route: |v| Ok((Method::POST, path(&["agents", &text(v, "runner")?, "probe"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(crate::api::probe_agent(&cx.hub, &text(&v, "runner")?).await).await }),
+            op!("ci.pools.get", "One executor pool: its kind, image, labels, sizes, and its executors now.", ro: true, destructive: false,
+                input: || schema(json!({"name": {"type": "string", "description": "The pool."}}), &["name"]),
+                route: |v| Ok((Method::GET, path(&["pools", &text(v, "name")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let name = text(&v, "name")?; answer(super::pools::list(&cx.hub, Some(name.as_str())).await).await }),
+            op!("ci.pools.delete", "Remove an executor pool (one made by API; a config file's stays).", ro: false, destructive: true,
+                input: || schema(json!({"name": {"type": "string", "description": "The pool."}}), &["name"]),
+                route: |v| Ok((Method::DELETE, path(&["pools", &text(v, "name")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::pools::delete(&cx.hub, &text(&v, "name")?).await).await }),
+            op!("ci.environments.get", "One of a repository's environments: its kind and targets, protection, latest deployment, and what waits to deploy there.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "name": {"type": "string"}}), &["repo", "name"]),
+                route: |v| Ok((Method::GET, path(&["environments", &text(v, "name")?]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { let name = text(&v, "name")?; answer(super::environments::route(&cx.hub, &Method::GET, &[name.as_str()], &query(&v, &["repo"]), Value::Null, Some(&cx.caller)).await).await }),
+            op!("ci.environments.deployments", "An environment's deployments, newest first: each one's run, commit, who started it and how it went.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "name": {"type": "string"}, "limit": {"type": "integer"}}), &["repo", "name"]),
+                route: |v| Ok((Method::GET, path(&["environments", &text(v, "name")?, "deployments"]), query(v, &["repo", "limit"]))),
+                run: |cx: Cx, v: Value| async move { let name = text(&v, "name")?; answer(super::environments::route(&cx.hub, &Method::GET, &[name.as_str(), "deployments"], &query(&v, &["repo", "limit"]), Value::Null, Some(&cx.caller)).await).await }),
+            op!("ci.environments.deploy", "Deploy to an environment by hand: the workflow at `ref` (the trunk by default) that deploys there, one with `workflow_dispatch` and a job with `environment: <name>` (`workflow` when several), dispatched with `inputs`. Its job waits for the environment's protection as any deployment's does.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "name": {"type": "string", "description": "The environment."}, "ref": {"type": "string"}, "workflow": {"type": "string"}, "inputs": {"type": "object"}}), &["repo", "name"]),
+                route: |v| Ok((Method::POST, path(&["environments", &text(v, "name")?, "deploy"]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { let name = text(&v, "name")?; answer(super::environments::route(&cx.hub, &Method::POST, &[name.as_str(), "deploy"], &query(&v, &["repo"]), v.clone(), Some(&cx.caller)).await).await }),
+            op!("ci.environments.delete", "Delete an environment made in kiln (a `.kiln/environments.yaml` one is removed by a change to the file).", ro: false, destructive: true,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "name": {"type": "string"}}), &["repo", "name"]),
+                route: |v| Ok((Method::DELETE, path(&["environments", &text(v, "name")?]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { let name = text(&v, "name")?; answer(super::environments::route(&cx.hub, &Method::DELETE, &[name.as_str()], &query(&v, &["repo"]), Value::Null, Some(&cx.caller)).await).await }),
+            op!("ci.webhooks.deliveries", "What outgoing webhooks sent (W19-R07): each delivery's event, integration, status and attempts, newest first.", ro: true, destructive: false,
+                input: || schema(json!({"integration": {"type": "string"}, "event": {"type": "string"}, "limit": {"type": "integer"}}), &[]),
+                route: |v| Ok((Method::GET, path(&["webhooks", "deliveries"]), query(v, &["integration", "event", "limit"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::webhooks::route(&cx.hub, &Method::GET, &["deliveries"], &query(&v, &["integration", "event", "limit"])).await).await }),
+            op!("ci.webhooks.delivery", "One delivery: what was sent, each attempt's response.", ro: true, destructive: false,
+                input: || schema(json!({"delivery": {"type": "string", "description": "Its id."}}), &["delivery"]),
+                route: |v| Ok((Method::GET, path(&["webhooks", "deliveries", &text(v, "delivery")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let id = text(&v, "delivery")?; answer(super::webhooks::route(&cx.hub, &Method::GET, &["deliveries", id.as_str()], &HashMap::new()).await).await }),
+            op!("ci.webhooks.redeliver", "Send a delivery again.", ro: false, destructive: false,
+                input: || schema(json!({"delivery": {"type": "string", "description": "Its id."}}), &["delivery"]),
+                route: |v| Ok((Method::POST, path(&["webhooks", "deliveries", &text(v, "delivery")?, "redeliver"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let id = text(&v, "delivery")?; answer(super::webhooks::route(&cx.hub, &Method::POST, &["deliveries", id.as_str(), "redeliver"], &HashMap::new()).await).await }),
+            op!("ci.hooks.list", "A repository's inbound webhooks (W03-R02): each one's id and the URL other systems call to start its `webhook` workflows.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "hooks"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::inbound::list(&cx.hub, &text(&v, "repo")?).await).await }),
+            op!("ci.hooks.create", "Make an inbound webhook for a repository: its URL and signing secret, shown once.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "name": {"type": "string"}}), &["repo"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "hooks"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::inbound::create(&cx.hub, &text(&v, "repo")?, &v, &by(&cx)).await).await }),
+            op!("ci.hooks.delete", "Delete an inbound webhook: calls to its URL stop starting anything.", ro: false, destructive: true,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "hook": {"type": "string", "description": "Its id."}}), &["repo", "hook"]),
+                route: |v| Ok((Method::DELETE, path(&["repos", &text(v, "repo")?, "hooks", &text(v, "hook")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::inbound::delete(&cx.hub, &text(&v, "repo")?, &text(&v, "hook")?, &by(&cx)).await).await }),
+            op!("ci.providers.get", "What a repository's CI runs on (W23): KilnCI, GitHub Actions, GitLab CI/CD or Bitbucket Pipelines, and each provider's state.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "providers"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::providers::show(&cx.hub, &text(&v, "repo")?).await }),
+            op!("ci.providers.set", "Choose what a repository's CI runs on: `providers`, one or more of `kiln`, `github-actions`, `gitlab-ci`, `bitbucket-pipelines`.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "providers": {"type": "array", "items": {"type": "string"}}}), &["repo", "providers"]),
+                route: |v| Ok((Method::PUT, path(&["repos", &text(v, "repo")?, "providers"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::providers::set(&cx.hub, &text(&v, "repo")?, &json!({ "providers": v.get("providers") }), &by(&cx)).await }),
+            op!("ci.providers.sync", "Look at a repository's other providers' runs now, instead of at their next poll.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "providers", "sync"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::providers::sync_now(&cx.hub, &text(&v, "repo")?).await }),
+            op!("ci.providers.workflows", "Each of a repository's providers' CI files, checked by that provider's rules (GitHub's, GitLab's, Bitbucket's).", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "providers", "workflows"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::providers::workflows(&cx.hub, &text(&v, "repo")?).await }),
+            op!("ci.providers.checks", "Every provider's runs of one commit: each run's provider, workflow, state and link.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "sha": {"type": "string"}}), &["repo", "sha"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "commits", &text(v, "sha")?, "checks"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::providers::checks(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?).await }),
+            op!("host.pulls.list", "A repository's open pull requests (merge requests) on its host, GitHub, GitLab or Bitbucket: as you, when you signed in with that host.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "pulls"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { pulls(&cx, Method::GET, &text(&v, "repo")?, &[], Value::Null).await }),
+            op!("host.pulls.get", "One pull request: its state, branches, checks, reviews and comments.", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "number": {"type": "integer"}}), &["repo", "number"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "pulls", &number(v)?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let n = number(&v)?; pulls(&cx, Method::GET, &text(&v, "repo")?, &[n.as_str()], Value::Null).await }),
+            op!("host.pulls.comment", "Comment on a pull request, on a line (`path`, `line`, `side`), or replying to a comment (`reply_to`).", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "number": {"type": "integer"}, "body": {"type": "string"}, "path": {"type": "string"}, "line": {"type": "integer"}, "side": {"type": "string", "enum": ["left", "right"]}, "reply_to": {"type": "string"}}), &["repo", "number", "body"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "pulls", &number(v)?, "comments"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let n = number(&v)?; pulls(&cx, Method::POST, &text(&v, "repo")?, &[n.as_str(), "comments"], v.clone()).await }),
+            op!("host.pulls.review", "Review a pull request: `approve`, `request_changes` or `comment`, with a body.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "number": {"type": "integer"}, "verdict": {"type": "string", "enum": ["approve", "request_changes", "comment"]}, "body": {"type": "string"}}), &["repo", "number", "verdict"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "pulls", &number(v)?, "reviews"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let n = number(&v)?; pulls(&cx, Method::POST, &text(&v, "repo")?, &[n.as_str(), "reviews"], v.clone()).await }),
+            op!("host.pulls.merge", "Merge a pull request on its host: `merge`, `squash` or `rebase`, as the host allows.", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "number": {"type": "integer"}, "method": {"type": "string", "enum": ["merge", "squash", "rebase"]}}), &["repo", "number"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "pulls", &number(v)?, "merge"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let n = number(&v)?; pulls(&cx, Method::POST, &text(&v, "repo")?, &[n.as_str(), "merge"], v.clone()).await }),
+            op!("ci.diffs.versions", "A diff's versions: each one's commit, base, when it was pushed and by whom.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "versions"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "versions"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.diffs.files", "The files a version of a diff changes, with their hunks.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "version": {"type": "integer"}}), &["diff", "version"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "versions", &version(v)?, "files"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let (d, n) = (text(&v, "diff")?, version(&v)?); diffs(&cx, Method::GET, &["diffs", d.as_str(), "versions", n.as_str(), "files"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.diffs.blob", "A file as a version of a diff has it (`side`: `new`, or `old` for its base's).", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "version": {"type": "integer"}, "path": {"type": "string"}, "side": {"type": "string", "enum": ["old", "new"]}}), &["diff", "version", "path"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "versions", &version(v)?, "blob"]), query(v, &["path", "side"]))),
+                run: |cx: Cx, v: Value| async move { let (d, n) = (text(&v, "diff")?, version(&v)?); diffs(&cx, Method::GET, &["diffs", d.as_str(), "versions", n.as_str(), "blob"], &query(&v, &["path", "side"]), &Value::Null).await }),
+            op!("ci.diffs.dependencies", "What a diff's version (the latest unless `to`) changes in the dependencies its lockfiles pin, against the commit it was made on (or version `from`): each lockfile's packages added, removed, and those whose versions changed (W18-R03).", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "from": {"type": "integer"}, "to": {"type": "integer"}}), &["diff"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "dependencies"]), query(v, &["from", "to"]))),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "dependencies"], &query(&v, &["from", "to"]), &Value::Null).await }),
+            op!("ci.diffs.interdiff", "What changed between two versions of a diff (`from`, `to`).", base: "", ro: true, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "from": {"type": "integer"}, "to": {"type": "integer"}}), &["diff", "from", "to"]),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "interdiff"]), query(v, &["from", "to"]))),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "interdiff"], &query(&v, &["from", "to"]), &Value::Null).await }),
+            op!("ci.diffs.ready", "Mark a draft diff ready for review.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "ready"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "ready"], &HashMap::new(), &json!({})).await }),
+            op!("ci.diffs.abandon", "Abandon a diff: it leaves review and the land queue (reclaim brings it back).", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "abandon"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "abandon"], &HashMap::new(), &json!({})).await }),
+            op!("ci.diffs.reclaim", "Bring an abandoned diff back to review.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "reclaim"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "reclaim"], &HashMap::new(), &json!({})).await }),
+            op!("ci.diffs.commandeer", "Take over someone else's diff: you become its author and push its next versions.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}}), &["diff"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "commandeer"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "commandeer"], &HashMap::new(), &json!({})).await }),
+            op!("ci.change_requests.list", "A repository's change requests: branches reviewed against the trunk as a whole.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "state": {"type": "string"}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "change-requests"]), query(v, &["state"]))),
+                run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::GET, &["repos", r.as_str(), "change-requests"], &query(&v, &["state"]), &Value::Null).await }),
+            op!("ci.change_requests.open", "Open a change request: a branch reviewed against the trunk as a whole (`kiln cr open`).", base: "", ro: false, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}, "branch": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}, "trunk": {"type": "string"}}), &["repo", "branch"]),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "change-requests"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::POST, &["repos", r.as_str(), "change-requests"], &HashMap::new(), &v).await }),
+            op!("ci.change_requests.get", "A change request: its versions, state, reviewers and runs.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"change_request": {"type": "string", "description": "Its key: `CR4`."}}), &["change_request"]),
+                route: |v| Ok((Method::GET, path(&["change-requests", &text(v, "change_request")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let k = text(&v, "change_request")?; diffs(&cx, Method::GET, &["change-requests", k.as_str()], &HashMap::new(), &Value::Null).await }),
+            op!("ci.review.inbox", "Your review inbox: what needs your review, your stacks, your agents' stacks, and the conversations you're in.", base: "", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["review", "inbox"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { diffs(&cx, Method::GET, &["review", "inbox"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.queue.list", "A repository's land queue: each entry's diffs, place, state and its batch.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"repo": {"type": "string", "description": REPO}}), &["repo"]),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "queue"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::GET, &["repos", r.as_str(), "queue"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.queue.remove", "Take an entry out of the land queue (its id, from ci.queue.list).", base: "", ro: false, destructive: true,
+                input: || schema(json!({"entry": {"type": "string", "description": "The entry's id."}}), &["entry"]),
+                route: |v| Ok((Method::DELETE, path(&["queue", &text(v, "entry")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let e = text(&v, "entry")?; diffs(&cx, Method::DELETE, &["queue", e.as_str()], &HashMap::new(), &Value::Null).await }),
+            op!("ci.stacks.get", "A stack: its diffs in order, each one's state and readiness.", base: "", ro: true, destructive: false,
+                input: || schema(json!({"stack": {"type": "string", "description": "The stack's id (a diff's `stack`)."}}), &["stack"]),
+                route: |v| Ok((Method::GET, path(&["stacks", &text(v, "stack")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let st = text(&v, "stack")?; diffs(&cx, Method::GET, &["stacks", st.as_str()], &HashMap::new(), &Value::Null).await }),
         ]
     })
 }
@@ -580,7 +974,8 @@ mod tests {
     /// Every operation is a route of the table, with a capability of its own (W20-R01).
     #[test]
     fn w20_r01_each_operation_is_a_route() {
-        let probe = json!({"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error", "job": "build", "scope": "repo:acme/app", "name": "N", "value": "v", "integration": "hook", "diff": "D1", "thread": "t1", "body": "b", "comment": "c1", "action": "accept"});
+        // Every field a route reads, as one input (parsed: it outgrows `json!`).
+        let probe: Value = serde_json::from_str(r#"{"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error", "job": "build", "scope": "repo:acme/app", "name": "N", "value": "v", "integration": "hook", "diff": "D1", "thread": "t1", "body": "b", "comment": "c1", "action": "accept", "cache": "c1", "kind": "gha", "artifact": "7", "event_type": "e", "sha": "0123456789abcdef0123456789abcdef01234567", "pack": "", "other": "last-green", "delivery": "d1", "hook": "h1", "number": 4, "version": 2, "from": 1, "to": 2, "change_request": "CR1", "entry": "q1", "stack": "s1", "runner": "mac", "providers": ["kiln"], "verdict": "comment", "test": "t1", "experiment": "E1", "variant": "a"}"#).unwrap_or_default();
         for op in ops() {
             let route = (op.route)(&probe);
             assert!(route.is_ok(), "{}", op.name);

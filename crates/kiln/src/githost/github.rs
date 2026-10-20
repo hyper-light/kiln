@@ -205,6 +205,15 @@ impl App {
         Ok((status, v))
     }
 
+    /// GitHub's GraphQL endpoint: `/graphql` beside github.com's REST API, an Enterprise Server's
+    /// `/api/graphql` beside its `/api/v3`.
+    pub fn graphql_url(&self) -> String {
+        match self.api.trim_end_matches('/').strip_suffix("/api/v3") {
+            Some(host) => format!("{host}/api/graphql"),
+            None => format!("{}/graphql", self.api.trim_end_matches('/')),
+        }
+    }
+
     /// The App's installation for `owner/name`, or for an owner (`name` without a `/`).
     pub async fn installation(&self, name: &str) -> anyhow::Result<u64> {
         static C: OnceLock<parking_lot::Mutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();

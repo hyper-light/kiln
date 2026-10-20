@@ -200,11 +200,16 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
     // Actions that couldn't be resolved, under a step's action that uses them: that step's action
     // can't run either.
     let mut beneath: Vec<(String, String)> = Vec::new();
+    // Composite actions with a Docker action or image beneath them: they need Docker too.
+    let mut docker_beneath: Vec<String> = Vec::new();
     while let Some((uses, depth, root)) = todo.pop() {
         let below = root.clone().unwrap_or_else(|| uses.clone());
         if let Some(a) = out.get(&uses) {
             if let (Some(why), Some(root)) = (&a.error, &root) {
                 beneath.push((root.clone(), format!("`{uses}`: {why}")));
+            }
+            if let (true, Some(root)) = (a.docker, &root) {
+                docker_beneath.push(root.clone());
             }
             continue;
         }
@@ -232,6 +237,9 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             {
                 // A kiln action's declarations (W07-R11, W09-R07).
                 a.declares(&action);
+                if let (true, Some(root)) = (a.docker, &root) {
+                    docker_beneath.push(root.clone());
+                }
                 if action.runs.using == "composite" {
                     let mut inner = Vec::new();
                     steps_uses(&action.runs.steps, &mut inner);
@@ -239,6 +247,12 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
                 }
             }
             out.insert(uses.clone(), a);
+            continue;
+        }
+        if uses.starts_with("docker://") {
+            if let Some(root) = &root {
+                docker_beneath.push(root.clone());
+            }
             continue;
         }
         let Some(r) = Remote::parse(&uses) else { continue };
@@ -273,6 +287,9 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             && let (Some(action), _) = kiln_ci::wf::parse_action(&meta)
         {
             a.declares(&action);
+            if let (true, Some(root)) = (a.docker, &root) {
+                docker_beneath.push(root.clone());
+            }
             // A composite action's own actions are the run's too.
             if action.runs.using == "composite" {
                 let mut inner = Vec::new();
@@ -281,6 +298,11 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             }
         }
         out.insert(uses.clone(), a);
+    }
+    for root in docker_beneath {
+        if let Some(a) = out.get_mut(&root) {
+            a.docker = true;
+        }
     }
     for (root, why) in beneath {
         if let Some(a) = out.get_mut(&root)

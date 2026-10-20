@@ -2222,6 +2222,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
+                        // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
+                        // then leaves.
+                        if o.ephemeral {
+                            served_dedicated = true;
+                        }
                         // A new attempt: its events count from one.
                         journal.remove(&id);
                         unreceived.remove(&id);

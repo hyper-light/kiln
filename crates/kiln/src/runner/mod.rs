@@ -16,4 +16,5 @@ pub mod hashfiles;
 pub mod kept;
 pub mod probe;
 pub mod runtime;
+pub mod setup;
 pub mod workspaces;

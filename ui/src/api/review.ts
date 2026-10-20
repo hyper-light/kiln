@@ -229,6 +229,8 @@ export const reviewApi = {
   diff: (key: string, signal?: AbortSignal) => request<DiffDetail>("GET", `/api/diffs/${enc(key)}`, undefined, { signal }),
   files: (key: string, version: number, signal?: AbortSignal) => request<VersionFiles>("GET", `/api/diffs/${enc(key)}/versions/${version}/files`, undefined, { signal }),
   interdiff: (key: string, from: number, to: number, signal?: AbortSignal) => request<Interdiff>("GET", `/api/diffs/${enc(key)}/interdiff?from=${from}&to=${to}`, undefined, { signal }),
+  dependencies: (key: string, to: number, from: number | null, signal?: AbortSignal) =>
+    request<Dependencies>("GET", `/api/diffs/${enc(key)}/dependencies?to=${to}${from != null ? `&from=${from}` : ""}`, undefined, { signal }),
   threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[] }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
   comment: (
     key: string,
@@ -257,6 +259,19 @@ export const inboxRes: Res<Inbox> = { key: "review/inbox", fetch: (s) => reviewA
 export const diffRes = (key: string): Res<DiffDetail> => ({ key: `review/diff/${key}`, fetch: (s) => reviewApi.diff(key, s), opts: { on: REVIEW_EVENTS } });
 export const threadsRes = (key: string): Res<Thread[]> => ({ key: `review/threads/${key}`, fetch: (s) => reviewApi.threads(key, s), opts: { on: ["comment", "review", "diff_version"] } });
 export const filesRes = (key: string, version: number): Res<VersionFiles> => ({ key: `review/files/${key}/${version}`, fetch: (s) => reviewApi.files(key, version, s) });
+
+/** What a version changes in the dependencies its lockfiles pin (docs/ci.md W18-R03). */
+export interface Dependencies {
+  diff: string;
+  from: string;
+  to: string;
+  lockfiles: { path: string; added: number; removed: number; changed: number; changes: { ecosystem: string; name: string; from: string[]; to: string[] }[] }[];
+}
+
+export const dependenciesRes = (key: string, to: number, from: number | null): Res<Dependencies> => ({
+  key: `review/dependencies/${key}/${from ?? "base"}/${to}`,
+  fetch: (s) => reviewApi.dependencies(key, to, from, s),
+});
 export const readinessRes = (key: string): Res<Readiness> => ({ key: `review/land/${key}`, fetch: (s) => reviewApi.readiness(key, s), opts: { on: REVIEW_EVENTS } });
 
 /** Who someone is, in words: `agent:a1b2` → "agent a1b2", `user:ada` → "ada". */

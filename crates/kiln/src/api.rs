@@ -431,6 +431,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (_, ["api", "ci", rest @ ..]) => boxed(|| crate::ci::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "push", rest @ ..]) => boxed(|| crate::push::api::route(&hub, &caller, &method, rest, req)).await.map_err(|(c, m)| err(c, m)),
+        // W20-R11: experiments.
+        (_, ["api", "experiments", rest @ ..]) => {
+            let rest: Vec<&str> = rest.to_vec();
+            let body: serde_json::Value = if method == Method::POST { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
+            boxed(|| crate::ci::experiments::route(&hub, &caller, &method, &rest, &q, body)).await.map_err(|(c, m)| err(c, m))
+        }
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
@@ -535,6 +541,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let name = (*name).to_owned();
             boxed(|| drain_agent(&hub, &name, req)).await
         }
+        (&Method::POST, ["api", "agents", name, "probe"]) => boxed(|| probe_agent(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "front-doors"]) => front_door(boxed(|| crate::frontdoor::control::list(&hub)).await),
         (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(boxed(|| crate::frontdoor::control::get(&hub, name)).await),
         (&Method::PUT, ["api", "runners", name, "front-door"]) => {
@@ -2357,6 +2364,29 @@ async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
     }
 }
 
+/// `POST /api/agents/:name/probe` (docs/ci.md W13-R01, on request): the runner probes its facts
+/// again now. The answer is its new report once it comes (within 30 s), or, when it hasn't yet,
+/// 202 without one.
+pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::Fail> {
+    let Some(before) = hub.agents.lock().get(name).map(|a| a.facts.as_ref().map_or(0, |f| f.probed_at)) else {
+        return Err((StatusCode::NOT_FOUND, format!("no runner `{name}`")));
+    };
+    if !hub.send_to_agent(name, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::ProbeFacts).await {
+        return Err((StatusCode::CONFLICT, format!("{name} isn't connected")));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let fresh = hub.agents.lock().get(name).and_then(|a| a.facts.as_ref().filter(|f| f.probed_at > before).map(|f| serde_json::to_value(f.as_ref()).unwrap_or_default()));
+        if let Some(facts) = fresh {
+            return Ok(srv::json(StatusCode::OK, &json!({ "runner": name, "facts": facts })));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(srv::json(StatusCode::ACCEPTED, &json!({ "runner": name, "facts": null, "note": "asked: its report hasn't come yet" })));
+        }
+        crate::rt::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 fn join_info(hub: &Hub) -> Response {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let token = hub.join_token.clone();
@@ -2417,13 +2447,22 @@ fn outpost_invite(hub: &Hub) -> Response {
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
-    let ephemeral = !persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some();
+    // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
+    // executor's, whatever it asks to be.
+    let pod = if persistent { None } else { hub.executor_tokens.lock().remove(&r.token).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
+    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some());
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
         return Err(err(StatusCode::UNAUTHORIZED, "invalid join token"));
     }
-    let name = crate::pki::sanitize_name(&r.name);
+    let name = match &pod {
+        Some((executor, pod_name, _)) => {
+            hub.pod_executors.lock().insert(pod_name.clone(), executor.clone());
+            pod_name.clone()
+        }
+        None => crate::pki::sanitize_name(&r.name),
+    };
     // An outpost never takes another machine's name: the same machine enrolling again keeps its
     // own, another one gets `<name>-2`.
     let name = if outpost { free_agent_name(hub, &name, &r.hostname).await } else { name };

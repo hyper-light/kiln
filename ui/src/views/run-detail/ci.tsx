@@ -414,6 +414,19 @@ function Tests({ list, counts }: { list: CiTest[]; counts: Record<string, number
   );
 }
 
+/** A test's last results on the branch, oldest first (W16-R03): a bar each, a failure taller. */
+function Spark({ history }: { history: string }) {
+  const n = (of: string) => [...history].filter((o) => of.includes(o)).length;
+  const said = [`${n("p")} passed`, n("fe") ? `${n("fe")} failed` : "", n("s") ? `${n("s")} skipped` : ""].filter(Boolean).join(", ");
+  return (
+    <span className="test-spark" role="img" aria-label={`Its last ${history.length} results: ${said}`} title={`Its last ${history.length} results: ${said}`}>
+      {[...history].map((o, i) => (
+        <i key={i} data-o={o} />
+      ))}
+    </span>
+  );
+}
+
 function TestRow({ t }: { t: CiTest }) {
   return (
     <li className="flex flex-col gap-1 px-5 py-2.5">
@@ -429,6 +442,7 @@ function TestRow({ t }: { t: CiTest }) {
             {t.flaky.class === "flaky" ? "flaky" : "probably flaky"}
           </span>
         )}
+        {t.history && t.history.length > 1 && <Spark history={t.history} />}
         <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a] tabular-nums">
           {t.leg_key}
           {t.duration_ms != null ? ` · ${testTime(t.duration_ms)}` : ""}

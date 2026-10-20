@@ -16,6 +16,7 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod ops;
 pub mod passkeys;
 pub mod passwords;
 pub mod sso;
@@ -382,6 +383,11 @@ pub static ROUTES: &[Rule] = &[
     r("PATCH", "/api/change-requests/*", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/labels", "diffs.review", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/labels/*", "diffs.review", At::Diff(2)),
+    // Experiments (W20-R11): each checked against its repository by its handler.
+    r("GET", "/api/experiments", "runs.read", At::Anywhere),
+    r("GET", "/api/experiments/*", "runs.read", At::Anywhere),
+    r("POST", "/api/experiments", "experiments.run", At::Anywhere),
+    r("POST", "/api/experiments/*/*", "experiments.run", At::Anywhere),
     // Lists narrowed row by row to the repositories the caller may read (W10).
     r("GET", "/api/runs", "runs.read", At::Anywhere),
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
@@ -412,6 +418,8 @@ pub static ROUTES: &[Rule] = &[
     // Who may review is the environment's to say too: the handler checks its reviewers.
     r("POST", "/api/ci/runs/*/approve", "runs.approve", At::Anywhere),
     r("POST", "/api/ci/runs/*/rerun", "runs.rerun", At::Run(3)),
+    // Bisecting a failure is diagnosing it (W20-R09's `diagnose`).
+    r("POST", "/api/ci/runs/*/bisect", "runs.debug", At::Run(3)),
     r("GET", "/api/ci/legs/*", "runs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs", "logs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs/*", "logs.read", At::Job(3)),
@@ -456,6 +464,10 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/environments/board", "runs.read", At::Anywhere),
     r("GET", "/api/ci/environments", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/environments/**", "runs.read", At::RepoQuery),
+    // The store, verified or collected (W08-R01): the server's own.
+    r("POST", "/api/ci/store/*", "settings.manage", At::Server),
+    // A deployment by hand: the workflow that deploys there, dispatched (W15, §4.1).
+    r("POST", "/api/ci/environments/*/deploy", "environments.deploy", At::RepoQuery),
     any("/api/ci/environments", "environments.manage", At::RepoQuery),
     any("/api/ci/environments/**", "environments.manage", At::RepoQuery),
     r("POST", "/api/ci/routing/explain", "runs.read", At::Anywhere),
@@ -496,6 +508,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
     r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
+    r("POST", "/api/agents/*/probe", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),

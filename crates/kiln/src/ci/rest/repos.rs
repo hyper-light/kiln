@@ -3,7 +3,7 @@
 //! - `GET /repos/{o}/{r}`;
 //! - `/commits/{ref}`;
 //! - `/branches/{b}`;
-//! - `/git/ref/{ref}` and `/git/matching-refs/{ref}`;
+//! - `/git/ref/{ref}`, `/git/matching-refs/{ref}` and the older `/git/refs[/{ref}]`;
 //! - `/contents/{path}?ref=`;
 //! - `/tarball/{ref}` and `/zipball/{ref}`;
 //! - `/compare/{base}...{head}`.
@@ -60,6 +60,11 @@ impl Site<'_> {
             }
         }
         None
+    }
+
+    /// The last commit `a` and `b` share, if they share one.
+    pub async fn merge_base(&self, a: &str, b: &str) -> Option<String> {
+        self.text(&["merge-base", a, b]).await.filter(|s| s.len() == 40)
     }
 
     pub fn owner(&self) -> &str {
@@ -221,6 +226,14 @@ pub async fn git_refs(s: &Site<'_>, r: &str, one: bool) -> Response {
     } else {
         srv::json(StatusCode::OK, &Value::Array(found))
     }
+}
+
+/// `GET /git/refs[/{ref}]`, GitHub's older form: the ref when one is named exactly, else the
+/// refs it begins (every ref, with none).
+pub async fn git_refs_older(s: &Site<'_>, r: &str) -> Response {
+    let full = format!("refs/{}", r.trim_start_matches("refs/"));
+    let exact = !r.is_empty() && s.text(&["for-each-ref", "--format=%(refname)", &full]).await.is_some_and(|out| out.lines().any(|l| l == full));
+    git_refs(s, r, exact).await
 }
 
 /// `GET /repos/{o}/{r}/contents/{path}?ref=`: a file (base64, or raw when asked) or a

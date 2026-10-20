@@ -112,8 +112,12 @@ enum Cmd {
     /// Run a command on another runner (`--on linux/amd64`, `--on <name>`): this repo is synced over
     /// first, output streams back, and the exit code is the command's.
     Run(kiln::reach::cli::RunArgs),
-    /// The runners commands can run on, best first for what you need (`kiln runners linux`).
+    /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
+    /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).
     Runners(kiln::reach::cli::RunnersArgs),
+    /// This machine as a CI runner: `kiln runner setup docker|firecracker|shards` takes an
+    /// executor's one-time privileged steps, each said first, `sudo` asked for itself.
+    Runner(kiln::runner::setup::RunnerArgs),
     /// Reach between runners: this runner's identity and pinned keys.
     Reach(kiln::reach::cli::ReachArgs),
     /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
@@ -126,6 +130,16 @@ enum Cmd {
     Secrets(kiln::ci::cli::SecretsArgs),
     /// CI variables (the `vars` context): set, list, delete.
     Vars(kiln::ci::cli::VarsArgs),
+    /// CI integrations, what jobs and deployments reach other systems through: list, verify.
+    Integrations(kiln::ci::cli::IntegrationsArgs),
+    /// CI executor pools: list, set, scale.
+    Pools(kiln::ci::cli::PoolsArgs),
+    /// CI runner images: list, validate, build (and push).
+    Images(kiln::ci::cli::ImagesArgs),
+    /// The CI store of caches, artifacts and the rest: verify (re-hash every chunk), gc.
+    Store(kiln::ci::cli::StoreArgs),
+    /// Experiments: options measured against each other and together (start, list, get, decide, cancel).
+    Experiment(kiln::ci::cli::ExperimentArgs),
     /// The CI OIDC issuer: status, keys to paste or publish, rotation.
     Oidc(kiln::ci::cli::OidcArgs),
     /// CI actions: the mirrored catalog, prefetching, the action policy.
@@ -764,7 +778,13 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             shutdown_on_signals(shutdown.clone());
             boxed(|| kiln::reach::cli::run(a, shutdown)).await
         }
-        Cmd::Runners(a) => kiln::reach::cli::runners(a),
+        Cmd::Runners(mut a) => match a.facts.take() {
+            Some(c) => {
+                let cfg = config::Config::load(&config_path).unwrap_or_default();
+                boxed(|| kiln::ci::cli::runner_facts(c, &cfg)).await
+            }
+            None => kiln::reach::cli::runners(a),
+        },
         Cmd::Reach(a) => kiln::reach::cli::reach(a),
         Cmd::Cd(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
@@ -785,6 +805,26 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Vars(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::ci::cli::vars(a, &cfg)).await
+        }
+        Cmd::Integrations(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::integrations(a, &cfg)).await
+        }
+        Cmd::Pools(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::pools(a, &cfg)).await
+        }
+        Cmd::Images(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::images(a, &cfg)).await
+        }
+        Cmd::Store(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::store(a, &cfg)).await
+        }
+        Cmd::Experiment(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::experiment(a, &cfg)).await
         }
         Cmd::Oidc(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
@@ -813,6 +853,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Auth(a) => boxed(|| kiln::runner::auth::cli(a)).await,
         Cmd::Sbom(a) => boxed(|| kiln::ci::sbom::cli(a)).await,
+        Cmd::Runner(a) => boxed(|| kiln::runner::setup::cli(a)).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.

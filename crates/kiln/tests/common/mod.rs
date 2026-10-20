@@ -125,9 +125,7 @@ labels = ["local"]
 slots = 2
 work_dir = "{work}"
 
-[kubernetes]
-enabled = false
-
+{kubernetes}
 {terminal}
 [discovery]
 enabled = false
@@ -153,6 +151,8 @@ enabled = true
         cd = if o.extra.contains("[cd]") { "" } else { "[cd]\nenabled = false\n" },
         // So do terminals (its own runner's, and into legs: docs/ci.md W17-R01).
         terminal = if o.extra.contains("[terminal]") { "" } else { "[terminal]\nenabled = false\n" },
+        // And pods (a `k8s` pool's: docs/ci.md W13-R07).
+        kubernetes = if o.extra.contains("[kubernetes]") { "" } else { "[kubernetes]\nenabled = false\n" },
     );
     let cfg = dir.join("kiln.toml");
     std::fs::write(&cfg, config)?;

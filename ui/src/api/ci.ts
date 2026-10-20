@@ -246,6 +246,8 @@ export interface CiTest {
   retried: number;
   quarantined: boolean;
   flaky: { class: "flaky" | "probably_flaky"; why: string } | null;
+  /** Its last results on the run's branch, oldest first, a letter each: `p`assed, `f`ailed, `e`rror, `s`kipped (W16-R03). */
+  history?: string | null;
 }
 
 /** A test over a window on a repository's default branch (W16-R03). */
@@ -716,7 +718,12 @@ export type CiImage = { id: string; repo: string | null; name: string; reference
 /** A stored pool, as `PUT /api/ci/pools/:name` takes it. */
 export type CiPoolSpec = { name: string; executor: string; image?: string | null; labels: string[]; min_idle: number; max?: number | null; idle_timeout?: string | null };
 
+/** What runs a repository's CI (W23-R07): the providers chosen, and those its host makes possible. */
+export type CiProviders = { repo: string; providers: string[]; available: string[] };
+
 export const ci = {
+  providers: (repo: string, signal?: AbortSignal) => request<CiProviders>("GET", `/api/ci/repos/${enc(repo)}/providers`, undefined, { signal }),
+  setProviders: (repo: string, providers: string[]) => request<CiProviders>("PUT", `/api/ci/repos/${enc(repo)}/providers`, { providers }),
   pools: (signal?: AbortSignal) => request<{ pools: CiPool[] }>("GET", "/api/ci/pools", undefined, { signal }).then((r) => r.pools),
   /** A pool's scaling history (W21-R08): its executors and the legs waiting for it, a minute apart, oldest first. */
   poolHistory: (name: string, hours: number, signal?: AbortSignal) =>

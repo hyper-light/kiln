@@ -245,6 +245,53 @@ while flow_run is None:
     assert time.time() < deadline, f"the flow's run didn't finish: {rl}"
     time.sleep(0.5)
 
+# W20-R11: an experiment, in a repository of its own: two options, every combination, twice each.
+call("POST", "/api/repos", admin, {"name": "acme/exp", "mode": "native"})
+exp_url = f"http://x:{admin}@127.0.0.1:{port}/git/acme/exp.git"
+exp_repo = os.path.join(work, "exp")
+os.makedirs(os.path.join(exp_repo, ".kiln"))
+git(exp_repo, "init", "-q", "-b", "main")
+open(os.path.join(exp_repo, "README.md"), "w").write("exp\n")
+git(exp_repo, "add", ".")
+git(exp_repo, "commit", "-qm", "first")
+git(exp_repo, "push", "-q", exp_url, "main")
+deadline = time.time() + 60
+while not any(r["name"] == "acme/exp" and r.get("last_polled_at") for r in call("GET", "/api/repos", admin)):
+    assert time.time() < deadline, "acme/exp was never looked at"
+    time.sleep(0.5)
+open(os.path.join(exp_repo, ".kiln", "bench.yaml"), "w").write(r"""on: push
+jobs:
+  bench:
+    runs-on: local
+    steps:
+      - run: |
+          t=100
+          if [ -e fast ]; then t=$((t - 20)); fi
+          if [ -e cache ]; then t=$((t - 10)); fi
+          echo "{\"name\": \"p99_ms\", \"value\": $t, \"unit\": \"ms\"}" >> "$KILN_METRICS"
+""")
+git(exp_repo, "add", ".")
+git(exp_repo, "commit", "-qm", "bench")
+git(exp_repo, "push", "-q", exp_url, "main")
+for branch, file in [("opt-fast", "fast"), ("opt-cache", "cache")]:
+    git(exp_repo, "checkout", "-q", "-B", branch, "main")
+    open(os.path.join(exp_repo, file), "w").write(file + "\n")
+    git(exp_repo, "add", ".")
+    git(exp_repo, "commit", "-qm", branch)
+    git(exp_repo, "push", "-q", exp_url, f"HEAD:{branch}")
+time.sleep(3)
+started = call("POST", "/api/experiments", admin, {
+    "repo": "acme/exp", "question": "Which make the parser faster?",
+    "options": [{"name": "fast", "branch": "opt-fast"}, {"name": "cache", "branch": "opt-cache"}], "strategy": "all",
+    "criteria": [{"name": "bench", "kind": "pipeline", "workflow": ".kiln/bench.yaml", "required": True}, {"name": "time", "kind": "metric", "metric": "p99_ms", "better": "lower"}],
+    "repetitions": 2, "max_parallel": 4,
+})
+experiment = started["experiment"]["id"]
+deadline = time.time() + 600
+while call("GET", f"/api/experiments/{experiment}", admin)["experiment"]["state"] != "done":
+    assert time.time() < deadline, f"{experiment} didn't finish: {call('GET', f'/api/experiments/{experiment}', admin)}"
+    time.sleep(1)
+
 # A second kind of runner: the same metrics, a little faster, one a day over the last ten days.
 dbs = [p for p in glob.glob(os.path.join(data, "**", "*.db"), recursive=True)]
 db = None
@@ -274,4 +321,4 @@ for name, rs in by_name.items():
 db.commit()
 fp = db.execute("SELECT DISTINCT fingerprint FROM metrics").fetchall()
 db.close()
-print(json.dumps({"base": base, "admin": admin, "pid": proc.pid, "runs": runs, "fingerprints": [f[0] for f in fp], "flow_run": flow_run}))
+print(json.dumps({"base": base, "admin": admin, "pid": proc.pid, "runs": runs, "fingerprints": [f[0] for f in fp], "flow_run": flow_run, "experiment": experiment}))

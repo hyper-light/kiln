@@ -460,3 +460,48 @@ fn w07_ac04_kinds() -> anyhow::Result<()> {
     assert!(named(js_pre, "Pre ") && named(docker_post, "Post "), "GitHub's names: {:?}", ran.iter().map(|(n, _)| n).collect::<Vec<_>>());
     Ok(())
 }
+
+const ALPINE: &str = r#"on: push
+jobs:
+  alpine:
+    runs-on: local
+    container: alpine:3.20
+    steps:
+      - id: js
+        uses: kinds/js@v1
+      - run: echo "js=${{ steps.js.outputs.greeting }} libc=$(ls /lib/ld-musl-*)"
+"#;
+
+/// W07-R05: a JavaScript action in an Alpine job container runs on a musl Node, as GitHub's runner
+/// runs one on its `node24_alpine`: its pre, main and post steps, its inputs, outputs and state.
+#[test]
+fn w07_r05_musl_node_in_an_alpine_container() -> anyhow::Result<()> {
+    if !docker_works() || std::env::consts::ARCH != "x86_64" {
+        // GitHub has musl builds for x86-64 only; arm64's need the image's libstdc++.
+        eprintln!("w07_r05_musl_node_in_an_alpine_container: skipped, no Docker or not x86-64");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let src = dir.path().join("src");
+    commit(&src.join("kinds/js"), JS, Some("v1"))?;
+    let repo = dir.path().join("repo");
+    let s = server_for(dir.path(), &src, &repo)?;
+    commit(&repo, &[(".github/workflows/alpine.yml", ALPINE)], None)?;
+    let (run, legs) = finished(&s, 0)?;
+    let leg_id = legs.first().and_then(|l| l.pointer("/leg/id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut steps: Vec<Value> = legs.first().and_then(|l| l.get("steps")).and_then(Value::as_array).cloned().unwrap_or_default();
+    steps.sort_by_key(|x| x.get("seq").and_then(Value::as_i64).unwrap_or(i64::MAX));
+    let mut all = String::new();
+    for x in &steps {
+        let idx = x.get("idx").and_then(Value::as_i64).unwrap_or_default();
+        let (_, log) = http(s.port, "GET", &format!("/api/ci/legs/{leg_id}/logs?step={idx}"), &s.admin, None)?;
+        all.push_str(&format!("--- {} ({})\n{log}\n", x.get("name").and_then(Value::as_str).unwrap_or_default(), x.get("conclusion").and_then(Value::as_str).unwrap_or_default()));
+    }
+    assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("success"), "{run}\n{all}\n{}", s.log());
+    for want in ["js pre: who=acme/kinds", "js main: who=acme/kinds state=pre-was-here", "js post: pre-was-here main-was-here", "js=hello acme/kinds libc=/lib/ld-musl-x86_64.so.1"] {
+        assert!(all.contains(want), "{want:?} in no step:\n{all}");
+    }
+    // Kept where GitHub's runner keeps it, beside the glibc builds.
+    assert!(dir.path().join("work/_externals/node24_alpine/bin/node").is_file(), "{all}");
+    Ok(())
+}

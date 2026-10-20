@@ -504,7 +504,7 @@ pub async fn reviews(s: &Site<'_>, n: &str, job: &Job, body: Option<&Value>) -> 
 
 /// A label as GitHub shows one. Labels have no rows of their own here, so the id comes from the
 /// name.
-fn label_json(s: &Site<'_>, name: &str) -> Value {
+pub(crate) fn label_json(s: &Site<'_>, name: &str) -> Value {
     let id = name.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))) & 0x1f_ffff_ffff_ffff;
     let path: String = name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
     json!({ "id": id, "node_id": format!("kiln-label-{id}"), "url": format!("{}/labels/{path}", s.api), "name": name, "color": "ededed", "default": false, "description": null })

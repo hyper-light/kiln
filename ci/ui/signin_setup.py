@@ -32,6 +32,8 @@ data = os.path.join(work, "data")
 secret = os.path.join(work, "github-secret")
 open(secret, "w").write("not-a-real-secret\n")
 cfg = os.path.join(work, "kiln.toml")
+gl_token = os.path.join(work, "gl-token")
+open(gl_token, "w").write("glpat-ui-check\n")
 open(cfg, "w").write(f"""[server]
 http_addr = "127.0.0.1:{port}"
 quic_addr = "127.0.0.1:{quic}"
@@ -77,6 +79,16 @@ max = 2
 [sso.github]
 client_id = "kiln-check"
 client_secret_file = "{secret}"
+
+# A repository on a GitLab, so its page offers GitLab CI/CD beside KilnCI (W23-R07); the page
+# never asks that GitLab anything, so it needn't be there.
+[[ci.gitlab]]
+url = "http://127.0.0.1:9"
+token_file = "{gl_token}"
+
+[[repos]]
+name = "acme/gl"
+clone_url = "http://127.0.0.1:9/acme/gl.git"
 """)
 # Its own binary name, so nothing that looks for kiln's processes takes it for another's.
 binary = os.path.join(work, "kiln-signin-ui")

@@ -544,7 +544,7 @@ pub fn binaries(hub: &Hub) -> Vec<Binary> {
 }
 
 /// GET with redirects followed (GitHub release assets redirect to their storage).
-async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
+pub(crate) async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
     let mut url = url.to_owned();
     for _ in 0..6 {
         let resp = client.get(&url).timeout(timeout).send().await?;

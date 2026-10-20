@@ -911,6 +911,55 @@ pub(crate) async fn home(hub: &Hub, d: &Diff) -> Result<(Repo, String), Fail> {
     Ok((repo, path.to_string_lossy().into_owned()))
 }
 
+/// The lockfiles kiln reads (W18-R03's) at `rev`, each with the packages it pins; a vendored
+/// tree's aren't the repository's own.
+pub(crate) async fn lockfiles_at(hub: &Hub, path: &str, rev: &str) -> Result<Vec<(String, Vec<kiln_ci::sbom::Package>)>, Fail> {
+    let listed = gitops::run_git(hub, &["-C", path, "ls-tree", "-r", "-z", "--name-only", rev], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+    let mut out = Vec::new();
+    for p in listed.split(|b| *b == 0).filter_map(|p| std::str::from_utf8(p).ok()).filter(|p| !p.is_empty()) {
+        let Some(kind) = kiln_ci::sbom::kind_of(p.rsplit('/').next().unwrap_or(p)) else { continue };
+        if p.split('/').any(|seg| matches!(seg, "node_modules" | "vendor" | "third_party")) {
+            continue;
+        }
+        if out.len() >= 50 {
+            break;
+        }
+        let text = gitops::run_git(hub, &["-C", path, "show", &format!("{rev}:{p}")], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
+        if text.len() > 8 << 20 {
+            continue;
+        }
+        out.push((p.to_owned(), kiln_ci::sbom::parse(kind, &String::from_utf8_lossy(&text)).unwrap_or_default()));
+    }
+    Ok(out)
+}
+
+/// `GET /api/diffs/:id/dependencies?from=&to=` (W18-R03): what a diff's version (the latest unless
+/// said) changes in the dependencies its lockfiles pin, against the commit it was made on (or an
+/// earlier version): each lockfile's packages added, removed, and those whose versions changed.
+async fn dependencies(hub: &Hub, d: &Diff, from: &str, to: &str, from_label: &str, to_label: &str) -> Result<Value, Fail> {
+    let (_, path) = home(hub, d).await?;
+    let (before, after) = (lockfiles_at(hub, &path, from).await?, lockfiles_at(hub, &path, to).await?);
+    let mut paths: Vec<&String> = before.iter().map(|(p, _)| p).chain(after.iter().map(|(p, _)| p)).collect();
+    paths.sort();
+    paths.dedup();
+    let none = Vec::new();
+    let files: Vec<Value> = paths
+        .into_iter()
+        .filter_map(|p| {
+            let b = before.iter().find(|(x, _)| x == p).map_or(&none, |(_, v)| v);
+            let a = after.iter().find(|(x, _)| x == p).map_or(&none, |(_, v)| v);
+            let c = kiln_ci::sbom::changes(b, a);
+            let count = |f: fn(&kiln_ci::sbom::Change) -> bool| c.iter().filter(|x| f(x)).count();
+            (!c.is_empty()).then(|| {
+                json!({
+                    "path": p, "added": count(|x| x.from.is_empty()), "removed": count(|x| x.to.is_empty()), "changed": count(|x| !x.from.is_empty() && !x.to.is_empty()), "changes": c,
+                })
+            })
+        })
+        .collect();
+    Ok(json!({ "diff": d.name, "from": from_label, "to": to_label, "from_commit": from, "to_commit": to, "lockfiles": files }))
+}
+
 fn version_of(list: &[Version], n: &str) -> Result<Version, Fail> {
     let n: u32 = n.trim_start_matches('v').parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("`{n}` isn't a version")))?;
     list.iter().find(|v| v.n == n).cloned().ok_or((StatusCode::NOT_FOUND, format!("no version {n}")))
@@ -1355,6 +1404,20 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     let from = version_of(&vs, q.get("from").map_or("1", String::as_str))?;
                     let to = version_of(&vs, q.get("to").map_or(last.as_str(), String::as_str))?;
                     ok(interdiff(hub, &d, &from, &to).await?)
+                }
+                // W18-R03: what a version changes in the dependencies its lockfiles pin.
+                (&Method::GET, ["dependencies"]) => {
+                    let vs = versions(hub, &d).await.map_err(fail)?;
+                    let last = vs.last().map(|v| v.n.to_string()).unwrap_or_default();
+                    let to = version_of(&vs, q.get("to").map_or(last.as_str(), String::as_str))?;
+                    let (from, from_label) = match q.get("from") {
+                        Some(n) => {
+                            let v = version_of(&vs, n)?;
+                            (v.commit, format!("v{}", v.n))
+                        }
+                        None => (to.parent.clone(), "its base".to_owned()),
+                    };
+                    ok(dependencies(hub, &d, &from, &to.commit, &from_label, &format!("v{}", to.n)).await?)
                 }
                 (&Method::GET, ["comments"]) => ok(json!({ "threads": super::review::threads(hub, &d, &super::review::who(caller).0).await? })),
                 (&Method::POST, ["comments"]) => ok(super::review::comment(hub, &d, caller, body).await?),

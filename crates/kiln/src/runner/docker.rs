@@ -32,13 +32,21 @@ const CALL: Duration = Duration::from_secs(600);
 const SWEEP: Duration = Duration::from_secs(60);
 /// How long services may take to become healthy.
 const HEALTHY_WITHIN: Duration = Duration::from_secs(600);
+/// Says `musl` in a container whose C library is musl (Alpine's): its dynamic loader is.
+const MUSL_PROBE: &str = "for f in /lib/ld-musl-*; do [ -e \"$f\" ] && echo musl && break; done; true";
 
 /// The container CLI on this machine (its full path, so a step's `PATH` can't hide it): `docker`,
-/// else `podman`, when its daemon answers.
+/// else `podman`, when its daemon answers. In a `k8s` pool's pod, the one its Docker sidecar's
+/// copied in (W13-R07).
 pub fn find() -> Option<String> {
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let pod = std::env::var_os("KILN_POD").and(std::env::var_os("KILN_POD_DOCKER")).map(PathBuf::from);
     for bin in ["docker", "podman"] {
-        let Some(full) = std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file()) else { continue };
+        let found = match &pod {
+            Some(p) => (bin == "docker").then(|| p.clone()),
+            None => std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file()),
+        };
+        let Some(full) = found else { continue };
         let ok = std::process::Command::new(&full).args(["version", "--format", "{{.Server.Version}}"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
         if ok {
             return Some(full.to_string_lossy().into_owned());
@@ -550,6 +558,8 @@ pub struct JobContainer {
     /// The image's `PATH`, to which `GITHUB_PATH` entries are prepended.
     pub path: String,
     pub has_bash: bool,
+    /// Its C library is musl (Alpine's), so its JavaScript actions get a musl Node (W07-R05).
+    pub musl: bool,
     pub map: PathMap,
 }
 
@@ -750,11 +760,12 @@ impl Containers {
                 c.cli.run(&[s("start"), id.clone()], &none, CALL).await?;
                 let path = c.image_path(&image).await.unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
                 let has_bash = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s("command -v bash")], &none, CALL).await.is_ok_and(|o| !o.is_empty());
+                let musl = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s(MUSL_PROBE)], &none, CALL).await.is_ok_and(|o| o.trim() == "musl");
                 let (user, home) = match user {
                     Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
                     None => (as_runner, "/github/home".to_owned()),
                 };
-                c.job = Some(JobContainer { id, user, home, path, has_bash, map });
+                c.job = Some(JobContainer { id, user, home, path, has_bash, musl, map });
             }
             // Health checks, then the ports the host got.
             let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();

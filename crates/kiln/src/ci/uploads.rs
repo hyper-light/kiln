@@ -73,7 +73,28 @@ pub async fn heads(hub: &Hub, repo: &str) -> Result<Response, Fail> {
 
 /// `POST /api/ci/repos/:repo/packs?sha=`: a pack holding commit `sha` (thin: its bases may be
 /// commits the server has), kept as `refs/kiln/uploads/<sha>`. 409 when the server lacks a base.
-pub async fn pack(hub: &Hub, repo: &str, q: &HashMap<String, String>, mut body: Incoming, by: &str) -> Result<Response, Fail> {
+pub async fn pack(hub: &Hub, repo: &str, q: &HashMap<String, String>, body: Incoming, by: &str) -> Result<Response, Fail> {
+    pack_from(hub, repo, q, PackFrom::Body(body), by).await
+}
+
+/// Where a pack's bytes come from: a request's body as it streams in, or bytes already read
+/// (`ci.uploads.pack`'s, base64 in its input).
+pub enum PackFrom {
+    Body(Incoming),
+    Bytes(Vec<u8>),
+}
+
+impl PackFrom {
+    async fn next(&mut self) -> anyhow::Result<Option<bytes::Bytes>> {
+        match self {
+            PackFrom::Body(b) => srv::next_chunk(b).await,
+            PackFrom::Bytes(v) => Ok((!v.is_empty()).then(|| bytes::Bytes::from(std::mem::take(v)))),
+        }
+    }
+}
+
+/// The same, from `from`.
+pub async fn pack_from(hub: &Hub, repo: &str, q: &HashMap<String, String>, mut from: PackFrom, by: &str) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let sha = q.get("sha").filter(|s| is_sha(s)).cloned().ok_or_else(|| bad("say which commit the pack holds: ?sha= and its 40 hex digits"))?;
     let m = mirror(hub, &repo)?;
@@ -94,7 +115,7 @@ pub async fn pack(hub: &Hub, repo: &str, q: &HashMap<String, String>, mut body: 
     let mut size = 0usize;
     let mut failed = None;
     loop {
-        match srv::next_chunk(&mut body).await {
+        match from.next().await {
             Ok(Some(c)) => {
                 size += c.len();
                 if size > MAX_PACK {
@@ -212,14 +233,37 @@ fn named(l: &load::Loaded, asked: &str) -> bool {
 
 /// `POST /api/ci/repos/:repo/local-runs`: `{ runs: [{ id, workflow }], skipped: [{ workflow, why }] }`.
 pub async fn local_runs(hub: &Hub, repo: &str, caller: Option<&Caller>, body: Incoming) -> Result<Response, Fail> {
+    let ask: Value = srv::body_json(body, 4 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    local_runs_value(hub, repo, caller, ask).await
+}
+
+/// The same, its request already read (`ci.runs.local`).
+pub async fn local_runs_value(hub: &Hub, repo: &str, caller: Option<&Caller>, ask: Value) -> Result<Response, Fail> {
     if !hub.ci.enabled() {
         return Err((StatusCode::NOT_FOUND, "the CI engine is off ([ci] enabled)".into()));
     }
     let repo = find_repo(hub, repo).await?;
-    let ask: Ask = srv::body_json(body, 4 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    let ask: Ask = serde_json::from_value(ask).map_err(|e| bad(format!("{e}")))?;
+    // The owner's runs are trusted, as the owner's pushes are; anyone else's are a fork's.
+    let (trusted, actor) = match caller {
+        None => (true, "admin".to_owned()),
+        Some(c) => (c.is_owner(), c.name.clone()),
+    };
+    let (runs, skipped) = start_runs(hub, &repo, &ask, trusted, &actor, true).await?;
+    let what = format!("{} {} at {}: {} run(s){}", repo.name, if ask.event.is_empty() { "push" } else { ask.event.as_str() }, ask.sha, runs.len(), if trusted { "" } else { ", untrusted" });
+    hub.store.audit(actor, "ci.runs.local".into(), what).await;
+    Ok(srv::json(StatusCode::CREATED, &json!({ "runs": runs, "skipped": skipped, "trusted": trusted })))
+}
+
+/// The runs `ask` asks for of commit `ask.sha`, `trusted` or not, as `actor`'s: those that started
+/// (`{ id, workflow }`), and those that didn't, with why. Local runs' and bisections'; a
+/// bisection's run its workflow whatever its triggers' filters say (`match_triggers` false).
+pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, actor: &str, match_triggers: bool) -> Result<(Vec<Value>, Vec<Value>), Fail> {
     if !is_sha(&ask.sha) {
         return Err(bad("`sha` is the commit's 40 hex digits"));
     }
+    let repo = repo.clone();
+    let actor = actor.to_owned();
     let m = mirror(hub, &repo)?;
     if gitops::run_git(hub, &["-C", &m, "cat-file", "-e", &format!("{}^{{commit}}", ask.sha)], LS_REMOTE_TIMEOUT).await.is_err() {
         return Err((StatusCode::CONFLICT, format!("the server doesn't have commit {}: send it first (POST …/packs?sha=)", ask.sha)));
@@ -231,11 +275,6 @@ pub async fn local_runs(hub: &Hub, repo: &str, caller: Option<&Caller>, body: In
         "" => format!("refs/heads/{}", super::events::facts(hub, &repo).await.default_branch),
         r if r.starts_with("refs/") => r.to_owned(),
         r => format!("refs/heads/{r}"),
-    };
-    // The owner's runs are trusted, as the owner's pushes are; anyone else's are a fork's.
-    let (trusted, actor) = match caller {
-        None => (true, "admin".to_owned()),
-        Some(c) => (c.is_owner(), c.name.clone()),
     };
     let chosen: Vec<&load::Loaded> = if ask.workflows.is_empty() { commit.workflows.iter().filter(|l| l.runs).collect() } else { commit.workflows.iter().filter(|l| ask.workflows.iter().any(|a| named(l, a))).collect() };
     if let Some(a) = ask.workflows.iter().find(|a| !commit.workflows.iter().any(|l| named(l, a))) {
@@ -269,6 +308,7 @@ pub async fn local_runs(hub: &Hub, repo: &str, caller: Option<&Caller>, body: In
             }
         }
         if let Some(w) = &loaded.workflow
+            && match_triggers
             && !loaded.has_errors()
             && let Err(why) = kiln_ci::trigger::matches(w, &event)
         {
@@ -283,9 +323,7 @@ pub async fn local_runs(hub: &Hub, repo: &str, caller: Option<&Caller>, body: In
             _ => skipped.push(json!({ "workflow": l.path, "why": "the run didn't start" })),
         }
     }
-    let what = format!("{} {} at {}: {} run(s){}", repo.name, event_name, ask.sha, runs.len(), if trusted { "" } else { ", untrusted" });
-    hub.store.audit(actor, "ci.runs.local".into(), what).await;
-    Ok(srv::json(StatusCode::CREATED, &json!({ "runs": runs, "skipped": skipped, "trusted": trusted })))
+    Ok((runs, skipped))
 }
 
 #[derive(Deserialize)]

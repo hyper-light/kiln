@@ -225,6 +225,28 @@ for (const [name, type, phone] of [
         await repoPanel.getByRole("list", { name: "Secrets" }).getByRole("button", { name: "Remove", exact: true }).first().click();
         await repoPanel.getByRole("button", { name: `Remove ${key}` }).click();
         check(name, `${tag}: and removed`, await until(async () => !(await text(repoPanel)).includes(key)), await text(repoPanel));
+        // What runs a repository's CI, on its page (W23-R07): one on a GitLab offers GitLab CI/CD
+        // beside KilnCI, and a choice saved is the one shown after.
+        const openGl = async () => {
+          await page.goto(`${cfg.base}/repos`);
+          await page.locator("table tbody tr", { hasText: "acme/gl" }).first().locator("td").first().click();
+          const panel = page.getByRole("region", { name: "What runs its CI" });
+          await panel.waitFor({ timeout: 30000 });
+          return panel;
+        };
+        let ciPanel = await openGl();
+        const gitlabBox = () => ciPanel.getByRole("checkbox", { name: "GitLab CI/CD" });
+        check(name, `${tag}: KilnCI and GitLab CI/CD offered`, (await ciPanel.getByRole("checkbox", { name: "KilnCI" }).count()) === 1 && (await gitlabBox().count()) === 1, await text(ciPanel));
+        const before = await gitlabBox().isChecked();
+        await gitlabBox().click();
+        await ciPanel.getByRole("button", { name: "Save" }).click();
+        const saved = await until(async () => (await ciPanel.getByRole("button", { name: "Save" }).count()) === 0, 30000);
+        check(name, `${tag}: the panel fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: what runs its CI`, page);
+        await ciPanel.screenshot({ path: `${shots}/repo-providers-${name}-${tag}.png` });
+        ciPanel = await openGl();
+        const after = await gitlabBox().isChecked();
+        check(name, `${tag}: its choice saved`, saved && after === !before, `${before} → ${after}`);
         // A workflow's own variables, in its editor.
         await page.goto(`${cfg.base}/workflows?repo=acme%2Fpeople&path=.kiln%2Fci.yaml`);
         const wfPanel = page.getByRole("region", { name: "This workflow's secrets and variables" });

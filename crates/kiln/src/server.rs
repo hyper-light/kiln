@@ -158,6 +158,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("diff-runs", h => crate::ci::review::runs_loop(h));
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
         child!("attachments", h => crate::ci::attach::run(h));
+        // Bisections and experiments this server was driving when it stopped stopped with it
+        // (docs/ci.md W20).
+        let h = hub.clone();
+        crate::rt::spawn(async move {
+            crate::ci::bisect::interrupted(&h).await;
+            crate::ci::experiments::interrupted(&h).await;
+        });
         child!("registry-collect", h => crate::ci::registry::collect_loop(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));
@@ -196,6 +203,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 k.reap_loop(hub).await
             }
         });
+        // The `k8s` pools' executor pods (docs/ci.md W13-R07).
+        let h = hub.clone();
+        sup::spawn(reg, "k8s-pods", shutdown.clone(), move || crate::ci::pools::reap_pods(h.clone()));
     } else {
         let _ = hub.k8s.set(None);
     }

@@ -55,7 +55,7 @@ for (const [name, type, phoneDevice] of [
     await page.screenshot({ path: `${shots}/review-inbox-${name}-wide.png`, fullPage: true });
 
     // The diff, every file unviewed (a run before may have left one ticked).
-    for (const file of ["big.txt", "moved.rs", "words.txt", "logo.png", "dist/gen.js"]) {
+    for (const file of ["big.txt", "moved.rs", "words.txt", "logo.png", "dist/gen.js", "Cargo.lock"]) {
       await ctx.request.post(cfg.base + "/api/diffs/D1/viewed", { data: { file, viewed: false } });
     }
     await page.goto(cfg.base + "/review/D1");
@@ -77,6 +77,16 @@ for (const [name, type, phoneDevice] of [
       Promise.all(list.map((i) => i.decode().then(() => `${i.naturalWidth}x${i.naturalHeight}`, () => `unloaded ${i.getAttribute("src")}`))),
     );
     check(name, "the image diff shows both sides", loaded.length === 2 && loaded.every((l) => l === "16x16"), JSON.stringify(loaded));
+    // W18-R03: what it does to the dependencies, from its lockfile.
+    const deps = page.getByRole("region", { name: "Dependency changes" });
+    await deps.scrollIntoViewIfNeeded({ timeout: 30000 }).catch(() => {});
+    const depsText = (await deps.innerText({ timeout: 30000 }).catch(() => "")).replace(/\s+/g, " ");
+    check(
+      name,
+      "the dependencies it changes, from its lockfile",
+      /Cargo\.lock 1 added · 1 removed · 1 changed/.test(depsText) && /serde 1\.0\.200 → 1\.0\.210/.test(depsText) && /tokio added 1\.40\.0/.test(depsText) && /rand removed 0\.8\.5/.test(depsText),
+      depsText,
+    );
 
     // Viewed files: ticked, and still ticked after a reload.
     const tick = () => fileOf(page, "words.txt").locator(".rv-viewed input");
