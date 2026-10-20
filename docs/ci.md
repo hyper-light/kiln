@@ -5607,9 +5607,21 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   of a million runs in Chromium and WebKit, desktop and phone (`ci/ui/runs_window_check.mjs`):
   grown to 5,000 runs as it scrolled, fewer than 200 rows rendered, and rows under the middle of
   the screen wherever it was scrolled to.
+- *Done.* R01's hover and the schema's keys, in the editor: a key hovered says what the file's
+  schema says of it (W02-R09's, a GitHub workflow's, a kiln one's or an action's), and a key typed
+  at a line's start (or asked for there, Ctrl-Space) is offered from those its mapping may have,
+  each with its description. Where a position is comes from its indentation alone
+  (`ui/src/lib/yaml-spot.ts`: sequences either way they're written; nothing inside a block
+  scalar), as the text is often half typed. Checked in Chromium and WebKit, desktop and phone
+  (hover on a desktop).
+- *Done.* R06's matrix view, in the plan preview: each job's matrix as written (its axes and
+  their values as a table, `include`, `exclude` and `where` as rows, `platforms`), the legs it
+  makes counted, and the combinations removed with why. The preview's answer carries each job's
+  matrix (`matrices`). Checked in Chromium and WebKit, desktop and phone.
 - *Left.*
-  - R06's flow view and matrix editor, and saving's commit to a branch and push through the App.
-  - R01's hover, schema completion of keys, and the Dockerfile and Agentfile modes.
+  - R06's flow view, editing the matrix in its table, and saving's commit to a branch and push
+    through the App.
+  - R01's Dockerfile and Agentfile modes.
   - R07; R08's image builder and the pools' scaling history; R10 (with W15's pages, the CD
     board's). R09 is the review pages W14-AC06 checks.
   - AC01's Playwright scripts in kiln's own CI, AC02 and AC03.

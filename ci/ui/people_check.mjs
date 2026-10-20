@@ -8,6 +8,8 @@
 // - W09-R11: a repository's secrets on the Repositories page, a workflow's variables in its
 //   editor, each set and removed in place.
 // - W21-R06: the editor's saving, the patch of an edit and a diff opened on the trunk.
+// - W21-R01: the editor's keys from the schema, on hover (desktop) and as one is typed; W21-R06:
+//   the plan preview's matrix as written.
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/people-shots:/shots \
@@ -202,6 +204,26 @@ for (const [name, type, phone] of [
         check(name, `${tag}: the editor fits, saved`, (await overflow(page)) <= 0, String(await overflow(page)));
         const cut = await page.locator("section.panel").first().evaluate((el) => el.scrollWidth - el.clientWidth);
         check(name, `${tag}: nothing in the editor's panel is cut off`, cut <= 0, String(cut));
+        // The plan preview's matrix (W21-R06): its axes and exclude as rows, the legs it makes.
+        const matrix = page.getByRole("table", { name: "Its matrix" });
+        check(name, `${tag}: the matrix as written, its legs counted`, await until(async () => /os linux · mac/i.test(await text(matrix)) && /exclude os: mac, n: 1/i.test(await text(matrix)) && /3 legs · 1 removed/i.test(await text(page.getByRole("region", { name: "Job build" })))), await text(page.getByRole("region", { name: "Job build" })));
+        // The editor knows the schema's keys (W21-R01): what one is, on hover; a step's, as typed.
+        if (tag === "wide") {
+          await page.locator(".cm-content").getByText("runs-on", { exact: true }).first().hover();
+          const tip = page.locator(".cm-tooltip-hover .cm-hover-words");
+          check(name, `${tag}: a key's hover says what it is`, await until(async () => /label/i.test(await text(tip))), await text(tip));
+          await page.mouse.move(0, 0);
+        }
+        await page.locator(".cm-line", { hasText: "- run: echo hi" }).first().click();
+        await page.keyboard.press("End");
+        // The new line and its indentation as text: emulated Android (the phone's Chromium) sends no
+        // Enter CodeMirror takes, as a real keyboard's input events would.
+        await page.keyboard.insertText("\n        ");
+        await page.keyboard.type("shel");
+        const offered = page.locator(".cm-tooltip-autocomplete li", { hasText: "shell" }).first();
+        check(name, `${tag}: a step's keys offered as one is typed`, await until(async () => (await offered.count()) > 0), await text(page.locator(".cm-tooltip-autocomplete").first()));
+        await offered.click();
+        check(name, `${tag}: and the one chosen written`, await until(async () => /shell: /.test(await page.locator(".cm-content").innerText())), await text(page.locator(".cm-content")));
         await page.screenshot({ path: `${shots}/workflow-saved-${name}-${tag}.png`, fullPage: true });
         check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
         await ctx.close();

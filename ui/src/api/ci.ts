@@ -1,5 +1,6 @@
 /** The CI engine (docs/ci.md §4.1): the /api/ci routes the run, leg and editor pages read. */
 import { ApiError, request } from "./client";
+import type { Schema } from "@/lib/yaml-spot";
 
 const enc = encodeURIComponent;
 const at = (attempt?: number) => (attempt ? `?attempt=${attempt}` : "");
@@ -325,6 +326,18 @@ export interface CiPreview {
     later: string[];
     error?: string;
   } | null;
+  /** Each job's matrix as written (W21-R06's matrix view). */
+  matrices?: Record<string, CiMatrix>;
+}
+
+/** A job's matrix as written: its axes' values (or the expression that makes them), `include`, `exclude` and `where`; or the expression that makes it whole. */
+export interface CiMatrix {
+  axes?: { name: string; values: unknown[] | string }[];
+  include?: unknown;
+  exclude?: unknown;
+  where?: string | null;
+  platforms?: unknown;
+  expr?: string;
 }
 
 export type RerunMode = "all" | "failed" | "job";
@@ -656,6 +669,8 @@ export const ci = {
   /** A leg's attempts, oldest first, each with its failure class, and its outputs (W21-R05). */
   legDetail: (leg: string, signal?: AbortSignal) => request<{ attempts: CiAttempt[]; outputs: Record<string, string> }>("GET", `/api/ci/legs/${enc(leg)}`, undefined, { signal }),
   validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
+  /** The JSON Schema of a kind of file (W02-R09): `gha`, `kiln`, `overlay` or `action`, for the editor's key completion and hover. */
+  schema: (kind: "gha" | "kiln" | "overlay" | "action") => request<Schema>("GET", `/api/ci/schema/${kind}`),
   /** A workflow's new text proposed as a diff on the trunk of a repository kiln hosts (W21-R06, `ci.workflows.edit`), checked first. */
   proposeWorkflow: (repo: string, path: string, content: string) =>
     request<{ diffs: { name: string; title: string; kind: string; url: string }[] }>("POST", "/api/ops/ci.workflows.edit", { repo, path, content }),

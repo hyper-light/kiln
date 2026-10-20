@@ -106,7 +106,7 @@ call("POST", "/api/users", admin, {"name": "dev", "grants": ["viewer"]})
 call("POST", "/api/repos", admin, {"name": "acme/people", "mode": "native"})
 src = os.path.join(work, "people-src")
 os.makedirs(os.path.join(src, ".kiln"))
-open(os.path.join(src, ".kiln", "ci.yaml"), "w").write("on: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo hi\n")
+open(os.path.join(src, ".kiln", "ci.yaml"), "w").write("on: push\njobs:\n  build:\n    runs-on: local\n    strategy:\n      matrix:\n        os: [linux, mac]\n        n: [1, 2]\n        exclude:\n          - { os: mac, n: 1 }\n    steps:\n      - run: echo hi\n")
 genv = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="lead", GIT_AUTHOR_EMAIL="lead@example.invalid", GIT_COMMITTER_NAME="lead", GIT_COMMITTER_EMAIL="lead@example.invalid")
 for args in (["init", "-q", "-b", "main"], ["add", "."], ["commit", "-qm", "A workflow"], ["push", "-q", f"http://x:{admin}@127.0.0.1:{port}/git/acme/people.git", "main"]):
     subprocess.run(["git", "-C", src, *args], env=genv, check=True, capture_output=True)

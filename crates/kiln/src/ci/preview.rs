@@ -9,7 +9,8 @@
 //!
 //! The answer: the workflow's diagnostics, whether the event starts it (and why not), and the
 //! plan: legs with their values and routing against the runners connected now, what was decided
-//! and why, combinations removed, and jobs decided only when their needs finish.
+//! and why, combinations removed, and jobs decided only when their needs finish; and each job's
+//! matrix as written, for the builder's matrix view (W21-R06).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,6 +77,7 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
     let matched = kiln_ci::trigger::matches(&w, &event);
     // What the action policies refuse among its own `uses:` (a run checks the nested ones too).
     let policy = super::actions::refusals(&super::actions::policies(hub, &repo).await, super::actions::uses_of(&w));
+    let matrices = matrices(&w);
     let (tx, rx) = async_channel::bounded(1);
     let start = Start { repo, event, path, workflow: Arc::new(w), message: String::new(), author: String::new(), actions: Default::default(), inputs, given: Default::default() };
     hub.ci.send(Msg::Preview { start: Box::new(start), reply: tx });
@@ -84,7 +86,35 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
         _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "The CI dispatcher didn't answer.".into())),
     };
     let why = matched.as_ref().err().map(ToString::to_string);
-    Ok(srv::json(StatusCode::OK, &merge(base, json!({ "event": event_name, "runs": matched.is_ok() && policy.is_empty(), "why": why, "policy": policy, "plan": plan }))))
+    Ok(srv::json(StatusCode::OK, &merge(base, json!({ "event": event_name, "runs": matched.is_ok() && policy.is_empty(), "why": why, "policy": policy, "plan": plan, "matrices": matrices }))))
+}
+
+/// Each job's matrix as written (W21-R06's matrix view): its axes and their values (or the
+/// expression that makes them), `include`, `exclude` and `where`; or the expression that makes
+/// the whole matrix.
+fn matrices(w: &kiln_ci::wf::Workflow) -> serde_json::Map<String, Value> {
+    use kiln_ci::wf::ir::{Axis, Matrix};
+    let axis = |a: &Axis| match a {
+        Axis::Values(v) => json!(v),
+        Axis::Expr(t) => json!(t.src),
+    };
+    w.jobs
+        .iter()
+        .filter_map(|j| {
+            let m = j.strategy.as_ref()?.matrix.as_ref()?;
+            let v = match m {
+                Matrix::Spec(m) => json!({
+                    "axes": m.axes.iter().map(|(name, a)| json!({ "name": name, "values": axis(a) })).collect::<Vec<_>>(),
+                    "include": m.include,
+                    "exclude": m.exclude,
+                    "where": m.filter.as_ref().map(|t| t.src.clone()),
+                    "platforms": m.platforms.as_ref().map(axis),
+                }),
+                Matrix::Expr(t) => json!({ "expr": t.src }),
+            };
+            Some((j.id.clone(), v))
+        })
+        .collect()
 }
 
 fn merge(mut a: Value, b: Value) -> Value {

@@ -8,13 +8,14 @@
 import * as React from "react";
 import { Download } from "lucide-react";
 import { api } from "@/api/client";
-import { ci, type CiOutline, type CiPreview } from "@/api/ci";
+import { ci, type CiMatrix, type CiOutline, type CiPreview } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link, useSearchParams } from "@/lib/router";
 import { unifiedPatch } from "@/lib/patch";
+import { describe, keysAt, yamlSpot, type Schema } from "@/lib/yaml-spot";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
@@ -142,9 +143,36 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
   const [preview, setPreview] = React.useState<CiPreview | null>(null);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
-  const known = React.useRef<{ outline: CiOutline | null; names?: { secrets: string[]; variables: string[] }; catalog?: { label: string; detail: string }[]; timer?: number; asked?: number }>({
+  const known = React.useRef<{
+    outline: CiOutline | null;
+    names?: { secrets: string[]; variables: string[] };
+    catalog?: { label: string; detail: string }[];
+    schema?: Schema;
+    schemaAsked?: boolean;
+    timer?: number;
+    asked?: number;
+  }>({
     outline: file.outline,
   });
+  // The file's schema (W02-R09): the keys a mapping may have, and what each is (W21-R01).
+  const kind = path.startsWith(".github/workflows/") ? "gha" : /(^|\/)action\.ya?ml$/.test(path) ? "action" : "kiln";
+  const schema = (): Schema | undefined => {
+    if (!known.current.schemaAsked) {
+      known.current.schemaAsked = true;
+      ci.schema(kind).then(
+        (s) => (known.current.schema = s),
+        () => (known.current.schemaAsked = false),
+      );
+    }
+    return known.current.schema;
+  };
+  const hover = (content: string, pos: number) => {
+    const s = schema();
+    const spot = s ? yamlSpot(content, pos) : null;
+    if (!s || !spot?.key) return null;
+    const text = describe(s, [...spot.path, spot.key.name]);
+    return text ? { from: spot.key.from, to: spot.key.to, text } : null;
+  };
 
   const ask = (content: string, ev: string) => {
     window.clearTimeout(known.current.timer);
@@ -164,6 +192,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   };
 
   const lint = async (content: string): Promise<Diagnostic[]> => {
+    schema();
     const r = await ci.validate(path, content);
     known.current.outline = r.outline ?? known.current.outline;
     const errors = r.diagnostics.filter((d) => d.severity === "error").length;
@@ -231,6 +260,14 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     }
     const runsOn = ctx.matchBefore(/\bruns-on:\s*[\w.-]*$/);
     if (runsOn) return { from: runsOn.from + (/^runs-on:\s*/.exec(runsOn.text)?.[0].length ?? 0), options: HOSTED.map((label) => ({ label, detail: "label" })) };
+    // A key being typed at a line's start (or asked for there): the keys its mapping may have.
+    const typing = ctx.matchBefore(/^\s*(?:-\s+)*[\w.-]*$/);
+    const word = /[\w.-]*$/.exec(typing?.text ?? "")?.[0] ?? "";
+    if (typing && (word || ctx.explicit)) {
+      const s = schema() ?? (known.current.schema = await ci.schema(kind).catch(() => undefined));
+      const spot = s ? yamlSpot(ctx.state.doc.toString(), ctx.pos) : null;
+      if (s && spot) return { from: ctx.pos - word.length, options: keysAt(s, spot.path).map((k) => ({ label: k.key, info: k.description, apply: `${k.key}: ` })) };
+    }
     return null;
   };
 
@@ -284,7 +321,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
         }
       >
         <React.Suspense fallback={<Hold height={420} />}>
-          <CodeEditor value={file.source} onChange={setText} lint={lint} complete={complete} label={`Editing ${path}`} />
+          <CodeEditor value={file.source} onChange={setText} lint={lint} complete={complete} hover={hover} label={`Editing ${path}`} />
         </React.Suspense>
         {/* Under the edit, so a phone's header keeps to Copy and Download. */}
         {(changed || saved) && (
@@ -329,6 +366,38 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   );
 }
 
+/** A job's matrix as written (W21-R06): its axes as a table, then `include`, `exclude` and `where` as rows. */
+function MatrixView({ m }: { m: CiMatrix }) {
+  const value = (v: unknown) => (typeof v === "string" ? v : JSON.stringify(v));
+  const each = (v: unknown): unknown[] => (Array.isArray(v) ? v : v == null ? [] : [v]);
+  const pairs = (o: unknown) =>
+    o && typeof o === "object" && !Array.isArray(o)
+      ? Object.entries(o)
+          .map(([k, v]) => `${k}: ${value(v)}`)
+          .join(", ")
+      : value(o);
+  const row = (key: string, label: string, text: string) => (
+    <tr key={key}>
+      <th scope="row" className="w-0 pr-3 text-left align-top font-normal whitespace-nowrap text-[#93a1b4]">
+        {label}
+      </th>
+      <td className="[overflow-wrap:anywhere] text-[#d4dde8]">{text}</td>
+    </tr>
+  );
+  if (m.expr) return <p className="mb-2 font-mono text-[11.5px] leading-[1.6] [overflow-wrap:anywhere] text-[#a6b2c6]">matrix: {m.expr}</p>;
+  return (
+    <table className="mb-2 w-full font-mono text-[11.5px] leading-[1.6]" aria-label="Its matrix">
+      <tbody>
+        {m.axes?.map((a) => row(`a-${a.name}`, a.name, Array.isArray(a.values) ? a.values.map(value).join(" · ") : a.values))}
+        {m.platforms != null && row("platforms", "platforms", Array.isArray(m.platforms) ? m.platforms.map(value).join(" · ") : value(m.platforms))}
+        {each(m.include).map((r, i) => row(`i${i}`, "include", pairs(r)))}
+        {each(m.exclude).map((r, i) => row(`e${i}`, "exclude", pairs(r)))}
+        {m.where && row("where", "where", m.where)}
+      </tbody>
+    </table>
+  );
+}
+
 function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | null; error: string | null; event: string; onEvent: (e: string) => void }) {
   const plan = preview?.plan;
   const byJob = new Map<string, NonNullable<typeof plan>["legs"]>();
@@ -360,8 +429,10 @@ function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | 
                 <div className="label mb-1.5">
                   {job}
                   {legs.length > 1 ? ` · ${legs.length} legs` : ""}
+                  {plan.removed[job]?.length ? ` · ${plan.removed[job]?.length} removed` : ""}
                 </div>
               )}
+              {preview?.matrices?.[job] && <MatrixView m={preview.matrices[job]} />}
               <ul className="flex flex-col gap-1">
                 {legs.map((l) => {
                   const fits = l.routing?.runners.filter((r) => r.eligible) ?? [];
