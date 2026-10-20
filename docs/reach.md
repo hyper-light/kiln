@@ -117,7 +117,10 @@ and reach never waits on the runner: output to the server is batched, many messa
 
 ### 4.2 Runs
 
-Shell text, run by `bash -c` (`sh` where there is none) in its own process group, with the
+Shell text, run by `bash -c` (`sh` where there is none; on Windows, Git for Windows' bash, found on
+PATH, beside the `git` on PATH or where it installs, and never WSL's `bash.exe`, which would run the
+command in Linux and, with no Linux installed, hangs: without a bash the run fails at once, saying
+so) in its own process group, with the
 environment a login shell of the machine's user has (resolved once, kept 10 minutes; the PATH
 people's tools live on), plus `KILN_REACH_FROM=<asking runner>`. A named shell (`--shell`, the
 tool's `shell`) carries its working folder and exported variables from one run to the next.
