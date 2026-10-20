@@ -313,12 +313,13 @@ fn traces_from_opentelemetry_s_sdk_are_kiln_s_traces_services_and_map() -> anyho
     let calls = at(&svc, &["calls"]).as_array().cloned().unwrap_or_default();
     anyhow::ensure!(calls.iter().any(|c| at(c, &["peer.service"]) == "postgresql" && at(c, &["hits"]).as_f64() == Some(ORDERS as f64) && at(c, &["errors"]).as_f64() == Some(errors)), "{calls:?}");
 
-    // The map: the frontend calls the cart (its spans answered it), the cart its database (named).
+    // The map: the frontend calls the cart (its spans answered it), the cart its database (named),
+    // each from the trace metrics that count its calls (the callers' calls out, by peer).
     let m = f.call("GET", &format!("/api/observe/v1/apm/map?{range}"), None)?;
     let edge = |from: &str, to: &str| at(&m, &["edges"]).as_array().and_then(|e| e.iter().find(|x| at(x, &["from"]) == from && at(x, &["to"]) == to).cloned()).unwrap_or(Value::Null);
     let (fc, cd) = (edge("frontend", "cart"), edge("cart", "postgresql"));
-    anyhow::ensure!(at(&fc, &["calls"]).as_f64() == Some(ORDERS as f64) && at(&fc, &["inferred"]) == false, "{m}");
-    anyhow::ensure!(at(&cd, &["calls"]).as_f64() == Some(ORDERS as f64) && at(&cd, &["errors"]).as_f64() == Some(errors) && at(&cd, &["inferred"]) == true, "{m}");
+    anyhow::ensure!(at(&fc, &["calls"]).as_f64() == Some(ORDERS as f64) && at(&fc, &["inferred"]) == false && at(&fc, &["counted"]) == true, "{m}");
+    anyhow::ensure!(at(&cd, &["calls"]).as_f64() == Some(ORDERS as f64) && at(&cd, &["errors"]).as_f64() == Some(errors) && at(&cd, &["inferred"]) == true && at(&cd, &["counted"]) == true, "{m}");
     eprintln!("  traces     {ORDERS} requests, 4 spans each across two services (OTLP/HTTP and OTLP/gRPC), traces by id, logs by trace, services, resources, calls and the map: all in kiln");
     Ok(())
 }

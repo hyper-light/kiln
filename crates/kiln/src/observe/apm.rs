@@ -323,8 +323,8 @@ pub async fn service(name: &str, q: &HashMap<String, String>) -> Result<Response
 }
 
 /// The service map over the range (15 minutes unless asked): who calls whom, from the spans, one
-/// trace in `k` past [`MAP_SPANS`] (its counts scaled up to the whole); each service's requests and
-/// errors from its trace metrics.
+/// trace in `k` past [`MAP_SPANS`]; its figures from the trace metrics (`kiln_obs::apm::figures`),
+/// the spans' (`k` times) where they have none.
 pub async fn map(q: &HashMap<String, String>) -> Result<Response, Fail> {
     let (from, to) = range(q, 15 * 60_000)?;
     let env = env_filter(q);
@@ -344,36 +344,18 @@ pub async fn map(q: &HashMap<String, String>) -> Result<Response, Fail> {
         })
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let map = m.finish();
-        #[allow(clippy::cast_precision_loss)]
-        let scale = |n: u64| (n * k) as f64;
-        // A service's requests and errors are its trace metrics' (every request, a trace sampled
-        // away or not: an Agent's stats count those it drops), else its calls out's (a service only
-        // of calls, a tracer's integration's); the spans' only where the range's metrics have none.
+        // Its figures the trace metrics' (every request and call, a trace sampled away or not: an
+        // Agent's stats and a runner's concentrator count those dropped), each edge its share of
+        // the groups that count its calls; the spans' only where the metrics have none.
         let filter: Vec<(&str, &str)> = env.as_deref().map(|e| ("env", e)).into_iter().collect();
-        let entries = kiln_obs::apm::red(s, false, &filter, "service", from, to).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let exits = kiln_obs::apm::red(s, true, &filter, "service", from, to).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let figures = |service: &str| entries.iter().chain(&exits).find(|r| r.group == service && r.hits > 0.0).map(|r| (r.hits, r.errors));
-        let mut nodes: Vec<Value> = map
-            .nodes
-            .iter()
-            .map(|n| {
-                let (hits, errors) = if n.inferred { (scale(n.hits), scale(n.errors)) } else { figures(&n.service).unwrap_or((scale(n.hits), scale(n.errors))) };
-                json!({ "service": n.service, "hits": hits, "errors": errors, "inferred": n.inferred })
-            })
-            .collect();
-        // A service of requests in the range none of whose spans were kept is on the map still.
-        for r in entries.iter().filter(|r| r.hits > 0.0 && r.group != kiln_obs::logs::metrics::NONE) {
-            if !map.nodes.iter().any(|n| n.service == r.group) {
-                nodes.push(json!({ "service": r.group, "hits": r.hits, "errors": r.errors, "inferred": false }));
-            }
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let edges: Vec<Value> = map
-            .edges
-            .iter()
-            .map(|e| json!({ "from": e.from, "to": e.to, "calls": scale(e.calls), "errors": scale(e.errors), "avg_s": (e.calls > 0).then(|| e.duration_ns as f64 / e.calls as f64 / 1e9), "inferred": e.inferred }))
-            .collect();
-        Ok(srv::json(StatusCode::OK, &json!({ "from": from, "to": to, "nodes": nodes, "edges": edges, "spans_read": map.spans, "sampled_one_in": k, "took_ms": started.elapsed().as_secs_f64() * 1000.0 })))
+        let figures = kiln_obs::apm::figures(s, &map, &filter, from, to, k).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let nodes: Vec<Value> = figures.nodes.iter().map(|n| json!({ "service": n.service, "hits": n.hits, "errors": n.errors, "inferred": n.inferred })).collect();
+        let edges: Vec<Value> =
+            figures.edges.iter().map(|e| json!({ "from": e.from, "to": e.to, "calls": e.calls, "errors": e.errors, "avg_s": e.avg_s, "inferred": e.inferred, "counted": e.counted })).collect();
+        Ok(srv::json(
+            StatusCode::OK,
+            &json!({ "from": from, "to": to, "nodes": nodes, "edges": edges, "spans_read": map.spans, "sampled_one_in": k, "took_ms": started.elapsed().as_secs_f64() * 1000.0 }),
+        ))
     })
     .await
 }

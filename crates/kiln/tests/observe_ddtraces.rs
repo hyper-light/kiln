@@ -360,9 +360,13 @@ fn the_traces_and_their_metrics(f: &Fleet, t0: i64, ids: &Value, host: &str, log
     let edge = |from: &str, to: &str| at(&m, &["edges"]).as_array().and_then(|e| e.iter().find(|x| at(x, &["from"]) == from && at(x, &["to"]) == to).cloned()).unwrap_or(Value::Null);
     let node = |name: &str| at(&m, &["nodes"]).as_array().and_then(|e| e.iter().find(|x| at(x, &["service"]) == name).cloned()).unwrap_or(Value::Null);
     let kept_n = (0..ORDERS).filter(|&i| kept(i)).count() as f64;
+    // Every call, kept or dropped: each edge's share of the trace metrics that count its calls (the
+    // requests integration's calls out, the database's spans its entries), not the kept traces'.
     for (from, to) in [("shop", "requests"), ("requests", "cart"), ("cart", "cart-db")] {
-        anyhow::ensure!(at(&edge(from, to), &["calls"]).as_f64() == Some(kept_n), "{from} -> {to}: {m}");
+        let e = edge(from, to);
+        anyhow::ensure!(at(&e, &["calls"]).as_f64() == Some(ORDERS as f64) && at(&e, &["counted"]) == true, "{from} -> {to}: {m}");
     }
+    anyhow::ensure!(at(&edge("cart", "cart-db"), &["errors"]).as_f64() == Some(errors), "the database's failures, every one: {m}");
     for name in ["shop", "cart", "cart-db"] {
         anyhow::ensure!(at(&node(name), &["hits"]).as_f64() == Some(ORDERS as f64) && at(&node(name), &["errors"]).as_f64() == Some(errors), "{name}: {m}");
     }
@@ -409,8 +413,9 @@ fn datadog_s_tracer_straight_to_a_kiln_runner_is_kiln_s_traces_and_their_trace_m
     Ok(())
 }
 
-/// A tracer's `/v0.4/traces` payload of one trace of `service`: its request's span and a call out,
-/// the request's sampling priority as its tracer decided it.
+/// A tracer's `/v0.4/traces` payload of one trace of `service`: its request's span and a call out
+/// to its database (`peer.service` `<service>-db`), the request's sampling priority as its tracer
+/// decided it.
 fn v04_trace(service: &str, trace: u64, start_ns: i64, priority: f64) -> Vec<u8> {
     fn s(out: &mut Vec<u8>, v: &str) {
         out.push(0xd9);
@@ -421,6 +426,7 @@ fn v04_trace(service: &str, trace: u64, start_ns: i64, priority: f64) -> Vec<u8>
         out.push(0xcf);
         out.extend_from_slice(&v.to_be_bytes());
     }
+    let db = format!("{service}-db");
     let mut b = vec![0x91, 0x92];
     for (span, parent, kind, name) in [(1u64, 0u64, "server", "GET /a"), (2, 1, "client", "GET")] {
         b.push(0x8a);
@@ -439,11 +445,15 @@ fn v04_trace(service: &str, trace: u64, start_ns: i64, priority: f64) -> Vec<u8>
         s(&mut b, "duration");
         u(&mut b, 2_000_000);
         s(&mut b, "meta");
-        b.push(0x82);
+        b.push(if parent == 0 { 0x82 } else { 0x83 });
         s(&mut b, "span.kind");
         s(&mut b, kind);
         s(&mut b, "env");
         s(&mut b, "sampled");
+        if parent != 0 {
+            s(&mut b, "peer.service");
+            s(&mut b, &db);
+        }
         s(&mut b, "metrics");
         if parent == 0 {
             b.push(0x81);
@@ -563,7 +573,12 @@ fn a_tracer_straight_to_kiln_keeps_its_share_and_every_trace_is_counted() -> any
         },
         &|| format!("{sent} sent; trace.hits and trace.outbound.hits {:?}\n{}", last.get(), f.logs()),
     )?;
-    eprintln!("  sampled    {sent} traces sent, {} kept ({:.0}% at the end, its rate {rate:.3}); every one counted", kept.len(), 100.0 * share);
+    // The map: its calls to its database every one sent, from the trace metrics, though a tenth of
+    // its traces are kept.
+    let m = f.call("GET", &format!("/api/observe/v1/apm/map?from={from}&to={to}"), None)?;
+    let e = at(&m, &["edges"]).as_array().and_then(|e| e.iter().find(|x| at(x, &["from"]) == "busy" && at(x, &["to"]) == "busy-db").cloned()).unwrap_or(Value::Null);
+    anyhow::ensure!(at(&e, &["calls"]).as_f64() == Some(sent as f64) && at(&e, &["counted"]) == true && at(&e, &["inferred"]) == true, "busy -> busy-db: {e}\n{m}");
+    eprintln!("  sampled    {sent} traces sent, {} kept ({:.0}% at the end, its rate {rate:.3}); every one counted, on the map too", kept.len(), 100.0 * share);
     Ok(())
 }
 

@@ -511,6 +511,11 @@ fn median(mut v: Vec<u64>) -> u64 {
 }
 
 fn main() {
+    // `map`: the service map's alone.
+    if std::env::args().any(|a| a == "map") {
+        map_bench();
+        return;
+    }
     println!("{:<30} {:>6} {:>9} {:>10} {:>10} {:>11} {:>10} {:>8}", "request", "spans", "bytes", "rows B/s", "lz4 B/s", "decode ns/s", "allocs/s", "faults");
     let at = 1_800_000_000_000_000_000u64;
     for spans in [512usize, 4096] {
@@ -821,6 +826,118 @@ fn main() {
         };
         let (up, raw) = (time(true), time(false));
         println!("{name:<8} by resource: {:>8.2} ms read from rollups, {:>8.2} ms from every sample ({:.1}x)", up as f64 / 1e6, raw as f64 / 1e6, raw as f64 / up as f64);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    map_bench();
+}
+
+/// A fleet's service map: 100 services, each serving three resources and calling three peers (its
+/// database, a cache they share, the next service, whose request answers the call), an hour of
+/// their trace metrics; the map read from 200,000 spans (the most it reads, `MAP_SPANS`) and its
+/// figures from the metrics.
+fn map_bench() {
+    use kiln_obs::batch::{Builder, Kind, SeriesKey};
+    use kiln_obs::logs::record::{Record, Rows, put_row};
+    const SERVICES: usize = 100;
+    // An hour's start (ms).
+    let start = 1_800_000_000_000i64;
+    let dir = std::env::temp_dir().join(format!("kiln-map-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut st = kiln_obs::store::Store::open(&dir, kiln_obs::hash::Keyed::with_keys(1, 2)).unwrap();
+    let svc = |i: usize| format!("svc-{}", i % SERVICES);
+    let mut keys = Vec::new();
+    for i in 0..SERVICES {
+        let s = svc(i);
+        for r in 0..3 {
+            let res = format!("GET /r/{r}");
+            let tags = [("env", "prod"), ("http.status_code", "200"), ("resource_name", res.as_str()), ("service", s.as_str()), ("span.kind", "server")];
+            for name in ["trace.hits", "trace.errors", "trace.duration.sum"] {
+                keys.push(SeriesKey::new(name, tags.iter().copied(), Kind::Count).unwrap());
+            }
+        }
+        let (db, next) = (format!("db-{i}"), svc(i + 1));
+        for peer in [db.as_str(), "cache", next.as_str()] {
+            let tags = [("env", "prod"), ("peer.service", peer), ("resource_name", "call"), ("service", s.as_str()), ("span.kind", "client")];
+            for name in ["trace.outbound.hits", "trace.outbound.errors", "trace.outbound.duration.sum"] {
+                keys.push(SeriesKey::new(name, tags.iter().copied(), Kind::Count).unwrap());
+            }
+        }
+    }
+    let mut b = Builder::new();
+    for k in &keys {
+        b.define(k);
+    }
+    let mut rng = kiln_obs::testkit::Rng::new(5);
+    for k in &keys {
+        b.run(k.fp, (0..360).map(|i| (start + i * 10_000, rng.below(20) as f64)).collect::<Vec<_>>());
+    }
+    st.apply(&b.finish()).unwrap();
+    // 40,000 traces of five spans: a service's request, its three calls out, the next service's
+    // request answering the third.
+    let span = |service: &str, trace: u64, id: u8, parent: Option<u8>, kind: &str, peer: Option<&str>, ts: i64| {
+        let mut attrs = vec![("span.kind".to_owned(), kind.to_owned()), ("duration".to_owned(), "1000000".to_owned())];
+        if let Some(p) = parent {
+            attrs.push(("parent_id".to_owned(), format!("{p:02x}").repeat(8)));
+        }
+        if let Some(p) = peer {
+            attrs.push(("peer.service".to_owned(), p.to_owned()));
+        }
+        let mut id128 = [0u8; 16];
+        id128[8..].copy_from_slice(&trace.to_le_bytes());
+        Record { ts, severity: 9, service: service.to_owned(), host: "h".into(), source: "otel".into(), message: "op".into(), attrs, trace_id: Some(id128), span_id: Some([id; 8]) }
+    };
+    let (mut raw, mut prev, mut n) = (Vec::new(), 0i64, 0usize);
+    for t in 0..40_000u64 {
+        let i = t as usize % SERVICES;
+        let (s, next, db) = (svc(i), svc(i + 1), format!("db-{i}"));
+        let ts = (start + (t as i64 * 3_600_000 / 40_000)) * 1_000_000;
+        for r in [
+            span(&s, t, 1, None, "server", None, ts),
+            span(&s, t, 2, Some(1), "client", Some(&db), ts + 1),
+            span(&s, t, 3, Some(1), "client", Some("cache"), ts + 2),
+            span(&s, t, 4, Some(1), "client", Some(&next), ts + 3),
+            span(&next, t, 5, Some(4), "server", None, ts + 4),
+        ] {
+            put_row(&mut raw, &r, prev);
+            prev = r.ts;
+            n += 1;
+        }
+    }
+    let build = || {
+        let mut m = kiln_obs::apm::MapBuilder::new();
+        let mut rows = Rows::new(&raw, n);
+        while let Some(r) = rows.next_row().unwrap() {
+            m.take(&r);
+        }
+        m.finish()
+    };
+    let map = build();
+    let ns = median(
+        (0..7)
+            .map(|_| {
+                let t = Instant::now();
+                std::hint::black_box(build());
+                t.elapsed().as_nanos() as u64
+            })
+            .collect(),
+    );
+    alloc::begin();
+    std::hint::black_box(build());
+    let c = alloc::end();
+    println!("\nthe map of {n} spans ({} edges): {:.1} ms, {:.0} ns and {:.3} allocations a span", map.edges.len(), ns as f64 / 1e6, ns as f64 / n as f64, c.calls() as f64 / n as f64);
+    for (name, range) in [("15 minutes", 900_000i64), ("an hour", 3_600_000)] {
+        let (from, to) = (start + 3_600_000 - range, start + 3_600_000);
+        let ns = median(
+            (0..11)
+                .map(|_| {
+                    let t = Instant::now();
+                    let f = kiln_obs::apm::figures(&st, &map, &[], from, to, 1).unwrap();
+                    assert!(f.edges.iter().all(|e| e.counted));
+                    t.elapsed().as_nanos() as u64
+                })
+                .collect(),
+        );
+        println!("its figures over {name:<10}: {:>8.2} ms ({} series of the metrics)", ns as f64 / 1e6, keys.len());
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

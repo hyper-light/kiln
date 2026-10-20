@@ -187,7 +187,7 @@ function MapView({ range }: { range: Range }) {
         </svg>
       </div>
       <p className="mt-3 font-mono text-[10px] text-[#7b7e88]">
-        {m.spans_read.toLocaleString()} spans read{m.sampled_one_in > 1 ? `, one trace in ${m.sampled_one_in.toLocaleString()} (counts scaled up)` : ""} · {m.took_ms.toFixed(1)} ms
+        {m.spans_read.toLocaleString()} spans read{m.sampled_one_in > 1 ? `, one trace in ${m.sampled_one_in.toLocaleString()}` : ""} · {m.took_ms.toFixed(1)} ms
       </p>
     </section>
   );

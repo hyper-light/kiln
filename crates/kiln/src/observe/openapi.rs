@@ -335,9 +335,23 @@ fn schemas() -> Map<String, Value> {
                 ("from", ms()),
                 ("to", ms()),
                 ("nodes", array(object(&[("service", string()), ("hits", number()), ("errors", number()), ("inferred", describe(boolean(), "only named, as a peer a service calls"))], &["service", "hits", "errors", "inferred"]))),
-                ("edges", array(object(&[("from", string()), ("to", string()), ("calls", number()), ("errors", number()), ("avg_s", nullable(number())), ("inferred", boolean())], &["from", "to", "calls", "errors", "inferred"]))),
+                (
+                    "edges",
+                    array(object(
+                        &[
+                            ("from", string()),
+                            ("to", string()),
+                            ("calls", number()),
+                            ("errors", number()),
+                            ("avg_s", nullable(number())),
+                            ("inferred", boolean()),
+                            ("counted", describe(boolean(), "its figures from the trace metrics (every call, whatever traces were kept), not the spans read alone")),
+                        ],
+                        &["from", "to", "calls", "errors", "inferred", "counted"],
+                    )),
+                ),
                 ("spans_read", integer()),
-                ("sampled_one_in", describe(integer(), "one trace in so many read (by its id), the counts scaled up")),
+                ("sampled_one_in", describe(integer(), "one trace in so many read (by its id): figures not from the trace metrics are the spans read's, so many times")),
                 ("took_ms", number()),
             ],
             &["from", "to", "nodes", "edges", "spans_read", "sampled_one_in"],
@@ -1248,7 +1262,7 @@ fn ops() -> Vec<Op<'static>> {
         },
         Op {
             params: vec![param("from", "query", false, integer(), "ms since the epoch (15 minutes before to)"), param("to", "query", false, integer(), "ms since the epoch"), param("env", "query", false, string(), "one environment")],
-            ..op("get", "/apm/map", "The service map over the range: who calls whom, from the spans; each service's requests and errors from its trace metrics", "observe.read", None, vec![ok("ServiceMap")])
+            ..op("get", "/apm/map", "The service map over the range: who calls whom, from the spans; its figures from the trace metrics (every request and call, whatever traces were kept), each edge its share of the groups that count its calls", "observe.read", None, vec![ok("ServiceMap")])
         },
         Op {
             params: vec![param("query", "query", false, string(), "a log search"), param("rate", "query", false, integer(), "records a second at the most, a uniform sample past it")],
