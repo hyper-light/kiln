@@ -33,6 +33,7 @@ import { useSeen } from "./seen";
 import { AgentFamilies } from "./family";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
+import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { PushOffer } from "./push-offer";
 import { RowChange, RowReview } from "./change-bar";
 
@@ -126,8 +127,11 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
   );
 }
 
-/** A row re-renders only when its own agent changes (or is selected); its clock counts by itself. */
-const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void; of?: string }) {
+/**
+ * A row re-renders only when its own agent changes (or is selected); its clock counts by itself.
+ * `picking`: agents are being selected by touch (its mark says whether it is).
+ */
+const Row = React.memo(function Row({ a, stand, selected, picking, onSelect, of }: { a: AgentInfo; stand: Stand; selected: boolean; picking?: boolean; onSelect: (id: string, on: boolean) => void; of?: string }) {
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
   const ap = a.approvals[0];
@@ -145,7 +149,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: A
     </span>
   );
   return (
-    <li className="ms-row" data-stand={stand} data-selected={selected || undefined} data-glide={a.id}>
+    <li className="ms-row" data-stand={stand} data-selected={selected || undefined} data-glide={a.id} data-agent={a.id}>
       <label className="ms-check">
         <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${label}`} />
       </label>
@@ -155,8 +159,9 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, of }: { a: A
           {line}
         </div>
       ) : (
-        <button type="button" className="ms-main" onClick={open}>
+        <button type="button" className="ms-main" onClick={open} aria-pressed={picking ? selected : undefined}>
           <span className="ms-name">
+            {picking && <span className="ms-pick" aria-hidden="true" />}
             {label}
             {of && <span className="ms-of">started by {of}</span>}
           </span>
@@ -434,6 +439,14 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const seen = useSeen();
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
+  // Selecting by touch (touch-select.ts): from a row held, or from Select, until Done.
+  const touchScreen = useMediaQuery("(pointer: coarse)");
+  const [picking, setPicking] = React.useState(false);
+  const selecting = picking || selected.size > 0;
+  const clear = () => {
+    setSelected(new Set());
+    setPicking(false);
+  };
   // On a phone the message box stays folded until agents are selected or it's opened.
   const phone = useMediaQuery(PHONE);
   const [messaging, setMessaging] = React.useState(false);
@@ -445,19 +458,28 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
   const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored, sort: sortOf(stored.sort ?? DEFAULT_VIEW.sort) }), [stored]);
   const [q, setQ] = React.useState("");
-  const { held, bind } = useListHold(selected.size > 0);
+  const { held, bind } = useListHold(selecting);
   const { live, ended } = useShownList(all, q, view, held);
   const glide = useGlide(live.map((r) => `${r.a.id}:${r.stand}`).join());
   const filtered = isFiltered(q, view.facets);
 
-  const select = React.useCallback((id: string, on: boolean) => {
+  const setMany = React.useCallback((ids: string[], on: boolean) => {
     setSelected((s) => {
       const next = new Set(s);
-      if (on) next.add(id);
-      else next.delete(id);
+      for (const id of ids) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
       return next;
     });
   }, []);
+  const select = React.useCallback((id: string, on: boolean) => setMany([id], on), [setMany]);
+  // The rows' gestures ask what's selected now; their props are made once, with the list's hold.
+  const [touch] = React.useState(() => {
+    const now: { s: TouchSelect } = { s: { isSelected: () => false, set: () => undefined, selecting: false } };
+    return { now, props: both(bind, touchSelect(() => now.s)) };
+  });
+  touch.now.s = { isSelected: (id) => selected.has(id), set: setMany, selecting: touchScreen && selecting };
   // Only what the list shows can be checked: a row the filter takes away is unchecked with it.
   const shownIds = [...live, ...ended].map((r) => r.a.id).join(",");
   const [wasShown, setWasShown] = React.useState(shownIds);
@@ -478,7 +500,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   // The message goes to what's checked; with nothing checked, to every agent the list shows.
   const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
   const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
-  const message = <MessageBar agents={targets} reach={reach} onEnded={() => setSelected(new Set())} />;
+  const message = <MessageBar agents={targets} reach={reach} onEnded={clear} />;
   const folds = phone && checked.length === 0;
 
   return (
@@ -506,29 +528,56 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
         </div>
       ) : (
         <>
-          <div className="ms-listhead">
-            <label className="ms-all">
-              <input
-                ref={allBox}
-                type="checkbox"
-                className="check"
-                disabled={live.length === 0}
-                checked={live.length > 0 && liveChecked === live.length}
-                onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
-                aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
-              />
-              <span>
-                {checked.length > 0
-                  ? `${checked.length} of ${live.length + ended.length} selected`
-                  : filtered
-                    ? `${live.length + ended.length} of ${all.length} agents`
-                    : `${all.length} agent${all.length === 1 ? "" : "s"}`}
-              </span>
-            </label>
-            {checked.length > 0 && (
-              <button type="button" className="ms-link" onClick={() => setSelected(new Set())}>
-                Clear selection
-              </button>
+          <div className="ms-listhead" data-selecting={(touchScreen && selecting) || undefined}>
+            {touchScreen ? (
+              // By touch: Select (or hold a row), then tap rows; All, and Done.
+              <>
+                <span className="ms-count" aria-live="polite">
+                  {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${all.length} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                </span>
+                {selecting ? (
+                  <span className="ms-picks">
+                    <button type="button" className="ms-link" disabled={live.length === 0 || liveChecked === live.length} onClick={() => setMany(live.map((r) => r.a.id), true)}>
+                      Select all
+                    </button>
+                    <button type="button" className="ms-link ms-done" onClick={clear}>
+                      Done
+                    </button>
+                  </span>
+                ) : (
+                  live.length > 0 && (
+                    <button type="button" className="ms-link ms-select" onClick={() => setPicking(true)}>
+                      Select
+                    </button>
+                  )
+                )}
+              </>
+            ) : (
+              <>
+                <label className="ms-all">
+                  <input
+                    ref={allBox}
+                    type="checkbox"
+                    className="check"
+                    disabled={live.length === 0}
+                    checked={live.length > 0 && liveChecked === live.length}
+                    onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
+                    aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
+                  />
+                  <span>
+                    {checked.length > 0
+                      ? `${checked.length} of ${live.length + ended.length} selected`
+                      : filtered
+                        ? `${live.length + ended.length} of ${all.length} agents`
+                        : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                  </span>
+                </label>
+                {checked.length > 0 && (
+                  <button type="button" className="ms-link" onClick={clear}>
+                    Clear selection
+                  </button>
+                )}
+              </>
             )}
             {folds && (
               <button type="button" className="ms-link ms-msg-open" aria-expanded={messaging} onClick={() => setMessaging(!messaging)}>
@@ -539,9 +588,9 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           </div>
           {phone && (!folds || messaging) && message}
           {live.length > 0 ? (
-            <div {...bind} data-held={held || undefined}>
+            <div {...touch.props} data-held={held || undefined}>
               <ul className="ms-list" ref={glide}>
-                <AgentFamilies rows={live} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
+                <AgentFamilies rows={live} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />} />
               </ul>
             </div>
           ) : filtered && ended.length === 0 ? (
@@ -585,7 +634,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           </div>
           {showEnded && (
             <ul className="ms-list">
-              <AgentFamilies rows={ended} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
+              <AgentFamilies rows={ended} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />} />
             </ul>
           )}
         </section>
