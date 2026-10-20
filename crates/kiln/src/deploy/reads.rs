@@ -256,6 +256,25 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_s_tracking_marks_are_no_disagreement() {
+        let deploy = |labels: Value, annotations: Value, image: &str| {
+            json!({ "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web", "namespace": "shop", "labels": labels, "annotations": annotations }, "spec": { "image": image } })
+                .to_string()
+        };
+        let item = |live: String, predicted: String| json!({ "group": "apps", "kind": "Deployment", "namespace": "shop", "name": "web", "normalizedLiveState": live, "predictedLiveState": predicted });
+        // What KilnCD runs, marked as its own, and what Argo CD would make of it: its tracking id.
+        let live = deploy(json!({ "app": "web", "kiln.dev/app": "web" }), json!({ "kiln.dev/tracking": "shop/web-staging" }), "web:1.0");
+        let ours = deploy(json!({ "app": "web", "kiln.dev/app": "web" }), json!({ "argocd.argoproj.io/tracking-id": "staging-web:apps/Deployment:shop/web", "kiln.dev/tracking": "shop/web-staging" }), "web:1.0");
+        assert!(disagreement(&item(live.clone(), ours)).is_none(), "only the marks differ");
+        let other = deploy(json!({ "app": "web" }), json!({}), "web:1.1");
+        let d = disagreement(&item(live, other));
+        assert!(d.as_ref().is_some_and(|d| d.pointer("/key/name") == Some(&json!("web"))), "{d:?}");
+        // Not there: the new provider would make it.
+        let missing = json!({ "group": "", "kind": "Service", "namespace": "shop", "name": "web", "targetState": json!({ "apiVersion": "v1", "kind": "Service", "metadata": { "name": "web" } }).to_string() });
+        assert!(disagreement(&missing).is_some());
+    }
+
+    #[test]
     fn another_version_is_what_it_renders_against_what_runs_renders() {
         let deploy = |tag: &str| json!({ "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web", "namespace": "shop" }, "spec": { "image": format!("web:{tag}") } });
         let test_pod = |name: &str| json!({ "apiVersion": "v1", "kind": "Pod", "metadata": { "name": name, "namespace": "shop", "annotations": { "helm.sh/hook": "test-success" } } });
