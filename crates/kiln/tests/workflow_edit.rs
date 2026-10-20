@@ -87,6 +87,11 @@ fn w02_r12_checks_and_saves_a_workflow() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "no runner: {body}");
         std::thread::sleep(Duration::from_millis(300));
     }
+    // What a `runs-on` may name here, each label with where it comes from.
+    let (st, body) = http(s.port, "GET", "/api/ci/repos/acme%2Fapp/labels", &dev, None)?;
+    let known: Value = serde_json::from_str(&body)?;
+    let from = |label: &str| known.get("labels").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("label") == Some(&json!(label)))).and_then(|x| x.get("from")).cloned();
+    assert!(st == 200 && from("local") == Some(json!(["runner"])) && from("self-hosted") == Some(json!(["runner"])) && from("big") == Some(json!(["rule"])), "{st} {body}");
     // Checked alone, a file knows nothing of runners; for its repository, it does.
     let labels = "on: push\njobs:\n  a:\n    runs-on: local\n    steps: [{ run: 'true' }]\n  b:\n    runs-on: [self-hosted, linux]\n    steps: [{ run: 'true' }]\n  c:\n    runs-on: [local, gpu-box]\n    steps: [{ run: 'true' }]\n  d:\n    runs-on: big\n    steps: [{ run: 'true' }]\n  e:\n    strategy: { matrix: { os: [x, y] } }\n    runs-on: ${{ matrix.os }}\n    steps: [{ run: 'true' }]\n";
     let path = ".github/workflows/labels.yml";

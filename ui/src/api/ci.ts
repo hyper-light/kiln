@@ -694,6 +694,8 @@ export const ci = {
     request<{ ref: string; sha: string; workflows: CiWorkflowFile[] }>("GET", `/api/ci/repos/${enc(repo)}/workflows${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
   workflow: (repo: string, path: string, ref: string, signal?: AbortSignal) =>
     request<CiWorkflowSource>("GET", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
+  /** What a `runs-on` of the repository's may name (W21-R06): runners', pools' and routing rules' labels, each with where it comes from. */
+  labels: (repo: string, signal?: AbortSignal) => request<{ labels: { label: string; from: ("runner" | "pool" | "rule")[] }[] }>("GET", `/api/ci/repos/${enc(repo)}/labels`, undefined, { signal }),
   names: (repo: string, path: string, signal?: AbortSignal) => request<{ secrets: string[]; variables: string[] }>("GET", `/api/ci/repos/${enc(repo)}/names?path=${enc(path)}`, undefined, { signal }),
   catalog: (q: string, signal?: AbortSignal) => request<{ actions: CiCatalogEntry[] }>("GET", `/api/ci/actions?q=${enc(q)}`, undefined, { signal }),
   searchLogs: (p: { q: string; repo?: string; branch?: string; conclusion?: string; days?: number }, signal?: AbortSignal) =>

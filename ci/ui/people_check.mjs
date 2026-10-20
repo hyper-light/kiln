@@ -10,7 +10,7 @@
 // - W21-R06: the editor's saving, the patch of an edit, a diff opened on the trunk and a commit to
 //   a branch; W02-R12: a label no runner has, warned of where it is.
 // - W21-R01: the editor's keys from the schema, on hover (desktop) and as one is typed; W21-R06:
-//   the plan preview's matrix as written.
+//   the plan preview's matrix as written, and the flow view's edits in the YAML.
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/people-shots:/shots \
@@ -238,6 +238,36 @@ for (const [name, type, phone] of [
         check(name, `${tag}: a step's keys offered as one is typed`, await until(async () => (await offered.count()) > 0), await text(page.locator(".cm-tooltip-autocomplete").first()));
         await offered.click();
         check(name, `${tag}: and the one chosen written`, await until(async () => /shell: /.test(await page.locator(".cm-content").innerText())), await text(page.locator(".cm-content")));
+        // The flow view (W21-R06): a job added, what it needs chosen, an axis's values; the YAML
+        // has them, its comment kept, and the plan follows.
+        await page.getByRole("group", { name: "View" }).getByRole("button", { name: "Flow", exact: true }).click();
+        const flowView = page.getByRole("region", { name: "Its flow" });
+        const buildCard = flowView.getByRole("region", { name: "Job build" });
+        check(name, `${tag}: the flow view, a job and where it runs`, await until(async () => /local/.test(await text(buildCard)) && /echo hi/.test(await text(buildCard))), await text(buildCard));
+        await page.getByLabel("A new job").fill("lint");
+        await page.getByRole("button", { name: "Add the job", exact: true }).click();
+        const lintCard = flowView.getByRole("region", { name: "Job lint" });
+        await lintCard.waitFor({ timeout: 15000 });
+        await lintCard.getByLabel("Add a need").selectOption("build");
+        const stage2 = flowView.getByRole("region", { name: "Stage 2" });
+        check(name, `${tag}: a job added, needing build, in the second stage`, await until(async () => (await stage2.getByRole("region", { name: "Job lint" }).count()) > 0), await text(flowView));
+        const osValues = buildCard.getByLabel("Values of os");
+        await osValues.fill("linux, mac, windows");
+        await osValues.press("Enter");
+        check(name, `${tag}: an axis's values, and the plan follows`, await until(async () => /5 legs · 1 removed/i.test(await text(page.locator("main").first()))), await text(page.locator("main").first()));
+        check(name, `${tag}: the flow view fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await page.screenshot({ path: `${shots}/workflow-flow-${name}-${tag}.png`, fullPage: true });
+        await page.getByRole("group", { name: "View" }).getByRole("button", { name: "YAML", exact: true }).click();
+        const yamlText = async () => await page.locator(".cm-content").innerText();
+        check(
+          name,
+          `${tag}: the YAML has it all, its comment kept`,
+          await until(async () => {
+            const y = await yamlText();
+            return /lint:/.test(y) && /needs: build/.test(y) && /os: \[linux, mac, windows\]/.test(y) && new RegExp(`# checked in ${name} ${tag}`).test(y);
+          }),
+          (await yamlText()).slice(0, 600),
+        );
         await page.screenshot({ path: `${shots}/workflow-saved-${name}-${tag}.png`, fullPage: true });
         check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
         await ctx.close();

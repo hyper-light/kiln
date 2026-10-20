@@ -206,6 +206,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
         (&Method::GET, ["repos", repo, "workflows"]) => boxed(|| workflows::list(hub, repo, q)).await,
+        (&Method::GET, ["repos", repo, "labels"]) => boxed(|| workflows::labels(hub, repo)).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => {
             let path = path.join("/");
             boxed(|| workflows::get(hub, repo, &path, q)).await

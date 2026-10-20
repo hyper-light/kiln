@@ -117,10 +117,8 @@ async fn unknown_labels(hub: &Hub, repo: &Repo, w: &wf::Workflow) -> Vec<Diag> {
     let runners = hub.store.agents().await.unwrap_or_default();
     let pools = super::pools::specs(hub).await;
     let carried = |label: &str, alone: bool| {
-        runners.iter().any(|a| {
-            let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), ..kiln_ci::facts::RunnerFacts::default() };
-            (alone && a.name.eq_ignore_ascii_case(label)) || a.labels.iter().chain(&routing::implicit_labels(&facts)).any(|x| x.eq_ignore_ascii_case(label))
-        }) || pools.iter().any(|p| p.labels.iter().any(|x| x.eq_ignore_ascii_case(label)))
+        runners.iter().any(|a| (alone && a.name.eq_ignore_ascii_case(label)) || carries(a).iter().any(|x| x.eq_ignore_ascii_case(label)))
+            || pools.iter().any(|p| p.labels.iter().any(|x| x.eq_ignore_ascii_case(label)))
     };
     // A rule may match on the event: a label is mapped if it is under any the workflow takes.
     let events: Vec<String> = if w.on.is_empty() { vec![String::new()] } else { w.on.iter().map(|t| t.event.clone()).collect() };
@@ -159,6 +157,43 @@ async fn unknown_labels(hub: &Hub, repo: &Repo, w: &wf::Workflow) -> Vec<Diag> {
         }
     }
     out
+}
+
+/// A runner's labels, and those GitHub gives every self-hosted runner, from its facts.
+fn carries(a: &crate::store::AgentRow) -> Vec<String> {
+    let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), ..kiln_ci::facts::RunnerFacts::default() };
+    let mut out = a.labels.clone();
+    out.extend(routing::implicit_labels(&facts).into_iter().filter(|x| !a.labels.iter().any(|l| l.eq_ignore_ascii_case(x))));
+    out
+}
+
+/// `GET /api/ci/repos/:repo/labels`: what a `runs-on` of the repository's may name (W21-R06's
+/// select of labels and rules), each label with where it comes from (`runner`, `pool`, `rule`),
+/// as [`unknown_labels`] knows them.
+pub async fn labels(hub: &Hub, repo: &str) -> Result<Response, Fail> {
+    let repo = find_repo(hub, repo).await?;
+    let mut found: Vec<(String, Vec<&'static str>)> = Vec::new();
+    let mut add = |label: &str, from: &'static str| match found.iter_mut().find(|(l, _)| l.eq_ignore_ascii_case(label)) {
+        Some((_, f)) if !f.contains(&from) => f.push(from),
+        Some(_) => {}
+        None => found.push((label.to_owned(), vec![from])),
+    };
+    for a in hub.store.agents().await.unwrap_or_default() {
+        carries(&a).iter().for_each(|l| add(l, "runner"));
+    }
+    for p in super::pools::specs(hub).await {
+        p.labels.iter().for_each(|l| add(l, "pool"));
+    }
+    // The rules that may apply to this repository's legs.
+    for r in super::routing::sources(hub).await.effective() {
+        let here = r.matches.repos.is_empty() || r.matches.repos.iter().any(|g| kiln_ci::trigger::pattern::Pattern::new(g).is_ok_and(|p| p.matches(&repo.name)));
+        if here {
+            r.matches.labels.iter().for_each(|l| add(l, "rule"));
+        }
+    }
+    found.sort_by_key(|(l, _)| l.to_ascii_lowercase());
+    let labels: Vec<Value> = found.into_iter().map(|(label, from)| json!({ "label": label, "from": from })).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "labels": labels })))
 }
 
 /// What the action policies (W07-R04) refuse of a workflow's `uses:`, where each is: what its run

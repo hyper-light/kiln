@@ -1,7 +1,7 @@
 /**
  * The workflow editor (docs/ci.md W21-R01, W21-R06): a repository's workflow in the code editor,
- * checked as you type, with the plan it would make for an event beside it (W04-R29). The YAML is
- * the source. An edit is saved as its repository takes it (`ci.workflows.edit`): a diff on the
+ * checked as you type, or in its flow view (its jobs by stage, edited in place), with the plan it
+ * would make for an event beside it (W04-R29). The YAML is the source. An edit is saved as its repository takes it (`ci.workflows.edit`): a diff on the
  * trunk of a repository kiln hosts, a pull or merge request on GitHub, GitLab or Bitbucket, or a
  * commit to a branch; for any repository the patch, Copy and Download take it away. Below, the
  * workflow's own secrets and variables (W09-R11).
@@ -12,6 +12,7 @@ import { api } from "@/api/client";
 import { ci, type CiMatrix, type CiOutline, type CiPreview, type CiSave } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
+import { Segmented } from "@/components/ui/tabs";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link, useSearchParams } from "@/lib/router";
@@ -21,6 +22,7 @@ import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
 import { ScopeSecrets } from "@/views/settings-ci";
+import { FlowView } from "@/views/ci/flow-view";
 
 const CodeEditor = React.lazy(() => import("@/components/code/editor"));
 
@@ -143,6 +145,9 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   const [saved, setSaved] = React.useState<{ tone?: "error"; text: string; diff?: string; url?: string } | null>(null);
   // The branch a commit goes to, while it's being named.
   const [branch, setBranch] = React.useState<string | null>(null);
+  // Two views of the text; the code editor opens again on what the flow view made of it.
+  const [view, setView] = React.useState<"yaml" | "flow">("yaml");
+  const [opened, setOpened] = React.useState(0);
   const [counts, setCounts] = React.useState<{ errors: number; warnings: number } | null>(null);
   const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
   const [preview, setPreview] = React.useState<CiPreview | null>(null);
@@ -151,6 +156,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     outline: CiOutline | null;
     names?: { secrets: string[]; variables: string[] };
     catalog?: { label: string; detail: string }[];
+    labels?: { label: string; detail: string }[];
     schema?: Schema;
     schemaAsked?: boolean;
     timer?: number;
@@ -263,7 +269,17 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
       return { from: uses.from + (/^uses:\s*/.exec(uses.text)?.[0].length ?? 0), options: known.current.catalog };
     }
     const runsOn = ctx.matchBefore(/\bruns-on:\s*[\w.-]*$/);
-    if (runsOn) return { from: runsOn.from + (/^runs-on:\s*/.exec(runsOn.text)?.[0].length ?? 0), options: HOSTED.map((label) => ({ label, detail: "label" })) };
+    if (runsOn) {
+      // This server's runners', pools' and rules' labels, then GitHub's hosted ones.
+      if (!known.current.labels) {
+        const here = (await ci.labels(repo).catch(() => ({ labels: [] }))).labels;
+        known.current.labels = [
+          ...here.map((l) => ({ label: l.label, detail: l.from.join(", ") })),
+          ...HOSTED.filter((h) => !here.some((l) => l.label.toLowerCase() === h)).map((label) => ({ label, detail: "GitHub" })),
+        ];
+      }
+      return { from: runsOn.from + (/^runs-on:\s*/.exec(runsOn.text)?.[0].length ?? 0), options: known.current.labels };
+    }
     // A key being typed at a line's start (or asked for there): the keys its mapping may have.
     const typing = ctx.matchBefore(/^\s*(?:-\s+)*[\w.-]*$/);
     const word = /[\w.-]*$/.exec(typing?.text ?? "")?.[0] ?? "";
@@ -331,8 +347,30 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
           counts && (counts.errors || counts.warnings ? `${counts.errors} error${counts.errors === 1 ? "" : "s"}, ${counts.warnings} warning${counts.warnings === 1 ? "" : "s"}` : "No problems.")
         }
       >
+        <Segmented
+          label="View"
+          value={view}
+          onChange={setView}
+          options={[
+            { value: "yaml", label: "YAML" },
+            { value: "flow", label: "Flow" },
+          ]}
+          className="mx-5 mt-1 mb-2"
+        />
         <React.Suspense fallback={<Hold height={420} />}>
-          <CodeEditor value={file.source} onChange={setText} lint={lint} complete={complete} hover={hover} label={`Editing ${path}`} />
+          {view === "yaml" ? (
+            <CodeEditor key={opened} value={text} onChange={setText} lint={lint} complete={complete} hover={hover} label={`Editing ${path}`} />
+          ) : (
+            <FlowView
+              repo={repo}
+              text={text}
+              onChange={(t) => {
+                setText(t);
+                setOpened((n) => n + 1);
+                void lint(t);
+              }}
+            />
+          )}
         </React.Suspense>
         {/* Under the edit, so a phone's header keeps to Copy and Download. */}
         {(changed || saved) && (
