@@ -249,6 +249,75 @@ pub fn agent_samples() -> &'static RwLock<BTreeMap<String, HostSample>> {
     AGENT_SAMPLES.get_or_init(|| RwLock::new(BTreeMap::new()))
 }
 
+/// The conversation stores' metrics (`crate::convo::board`): name, type and help of each, in the
+/// order [`set_convo`] measures them.
+const CONVO: [(&str, &str, &str); 13] = [
+    ("kiln_convo_store_up", "gauge", "Conversation stores linked to the server (1) or not (0)."),
+    ("kiln_convo_store_bytes", "gauge", "Each conversation store's file size."),
+    ("kiln_convo_store_free_bytes", "gauge", "The part of each store's file free for what comes next."),
+    ("kiln_convo_store_wal_bytes", "gauge", "Each store's log (WAL) size."),
+    ("kiln_convo_store_rev", "gauge", "Each store's last write number: how many writes it has had."),
+    ("kiln_convo_store_sessions", "gauge", "Sessions each store holds."),
+    ("kiln_convo_store_behind_rows", "gauge", "Rows a store's feed hasn't delivered yet (a runner's to the server, the server's to a mirror)."),
+    ("kiln_convo_store_commits_total", "counter", "Commits of each store's writer, since its kiln started."),
+    ("kiln_convo_store_busy_milliseconds_total", "counter", "Time each store's writer was busy, since its kiln started."),
+    ("kiln_convo_store_dropped_total", "counter", "Updates each store dropped while its writer couldn't keep up."),
+    ("kiln_convo_store_read_timeouts_total", "counter", "Reads of each store that got no answer in time."),
+    ("kiln_convo_feed_batches_total", "counter", "Feed batches: taken by the server, from a runner's store; sent to a mirror."),
+    ("kiln_convo_feed_bytes_total", "counter", "Feed bytes on the wire, as for kiln_convo_feed_batches_total."),
+];
+
+/// Each store's labels (`store`, `role`, `machine`) and its [`CONVO`] values (None: not known).
+type ConvoRow = ([String; 3], [Option<i64>; 13]);
+static CONVO_ROWS: OnceLock<RwLock<Vec<ConvoRow>>> = OnceLock::new();
+
+fn convo_rows() -> &'static RwLock<Vec<ConvoRow>> {
+    CONVO_ROWS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// The conversation stores as the board just sampled them.
+pub fn set_convo(status: &crate::convo::board::Status) {
+    let n = |v: u64| Some(i64::try_from(v).unwrap_or(i64::MAX));
+    let rows = status
+        .stores
+        .iter()
+        .filter(|s| s.id.is_some())
+        .map(|s| {
+            let r = s.report.as_ref();
+            let behind = s.feed.as_ref().and_then(|f| f.behind).or(s.mirror.as_ref().and_then(|m| m.behind));
+            let (batches, bytes) = match (&s.feed, &s.mirror) {
+                (Some(f), _) => (f.intake.as_ref().map(|i| i.batches), f.intake.as_ref().map(|i| i.bytes)),
+                (None, Some(m)) => (Some(m.ship.batches), Some(m.ship.bytes)),
+                // The server's: what it took from every feed.
+                (None, None) => {
+                    let feeds = status.stores.iter().filter_map(|x| x.feed.as_ref()?.intake.as_ref());
+                    let (b, w) = feeds.fold((0, 0), |(b, w), i| (b + i.batches, w + i.bytes));
+                    (Some(b), Some(w))
+                }
+            };
+            (
+                [s.key.clone(), s.role.to_owned(), s.machine.clone()],
+                [
+                    Some(i64::from(s.connected)),
+                    r.and_then(|r| n(r.file.bytes)),
+                    r.and_then(|r| n(r.file.free)),
+                    r.and_then(|r| n(r.file.wal)),
+                    r.and_then(|r| n(r.file.top)),
+                    r.and_then(|r| r.file.sessions).and_then(n),
+                    behind.and_then(n),
+                    r.and_then(|r| n(r.commits)),
+                    r.and_then(|r| n(r.busy_ms)),
+                    r.and_then(|r| n(r.dropped)),
+                    r.and_then(|r| n(r.timeouts)),
+                    batches.and_then(n),
+                    bytes.and_then(n),
+                ],
+            )
+        })
+        .collect();
+    *convo_rows().write() = rows;
+}
+
 pub fn render() -> String {
     let m = global();
     let mut o = String::with_capacity(8192);
@@ -338,6 +407,18 @@ pub fn render() -> String {
             }
         }
     }
+    let convo = convo_rows().read();
+    if !convo.is_empty() {
+        for (i, (name, kind, h)) in CONVO.iter().enumerate() {
+            help(&mut o, name, kind, h);
+            for (l, values) in convo.iter() {
+                if let Some(v) = values.get(i).copied().flatten() {
+                    let _ = writeln!(o, "{name}{{{}}} {v}", labels(&["store", "role", "machine"], l));
+                }
+            }
+        }
+    }
+    drop(convo);
     let p = crate::host::process_self();
     scalar!("process_resident_memory_bytes", "gauge", "Server RSS.", p.rss_bytes);
     scalar!("process_cpu_seconds_total", "counter", "Server CPU time.", p.cpu_seconds);

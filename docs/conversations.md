@@ -231,6 +231,75 @@ outlives the server's disk and its own machine both.
   - The UI mock answers the search too: `MOCK_DROPPED=n` gives its long conversation an earlier
     history.
 
+## Telemetry
+
+What every store is doing, live: on the System page (*02 Conversations*), on `/metrics`, and from
+the API. Nothing of it asks a store's writer for anything.
+
+- **What each store counts** (`convo/telemetry.rs`), as its writer and its readers go:
+  - commits and the rows in them, reads run, and how long the writer was held (by commits, reads,
+    and looking after the file);
+  - updates dropped while the writer couldn't keep up, reads that got no answer in time, and how
+    long reads waited, by power of two of milliseconds.
+- **What it sees of its file.** Every 2 s, between whatever else it does, the writer looks at its
+  file. That takes the header's numbers and the log's size, nothing more. It notes:
+  - the file's size, its free part and its log, and its last write number (and when that last
+    changed);
+  - its sessions, counted every 30 s;
+  - what it does to the file while idle: compressing older lines, letting old transcripts go, or
+    making it compact (which phase, which table, and how much of it is copied);
+  - when it last made the file compact, and when it last let old transcripts go.
+- **Feeds.** The sending side counts batches, rows and bytes, acknowledgements, hellos and quiet
+  spells (`ShipStats`). The taking side counts, for each store that feeds it:
+  - batches, the rows taken and those left out, and bytes;
+  - gaps and errors;
+  - through where it has the store, and how long the last batch held the store (`PeerView`).
+- **Runners report.** Every 5 s while linked, with its host sample, a runner sends the server what
+  its stores are doing (`Msg::Stats` on the feed's lane): its own store and its feed, and its mirror
+  copy if it keeps one. Versions mix safely:
+  - a server from before takes the report for nothing;
+  - a runner from before says nothing, and is shown as *feeding*: its batches still count, but how
+    far behind it is isn't known.
+- **The board** (`convo/board.rs`, `harness/stores.rs`): the server puts it together. It holds:
+  - the server's own store;
+  - each runner's store, from what the runner said, what its feed brought, and the store's `peers`
+    table (that table covers those not heard from since the server started);
+  - the machines that keep none;
+  - each mirror's copy.
+
+  Each store is in one state: *in sync*, *catching up*, *behind* (and nothing moving), *offline*,
+  *feeding* or *keeps no store*. *Rows to come* is, for a runner's store, its last write less what
+  the server has of it; for a mirror's copy, the server's last write less what the mirror
+  acknowledged.
+- **Series and notes.** Every 5 s the server samples the board.
+  - Each store's series takes a point: an hour at 5 s and a day at a minute, kept in memory like the
+    machines' samples.
+  - What changed since the last sample is noted: a store that came or went, fell behind or caught
+    up, a gap, a batch that couldn't be taken, a quiet spell, updates dropped, reads that timed
+    out, a compaction begun or done, old transcripts let go, a restore.
+- **API** (`runners.read`):
+  - `GET /api/conversations/status` returns `{at, on, mirrors_wanted, restore, stores, notes}`;
+  - `GET /api/conversations/series?key=&window=` returns one store's series, a column each, rates
+    per second.
+- **Prometheus.** `/metrics` labels each line by `store`, `role` and `machine`:
+  - `kiln_convo_store_up`, `_bytes`, `_free_bytes`, `_wal_bytes`, `_rev`, `_sessions` and
+    `_behind_rows`;
+  - `kiln_convo_store_commits_total`, `_busy_milliseconds_total`, `_dropped_total` and
+    `_read_timeouts_total`;
+  - `kiln_convo_feed_batches_total` and `kiln_convo_feed_bytes_total`.
+- **On the System page,** a figure in the style of hyperlight's articles draws every store:
+  - runners' stores on the left, the server's in the middle, the mirror's copy on the right;
+  - a light runs on a cable while batches move on it, and on a store's file while it writes;
+    nothing else moves;
+  - tabs for replication, the server's store, the mirror and upkeep, each with its facts as they
+    stand.
+
+  Below the figure, every store is in a table. Picking one (or clicking it in the figure) opens its
+  dashboard: writes, the file, the feed (rows to come, batches), and the writer (busy, reads'
+  waits at p50 and p99), over 1 h, 6 h or 24 h, with what happened to it lately. The UI mock has
+  stores too: they write, feed, fall behind and catch up, and the server's file is made compact
+  every ten minutes.
+
 ## Settings
 
 - `KILN_CONVERSATIONS`, the same on every machine: `off` turns the store off. Replication to the
@@ -298,3 +367,4 @@ compact = true       # make the store's file compact once a third of it is free 
 | Compression | live (2540397, deployed with 2bd78af, 2026-10-18): transcript lines of 256 bytes or more kept brotli-compressed, older ones compressed in the background under the same numbers; feed batches compressed to a taker that says it takes them. Labs C2, C3 and C5 pass on compressed stores |
 | Pruning and compaction | pruning live (902b999, deployed with 5360484, 2026-10-19): an ended agent's transcript goes after `keep_closed_days`. Compaction went live with c98ae28 as one copy of the whole file in one transaction (`VACUUM INTO`) and took the first server down: out of memory on its store of several GB, every minute, until rolled back. The fix (9b7558f, live with 5360484) took it out, and a server answers nothing rather than "from 0" when it can't read where a runner's store stands. Built again (6ca8494): a copy a step at a time, written on a thread of its own, under the same numbers, caught up by them, counted, then swapped. On a 4 GB store (1M events, 76k compressed transcript lines), capped at 2 GiB with a runner feeding it meanwhile: made 2.8 GB in 3 to 5 minutes, identical after (integrity ok), memory under 140 MB, reads 2 ms median and 0.15 to 0.46 s at p99, none failed; the swap held the store 0.3 to 1.4 s |
 | Restore from a mirror | live (5360484, 2026-10-19): a server that starts with an empty store asks a mirror named in `mirrors.json` for its copy, or `POST /api/conversations/restore` asks one; the copy fills in what the store lacks and never overwrites what a machine's own feed brought. Lab C6 (12 checks): the store deleted and the agent's machine killed, the server restores by itself, the agent is listed away and moved on with its context; a second restore changes nothing. At scale (a 4 GB store: 40 sessions, 75,764 transcript lines kept compressed; the server and the mirror each capped at 2 GiB like the pod): restored by itself in 18 seconds, identical row for row, the server at 107 MB and the mirror at 93 MB at most, no OOM (122 seconds before the feed read only what a batch takes, sent lines as kept, and stopped sending the copy back). Mixed versions (an old server with new runners, and the other way) pass labs C2 and C6 |
+| Telemetry | built 2026-10-19, not deployed: each store's counters and file, the feeds' positions, runners' reports, the server's board with each store's series and notes, `kiln_convo_*` on `/metrics`, and the System page's figure and dashboards. Lab (`board_e2e.py`): a server with an empty store and a runner whose 150 MB store feeds it. The board shows the runner's store catching up from 22,885 rows to in sync, the runner picked as the mirror and its copy caught up, series and notes, 38 `kiln_convo_*` lines on `/metrics`, and no errors in either log. Checked on the UI mock on desktop Chromium and phone WebKit |

@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -213,6 +213,10 @@ export const api = {
   metricsHistory: (agent?: string, signal?: AbortSignal) => get<MetricsHistory>(`/api/metrics/history${qs({ agent })}`, signal),
 
   system: (signal?: AbortSignal) => get<SystemInfo>("/api/system", signal),
+  /** Every conversation store as the server sees it (docs/conversations.md, "Telemetry"). */
+  convoStatus: (signal?: AbortSignal) => get<ConvoStatus>("/api/conversations/status", signal),
+  /** One store's series over the last `window` seconds. */
+  convoSeries: (key: string, window: number, signal?: AbortSignal) => get<ConvoSeries>(`/api/conversations/series${qs({ key, window })}`, signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
   /** Reach's directory: every runner, whether it takes commands from other runners, how busy it is. */
   reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>("/api/reach/runners", signal),

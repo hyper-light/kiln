@@ -13,6 +13,7 @@ import { useRes, warm, type Res } from "@/lib/data";
 import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { childStatus, RelTime } from "./shared";
+import { StoresHold, StoresSection } from "./stores/section";
 
 const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 15_000 } };
 
@@ -34,8 +35,18 @@ function JsonView({ value }: { value: unknown }) {
           </span>,
         );
         if (m[2]) out.push(m[2]);
-      } else if (m[3]) out.push(<span key={i++} className="text-[#c6b2e1]">{m[3]}</span>);
-      else if (m[4]) out.push(<span key={i++} className="text-[#d2b9a0]">{m[4]}</span>);
+      } else if (m[3])
+        out.push(
+          <span key={i++} className="text-[#c6b2e1]">
+            {m[3]}
+          </span>,
+        );
+      else if (m[4])
+        out.push(
+          <span key={i++} className="text-[#d2b9a0]">
+            {m[4]}
+          </span>,
+        );
       last = re.lastIndex;
     }
     out.push(text.slice(last));
@@ -67,6 +78,7 @@ export default function System() {
             variant="ghost"
             onClick={() => {
               invalidate("system");
+              invalidate("conversations");
               invalidate("audit");
             }}
           >
@@ -180,7 +192,7 @@ function AuditSection() {
   const [win, setWin] = React.useState<AuditWindow>("7");
   return (
     <section className="mt-12">
-      <SectionHeading index="02" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />} />
+      <SectionHeading index="03" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />} />
       <Loadable label="the audit log" fallback={<TableHold head={<AuditHead />} rows={8} rowHeight={39} />}>
         <AuditTable win={win} />
       </Loadable>
@@ -302,6 +314,8 @@ function SystemBody() {
         </Panel>
       </section>
 
+      <StoresSection index="02" />
+
       <AuditSection />
     </>
   );
@@ -325,7 +339,11 @@ function SystemHold() {
         </Panel>
       </section>
       <section className="mt-12">
-        <SectionHeading index="02" label="Audit" title="Audit log" />
+        <SectionHeading index="02" label="Conversations" title="Conversation stores" />
+        <StoresHold />
+      </section>
+      <section className="mt-12">
+        <SectionHeading index="03" label="Audit" title="Audit log" />
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
       </section>
     </>
