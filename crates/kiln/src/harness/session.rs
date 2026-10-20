@@ -13,7 +13,7 @@ use tracing::Instrument as _;
 
 use super::core::{Core, Update};
 use super::kinds::{Kind, Protocol};
-use super::model::{Command, ExitInfo, Level, State, Status, ToolKind};
+use super::model::{Command, ExitInfo, Level, State, Status, Task, ToolKind};
 
 fn is_zero_epoch(n: &u64) -> bool {
     *n == 0
@@ -131,6 +131,49 @@ pub struct ApprovalBrief {
     pub at: i64,
 }
 
+/// A native subagent as lists show it. Its work still belongs to its harness's task, not a
+/// separate kiln session, so this is tracking only and carries no execution settings or output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubagentBrief {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    pub description: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task: Option<String>,
+    pub started: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<i64>,
+}
+
+impl SubagentBrief {
+    pub(super) fn of(tasks: &[Task]) -> Vec<Self> {
+        tasks
+            .iter()
+            .filter(|t| match t.class.as_deref() {
+                Some(class) => class == "agent",
+                // Older machines only report the harness's own task kind. Keep this the same
+                // as the task inspector's classOf fallback.
+                None => {
+                    !t.kind.starts_with("monitor")
+                        && !matches!(t.kind.as_str(), "local_bash" | "local_workflow")
+                        && !t.kind.contains("mcp")
+                }
+            })
+            .map(|t| Self {
+                id: t.id.clone(),
+                tool_id: t.tool_id.clone(),
+                description: super::model::clip_middle(&t.description, 200).0,
+                status: t.status.clone(),
+                parent_task: t.parent_task.clone(),
+                started: t.started,
+                ended: t.ended,
+            })
+            .collect()
+    }
+}
+
 /// A session as lists show it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Info {
@@ -160,6 +203,9 @@ pub struct Info {
     pub queued: usize,
     #[serde(default)]
     pub tasks_running: usize,
+    /// Native harness subagents, including finished work, for the list's child disclosure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentBrief>,
     #[serde(default)]
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +318,7 @@ impl Info {
             .collect();
         self.queued = s.queue.len();
         self.tasks_running = s.tasks.iter().filter(|t| t.status == "running").count();
+        self.subagents = SubagentBrief::of(&s.tasks);
         self.cost_usd = s.usage.cost_usd;
         self.activity.clone_from(&s.activity);
         self.exit.clone_from(&s.exit);
@@ -732,6 +779,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         approvals: Vec::new(),
         queued: 0,
         tasks_running: 0,
+        subagents: Vec::new(),
         cost_usd: 0.0,
         activity: None,
         last_activity: now,
@@ -2762,6 +2810,141 @@ mod tests {
     use super::*;
 
     #[test]
+    fn info_lists_native_subagents_and_keeps_their_finished_work() -> anyhow::Result<()> {
+        let native = |id: &str, kind: &str, status: &str| Task {
+            id: id.into(),
+            tool_id: Some(format!("spawn-{id}")),
+            description: format!("Review {id}"),
+            kind: kind.into(),
+            class: Some("agent".into()),
+            status: status.into(),
+            started: 10,
+            ..Task::default()
+        };
+        let mut state = State {
+            tasks: vec![
+                native("claude-child", "general-purpose", "running"),
+                Task {
+                    parent_task: Some("claude-child".into()),
+                    ended: Some(30),
+                    prompt: Some("The full task prompt".into()),
+                    summary: Some("A long result".into()),
+                    output: Some("/tmp/private-output".into()),
+                    ..native("codex-thread", "reviewer", "completed")
+                },
+                native("failed-child", "", "failed"),
+                native("stopped-child", "", "stopped"),
+                Task {
+                    class: None,
+                    ..native("legacy-child", "Explore", "paused")
+                },
+            ],
+            ..State::default()
+        };
+        for class in ["shell", "monitor", "workflow", "mcp"] {
+            state.tasks.push(Task {
+                class: Some(class.into()),
+                ..native(class, "", "running")
+            });
+        }
+        for kind in [
+            "local_bash",
+            "monitor",
+            "monitor_background",
+            "local_workflow",
+            "mcp_task",
+        ] {
+            state.tasks.push(Task {
+                class: None,
+                ..native(kind, kind, "running")
+            });
+        }
+        let mut info = Info::default();
+        info.apply(&state);
+        assert_eq!(
+            info.subagents
+                .iter()
+                .map(|s| (s.id.as_str(), s.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claude-child", "running"),
+                ("codex-thread", "completed"),
+                ("failed-child", "failed"),
+                ("stopped-child", "stopped"),
+                ("legacy-child", "paused")
+            ],
+        );
+        let encoded = serde_json::to_value(&info.subagents)?;
+        assert_eq!(
+            encoded.get(1),
+            Some(&serde_json::json!({
+                "id": "codex-thread", "tool_id": "spawn-codex-thread", "description": "Review codex-thread",
+                "status": "completed", "parent_task": "claude-child", "started": 10, "ended": 30,
+            })),
+            "list entries identify native work without copying prompts, results or output",
+        );
+        assert!(
+            info.parent.is_none(),
+            "native tasks are not kiln session lineage"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn info_subagents_update_from_old_runner_state_and_notify_lists() -> anyhow::Result<()> {
+        // A list entry from before subagent briefs still loads; the runner's state fills them.
+        let old = serde_json::to_value(Info::default())?;
+        assert!(
+            old.get("subagents").is_none(),
+            "empty briefs stay absent on the wire"
+        );
+        let mut info: Info = serde_json::from_value(old)?;
+        assert!(info.subagents.is_empty());
+        let mut state = State {
+            tasks: vec![Task {
+                id: "child".into(),
+                description: "é".repeat(400),
+                kind: "Explore".into(),
+                status: "pending".into(),
+                ..Task::default()
+            }],
+            ..State::default()
+        };
+        info.apply(&state);
+        assert_eq!(info.subagents.len(), 1);
+        assert!(
+            info.subagents.iter().all(|s| s.description.len() < 256),
+            "list labels stay bounded and valid UTF-8"
+        );
+        let pending = info.clone();
+        for task in &mut state.tasks {
+            task.status = "completed".into();
+            task.ended = Some(50);
+        }
+        info.apply(&state);
+        assert!(
+            info.differs(&pending),
+            "finishing a native subagent refreshes Mission Control"
+        );
+        let finished = info.clone();
+        for task in &mut state.tasks {
+            task.description = "Renamed native task".into();
+        }
+        info.apply(&state);
+        assert!(
+            info.differs(&finished),
+            "renaming a native subagent refreshes Mission Control"
+        );
+        state.tasks.clear();
+        info.apply(&state);
+        assert!(
+            info.subagents.is_empty(),
+            "clearing task history clears the disclosure too"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn info_follows_state() {
         let mut i = Info {
             id: "a".into(),
@@ -2780,6 +2963,7 @@ mod tests {
             approvals: vec![],
             queued: 0,
             tasks_running: 0,
+            subagents: Vec::new(),
             cost_usd: 0.0,
             activity: None,
             last_activity: 1,

@@ -585,9 +585,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           </div>
           {showEnded && (
             <ul className="ms-list">
-              {ended.map(({ a, stand }) => (
-                <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />
-              ))}
+              <AgentFamilies rows={ended} all={list} render={({ a, stand }, of) => <Row key={a.id} a={a} stand={stand} of={of} selected={selected.has(a.id)} onSelect={select} />} />
             </ul>
           )}
         </section>

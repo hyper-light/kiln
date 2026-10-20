@@ -169,6 +169,9 @@ export interface Task {
   stoppable?: boolean;
 }
 
+/** A harness's own subagent, tracked within its parent's session without another executor. */
+export type SubagentBrief = Pick<Task, "id" | "tool_id" | "description" | "status" | "parent_task" | "started" | "ended">;
+
 /** A slice of a task's output (`since` → `offset`); `gone` once the harness deleted it. */
 export interface TaskOutput {
   data?: string;
@@ -613,6 +616,8 @@ export interface AgentInfo {
   approvals: ApprovalBrief[];
   queued: number;
   tasks_running: number;
+  /** Native Claude/Codex subagents, including their completed work (older servers omit these). */
+  subagents?: SubagentBrief[];
   /** Shells, monitors and other tasks still running while the agent is idle or ended. */
   left_behind?: number;
   /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
