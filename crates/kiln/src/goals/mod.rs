@@ -410,7 +410,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         }
         keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
         // Parents told of their children that settled, so none has to wait for them.
-        crate::harness::told::tick(&hub, &all, now).await;
+        crate::harness::told::tick(&hub, &all, now, &running).await;
         // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
         crate::harness::elsewhere::tick(&hub, &all, now);
     }

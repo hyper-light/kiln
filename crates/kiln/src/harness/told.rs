@@ -47,8 +47,9 @@ pub fn saw(child: &Info) {
 
 /// Each child that settled since it was last looked at, `SETTLE_MS` on: what its parent is told,
 /// by parent (one message for the children that settled together). Children first seen settled
-/// (the server just started) aren't told of.
-fn due(all: &[Info], now: i64) -> Vec<(String, String)> {
+/// (the server just started) aren't told of, nor ones a goal stack drives (`driven`: they settle
+/// between goals; their parent is told once no stack drives them).
+fn due(all: &[Info], now: i64, driven: &[String]) -> Vec<(String, String)> {
     let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
     let mut seen = SEEN.lock();
     for c in all {
@@ -61,6 +62,9 @@ fn due(all: &[Info], now: i64) -> Vec<(String, String)> {
         }
         if st == "working" {
             e.worked = true;
+            continue;
+        }
+        if driven.contains(&c.id) {
             continue;
         }
         if !settled(st) || !e.worked || e.told == key || now - e.since < SETTLE_MS {
@@ -114,8 +118,9 @@ fn line(c: &Info) -> String {
 }
 
 /// Tells parents of their children that settled (`due`): queued after each parent's turn.
-pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64) {
-    for (parent, text) in due(all, now) {
+/// `driven`: the agents a goal stack drives now.
+pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64, driven: &[String]) {
+    for (parent, text) in due(all, now, driven) {
         crate::workspace::follow::deliver(hub, &parent, text).await;
     }
 }
@@ -156,33 +161,41 @@ mod tests {
         let t0 = 1_000_000;
         // First seen: one already done (a restart), one at work.
         let done_before = child("c0", Status::Idle, 10, "old news");
-        assert!(due(&[done_before.clone(), child("c1", Status::Running, 0, "")], t0).is_empty());
+        assert!(due(&[done_before.clone(), child("c1", Status::Running, 0, "")], t0, &[]).is_empty());
         assert!(children_working(&[child("c1", Status::Running, 0, "")], "p1"));
         // c1 and c2 at work, then both done.
-        assert!(due(&[done_before.clone(), child("c1", Status::Running, 0, ""), child("c2", Status::Running, 0, "")], t0 + 100).is_empty());
+        assert!(due(&[done_before.clone(), child("c1", Status::Running, 0, ""), child("c2", Status::Running, 0, "")], t0 + 100, &[]).is_empty());
         let settled = [done_before.clone(), child("c1", Status::Idle, t0 + 200, "Fixed the parser; tests pass."), child("c2", Status::Idle, t0 + 300, "Docs updated.")];
-        assert!(due(&settled, t0 + 400).is_empty(), "not before it has stood settled a while");
-        let told = due(&settled, t0 + 400 + SETTLE_MS);
+        assert!(due(&settled, t0 + 400, &[]).is_empty(), "not before it has stood settled a while");
+        let told = due(&settled, t0 + 400 + SETTLE_MS, &[]);
         assert_eq!(told.len(), 1, "one message for the parent: {told:?}");
         let (parent, text) = told.first().cloned().unwrap_or_default();
         assert_eq!(parent, "p1");
         assert!(text.contains("Agents you started") && text.contains("Fixed the parser; tests pass.") && text.contains("Docs updated.") && text.contains("agents_result"), "{text}");
         assert!(!text.contains("old news"), "what was done before the server saw it isn't told");
-        assert!(due(&settled, t0 + 10_000).is_empty(), "told once");
+        assert!(due(&settled, t0 + 10_000, &[]).is_empty(), "told once");
         assert!(!children_working(&settled, "p1"));
         // c1 at work again, then waiting on a person; the parent saw that itself (agents_wait).
-        let _ = due(&[child("c1", Status::Running, t0 + 200, "")], t0 + 11_000);
+        let _ = due(&[child("c1", Status::Running, t0 + 200, "")], t0 + 11_000, &[]);
         let mut asking = child("c1", Status::Waiting, t0 + 200, "");
         asking.approvals.push(asks("Run cargo publish")?);
         saw(&asking);
-        assert!(due(std::slice::from_ref(&asking), t0 + 20_000).is_empty());
-        assert!(due(std::slice::from_ref(&asking), t0 + 20_000 + SETTLE_MS).is_empty(), "what the parent saw isn't told again");
+        assert!(due(std::slice::from_ref(&asking), t0 + 20_000, &[]).is_empty());
+        assert!(due(std::slice::from_ref(&asking), t0 + 20_000 + SETTLE_MS, &[]).is_empty(), "what the parent saw isn't told again");
         // Children of no agent (a person started them) are nobody's to tell.
         let mut orphan = child("c3", Status::Running, 0, "");
         orphan.parent = None;
-        let _ = due(std::slice::from_ref(&orphan), t0);
+        let _ = due(std::slice::from_ref(&orphan), t0, &[]);
         orphan.status = Status::Idle;
-        assert!(due(&[orphan], t0 + 30_000).is_empty());
+        assert!(due(&[orphan], t0 + 30_000, &[]).is_empty());
+        // A child its goal stack drives settles between goals unannounced; once no stack drives
+        // it, its parent is told.
+        let driven = vec!["c4".to_owned()];
+        let _ = due(&[child("c4", Status::Running, 0, "")], t0 + 40_000, &driven);
+        let between = child("c4", Status::Idle, t0 + 41_000, "Goal 1 met.");
+        assert!(due(std::slice::from_ref(&between), t0 + 50_000, &driven).is_empty(), "between goals");
+        let told = due(std::slice::from_ref(&between), t0 + 60_000, &[]);
+        assert!(told.first().is_some_and(|(p, t)| p == "p1" && t.contains("Goal 1 met.")), "once left to itself: {told:?}");
         Ok(())
     }
 
