@@ -2258,6 +2258,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-seams"
+version = "0.2.0"
+dependencies = [
+ "event-listener",
+ "futures",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
