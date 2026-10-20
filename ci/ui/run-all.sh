@@ -23,6 +23,7 @@ run=$here/run
 pw=$run/pw
 mkdir -p "$shots" "$run"
 failed=0
+ran=0
 
 # playwright-core as the image's browsers want it, outside the image (the checks import it).
 [ -f "$pw/node_modules/playwright-core/index.mjs" ] || npm install --prefix "$pw" --no-save --no-audit --no-fund --loglevel=error playwright-core@1.64.1 > "$run/pw-install.log" 2>&1 || {
@@ -68,6 +69,7 @@ bunned() {
 
 report() {
   local oks fails
+  ran=$((ran + 1))
   oks=$(grep -c '^ok' "$shots/$1/report.txt")
   fails=$(grep -c '^FAIL' "$shots/$1/report.txt")
   if [ "$2" -eq 0 ]; then
@@ -95,6 +97,7 @@ bunned editor_ranges_check SIGNIN "$run/people.json"
 if SIGNIN="$(cat "$run/people.json")" timeout 600 python3 -I "$here/graph_setup.py" > "$run/graph.json" 2> "$run/graph.err"; then
   browser graph_bench GRAPH "$run/graph.json"
 else
+  ran=$((ran + 1))
   failed=$((failed + 1))
   echo "FAIL graph_bench's runs (graph_setup.py): $(tail -3 "$run/graph.err")"
 fi
@@ -109,5 +112,5 @@ fixture review review_setup.py
 browser review_ac06 AC06 "$run/review.json" --ipc host
 stop "$run/review.json" "$run/review"
 
-echo "$failed of 13 checks failed"
+echo "$failed of $ran checks failed"
 exit "$failed"
