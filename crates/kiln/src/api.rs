@@ -685,9 +685,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             }
         }
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
-        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, id, req).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, id, req).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => goals_control(&hub, id, action).await,
+        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, &caller, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, &caller, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => goals_control(&hub, &caller, id, action).await,
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -1478,6 +1478,7 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
     match e {
         crate::plans::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
         crate::plans::Error::Missing => err(StatusCode::NOT_FOUND, "no such plan"),
+        crate::plans::Error::Refused(c, m) => err(c, m),
         crate::plans::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -3360,11 +3361,18 @@ struct GoalsSet {
     goals: Vec<crate::goals::Given>,
 }
 
+/// Whether `caller` may change agent `id`'s goals: a person any agent's, an agent its own and those
+/// of the agents it started (`crate::harness::lineage::may_steer`).
+fn may_steer_goals(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), ApiError> {
+    crate::harness::lineage::may_steer(hub, caller, id).map_err(|(c, m)| err(c, m))
+}
+
 /// An agent's goals not yet started, as they should be (`crate::goals::set`).
-async fn goals_set(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.set".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
@@ -3376,18 +3384,20 @@ struct GoalsAdd {
 }
 
 /// Goals lined up after the agent's others (`crate::goals::add`).
-async fn goals_add(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.add".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
 /// Start, pause, skip or clear an agent's goal stack.
-async fn goals_control(hub: &Hub, id: &str, action: &str) -> R {
+async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
     let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
+    may_steer_goals(hub, caller, id)?;
     let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.control".into(), format!("{id}: {action}")).await;
+    hub.store.audit(caller.name.clone(), "goals.control".into(), format!("{id}: {action}")).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
