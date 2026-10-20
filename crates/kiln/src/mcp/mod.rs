@@ -113,11 +113,10 @@ pub fn opener_key(id: &str) -> String {
     format!("agents/opener/{id}")
 }
 
-/// The caller agent session `session` is (one kiln runs, on `runner` or the server): it acts for
-/// whoever started it (the owner on a kiln nobody else signs in to), audited as
-/// `agent:<short>[@<runner>] for <them>`, and what it starts are its children.
-pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> Result<Caller, String> {
-    // Who started it; for one started with `kiln spawn` in a kiln shell, whoever opened that shell.
+/// Whom agent session `session` acts for (`owner` or `user:<id>`): whoever started it, or for one
+/// started with `kiln spawn` in a kiln shell, whoever opened that shell; the owner on a kiln nobody
+/// else signs in to. `None`: kiln doesn't know.
+pub async fn acts_for(hub: &Hub, session: &str) -> Option<String> {
     let shell = hub.harness.info(session).and_then(|i| i.shell);
     let opener = match hub.store.kv_get(opener_key(session)).await.ok().flatten() {
         Some(o) => Some(o),
@@ -126,10 +125,19 @@ pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> R
             None => None,
         },
     };
-    let opener = match opener {
-        Some(o) => o,
-        None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
-        None => return Err("kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents".to_owned()),
+    match opener {
+        Some(o) => Some(o),
+        None if !crate::authz::gate::has_users(hub).await => Some("owner".to_owned()),
+        None => None,
+    }
+}
+
+/// The caller agent session `session` is (one kiln runs, on `runner` or the server): it acts for
+/// whoever started it (the owner on a kiln nobody else signs in to), audited as
+/// `agent:<short>[@<runner>] for <them>`, and what it starts are its children.
+pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> Result<Caller, String> {
+    let Some(opener) = acts_for(hub, session).await else {
+        return Err("kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents".to_owned());
     };
     let short: String = session.chars().take(8).collect();
     let name = runner.map_or_else(|| format!("agent:{short}"), |r| format!("agent:{short}@{r}"));

@@ -234,6 +234,30 @@ pub fn may_steer(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(
     Err((StatusCode::FORBIDDEN, format!("an agent steers and ends only the agents it started (and theirs): {} isn't one of {}'s", short(id), short(me))))
 }
 
+/// How an agent may send agent `id` a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// A person, the agent itself, or an agent it started (and theirs): in any mode, as its own.
+    Own,
+    /// Another agent that works for the same person: queued, its receiver told who sent it.
+    Peer,
+}
+
+/// Whether `caller` may send agent `id` a message (docs/agents.md, "Messages between agents"): a
+/// person any agent they reach; an agent itself and the agents it started in any mode, as
+/// [`may_steer`] has it, and any other agent that works for the same person, as a queued message
+/// from it. Agents that work for someone else, or for someone kiln can't name, aren't sent to.
+pub async fn may_message(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<Reach, Refused> {
+    let Some(me) = caller.agent.as_deref() else { return Ok(Reach::Own) };
+    if me == id || descends(&hub.harness.list(), id, me) {
+        return Ok(Reach::Own);
+    }
+    match (crate::mcp::acts_for(hub, me).await, crate::mcp::acts_for(hub, id).await) {
+        (Some(mine), Some(theirs)) if mine == theirs => Ok(Reach::Peer),
+        _ => Err(refuse(format!("an agent messages the agents it started and those that work for the same person: {} works for someone else", short(id)))),
+    }
+}
+
 pub fn descends(all: &[Info], id: &str, ancestor: &str) -> bool {
     let mut at = id;
     for _ in 0..64 {
