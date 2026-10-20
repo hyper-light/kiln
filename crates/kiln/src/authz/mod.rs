@@ -416,8 +416,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
     any("/api/deploy/**", "environments.manage", At::Server),
-    // Runners and machines.
-    r("GET", "/api/agents", "runners.read", At::Server),
+    // Runners and machines. The list is of the runners the caller may read (`crate::doctor::readable`).
+    r("GET", "/api/agents", "runners.read", At::Anywhere),
     r("GET", "/api/reach/runners", "runners.read", At::Server),
     r("GET", "/api/front-doors", "runners.read", At::Server),
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
@@ -429,6 +429,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),
+    // The runners the caller may read against the newest kiln (`updates.list`).
+    r("GET", "/api/updates/runners", "runners.read", At::Anywhere),
     r("POST", "/api/updates/binaries", "binaries.publish", At::Server),
     // A runner upgraded now, or its policy (`crate::doctor`'s `updates.retry` and `updates.policy`).
     r("POST", "/api/updates/runners/*", "runners.manage", At::Runner(3)),

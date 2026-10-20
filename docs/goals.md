@@ -129,7 +129,12 @@ holds across restarts.
 Agents use the same through kiln's MCP tools (`goals_get`, `goals_add`, `goals_set`,
 `goals_control`) or `kiln.goals.*` in code mode: an agent can line goals up for itself and for
 the agents it started (and theirs), and change or clear only theirs (docs/agents.md, "No more than
-its parent"). `plans_run` takes `mode: "goals"`; on a new agent, that agent is the caller's child.
+its parent"). Without `agent`, they're about the agent calling: its own stack. `plans_run` takes
+`mode: "goals"` (on the agent calling, when it gives neither `session` nor `new`); on a new agent,
+that agent is the caller's child. Every agent kiln runs is told this (and its id) by kiln's MCP
+server, and Claude Code gets the kiln-plans skill, which walks through turning a document or a list
+into a goal stack it pursues: a goal per item, then ending its turn, since the first goal comes
+once it's free.
 
 How the harness's own goal stands is in the agent's state as `objective` (`{text, status:
 "active" | "met" | "unmet" | "paused" | "cleared", reason?, at}`), for Claude Code and Codex.

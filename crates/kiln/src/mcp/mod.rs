@@ -297,10 +297,35 @@ a command in one, `ci.legs.rerun_step` reruns a step there). Deployments (GitOps
 sync and health, resources and why they differ, diffs, history, syncs, clusters. Agents are under `kiln.agents`: start \
 agents for parts of the work on any machine (`agents_start`), wait for them (`agents_wait`) and read what they concluded \
 (`agents_result`), and put an agent's work up for review (`agents_change`); what they ask a person stays a person's to answer. \
-Plans and goal stacks are under `kiln.plans` and \
-`kiln.goals`. Prefer code_run: one program can list, filter and act on a whole fleet and return only what matters. \
-code_search shows the operations and their inputs. The skills (kiln-agents, kiln-ci-diagnose, kiln-deploy, kiln-diagnose, \
-kiln-apps, kiln-argocd-migration) say how to use them.";
+Goal stacks and plans are under `kiln.goals` and `kiln.plans`. Prefer code_run: one program can list, filter and act on a \
+whole fleet and return only what matters. code_search shows the operations and their inputs. The skills (kiln-agents, \
+kiln-plans, kiln-ci-diagnose, kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd-migration) say how to use them.";
+
+/// What kiln's MCP servers (this one and the runners', `crate::reach::mcp`) tell an agent about
+/// its own goal stack and plans.
+pub const GOALS_AND_PLANS: &str = "kiln keeps a goal stack for you: `goals_add` lines goals up (leave out `agent`: they're \
+yours), one condition or objective each, in order, and kiln gives you each in turn and holds you to it until it's met, then \
+the next, so you carry on without a person. To pursue a document or a list as a goal stack, add one goal per item (every \
+item asked for), each saying what done is, then end your turn: the first comes to you as soon as you're free. `goals_get` \
+says where it stands; `goals_control` pauses, skips or clears it. A plan is \
+kept in kiln for the person to read, change and run again: `plans_create` keeps one (its top-level list items are its \
+steps), and `plans_run` runs it on you (leave out `session` and `new`: as one message, a step a turn, or each step a goal) \
+or with an agent of its own for each step (mode `agents`: in your harness, on your machine and in your folder unless you \
+say otherwise; `plans_runs_get` follows the run). The kiln-plans skill says how.";
+
+/// Who an agent kiln runs is, as kiln's MCP servers tell it.
+pub fn you_are(agent: &str) -> String {
+    format!("You are kiln agent {agent}: that's your id wherever an operation asks for an agent's, and kiln's operations act for whoever started you.")
+}
+
+/// What this server tells `caller` it is for: an agent kiln runs also hears about its goal stack
+/// and plans, and who it is.
+fn instructions(caller: &Caller) -> String {
+    match caller.agent.as_deref() {
+        Some(me) => format!("{INSTRUCTIONS} {GOALS_AND_PLANS} {}", you_are(me)),
+        None => INSTRUCTIONS.to_owned(),
+    }
+}
 
 /// An MCP token for `label` (an agent session, an attachment): `kiln_mcp_<label>_<hmac>`.
 pub fn token(admin_token: &str, label: &str) -> String {
@@ -399,7 +424,7 @@ impl Server {
                             "extensions": {SKILLS_EXTENSION: {}},
                         },
                         "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
-                        "instructions": INSTRUCTIONS,
+                        "instructions": instructions(&self.caller),
                     }),
                 )
             }
@@ -576,5 +601,17 @@ mod tests {
             assert!(!name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'), "{name}");
             assert!(t.get("inputSchema").and_then(|s| s.get("type")).is_some(), "{name}");
         }
+    }
+
+    /// An agent kiln runs is told who it is and how its goal stack and plans work; anyone else
+    /// hears what kiln is.
+    #[test]
+    fn an_agent_hears_who_it_is_and_of_its_goals_and_plans() {
+        let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:01a14ab9", None, None);
+        agent.agent = Some("01a14ab9693976deb6ff6825f7da1c42".into());
+        let told = instructions(&agent);
+        assert!(told.starts_with(INSTRUCTIONS) && told.contains("You are kiln agent 01a14ab9693976deb6ff6825f7da1c42") && told.contains("goals_add") && told.contains("plans_run"), "{told}");
+        assert_eq!(instructions(&Caller::owner()), INSTRUCTIONS);
+        assert!(skills::list().iter().any(|s| s.get("name").and_then(Value::as_str) == Some("kiln-plans")), "the skill the instructions name is there");
     }
 }

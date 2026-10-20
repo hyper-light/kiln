@@ -806,7 +806,10 @@ async fn trigger_of(hub: &Hub, v: &Value) -> Vec<Trigger> {
                 detail: format!("Runner {name} ({}) went away {} minutes ago and hasn't come back.", if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") }, gone / 60),
             }]
         }
-        "updates" => upgrades_failed(hub).await,
+        "updates" => {
+            upgrades_through(hub).await;
+            upgrades_failed(hub).await
+        }
         "comment" => mentions(hub, v).await,
         _ => Vec::new(),
     }
@@ -814,6 +817,48 @@ async fn trigger_of(hub: &Hub, v: &Value) -> Vec<Trigger> {
 
 /// Upgrade jobs kiln has told attachments of, so each wakes them once.
 static UPGRADES_SEEN: parking_lot::Mutex<Option<HashSet<String>>> = parking_lot::Mutex::new(None);
+/// Upgrade jobs that went through, and that kiln has told incidents' agents of.
+static UPGRADES_THROUGH: parking_lot::Mutex<Option<HashSet<String>>> = parking_lot::Mutex::new(None);
+
+/// Runner upgrades that went through since kiln last looked: the agent of an incident about that
+/// runner's upgrading (open, or reported on) hears of it, to check and resolve it rather than
+/// wait on an upgrade that is over.
+async fn upgrades_through(hub: &Hub) {
+    let through: Vec<crate::updates::Job> = {
+        let mut seen = UPGRADES_THROUGH.lock();
+        let first = seen.is_none();
+        let seen = seen.get_or_insert_with(HashSet::new);
+        // Those that went through before the server started aren't news.
+        hub.updates.jobs().into_iter().filter(|j| j.kind == "runner" && j.state == crate::updates::JobState::Done).filter(|j| seen.insert(j.id.clone()) && !first).collect()
+    };
+    if through.is_empty() {
+        return;
+    }
+    for (agent, text) in through_news(&through, &incidents(hub).await) {
+        crate::workspace::follow::deliver(hub, &agent, text).await;
+    }
+}
+
+/// Whom upgrades `through` are news to, and what they hear: each agent of an incident about that
+/// runner's upgrading that is open or reported on.
+fn through_news(through: &[crate::updates::Job], all: &[Incident]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for j in through {
+        for i in all.iter().filter(|i| i.wake == "upgrade" && i.runner.as_deref() == Some(j.target.as_str()) && matches!(i.state.as_str(), "open" | "reported")) {
+            let Some(agent) = i.agent.clone() else { continue };
+            let text = format!(
+                "Upgrading runner {} went through: upgrade {} ({}) brought it to build {}. If that's what incident {} is about, check it and report it resolved.",
+                j.target,
+                j.id,
+                j.method,
+                j.to_build.as_deref().unwrap_or("?"),
+                i.id
+            );
+            out.push((agent, text));
+        }
+    }
+    out
+}
 
 /// Runner upgrades that failed since kiln last looked.
 async fn upgrades_failed(hub: &Hub) -> Vec<Trigger> {
@@ -1183,8 +1228,9 @@ async fn stuck(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     crate::rt::spawn(ticks(Arc::clone(&hub)));
-    // Upgrades that failed before now aren't news.
+    // Upgrades that failed or went through before now aren't news.
     let _ = upgrades_failed(&hub).await;
+    upgrades_through(&hub).await;
     let mut rx = hub.events.subscribe();
     loop {
         futures::select_biased! {
@@ -1656,6 +1702,33 @@ agents:
         assert_eq!(one, two);
         assert!(one.contains("sync::reconnect") && one.contains("<path>") && one.contains("<n>"), "{one}");
         assert_ne!(normalized("error: disk full"), normalized("error: connection refused"));
+    }
+
+    /// An upgrade that goes through is news to the agent of an incident about that runner's
+    /// upgrading, open or reported on: it checks and resolves it instead of waiting on an upgrade
+    /// that's over. Other runners', other kinds of incident and settled ones hear nothing.
+    #[test]
+    fn an_upgrade_that_went_through_is_news_to_its_incident_s_agent() {
+        let mut job = crate::updates::new_job("runner", "metal-1", "native", Some("9e912b75a6b6".into()), Some("669cb1ae027a".into()));
+        job.state = crate::updates::JobState::Done;
+        let incident = |id: &str, wake: &str, runner: &str, state: &str| Incident {
+            id: id.into(),
+            wake: wake.into(),
+            runner: Some(runner.into()),
+            state: state.into(),
+            agent: Some(format!("agent-{id}")),
+            ..Incident::default()
+        };
+        let all = [
+            incident("i1", "upgrade", "metal-1", "reported"),
+            incident("i2", "upgrade", "metal-2", "open"),
+            incident("i3", "offline", "metal-1", "open"),
+            incident("i4", "upgrade", "metal-1", "resolved"),
+            incident("i5", "upgrade", "metal-1", "open"),
+        ];
+        let news = through_news(std::slice::from_ref(&job), &all);
+        assert_eq!(news.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), ["agent-i1", "agent-i5"]);
+        assert!(news[0].1.contains("brought it to build 669cb1ae027a") && news[0].1.contains("incident i1") && news[0].1.contains("report it resolved"), "{}", news[0].1);
     }
 }
 

@@ -29,7 +29,7 @@ fn schema(props: Value, required: &[&str]) -> Value {
     json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
 
-const AGENT: &str = "The agent session's id (kiln's, as `harness.sessions` lists them).";
+const AGENT: &str = "The agent's id (as agents_list gives it); leave it out for your own goal stack.";
 
 async fn get(cx: Cx, v: Value) -> Out {
     json_of(&super::get(&cx.hub, &agent_of(&v)?).await.map_err(fail)?)
@@ -71,16 +71,16 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "goals.get",
-            summary: "An agent's goal stack: its goals in order (pending, active, met, unmet, skipped), and whether it runs, is paused (and why) or is done. The goal under way is sent again whenever the agent stops short of it, until it's met; an agent without goals of its own says it's met by ending its reply with the line GOAL MET.",
+            summary: "An agent's goal stack (yours, without `agent`): its goals in order (pending, active, met, unmet, skipped), and whether it runs, is paused (and why) or is done. The goal under way is sent again whenever the agent stops short of it, until it's met; an agent without goals of its own says it's met by ending its reply with the line GOAL MET.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
+            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &[]),
             route: |v| Ok((Method::GET, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
             name: "goals.add",
-            summary: "Line goals up for an agent, after the ones it has: each goes to it once the one before is met (its harness's own /goal where it has one), like giving it /goal again and again. Runs the stack unless `start` is false.",
+            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has: each goes to it once the one before is met (its harness's own /goal where it has one), like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, in order, each saying what done is.",
             read_only: false,
             destructive: false,
             input: || {
@@ -90,7 +90,7 @@ pub fn list_ops() -> Vec<Op> {
                         "goals": {"type": "array", "items": {"type": "string"}, "description": "Each a condition or objective, one line."},
                         "start": {"type": "boolean"}
                     }),
-                    &["agent", "goals"],
+                    &["goals"],
                 )
             },
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
@@ -107,7 +107,7 @@ pub fn list_ops() -> Vec<Op> {
                         "agent": {"type": "string", "description": AGENT},
                         "goals": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}}, "required": ["text"]}}
                     }),
-                    &["agent", "goals"],
+                    &["goals"],
                 )
             },
             route: |v| Ok((Method::PUT, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
@@ -118,7 +118,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Start (or resume), pause, skip the goal under way, or clear an agent's goal stack.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "action": {"type": "string", "enum": ["start", "pause", "skip", "clear"]}}), &["agent", "action"]),
+            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "action": {"type": "string", "enum": ["start", "pause", "skip", "clear"]}}), &["action"]),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", v.get("action").and_then(Value::as_str).unwrap_or("start")]))),
             run: |cx, v| Box::pin(control(cx, v)),
         },

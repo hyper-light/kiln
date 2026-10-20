@@ -91,9 +91,25 @@ pub fn listed(cd: bool) -> Vec<Info> {
     out
 }
 
+/// Operations on one agent that an agent calling them without `agent` means for itself: its own
+/// goal stack, and putting its own work up for review.
+const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "agents.change"];
+
+/// `input` to operation `name` as `caller` means it: an agent's own id where it left out `agent`
+/// on one of [`YOURS`].
+fn yours(caller: &Caller, name: &str, mut input: Value) -> Value {
+    if YOURS.contains(&name)
+        && let (Some(me), Some(o)) = (caller.agent.as_deref(), input.as_object_mut())
+        && o.get("agent").and_then(Value::as_str).is_none_or(|a| a.trim().is_empty())
+    {
+        o.insert("agent".into(), json!(me));
+    }
+    input
+}
+
 /// Runs operation `name` for `cx`'s caller, when the route table lets it.
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
-    let input = if input.is_null() { json!({}) } else { input };
+    let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
     if name.starts_with("ci.") {
         return crate::ci::ops::call(cx, name, input).await;
     }
@@ -180,5 +196,19 @@ mod tests {
         // Listed whether deployments are on or not.
         assert!(listed(false).iter().any(|o| o.name == "agents.wait"));
         assert!(listed(false).iter().any(|o| o.name == "plans.create"));
+    }
+
+    /// An agent's own goal stack and change request need no id: left out, `agent` is the agent
+    /// calling. One it names stays; a person's input, and other operations', are as they came.
+    #[test]
+    fn an_agent_s_own_goals_and_change_need_no_id() {
+        let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:01a1", None, None);
+        agent.agent = Some("01a1".into());
+        assert_eq!(yours(&agent, "goals.add", json!({"goals": ["g"]})), json!({"goals": ["g"], "agent": "01a1"}));
+        assert_eq!(yours(&agent, "goals.control", json!({"agent": " ", "action": "start"})), json!({"agent": "01a1", "action": "start"}));
+        assert_eq!(yours(&agent, "agents.change", json!({})), json!({"agent": "01a1"}));
+        assert_eq!(yours(&agent, "goals.get", json!({"agent": "child"})), json!({"agent": "child"}));
+        assert_eq!(yours(&agent, "agents.stop", json!({})), json!({}), "ending an agent always names it");
+        assert_eq!(yours(&Caller::owner(), "goals.add", json!({"goals": ["g"]})), json!({"goals": ["g"]}));
     }
 }

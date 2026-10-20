@@ -411,6 +411,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
         (&Method::GET, ["api", "updates"]) => Ok(updates_overview(&hub, false).await),
         (&Method::POST, ["api", "updates", "check"]) => Ok(updates_overview(&hub, true).await),
+        (&Method::GET, ["api", "updates", "runners"]) => Ok(srv::json(StatusCode::OK, &crate::doctor::updates_for(&hub, &caller).await)),
         (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
         (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
         (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name, req).await,
@@ -452,7 +453,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             job_logs_ws(hub.clone(), id, step, req)
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => get_artifacts(&hub, id).await,
-        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &hub.agent_list().await)),
+        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &crate::doctor::runners_for(&hub, &caller).await)),
         (&Method::GET, ["api", "reach", "runners"]) => {
             let want = srv::query(&req).get("want").cloned();
             reach_runners(&hub, want.as_deref())

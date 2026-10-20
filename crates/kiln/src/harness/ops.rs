@@ -424,14 +424,14 @@ pub fn list_ops() -> Vec<Op> {
             input: || {
                 schema(
                     json!({
-                        "agent": {"type": "string", "description": AGENT},
+                        "agent": {"type": "string", "description": "The agent whose work it is (as agents.list gives it); leave it out for your own."},
                         "title": {"type": "string"},
                         "body": {"type": "string", "description": "What it changes and why, for reviewers."},
                         "draft": {"type": "boolean", "description": "Not ready for review yet (kiln's own review)."},
                         "trunk": {"type": "string", "description": "The branch it goes into."},
                         "fix_checks": {"type": "boolean", "description": "Failing checks go to the agent to fix (the default)."}
                     }),
-                    &["agent"],
+                    &[],
                 )
             },
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "change"]))),

@@ -247,9 +247,12 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
 
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
-lists shorten it). `workspace` is `folder` (the folder itself, the default) or `volume` (a Slates
-volume of its own, where its machine can make one); in a result it is `null` for an agent in its
-folder, and `branch` and `change_request` are `null` until it has a change request.
+lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
+as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.
+kiln's MCP server tells each agent its id. `workspace` is `folder` (the folder itself, the
+default) or `volume` (a Slates volume of its own, where its machine can make one); in a result it
+is `null` for an agent in its folder, and `branch` and `change_request` are `null` until it has a
+change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
 files_changed, lines_added, lines_removed, cost_usd, doing?, parent?, plan_run?, last_turn?,
