@@ -153,7 +153,12 @@ mod tests {
     #[test]
     fn an_agent_steers_the_goals_and_plans_of_itself_and_its_own_only() -> anyhow::Result<()> {
         within(async {
-            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            // No conversation store: what's steered is goals and plans, not conversations.
+            let hub = crate::hub::tests::scratch_hub_with(|c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;

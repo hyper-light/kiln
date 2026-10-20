@@ -777,7 +777,7 @@ mod tests {
         use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
             let clock = SimClock::new();
-            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), |_| {}).await?;
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(clock.clone()), |c| c.conversations.off = true).await?;
             let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
             let (id, goal) = ("goals-backoff", "the parser takes every input");
             // Its harness has goals of its own (Claude Code's /goal); it's idle, its goal still set.

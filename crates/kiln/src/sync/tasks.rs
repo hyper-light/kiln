@@ -167,16 +167,21 @@ impl Tasks {
         let file = dir.join("tasks.json");
         let mut tasks: Vec<Task> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let now = crate::util::now_unix();
+        let mut cut = false;
         for t in tasks.iter_mut().filter(|t| !t.over()) {
             t.state = "failed".into();
             t.error = Some("the server restarted while it was under way: start it again".into());
             t.updated = now;
+            cut = true;
         }
         let bundles = dir.join("bundles");
         let _ = std::fs::remove_dir_all(&bundles);
         let _ = std::fs::create_dir_all(&bundles);
         let me = Self { file, dir: bundles, inner: Mutex::new(Inner { tasks, ..Inner::default() }), changed: event_listener::Event::new() };
-        me.save();
+        // Written again only when the restart failed one under way: unchanged, the file stands.
+        if cut {
+            me.save();
+        }
         me
     }
 

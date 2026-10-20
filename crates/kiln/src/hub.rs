@@ -2143,7 +2143,8 @@ pub(crate) mod tests {
         cfg.server.data_dir = dir.clone();
         cfg.terminal.enabled = false;
         f(&mut cfg);
-        let pki = Arc::new(crate::pki::Pki::open(&dir.join("pki"))?);
+        // Its keys are throwaway: written without waiting for the disk.
+        let pki = Arc::new(crate::pki::Pki::open_scratch(&dir.join("pki"))?);
         let leaf = pki.server_leaf(&[])?;
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
         let store = Store::in_memory()?;
