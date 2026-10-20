@@ -365,7 +365,9 @@ async fn compare(d: &Deploy, m: &mut Move) -> Result<bool, String> {
         }
         None => {
             let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
-            shadow_on_kilncd(d, &cd, &target, &runs, &m.by).await?;
+            let from = env.provider.strip_prefix("argocd/").ok_or("a move goes between KilnCD and Argo CD")?;
+            let tracking = Argo::of(&d.hub, from).await?.tracking().await?;
+            shadow_on_kilncd(d, &cd, &target, &runs, &m.by, tracking).await?;
             let mut out = Vec::new();
             for r in &runs {
                 let id = kilncd::app_id(&r.app, &target.name);
@@ -384,9 +386,10 @@ async fn compare(d: &Deploy, m: &mut Move) -> Result<bool, String> {
     Ok(m.registrations.iter().all(|r| r.agrees == Some(true)))
 }
 
-/// Each app as a KilnCD app whose automation is off, compared with what runs: it never syncs. Put
-/// again as it is, it changes nothing.
-async fn shadow_on_kilncd(d: &Deploy, cd: &Arc<crate::cd::Cd>, target: &Environment, runs: &[Runs], by: &str) -> Result<(), String> {
+/// Each app as a KilnCD app whose automation is off, compared with what runs: it never syncs. It
+/// knows the objects Argo CD deployed by Argo CD's own tracking (`tracking`, under the Argo CD
+/// Application's name), so it takes them over as they are. Put again as it is, it changes nothing.
+async fn shadow_on_kilncd(d: &Deploy, cd: &Arc<crate::cd::Cd>, target: &Environment, runs: &[Runs], by: &str, tracking: kiln_cd::model::Tracking) -> Result<(), String> {
     let url = d.hosted.url(&target.release_repo.repo).map_err(|e| format!("{e:#}"))?;
     let actor = format!("deploy for {by}");
     for r in runs {
@@ -399,6 +402,8 @@ async fn shadow_on_kilncd(d: &Deploy, cd: &Arc<crate::cd::Cd>, target: &Environm
         let chart = kilncd::git_chart(cd, &r.file.package, &version).await;
         let mut def = kilncd::definition(&r.app, target, &r.reg, &r.file, &r.commit, &url, chart)?;
         def.sync.auto = false;
+        def.tracking = tracking;
+        def.tracking_name = Some(argocd::application_name(&r.app, &target.name));
         kilncd::deliver(&d.hub, cd, &actor, &def).await.map_err(|e| e.to_string())?;
     }
     let ids: Vec<String> = runs.iter().map(|r| kilncd::app_id(&r.app, &target.name)).collect();
@@ -466,7 +471,7 @@ async fn handover(d: &Deploy, m: &mut Move) -> Result<(), String> {
         }
         // The new provider holds each app (in shadow, unless it took it over already).
         if to_kilncd {
-            shadow_on_kilncd(d, &cd, &target, &runs, &m.by).await?;
+            shadow_on_kilncd(d, &cd, &target, &runs, &m.by, argo.tracking().await?).await?;
         } else {
             shadow_on_argo(d, &argo, &target, &runs).await?;
         }

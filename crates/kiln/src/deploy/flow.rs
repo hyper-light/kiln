@@ -675,6 +675,24 @@ pub async fn delete_template(d: &Deploy, actor: &str, name: &str) -> Result<(), 
 /// The trailer kiln's registering commits carry, so no scan takes them for someone's edit.
 const REGISTRATION_TRAILER: &str = "Kiln-Registration";
 
+/// Gives an environment's release repository its first commit, when it has none yet: a README
+/// saying what it is. An empty repository has no `HEAD` for Argo CD to read, and Argo CD tries one
+/// as it's registered (§8.3).
+pub(super) async fn first_commit(d: &Deploy, env: &Environment) -> Result<(), String> {
+    let (hosted, rr) = (d.hosted.clone(), env.release_repo.clone());
+    let head = crate::rt::blocking(move || hosted.head(&rr.repo, &rr.branch)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    if head.is_some() {
+        return Ok(());
+    }
+    let readme = format!(
+        "# {}\n\nkiln's release repository (docs/deploy-api.md §6): what each environment runs, one release a commit.\n\n- `<project>/<app>/app.yaml`: an app's package\n- `<project>/<app>/<env>/release.json`: what runs there, kiln writes it\n- `<project>/<app>/<env>/values.yaml`: its values there, a config release changes them\n",
+        env.release_repo.repo
+    );
+    let path = repo::join(&env.release_repo.root, "README.md");
+    let message = format!("start the release repository\n\n{REGISTRATION_TRAILER}: -\n{}: kiln\n", repo::REQUESTED_BY_TRAILER);
+    commit_files(d, env, vec![Change { path, content: Some(readme.into_bytes()) }], message, "kiln").await.map(|_| ())
+}
+
 /// Commits `changes` on the environment's release repository, made on its head, again on a newer
 /// head while someone else's push races it.
 async fn commit_files(d: &Deploy, env: &Environment, changes: Vec<Change>, message: String, who: &str) -> Result<String, String> {
@@ -2065,14 +2083,26 @@ async fn revert(d: &Deploy, r: &Release, why: &str) -> Result<(Option<String>, O
     Ok((Some(sha.clone()), Some(sha)))
 }
 
+/// Where an environment's look at its release repository's branch for commits kiln didn't make
+/// got to.
+fn seen_key(env: &str, repo: &str, branch: &str) -> String {
+    format!("deploy/seen/{env}/{repo}/{branch}")
+}
+
 /// Commits on release repositories that kiln didn't make become releases (origin `git`), so the
 /// records never disagree with git (docs/deploy-api.md §6).
 async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
     let st = &d.hub.store;
     for env in store::environments(st).await? {
         let rr = env.release_repo.clone();
-        let key = format!("deploy/seen/{}/{}", rr.repo, rr.branch);
-        let seen = st.kv_get(key.clone()).await?;
+        // Where each environment has looked to, its own: environments share a release repository
+        // (kiln/releases by default), and each looks at every commit for its registrations. One
+        // from before kept a repository's mark: it starts from there.
+        let key = seen_key(&env.name, &rr.repo, &rr.branch);
+        let seen = match st.kv_get(key.clone()).await? {
+            Some(s) => Some(s),
+            None => st.kv_get(format!("deploy/seen/{}/{}", rr.repo, rr.branch)).await?,
+        };
         let (hosted, rr2, since) = (d.hosted.clone(), rr.clone(), seen.clone());
         let (head, commits) = crate::rt::blocking(move || -> anyhow::Result<(Option<String>, Vec<super::host::LoggedCommit>)> {
             let head = hosted.head(&rr2.repo, &rr2.branch)?;
@@ -2151,6 +2181,85 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::authz::gate::Kind as CallerKind;
+
+    #[test]
+    fn a_commit_kiln_didn_t_make_is_a_release_in_every_environment_sharing_the_repository() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let st = &hub.store;
+            // Two environments on one release repository: kiln's default.
+            let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+            store::put_app(st, &web).await?;
+            for name in ["staging", "production"] {
+                store::put_environment(st, &Environment { name: name.into(), ..env(false) }).await?;
+                store::put_registration(st, &Registration { app: "web".into(), environment: name.into(), enabled: true, paused: false, running: None, created_at: 0, degraded: None }).await?;
+            }
+            let rr = super::super::model::RepoRef::default();
+            let hand = |path: String, text: &str, message: &str| -> anyhow::Result<()> {
+                let head = d.hosted.head(&rr.repo, &rr.branch)?;
+                d.hosted
+                    .commit(&rr.repo, &rr.branch, head.as_deref(), &[Change { path, content: Some(text.as_bytes().to_vec()) }], message, &author("hand"))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(())
+            };
+            // The first look notes where the branch is.
+            hand("README.md".into(), "releases\n", "start")?;
+            scan_git(&d).await?;
+            // A hand edit of each environment's values, one commit each.
+            hand(repo::values_file(&rr, &web, "staging"), "replicaCount: 2\n", "two replicas in staging")?;
+            hand(repo::values_file(&rr, &web, "production"), "replicaCount: 3\n", "three in production")?;
+            scan_git(&d).await?;
+            let releases = store::releases(st, store::ReleaseQuery { app: Some("web".into()), environment: None, state: None, version: None, limit: 10 }).await?;
+            let mut made: Vec<(String, Origin, Kind)> = releases.iter().map(|r| (r.environment.clone(), r.origin, r.kind)).collect();
+            made.sort_by(|a, b| a.0.cmp(&b.0));
+            anyhow::ensure!(made == [("production".into(), Origin::Git, Kind::Config), ("staging".into(), Origin::Git, Kind::Config)], "each environment sees its own: {made:?}");
+            // Looked at again, nothing new.
+            scan_git(&d).await?;
+            anyhow::ensure!(store::releases(st, store::ReleaseQuery { app: Some("web".into()), environment: None, state: None, version: None, limit: 10 }).await?.len() == 2);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_release_repository_starts_with_a_commit_argo_cd_can_read() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let mut e = env(false);
+            e.release_repo.root = "deploy".into();
+            let head = |d: &Deploy| d.hosted.head(&e.release_repo.repo, &e.release_repo.branch);
+            anyhow::ensure!(head(&d)?.is_none(), "an empty repository has no HEAD for Argo CD to read");
+            first_commit(&d, &e).await.map_err(anyhow::Error::msg)?;
+            let first = head(&d)?.ok_or_else(|| anyhow::anyhow!("no first commit"))?;
+            let readme = d.hosted.read(&e.release_repo.repo, &first, "deploy/README.md")?.unwrap_or_default();
+            anyhow::ensure!(String::from_utf8_lossy(&readme).contains("release.json"), "a README under its root");
+            // Not a commit kiln takes for someone's: it carries a registration's trailer.
+            let logged = d.hosted.commits_since(&e.release_repo.repo, &e.release_repo.branch, None)?;
+            anyhow::ensure!(logged.iter().all(|c| c.trailer(REGISTRATION_TRAILER).is_some()), "{logged:?}");
+            // Once is enough.
+            first_commit(&d, &e).await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(head(&d)?.as_deref() == Some(first.as_str()), "a repository with commits gets none");
+            Ok(())
+        })
+    }
 
     fn env(agents_deploy: bool) -> Environment {
         Environment {

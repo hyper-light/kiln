@@ -1,6 +1,6 @@
 //! An environment on Argo CD through its ApplicationSet (docs/deploy-api.md §8.3): what kiln keeps
 //! in place there (the release repository registered with a token of kiln's that reads only it,
-//! an AppProject per kiln project, the ApplicationSet itself), and a release delivered and followed
+//! the environment's AppProject, the ApplicationSet itself), and a release delivered and followed
 //! through it. The ApplicationSet makes and updates each registration's Application from its
 //! `release.json`; kiln never writes one, and deletes one only once the ApplicationSet no longer
 //! makes it.
@@ -31,8 +31,7 @@ pub fn release_url(d: &Deploy, argo: &Argo, env: &Environment) -> String {
 }
 
 /// Puts in place what an environment's ApplicationSet needs, then the ApplicationSet, read again at
-/// once: the release repository registered for reading, and the AppProject of each kiln project
-/// with apps registered on this Argo CD.
+/// once: the release repository registered for reading, and the environment's AppProject.
 pub async fn ensure(d: &Deploy, argo: &Argo, env: &Environment) -> Result<(), Undelivered> {
     put(d, argo, env, false).await
 }
@@ -45,9 +44,7 @@ pub async fn shadow(d: &Deploy, argo: &Argo, env: &Environment) -> Result<(), Un
 async fn put(d: &Deploy, argo: &Argo, env: &Environment, shadow: bool) -> Result<(), Undelivered> {
     let url = release_url(d, argo, env);
     register_repo(d, argo, env, &url).await?;
-    for (project, allowed) in allowed(d, argo, env).await? {
-        argo.put_project(&argocd::app_project(&project, &allowed)).await?;
-    }
+    argo.put_project(&argocd::app_project(&env.name, &allowed(d, env, &url).await?)).await?;
     argo.put_application_set(&argocd::application_set(&argo.namespace, env, &url, shadow)).await
 }
 
@@ -62,6 +59,7 @@ async fn register_repo(d: &Deploy, argo: &Argo, env: &Environment, url: &str) ->
     if !live.is_empty() && reads {
         return Ok(());
     }
+    super::flow::first_commit(d, env).await?;
     let (id, token) = crate::authz::tokens::mint_reader(&d.hub, repo_name, Some(TOKEN_DAYS), &note).await.map_err(|e| format!("{e:#}"))?;
     if let Err(why) = argo.put_repository(url, &argocd::release_repo_name(repo_name), "kiln", &token).await {
         let _ = crate::authz::tokens::revoke_reader(&d.hub, &id).await;
@@ -74,36 +72,27 @@ async fn register_repo(d: &Deploy, argo: &Argo, env: &Environment, url: &str) ->
     Ok(())
 }
 
-/// What each kiln project's AppProject allows on this Argo CD: every registration in an
-/// environment on it through an ApplicationSet, `env` as it's being put (a change not stored yet,
-/// or an environment on its way here) in place of the one stored.
-async fn allowed(d: &Deploy, argo: &Argo, env: &Environment) -> Result<BTreeMap<String, Allowed>, String> {
+/// What an environment's AppProject allows: each registration's package repository and namespace,
+/// its template's cluster-scoped kinds, and the release repository.
+async fn allowed(d: &Deploy, env: &Environment, url: &str) -> Result<Allowed, String> {
     let st = &d.hub.store;
     let e = |e: anyhow::Error| format!("{e:#}");
-    let mut out: BTreeMap<String, Allowed> = BTreeMap::new();
+    let mut out = Allowed::default();
+    out.sources.insert(url.to_owned());
     let mut kinds: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut envs = store::environments(st).await.map_err(e)?;
-    envs.retain(|x| x.name != env.name);
-    envs.push(env.clone());
-    for env in envs {
-        if integration_of(&env) != Some(argo.integration.as_str()) {
-            continue;
-        }
-        let url = release_url(d, argo, &env);
-        for reg in store::registrations(st, None, Some(&env.name)).await.map_err(e)? {
-            let Some(a) = store::app(st, &reg.app).await.map_err(e)? else { continue };
-            let cluster_kinds = match &a.template {
-                Some(t) => {
-                    if !kinds.contains_key(t) {
-                        let found = store::template(st, t).await.map_err(e)?.map(|t| t.cluster_kinds).unwrap_or_default();
-                        kinds.insert(t.clone(), found);
-                    }
-                    kinds.get(t).cloned().unwrap_or_default()
+    for reg in store::registrations(st, None, Some(&env.name)).await.map_err(e)? {
+        let Some(a) = store::app(st, &reg.app).await.map_err(e)? else { continue };
+        let cluster_kinds = match &a.template {
+            Some(t) => {
+                if !kinds.contains_key(t) {
+                    let found = store::template(st, t).await.map_err(e)?.map(|t| t.cluster_kinds).unwrap_or_default();
+                    kinds.insert(t.clone(), found);
                 }
-                None => Vec::new(),
-            };
-            out.entry(a.project.clone()).or_default().add(&a, &env, &url, &cluster_kinds);
-        }
+                kinds.get(t).cloned().unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        out.add(&a, env, url, &cluster_kinds);
     }
     Ok(out)
 }

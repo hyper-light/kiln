@@ -20,7 +20,8 @@ pub const RELEASE_TRAILER: &str = "Kiln-Release";
 /// The trailer that names who asked for it.
 pub const REQUESTED_BY_TRAILER: &str = "Kiln-Requested-By";
 
-fn join(root: &str, rest: &str) -> String {
+/// A path in a release repository, under its root.
+pub fn join(root: &str, rest: &str) -> String {
     let root = root.trim_matches('/');
     if root.is_empty() { rest.to_owned() } else { format!("{root}/{rest}") }
 }

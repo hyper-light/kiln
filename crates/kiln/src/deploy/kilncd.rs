@@ -143,6 +143,7 @@ pub fn definition(app: &App, env: &Environment, reg: &Registration, file: &Relea
         sync: SyncPolicy { auto: !reg.paused, prune: env.sync.prune, self_heal: env.sync.self_heal, allow_empty: false, options, retry: None },
         ignore: Vec::new(),
         tracking: Tracking::Kiln,
+        tracking_name: None,
         origin: Origin::Api,
         environment: None,
         labels: BTreeMap::from([("kiln.dev/registration".to_owned(), format!("{}/{}", app.name, env.name)), ("kiln.dev/release".to_owned(), file.release.to_string())]),

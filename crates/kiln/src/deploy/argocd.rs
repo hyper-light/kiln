@@ -8,7 +8,7 @@
 //! reads every `release.json` of the environment in its release repository and makes one
 //! Application per registration, `<env>-<app>`: the package at its version, its values from the
 //! release repository (a second source, `$release`), what it sets and `kiln.release=<id>` (txst's
-//! deployment id) as Helm parameters, in the AppProject of the app's project, `kiln-<project>`.
+//! deployment id) as Helm parameters, in the environment's AppProject, `kiln-<env>`.
 //! kiln registers the release repository with Argo CD with a token of its own that reads only
 //! that repository. A release is a commit and a refresh; it has landed when Argo CD compared its
 //! spec (the parameter, or the version for plain manifests) with the release repository at a
@@ -245,6 +245,18 @@ impl Argo {
             .collect())
     }
 
+    /// How it tracks the objects its Applications deploy, as KilnCD reads that tracking to take
+    /// them over: by annotation (Argo CD 3's default), label, or both.
+    pub async fn tracking(&self) -> Result<kiln_cd::model::Tracking, String> {
+        use kiln_cd::model::Tracking;
+        let v = self.ok(Method::Get, "/api/v1/settings", None).await?;
+        Ok(match v.get("trackingMethod").and_then(Value::as_str).unwrap_or("annotation") {
+            "label" => Tracking::ArgoLabel,
+            "annotation+label" => Tracking::ArgoAnnotationAndLabel,
+            _ => Tracking::ArgoAnnotation,
+        })
+    }
+
     fn set_query(&self) -> String {
         format!("appsetNamespace={}", enc(&self.namespace))
     }
@@ -284,12 +296,13 @@ impl Argo {
     }
 
     /// A repository Argo CD reads, and how its last connection went; `None` when it has none.
+    /// Argo CD answers 403 for a repository it doesn't have, as for one the token may not see:
+    /// putting it says which.
     pub async fn repository(&self, url: &str) -> Result<Option<Value>, String> {
         let (status, v) = self.call(Method::Get, &format!("/api/v1/repositories/{}", enc(url)), None).await?;
         match status {
             200 => Ok(Some(v)),
-            404 => Ok(None),
-            403 if v.to_string().contains("not found") => Ok(None),
+            403 | 404 => Ok(None),
             s => Err(format!("{} (repository {url})", answered(s, &v))),
         }
     }
@@ -439,9 +452,10 @@ pub fn set_name(env: &str) -> String {
     format!("kiln-{env}")
 }
 
-/// The AppProject of a kiln project.
-pub fn project_name(project: &str) -> String {
-    format!("kiln-{project}")
+/// The AppProject of an environment's Applications, which its ApplicationSet names (Argo CD's API
+/// takes no ApplicationSet whose project is templated).
+pub fn project_name(env: &str) -> String {
+    format!("kiln-{env}")
 }
 
 /// The label every Application and ApplicationSet kiln makes carries: its stream picks them.
@@ -542,7 +556,7 @@ pub fn application_set(namespace: &str, env: &Environment, release_url: &str, sh
                     "annotations": { "kiln.dev/release": "{{ .release }}" },
                 },
                 "spec": {
-                    "project": "kiln-{{ .project }}",
+                    "project": project_name(&env.name),
                     "destination": { "name": cluster_of(env), "namespace": "{{ .namespace | default .app }}" },
                     "syncPolicy": sync_policy(env, !shadow),
                 },
@@ -561,9 +575,9 @@ fn sync_policy(env: &Environment, automated: bool) -> Value {
     sync
 }
 
-/// What a kiln project's AppProject allows on one Argo CD: the repositories its apps come from
-/// and the release repositories, where they run, and the cluster-scoped kinds they make (a
-/// Namespace always, for `CreateNamespace`).
+/// What an environment's AppProject allows: the repositories its apps come from and its release
+/// repository, where they run, and the cluster-scoped kinds they make (a Namespace always, for
+/// `CreateNamespace`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Allowed {
     pub sources: BTreeSet<String>,
@@ -586,14 +600,14 @@ impl Allowed {
     }
 }
 
-/// The AppProject of a kiln project.
-pub fn app_project(project: &str, allowed: &Allowed) -> Value {
+/// The AppProject of an environment's Applications.
+pub fn app_project(env: &str, allowed: &Allowed) -> Value {
     let mut kinds = vec![json!({ "group": "", "kind": "Namespace" })];
     kinds.extend(allowed.cluster_kinds.iter().filter(|(g, k)| !(g.is_empty() && k == "Namespace")).map(|(g, k)| json!({ "group": g, "kind": k })));
     json!({
-        "metadata": { "name": project_name(project), "labels": { "app.kubernetes.io/managed-by": "kiln", "kiln.dev/project": project } },
+        "metadata": { "name": project_name(env), "labels": { "app.kubernetes.io/managed-by": "kiln", "kiln.dev/environment": env } },
         "spec": {
-            "description": format!("kiln's project {project}: where its apps come from, and where they run"),
+            "description": format!("kiln's environment {env}: where its apps come from, and where they run"),
             "sourceRepos": allowed.sources,
             "destinations": allowed.destinations.iter().map(|(c, ns)| json!({ "name": c, "namespace": ns })).collect::<Vec<_>>(),
             "clusterResourceWhitelist": kinds,
@@ -1031,7 +1045,7 @@ mod tests {
         assert_eq!(at("/spec/syncPolicy/preserveResourcesOnDeletion"), json!(true));
         assert_eq!(at("/spec/ignoreApplicationDifferences/0/jsonPointers/0"), json!("/spec/syncPolicy"), "a pause stays");
         assert_eq!(at("/spec/template/metadata/name"), json!("production-{{ .app }}"), "the name kiln writes Applications under");
-        assert_eq!(at("/spec/template/spec/project"), json!("kiln-{{ .project }}"));
+        assert_eq!(at("/spec/template/spec/project"), json!("kiln-production"), "its own AppProject, named as it is");
         assert_eq!(at("/spec/template/spec/destination/name"), json!("prod-us"));
         assert_eq!(at("/spec/template/spec/syncPolicy/automated/prune"), json!(true));
         let patch = at("/spec/templatePatch");
@@ -1045,14 +1059,14 @@ mod tests {
     }
 
     #[test]
-    fn a_project_allows_where_its_apps_come_from_and_run() {
+    fn an_environment_s_project_allows_where_its_apps_come_from_and_run() {
         let mut allowed = Allowed::default();
         let url = "http://kiln/git/acme/releases.git";
         allowed.add(&app(helm()), &env(), url, &["rbac.authorization.k8s.io/ClusterRole".into(), "Namespace".into()]);
         let git = Package::Git { repo: "https://github.com/acme/api".into(), path: "deploy".into(), set: BTreeMap::new() };
         allowed.add(&App { name: "api".into(), namespace: Some("shop-api".into()), ..app(git) }, &env(), url, &[]);
-        let p = app_project("shop", &allowed);
-        assert_eq!(p.pointer("/metadata/name"), Some(&json!("kiln-shop")));
+        let p = app_project("production", &allowed);
+        assert_eq!(p.pointer("/metadata/name"), Some(&json!("kiln-production")));
         assert_eq!(p.pointer("/spec/sourceRepos"), Some(&json!(["ghcr.io/acme/charts", url, "https://github.com/acme/api"])));
         assert_eq!(p.pointer("/spec/destinations"), Some(&json!([{ "name": "prod-us", "namespace": "shop-api" }, { "name": "prod-us", "namespace": "web" }])));
         assert_eq!(p.pointer("/spec/clusterResourceWhitelist"), Some(&json!([{ "group": "", "kind": "Namespace" }, { "group": "rbac.authorization.k8s.io", "kind": "ClusterRole" }])), "a Namespace once");

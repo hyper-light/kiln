@@ -66,7 +66,7 @@ pub async fn list(d: &Deploy, a: &App, env: &Environment, t: &Target) -> Result<
             let argo = argocd::Argo::of(&d.hub, integration).await.map_err(unavailable)?;
             let name = argocd::application_name(a, &env.name);
             let app = argo.application(&name, None).await.map_err(unavailable)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("Argo CD has no Application {name}")))?;
-            let o = argocd::Object::of(&app, &group, &t.kind, t.namespace.as_deref().unwrap_or(""), &t.name);
+            let o = argocd::Object::of(&app, &group, &t.kind, t.namespace.as_deref().unwrap_or(a.namespace()), &t.name);
             let mut actions: Vec<Value> = argo
                 .actions(&name, &o)
                 .await
@@ -99,7 +99,8 @@ pub async fn run(d: &Deploy, who: &Who, a: &App, env: &Environment, ask: &Ask) -
             let argo = argocd::Argo::of(&d.hub, integration).await.map_err(unavailable)?;
             let name = argocd::application_name(a, &env.name);
             let app = argo.application(&name, None).await.map_err(unavailable)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("Argo CD has no Application {name}")))?;
-            let o = argocd::Object::of(&app, &group, &t.kind, t.namespace.as_deref().unwrap_or(""), &t.name);
+            // An object it doesn't list (a pod its workload made) is in the app's namespace.
+            let o = argocd::Object::of(&app, &group, &t.kind, t.namespace.as_deref().unwrap_or(a.namespace()), &t.name);
             if ask.action == "delete" {
                 if t.kind != "Pod" {
                     return Err(bad("only a pod is deleted as an action: what else runs is the release's to remove"));
