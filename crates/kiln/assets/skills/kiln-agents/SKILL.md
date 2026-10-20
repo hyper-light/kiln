@@ -20,6 +20,10 @@ cores). Don't for a few minutes of work, for steps that depend on each other's r
 go, or for anything you'd have to explain at more length than doing it. One or two children,
 then more if it works; a child that starts children of its own is rarely what you want.
 
+Steps that follow one another, each to be done before the next, are a plan: `plans_run` with
+`mode: "agents"` gives each step an agent of its own, held to it until it's met (the kiln-plans
+skill). Work you'll do yourself, item by item, is a goal stack of your own.
+
 Children in one folder share it: **only one should write at a time** there. To let several
 write, give each a workspace of its own: `workspace: "volume"` in `agents_start`, a Slates volume
 over the folder where what it changes stays its own (where its machine has Slates; it says if
@@ -53,7 +57,13 @@ return { waited: done.agents.map(x => ({ id: x.id, stand: x.stand })),
 
 ## Waiting and reading results
 
-`agents_wait` returns when each agent has **settled** (idle, needs a person, paused for a usage
+**You don't have to wait.** Once your children are started, carry on with other work, or end your
+turn: kiln tells you, in a message after your turn, when each one ends its turn (with its last
+words), needs a person, stops or ends, and starts your next turn with it if you're idle. Children
+that settle together come in one message. Then read what one concluded with `agents_result`.
+
+Wait only when you can't go on without a result: `agents_wait` returns when each agent has
+**settled** (idle, needs a person, paused for a usage
 limit, stopped, or ended), or when its time is up (`timeout_s`, at most 600: call it again to
 wait longer). `until: "change"` returns on any change; `any: true` when the first is done. A
 message you just sent counts: an agent isn't settled until it has had its turn.
@@ -91,7 +101,7 @@ one, with conflicts down to the byte, waits on Slates.)
 
 ## Putting work up for review
 
-`agents_change` opens a change request from an agent's work: yours (`agent` is your own id) or
+`agents_change` opens a change request from an agent's work: yours (leave out `agent`) or
 a child's. It takes the files the agent changed, commits them on the folder's last commit without
 touching the folder's branch, index or working tree, and pushes them as the branch
 `agents/<what it's about>-<id>`: into kiln's review for a repository kiln hosts, as a pull request

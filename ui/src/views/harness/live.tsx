@@ -3,7 +3,8 @@
  * `show_live` call, drawn as the page itself running on the agent's machine (its dev server, its
  * files, its network), streamed here. Its picture comes as video (the size of this frame at this
  * screen's density), its sound as Opus once you turn it on: over WebRTC when the server has it and
- * it gets through, else over its socket (WebCodecs) as it does until then. What you do in it goes back:
+ * it gets through, else over its socket (WebCodecs) as it does until then; in a browser with no
+ * WebCodecs (any, on an http:// address other than localhost), over WebRTC alone. What you do in it goes back:
  * taps and the mouse, the wheel, keys by meaning, text from a phone's keyboard, a paste. Out of
  * view it's let go (the stream pauses, nothing is sent) and its last picture stays.
  *
@@ -30,9 +31,20 @@ const touchViewer = typeof window !== "undefined" && window.matchMedia?.("(point
 const decodes = typeof window !== "undefined" && "VideoDecoder" in window;
 const plays = typeof window !== "undefined" && "AudioDecoder" in window;
 const rtcs = typeof window !== "undefined" && "RTCPeerConnection" in window;
+/** No WebCodecs (a browser hides them on an http:// address other than localhost): WebRTC is the
+ *  one way its picture comes. */
+const rtcOnly = !decodes && rtcs;
+const insecure = typeof window !== "undefined" && window.isSecureContext === false;
 /** WebRTC that didn't play here (this server's port out of reach, a codec this browser lacks):
  *  after two, this page doesn't try it again (the socket does). */
 let rtcMisses = 0;
+
+/** Why it can't be shown here (`rtc`: what became of WebRTC, when it was the one way left). */
+function cantShow(rtc?: "off" | "missed"): string {
+  if (!rtcs) return insecure ? "This browser can't show live pages on an http:// address: open kiln over https, or on localhost." : "This browser can't show live pages (it has neither WebCodecs nor WebRTC).";
+  const no = insecure ? "On an http:// address this browser has no WebCodecs (they need https, or localhost)" : "This browser has no WebCodecs";
+  return rtc === "off" ? `${no}, and this kiln has no WebRTC to show live pages with.` : `${no}, and WebRTC couldn't get through to kiln from here.`;
+}
 
 /** One viewing of a stream: its socket, its decoders, what it draws; its WebRTC peer, when the
  *  server has WebRTC (`rtc`: its picture plays in `player`, under the canvas, which is clear then). */
@@ -49,6 +61,10 @@ class Viewing {
   private pc: RTCPeerConnection | null = null;
   private rtc = false;
   private rtcWait: ReturnType<typeof setTimeout> | undefined;
+  /** With WebRTC the one way: the server's word that it has it, awaited; one try again once a peer
+   *  that played goes. */
+  private canWait: ReturnType<typeof setTimeout> | undefined;
+  private retried = false;
   private soundOn = false;
   closed = false;
 
@@ -60,7 +76,11 @@ class Viewing {
   ) {
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
-    this.ws.onopen = () => this.on.open();
+    this.ws.onopen = () => {
+      this.on.open();
+      // The server says at once whether it has WebRTC.
+      if (rtcOnly) this.canWait = setTimeout(() => this.cant("off"), 4000);
+    };
     this.ws.onmessage = (m) => (typeof m.data === "string" ? this.event(m.data) : this.chunk(m.data as ArrayBuffer));
     this.ws.onclose = (e) => {
       if (!this.closed) this.on.status("ended", e.code === 1000 ? "" : "The connection to it was lost.");
@@ -87,6 +107,7 @@ class Viewing {
 
   close() {
     this.closed = true;
+    clearTimeout(this.canWait);
     this.unpeer(false);
     this.ws.close(1000);
     for (const d of [this.video, this.audio]) if (d && d.state !== "closed") d.close();
@@ -102,7 +123,10 @@ class Viewing {
     }
     const w = e.webrtc as { can?: boolean; answer?: string; error?: string; gone?: string } | undefined;
     if (!w) return this.on.event(e);
-    if (w.can) void this.offer();
+    if (w.can) {
+      clearTimeout(this.canWait);
+      void this.offer();
+    }
     else if (w.answer && this.pc) this.pc.setRemoteDescription({ type: "answer", sdp: w.answer }).catch(() => this.unpeer(true));
     else if (w.error !== undefined || w.gone !== undefined) this.unpeer(false);
   }
@@ -110,7 +134,7 @@ class Viewing {
   /** A peer offered to the server: the picture and sound come over it once it plays. */
   private async offer() {
     const player = this.player;
-    if (!rtcs || !player || this.pc || this.closed || rtcMisses >= 2) return;
+    if (!rtcs || !player || this.pc || this.closed || (rtcMisses >= 2 && !rtcOnly)) return;
     let pc: RTCPeerConnection;
     try {
       pc = new RTCPeerConnection({ bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" });
@@ -188,6 +212,7 @@ class Viewing {
     const c = this.canvas;
     if (!this.rtc) {
       this.rtc = true;
+      this.retried = false;
       rtcMisses = 0;
       clearTimeout(this.rtcWait);
       this.send({ webrtc: { playing: true } });
@@ -222,6 +247,20 @@ class Viewing {
       this.on.rtc(false);
     } else rtcMisses++;
     if (tell) this.send({ webrtc: { playing: false, close: true } });
+    // With no other way here: a peer that played is tried again once; else it can't be shown.
+    if (rtcOnly && !this.closed) {
+      if (was && !this.retried) {
+        this.retried = true;
+        void this.offer();
+      } else this.cant("missed");
+    }
+  }
+
+  /** It can't be shown here: said, and its socket let go (nothing comes that would be shown). */
+  private cant(rtc: "off" | "missed") {
+    if (this.closed || this.rtc) return;
+    this.on.status("unsupported", cantShow(rtc));
+    this.close();
   }
 
   private chunk(buf: ArrayBuffer) {
@@ -265,6 +304,7 @@ class Viewing {
   }
 
   private configureVideo(cfg: { codec: string; codedWidth?: number; codedHeight?: number; description?: string }) {
+    if (!decodes) return;
     if (this.video && this.video.state !== "closed") this.video.close();
     this.video = new VideoDecoder({
       output: (f) => this.draw(f),
@@ -372,7 +412,7 @@ function agentWords(did: Record<string, unknown>[]): string {
 /** The live page, its controls above it (`onClose`: it may be closed from here). */
 export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: string; onClose?: () => void }) {
   const [stream, setStream] = React.useState(first);
-  const [status, setStatus] = React.useState<Status>(decodes ? "connecting" : "unsupported");
+  const [status, setStatus] = React.useState<Status>(decodes || rtcs ? "connecting" : "unsupported");
   const [why, setWhy] = React.useState("");
   const [address, setAddress] = React.useState(first.url);
   const [editing, setEditing] = React.useState<string | null>(null);
@@ -425,19 +465,20 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
 
   const connect = React.useCallback(() => {
     const c = canvas.current;
-    if (!c || !decodes || viewing.current) return;
+    if (!c || !(decodes || rtcs) || viewing.current) return;
     const s = live.current.stream;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const v = new Viewing(`${proto}//${location.host}/api/harness/sessions/${encodeURIComponent(s.session)}/streams/${s.id}/ws`, c, player.current, {
       // Its size first, before anything done in it: the page lays out at this frame's.
       open: () => {
         resize();
-        setTimeout(() => setStatus((st) => (st === "connecting" ? "still" : st)), 1500);
+        // Still, its socket's pictures having come (over WebRTC alone, it's live once one shows).
+        setTimeout(() => setStatus((st) => (st === "connecting" && !rtcOnly ? "still" : st)), 1500);
       },
       status: (st, w) => {
         setStatus(st);
         if (w !== undefined) setWhy(w);
-        if (st === "ended" && viewing.current === v) viewing.current = null;
+        if ((st === "ended" || st === "unsupported") && viewing.current === v) viewing.current = null;
       },
       fps: setFps,
       rtc: (on) => setPath(on ? "webrtc" : "socket"),
@@ -688,7 +729,8 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           {recording !== null ? <Since at={recording} /> : agentDid || word}
         </span>
         <span className="pg-actions">
-          {plays && (
+          {/* Its sound comes over WebRTC, or over its socket where WebCodecs' AudioDecoder plays it. */}
+          {(plays || rtcs) && (
             <button
               type="button"
               className="pg-action"
@@ -819,10 +861,23 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         ))}
         {(status === "ended" || status === "unsupported") && (
           <div className="lv-over">
-            <p>{status === "unsupported" ? "This browser can't show live pages (it has no WebCodecs)." : why || "This live page ended."}</p>
+            <p>{status === "unsupported" ? why || cantShow() : why || "This live page ended."}</p>
             {status === "ended" && (
               <button type="button" className="pg-action" onClick={() => void startAgain()}>
                 Start it again
+              </button>
+            )}
+            {status === "unsupported" && rtcOnly && (
+              <button
+                type="button"
+                className="pg-action"
+                onClick={() => {
+                  setStatus("connecting");
+                  setWhy("");
+                  connect();
+                }}
+              >
+                Try again
               </button>
             )}
           </div>

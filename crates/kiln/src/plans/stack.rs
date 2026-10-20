@@ -723,7 +723,7 @@ mod end_to_end {
             let url = format!("http://127.0.0.1:{port}/git/acme/app.git");
             sh_off(
                 work.path(),
-                &format!("git init -q -b main && git config user.name Ada && git config user.email ada@example.com && printf 'app\\n' > README.md && git add . && git commit -qm first && git remote add origin {url} && git -c 'http.extraHeader=Authorization: Bearer test-admin-token' push -q origin main"),
+                &format!("git init -q -b main && git config user.name Ada && git config user.email ada@example.com && git config commit.gpgsign false && git config tag.gpgsign false && printf 'app\\n' > README.md && git add . && git commit -qm first && git remote add origin {url} && git -c 'http.extraHeader=Authorization: Bearer test-admin-token' push -q origin main"),
             )
             .await?;
             let head = sh_off(work.path(), "git rev-parse HEAD").await?;

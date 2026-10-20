@@ -26,7 +26,8 @@ macro_rules! skill {
     };
 }
 
-static SKILLS: &[Skill] = &[skill!("kiln-agents"), skill!("kiln-deploy"), skill!("kiln-diagnose"), skill!("kiln-apps"), skill!("kiln-argocd-migration"), skill!("kiln-ci-diagnose")];
+static SKILLS: &[Skill] =
+    &[skill!("kiln-agents"), skill!("kiln-plans"), skill!("kiln-deploy"), skill!("kiln-diagnose"), skill!("kiln-apps"), skill!("kiln-argocd-migration"), skill!("kiln-ci-diagnose")];
 
 /// A frontmatter field of a `SKILL.md`.
 fn field(text: &str, key: &str) -> String {
@@ -119,6 +120,11 @@ mod tests {
         let agents = read("skill://kiln-agents/SKILL.md").and_then(|f| f.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
         for part in ["## When to fan out", "## Briefing a child", "## Waiting and reading results", "## Keeping children's permissions low", "## Merging their work", "## Putting work up for review", "## Never answering for the person"] {
             assert!(agents.contains(part), "kiln-agents: {part}");
+        }
+        // Goal stacks and plans: one's own stack (and ending the turn after lining it up), plans, an agent per step.
+        let plans = read("skill://kiln-plans/SKILL.md").and_then(|f| f.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+        for part in ["## Your own goal stack", "**end your turn**", "## Plans", "## One agent per step", "## What a person decides"] {
+            assert!(plans.contains(part), "kiln-plans: {part}");
         }
         assert!(get("skill://kiln-diagnose/SKILL.md").is_some());
     }

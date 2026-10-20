@@ -175,8 +175,13 @@ fn comment_text(r: &Record, v: &Value) -> String {
     let name = r.change.clone().unwrap_or_default();
     let version = v.get("version").and_then(Value::as_u64).map(|n| format!(" (version {n})")).unwrap_or_default();
     let body = s(v, "body").unwrap_or_default();
+    // Answering in its thread, where kiln has the operation for it (W14's review operations).
+    let reply = match s(v, "thread") {
+        Some(t) if crate::ci::ops::ops().iter().any(|o| o.name == "ci.diffs.reply") => format!(" To answer in its thread: ci.diffs.reply {{\"diff\": \"{name}\", \"thread\": \"{t}\", \"body\": …}}."),
+        _ => String::new(),
+    };
     format!(
-        "A comment on your change request {name}{version}{}, from {}:\n\n{body}\n\nIf it asks for a change, make it and open a new version (agents.change). It's at {}",
+        "A comment on your change request {name}{version}{}, from {}:\n\n{body}\n\nIf it asks for a change, make it and open a new version (agents.change).{reply} It's at {}",
         place(v),
         s(v, "author").unwrap_or("someone"),
         r.url

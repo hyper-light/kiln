@@ -156,6 +156,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("ci-providers", h => crate::ci::providers::sync_loop(h));
         child!("diff-runs", h => crate::ci::review::runs_loop(h));
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
+        child!("attachments", h => crate::ci::attach::run(h));
         child!("registry-collect", h => crate::ci::registry::collect_loop(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));

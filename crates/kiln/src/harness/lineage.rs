@@ -223,6 +223,17 @@ pub async fn depth(hub: &Hub, id: &str) -> u32 {
 }
 
 /// Whether agent `id` descends from agent `ancestor` (a child of it, or of one of its children…).
+/// Whether `caller` may steer agent `id`: send it messages, plans or goals, change or clear its
+/// goals, interrupt or end it. A person may steer any agent they reach; an agent only itself and
+/// the agents it started (and theirs).
+pub fn may_steer(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), Refused> {
+    let Some(me) = caller.agent.as_deref() else { return Ok(()) };
+    if me == id || descends(&hub.harness.list(), id, me) {
+        return Ok(());
+    }
+    Err((StatusCode::FORBIDDEN, format!("an agent steers and ends only the agents it started (and theirs): {} isn't one of {}'s", short(id), short(me))))
+}
+
 pub fn descends(all: &[Info], id: &str, ancestor: &str) -> bool {
     let mut at = id;
     for _ in 0..64 {

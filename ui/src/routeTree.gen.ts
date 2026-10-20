@@ -24,6 +24,7 @@ import { Route as AppTerminalRouteImport } from './routes/_app.terminal'
 import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppAgentsIndexRouteImport } from './routes/_app.agents.index'
 import { Route as AppAgentsIdRouteImport } from './routes/_app.agents.$id'
+import { Route as AppAgentsAttachedRouteImport } from './routes/_app.agents.attached'
 import { Route as AppAgentsSessionsRouteImport } from './routes/_app.agents.sessions'
 import { Route as AppDeploymentsIndexRouteImport } from './routes/_app.deployments.index'
 import { Route as AppDeploymentsNewRouteImport } from './routes/_app.deployments.new'
@@ -122,6 +123,11 @@ const AppAgentsIndexRoute = AppAgentsIndexRouteImport.update({
 const AppAgentsIdRoute = AppAgentsIdRouteImport.update({
   id: '/agents/$id',
   path: '/agents/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAgentsAttachedRoute = AppAgentsAttachedRouteImport.update({
+  id: '/agents/attached',
+  path: '/agents/attached',
   getParentRoute: () => AppRoute,
 } as any)
 const AppAgentsSessionsRoute = AppAgentsSessionsRouteImport.update({
@@ -271,6 +277,7 @@ export interface FileRoutesByFullPath {
   '/terminal': typeof AppTerminalRoute
   '/workflows': typeof AppWorkflowsRoute
   '/agents/$id': typeof AppAgentsIdRoute
+  '/agents/attached': typeof AppAgentsAttachedRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
@@ -312,6 +319,7 @@ export interface FileRoutesByTo {
   '/workflows': typeof AppWorkflowsRoute
   '/': typeof AppIndexRoute
   '/agents/$id': typeof AppAgentsIdRoute
+  '/agents/attached': typeof AppAgentsAttachedRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
@@ -355,6 +363,7 @@ export interface FileRoutesById {
   '/_app/workflows': typeof AppWorkflowsRoute
   '/_app/': typeof AppIndexRoute
   '/_app/agents/$id': typeof AppAgentsIdRoute
+  '/_app/agents/attached': typeof AppAgentsAttachedRoute
   '/_app/agents/sessions': typeof AppAgentsSessionsRoute
   '/_app/deployments/new': typeof AppDeploymentsNewRoute
   '/_app/deployments/plans': typeof AppDeploymentsPlansRoute
@@ -398,6 +407,7 @@ export interface FileRouteTypes {
     | '/terminal'
     | '/workflows'
     | '/agents/$id'
+    | '/agents/attached'
     | '/agents/sessions'
     | '/deployments/new'
     | '/deployments/plans'
@@ -439,6 +449,7 @@ export interface FileRouteTypes {
     | '/workflows'
     | '/'
     | '/agents/$id'
+    | '/agents/attached'
     | '/agents/sessions'
     | '/deployments/new'
     | '/deployments/plans'
@@ -481,6 +492,7 @@ export interface FileRouteTypes {
     | '/_app/workflows'
     | '/_app/'
     | '/_app/agents/$id'
+    | '/_app/agents/attached'
     | '/_app/agents/sessions'
     | '/_app/deployments/new'
     | '/_app/deployments/plans'
@@ -619,6 +631,13 @@ declare module '@tanstack/react-router' {
       path: '/agents/$id'
       fullPath: '/agents/$id'
       preLoaderRoute: typeof AppAgentsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/agents/attached': {
+      id: '/_app/agents/attached'
+      path: '/agents/attached'
+      fullPath: '/agents/attached'
+      preLoaderRoute: typeof AppAgentsAttachedRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/agents/sessions': {
@@ -813,6 +832,7 @@ interface AppRouteChildren {
   AppWorkflowsRoute: typeof AppWorkflowsRoute
   AppIndexRoute: typeof AppIndexRoute
   AppAgentsIdRoute: typeof AppAgentsIdRoute
+  AppAgentsAttachedRoute: typeof AppAgentsAttachedRoute
   AppAgentsSessionsRoute: typeof AppAgentsSessionsRoute
   AppDeploymentsNewRoute: typeof AppDeploymentsNewRoute
   AppDeploymentsPlansRoute: typeof AppDeploymentsPlansRoute
@@ -854,6 +874,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppWorkflowsRoute: AppWorkflowsRoute,
   AppIndexRoute: AppIndexRoute,
   AppAgentsIdRoute: AppAgentsIdRoute,
+  AppAgentsAttachedRoute: AppAgentsAttachedRoute,
   AppAgentsSessionsRoute: AppAgentsSessionsRoute,
   AppDeploymentsNewRoute: AppDeploymentsNewRoute,
   AppDeploymentsPlansRoute: AppDeploymentsPlansRoute,

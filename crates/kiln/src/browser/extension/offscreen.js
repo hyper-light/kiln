@@ -31,6 +31,9 @@ const avcCodec = (w, h, fps) => {
   const l = levels.find(([f, r]) => mbs <= f && mbs * fps <= r) || levels[levels.length - 1];
   return `avc1.42E0${l[2]}`;
 };
+// H.264 takes only even sizes (its colour comes in 2×2 blocks): an odd size (an iPhone 15's 393
+// points at 3×, 1179 pixels) loses its last column or row.
+const even = (n) => Math.max(2, n - (n % 2));
 
 class Stream {
   constructor(id, media, opts) {
@@ -54,7 +57,8 @@ class Stream {
     return avcCodec(w, h, this.opts.framerate || 60);
   }
 
-  async configure(w, h) {
+  async configure(width, height) {
+    const [w, h] = [even(width), even(height)];
     this.size = [w, h];
     const codec = this.codecFor(w, h);
     const base = { codec, width: w, height: h, framerate: this.opts.framerate || 60, latencyMode: "realtime", hardwareAcceleration: "no-preference", ...(codec.startsWith("avc1") ? { avc: { format: "annexb" } } : {}) };
@@ -107,7 +111,8 @@ class Stream {
     }
   }
 
-  frame(frame) {
+  frame(taken) {
+    const frame = this.evened(taken);
     const [w, h] = this.size;
     if (frame.displayWidth !== w || frame.displayHeight !== h) {
       // The page's size changed: the encoders follow, from a key frame (what comes meanwhile waits
@@ -143,6 +148,16 @@ class Stream {
     frame.close();
     // Still for a moment: the same picture again, sharp; what moves next starts from a key frame.
     this.stillTimer = setTimeout(() => this.still(), this.opts.still_ms || 400);
+  }
+
+  // A picture of an odd size, cut to the even one its encoders take.
+  evened(frame) {
+    const r = frame.visibleRect;
+    if (!r || (r.width % 2 === 0 && r.height % 2 === 0)) return frame;
+    const [w, h] = [even(r.width), even(r.height)];
+    const cut = new VideoFrame(frame, { visibleRect: { x: r.x, y: r.y, width: w, height: h }, displayWidth: w, displayHeight: h });
+    frame.close();
+    return cut;
   }
 
   still() {

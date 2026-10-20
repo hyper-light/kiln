@@ -45,6 +45,7 @@ pub mod relocate;
 pub mod screen;
 pub mod session;
 pub mod survivors;
+pub mod told;
 pub mod socket;
 pub mod stores;
 pub mod streams;

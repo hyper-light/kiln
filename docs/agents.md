@@ -28,18 +28,34 @@ between turns. Files you attach go to it as their paths on its machine; its mode
 
 ## What an agent left running
 
-Every harness kiln starts carries `KILN_AGENT=<session id>` in its environment, and so does every
-process it starts, however it's parented later. Every ten seconds the runner notes what runs under
-each harness and what carries its mark apart from it, and keeps that in its record of its sessions
-(beside each one's harness process). What an agent started that runs on apart from its harness (a
-server started with `&` or `setsid`, a script left going) shows with its background tasks as "left
-running" (task id `left-<pid>`), until it ends; stopping that task stops it and what runs under it.
+Every agent session's processes are held together by the system where it can (`crate::os::contain`):
+
+| Where | How | What it gives |
+|---|---|---|
+| Linux with cgroup v2 the runner may write (a systemd user unit, a container with its own cgroup namespace) | a cgroup of its own, `kiln-agents/<session>` under the runner's | its harness joins it between fork and exec, so nothing it starts leaves it by forking, `setsid` or a double fork; its processes are its `cgroup.procs`; whose a process is, one read of `/proc/<pid>/cgroup`; ending them all, one write to `cgroup.kill` |
+| Windows | a job object of its own, `Local\kiln-agent-<session>` | its harness is created suspended, put in the job, then let run; the job lists its processes, says whether it holds one, and ends them all; it ends with the runner, as every job kiln makes |
+| macOS | followed fork by fork | its harness is watched with kqueue; whenever one of its processes forks, the children are listed and watched too; once a minute the user's processes are looked at for the agent's mark, for one that left between a fork and its listing |
+
+Every harness kiln starts also carries `KILN_AGENT=<session id>` in its environment, and so does
+every process it starts, however it's parented later: where the system holds nothing together
+(cgroup v1, a read-only cgroup filesystem, a cgroup another user owns), and for sessions whose
+harness started before the runner had groups, that mark is how their processes are found, which
+takes looking at every process on the machine. The runner logs how it holds them as it starts
+(`agents' processes are held together by`).
+
+Every ten seconds the runner notes what runs under each harness and what else is the agent's (in
+its group, or carrying its mark), and keeps that in its record of its sessions (beside each one's
+harness process). What an agent started that runs on apart from its harness (a server started with
+`&` or `setsid`, a script left going) shows with its background tasks as "left running" (task id
+`left-<pid>`), until it ends; stopping that task stops it and what runs under it.
 
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
 the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short.
-Ending the agent stops what it left running. kiln's own helpers and MCP servers aren't counted.
+Ending the agent stops what it left running, then ends whatever else is still in its group (what
+left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
+counted.
 
 ## API
 
@@ -225,6 +241,29 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
+### Told, not made to wait
+
+Nothing makes a parent wait for its children, or for its own work that runs on its own (a
+subagent or a command its harness started in the background): it decides when to wait.
+
+- **When a child settles** (its turn over, a person needed, stopped, ended, paused at a usage
+  limit), kiln tells its parent (`crate::harness::told`), in a message after the parent's turn
+  that starts its next turn if it's idle, as Claude Code tells an agent of its own background
+  subagents: "Agent “Fix the parser” (01a1b2c3), which you started, ended its turn: … agents_result
+  {"agent": …} has its whole reply and what it changed." Children that settle together come in
+  one message; only a settle after work the server saw is told (not one from before a restart), a
+  few seconds on (a wait under way returns first). What the parent saw itself through
+  `agents_wait` or `agents_result` isn't told again.
+- **Waiting is the parent's choice**: `agents_wait` blocks until its children settle, for one that
+  can't go on without them.
+- **A parent whose children are at work isn't prodded**: keep-going (docs/goals.md) and a goal
+  stack's reminders leave it be until they settle, as keep-going does while its background tasks
+  run.
+- **A Claude Code subagent in the background is its own**: its output (forwarded with its parent
+  call's id) shows under it, and doesn't make its parent's ended turn start again, so a message to
+  the parent goes to it at once rather than after the subagent. Claude Code starts the parent's
+  next turn itself when the subagent is done.
+
 ### Operations
 
 Each is an operation of kiln's one registry: an HTTP route, an MCP tool (`agents_start`, …), a
@@ -247,9 +286,12 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
 
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
-lists shorten it). `workspace` is `folder` (the folder itself, the default) or `volume` (a Slates
-volume of its own, where its machine can make one); in a result it is `null` for an agent in its
-folder, and `branch` and `change_request` are `null` until it has a change request.
+lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
+as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.
+kiln's MCP server tells each agent its id. `workspace` is `folder` (the folder itself, the
+default) or `volume` (a Slates volume of its own, where its machine can make one); in a result it
+is `null` for an agent in its folder, and `branch` and `change_request` are `null` until it has a
+change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
 files_changed, lines_added, lines_removed, cost_usd, doing?, parent?, plan_run?, last_turn?,
@@ -284,7 +326,8 @@ in that machine's home unless `cwd` names a folder there.
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
 | Children | at most `[agents] max_children` (24) running at once per agent |
-| Steering | an agent sends to, interrupts and ends only itself and the agents it started (and theirs) |
+| Steering | an agent sends to, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
+| Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
 
 The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk` (ask),
 `acceptEdits` (accept edits), `auto` (auto), `bypassPermissions` (bypass); Codex `read-only`
@@ -310,7 +353,7 @@ its way is `working`. An agent kiln no longer lists has `ended`.
 |---|---|
 | kiln's MCP server on the server (`/api/mcp`) | the agent whose own MCP token it is: kiln gives every agent it starts on the server a token of its own (`kiln_mcp_session-<id>_…`, in a 0600 config file), which works only while kiln runs that agent |
 | kiln's MCP server on a runner (`kiln reach mcp`) | the agent session the runner runs it for |
-| `kiln spawn`, `kiln agents` on a machine | the agent whose command it is (its harness is an ancestor of the process, or the process carries the agent's `KILN_AGENT` mark), else the person in the kiln shell it runs in |
+| `kiln spawn`, `kiln agents` on a machine | the agent whose command it is (the process is in the agent's group of processes, its harness is an ancestor of the process, or the process carries the agent's `KILN_AGENT` mark), else the person in the kiln shell it runs in |
 
 An agent acts for whoever started it (the owner on a kiln nobody else signs in to): its calls
 are audited as `agent:<id>[@<machine>] for <them>`, and its children act for them too. A person's
@@ -413,8 +456,93 @@ title, state, review?, checks?, fix_checks, opened_at, updated_at, stack?}`: `pr
 request is opened); `state` is `open`, `landed` or `closed`; `stack` (`{run, step}`) says it is a
 step of a plan run's stack. Mission Control shows each agent's change
 on its row, with **Review** on a finished agent's open one; the Changes tab shows where it
-stands, linked, and pushes new versions. Replying in a review thread as the agent comes with
-review operations agents can call; until then an agent answers a comment with a new version.
+stands, linked, and pushes new versions. Where kiln has W14's review operations, a comment's
+message tells the agent how to answer in its thread (`ci.diffs.reply` with the thread's id);
+otherwise it answers a comment with a new version.
+
+## Attached agents
+
+An agent attached to what it looks after wakes when something happens there (docs/ci.md W20-R08 to
+R10; docs/agentic.md K2 and R4). **Agents → Attached** lists them and their incidents, and attaches
+one; `attachments.*` and `incidents.*` do the same for agents and code mode. An attachment names:
+
+- **What it looks after** (`on`, written as access scopes are): `repo:acme/app`,
+  `workflow:acme/app:.github/workflows/ci.yml`, `environment:acme/app:production`, `pool:gpu`,
+  `runner:metal-1`, or `runners` for every runner; for code, the `branches` whose runs wake it
+  (none: any).
+- **Its agent**: a harness kiln starts for each incident (`harness: {kind, on?, cwd?, model?,
+  effort?, mode?}`, `on` and `cwd` the machine and the checkout it works in), or a live agent it
+  tells instead (`session`).
+- **What wakes it** (`wake`): `failure` (a run of what it looks after failed, or a deployment to its
+  environment), `flaky` (a run had flaky tests), `ejected` (the land queue took a change out),
+  `stuck` (a job waited for a runner past `limits.stuck_minutes`), `mention` (`@name` in a comment),
+  `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two minutes), `upgrade`
+  (an upgrade failed) and `check` (kiln's checks of the machine, every half hour, found something
+  failing).
+- **What it may do** (`can`, W20-R09): it always reads what it looks after; beyond that `rerun`,
+  `cancel`, `diagnose`, `fix`, `edit-pipelines`, `quarantine`, `comment`, `experiment`,
+  `manage-runners`, `deploy`, `land`. Its agent acts for whoever attached it (who needs
+  `agents.attach` there), and its calls to kiln are held to these capabilities on what it looks
+  after: kiln refuses it the rest.
+- **Its limits** (`limits`): incidents a day (`sessions_per_day`, 10), reruns per failure
+  (`reruns_per_failure`, 2), when a job is stuck (`stuck_minutes`, 15); **its playbook**, and
+  **who reviews** what it opens.
+
+What wakes it opens an **incident**, or adds to the open one with the same signature (what failed
+and how, with numbers, paths and hashes taken out), so one cause never starts two agents. Its
+agent is given the bundle: what happened, each failed job's failing step with the log around the
+error, the last green run, the same thing before and how it went, what it may do, its playbook,
+and how to report. It says what it found with `incidents.report`: `class` (flaky,
+infrastructure, regression, pipeline, dependency, other), `summary`, `links`, `state` (reported,
+resolved; dismissing is a person's). A failure that keeps coming back from reruns past its limit
+tells the agent to stop rerunning. An incident waits for a person instead (`waiting`, saying why)
+while its attachment is paused, past its limit for the day, or when its agent couldn't start.
+**Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
+its workflows' and environments' too. Mission Control puts the agents an attachment woke under it,
+and their questions come to Needs you and to notifications as any agent's do. A runner doctor's
+open incident shows in the runner's row in Settings → Updates.
+
+| Operation | Route | |
+|---|---|---|
+| `attachments.list` | `GET /api/attachments` | `on?` → `{attachments: [{attachment, open, today, latest}]}` |
+| `attachments.get` | `GET /api/attachments/:id` | → `{attachment, grants, incidents}` |
+| `attachments.save` | `POST /api/attachments`, `PUT /api/attachments/:id` | an attachment → `{attachment, grants}` |
+| `attachments.remove` | `DELETE /api/attachments/:id` | its incidents stay |
+| `attachments.pause` | `POST /api/attachments/pause` | `{attachment?, on?, paused}` |
+| `incidents.list` | `GET /api/incidents` | `state?`, `attachment?`, `limit?` → `{incidents}`, newest first |
+| `incidents.get` | `GET /api/incidents/:id` | the bundle, and each time it happened |
+| `incidents.report` | `POST /api/incidents/:id/report` | `{class?, summary?, links?, state?}`: its agent, or a person who may attach there |
+
+A run that woke an attached agent shows the incident on its page: who looks after it, where it
+stands, what its agent found and opened, and a link to the agent.
+
+**In the repository.** A repository can keep its attachments in trunk's `.kiln/agents.yaml`, read
+like the rest of its policy (from trunk, never from a change, within a minute of landing):
+
+```yaml
+agents:
+  ci-doctor:
+    harness: claude              # claude, codex, acp:<name>
+    model: opus
+    effort: high
+    machine: linux/amd64         # where its agents run (a machine, or what it needs)
+    cwd: ~/src/app               # their folder there
+    attach: { pipelines: [ci], branches: [main] }   # or environments: [production]
+    wake: [failure, flaky, stuck, ejected]          # or { schedule: "0 6 * * 1" }
+    can: [read, rerun, diagnose, fix, comment, quarantine]
+    limits: { per-day: { sessions: 10 }, reruns-per-failure: 2 }
+    instructions: .kiln/agents/ci-doctor.md         # its playbook: a file on trunk, or the words
+    reviewers: [ada]
+```
+
+Each looks after the repository, narrowed to its pipelines, environments and branches. It acts for
+kiln's owner, held to its capabilities there, and is changed by a change to that file. Kiln keeps
+only its pause switch. An agent the file names but can't be (an unknown harness, a wake that isn't
+one) is left out, and the server's log says why. `@name` in a comment calls a repository's own
+attachment only on that repository's diffs.
+
+Not yet: a workspace of its own per incident (its agent works in the folder named; workspaces wait
+on Slates), and the file's per-day runner minutes and tokens, which are read but not held to.
 
 ## Commands
 

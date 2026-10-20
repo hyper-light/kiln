@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 pub use criteria::{Criterion, Op, Test};
 use crate::harness::model::{Command, SendMode};
 use crate::harness::registry::Sent;
-use crate::harness::session::Spec;
 use crate::hub::Hub;
 
 /// A title's characters at the most, and a plan's bytes.
@@ -257,6 +256,9 @@ pub struct Ran {
 pub enum Error {
     #[error("{0}")]
     Bad(String),
+    /// Refused as the agents' lineage refuses (`crate::harness::lineage`): its status and why.
+    #[error("{1}")]
+    Refused(http::StatusCode, String),
     #[error("no such plan")]
     Missing,
     #[error(transparent)]
@@ -628,8 +630,16 @@ pub async fn share(hub: &Hub, id: &str, on: bool) -> R<Plan> {
     plan.ok_or(Error::Missing)
 }
 
-/// Runs a plan on an agent: an existing one, or a new one started with it.
-pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R<Ran> {
+/// Starts the agent a plan runs on, as `by` starts agents (`crate::harness::lineage::start`): an
+/// agent's is its child, held to what it may have and within its limits.
+async fn start_for(hub: &Hub, by: &crate::harness::lineage::Starter, target: String, kind: String, cwd: Option<String>, prompt: Option<String>, name: String) -> R<String> {
+    let ask = crate::harness::lineage::Ask { kind, on: Some(target), cwd: cwd.filter(|c| !c.trim().is_empty()), prompt, name: Some(name), count: Some(1), ..crate::harness::lineage::Ask::default() };
+    let infos = crate::harness::lineage::start(hub, by, ask).await.map_err(|(c, m)| Error::Refused(c, m))?;
+    infos.into_iter().next().map(|i| i.id).ok_or_else(|| Error::Bad("the agent did not start".into()))
+}
+
+/// Runs a plan on an agent: an existing one, or a new one started with it (as `by` starts agents).
+pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &crate::harness::lineage::Starter) -> R<Ran> {
     let p = get(hub, id).await?;
     if mode == Mode::Goals {
         return run_goals(hub, &p, target, by).await;
@@ -652,10 +662,7 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R
         Target::Session(session) => (session, messages.as_slice()),
         Target::New { target, kind, cwd } => {
             let (first, rest) = messages.split_first().ok_or_else(|| Error::Bad("nothing to send".into()))?;
-            let spec = Spec { kind, cwd: cwd.filter(|c| !c.trim().is_empty()), prompt: Some(first.clone()), name: Some(p.title.clone()), ..Spec::default() };
-            let infos = hub.harness.open(hub, &target, spec, 1).await?;
-            let info = infos.into_iter().next().ok_or_else(|| Error::Bad("the agent did not start".into()))?;
-            (info.id, rest)
+            (start_for(hub, by, target, kind, cwd, Some(first.clone()), p.title.clone()).await?, rest)
         }
     };
     let mut sent = messages.len().saturating_sub(rest.len());
@@ -667,7 +674,7 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R
             Sent::Unreachable => return Err(Error::Bad("that agent's machine is not connected".into())),
         }
     }
-    let (run, now, by_s, version, mode_s, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.to_owned(), p.version, mode.as_str(), p.id.clone(), session.clone());
+    let (run, now, by_s, version, mode_s, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.actor.clone(), p.version, mode.as_str(), p.id.clone(), session.clone());
     let run_c = run.clone();
     hub.store
         .call(move |c| {
@@ -683,18 +690,14 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R
 
 /// A plan's steps as goals, after the agent's others (a new agent is started for them), and the
 /// stack running.
-async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &str) -> R<Ran> {
+async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &crate::harness::lineage::Starter) -> R<Ran> {
     let goals: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
     if goals.is_empty() {
         return Err(Error::Bad("this plan has no steps (no list in it) to make goals of".into()));
     }
     let session = match target {
         Target::Session(s) => s,
-        Target::New { target, kind, cwd } => {
-            let spec = Spec { kind, cwd: cwd.filter(|c| !c.trim().is_empty()), name: Some(p.title.clone()), ..Spec::default() };
-            let infos = hub.harness.open(hub, &target, spec, 1).await?;
-            infos.into_iter().next().ok_or_else(|| Error::Bad("the agent did not start".into()))?.id
-        }
+        Target::New { target, kind, cwd } => start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?,
     };
     let sent = goals.len();
     crate::goals::add(hub, &session, goals, true).await.map_err(|e| match e {
@@ -702,7 +705,7 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &str) -> R<Ran> {
         crate::goals::Error::Bad(m) => Error::Bad(m),
         crate::goals::Error::Other(e) => Error::Other(e),
     })?;
-    let (run, now, by_s, version, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.to_owned(), p.version, p.id.clone(), session.clone());
+    let (run, now, by_s, version, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.actor.clone(), p.version, p.id.clone(), session.clone());
     let run_c = run.clone();
     hub.store
         .call(move |c| {

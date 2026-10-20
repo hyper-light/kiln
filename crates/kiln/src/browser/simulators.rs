@@ -3,8 +3,9 @@
 //! through `safaridriver` as Safari is (`super::driven`). kiln keeps a simulator of its own for each
 //! model ("kiln iPhone 15"), boots it with no Simulator window, and lets its Safari be automated.
 //!
-//! What a Mac needs once: Xcode, an iOS simulator runtime (`xcodebuild -downloadPlatform iOS`), and
-//! Safari's remote automation (`safaridriver --enable`, which asks for an administrator's password).
+//! What a Mac needs once: Xcode and an iOS simulator runtime (`xcodebuild -downloadPlatform iOS`).
+//! The Mac's own Safari needn't be open to automation (`safaridriver --enable`): a simulator's is,
+//! set inside it here.
 
 use std::time::Duration;
 
