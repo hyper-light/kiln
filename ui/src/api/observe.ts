@@ -208,8 +208,8 @@ export interface MonitorCheck {
   ok: boolean;
   op?: string;
   threshold?: number;
-  kind?: "metric" | "change" | "logs" | "spans" | "composite" | "forecast";
-  watched?: { query?: string; search?: string };
+  kind?: "metric" | "change" | "logs" | "spans" | "composite" | "forecast" | "slo" | "error-tracking";
+  watched?: { query?: string | null; search?: string };
   composite?: CompositeOf;
   window_ms?: number;
   error?: string;

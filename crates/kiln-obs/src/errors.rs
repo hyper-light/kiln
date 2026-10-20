@@ -209,17 +209,33 @@ pub struct Seen {
 /// A long range is read from the series' rollups as [`crate::apm::red`] reads them (its first and
 /// last windows then a tier's, where the range's edges are not).
 pub fn seen(store: &crate::store::Store, filter: &[(&str, &str)], from: i64, to: i64) -> Result<Vec<Seen>, crate::store::StoreError> {
-    use crate::rollup::{Col, Rolled, TIERS};
     let mut sel = crate::index::Selector::metric(METRIC);
     for (k, v) in filter {
         sel = sel.tag(k, v);
     }
     let mut ids = Vec::new();
     store.select(&sel, &mut ids);
+    read_seen(store, &ids, from, to)
+}
+
+/// [`seen`] of these issues' series alone, each issue's found in the store's index by its tag: what
+/// a monitor watching a few issues reads.
+pub fn seen_of(store: &crate::store::Store, issues: &[&str], from: i64, to: i64) -> Result<Vec<Seen>, crate::store::StoreError> {
+    let (mut ids, mut one) = (Vec::new(), Vec::new());
+    for issue in issues {
+        one.clear();
+        store.select(&crate::index::Selector::metric(METRIC).tag("issue.id", issue), &mut one);
+        ids.extend_from_slice(&one);
+    }
+    read_seen(store, &ids, from, to)
+}
+
+fn read_seen(store: &crate::store::Store, ids: &[u32], from: i64, to: i64) -> Result<Vec<Seen>, crate::store::StoreError> {
+    use crate::rollup::{Col, Rolled, TIERS};
     let width = TIERS.iter().rev().copied().find(|&w| w.saturating_mul(crate::apm::RED_WINDOWS) <= to.saturating_sub(from));
     let (mut ts, mut vs, mut rolled, mut scratch) = (Vec::new(), Vec::new(), Rolled::default(), crate::store::Scratch::default());
     let mut out = Vec::new();
-    for &id in &ids {
+    for &id in ids {
         let Some(series) = store.series(id) else { continue };
         ts.clear();
         vs.clear();
@@ -249,6 +265,29 @@ pub fn seen(store: &crate::store::Store, filter: &[(&str, &str)], from: i64, to:
 
 /// Buckets an issue's timeline has at the most.
 pub const TIMELINE_BUCKETS: usize = 1_500;
+
+/// The metric query of the errors an Error Tracking monitor of `search` counts, by issue, for a
+/// chart of them: when the search says no more than tags of [`METRIC`], each one value, all to
+/// hold (`service:shop env:prod`, `*`); none when it says more (a type, a word, an `OR`).
+pub fn monitor_query(search: &str) -> Option<String> {
+    use crate::logs::search::{AttrMatch, Field, Leaf, Node, Text};
+    let s = crate::logs::search::parse(search).ok()?;
+    let mut tags: Vec<String> = Vec::new();
+    let plain = |v: &str| !v.is_empty() && !v.contains([',', '{', '}', ' ', '"']);
+    let mut todo = vec![s.root];
+    while let Some(n) = todo.pop() {
+        match s.nodes.get(n)? {
+            Node::And(a, b) => todo.extend([*a, *b]),
+            Node::Leaf(Leaf::All) => {}
+            Node::Leaf(Leaf::Field(Field::Service, Text::Exact(v))) if plain(v) => tags.push(format!("service:{v}")),
+            Node::Leaf(Leaf::Attr(k, AttrMatch::Text(Text::Exact(v)))) if matches!(k.as_str(), "env" | "version" | "issue.id") && plain(v) => tags.push(format!("{k}:{v}")),
+            _ => return None,
+        }
+    }
+    tags.sort();
+    let scope = if tags.is_empty() { "*".to_owned() } else { tags.join(",") };
+    Some(format!("sum:{METRIC}{{{scope}}} by {{issue.id}}.as_count()"))
+}
 
 /// Issue `id`'s errors over `[from, to)` (ms) in buckets of `step` (ms; `from` a multiple of it):
 /// each bucket's start and its errors, [`TIMELINE_BUCKETS`] at the most. A step a rollup tier
@@ -1172,5 +1211,17 @@ mod tests {
         }
         let f = frame(&s).unwrap();
         assert_eq!((f.file, f.function), ("Deep.java", "com.shop.Deep.f0"));
+    }
+
+    /// A monitor's search of the metric's tags alone is a chart's query of what it counts; one
+    /// that says more is not.
+    #[test]
+    fn a_monitor_s_search_of_tags_alone_is_a_chart_s_query() {
+        assert_eq!(monitor_query("*").as_deref(), Some("sum:error_tracking.errors{*} by {issue.id}.as_count()"));
+        assert_eq!(monitor_query("service:shop env:prod").as_deref(), Some("sum:error_tracking.errors{env:prod,service:shop} by {issue.id}.as_count()"));
+        assert_eq!(monitor_query("@version:2.0 AND service:shop").as_deref(), Some("sum:error_tracking.errors{service:shop,version:2.0} by {issue.id}.as_count()"));
+        for more in ["service:shop OR service:cart", "-env:dev", "service:shop ValueError", "@error.type:ValueError", "service:shop*", "\"bad item\"", "(x"] {
+            assert_eq!(monitor_query(more), None, "{more}");
+        }
     }
 }

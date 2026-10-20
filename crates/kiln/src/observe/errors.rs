@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use kiln_obs::logs::search::Search;
 use serde::{Deserialize, Serialize};
 
 /// Issues kept at the most.
@@ -42,6 +43,13 @@ const ENVS: usize = 16;
 const ACTIVITY: usize = 50;
 /// Text an issue keeps of its error at the most (bytes).
 const TEXT_BYTES: usize = 512;
+/// How long an issue is new to a monitor of new issues after it came (was made, or regressed):
+/// Datadog's New Issue alert's lookback, a day.
+pub const NEW_FOR_MS: i64 = 86_400_000;
+/// The share of the issues kept (nine tenths) from which a monitor watching them reads every
+/// issue's series at once, not each one's: where the two cost the same, an issue's read costing
+/// 1.03 to 1.09 times its share of the whole (§12.24: 10,000 issues, twenty minutes to a day).
+const READ_ALL: (usize, usize) = (9, 10);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -98,6 +106,8 @@ pub struct Issue {
     /// Its first and its last error's window (ms).
     pub first_seen: i64,
     pub last_seen: i64,
+    /// When kiln made it (ms): when it came, to a monitor of new issues.
+    pub created: i64,
     /// The versions and envs its errors were of, in the order they came (the latest kept).
     pub versions: Vec<String>,
     pub envs: Vec<String>,
@@ -212,25 +222,24 @@ impl Issues {
     pub fn scan(&self, now_ms: i64, seen: impl FnOnce(i64, i64) -> Vec<kiln_obs::errors::Seen>, sample: impl Fn(&str, i64, i64) -> Option<Sample>) {
         let scanned_to = lock(&self.state).scanned_to;
         let from = if scanned_to == 0 { now_ms.saturating_sub(FIRST_MS) } else { scanned_to.saturating_sub(HORIZON_MS) };
-        let seen = seen(from, now_ms.saturating_add(1));
-        // Each issue's series, together.
-        let mut by_issue: BTreeMap<&str, Vec<&kiln_obs::errors::Seen>> = BTreeMap::new();
-        for s in &seen {
-            if s.issue != kiln_obs::logs::metrics::NONE {
-                by_issue.entry(s.issue.as_str()).or_default().push(s);
-            }
-        }
+        let mut seen = seen(from, now_ms.saturating_add(1));
+        // Each issue's series, together: sorted where they are, read a run at a time.
+        seen.retain(|s| s.issue != kiln_obs::logs::metrics::NONE);
+        seen.sort_unstable_by(|a, b| a.issue.cmp(&b.issue));
+        let runs = || seen.chunk_by(|a, b| a.issue == b.issue);
         let new: Vec<(String, i64)> = {
             let st = lock(&self.state);
-            by_issue.iter().filter(|(id, _)| !st.issues.contains_key(**id)).map(|(id, s)| ((*id).to_owned(), s.iter().map(|x| x.first).min().unwrap_or(now_ms))).collect()
+            runs().filter_map(|r| r.first().filter(|x| !st.issues.contains_key(x.issue.as_str())).map(|x| (x.issue.clone(), r.iter().map(|y| y.first).min().unwrap_or(now_ms)))).collect()
         };
         // What a new issue's first error says, read outside the lock (a search of the stores).
         let samples: HashMap<String, Sample> = new.iter().filter_map(|(id, first)| sample(id, *first, now_ms).map(|s| (id.clone(), s))).collect();
         let mut st = lock(&self.state);
-        for (id, series) in by_issue {
+        for series in runs() {
+            let Some(id) = series.first().map(|x| x.issue.as_str()) else { continue };
             let first = series.iter().map(|x| x.first).min().unwrap_or(now_ms);
             let last = series.iter().map(|x| x.last).max().unwrap_or(now_ms);
-            let issue = st.issues.entry(id.to_owned()).or_insert_with(|| {
+            // An issue known is found by its id as it is (no key made for it).
+            if !st.issues.contains_key(id) {
                 let s = samples.get(id).cloned().unwrap_or_default();
                 let mut i = Issue {
                     id: id.to_owned(),
@@ -242,11 +251,13 @@ impl Issues {
                     function: cut(&s.function),
                     first_seen: first,
                     last_seen: last,
+                    created: now_ms,
                     ..Issue::default()
                 };
                 i.set(Status::ForReview, now_ms, "kiln", "its first error");
-                i
-            });
+                st.issues.insert(id.to_owned(), i);
+            }
+            let Some(issue) = st.issues.get_mut(id) else { continue };
             issue.first_seen = issue.first_seen.min(first);
             // A regression: an error after it was resolved, of a version it was not seen in then.
             if issue.status == Status::Resolved {
@@ -259,7 +270,7 @@ impl Issues {
                 }
             }
             issue.last_seen = issue.last_seen.max(last);
-            for x in &series {
+            for x in series {
                 remember(&mut issue.versions, &x.version, VERSIONS);
                 remember(&mut issue.envs, &x.env, ENVS);
             }
@@ -282,6 +293,72 @@ impl Issues {
         }
         st.scanned_to = now_ms;
         st.dirty = true;
+    }
+
+    /// An Error Tracking monitor's values as of `now_ms` (`kiln_obs::monitor::Kind::ErrorTracking`):
+    /// the errors of each group (by `by`: [`kiln_obs::monitor::ERROR_FACETS`]) of the issues it
+    /// watches ([`watched`]) where `search` holds of them, its issue's and its env's and version's
+    /// ([`ErrorsOf`]). `seen` reads the metric over the monitor's window: of the issues watched
+    /// alone (`Some`, their ids), or of every issue (`None`) when it watches most of them
+    /// ([`READ_ALL`]); it is not called when no issue is watched (a monitor of new issues, most of
+    /// the time).
+    pub fn monitor_values<E>(
+        &self,
+        search: &Search,
+        new: bool,
+        by: &[String],
+        since: i64,
+        now_ms: i64,
+        seen: impl FnOnce(Option<&[&str]>) -> Result<Vec<kiln_obs::errors::Seen>, E>,
+    ) -> Result<Vec<kiln_obs::monitor::Value>, E> {
+        let few: Option<Vec<String>> = {
+            let st = lock(&self.state);
+            let n = st.issues.values().filter(|i| watched(i, new, since, now_ms)).count();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            (n.saturating_mul(READ_ALL.1) < st.issues.len().saturating_mul(READ_ALL.0)).then(|| st.issues.values().filter(|i| watched(i, new, since, now_ms)).map(|i| i.id.clone()).collect())
+        };
+        let ids: Option<Vec<&str>> = few.as_ref().map(|f| f.iter().map(String::as_str).collect());
+        let seen = seen(ids.as_deref())?;
+        let st = lock(&self.state);
+        // Each group's errors by its tags' values as they are (the issues', the rows'), in
+        // `ERROR_FACETS`' order, a facet it does not name empty: no key made for a row.
+        let mut groups: HashMap<[&str; 4], f64> = HashMap::new();
+        let (mut text, mut scratch) = (String::new(), kiln_obs::logs::search::RowScratch::default());
+        for s in &seen {
+            let Some(i) = st.issues.get(&s.issue).filter(|i| watched(i, new, since, now_ms)) else { continue };
+            text.clear();
+            text.push_str(&i.kind);
+            if !i.kind.is_empty() && !i.message.is_empty() {
+                text.push_str(": ");
+            }
+            text.push_str(&i.message);
+            if !search.fields(&ErrorsOf { issue: i, text: &text, env: &s.env, version: &s.version }, &mut scratch) {
+                continue;
+            }
+            let mut key = [""; 4];
+            for (slot, f) in key.iter_mut().zip(kiln_obs::monitor::ERROR_FACETS) {
+                if by.iter().any(|b| b == f) {
+                    *slot = match f {
+                        "issue.id" => i.id.as_str(),
+                        "service" => i.service.as_str(),
+                        "env" => s.env.as_str(),
+                        _ => s.version.as_str(),
+                    };
+                }
+            }
+            *groups.entry(key).or_default() += s.errors;
+        }
+        Ok(groups
+            .into_iter()
+            .map(|(key, value)| {
+                let mut group: Vec<(String, String)> =
+                    kiln_obs::monitor::ERROR_FACETS.into_iter().zip(key).filter(|(f, _)| by.iter().any(|b| b == f)).map(|(f, v)| (f.to_owned(), v.to_owned())).collect();
+                group.sort();
+                kiln_obs::monitor::Value { group, value }
+            })
+            .collect())
     }
 
     /// Reads the metric every ten seconds on the server (its group's leader), until `shutdown`;
@@ -367,6 +444,92 @@ pub fn sample_from(source: &str, r: &kiln_obs::logs::record::Record) -> Sample {
         file: frame.map(|f| f.file.to_owned()).unwrap_or_default(),
         function: frame.map(|f| f.function.to_owned()).unwrap_or_default(),
     }
+}
+
+/// When an issue came, to a monitor of new issues: when it regressed, for a regression; else when
+/// kiln made it (its first error, for one kept before kiln said when it made them).
+fn came(i: &Issue) -> i64 {
+    if i.regression {
+        i.status_at
+    } else if i.created > 0 {
+        i.created
+    } else {
+        i.first_seen
+    }
+}
+
+/// Whether an Error Tracking monitor watches an issue, as Datadog's do: with `new` (its New Issue
+/// alert), one for review that came within [`NEW_FOR_MS`] and not before `since` (the monitor made
+/// or last changed); else (its High Impact alert) one for review or reviewed. Resolved and ignored
+/// issues never.
+fn watched(i: &Issue, new: bool, since: i64, now_ms: i64) -> bool {
+    if new {
+        let c = came(i);
+        i.status == Status::ForReview && c >= since && now_ms.saturating_sub(c) <= NEW_FOR_MS
+    } else {
+        matches!(i.status, Status::ForReview | Status::Reviewed)
+    }
+}
+
+/// An issue's errors of an env and a version, as a monitor's search reads them: its service, its
+/// source (`span` or `log`), its type and message as the text, at error's status; `@issue.id`,
+/// `@env`, `@version`, `@error.type`, `@error.message`, `@error.file` and `@error.function`.
+struct ErrorsOf<'a> {
+    issue: &'a Issue,
+    text: &'a str,
+    env: &'a str,
+    version: &'a str,
+}
+
+impl kiln_obs::logs::search::Fields for ErrorsOf<'_> {
+    fn message(&self) -> &str {
+        self.text
+    }
+    fn service(&self) -> &str {
+        &self.issue.service
+    }
+    fn host(&self) -> &str {
+        ""
+    }
+    fn source(&self) -> &str {
+        &self.issue.source
+    }
+    fn severity(&self) -> u8 {
+        17
+    }
+    fn attr(&self, key: &str) -> Option<&str> {
+        let v = match key {
+            "issue.id" => self.issue.id.as_str(),
+            "env" => self.env,
+            "version" => self.version,
+            "error.type" => self.issue.kind.as_str(),
+            "error.message" => self.issue.message.as_str(),
+            "error.file" => self.issue.file.as_str(),
+            "error.function" => self.issue.function.as_str(),
+            _ => return None,
+        };
+        (!v.is_empty() && v != kiln_obs::logs::metrics::NONE).then_some(v)
+    }
+    fn trace_id(&self) -> Option<[u8; 16]> {
+        None
+    }
+    fn span_id(&self) -> Option<[u8; 8]> {
+        None
+    }
+}
+
+/// The stack of an issue's latest error, where its errors are said (its spans, or its logs), from
+/// a little before its last one.
+pub fn latest_stack(s: &kiln_obs::store::Store, i: &Issue, now_ms: i64) -> Option<String> {
+    let ns = |ms: i64| ms.saturating_mul(1_000_000);
+    let query = format!("@issue.id:{}", i.id);
+    let (from, to) = (ns(i.last_seen.saturating_sub(HORIZON_MS)), ns(now_ms));
+    let found = match i.source.as_str() {
+        "log" => kiln_obs::logs::search::parse(&query).ok().and_then(|q| s.search_logs(&q, from, to, 1).ok()),
+        _ => kiln_obs::logs::search::parse_spans(&query).ok().and_then(|q| s.search_spans(&q, from, to, 1).ok()),
+    }?;
+    let r = found.records.into_iter().next()?;
+    kiln_obs::errors::STACK_KEYS.iter().find_map(|k| r.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone()))
 }
 
 // ---------------------------------------------------------------------------------- the API
@@ -591,6 +754,72 @@ mod tests {
         let again = Issues::open(dir.path());
         assert_eq!(again.get("a"), Some(a));
         assert_eq!(lock(&again.state).scanned_to, last + RESOLVE_AFTER_MS + 1);
+        Ok(())
+    }
+
+    fn counted(issue: &str, env: &str, version: &str, errors: f64) -> Seen {
+        Seen { issue: issue.into(), service: "shop".into(), env: env.into(), version: version.into(), errors, first: 0, last: 0 }
+    }
+
+    /// A monitor of new issues watches those for review that came (made, or regressed) since it
+    /// was made and within a day; one of impact, every issue for review or reviewed; neither one
+    /// resolved or ignored. Its search holds of an issue (its service, type, message, place) and of
+    /// its errors' env and version; each group's errors are summed, by issue and what it names.
+    #[test]
+    fn monitors_watch_new_issues_and_regressions_or_every_issue_in_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let is = Issues::open(dir.path());
+        let t = 1_800_000_000_000;
+        is.scan(t, |_, _| vec![seen("a", "1.0", t - 30_000, t - 10_000), seen("b", "1.0", t - 30_000, t - 10_000), seen("c", "1.0", t - 30_000, t - 10_000)], sample);
+        is.set_status("b", Status::Reviewed, t + 1);
+        is.set_status("c", Status::Ignored, t + 1);
+        let counts = vec![counted("a", "prod", "1.0", 3.0), counted("a", "dev", "1.0", 2.0), counted("b", "prod", "1.0", 4.0), counted("c", "prod", "1.0", 9.0)];
+        let by_issue = vec!["issue.id".to_owned()];
+        let values = |new: bool, search: &str, by: &[String], since: i64, now: i64| -> anyhow::Result<Vec<String>> {
+            let search = kiln_obs::logs::search::parse(search)?;
+            let found = is.monitor_values(&search, new, by, since, now, |_| Ok::<_, anyhow::Error>(counts.clone()))?;
+            let mut out: Vec<String> = found.iter().map(|v| format!("{}={}", v.group.iter().map(|(k, x)| format!("{k}:{x}")).collect::<Vec<_>>().join(","), v.value)).collect();
+            out.sort();
+            Ok(out)
+        };
+        // New: a alone (b reviewed, c ignored); none for a monitor made after it came, or a day on.
+        assert_eq!(values(true, "*", &by_issue, t - 1, t + 60_000)?, ["issue.id:a=5"]);
+        assert!(values(true, "*", &by_issue, t + 1, t + 60_000)?.is_empty());
+        assert!(values(true, "*", &by_issue, t - 1, t + NEW_FOR_MS + 1)?.is_empty());
+        // Not read at all when nothing is watched.
+        let search = kiln_obs::logs::search::parse("*")?;
+        assert!(is.monitor_values(&search, true, &by_issue, t + 1, t + 60_000, |_| Err(anyhow::anyhow!("read")))?.is_empty());
+        // Impact: a and b; by issue and env; an env's errors, a type's, a word of its text, a service.
+        assert_eq!(values(false, "*", &by_issue, 0, t + 60_000)?, ["issue.id:a=5", "issue.id:b=4"]);
+        let by_env = vec!["issue.id".to_owned(), "env".to_owned()];
+        assert_eq!(values(false, "*", &by_env, 0, t + 60_000)?, ["env:dev,issue.id:a=2", "env:prod,issue.id:a=3", "env:prod,issue.id:b=4"]);
+        assert_eq!(values(false, "env:prod", &by_issue, 0, t + 60_000)?, ["issue.id:a=3", "issue.id:b=4"]);
+        assert_eq!(values(false, "@error.type:bError", &by_issue, 0, t + 60_000)?, ["issue.id:b=4"]);
+        assert_eq!(values(false, "aerror -env:dev", &by_issue, 0, t + 60_000)?, ["issue.id:a=3"]);
+        assert_eq!(values(false, "service:shop @error.file:*cart.py \"bad item\"", &by_issue, 0, t + 60_000)?.len(), 2);
+        assert!(values(false, "service:other", &by_issue, 0, t + 60_000)?.is_empty());
+        // A regression is new to a monitor made before it regressed, though not before it was made.
+        is.set_status("a", Status::Resolved, t + 2);
+        assert!(values(true, "*", &by_issue, t - 1, t + 60_000)?.is_empty(), "resolved: not watched");
+        is.scan(t + 100_000, |_, _| vec![seen("a", "2.0", t + 90_000, t + 90_000), seen("c", "2.0", t + 90_000, t + 90_000)], |_, _, _| None);
+        assert!(issue(&is, "a")?.regression);
+        assert_eq!(values(true, "*", &by_issue, t + 50_000, t + 110_000)?, ["issue.id:a=5"]);
+        assert!(values(true, "*", &by_issue, t + 100_001, t + 110_000)?.is_empty(), "made after it regressed");
+        // What it reads: the watched issues' series alone while they are fewer than nine tenths of
+        // the issues kept (a, the one new); every issue's once they are not (a, b and c, all in review).
+        is.set_status("c", Status::Reviewed, t + 120_000);
+        let mut asked: Vec<Option<Vec<String>>> = Vec::new();
+        for (new, since) in [(true, t - 1), (false, 0)] {
+            is.monitor_values(&search, new, &by_issue, since, t + 130_000, |ids| {
+                asked.push(ids.map(|i| {
+                    let mut v: Vec<String> = i.iter().map(|s| (*s).to_owned()).collect();
+                    v.sort();
+                    v
+                }));
+                Ok::<_, anyhow::Error>(Vec::new())
+            })?;
+        }
+        assert_eq!(asked, [Some(vec!["a".to_owned()]), None]);
         Ok(())
     }
 

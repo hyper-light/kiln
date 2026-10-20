@@ -13,6 +13,8 @@
 //!           [".by(" '"' facets '"' ")"] ".last(" '"' window '"' ")" op threshold
 //! spans  := ("trace-analytics(" | "spans(") '"' search '"' ")" ... as logs   (a span search, its facets a span's)
 //! slo    := "slo(" '"' id '"' ")" ( ".burn_rate(" '"' long '"' "," '"' short '"' ")" | ".error_budget()" ) op threshold
+//! errors := "error-tracking(" '"' search '"' ")" [".source(" '"' ("all" | "backend") '"' ")"] (".new()" | ".impact()")
+//!           [".rollup(" '"' "count" '"' ")"] ".by(" '"' "issue.id" ["," facets] '"' ")" ".last(" '"' window '"' ")" op threshold
 //! time_aggr := avg | sum | min | max | last
 //! window := last_<n>(m|h|d|w)  (logs: <n>(m|h|d|w))
 //! op     := > | >= | < | <= | == | !=
@@ -103,7 +105,16 @@ pub enum Kind {
     /// at once, the lesser of the two (both must pass: the workbook's multiwindow alert), or with
     /// `burn` none, its error budget left (percent). Its SLO is kiln's to know: kiln evaluates it.
     Slo { id: String, burn: Option<(i64, i64)> },
+    /// Datadog's Error Tracking monitor: the errors over the window of each issue it watches, by
+    /// issue and the other facets it names ([`ERROR_FACETS`]). With `new` (Datadog's New Issue
+    /// alert) it watches issues new or regressed, for review; else (its High Impact alert) issues
+    /// for review or reviewed. Its issues are kiln's to know: kiln evaluates it.
+    ErrorTracking { search: String, new: bool, by: Vec<String>, window_ms: i64 },
 }
+
+/// What an Error Tracking monitor may group by: the tags its errors are counted by
+/// (`crate::errors::METRIC`).
+pub const ERROR_FACETS: [&str; 4] = ["issue.id", "service", "env", "version"];
 
 /// A monitor's query, parsed.
 #[derive(Debug, Clone, PartialEq)]
@@ -281,6 +292,9 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     if q.starts_with("slo(") {
         return parse_slo(q);
     }
+    if q.strip_prefix("error-tracking").is_some_and(|r| r.starts_with('(')) {
+        return parse_error_tracking(q);
+    }
     let (left, op, threshold) = comparison(q)?;
     let colon = left.find("):").ok_or_else(|| syntax("time_aggr(window): before the query"))?;
     let (head, query) = (left.get(..=colon).unwrap_or(""), left.get(colon + 2..).unwrap_or("").trim().to_owned());
@@ -315,7 +329,7 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     // The metric query must parse as one.
     crate::query::parse::parse(match &kind {
         Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } => query,
-        Kind::Logs { .. } | Kind::Spans { .. } | Kind::Slo { .. } => "",
+        Kind::Logs { .. } | Kind::Spans { .. } | Kind::Slo { .. } | Kind::ErrorTracking { .. } => "",
     })
     .map_err(|e| syntax(e.to_string()))?;
     Ok(Query { kind, op, threshold })
@@ -341,6 +355,64 @@ fn parse_slo(q: &str) -> Result<Query, MonitorError> {
         return Err(syntax("slo(\"id\").burn_rate(\"1h\", \"5m\") or slo(\"id\").error_budget()"));
     };
     Ok(Query { kind: Kind::Slo { id, burn }, op, threshold })
+}
+
+/// An Error Tracking monitor's query (`error-tracking(...)`), as Datadog's API has it: a search of
+/// the errors, which issues it watches (`.new()` or `.impact()`), by issue, over a window. Kiln's
+/// issues are of backends (spans and logs): `.source()` is `all` or `backend` (`all` unless it
+/// says), and the rollup a count, Datadog's Error Occurrences.
+fn parse_error_tracking(q: &str) -> Result<Query, MonitorError> {
+    let (left, op, threshold) = comparison(q)?;
+    let Some((args, mut rest)) = call(left, "error-tracking")? else { return Err(syntax("error-tracking(\"search\")")) };
+    let search = args.first().map(|s| unescape(s)).unwrap_or_default();
+    crate::logs::search::parse(&search).map_err(|e| syntax(e.to_string()))?;
+    let (mut source, mut new, mut by, mut window_ms) = (false, None, None, None);
+    while !rest.trim().is_empty() {
+        if let Some((a, r)) = call(rest, "source")? {
+            match a.as_slice() {
+                _ if source => return Err(syntax("one .source()")),
+                ["all" | "backend"] => source = true,
+                [s @ ("browser" | "mobile")] => return Err(syntax(format!(".source(\"{s}\"): kiln's issues are backends' (all, backend)"))),
+                _ => return Err(syntax(".source(\"all\") or .source(\"backend\")")),
+            }
+            rest = r;
+        } else if let Some((is_new, (a, r))) = match call(rest, "new")? {
+            Some(c) => Some((true, c)),
+            None => call(rest, "impact")?.map(|c| (false, c)),
+        } {
+            if !a.is_empty() || new.is_some() {
+                return Err(syntax("one of .new() (new issues and regressions) and .impact() (issues for review or reviewed)"));
+            }
+            new = Some(is_new);
+            rest = r;
+        } else if let Some((a, r)) = call(rest, "rollup")? {
+            if a.as_slice() != ["count"] {
+                return Err(syntax("an Error Tracking monitor's rollup: count (its issues' errors)"));
+            }
+            rest = r;
+        } else if let Some((a, r)) = call(rest, "by")? {
+            let mut facets: Vec<String> = Vec::new();
+            for f in a.iter().flat_map(|s| s.split(',')).map(|f| f.trim().trim_start_matches('@')).filter(|f| !f.is_empty()) {
+                if !ERROR_FACETS.contains(&f) {
+                    return Err(syntax(format!("an Error Tracking monitor's group: {f} ({})", ERROR_FACETS.join(", "))));
+                }
+                if !facets.iter().any(|x| x == f) {
+                    facets.push(f.to_owned());
+                }
+            }
+            by = Some(facets);
+            rest = r;
+        } else if let Some((a, r)) = call(rest, "last")? {
+            window_ms = Some(window(a.first().copied().unwrap_or(""))?);
+            rest = r;
+        } else {
+            return Err(syntax(format!("after error-tracking(...): {}", rest.trim())));
+        }
+    }
+    let new = new.ok_or_else(|| syntax(".new() (new issues and regressions) or .impact() (issues for review or reviewed)"))?;
+    let by = by.filter(|b| b.iter().any(|f| f == "issue.id")).ok_or_else(|| syntax(".by(\"issue.id\"): an Error Tracking monitor tells of each issue"))?;
+    let window_ms = window_ms.ok_or_else(|| syntax(".last(\"1d\")"))?;
+    Ok(Query { kind: Kind::ErrorTracking { search, new, by, window_ms }, op, threshold })
 }
 
 /// A log monitor's query (`logs(...)`), or with `spans` a trace analytics monitor's (`name(...)`:
@@ -495,6 +567,7 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
         }
         Kind::Forecast { highest, ahead_ms, query } => forecast_values(store, query, *highest, *ahead_ms, to),
         Kind::Slo { .. } => Err(MonitorError::Eval("an SLO's monitor is evaluated with its SLO".into())),
+        Kind::ErrorTracking { .. } => Err(MonitorError::Eval("an Error Tracking monitor is evaluated with its issues".into())),
         Kind::Logs { search, measure, by, window_ms } => {
             let parsed: Search = crate::logs::search::parse(&logs_only(search)).map_err(|e| MonitorError::Eval(e.to_string()))?;
             let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -628,6 +701,9 @@ pub struct Vars<'a> {
     pub warn_threshold: Option<f64>,
     pub group: &'a [(String, String)],
     pub link: &'a str,
+    /// Variables besides, by their whole name: an Error Tracking monitor's issue's
+    /// (`issue.attributes.error.type`, ...).
+    pub extra: &'a [(String, String)],
 }
 
 fn num(v: f64) -> String {
@@ -636,7 +712,7 @@ fn num(v: f64) -> String {
 
 /// A message rendered from Datadog's template syntax: `{{value}}`, `{{threshold}}`,
 /// `{{warn_threshold}}`, `{{monitor.name}}`, `{{group}}`, `{{<tag>.name}}` (the group's tag),
-/// `{{link}}`, and sections `{{#is_alert}}…{{/is_alert}}` (`^` for not) over the transition's
+/// `{{link}}`, the variables [`Vars::extra`] names, and sections `{{#is_alert}}…{{/is_alert}}` (`^` for not) over the transition's
 /// kind. Sections nest; the walk keeps a stack of its own. What it does not know it leaves as it
 /// was written.
 pub fn render(template: &str, t: Transition, v: &Vars<'_>) -> String {
@@ -678,7 +754,7 @@ pub fn render(template: &str, t: Transition, v: &Vars<'_>) -> String {
             "monitor.name" | "name" => v.monitor.to_owned(),
             "group" => v.group.iter().map(|(k, gv)| format!("{k}:{gv}")).collect::<Vec<_>>().join(","),
             "link" => v.link.to_owned(),
-            _ => match group_tag {
+            _ => match group_tag.or_else(|| v.extra.iter().find(|(k, _)| k == tag).map(|(_, x)| x.clone())) {
                 Some(g) => g,
                 None => format!("{{{{{tag}}}}}"),
             },
@@ -744,6 +820,40 @@ mod tests {
         }
     }
 
+    /// Datadog's Error Tracking monitors as its API has them (its documentation's two examples),
+    /// and what kiln refuses of them: browsers' and phones' issues (kiln's are backends'), a rollup
+    /// but a count, groups without the issue.
+    #[test]
+    fn datadog_s_error_tracking_monitors_parse() {
+        let q = parse(r#"error-tracking("service:shop env:prod").source("backend").new().rollup("count").by("issue.id").last("1d") > 0"#).unwrap();
+        assert_eq!(q.kind, Kind::ErrorTracking { search: "service:shop env:prod".into(), new: true, by: vec!["issue.id".into()], window_ms: 86_400_000 });
+        assert_eq!((q.op, q.threshold), (Op::Gt, 0.0));
+        let q = parse(r#"error-tracking("*").source("all").impact().rollup("count").by("issue.id,@env").last("1h") >= 100"#).unwrap();
+        assert_eq!(q.kind, Kind::ErrorTracking { search: "*".into(), new: false, by: vec!["issue.id".into(), "env".into()], window_ms: 3_600_000 });
+        // Its source and its rollup may go unsaid.
+        let q = parse(r#"error-tracking("@error.type:ValueError").new().by("issue.id").last("1d") > 0"#).unwrap();
+        assert!(matches!(q.kind, Kind::ErrorTracking { new: true, .. }));
+        for bad in [
+            r#"error-tracking("*").source("browser").new().by("issue.id").last("1d") > 0"#,
+            r#"error-tracking("*").source("backend").source("all").new().by("issue.id").last("1d") > 0"#,
+            r#"error-tracking("*").by("issue.id").last("1d") > 0"#,
+            r#"error-tracking("*").new().impact().by("issue.id").last("1d") > 0"#,
+            r#"error-tracking("*").new("x").by("issue.id").last("1d") > 0"#,
+            r#"error-tracking("*").impact().rollup("cardinality", "@usr.email").by("issue.id").last("1d") > 0"#,
+            r#"error-tracking("*").new().by("env").last("1d") > 0"#,
+            r#"error-tracking("*").new().by("issue.id,host").last("1d") > 0"#,
+            r#"error-tracking("*").new().last("1d") > 0"#,
+            r#"error-tracking("*").new().by("issue.id") > 0"#,
+            r#"error-tracking("*").new().by("issue.id").last("2w") > 0"#,
+            r#"error-tracking("(x").new().by("issue.id").last("1d") > 0"#,
+            r#"error-tracking("*").new().by("issue.id").last("1d")"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        // Evaluated by kiln, with its issues.
+        assert!(evaluate(&Store::new(crate::hash::Keyed::new()), &parse(r#"error-tracking("*").new().by("issue.id").last("1d") > 0"#).unwrap(), 0, 0).is_err());
+    }
+
     #[test]
     fn states_alert_and_recover_with_hysteresis() {
         let t = Thresholds { critical: 90.0, warning: Some(80.0), critical_recovery: Some(85.0), warning_recovery: Some(70.0) };
@@ -766,7 +876,7 @@ mod tests {
     #[test]
     fn messages_render_datadog_s_template_syntax() {
         let group = vec![("host".to_owned(), "web-1".to_owned()), ("env".to_owned(), "prod".to_owned())];
-        let v = Vars { monitor: "CPU high", value: Some(93.25), threshold: 90.0, warn_threshold: Some(80.0), group: &group, link: "https://kiln/monitors/1" };
+        let v = Vars { monitor: "CPU high", value: Some(93.25), threshold: 90.0, warn_threshold: Some(80.0), group: &group, link: "https://kiln/monitors/1", extra: &[] };
         let template = "{{#is_alert}}CPU on {{host.name}} is {{value}}% (> {{threshold}}) @slack-ops @pagerduty-oncall{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @slack-ops{{/is_recovery}}{{^is_recovery}} [{{group}}]{{/is_recovery}} {{link}} {{unknown.var}}";
         let alert = render(template, Transition { from: State::Ok, to: State::Alert }, &v);
         assert_eq!(alert, "CPU on web-1 is 93.25% (> 90) @slack-ops @pagerduty-oncall [host:web-1,env:prod] https://kiln/monitors/1 {{unknown.var}}");
@@ -777,6 +887,11 @@ mod tests {
         // Unbalanced and deep sections never panic.
         let deep = "{{#is_alert}}".repeat(10_000) + "x" + &"{{/is_alert}}".repeat(9_999) + "{{";
         let _ = render(&deep, Transition { from: State::Ok, to: State::Alert }, &v);
+        // Variables besides the group's tags: an Error Tracking monitor's issue's.
+        let extra = vec![("issue.attributes.error.type".to_owned(), "ValueError".to_owned())];
+        let v = Vars { extra: &extra, ..v };
+        let said = render("{{issue.attributes.error.type}} on {{host.name}}: {{issue.attributes.error.stack}}", Transition { from: State::Ok, to: State::Alert }, &v);
+        assert_eq!(said, "ValueError on web-1: {{issue.attributes.error.stack}}");
     }
 
     /// Ten days of a daily cycle every five minutes, a spike in the last few minutes: the anomaly

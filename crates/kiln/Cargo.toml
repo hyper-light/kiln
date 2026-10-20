@@ -96,3 +96,7 @@ hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "7676
 [[bench]]
 name = "collect"
 harness = false
+
+[[bench]]
+name = "issues"
+harness = false

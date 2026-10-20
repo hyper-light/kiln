@@ -10,14 +10,20 @@
 //! spans, its logs; ddtrace's spans), every failure counted, its type and its place (its file, its
 //! function) as its stack says; an issue resolved stays so while the version it was resolved in
 //! fails again, and comes back for review, a regression, when a new version fails so; an issue's
-//! latest error whole (its stack), and its errors found by its id.
+//! latest error whole (its stack), and its errors found by its id. And Datadog's Error Tracking
+//! monitors, telling a webhook: a monitor of new issues tells each as it comes (its type, message,
+//! place and stack), its end once resolved, nothing of one ignored, and the regression again; one
+//! made after the issues came tells the regression alone; one of impact (more than nine errors in
+//! an hour) tells the issues past it while for review, none resolved.
 //!
 //! It needs Docker: `cargo test -p kiln --test observe_errors -- --ignored --nocapture`.
 #![cfg(unix)]
 
 mod common;
 
+use std::io::{Read, Write};
 use std::process::Command;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use common::{Fleet, at, free_port, now_ms};
@@ -237,6 +243,59 @@ fn find<'a>(all: &'a [Value], service: &str, source: &str, function: &str) -> Op
     all.iter().find(|i| at(i, &["service"]) == service && at(i, &["source"]) == source && at(i, &["function"]) == function)
 }
 
+/// The id of an issue the scenario found.
+fn id_of(all: &[Value], service: &str, source: &str, function: &str) -> anyhow::Result<String> {
+    find(all, service, source, function).and_then(|i| at(i, &["id"]).as_str()).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no issue of {service}'s {source} in {function}"))
+}
+
+/// A receiver of webhooks: each body it is sent (JSON), in order.
+fn receiver() -> anyhow::Result<(u16, Arc<Mutex<Vec<Value>>>)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let heard: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let kept = heard.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let (mut buf, mut chunk) = (Vec::new(), [0u8; 8192]);
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(chunk.get(..n).unwrap_or(&[])),
+                }
+                let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(buf.get(..end).unwrap_or(&[])).to_ascii_lowercase();
+                let len: usize = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+                let body = buf.get(end + 4..).unwrap_or(&[]);
+                if body.len() >= len {
+                    if let Ok(v) = serde_json::from_slice::<Value>(body.get(..len).unwrap_or(body)) {
+                        kept.lock().unwrap_or_else(PoisonError::into_inner).push(v);
+                    }
+                    break;
+                }
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    Ok((port, heard))
+}
+
+/// What monitor `id` told the receiver, in order: each notice.
+fn notices(heard: &Mutex<Vec<Value>>, id: &str) -> Vec<Value> {
+    heard.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|b| at(b, &["notice", "monitor_id"]) == id).map(|b| at(b, &["notice"]).clone()).collect()
+}
+
+/// The issue a notice, or a monitor's group, is of: its group's one tag.
+fn issue_in(v: &Value) -> &str {
+    at(v, &["group"]).as_array().and_then(|g| g.first()).and_then(|t| t.get(1)).and_then(Value::as_str).unwrap_or("")
+}
+
+/// The issues monitor `id` told of as alerting, in order.
+fn alerted(heard: &Mutex<Vec<Value>>, id: &str) -> Vec<String> {
+    notices(heard, id).iter().filter(|n| at(n, &["state"]) == "ALERT").map(|n| issue_in(n).to_owned()).collect()
+}
+
 #[test]
 #[ignore = "needs Docker: runs a Flask shop under OpenTelemetry's Python SDK and Datadog's tracer, and a kiln server and runner as processes"]
 fn a_shop_s_failures_are_issues_grouped_as_datadog_groups_them_and_regress_in_a_new_version() -> anyhow::Result<()> {
@@ -264,6 +323,26 @@ fn a_shop_s_failures_are_issues_grouped_as_datadog_groups_them_and_regress_in_a_
         ("DD_REMOTE_CONFIGURATION_ENABLED", "false".to_owned()),
         ("DD_INSTRUMENTATION_TELEMETRY_ENABLED", "false".to_owned()),
     ];
+    // Datadog's Error Tracking monitors of the OTel shop, telling a webhook: of its new issues (each
+    // one's type, message, place and stack said), and of its issues of impact (more than nine
+    // errors in an hour).
+    let (hook, heard) = receiver()?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/hook", Some(&json!({ "kind": "webhook", "url": format!("http://127.0.0.1:{hook}/hook") })))?;
+    anyhow::ensure!((200..300).contains(&code), "the webhook: {code}");
+    let monitor = |name: &str, query: &str, message: &str| -> anyhow::Result<String> {
+        let m = f.call("POST", "/api/observe/v1/monitors", Some(&json!({ "name": name, "type": "error-tracking alert", "query": query, "message": message, "options": { "every": 10 } })))?;
+        at(&m, &["id"]).as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("the monitor {name}: {m}"))
+    };
+    let new = monitor(
+        "New shop-otel issue",
+        r#"error-tracking("service:shop-otel").source("backend").new().rollup("count").by("issue.id").last("1d") > 0"#,
+        "{{#is_alert}}New issue {{issue.attributes.error.type}}: {{issue.attributes.error.message}} at {{issue.attributes.error.file}}\n{{issue.attributes.error.stack}}{{/is_alert}}{{#is_recovery}}{{issue.attributes.error.type}} recovered{{/is_recovery}} @webhook-hook",
+    )?;
+    let impact = monitor(
+        "shop-otel issue of impact",
+        r#"error-tracking("service:shop-otel").source("backend").impact().rollup("count").by("issue.id").last("1h") > 9"#,
+        "{{issue.attributes.error.type}}: {{value}} errors @webhook-hook",
+    )?;
     fail("otel", "total,load,parse", 1, "1.0", &otel(&ingest))?;
     fail("dd", "total,load,parse", 1, "1.0", &dd)?;
 
@@ -302,9 +381,56 @@ fn a_shop_s_failures_are_issues_grouped_as_datadog_groups_them_and_regress_in_a_
     let id = at(total, &["id"]).as_str().unwrap_or("").to_owned();
     anyhow::ensure!(at(total, &["message"]).as_str().is_some_and(|m| m.starts_with("bad item -")), "{total}");
 
+    // Each of the OTel shop's six issues told once as new, with what it is; none of ddtrace's.
+    let mut otel_ids: Vec<String> = want.iter().filter(|w| w.0 == "shop-otel").map(|(s, src, func, _)| id_of(&all, s, src, func)).collect::<anyhow::Result<_>>()?;
+    otel_ids.sort();
+    until("each new issue told", Duration::from_secs(90), || Ok(alerted(&heard, &new).len() >= otel_ids.len()), &|| format!("{:?}\n{}", notices(&heard, &new), f.logs()))?;
+    let mut told = alerted(&heard, &new);
+    told.sort();
+    anyhow::ensure!(told == otel_ids, "told {told:?}, not {otel_ids:?}");
+    let said = notices(&heard, &new).into_iter().find(|n| issue_in(n) == id).ok_or_else(|| anyhow::anyhow!("its notice"))?;
+    let message = at(&said, &["message"]).as_str().unwrap_or("");
+    anyhow::ensure!(
+        message.starts_with("New issue ValueError: bad item -") && message.contains("/e2e/shop.py\nTraceback (most recent call last):") && message.contains("in total"),
+        "its type, message, place and stack said: {said}"
+    );
+    anyhow::ensure!(at(&said, &["link"]).as_str().is_some_and(|l| l.ends_with(&format!("/observe/errors/{id}"))), "its page the link: {said}");
+    // A monitor of new issues made now tells none of these.
+    let again = monitor("A new issue anywhere", r#"error-tracking("*").new().by("issue.id").last("1d") > 0"#, "{{issue.attributes.error.type}} came @webhook-hook")?;
+    // One ignored: its alert ends, saying nothing (Datadog's: an ignored issue is muted).
+    let load = id_of(&all, "shop-otel", "span", "load")?;
+    let r = f.call("PUT", &format!("/api/observe/v1/errors/issues/{load}"), Some(&json!({ "status": "ignored" })))?;
+    anyhow::ensure!(at(&r, &["status"]) == "ignored", "{r}");
+
     // Resolved, its version failing again: still resolved, its errors counted.
     let r = f.call("PUT", &format!("/api/observe/v1/errors/issues/{id}"), Some(&json!({ "status": "resolved" })))?;
     anyhow::ensure!(at(&r, &["status"]) == "resolved", "{r}");
+    // Its alert ends, told; the ignored one's too, told nothing, its event saying it was muted.
+    until("its alert's end told", Duration::from_secs(60), || Ok(notices(&heard, &new).iter().any(|n| at(n, &["state"]) == "OK" && issue_in(n) == id)), &|| {
+        format!("{:?}\n{}", notices(&heard, &new), f.logs())
+    })?;
+    let ended = || -> anyhow::Result<bool> {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{new}"), None)?;
+        Ok(at(&m, &["groups"]).as_array().is_some_and(|gs| gs.iter().any(|g| issue_in(g) == load && at(g, &["state"]) == "OK")))
+    };
+    until("the ignored issue's alert ended", Duration::from_secs(60), ended, &|| f.logs())?;
+    anyhow::ensure!(!notices(&heard, &new).iter().any(|n| issue_in(n) == load && at(n, &["state"]) != "ALERT"), "an ignored issue's end told: {:?}", notices(&heard, &new));
+    let ends = || -> anyhow::Result<Vec<(String, String)>> {
+        let events =
+            f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("source:kiln.event @monitor_id:{new} @state:OK"), "from": t0, "to": now_ms() + 60_000, "limit": 50 })))?;
+        Ok(at(&events, &["records"])
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| (at(r, &["attributes", "group.issue.id"]).as_str().unwrap_or("").to_owned(), at(r, &["attributes", "muted"]).as_str().unwrap_or("").to_owned()))
+            .collect())
+    };
+    until("the ends' events", Duration::from_secs(30), || Ok(ends()?.len() >= 2), &|| f.logs())?;
+    let ends = ends()?;
+    anyhow::ensure!(
+        ends.len() == 2 && ends.contains(&(load.clone(), "true".to_owned())) && ends.contains(&(id.clone(), "false".to_owned())),
+        "the ends: the ignored one's muted, the resolved one's told: {ends:?}"
+    );
     fail("otel", "total", 100, "1.0", &otel(&ingest))?;
     let now_of = |f: &Fleet| -> anyhow::Result<Value> { f.call("GET", &format!("/api/observe/v1/errors/issues/{id}?from={t0}&to={}", now_ms() + 60_000), None) };
     until("its old version's errors counted", Duration::from_secs(90), || Ok(at(&now_of(&f)?, &["issue", "errors"]).as_f64() == Some(2.0 * EACH as f64)), &|| f.logs())?;
@@ -339,10 +465,31 @@ fn a_shop_s_failures_are_issues_grouped_as_datadog_groups_them_and_regress_in_a_
     let found = f.call("POST", "/api/observe/v1/spans/search", Some(&json!({ "query": format!("@issue.id:{id}"), "from": t0, "to": now_ms() + 60_000, "limit": 1000 })))?;
     let spans = at(&found, &["spans"]).as_array().map_or(0, Vec::len) as u64;
     anyhow::ensure!(spans == 3 * EACH, "{spans} of its spans found by its id");
+
+    // The regression told: as new again by the first monitor; alone by the one made after the
+    // issues came; and by the monitor of impact once for review, past nine errors in the hour, as
+    // the log's issue of the same place was (never resolved, past them with its old version's).
+    until(
+        "the regression told",
+        Duration::from_secs(90),
+        || Ok(alerted(&heard, &new).iter().filter(|i| **i == id).count() == 2 && alerted(&heard, &again) == [id.clone()] && alerted(&heard, &impact).contains(&id)),
+        &|| format!("{:?}\n{:?}\n{:?}\n{}", notices(&heard, &new), notices(&heard, &again), notices(&heard, &impact), f.logs()),
+    )?;
+    // And nothing more, two evaluations on.
+    std::thread::sleep(Duration::from_secs(25));
+    let (a, b, c) = (notices(&heard, &new), notices(&heard, &impact), notices(&heard, &again));
+    anyhow::ensure!(a.len() == otel_ids.len() + 2, "the monitor of new issues: six new, an end, the regression: {a:?}");
+    anyhow::ensure!(c.len() == 1, "the monitor made after the issues came: the regression alone: {c:?}");
+    let mut past = alerted(&heard, &impact);
+    past.sort();
+    let mut want_past = vec![id.clone(), id_of(&all, "shop-otel", "log", "total")?];
+    want_past.sort();
+    anyhow::ensure!(b.len() == 2 && past == want_past && b.iter().all(|n| at(n, &["value"]).as_f64().is_some_and(|v| v >= 10.0)), "the monitor of impact: {b:?}");
     eprintln!(
-        "  errors     {} failures of three places, under OpenTelemetry's SDK (spans, logs) and ddtrace: {} issues, each counted whole; resolved, a new version's failure a regression",
+        "  errors     {} failures of three places, under OpenTelemetry's SDK (spans, logs) and ddtrace: {} issues, each counted whole; resolved, a new version's failure a regression; {} notices of three Error Tracking monitors",
         2 * 3 * EACH,
-        want.len()
+        want.len(),
+        a.len() + b.len() + c.len()
     );
     Ok(())
 }

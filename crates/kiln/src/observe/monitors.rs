@@ -66,6 +66,8 @@ pub struct Options {
 
 /// Datadog's type for a composite monitor.
 pub const COMPOSITE: &str = "composite";
+/// Datadog's types of the monitors whose kind their query says, as its API names them.
+pub const TYPES: [&str; 6] = ["metric alert", "query alert", "log alert", "trace-analytics alert", "slo alert", "error-tracking alert"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Monitor {
@@ -73,8 +75,7 @@ pub struct Monitor {
     pub id: String,
     pub name: String,
     /// Datadog's monitor type: [`COMPOSITE`] for a composite, its query an expression of other
-    /// monitors' ids; none (or `metric alert`, `query alert`, `log alert`) for the rest, whose kind
-    /// their query says.
+    /// monitors' ids; none (or one of [`TYPES`]) for the rest, whose kind their query says.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     pub query: String,
@@ -112,6 +113,44 @@ fn slo_values(store: &kiln_obs::store::Store, id: &str, burn: Option<(i64, i64)>
     Ok(value.map(|v| vec![monitor::Value { group: Vec::new(), value: v }]).unwrap_or_default())
 }
 
+/// An Error Tracking monitor's values (`monitor::Kind::ErrorTracking`): its issues' errors over
+/// its window (`super::errors::Issues::monitor_values`), of the issues it watches since `since`
+/// (when it was made or last changed).
+fn error_values(store: &kiln_obs::store::Store, search: &str, new: bool, by: &[String], window_ms: i64, since: i64, now: i64) -> Result<Vec<monitor::Value>, monitor::MonitorError> {
+    let eval = |e: String| monitor::MonitorError::Eval(e);
+    let issues = super::api::issues().map_err(|_| eval("Error Tracking's issues are kept by the server".into()))?;
+    let search = kiln_obs::logs::search::parse(search).map_err(|e| eval(e.to_string()))?;
+    let from = now.saturating_sub(window_ms);
+    issues.monitor_values(&search, new, by, since, now, |few| {
+        match few {
+            Some(ids) => kiln_obs::errors::seen_of(store, ids, from, now),
+            None => kiln_obs::errors::seen(store, &[], from, now),
+        }
+        .map_err(|e| eval(e.to_string()))
+    })
+}
+
+/// The issue an Error Tracking monitor's group is of (none for other monitors' groups).
+fn issue_of(m: &Monitor, g: &GroupState) -> Option<super::errors::Issue> {
+    if !matches!(m.compiled(), Ok(Compiled::Query(q, _)) if matches!(q.kind, monitor::Kind::ErrorTracking { .. })) {
+        return None;
+    }
+    let id = g.group.iter().find(|(k, _)| k == "issue.id").map(|(_, v)| v.as_str())?;
+    super::api::issues().ok()?.get(id)
+}
+
+/// An issue's variables for its monitor's message, Datadog's (`issue.attributes.error.*`): its
+/// type, message and file, and its latest error's stack when the message asks for it (a search);
+/// what only a browser's or a phone's error says (`is_crash`, `category`, `handling`) nothing.
+fn issue_vars(store: &kiln_obs::store::Store, i: &super::errors::Issue, template: &str, now: i64) -> Vec<(String, String)> {
+    let var = |k: &str, v: &str| (format!("issue.attributes.error.{k}"), v.to_owned());
+    let mut out = vec![var("type", &i.kind), var("message", &i.message), var("file", &i.file), var("is_crash", ""), var("category", ""), var("handling", "")];
+    if template.contains("issue.attributes.error.stack") {
+        out.push(var("stack", &super::errors::latest_stack(store, i, now).unwrap_or_default()));
+    }
+    out
+}
+
 /// A monitor, compiled: a query of the store and its thresholds, or a composite of other monitors.
 #[derive(Debug, Clone)]
 pub enum Compiled {
@@ -134,10 +173,14 @@ impl Monitor {
         }
         match self.kind.as_deref() {
             Some(COMPOSITE) => return composite::parse(&self.query).map(Compiled::Composite).map_err(|e| e.to_string()),
-            None | Some("metric alert" | "query alert" | "log alert") => {}
-            Some(other) => return Err(format!("a monitor's type: {other} ({COMPOSITE}, or none: the query says)")),
+            None => {}
+            Some(t) if TYPES.contains(&t) => {}
+            Some(other) => return Err(format!("a monitor's type: {other} ({COMPOSITE}, {}, or none: the query says)", TYPES.join(", "))),
         }
         let q = monitor::parse(&self.query).map_err(|e| e.to_string())?;
+        if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) && self.options.notify_no_data {
+            return Err("an Error Tracking monitor has no NO DATA: an issue without errors in its window counts none".into());
+        }
         let t = &self.options.thresholds;
         if let Some(c) = t.critical
             && c != q.threshold
@@ -158,7 +201,11 @@ impl Monitor {
 
     fn window_ms(q: &monitor::Query) -> i64 {
         match &q.kind {
-            monitor::Kind::Metric { window_ms, .. } | monitor::Kind::Change { window_ms, .. } | monitor::Kind::Logs { window_ms, .. } | monitor::Kind::Spans { window_ms, .. } => *window_ms,
+            monitor::Kind::Metric { window_ms, .. }
+            | monitor::Kind::Change { window_ms, .. }
+            | monitor::Kind::Logs { window_ms, .. }
+            | monitor::Kind::Spans { window_ms, .. }
+            | monitor::Kind::ErrorTracking { window_ms, .. } => *window_ms,
             // Ahead, not behind: an hour without a forecast is two "windows" without data.
             monitor::Kind::Forecast { .. } => 3_600_000,
             monitor::Kind::Slo { burn, .. } => burn.map_or(3_600_000, |b| b.0),
@@ -380,10 +427,10 @@ impl Monitors {
         for c in composites {
             let Ok(Compiled::Composite(x)) = c.compiled() else { continue };
             if due.iter().any(|d| d.id == c.id) || x.ids.iter().any(|id| evaluated.contains(id.as_str())) {
-                changed |= self.evaluate_composite(&c, &x, now);
+                changed |= self.evaluate_composite(store, &c, &x, now);
             }
         }
-        changed |= self.tell_ends(now);
+        changed |= self.tell_ends(store, now);
         if changed {
             self.save_states();
         }
@@ -392,7 +439,7 @@ impl Monitors {
     /// Downtimes' windows that ended since last looked at: each group one held that is in one of
     /// its end states told once (as a renotification), and asked, if the downtime says so, to keep
     /// its first recovery quiet. Whether any state changed.
-    fn tell_ends(&self, now: i64) -> bool {
+    fn tell_ends(&self, store: &kiln_obs::store::Store, now: i64) -> bool {
         let ended = self.downtimes.ended(now);
         if ended.is_empty() {
             return false;
@@ -424,7 +471,7 @@ impl Monitors {
                     };
                     if tell && d.notify_end_states.iter().any(|s| s == named) {
                         tracing::debug!(monitor = %m.name, downtime = %d.id, how = e.how, group = %group_key(&g.group), "a downtime ended with a group in trouble: told");
-                        self.say(m, said_of(m), &g, state, state, now);
+                        self.say(store, m, said_of(m), &g, state, state, now);
                     }
                 }
             }
@@ -437,7 +484,11 @@ impl Monitors {
     fn evaluate(&self, store: &kiln_obs::store::Store, m: &Monitor, now: i64) -> bool {
         let Ok(Compiled::Query(q, t)) = m.compiled() else { return false };
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
-        let values = if let monitor::Kind::Slo { id, burn } = &q.kind { slo_values(store, id, *burn, now - delay) } else { monitor::evaluate(store, &q, now, delay) };
+        let values = match &q.kind {
+            monitor::Kind::Slo { id, burn } => slo_values(store, id, *burn, now - delay),
+            monitor::Kind::ErrorTracking { search, new, by, window_ms } => error_values(store, search, *new, by, *window_ms, m.modified, now - delay),
+            _ => monitor::evaluate(store, &q, now, delay),
+        };
         let values = match values {
             Ok(v) => v,
             Err(e) => {
@@ -446,15 +497,24 @@ impl Monitors {
             }
         };
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * Monitor::window_ms(&q), |mins| i64::from(mins) * 60_000);
-        let found: Vec<(Group, Option<f64>, State)> = values.into_iter().map(|v| (v.group, Some(v.value), State::Ok)).collect();
+        let mut found: Vec<(Group, Option<f64>, State)> = values.into_iter().map(|v| (v.group, Some(v.value), State::Ok)).collect();
+        // An Error Tracking monitor's group in trouble that it no longer finds (its issue resolved,
+        // ignored, no longer new, or without errors in the window) counts none, and recovers: a
+        // count of a group gone quiet is zero, as Datadog evaluates its event monitors' groups.
+        if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) {
+            let have: HashSet<&Group> = found.iter().map(|(g, _, _)| g).collect();
+            let gone: Vec<Group> =
+                lock(&self.states).get(&m.id).map(|gs| gs.values().filter(|g| g.state != State::Ok.as_str() && !have.contains(&g.group)).map(|g| g.group.clone()).collect()).unwrap_or_default();
+            found.extend(gone.into_iter().map(|g| (g, Some(0.0), State::Ok)));
+        }
         let said = Said { threshold: q.threshold, warning: t.warning };
-        self.apply(m, now, no_data_ms, found, |prev, value, _| monitor::next(prev, value, q.op, &t, m.options.notify_no_data), said)
+        self.apply(store, m, now, no_data_ms, found, |prev, value, _| monitor::next(prev, value, q.op, &t, m.options.notify_no_data), said)
     }
 
     /// A composite's evaluation: its groups' states from the states of the monitors it reads, as
     /// they last found them. A group that comes out NO DATA keeps its last state, unless the
     /// composite asks to be told (Datadog's "last known state").
-    fn evaluate_composite(&self, m: &Monitor, c: &Composite, now: i64) -> bool {
+    fn evaluate_composite(&self, store: &kiln_obs::store::Store, m: &Monitor, c: &Composite, now: i64) -> bool {
         let inputs: Vec<Vec<(Group, State)>> = {
             let all = lock(&self.states);
             c.ids.iter().map(|id| all.get(id).map(|gs| gs.values().map(|g| (g.group.clone(), State::parse(&g.state).unwrap_or(State::Ok))).collect()).unwrap_or_default()).collect()
@@ -464,14 +524,24 @@ impl Monitors {
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * every_ms, |mins| i64::from(mins) * 60_000);
         let notify = m.options.notify_no_data;
         let found: Vec<(Group, Option<f64>, State)> = results.into_iter().map(|(g, s)| (g, None, s)).collect();
-        self.apply(m, now, no_data_ms, found, |prev, _, s| if s == State::NoData && !notify { prev } else { s }, Said { threshold: f64::NAN, warning: None })
+        self.apply(store, m, now, no_data_ms, found, |prev, _, s| if s == State::NoData && !notify { prev } else { s }, Said { threshold: f64::NAN, warning: None })
     }
 
     /// What an evaluation found, applied: each group found moves from its last state to what
     /// `next(last, its value, what the evaluation made of it)` says; groups not found go to NO DATA
     /// after `no_data_ms` when the monitor asks to be told, and are forgotten after a day. Changes
     /// are said, and groups in trouble said again when due. Whether any state changed.
-    fn apply(&self, m: &Monitor, now: i64, no_data_ms: i64, found: Vec<(Group, Option<f64>, State)>, next: impl Fn(State, Option<f64>, State) -> State, said: Said) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn apply(
+        &self,
+        store: &kiln_obs::store::Store,
+        m: &Monitor,
+        now: i64,
+        no_data_ms: i64,
+        found: Vec<(Group, Option<f64>, State)>,
+        next: impl Fn(State, Option<f64>, State) -> State,
+        said: Said,
+    ) -> bool {
         let renotify_ms = m.options.renotify_interval.map(|mins| i64::from(mins) * 60_000).filter(|&r| r > 0);
         let mut transitions: Vec<(GroupState, State)> = Vec::new();
         let mut renotify: Vec<GroupState> = Vec::new();
@@ -521,21 +591,29 @@ impl Monitors {
             // The group as it is now (its new state and value).
             let now_g = lock(&self.states).get(&m.id).and_then(|gs| gs.get(&group_key(&g.group)).cloned()).unwrap_or(g);
             let to = State::parse(&now_g.state).unwrap_or(State::Ok);
-            self.say(m, said, &now_g, prev, to, now);
+            self.say(store, m, said, &now_g, prev, to, now);
         }
         for g in renotify {
             let s = State::parse(&g.state).unwrap_or(State::Ok);
-            self.say(m, said, &g, s, s, now);
+            self.say(store, m, said, &g, s, s, now);
         }
         changed
     }
 
     /// A group's change of state (or its renotification): its event, and, unless the monitor is
-    /// muted, its message to every integration the message mentions.
-    fn say(&self, m: &Monitor, said: Said, g: &GroupState, from: State, to: State, now: i64) {
-        let link = format!("{}/observe/monitors/{}", self.link_base, m.id);
+    /// muted, its message to every integration the message mentions. An Error Tracking monitor's
+    /// group is an issue's: its message given the issue's variables, its link the issue's page,
+    /// and nothing said of it while the issue is ignored (Datadog's).
+    #[allow(clippy::too_many_arguments)]
+    fn say(&self, store: &kiln_obs::store::Store, m: &Monitor, said: Said, g: &GroupState, from: State, to: State, now: i64) {
+        let issue = issue_of(m, g);
+        let link = match &issue {
+            Some(i) => format!("{}/observe/errors/{}", self.link_base, i.id),
+            None => format!("{}/observe/monitors/{}", self.link_base, m.id),
+        };
+        let extra = issue.as_ref().map(|i| issue_vars(store, i, &m.message, now)).unwrap_or_default();
         let tr = Transition { from, to };
-        let vars = Vars { monitor: &m.name, value: g.value, threshold: said.threshold, warn_threshold: said.warning, group: &g.group, link: &link };
+        let vars = Vars { monitor: &m.name, value: g.value, threshold: said.threshold, warn_threshold: said.warning, group: &g.group, link: &link, extra: &extra };
         let message = monitor::render(&m.message, tr, &vars);
         let downtime = self.downtimes.holding(&m.id, &m.tags, &g.group, now);
         // A recovery a downtime that ended asked to keep quiet: this one, once.
@@ -544,7 +622,8 @@ impl Monitors {
             let gs = all.get_mut(&m.id).and_then(|gs| gs.get_mut(&group_key(&g.group)));
             gs.is_some_and(|gs| std::mem::take(&mut gs.quiet_recovery))
         };
-        let muted = m.muted(now) || downtime.is_some() || quiet;
+        let ignored = issue.as_ref().is_some_and(|i| i.status == super::errors::Status::Ignored);
+        let muted = m.muted(now) || downtime.is_some() || quiet || ignored;
         if let Some(o) = super::api::get() {
             let mut attrs: Vec<(String, String)> = vec![
                 ("event.type".into(), format!("monitor.{}", to.as_str().to_ascii_lowercase().replace(' ', "_"))),
@@ -615,5 +694,34 @@ impl Monitors {
             })
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Datadog's types of monitor are taken (an Error Tracking monitor's among them), another is
+    /// not; an Error Tracking monitor asking for NO DATA is refused (an issue without errors counts
+    /// none).
+    #[test]
+    fn datadog_s_types_are_taken_and_an_error_tracking_monitor_has_no_no_data() {
+        let m = |kind: Option<&str>, notify_no_data: bool| Monitor {
+            id: String::new(),
+            name: "new issues".into(),
+            kind: kind.map(str::to_owned),
+            query: r#"error-tracking("service:shop").source("backend").new().rollup("count").by("issue.id").last("1d") > 0"#.into(),
+            message: String::new(),
+            tags: Vec::new(),
+            priority: None,
+            options: Options { notify_no_data, ..Options::default() },
+            muted_until: None,
+            created: 0,
+            modified: 0,
+        };
+        assert!(m(Some("error-tracking alert"), false).compiled().is_ok());
+        assert!(m(None, false).compiled().is_ok());
+        assert!(m(Some("rum alert"), false).compiled().is_err());
+        assert!(m(Some("error-tracking alert"), true).compiled().is_err());
     }
 }

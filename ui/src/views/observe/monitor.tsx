@@ -233,6 +233,15 @@ function Watched({ m, range }: { m: Monitor; range: Range }) {
   if (!check.ok) return <p className="empty-line py-10 text-center">{check.error}</p>;
   if (check.kind === "logs") return <LogsWatched search={check.watched?.search ?? ""} range={range} />;
   if (check.kind === "spans") return <SpansWatched search={check.watched?.search ?? ""} range={range} />;
+  // An Error Tracking monitor's issues' errors, by issue: drawn when its search says tags alone.
+  if (check.kind === "error-tracking")
+    return check.watched?.query ? (
+      <QueryChart queries={[check.watched.query]} range={range} height={220} display="bars" />
+    ) : (
+      <p className="empty-line py-10 text-center">
+        Its issues&apos; errors where <code className="font-mono">{check.watched?.search}</code> holds, by issue: its groups, below.
+      </p>
+    );
   const t = m.options.thresholds;
   // A change monitor's thresholds are of the change, not of the series drawn.
   const marks: Mark[] =
@@ -427,8 +436,16 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
                   check.ok ? (
                     <span>
                       Alerts when{" "}
-                      {check.kind === "logs" || check.kind === "spans" ? "the count" : check.kind === "change" ? "the change" : check.kind === "forecast" ? "the forecast's edge" : "the value"} is{" "}
-                      {check.op} {check.threshold}.
+                      {check.kind === "logs" || check.kind === "spans"
+                        ? "the count"
+                        : check.kind === "change"
+                          ? "the change"
+                          : check.kind === "forecast"
+                            ? "the forecast's edge"
+                            : check.kind === "error-tracking"
+                              ? "an issue's error count"
+                              : "the value"}{" "}
+                      is {check.op} {check.threshold}.
                     </span>
                   ) : (
                     <span className="text-[#e2c4c6]">{check.error}</span>

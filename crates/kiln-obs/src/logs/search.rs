@@ -528,6 +528,12 @@ impl Search {
         self.matches(r, s)
     }
 
+    /// Whether what has a record's fields matches, as a record of them would (an Error Tracking
+    /// monitor's issue's errors of an env and a version).
+    pub fn fields<F: Fields>(&self, r: &F, s: &mut RowScratch) -> bool {
+        self.matches(r, s)
+    }
+
     fn matches<F: Fields>(&self, r: &F, s: &mut RowScratch) -> bool {
         s.lower.clear();
         let mut lowered = false;

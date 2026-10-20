@@ -718,6 +718,10 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                         // A forecast's window is ahead: `window_ms` its horizon.
                         kiln_obs::monitor::Kind::Forecast { query, ahead_ms, .. } => ("forecast", json!({ "query": query }), ahead_ms),
                         kiln_obs::monitor::Kind::Slo { id, burn } => ("slo", json!({ "slo": id }), &burn.map_or(3_600_000, |b| b.0)),
+                        // Its issues' errors, by issue: a chart's query of them when its search says tags alone.
+                        kiln_obs::monitor::Kind::ErrorTracking { search, window_ms, .. } => {
+                            ("error-tracking", json!({ "search": search, "query": kiln_obs::errors::monitor_query(search) }), window_ms)
+                        }
                     };
                     srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold, "kind": kind, "watched": watched, "window_ms": window_ms }))
                 }

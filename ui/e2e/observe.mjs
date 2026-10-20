@@ -313,6 +313,23 @@ const scenarios = {
     await page.getByRole("group", { name: "Its status", exact: true }).getByRole("button", { name: "Resolved", exact: true }).click();
     await until("resolved, as the API keeps it", async () => (await api("GET", `/api/observe/v1/errors/issues/${issue.id}`)).body?.issue?.status === "resolved");
     await page.getByText("by a user", { exact: true }).first().waitFor();
+    // A monitor of the service's new issues made from the form, Datadog's Error Tracking monitor:
+    // checked, kept as made, its issues' errors drawn by issue on its page.
+    const query = `error-tracking("service:${service}").source("backend").new().rollup("count").by("issue.id").last("1d") > 0`;
+    await page.goto(`${BASE}/observe/monitors/new?query=${encodeURIComponent(query)}`);
+    await page.getByRole("button", { name: "Check", exact: true }).click();
+    await page.getByText(/Alerts when an issue's error count is > 0/).waitFor();
+    await fillIn(page.getByLabel("Name", { exact: true }), `E2E new issues ${run}`);
+    await page.getByRole("button", { name: "Create", exact: true }).click();
+    await page.waitForURL(/\/observe\/monitors\/m[0-9a-f]+$/);
+    const id = page.url().split("/").pop();
+    const m = await api("GET", `/api/observe/v1/monitors/${id}`);
+    expect(m.status === 200 && m.body.query === query, `the monitor kept as made: ${JSON.stringify(m.body)}`);
+    await page.getByRole("img", { name: `sum:error_tracking.errors{service:${service}} by {issue.id}.as_count()` }).waitFor();
+    await page.getByText(`issue.id:${issue.id}`).first().waitFor();
+    await fitsAcross("the monitor's page");
+    if (process.env.SHOTS) await page.screenshot({ path: `${process.env.SHOTS}/monitor-${which}${phone ? "-phone" : ""}.png`, fullPage: true });
+    expect((await api("DELETE", `/api/observe/v1/monitors/${id}`)).status < 300, "the monitor deleted");
   },
 
   /** Logs searched, narrowed by a facet, a record opened and one of its attributes searched. */

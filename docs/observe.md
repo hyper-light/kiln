@@ -30,7 +30,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-16 | Synthetic tests (§10.4): Datadog's API tests, HTTP (its time cut into DNS, connection, TLS, first byte, download and redirects), TCP, DNS and TLS (a certificate's days left), from the server and runners as locations; Datadog's assertions and series; a location failing or recovering an event once; alerting by a monitor each test owns (at least N locations failing for a while); tried once from the server, run now everywhere; their page; checked live (a server and a runner, an endpoint switched to 500 and back, a TLS endpoint with a CA of its own) and in browsers (§13) | done |
 | O-17 | Metrics summary (§7, §11): Datadog's, each metric's series by kind, each tag's values and its values of most series, the samples it brings (counted as they are applied, by metric; carried over when retention numbers the symbols anew) and of late a second, its newest sample; from the index, nothing read from disk; its page; checked by the API's conformance test, a unit test of the counts through retention, and in browsers (§13) | done |
 | O-18 | Traces (APM, §8.7): OTLP traces over HTTP (protobuf, JSON) and gRPC on the server and every runner, each span decoded straight into its row (614 ns, no allocation a span past the request's, §12.23) in a span store of its own beside the logs (its own files and retention, replicated as logs are; formats a build that knows no spans still reads until the first span comes); found by their trace in the whole retention, their blocks' filters holding their ids (salted by the block: a trace reads its own block and 1% of the rest, whichever trace); the trace explorer's search syntax; a trace assembled as a waterfall draws it; Datadog's trace metrics (hits, errors, latency distributions, of entry spans and calls out by peer) counted on the server as metrics from logs are, and metrics from spans; services, resources and calls from them over any range; the service map from the spans, sampled by trace past 200,000; the API, described in OpenAPI; APM's pages (services, a service, the trace explorer, a trace's waterfall and its logs, the map); checked live against OpenTelemetry's Python SDK across two services by way of a runner (§13). Datadog's Agent's traces (§8.7: its indexed and inline forms, 532 ns a span, §12.23) and its stats as the trace metrics (every span counted before it sampled, its DDSketches' four mappings read within their accuracy; 6 µs and 0.2 allocations a grouped stat), checked live against Agent 7.84 and ddtrace 4.16 with traces kept and dropped (§13). Datadog's tracers straight to kiln on every runner (kiln in the Agent's place on its port: `/v0.4/traces`, `/v0.5/traces`, `/info`; 490 ns a span), every span counted by the runner's concentrator before a dropped trace is let go, as the Agent counts (133 ns a span); checked live with ddtrace 4.16, no Agent (§13). The Agent's priority sampler on every runner (each tracer told its services' rates, `rate_by_service`: ten traces a second a node, each service its share by water-filling), checked live: a busy service's rate falling to its share, every trace counted, kept or not (§13). A runner's last spans and buckets written as it stops, a bucket two of its lives write added and not written over, checked live across a stop (§13). The map's figures from the trace metrics, each edge its share of the groups that count its calls (the ratio estimator), so a sampled service's calls are every call: checked live through the Agent, straight to a runner under the sampler, and with OpenTelemetry's SDK (§13). CI runs as traces, span monitors | in progress |
-| O-19 | Error Tracking (§8.8): errors grouped into issues as Datadog groups them (within a service: their type, their message's words, the application's innermost frame of their stack; a user's `error.fingerprint`), of the errors requests failed with (a service's entry span's, or a Datadog tracer's top-most error under its erring entry) and of error logs; eight languages' stacks read as their runtimes write them (recorded from them); an `issue.id` on each error as it is taken, a stack kept whole to 25,000 bytes (both its ends past it); each issue's errors counted on the server (`error_tracking.errors` by issue, service, env and version); issues kept by the server with Datadog's statuses, fourteen quiet days resolving one, a new version's error a regression; the API (OpenAPI) and its pages; checked live with OpenTelemetry's Python SDK (spans and logs) and ddtrace through a resolve and a regression (§13); 1.1 to 2.8 µs an error (§12.24). Next: an allocation pass on reading an error, new issues and regressions told to integrations | in progress |
+| O-19 | Error Tracking (§8.8): errors grouped into issues as Datadog groups them (within a service: their type, their message's words, the application's innermost frame of their stack; a user's `error.fingerprint`), of the errors requests failed with (a service's entry span's, or a Datadog tracer's top-most error under its erring entry) and of error logs; eight languages' stacks read as their runtimes write them (recorded from them); an `issue.id` on each error as it is taken, a stack kept whole to 25,000 bytes (both its ends past it); each issue's errors counted on the server (`error_tracking.errors` by issue, service, env and version); issues kept by the server with Datadog's statuses, fourteen quiet days resolving one, a new version's error a regression; the API (OpenAPI) and its pages; checked live with OpenTelemetry's Python SDK (spans and logs) and ddtrace through a resolve and a regression (§13); 1.1 to 2.8 µs an error (§12.24); Datadog's Error Tracking monitors (new issues and regressions, impact; §9) telling integrations, an ignored issue muted, checked live and in browsers (§13). Next: an allocation pass on reading an error | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1256,10 +1256,16 @@ kept in `<observe>/issues.json` (a user's change at once, what the metric says a
 most), 10,000 at the most: past them, the one longest without an error among those resolved or
 ignored goes, else the one longest without an error.
 
+Issues are told as Datadog tells them, by Error Tracking monitors (§9): one of new issues tells each
+as it comes and as it regresses, one of impact each past a number of errors, to the integrations
+their messages name.
+
 ## 9. Monitors
 
 A monitor is Datadog's (`kiln_obs::monitor`, `crate::observe::monitors`): a query, a message and
-options, so a monitor written for Datadog reads here.
+options, so a monitor written for Datadog reads here. Its type, when it says one, is Datadog's
+(`metric alert`, `query alert`, `log alert`, `trace-analytics alert`, `slo alert`,
+`error-tracking alert`, or `composite`); its query says its kind.
 
 - **Queries**: `avg|sum|min|max|last(last_5m):<metric query> > 90`; change monitors
   `change(avg(last_5m),last_1h):…` and `pct_change(…)`; anomaly monitors
@@ -1308,6 +1314,22 @@ options, so a monitor written for Datadog reads here.
 - **Outliers**: Datadog's `avg(last_1h):outliers(<metric query> by {host}, 'dbscan', 1) > 0`: a
   group's value is 1 if its series is an outlier of the query's groups over the window, 0 if not;
   each outlier alerts on its own.
+- **Error Tracking** (§8.8): Datadog's,
+  `error-tracking("service:shop").source("backend").new().rollup("count").by("issue.id").last("1d") > 0`
+  (its New Issue alert) or `.impact()` (its High Impact alert). A group is an issue's (and its env's,
+  version's or service's, as `.by` says); its value, the issue's errors over the window where the
+  search holds of them: of the issue (its service, type, message, file and function: `service:`,
+  `@error.type:`, words of its type and message) and of each error's env and version. A monitor of
+  new issues watches those FOR REVIEW that came (were made, or regressed) after it was made or last
+  changed, and within a day (Datadog's lookback); one of impact, those FOR REVIEW or REVIEWED; RESOLVED
+  and IGNORED issues never. A group in trouble whose issue it no longer watches, or without errors in
+  the window, counts none and recovers (a count of a group gone quiet is zero, as Datadog evaluates
+  its event monitors), told unless its issue is IGNORED (Datadog mutes an ignored issue; its event says
+  `muted`). Kiln's issues are backends': `.source()` is `all` or `backend` (unsaid: all), and the
+  rollup a count (Datadog's Error Occurrences). Its messages have Datadog's
+  `{{issue.attributes.error.type}}`, `.message`, `.file` and `.stack` (the latest error's, searched
+  for only when the message asks; what only a browser's or a phone's error says, `is_crash`,
+  `category` and `handling`, nothing), and its notices link the issue's page.
 
 ### 9.1 Anomalies, forecasts and outliers
 
@@ -2735,6 +2757,42 @@ Only an error is read so (a span in error, a log of an error's status): of a str
 a hundred failing, some 13 ns a span. Rust's frames, their generics written out in full (5.6 KB a
 stack), cost the most.
 
+What the server does with issues, at Error Tracking's bound: 10,000 issues, each erring in three
+series (two versions of an env, one of another) in one window of ten seconds in twenty over a day,
+the last two hours in the head as the server holds them (kiln-obs's `benches/errors.rs`, kiln's
+`benches/issues.rs`; one core of fedora). The metric read (`kiln_obs::errors::seen`, and
+`seen_of` for some issues alone):
+
+| read | twenty minutes | an hour | a day |
+| --- | --- | --- | --- |
+| every issue's series | 19.0 ms | 19.7 ms | 75.3 ms |
+| one issue's | 0.002 ms | 0.002 ms | 0.008 ms |
+| ten issues' | 0.016 ms | 0.017 ms | 0.062 ms |
+| a hundred issues' | 0.20 ms | 0.21 ms | 0.69 ms |
+| a thousand issues' | 2.08 ms | 2.22 ms | 7.04 ms |
+| all 10,000, each's | 20.8 ms | 22.0 ms | 77.0 ms |
+
+A series costs 4 allocations read with the whole (its tags' text), 7.3 read by its issue (the
+issue's selection besides). Read by issue, an issue costs 1.03 to 1.09 times its share of the whole,
+so a monitor reads the series of the issues it watches alone until they are nine tenths of the
+issues kept: a monitor of new issues, watching a few, reads them in microseconds where every series
+would cost it 19 to 75 ms an evaluation. All of them on the metric written as blocks alone, the
+last twenty minutes cost 51 ms: the head is the cheaper read. The registry, handed the rows read:
+
+| the registry's work | time | allocations |
+| --- | --- | --- |
+| its read each ten seconds, every issue known | 5.4 ms | 0 |
+| a monitor of impact, by issue (10,000 groups) | 4.2 ms | 30,018 |
+| a monitor of impact, by issue and env (20,000 groups) | 6.5 ms | 100,019 |
+| a monitor of impact of a service in an env (100 groups) | 2.4 ms | 311 |
+| a monitor of new issues, none new | 0.03 to 0.06 ms | 0 |
+
+Two passes cut these: the read sorts the rows it is handed in place and reads an issue's as a run,
+an issue known found by its id as it is (21,298 allocations a read to none); a monitor's groups are
+kept by their tags' values as they are, their text made once, for the answer (4 allocations a group
+to 3). At the bound, the registry's read every ten seconds holds the store's read lock some 25 ms (the
+metric's read and its own).
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -2856,8 +2914,10 @@ six error logs of a service, their messages differing in their numbers and what 
 in Error Tracking as one issue by the service's name, opened, its stack shown, resolved from its
 page as the API keeps it, neither page wider than the screen (anything wider, a stack's lines,
 scrolls in its own box; the check itself tried on a page too wide, which it names, and on a wide
-box that scrolls, which it lets be) (2026-10-20: passes in Chromium at 1,440 px and as a phone, and
-in WebKit as a phone, on fedora).
+box that scrolls, which it lets be); then a monitor of the service's new issues made from the form,
+checked as Datadog's Error Tracking monitor (`Alerts when an issue's error count is > 0`), kept as
+made, its issues' errors drawn by issue on its page, which fits the screen too (2026-10-20: passes
+in Chromium at 1,440 px and as a phone, and in WebKit as a phone, on fedora).
 Each makes its own records and checks through the API, not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a
 server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a
@@ -3115,7 +3175,16 @@ fixed: an OTLP log's attributes were read to a tag's 800 bytes (a Python traceba
 frame last, lost its frames: now a span's 25,000, a stack's longer); a stored log's attributes were
 cut so too (a stack is now kept to 25,000 bytes, both its ends: Python's innermost frame is its
 last, every other language's its first); OTLP logs took no `env` nor `version` from their resource
-(now as spans do). 2026-10-20: passes (119 s, on fedora).
+(now as spans do). 2026-10-20: passes (119 s, on fedora). With it, three Error Tracking monitors
+(§9) telling a webhook in the scenario: one of the SDK's shop's new issues, made before its first
+failures, tells each of its six as it comes (its type, message, place and latest stack in its
+message; the issue's page its link) and none of ddtrace's; one issue ignored, its alert ends told
+nothing (its event `muted`); the resolved one's end is told, and its regression told again; a monitor
+of new issues made after the first failures tells the regression alone; a monitor of impact (more
+than nine errors in an hour) tells the two issues past it, the log's issue of the same place (past
+it with its old version's errors, never resolved) and the regressed one (once for review again),
+none while resolved; eleven notices in all, nothing more two evaluations on. 2026-10-20: passes
+(163 s, on fedora).
 
 **Event Hubs** (`crates/kiln/tests/observe_eventhubs.rs`; Docker): Apache Kafka's own broker (4.1,
 KRaft, one node) in a namespace's place, taking Event Hubs' SASL PLAIN user `$ConnectionString` and

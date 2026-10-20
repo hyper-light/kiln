@@ -476,9 +476,21 @@ fn schemas() -> Map<String, Value> {
     );
     let monitor_fields = [
         ("name", string()),
-        ("type", describe(string(), "`composite` for a composite (its query an expression of monitors' ids); else the query says")),
-        ("query", describe(string(), "Datadog's monitor query: `avg(last_5m):avg:system.load.1{*} by {host} > 4`, `logs(\"status:error\").last(\"5m\") > 10`")),
-        ("message", describe(string(), "Datadog's template variables and @-mentions of integrations")),
+        (
+            "type",
+            describe(
+                string(),
+                "`composite` for a composite (its query an expression of monitors' ids); else the query says (none, or Datadog's type: `metric alert`, `query alert`, `log alert`, `trace-analytics alert`, `slo alert`, `error-tracking alert`)",
+            ),
+        ),
+        (
+            "query",
+            describe(
+                string(),
+                "Datadog's monitor query: `avg(last_5m):avg:system.load.1{*} by {host} > 4`, `logs(\"status:error\").last(\"5m\") > 10`, `error-tracking(\"service:shop\").source(\"backend\").new().rollup(\"count\").by(\"issue.id\").last(\"1d\") > 0`",
+            ),
+        ),
+        ("message", describe(string(), "Datadog's template variables (an Error Tracking monitor's `{{issue.attributes.error.type}}`, `.message`, `.file`, `.stack`) and @-mentions of integrations")),
         ("tags", array(string())),
         ("priority", nullable(integer())),
         ("options", options),
@@ -517,7 +529,7 @@ fn schemas() -> Map<String, Value> {
             &[
                 ("ok", boolean()),
                 ("error", string()),
-                ("kind", one_of(&["metric", "change", "logs", "forecast", "composite"])),
+                ("kind", one_of(&["metric", "change", "logs", "spans", "forecast", "slo", "error-tracking", "composite"])),
                 ("op", string()),
                 ("threshold", number()),
                 ("watched", any()),
