@@ -4111,7 +4111,7 @@ mod tests {
             c.line(&mut core, l);
         }
         assert!(!c.busy(&core) && core.state.turn_started.is_none(), "the subagent's work isn't its parent's turn");
-        assert_eq!(core.get("msg_6:0").and_then(|e| e.parent.clone()), Some("toolu_5".to_owned()), "the subagent's call shows, under it");
+        assert_eq!(core.get("toolu_7").and_then(|e| e.parent.clone()), Some("toolu_5".to_owned()), "the subagent's call shows, under it");
         // A message to the parent goes to it now, rather than waiting for the subagent.
         let _ = core.take_writes();
         c.command(&mut core, Command::Send { id: "m2".into(), text: "and another thing".into(), mode: Default::default(), attachments: Vec::new(), overrides: None });
