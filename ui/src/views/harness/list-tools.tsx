@@ -260,8 +260,8 @@ export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListV
 
 /** After the pointer last moved over the list (or a finger left it), this long before it moves again. */
 const QUIET_MS = 1200;
-/** While one of these is open (a row's menu, a dialog from it), the list holds still. */
-const OPEN = '[role="menu"], [role="dialog"], [role="alertdialog"]';
+/** While one of these is open (a row's menu, a dialog from it), the list holds still (one closing doesn't count). */
+const OPEN = ':is([role="menu"], [role="dialog"], [role="alertdialog"]):not([data-state="closed"])';
 
 /**
  * Whether the list is in use, so its rows hold still: a finger or button pressed on it, focus on one
