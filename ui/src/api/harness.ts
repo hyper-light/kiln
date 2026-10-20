@@ -175,6 +175,9 @@ export type SubagentBrief = Pick<Task, "id" | "tool_id" | "description" | "statu
 /** A slice of a task's output (`since` → `offset`); `gone` once the harness deleted it. */
 export interface TaskOutput {
   data?: string;
+  /** A transcript snapshot replaces previously read output instead of appending to it. */
+  reset?: boolean;
+  pending?: boolean;
   offset?: number;
   live?: boolean;
   truncated?: boolean;
@@ -805,12 +808,13 @@ export type Update =
 
 /* ------------------------------------------------------------------ REST */
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(path, {
     method,
     credentials: "same-origin",
     headers: body === undefined ? undefined : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
@@ -946,8 +950,8 @@ export const harnessApi = {
   history: (target: string, kind?: string, limit = 40) =>
     call<PastSession[]>("GET", `/api/harness/history?target=${encodeURIComponent(target)}${kind ? `&kind=${encodeURIComponent(kind)}` : ""}&limit=${limit}`),
   /** A task's output: its tail, or what came after byte `since`. */
-  taskOutput: (id: string, task: string, since?: number) =>
-    call<TaskOutput>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(task)}/output${since !== undefined ? `?since=${since}` : ""}`),
+  taskOutput: (id: string, task: string, since?: number, signal?: AbortSignal) =>
+    call<TaskOutput>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(task)}/output${since !== undefined ? `?since=${since}` : ""}`, undefined, signal),
   /** End the terminal a found session runs in and continue its conversation as an agent here. */
   /** `stop`: it runs outside kiln, so it is stopped on its machine first. */
   takeover: (machine: string, pid: number, opts?: { stop?: boolean }) =>

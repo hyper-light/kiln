@@ -5184,6 +5184,51 @@ mod tests {
     }
 
     #[test]
+    fn native_subagent_output_reads_completed_history_and_streaming_messages() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "spawn", "tool": "spawnAgent", "status": "completed",
+            "receiverThreadIds": ["child", "sibling"], "agentsStates": {"child": {"status": "running"}, "sibling": {"status": "running"}}}), true);
+        let read = |core: &Core, id: &str| -> anyhow::Result<Value> {
+            let task = core.state.tasks.iter().find(|t| t.id == id).ok_or_else(|| anyhow::anyhow!("missing child"))?;
+            Ok(super::super::session::codex_task_output(core, task))
+        };
+        let pending = read(&core, "child")?;
+        assert_eq!((pending["data"].as_str(), pending["pending"].as_bool(), pending["live"].as_bool()), (Some(""), Some(true), Some(true)));
+        c.child_history(&mut core, "child", &[json!({"id": "child-turn", "status": "completed", "items": [
+            {"type": "userMessage", "id": "assignment", "content": [{"type": "text", "text": "Private assignment"}]},
+            {"type": "reasoning", "id": "thought", "summary": [{"text": "Private reasoning"}]},
+            {"type": "commandExecution", "id": "command", "command": "cargo check", "status": "completed", "aggregatedOutput": "passed", "exitCode": 0},
+            {"type": "agentMessage", "id": "result", "text": "Mobile and desktop checks passed.", "phase": "final_answer"}
+        ]})]);
+        c.child_history(&mut core, "sibling", &[json!({"id": "sibling-turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "result", "text": "Sibling result", "phase": "final_answer"}
+        ]})]);
+        core.upsert("parent-answer", None, Body::Assistant { text: "Parent result".into(), streaming: false });
+        core.upsert("child:grandchild:answer", Some("grandchild-spawn".into()), Body::Assistant { text: "Grandchild result".into(), streaming: false });
+        let completed = read(&core, "child")?;
+        assert_eq!(completed["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed."));
+        assert_eq!((completed["live"].as_bool(), completed["reset"].as_bool(), completed["truncated"].as_bool()), (Some(false), Some(true), Some(false)));
+        assert_eq!(read(&core, "sibling")?["data"].as_str(), Some("Sibling result"));
+        // Starting more work and streamed text updates are visible without reopening an
+        // executor, waiting for a final answer, or appending an earlier snapshot twice.
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "child", "turn": {"id": "follow-up"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "itemId": "progress", "delta": "Checking"}})
+        ]);
+        assert_eq!(read(&core, "child")?["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking"));
+        feed(&mut c, &mut core, &[json!({"method": "item/agentMessage/delta", "params": {"threadId": "child", "itemId": "progress", "delta": " again"}})]);
+        let running = read(&core, "child")?;
+        assert_eq!(running["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nChecking again"));
+        assert_eq!(running["live"].as_bool(), Some(true));
+        // Repeated history import updates the same events, never duplicating their output.
+        c.child_history(&mut core, "child", &[json!({"id": "follow-up", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "progress", "text": "Rechecked successfully.", "phase": "final_answer"}
+        ]})]);
+        assert_eq!(read(&core, "child")?["data"].as_str(), Some("cargo check\npassed\n\nMobile and desktop checks passed.\n\nRechecked successfully."));
+        Ok(())
+    }
+
+    #[test]
     fn native_child_notifications_are_scoped_and_outlive_the_parent_turn() {
         let (mut c, mut core, _) = opened();
         c.item(&mut core, &json!({"type": "subAgentActivity", "id": "spawn", "kind": "started", "agentThreadId": "child", "agentPath": "/root/audit"}), true);
