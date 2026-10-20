@@ -22,6 +22,7 @@ use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::authz::{Caller, Scope};
 use crate::hub::Hub;
 use crate::ops::{Cx, Fail, Op, Out, path, schema, text};
 use crate::proto::{self, ServerMsg};
@@ -619,17 +620,39 @@ fn runner_of(v: &Value) -> Result<String, Fail> {
     text(v, "runner")
 }
 
+/// What of `rows` (each a runner's, named by `name`) `caller` may read: every one for whoever reads
+/// runners server-wide, else the runners its grants name (an agent attached to some runners, a
+/// person who looks after a few).
+pub fn readable<T>(caller: &Caller, rows: Vec<T>, name: impl Fn(&T) -> &str) -> Vec<T> {
+    rows.into_iter().filter(|r| caller.can("runners.read", &Scope::Runner { runner: name(r).to_owned() })).collect()
+}
+
+/// The runners `caller` may read, as Runners lists them.
+pub async fn runners_for(hub: &Hub, caller: &Caller) -> Vec<crate::hub::AgentLive> {
+    readable(caller, hub.agent_list().await, |a| &a.name)
+}
+
+/// The runners `caller` may read against the newest kiln, and their latest upgrades: the server's
+/// own only for whoever reads runners server-wide.
+pub async fn updates_for(hub: &Arc<Hub>, caller: &Caller) -> Value {
+    let runners = readable(caller, crate::updates::runners(hub).await, |r| &r.name);
+    let all = caller.can("runners.read", &Scope::Server);
+    let jobs: Vec<crate::updates::Job> =
+        hub.updates.jobs().into_iter().filter(|j| if j.kind == "runner" { caller.can("runners.read", &Scope::Runner { runner: j.target.clone() }) } else { all }).take(20).collect();
+    json!({"runners": runners, "jobs": jobs})
+}
+
 /// The runners' operations (docs/agentic.md R1–R3): list, diagnose, repair, and their upgrades.
 pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "runners.list",
-            summary: "Every runner (machine) of this kiln: connected or not, its OS and architecture, labels, slots, what it runs now, its kiln version, battery, and when it was last heard.",
+            summary: "Every runner (machine) of this kiln you may read: connected or not, its OS and architecture, labels, slots, what it runs now, its kiln version, battery, and when it was last heard.",
             read_only: true,
             destructive: false,
             input: || schema(json!({}), &[]),
             route: |_| Ok((Method::GET, path(&["api", "agents"]))),
-            run: |cx, _| Box::pin(async move { serde_json::to_value(cx.hub.agent_list().await).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())) }),
+            run: |cx, _| Box::pin(async move { serde_json::to_value(runners_for(&cx.hub, &cx.caller).await).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())) }),
         },
         Op {
             name: "runners.diagnose",
@@ -665,12 +688,12 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "updates.list",
-            summary: "Every runner's kiln against the newest: its build, whether it's up to date, what it does next, the ways it can be upgraded now (or why not), its policy; and the latest upgrades with their state, error and log.",
+            summary: "The kiln of every runner you may read against the newest: its build, whether it's up to date, what it does next, the ways it can be upgraded now (or why not), its policy; and their latest upgrades with their state, error and log.",
             read_only: true,
             destructive: false,
             input: || schema(json!({}), &[]),
-            route: |_| Ok((Method::GET, path(&["api", "updates"]))),
-            run: |cx, _| Box::pin(async move { Ok(json!({"runners": crate::updates::runners(&cx.hub).await, "jobs": cx.hub.updates.jobs().into_iter().take(20).collect::<Vec<_>>()})) }),
+            route: |_| Ok((Method::GET, path(&["api", "updates", "runners"]))),
+            run: |cx, _| Box::pin(async move { Ok(updates_for(&cx.hub, &cx.caller).await) }),
         },
         Op {
             name: "updates.retry",
@@ -718,6 +741,18 @@ mod tests {
             log: vec!["\u{1b}[31merror[E0658]\u{1b}[0m: use of unstable library feature".into(), "error: could not compile `kiln`".into()],
             error: error.map(str::to_owned),
         }
+    }
+
+    /// An agent attached to one runner reads that runner (its row in runners.list and
+    /// updates.list), not the others; whoever reads runners server-wide reads them all.
+    #[test]
+    fn a_runner_s_doctor_reads_its_runner_not_the_others() {
+        let grants = ["runners.read@runner:metal-1", "runners.manage@runner:metal-1"].iter().filter_map(|g| crate::authz::Grant::parse(g).ok()).collect();
+        let doctor = Caller::owner().limited_to(crate::authz::Rights { grants, custom: Default::default() });
+        let rows = vec!["metal-1".to_owned(), "metal-2".to_owned()];
+        assert_eq!(readable(&doctor, rows.clone(), |r| r.as_str()), ["metal-1"]);
+        assert_eq!(readable(&Caller::owner(), rows, |r| r.as_str()), ["metal-1", "metal-2"]);
+        assert!(doctor.has_somewhere("runners.read") && !doctor.can("runners.read", &Scope::Server), "the route lets it through; the list narrows");
     }
 
     #[test]

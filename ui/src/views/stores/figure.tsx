@@ -147,6 +147,16 @@ function stepsOf(status: ConvoStatus): Step[] {
   ];
 }
 
+/** Hyperlight's materials (components/proof-work/proof-scene.tsx): a surface lit from the top left. */
+const MATERIALS: [string, string, string, string][] = [
+  ["paper", "#6b7c89", "#1c2631", "#354250"],
+  ["circuit", "#344d50", "#111d25", "#253342"],
+  ["metal", "#6c788b", "#222c3a", "#42475b"],
+  ["silicon", "#303747", "#0c111b", "#242033"],
+  ["shadow", "#020407", "#020407", "#020407"],
+  ["emissive", "#b7e3d6", "#669daa", "#b8b0dc"],
+];
+
 function SceneSvg({ scene, selection, portrait, onPick }: { scene: Scene; selection: number; portrait: boolean; onPick: (key: string) => void }) {
   const prefix = "cv-" + React.useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const emphasis = EMPHASIS[selection] ?? EMPHASIS[0]!;
@@ -165,33 +175,43 @@ function SceneSvg({ scene, selection, portrait, onPick }: { scene: Scene; select
           <stop offset=".63" stopColor="#c0bdd5" stopOpacity=".12" />
           <stop offset="1" stopColor="#a4bacb" stopOpacity=".025" />
         </linearGradient>
+        {MATERIALS.map(([name, a, b, c]) => (
+          <linearGradient key={name} id={`${prefix}-${name}`} x1="0" y1="0" x2=".85" y2="1">
+            <stop stopColor={a} />
+            <stop offset=".48" stopColor={b} />
+            <stop offset="1" stopColor={c} />
+          </linearGradient>
+        ))}
         <radialGradient id={`${prefix}-halo`}>
           <stop stopColor="#94acc1" stopOpacity=".055" />
           <stop offset="1" stopColor="#94acc1" stopOpacity="0" />
         </radialGradient>
       </defs>
-      <ellipse cx={scene.width / 2} cy={scene.height * 0.45} rx={scene.width * 0.46} ry={scene.height * 0.36} fill={`url(#${prefix}-halo)`} />
+      <ellipse cx={scene.width / 2} cy={scene.height * 0.42} rx={scene.width * 0.48} ry={scene.height * 0.38} fill={`url(#${prefix}-halo)`} />
       {PARTS.map((part) => (
         <g key={part} className="cv-part" style={{ opacity: emphasis[part] }}>
           {scene.paths
             .filter((p) => p.part === part)
-            .map((p) => (
-              <path
-                key={p.id}
-                className={`cv-${p.kind}`}
-                d={p.d}
-                // Per paint, not per element: an element's own opacity is a layer of its own, which
-                // Chromium paints wrong under a gradient fill (a dark band over its box).
-                strokeOpacity={p.opacity.toFixed(3)}
-                fillOpacity={p.kind === "glass" ? p.opacity.toFixed(3) : undefined}
-                fill={p.kind === "glass" ? `url(#${prefix}-glass)` : "none"}
-                stroke={`url(#${prefix}-prism)`}
-                style={{ stroke: toneColor(p.tone) }}
-                vectorEffect="non-scaling-stroke"
-                pathLength={p.kind === "light" ? 200 : undefined}
-                strokeDasharray={p.dash}
-              />
-            ))}
+            .map((p) => {
+              const fill = p.material ? `url(#${prefix}-${p.material})` : p.kind === "glass" ? `url(#${prefix}-glass)` : "none";
+              return (
+                <path
+                  key={p.id}
+                  className={`cv-${p.kind}`}
+                  d={p.d}
+                  // Per paint, not per element: an element's own opacity is a layer of its own, which
+                  // Chromium paints wrong under a gradient fill (a dark band over its box).
+                  strokeOpacity={(p.material === "shadow" ? 0 : p.material ? p.opacity * 0.85 : p.opacity).toFixed(3)}
+                  fillOpacity={fill === "none" ? undefined : p.opacity.toFixed(3)}
+                  fill={fill}
+                  stroke={`url(#${prefix}-prism)`}
+                  style={{ stroke: toneColor(p.tone) }}
+                  vectorEffect="non-scaling-stroke"
+                  pathLength={p.kind === "light" ? 200 : undefined}
+                  strokeDasharray={p.dash}
+                />
+              );
+            })}
           {scene.labels
             .filter((l) => l.part === part)
             .map((l) => (
@@ -202,7 +222,9 @@ function SceneSvg({ scene, selection, portrait, onPick }: { scene: Scene; select
         </g>
       ))}
       {scene.hits.map((h) => (
-        <rect key={h.key} className="cv-hit" x={h.x} y={h.y} width={Math.max(0, h.w)} height={Math.max(0, h.h)} rx="6" onClick={() => onPick(h.key)} />
+        <rect key={h.key} className="cv-hit" x={h.x} y={h.y} width={Math.max(0, h.w)} height={Math.max(0, h.h)} rx="6" onClick={() => onPick(h.key)}>
+          <title>{h.title}</title>
+        </rect>
       ))}
     </svg>
   );

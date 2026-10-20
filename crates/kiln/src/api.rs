@@ -421,6 +421,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "audit"]) => boxed(|| audit(&hub, &q)).await,
         (&Method::GET, ["api", "updates"]) => Ok(boxed(|| updates_overview(&hub, false)).await),
         (&Method::POST, ["api", "updates", "check"]) => Ok(boxed(|| updates_overview(&hub, true)).await),
+        (&Method::GET, ["api", "updates", "runners"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::updates_for(&hub, &caller)).await)),
         (&Method::POST, ["api", "updates", "runners"]) => Ok(boxed(|| upgrade_all_runners(&hub)).await),
         (&Method::POST, ["api", "updates", "build"]) => boxed(|| build_every_platform(&hub)).await,
         (&Method::POST, ["api", "updates", "runners", name]) => boxed(|| upgrade_runner(&hub, name, req)).await,
@@ -462,7 +463,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             job_logs_ws(hub.clone(), id, step, req)
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
-        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.agent_list()).await)),
+        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::runners_for(&hub, &caller)).await)),
         (&Method::GET, ["api", "reach", "runners"]) => {
             let want = srv::query(&req).get("want").cloned();
             reach_runners(&hub, want.as_deref())
@@ -544,6 +545,36 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             } else {
                 Err(err(StatusCode::CONFLICT, "no such task, or it is still under way"))
             }
+        }
+        // Agents attached to what they look after, and their incidents (docs/ci.md W20-R08 to R10).
+        (&Method::GET, ["api", "attachments"]) => boxed(|| own_op(&hub, &caller, "attachments.list", query_value(&q))).await,
+        (&Method::POST, ["api", "attachments", "pause"]) => {
+            let body = body_value(req).await?;
+            boxed(|| own_op(&hub, &caller, "attachments.pause", body)).await
+        }
+        (&Method::POST, ["api", "attachments"]) => {
+            let body = body_value(req).await?;
+            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
+        }
+        (&Method::GET, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.get", json!({ "attachment": a }))).await,
+        (&Method::PUT, ["api", "attachments", a]) => {
+            let a = (*a).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("attachment".into(), json!(a));
+            }
+            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
+        }
+        (&Method::DELETE, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.remove", json!({ "attachment": a }))).await,
+        (&Method::GET, ["api", "incidents"]) => boxed(|| own_op(&hub, &caller, "incidents.list", query_value(&q))).await,
+        (&Method::GET, ["api", "incidents", i]) => boxed(|| own_op(&hub, &caller, "incidents.get", json!({ "incident": i }))).await,
+        (&Method::POST, ["api", "incidents", i, "report"]) => {
+            let i = (*i).to_owned();
+            let mut body = body_value(req).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("incident".into(), json!(i));
+            }
+            boxed(|| own_op(&hub, &caller, "incidents.report", body)).await
         }
         // A plan run as one agent per step (docs/plans.md): its own page's routes.
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
@@ -702,9 +733,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             }
         }
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
-        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, id, action)).await,
+        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, &caller, id, action)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -1568,6 +1599,7 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
     match e {
         crate::plans::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
         crate::plans::Error::Missing => err(StatusCode::NOT_FOUND, "no such plan"),
+        crate::plans::Error::Refused(c, m) => err(c, m),
         crate::plans::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -3460,11 +3492,18 @@ struct GoalsSet {
     goals: Vec<crate::goals::Given>,
 }
 
+/// Whether `caller` may change agent `id`'s goals: a person any agent's, an agent its own and those
+/// of the agents it started (`crate::harness::lineage::may_steer`).
+fn may_steer_goals(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), ApiError> {
+    crate::harness::lineage::may_steer(hub, caller, id).map_err(|(c, m)| err(c, m))
+}
+
 /// An agent's goals not yet started, as they should be (`crate::goals::set`).
-async fn goals_set(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.set".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
@@ -3476,18 +3515,20 @@ struct GoalsAdd {
 }
 
 /// Goals lined up after the agent's others (`crate::goals::add`).
-async fn goals_add(hub: &Hub, id: &str, req: Request) -> R {
+async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    may_steer_goals(hub, caller, id)?;
     let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.add".into(), id.to_owned()).await;
+    hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
 /// Start, pause, skip or clear an agent's goal stack.
-async fn goals_control(hub: &Hub, id: &str, action: &str) -> R {
+async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
     let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
+    may_steer_goals(hub, caller, id)?;
     let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
-    hub.store.audit("admin".into(), "goals.control".into(), format!("{id}: {action}")).await;
+    hub.store.audit(caller.name.clone(), "goals.control".into(), format!("{id}: {action}")).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 

@@ -17,8 +17,9 @@
 //!   look started again after every turn.
 //!
 //! Not when you stopped it, it waits on you (an approval, a question, last words that ask), a
-//! message is queued, a background task of its runs, a usage limit paused it, a goal stack drives
-//! it, or it's switched off for this agent (the "keep_going" control). Kiln keeps an agent going
+//! message is queued, a background task of its runs or an agent it started is at work (it's told
+//! when that settles, `harness::told`), a usage limit paused it, a goal stack drives it, or it's
+//! switched off for this agent (the "keep_going" control). Kiln keeps an agent going
 //! at most [`MAX_KEPT`] turns in a row since a person last said something, and stops sooner when
 //! the turns it starts do no work.
 
@@ -189,8 +190,17 @@ pub(super) fn message(why: &Why) -> String {
     }
 }
 
-/// One agent with no goal stack driving it, at `now`: kept going if it stopped part-way.
-pub async fn tick(hub: &Hub, info: &Info, now: i64) {
+/// One agent with no goal stack driving it, at `now`: kept going if it stopped part-way. Agents
+/// it started that are at work (`children`) are work it has going, as its background tasks are:
+/// it isn't prodded while they work, and is told when each settles (`harness::told`).
+pub async fn tick(hub: &Hub, info: &Info, now: i64, children: bool) {
+    let held;
+    let info = if children {
+        held = Info { tasks_running: info.tasks_running + 1, ..info.clone() };
+        &held
+    } else {
+        info
+    };
     let next = {
         let mut g = SEEN.lock();
         // First seen (the server just started): only what happens from now on counts.

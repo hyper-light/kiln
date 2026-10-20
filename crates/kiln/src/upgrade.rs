@@ -574,10 +574,10 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
     )?;
 
     let new_unit = instance_unit(unit, &id);
+    // Its own instance, in place of the one the runner it's beside may have (itself set up by an
+    // upgrade before): `agent` takes `--instance` once.
     let mut args = vec!["supervise".to_owned(), "--".to_owned()];
-    args.extend(existing.args.iter().cloned());
-    args.push("--instance".to_owned());
-    args.push(id.clone());
+    args.extend(with_instance(&existing.args, &id));
     crate::install::start_service(existing.system, &new_unit, &stable_bin, &args, &state_dir, &existing.env)?;
     say(format!("service     {new_unit} started beside {unit}"));
     // Wait until the new runner reached the server (its certificate and connection work).
@@ -588,6 +588,29 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
         format!("status      started; check `journalctl --user -u {new_unit}` if it does not appear in Runners")
     });
     Ok(())
+}
+
+/// A runner's arguments with `--instance` set to `id` (the new build runs as its own instance),
+/// any it had before left out.
+pub fn with_instance(args: &[String], id: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if a == "--instance" {
+            skip = true;
+            continue;
+        }
+        if a.starts_with("--instance=") {
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out.push("--instance".to_owned());
+    out.push(id.to_owned());
+    out
 }
 
 /// The new runner writes `connected` into its instance directory once the server welcomed it.
@@ -621,6 +644,19 @@ mod tests {
         assert_eq!(arg_value(&["--state-dir=/x".to_owned()], "--state-dir").as_deref(), Some("/x"));
         assert!(parse_unit("ExecStart=/bin/kiln supervise -- server\n", "kiln", false).is_none());
         assert_eq!(instance_unit("kiln-agent", "0199a2b3-c4d5"), "kiln-agent-0199a2b3");
+        Ok(())
+    }
+
+    /// Upgraded beside a runner that is itself an instance (an upgrade before set it up), the new
+    /// one is told its own instance once, in place of that one's.
+    #[test]
+    fn a_runner_beside_an_instance_has_one_instance_of_its_own() -> anyhow::Result<()> {
+        let body = "[Service]\nExecStart=/home/u/.local/share/kiln/runner/kiln supervise -- agent --server http://10.0.0.2:7070 --name fedora --instance 01a14c4f-0eea\n";
+        let e = parse_unit(body, "kiln-agent-01a14c4f", false).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
+        assert_eq!(with_instance(&e.args, "01a1576c-1b27"), ["agent", "--server", "http://10.0.0.2:7070", "--name", "fedora", "--instance", "01a1576c-1b27"]);
+        let first = ["agent".to_owned(), "--slots".to_owned(), "2".to_owned()];
+        assert_eq!(with_instance(&first, "g1"), ["agent", "--slots", "2", "--instance", "g1"]);
+        assert_eq!(with_instance(&["agent".to_owned(), "--instance=old".to_owned()], "g2"), ["agent", "--instance", "g2"]);
         Ok(())
     }
 

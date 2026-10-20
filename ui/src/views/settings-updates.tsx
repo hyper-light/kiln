@@ -9,6 +9,7 @@ import * as React from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { create } from "zustand";
 import { Bot, ChevronDown, RefreshCw, Stethoscope, Trash2, Upload } from "lucide-react";
+import { attachApi, type IncidentBrief } from "@/api/attach";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
 import type { FleetTarget, KilnBinary, ReleaseBuild, ReleaseWait, RunnerDiagnosis, RunnerFinding, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay, UpgradeWayOpen } from "@/api/types";
@@ -21,7 +22,7 @@ import { toast } from "@/components/ui/toast";
 import { fuller, mergeJobs, updatesRes, useRes, useUpdateJobs } from "@/lib/data";
 import { formatBytes, formatDuration, relativeTime, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { SpawnDialog } from "@/views/harness/spawn";
 import { UpgradeLog } from "./settings-upgrade-log";
@@ -804,6 +805,9 @@ function RunnerRow({
           </div>
         </details>
         {plan}
+        <React.Suspense fallback={null}>
+          <DoctorLine runner={r.name} />
+        </React.Suspense>
         {diag && <DiagnosisPanel name={r.name} s={diag} onRepair={(f) => void repair(f)} onAgain={() => void look()} onAskAgent={onAskAgent} />}
         {job && <UpgradeLog key={job.id} job={job} onChangeWaits={() => toWaits(job.timed_out)} />}
       </div>
@@ -900,6 +904,26 @@ function toWaits(which: UpdateJob["timed_out"]) {
       field?.scrollIntoView({ behavior: "smooth", block: "center" });
       field?.focus({ preventScroll: true });
     }),
+  );
+}
+
+/* ---------------------------- a runner doctor ---------------------------- */
+
+/** What an agent attached to the runners (docs/agentic.md R4) is doing about this one, while it does it. */
+function DoctorLine({ runner }: { runner: string }) {
+  const incidents = useSuspenseResource("incidents/agents", (s) => attachApi.incidents(s).catch(() => [] as IncidentBrief[]), { on: ["incident"], pollMs: 30_000 }).data;
+  const i = incidents.find((x) => x.runner === runner && (x.state === "open" || x.state === "waiting"));
+  if (!i) return null;
+  return (
+    <p className="upd-sub">
+      <Link to="/agents/attached">{i.name}</Link>: {i.title} · {i.state === "open" ? (i.report ?? "its agent is on it") : (i.why ?? "waiting for you")}
+      {i.agent && (
+        <>
+          {" · "}
+          <Link to={`/agents/${encodeURIComponent(i.agent)}`}>its agent</Link>
+        </>
+      )}
+    </p>
   );
 }
 

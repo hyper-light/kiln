@@ -161,7 +161,8 @@ Codex through `-c mcp_servers.kiln.*` (with a tool timeout as long as a program 
 otherwise gives up after 60 s), and ACP agents (Gemini CLI, opencode, Goose, Amp) through their
 session's `mcpServers`. Antigravity's headless mode takes no MCP servers; its agents use `kiln run`
 from their shell. Its instructions name the kiln's machines (asked of the runner when the server
-starts) and tell the model when reach helps. When a step has to happen on another machine, such as
+starts), tell the agent who it is (its id in kiln) and how its goal stack and plans work, and tell
+the model when reach helps. When a step has to happen on another machine, such as
 the person's Mac, the agent runs it there itself rather than handing the person a command to type.
 When the step needs a person at that machine (a password, a system dialog to allow), the agent
 starts it and says what will appear. Reach also serves builds and tests that need another platform
@@ -175,6 +176,9 @@ or more power. Its tools:
 | `run` | a command on `on` (default: the session's preference, else the best), synced first; returns exit code and output (the middle cut past 30k characters), or an id with `background` |
 | `output` | a background run's new output, and whether it ended |
 | `stop` | stop a background run |
+| `agents_*` | kiln's agents operations (docs/agents.md, "Agents that run agents"): what it starts is its child |
+| `goals_*` | its goal stack (docs/goals.md): without `agent`, its own |
+| `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
 
 **Code mode.** A program runs in the same bounded QuickJS sandbox as the server's code mode
 (`mcp/code.rs`), here on the runner. `kiln.machines.run({on, command})` runs a command as `run` does

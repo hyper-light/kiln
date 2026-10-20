@@ -1,0 +1,140 @@
+/* Attached agents (views/attach): what each looks after, its incidents, attaching one. */
+.attach-list,
+.attach-incidents {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--color-line);
+}
+.attach-row,
+.attach-incident {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.attach-row[data-paused] .attach-name,
+.attach-row[data-paused] .attach-on {
+  color: var(--color-secondary);
+}
+.attach-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.attach-name {
+  color: var(--color-bright);
+  font-size: 15px;
+  font-weight: 500;
+}
+.attach-on {
+  min-width: 0;
+  color: var(--color-foreground);
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+.attach-state {
+  margin-left: auto;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+}
+.attach-meta,
+.attach-dim {
+  min-width: 0;
+  color: var(--color-meta);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.attach-meta a:hover {
+  color: var(--color-link);
+}
+.attach-latest,
+.attach-report {
+  min-width: 0;
+  color: var(--color-secondary);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.attach-report {
+  white-space: pre-wrap;
+}
+.attach-incident-title {
+  color: var(--color-foreground);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.attach-incident[data-state="waiting"] .attach-incident-title {
+  color: var(--color-bright);
+}
+.attach-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+}
+.attach-error {
+  color: var(--color-fail);
+  font-size: 12.5px;
+}
+.attach-heading {
+  margin: 32px 0 10px;
+  color: var(--color-bright);
+  font-size: 15px;
+  font-weight: 500;
+}
+.attach-form {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 24px;
+  padding: 16px 0 20px;
+  border-top: 1px solid var(--color-line);
+  border-bottom: 1px solid var(--color-line);
+}
+.attach-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px 16px;
+}
+.attach-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.attach-checks legend {
+  width: 100%;
+  margin-bottom: 4px;
+}
+.attach-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-foreground);
+  font-size: 13px;
+}
+/* A run's incident card (views/attach/card.tsx). */
+.attach-cards {
+  display: grid;
+  gap: 8px;
+  max-width: 72ch;
+  margin-top: 16px;
+}
+.attach-card {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--color-line);
+  border-left: 2px solid var(--color-line-strong);
+  border-radius: 6px;
+}
+.attach-card[data-state="waiting"] {
+  border-left-color: var(--color-warn);
+}

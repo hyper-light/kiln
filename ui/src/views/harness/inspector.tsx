@@ -372,7 +372,8 @@ export function Inspector({
         )}
         {tab === "tools" && (
           <div className="in-secs">
-            {/* What it has going: shells and monitors it left running, subagents, the commands it ran. */}
+            {/* What it has going: shells and monitors it left running, subagents; what it works with; then
+                every command it ran, last, since that list only grows. */}
             {agentId && send && <Background state={state} agent={agentId} send={send} />}
             {agentId && (
               <section>
@@ -384,12 +385,6 @@ export function Inspector({
               <section>
                 <h3 className="in-sec-head">Subagents<span>{tasks.length}</span></h3>
                 <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />
-              </section>
-            )}
-            {runs.length > 0 && (
-              <section>
-                <h3 className="in-sec-head">Commands it ran<span>{runs.length}</span></h3>
-                <Runs runs={runs} />
               </section>
             )}
             <section>
@@ -404,6 +399,12 @@ export function Inspector({
               <h3 className="in-sec-head">Usage and status</h3>
               <Status state={state} />
             </section>
+            {runs.length > 0 && (
+              <section>
+                <h3 className="in-sec-head">Commands it ran<span>{runs.length}</span></h3>
+                <Runs runs={runs} />
+              </section>
+            )}
           </div>
         )}
       </div>
