@@ -1,9 +1,16 @@
 // W14-AC06, in Chromium and WebKit against a real kiln server (review_setup.py made its diff): the
 // conversations inbox, next/previous unresolved, viewed files, word diffs, moved blocks, the
-// generated file folded, the image diff, a 10,000-line diff's scrolling, unified on phones.
+// generated file folded, the image diff, a 10,000-line diff's scrolling, unified on phones; and
+// W21-AC01's two asserts on each page (layout.mjs), with a screenshot of each.
+//
+//     docker run --rm --network host --ipc host -e AC06="$(cat /tmp/ac06.json)" \
+//       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/review-shots:/shots \
+//       mcr.microsoft.com/playwright:v1.64.1-noble node /check/review_ac06.mjs
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs"; // playwright-core 1.64.1
+import { checkLayout } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.AC06);
+const shots = "/shots";
 const report = [];
 let failed = 0;
 const check = (browser, what, ok, detail = "") => {
@@ -26,7 +33,7 @@ async function signedIn(browser, options) {
 const fileOf = (page, path) => page.locator(".rv-file").filter({ has: page.locator(".rv-path", { hasText: path }) }).first();
 
 for (const [name, type, phoneDevice] of [
-  ["chromium", chromium, devices["Pixel 7"]],
+  ["chromium", chromium, { ...devices["Pixel 7"], viewport: { width: 390, height: 844 } }],
   ["webkit", webkit, devices["iPhone 13"]],
 ]) {
   const browser = await type.launch();
@@ -44,6 +51,8 @@ for (const [name, type, phoneDevice] of [
     await page.goto(cfg.base + "/review");
     const inbox = await page.getByText("Why the American spelling?").first().waitFor({ timeout: 60000 }).then(() => true, () => false);
     check(name, "the inbox shows the thread waiting for your reply", inbox);
+    await checkLayout(check, `${name}: wide: the inbox`, page);
+    await page.screenshot({ path: `${shots}/review-inbox-${name}-wide.png`, fullPage: true });
 
     // The diff, every file unviewed (a run before may have left one ticked).
     for (const file of ["big.txt", "moved.rs", "words.txt", "logo.png", "dist/gen.js"]) {
@@ -128,6 +137,8 @@ for (const [name, type, phoneDevice] of [
     check(name, "a 10,000-line diff scrolls at 60 fps (median frame ≤ 17.5 ms)", frames.median <= 17.5, `median ${frames.median?.toFixed(1)} ms, p95 ${frames.p95?.toFixed(1)} ms over ${frames.n} frames; ${rows} rows in the DOM`);
     check(name, "no script errors on the desktop", errors.length === 0, errors.join(" | "));
     check(name, "no failed requests", bad.length === 0, bad.slice(0, 5).join(", "));
+    await checkLayout(check, `${name}: wide: the diff`, page);
+    await page.screenshot({ path: `${shots}/review-diff-${name}-wide.png` });
 
     // Phones: unified, nothing wider than the screen.
     const phone = await signedIn(browser, phoneDevice);
@@ -139,6 +150,8 @@ for (const [name, type, phoneDevice] of [
     const wide = await p.evaluate(() => ({ scroll: document.documentElement.scrollWidth, inner: window.innerWidth }));
     check(name, "unified on a phone", split === 0, `${split} split`);
     check(name, "nothing wider than the phone", wide.scroll <= wide.inner, `${wide.scroll} > ${wide.inner}`);
+    await checkLayout(check, `${name}: phone: the diff`, p);
+    await p.screenshot({ path: `${shots}/review-diff-${name}-phone.png` });
     await phone.close();
     await ctx.close();
   } catch (e) {

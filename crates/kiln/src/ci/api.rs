@@ -194,6 +194,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         // W13-R11: an image's definition, checked; or proposed for the repository ("Save to repo").
         (&Method::POST, ["images", "validate"]) => boxed(|| super::images::validate(req.into_body())).await,
+        // W21-R08: an image's definition, as its editor has it, built once (and pushed, the owner's).
+        (&Method::POST, ["images", "build"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 2 << 20)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| async { super::uploads::build(hub, caller.as_ref(), q, body).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v)) }).await
+        }
         (&Method::POST, ["images"]) => {
             let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
             let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 1 << 20)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -244,6 +250,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W13-R09: pools and their executors.
         (&Method::GET, ["pools"]) => boxed(|| super::pools::list(hub, None)).await,
         (&Method::GET, ["pools", name]) => boxed(|| super::pools::list(hub, Some(name))).await,
+        (&Method::GET, ["pools", name, "history"]) => boxed(|| super::pools::history(hub, name, q)).await,
         (&Method::PUT, ["pools", name]) => {
             let body: serde_json::Value = boxed(|| crate::http::server::body_json(req.into_body(), 64 << 10)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             boxed(|| super::pools::put(hub, name, &body)).await

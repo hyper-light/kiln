@@ -7,6 +7,7 @@
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/runs-shots:/shots \
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/runs_window_check.mjs
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
+import { checkLayout } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
 const shots = "/shots";
@@ -35,7 +36,8 @@ function run(n) {
 }
 
 for (const [name, type, phone] of [
-  ["chromium", chromium, devices["Pixel 7"]],
+  // W21-AC01's phone: 390×844 in both (Chromium as a Pixel at that size).
+  ["chromium", chromium, { ...devices["Pixel 7"], viewport: { width: 390, height: 844 } }],
   ["webkit", webkit, devices["iPhone 13"]],
 ]) {
   const browser = await type.launch();
@@ -88,6 +90,7 @@ for (const [name, type, phone] of [
       }
       check(name, `${tag}: scrolled anywhere, rows fill the screen`, blank.length === 0, blank.length ? `blank at ${blank.join(", ")}` : "");
       check(name, `${tag}: the page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the page`, page);
       await page.evaluate(() => window.scrollTo(0, Math.floor(document.scrollingElement.scrollHeight / 2)));
       await page.screenshot({ path: `${shots}/runs-window-${name}-${tag}.png` });
       check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));

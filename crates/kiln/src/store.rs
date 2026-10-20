@@ -139,6 +139,10 @@ pub struct Job {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<PlannedJob>,
     pub steps: Vec<Step>,
+    /// A CI matrix leg's values, by axis: where it sits in its job's grid on the run graph
+    /// (docs/ci.md W21-R04).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1145,7 +1149,7 @@ impl Store {
 }
 
 const JOB_SELECT: &str = "SELECT id, run_id, key, display, status, labels, needs, agent, executor,
-    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec FROM jobs";
+    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec, matrix FROM jobs";
 
 fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -1189,6 +1193,10 @@ fn row_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         cpu_seconds: r.get(16)?,
         spec: serde_json::from_str(&r.get::<_, String>(17)?).ok(),
         steps: Vec::new(),
+        matrix: r
+            .get::<_, Option<String>>(18)?
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty())),
     })
 }
 

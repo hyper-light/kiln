@@ -794,3 +794,110 @@ fn w13_r11_build_agentfile() -> anyhow::Result<()> {
     assert!(!b.log.contains("docker buildx"), "an Agentfile is never built with Docker: {}", b.log);
     Ok(())
 }
+
+/// W21-R08's image builder: a Dockerfile as its editor has it, built once on the server's runner by
+/// `kiln/build-image@v1` from a commit made for it. The owner's build is pushed and registered with
+/// its platform, or only built; anyone else's is a fork's run (a read-only token, and only where
+/// untrusted code may run), and their push is refused before it starts.
+#[test]
+fn w21_r08_an_image_built_from_its_editor() -> anyhow::Result<()> {
+    if !std::process::Command::new("docker").args(["buildx", "version"]).output().is_ok_and(|o| o.status.success()) {
+        eprintln!("w21_r08_an_image_built_from_its_editor: no docker buildx here");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    std::fs::write(repo.join("README.md"), "images\n")?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "start"])?;
+    let extra = format!("[[repos]]\nname = \"acme/images\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
+    let s = start(dir.path(), &Options { agent: true, extra: &extra, ..Options::default() })?;
+    let port = s.port;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = common::http(port, "GET", "/api/repos", &s.admin, None)?;
+        if body.contains("acme/images") && !body.contains("\"last_polled_at\":null") {
+            break;
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "never polled: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let (st, body) = common::http(port, "POST", "/api/users", &s.admin, Some(&json!({ "name": "dev", "grants": ["developer@repo:acme/images"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let (_, body) = common::http(port, "POST", "/api/tokens", &s.admin, Some(&json!({ "kind": "pat", "user": "dev", "grants": ["owner"] })))?;
+    let dev = serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let dockerfile = "FROM scratch\nCOPY Dockerfile /Dockerfile\n";
+    let build = |token: &str, push: bool| -> anyhow::Result<(u16, Value)> {
+        let (st, body) = common::http(port, "POST", "/api/ci/images/build?repo=acme/images", token, Some(&json!({ "name": "editor", "content": dockerfile, "runs_on": "local", "push": push })))?;
+        Ok((st, serde_json::from_str(&body).unwrap_or(json!({ "text": body }))))
+    };
+    // The run's conclusion and its log, once it's done.
+    let finished = |run: &str| -> anyhow::Result<(String, String)> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            let (_, body) = common::http(port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+            let d: Value = serde_json::from_str(&body).unwrap_or_default();
+            if d.pointer("/run/finished_at").is_some_and(|f| !f.is_null()) {
+                let leg = d.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let mut log = String::new();
+                for step in 0..3 {
+                    let (_, text) = common::http(port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+                    log.push_str(&text);
+                }
+                return Ok((d.pointer("/run/conclusion").and_then(Value::as_str).unwrap_or_default().to_owned(), log));
+            }
+            anyhow::ensure!(std::time::Instant::now() < deadline, "{run} didn't finish: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    let (st, v) = build(&s.admin, true)?;
+    assert!(st == 201 && v.get("trusted") == Some(&json!(true)), "{st} {v}");
+    let (conclusion, log) = finished(v.get("run").and_then(Value::as_str).unwrap_or_default())?;
+    let sha = v.get("sha").and_then(Value::as_str).unwrap_or_default().to_owned();
+    for tag in [sha.get(..12).unwrap_or_default(), "latest"] {
+        let _ = std::process::Command::new("docker").args(["image", "rm", &format!("127.0.0.1:{port}/acme/images/images/editor:{tag}")]).output();
+    }
+    assert_eq!(conclusion, "success", "{log}\n{}", s.log());
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        a => a,
+    };
+    let (_, body) = common::http(port, "GET", "/api/ci/images?repo=acme/images", &s.admin, None)?;
+    let images: Value = serde_json::from_str(&body)?;
+    assert_eq!(images.pointer("/images/0/name"), Some(&json!("editor")), "{body}");
+    assert_eq!(images.pointer("/images/0/platforms"), Some(&json!([format!("linux/{arch}")])), "{body}");
+    // A developer's is a fork's: only built, and only where untrusted code may run (W18-R07). This
+    // runner runs legs on its host, so it waits, saying for what.
+    let (st, v) = build(&dev, false)?;
+    assert!(st == 201 && v.get("trusted") == Some(&json!(false)), "{st} {v}");
+    let run = v.get("run").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let wait = loop {
+        let (_, body) = common::http(port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+        let d: Value = serde_json::from_str(&body).unwrap_or_default();
+        if let Some(w) = d.pointer("/legs/0/wait_reason").filter(|w| !w.is_null()) {
+            break w.clone();
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "it never said why it waits: {body}");
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert!(wait.get("reason") == Some(&json!("unroutable")) && wait.to_string().contains("executor in"), "{wait}");
+    let (st, _) = common::http(port, "POST", &format!("/api/ci/runs/{run}/cancel"), &s.admin, Some(&json!({})))?;
+    assert!((200..300).contains(&st));
+    // The owner's again, built only: nothing more registered.
+    let (st, v) = build(&s.admin, false)?;
+    assert!(st == 201, "{st} {v}");
+    let (conclusion, log) = finished(v.get("run").and_then(Value::as_str).unwrap_or_default())?;
+    assert!(conclusion == "success" && log.contains("type=cacheonly") && log.contains("built, not pushed"), "{conclusion}\n{log}\n{}", s.log());
+    let (_, body) = common::http(port, "GET", "/api/ci/images?repo=acme/images", &s.admin, None)?;
+    assert_eq!(serde_json::from_str::<Value>(&body)?.get("images").and_then(Value::as_array).map(Vec::len), Some(1), "nothing more registered: {body}");
+    // Their push, and a Dockerfile with errors, refused before a run.
+    let (st, v) = build(&dev, true)?;
+    assert!(st == 403 && v.to_string().contains("owner"), "{st} {v}");
+    let (st, _) = common::http(port, "POST", "/api/ci/images/build?repo=acme/images", &s.admin, Some(&json!({ "name": "editor", "content": "FROM\n", "runs_on": "local" })))?;
+    assert_eq!(st, 422);
+    Ok(())
+}

@@ -13,16 +13,35 @@ import { Confirm, Panel, SelectField } from "@/components/ui/misc";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
+import { Hold } from "@/components/ui/hold";
+import { Chart } from "@/components/charts/chart";
+import { SERIES } from "@/components/charts/types";
+import { Segmented } from "@/components/ui/tabs";
+import { useSuspenseResource } from "@/lib/resource";
+import { ImageBuilder } from "@/views/ci/image-builder";
 
 export const poolsRes: Res<CiPool[]> = { key: "ci/pools", fetch: (s) => ci.pools(s), opts: { pollMs: 5000 } };
 export const imagesRes: Res<CiImage[]> = { key: "ci/images", fetch: (s) => ci.images(s) };
 
 /** The runner images kiln built (`kiln/build-image@v1`) into its registry, newest first: each
- * one's platforms and digest, and the run that built it. */
+ * one's platforms and digest, and the run that built it; and a new one made in the image builder
+ * (W21-R08). */
 export function ImagesPanel() {
   const images = useRes(imagesRes).data;
+  const [building, setBuilding] = React.useState(false);
   return (
-    <Panel className="mt-8" title="Images" description="Runner images kiln built into its registry, for pools and routing rules (kiln/build-image@v1).">
+    <Panel
+      className="mt-8"
+      title="Images"
+      description="Runner images kiln built into its registry, for pools and routing rules (kiln/build-image@v1)."
+      actions={
+        !building && (
+          <Button size="xs" variant="ghost" onClick={() => setBuilding(true)}>
+            New image
+          </Button>
+        )
+      }
+    >
       {images.length === 0 ? (
         <p className="empty-line px-5 py-4">None yet: a workflow&rsquo;s kiln/build-image@v1 step makes them.</p>
       ) : (
@@ -53,6 +72,11 @@ export function ImagesPanel() {
             </tbody>
           </table>
         </div>
+      )}
+      {building && (
+        <React.Suspense fallback={<Hold height={360} />}>
+          <ImageBuilder onClose={() => setBuilding(false)} />
+        </React.Suspense>
       )}
     </Panel>
   );
@@ -166,6 +190,101 @@ export function PoolsPanel({ manage }: { manage: boolean }) {
   );
 }
 
+/** The pool's size and the busy among it, an ordinal pair (the busy the darker step of one hue, as
+ *  Insights' p50 and p90), validated against the panel's surface; the legs waiting as the overview's
+ *  queued are. */
+const SIZE = "#b8a6d5";
+const BUSY = "#7f6ca6";
+
+/** A pool's scaling history (W21-R08): the executors it had (and the busy among them) and the legs
+ *  waiting for it, a minute apart, over a day or a week; as a table too, by the hour. */
+function PoolHistory({ pool }: { pool: string }) {
+  const [hours, setHours] = React.useState<"24" | "168">("24");
+  const h = useSuspenseResource(`ci/pools/${pool}/history/${hours}`, (s) => ci.poolHistory(pool, Number(hours), s), { pollMs: 60_000 }).data;
+  const xs = h.samples.map((s) => s.ts);
+  const size = h.samples.map((s) => s.starting + s.idle + s.busy);
+  const busy = h.samples.map((s) => s.busy);
+  const waiting = h.samples.map((s) => s.waiting);
+  const week = hours === "168";
+  const when = (ts: number) => new Date(ts * 1000).toLocaleString(undefined, week ? { weekday: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
+  // The table, by the hour: the most of each it had in that hour, newest first.
+  const byHour = new Map<number, { size: number; busy: number; waiting: number }>();
+  h.samples.forEach((s, i) => {
+    const at = Math.floor(s.ts / 3600) * 3600;
+    const was = byHour.get(at) ?? { size: 0, busy: 0, waiting: 0 };
+    byHour.set(at, { size: Math.max(was.size, size[i] ?? 0), busy: Math.max(was.busy, s.busy), waiting: Math.max(was.waiting, s.waiting) });
+  });
+  const hourly = [...byHour.entries()].sort((a, b) => b[0] - a[0]);
+  return (
+    <section aria-label={`${pool}'s scaling history`} className="mt-4 grid gap-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <h4 className="label">Scaling history</h4>
+        <Segmented
+          label="Over"
+          value={hours}
+          onChange={setHours}
+          options={[
+            { value: "24", label: "A day" },
+            { value: "168", label: "A week" },
+          ]}
+        />
+      </div>
+      {h.samples.length < 2 ? (
+        <p className="empty-line">Its size is taken a minute apart: there&apos;s no history to show yet.</p>
+      ) : (
+        <>
+          <Chart
+            ariaLabel={`${pool}'s executors`}
+            data={[xs, size, busy]}
+            height={140}
+            timeFormat={week ? "day" : "time"}
+            xValue={when}
+            yFormat={(v) => String(Math.round(v))}
+            series={[
+              { label: "Executors", color: SIZE, width: 2, fill: true },
+              { label: "Busy", color: BUSY, width: 2 },
+            ]}
+          />
+          <Chart
+            ariaLabel={`Legs waiting for ${pool}`}
+            data={[xs, waiting]}
+            height={100}
+            timeFormat={week ? "day" : "time"}
+            xValue={when}
+            yFormat={(v) => String(Math.round(v))}
+            series={[{ label: "Legs waiting", color: SERIES.pending, width: 2, fill: true }]}
+          />
+          <details>
+            <summary className="cursor-pointer font-mono text-[11px] text-[#9499a5]">As a table</summary>
+            <div className="table-wrap mt-2">
+              <table className="data-table" aria-label={`${pool}'s size by the hour`}>
+                <thead>
+                  <tr>
+                    <th>Hour</th>
+                    <th className="num">Executors</th>
+                    <th className="num">Busy</th>
+                    <th className="num">Waiting</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {hourly.map(([at, v]) => (
+                    <tr key={at}>
+                      <td className="cell-mono">{new Date(at * 1000).toLocaleString(undefined, { weekday: week ? "short" : undefined, hour: "2-digit", minute: "2-digit" })}</td>
+                      <td className="num cell-mono">{v.size}</td>
+                      <td className="num cell-mono">{v.busy}</td>
+                      <td className="num cell-mono">{v.waiting}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </>
+      )}
+    </section>
+  );
+}
+
 function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; manage: boolean; onDone: () => void; reload: () => void; saved: (warnings: string[]) => void }) {
   const [editing, setEditing] = React.useState(false);
   const [removing, setRemoving] = React.useState(false);
@@ -190,6 +309,9 @@ function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; man
           ))}
         </ul>
       )}
+      <React.Suspense fallback={<Hold height={300} className="mt-4" />}>
+        <PoolHistory pool={pool.name} />
+      </React.Suspense>
       {pool.last_error && (
         <p className={`mt-3 ${NOTE} text-[var(--color-fail)]`}>
           Its last start failed on {pool.last_error[0]}: {pool.last_error[1]}

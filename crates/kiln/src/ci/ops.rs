@@ -238,6 +238,15 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"repo": {"type": "string", "description": REPO}, "path": {"type": "string"}, "ref": {"type": "string"}}), &["repo", "path"]),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "workflows", &text(v, "path")?]), query(v, &["ref"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::workflows::get(&cx.hub, &text(&v, "repo")?, &text(&v, "path")?, &query(&v, &["ref"])).await).await }),
+            op!("ci.images.build", "Build a runner image's definition as you have it, saved or not (W21-R08): `kiln/build-image@v1` on what `runs_on` names, from `.kiln/images/<name>/`. With `push`, pushed to kiln's registry and registered: the server owner's only. Watch the run and read its log after.", ro: false, destructive: false,
+                input: || schema(json!({
+                    "repo": {"type": "string", "description": REPO}, "name": {"type": "string", "description": "The image's name."},
+                    "kind": {"type": "string", "enum": ["dockerfile", "agentfile"]}, "content": {"type": "string", "description": "The definition's whole text."},
+                    "platforms": {"type": "array", "items": {"type": "string"}}, "runs_on": {"type": "string", "description": "A label, or a runner's name: one with Docker (a Dockerfile) or shards (an Agentfile)."},
+                    "push": {"type": "boolean"}, "ref": {"type": "string"}
+                }), &["repo", "name", "content", "runs_on"]),
+                route: |v| Ok((Method::POST, path(&["images", "build"]), query(v, &["repo"]))),
+                run: |cx: Cx, v: Value| async move { let q = query(&v, &["repo"]); super::uploads::build(&cx.hub, Some(&cx.caller), &q, v).await }),
             op!("ci.actions.try", "Try an action as you have it, saved or not (W21-R07): it runs once with `inputs` on what `runs_on` names (a label or a runner), its outputs the job's. Watch the run and read its log after.", ro: false, destructive: false,
                 input: || schema(json!({
                     "repo": {"type": "string", "description": REPO}, "path": {"type": "string", "description": "The action's file, e.g. `.github/actions/greet/action.yml`."},
@@ -313,6 +322,10 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["pools"]), HashMap::new())),
                 run: |cx: Cx, _v: Value| async move { answer(super::pools::list(&cx.hub, None).await).await }),
+            op!("ci.pools.history", "A pool's scaling history (W21-R08): its executors starting, idle and busy, and the legs waiting for it, a minute apart, over the last `hours` (24 by default, a week at most).", ro: true, destructive: false,
+                input: || schema(json!({"name": {"type": "string", "description": "The pool."}, "hours": {"type": "integer", "minimum": 1, "maximum": 168}}), &["name"]),
+                route: |v| Ok((Method::GET, path(&["pools", &text(v, "name")?, "history"]), query(v, &["hours"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::pools::history(&cx.hub, &text(&v, "name")?, &query(&v, &["hours"])).await).await }),
             op!("ci.pools.set", "Make or change a stored pool (its executor, image, labels, how many idle at least and at most), with what the change does now: warnings (no runner can start its executor; a runner carries its labels) and the size it heads for.", ro: false, destructive: false,
                 input: || schema(json!({"name": {"type": "string"}, "executor": {"type": "string", "enum": ["docker", "firecracker", "shards", "k8s"]}, "image": {"type": "string"}, "labels": {"type": "array", "items": {"type": "string"}}, "min_idle": {"type": "integer"}, "max": {"type": "integer"}}), &["name", "executor", "labels"]),
                 route: |v| Ok((Method::PUT, path(&["pools", &text(v, "name")?]), HashMap::new())),

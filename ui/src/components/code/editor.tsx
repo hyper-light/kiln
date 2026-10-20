@@ -8,7 +8,7 @@ import * as React from "react";
 import { autocompletion, closeBrackets, completionKeymap, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { yaml } from "@codemirror/lang-yaml";
-import { bracketMatching, HighlightStyle, indentOnInput, syntaxHighlighting } from "@codemirror/language";
+import { bracketMatching, HighlightStyle, indentOnInput, StreamLanguage, syntaxHighlighting } from "@codemirror/language";
 import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { EditorState } from "@codemirror/state";
@@ -27,6 +27,7 @@ import {
   type ViewUpdate,
 } from "@codemirror/view";
 import { tags as t } from "@lezer/highlight";
+import { agentFile, dockerFile } from "./image-modes";
 
 export type { Diagnostic } from "@codemirror/lint";
 export type { CompletionContext, CompletionResult } from "@codemirror/autocomplete";
@@ -41,7 +42,11 @@ export interface CodeEditorProps {
   /** What to say of what's under the pointer at `pos`: where it is, and the words. */
   hover?: (text: string, pos: number) => { from: number; to: number; text: string } | null;
   label: string;
+  /** What it reads the text as: YAML (by default), a Dockerfile or an Agentfile (W13-R11). */
+  language?: "yaml" | "dockerfile" | "agentfile";
 }
+
+const languages = { yaml, dockerfile: () => StreamLanguage.define(dockerFile), agentfile: () => StreamLanguage.define(agentFile) };
 
 const highlight = HighlightStyle.define([
   { tag: [t.propertyName, t.definition(t.propertyName)], color: "#a6c4ed" },
@@ -116,7 +121,7 @@ export default function CodeEditor(props: CodeEditorProps) {
           highlightSelectionMatches(),
           EditorView.lineWrapping,
           EditorView.contentAttributes.of({ "aria-label": latest.current.label }),
-          yaml(),
+          languages[latest.current.language ?? "yaml"](),
           syntaxHighlighting(highlight),
           expressions,
           theme,

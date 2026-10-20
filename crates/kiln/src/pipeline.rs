@@ -129,6 +129,10 @@ pub struct JobSpec {
     /// here, where it's ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_gate: Option<serde_yaml::Value>,
+    /// The CI engine's routing constraints (docs/ci.md W05-R22): kept so a file both run stays
+    /// valid here, where a job goes where its `runs-on` labels say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<serde_yaml::Value>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -404,8 +408,9 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             exclusive: j.kiln.exclusive,
             artifacts: j.kiln.artifacts.clone(),
             cache: j.kiln.cache.iter().map(|c| c.as_str().map(str::to_owned).ok_or_else(|| format!("{} holds more than directories", at("cache")))).collect::<Result<_, _>>()?,
-            // The engine's; v1 doesn't gate on benchmarks.
+            // The engine's; v1 doesn't gate on benchmarks, nor route by facts.
             bench_gate: None,
+            requires: None,
             steps,
         };
         jobs.insert(j.id.clone(), spec);

@@ -175,14 +175,16 @@ export function TryPane({ repo, path, gitRef, text, blocked }: { repo: string; p
       </form>
       {started && (
         <React.Suspense fallback={<Hold height={160} className="mt-4" />}>
-          <TryRun key={started.run} run={started.run} trusted={started.trusted} dir={dir} />
+          <RunFollow key={started.run} run={started.run} trusted={started.trusted} step={`./${dir}`} />
         </React.Suspense>
       )}
     </Panel>
   );
 }
 
-function TryRun({ run, trusted, dir }: { run: string; trusted: boolean; dir: string }) {
+/** A run started here, followed: its state, and the log of its step that uses `step` (and the job's
+ *  outputs) as it goes. */
+export function RunFollow({ run, trusted, step }: { run: string; trusted: boolean; step: string }) {
   // Asked again while it runs; once it's done, not.
   const [done, setDone] = React.useState(false);
   const detail = useSuspenseResource(`ci-try/${run}`, (s) => ciRun(run, undefined, s), { pollMs: done ? undefined : 1500 }).data;
@@ -199,14 +201,14 @@ function TryRun({ run, trusted, dir }: { run: string; trusted: boolean; dir: str
         {state.replace(/_/g, " ")}
         {!trusted && <span className="text-[#8c8f98]"> · as a fork&apos;s: no secrets, a read-only token</span>}
       </p>
-      {leg && <LegResult leg={leg.id} dir={dir} live={!finished} />}
+      {leg && <LegResult leg={leg.id} uses={step} live={!finished} />}
     </section>
   );
 }
 
-function LegResult({ leg, dir, live }: { leg: string; dir: string; live: boolean }) {
+function LegResult({ leg, uses, live }: { leg: string; uses: string; live: boolean }) {
   const d = useSuspenseResource(`ci-try-leg/${leg}`, (s) => ci.legDetail(leg, s), { pollMs: live ? 1500 : undefined }).data;
-  const step = d.steps?.find((s) => s.action === `./${dir}`);
+  const step = d.steps?.find((s) => s.action === uses);
   const outputs = Object.entries(d.outputs ?? {});
   return (
     <>

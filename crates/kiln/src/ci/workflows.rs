@@ -77,9 +77,11 @@ pub async fn validate_value(hub: &Hub, caller: Option<&Caller>, body: Value) -> 
 
 /// The file checked as [`wf::check`] checks it, and a workflow kiln runs for `repo` against what
 /// only the server knows (W02-R12): the routing rules, runners and pools its `runs-on` may name
-/// (`KCI6007`), and the action policies its `uses:` answer to (W07-R04), as its run would.
+/// (`KCI6007`), and the action policies its `uses:` answer to (W07-R04), as its run would; an
+/// overlay, against the workflow it overlays.
 async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, dialect: Option<Dialect>) -> Result<wf::Checked, Fail> {
     let p = path.to_owned();
+    let overlay_text = content.clone();
     let (mut checked, model) = crate::rt::blocking(move || wf::check_model(&p, &content, dialect)).await.map_err(|e| internal(&e))?;
     if let (Some(repo), Some(w)) = (repo, &model)
         && runs_here(hub, repo, path).await
@@ -88,6 +90,29 @@ async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, di
         more.extend(refused(&super::actions::policies(hub, repo).await, w));
         // A use the policy refuses for its pin needs no hint to pin it.
         checked.diagnostics.retain(|d| !(d.code == "KCI6002" && more.iter().any(|m| m.code == "KCI4021" && m.range == d.range)));
+        checked.diagnostics.extend(more);
+        checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
+    }
+    // An overlay against the workflow it overlays, at the repository's default branch: the keys it
+    // sets that the workflow hasn't (`KCI4010`), as its run would find them.
+    if let (Some(repo), Some(wf::FileKind::Overlay { stem })) = (repo, wf::file_kind(path))
+        && let Ok(Some(sha)) = load::resolve(hub, repo, "HEAD").await
+        && let Ok(commit) = load::load(hub, repo, &sha).await
+        && let Some(l) = commit.workflows.iter().find(|l| [format!(".github/workflows/{stem}.yml"), format!(".github/workflows/{stem}.yaml")].contains(&l.path))
+        && let Ok(source) = load::blob(hub, repo, &sha, &l.path).await
+    {
+        let (text, lpath) = (overlay_text, l.path.clone());
+        let more = crate::rt::blocking(move || {
+            let (ov, _) = wf::parse_overlay(&text);
+            // The workflow as written, not as an overlay already made it.
+            let (w, _) = wf::parse_workflow(&lpath, &source, Dialect::Gha);
+            match (w, ov) {
+                (Some(mut w), Some(ov)) => wf::apply_overlay(&mut w, &ov),
+                _ => Vec::new(),
+            }
+        })
+        .await
+        .map_err(|e| internal(&e))?;
         checked.diagnostics.extend(more);
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
     }

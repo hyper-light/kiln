@@ -42,6 +42,27 @@ jobs:
       # The UI only: packing Bun for the binary (vendor/bun) is the release builds' part.
       - run: KILN_UI_SERVER=off npm run --prefix ui build
 
+  ui-checks:
+    name: ui checks (Chromium and WebKit, desktop and phone)
+    needs: [rust, ui]
+    # Every page's check (docs/ci.md W21-AC01) against servers of this build, the browsers in
+    # Playwright's image: on any machine that runs Docker and builds kiln (the engine routes by
+    # these; v1, by the label alone).
+    runs-on: [baremetal]
+    requires: ["os == linux", "executors has docker", "tools has cargo", "tools has node", "tools has python3", "tools has git"]
+    if: "branch == 'main'"
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: what it needs
+        run: for t in docker python3 git node npm cargo; do command -v "$t" > /dev/null || { echo "this machine has no $t"; exit 1; }; done && docker info --format '{{.ServerVersion}}'
+      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+      - run: cargo build --locked -p kiln --bin kiln
+      - run: ci/ui/run-all.sh target/debug/kiln
+    artifacts: [ci/ui/shots/*/*]
+
   release-binary:
     name: release build (bare metal)
     needs: [rust, ui]

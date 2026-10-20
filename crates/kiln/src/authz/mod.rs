@@ -394,11 +394,13 @@ pub static ROUTES: &[Rule] = &[
     // The CI engine.
     r("POST", "/api/ci/validate", "runs.read", At::Anywhere),
     r("POST", "/api/ci/images/validate", "runs.read", At::Anywhere),
+    r("POST", "/api/ci/images/build", "runs.trigger", At::RepoQuery),
     r("POST", "/api/ci/images", "diffs.submit", At::RepoQuery),
     r("POST", "/api/ci/attestations/verify", "runs.read", At::Anywhere),
     r("GET", "/api/ci/images", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/pools", "runners.read", At::Server),
     r("GET", "/api/ci/pools/*", "runners.read", At::Server),
+    r("GET", "/api/ci/pools/*/history", "runners.read", At::Server),
     r("PUT", "/api/ci/pools/*", "pools.manage", At::Server),
     r("DELETE", "/api/ci/pools/*", "pools.manage", At::Server),
     r("POST", "/api/ci/plan-preview", "runs.read", At::Anywhere),

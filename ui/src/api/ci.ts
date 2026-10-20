@@ -95,6 +95,23 @@ export interface CiGraph {
   nodes: { job: string; legs: CiGraphLeg[]; started_at: number | null; finished_at: number | null }[];
   edges: { from: string; to: string }[];
   critical_path: string[];
+  /** The workflow's jobs as the run's plan has them, those with no legs yet included. */
+  jobs?: CiPlanJob[];
+}
+
+/** A job as a run's plan has it (W21-R04), whether its legs are made yet or not. */
+export interface CiPlanJob {
+  job: string;
+  /** Its name as written (null: an expression makes it, or it has none). */
+  name: string | null;
+  needs: string[];
+  /** Its matrix comes from what it needs: how many legs it has is known once they're done. */
+  matrix_waits: boolean;
+  steps: number;
+  /** It calls a workflow: its legs are that workflow's jobs (`<job>/<theirs>`). */
+  calls: boolean;
+  /** How long it typically takes, in seconds: the median of its last 20 successful runs. */
+  typical: number | null;
 }
 
 export interface CiAnnotation {
@@ -404,10 +421,13 @@ export interface CiSaved {
   patch?: string;
 }
 
+/** An action the catalog has: one mirrored (its versions, its metadata), or kiln's own (W07-R10:
+ *  `uses` with its version, and what it does). */
 export interface CiCatalogEntry {
   uses: string;
-  versions: { ref: string; sha: string }[];
-  action: {
+  versions?: { ref: string; sha: string }[];
+  description?: string;
+  action?: {
     name: string | null;
     description: string | null;
     using: string;
@@ -602,10 +622,27 @@ export type CiPoolSpec = { name: string; executor: string; image?: string | null
 
 export const ci = {
   pools: (signal?: AbortSignal) => request<{ pools: CiPool[] }>("GET", "/api/ci/pools", undefined, { signal }).then((r) => r.pools),
+  /** A pool's scaling history (W21-R08): its executors and the legs waiting for it, a minute apart, oldest first. */
+  poolHistory: (name: string, hours: number, signal?: AbortSignal) =>
+    request<{ pool: string; hours: number; samples: { ts: number; starting: number; idle: number; busy: number; waiting: number }[] }>(
+      "GET",
+      `/api/ci/pools/${enc(name)}/history?hours=${hours}`,
+      undefined,
+      { signal },
+    ),
   /** The pool, with what it does now (W20-R03): warnings, and the size it heads for. */
   putPool: (spec: CiPoolSpec) => request<{ diagnostics?: { message: string }[]; preview?: { heading_for: number } }>("PUT", `/api/ci/pools/${enc(spec.name)}`, spec),
   removePool: (name: string) => request<void>("DELETE", `/api/ci/pools/${enc(name)}`),
   images: (signal?: AbortSignal) => request<{ images: CiImage[] }>("GET", "/api/ci/images", undefined, { signal }).then((r) => r.images),
+  /** An image's definition checked as the editor checks it (W13-R11): a Dockerfile by kiln's parser and lints; an Agentfile is shards' to check, where it builds. */
+  validateImage: (kind: "dockerfile" | "agentfile", content: string, signal?: AbortSignal) =>
+    request<{ kind: string; checked: boolean; diagnostics: CiDiagnostic[]; note?: string }>("POST", "/api/ci/images/validate", { kind, content }, { signal }),
+  /** A definition proposed as a diff adding `.kiln/images/<name>/` ("Save to repo"). */
+  proposeImage: (repo: string, body: { name: string; kind: "dockerfile" | "agentfile"; content: string }) =>
+    request<{ diffs: { name: string; title: string; kind: string; url: string }[] }>("POST", `/api/ci/images?repo=${enc(repo)}`, body),
+  /** A definition built once as the editor has it (W21-R08's Build), pushed and registered too with `push` (the server owner's). */
+  buildImage: (repo: string, body: { name: string; kind: "dockerfile" | "agentfile"; content: string; platforms: string[]; runs_on: string; push: boolean }) =>
+    request<{ run: string; sha: string; trusted: boolean }>("POST", `/api/ci/images/build?repo=${enc(repo)}`, body),
   graph: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<CiGraph>("GET", `/api/ci/runs/${enc(id)}/graph${at(attempt)}`, undefined, { signal }),
   annotations: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ annotations: CiAnnotation[] }>("GET", `/api/ci/runs/${enc(id)}/annotations${at(attempt)}`, undefined, { signal }),

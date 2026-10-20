@@ -2851,7 +2851,14 @@ impl Leg {
         let tags = if tag == "latest" { vec![format!("{base}:latest")] } else { vec![format!("{base}:{tag}"), format!("{base}:latest")] };
         let platforms: Vec<String> = get("platforms").map(|p| p.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
         let meta = st.layout.temp.join(format!("_kiln_build_{idx}.json"));
-        let mut args: Vec<String> = if shards { vec!["build".into()] } else { vec!["buildx".into(), "build".into(), "--push".into(), "--metadata-file".into(), meta.to_string_lossy().into_owned()] };
+        // `push: false`: built only, as a check (the image builder's Build, W21-R08): nothing pushed
+        // or registered.
+        let push = get("push").is_none_or(|p| !p.eq_ignore_ascii_case("false"));
+        let mut args: Vec<String> = match (shards, push) {
+            (true, _) => vec!["build".into()],
+            (false, true) => vec!["buildx".into(), "build".into(), "--push".into(), "--metadata-file".into(), meta.to_string_lossy().into_owned()],
+            (false, false) => vec!["buildx".into(), "build".into(), "--output".into(), "type=cacheonly".into()],
+        };
         args.extend(["-f".into(), file.clone()]);
         for t in &tags {
             args.extend(["-t".into(), t.clone()]);
@@ -2862,7 +2869,7 @@ impl Leg {
         args.push(context.clone());
         let mut said = String::new();
         let mut runs = vec![args];
-        if shards {
+        if shards && push {
             runs.extend(tags.iter().map(|t| vec!["push".to_owned(), t.clone()]));
         }
         for args in runs {
@@ -2874,6 +2881,10 @@ impl Leg {
             self.log(idx, text.replace('\n', "\r\n").into_bytes()).await;
             anyhow::ensure!(out.status.success(), "{prog} {} didn't finish (exit {})", args.first().map_or("", String::as_str), out.status.code().unwrap_or(-1));
             said.push_str(&text);
+        }
+        if !push {
+            self.note(idx, "built, not pushed (push: false)").await;
+            return Ok([("image".to_owned(), String::new()), ("digest".to_owned(), String::new())].into_iter().collect());
         }
         // buildx's metadata names the digest pushed; a push says it (`…: digest: sha256:… size: …`).
         let m: serde_json::Value = std::fs::read(&meta).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();

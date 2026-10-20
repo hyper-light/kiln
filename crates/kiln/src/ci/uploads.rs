@@ -371,53 +371,155 @@ pub async fn try_action(hub: &Hub, caller: Option<&Caller>, repo: &str, body: Va
         return Err(bad(format!("{path} has no input `{k}`")));
     }
     let dir = path.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
-    let m = mirror(hub, &repo)?;
-    let r = if ask.git_ref.is_empty() { super::events::facts(hub, &repo).await.default_branch } else { ask.git_ref.clone() };
-    let tip = load::resolve(hub, &repo, &r).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{} has no branch, tag or commit `{r}`", repo.name)))?;
-    // The commit: the action as edited, and the workflow trying it, on the ref's head.
-    let put = |base: String, file: String, text: String| {
-        let m = m.clone();
-        async move {
-            let mode = gitops::run_git(hub, &["-C", &m, "ls-tree", &base, "--", &file], LS_REMOTE_TIMEOUT)
-                .await
-                .ok()
-                .and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned))
-                .unwrap_or_else(|| "100644".into());
-            super::diffs::tree_with(hub, &m, &base, super::diffs::Edit::Put { file: &file, mode: &mode, content: text.into_bytes() }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
-        }
+    let files = [(path.clone(), ask.content.clone()), (TRY_PATH.to_owned(), try_workflow(&dir, &action, runs_on))];
+    let once = run_once(hub, caller, &repo, &ask.git_ref, &files, TRY_PATH, &ask.inputs, &format!("Try {path}")).await?;
+    hub.store
+        .audit(once.actor.clone(), "ci.actions.try".into(), format!("{} {path} at {} on {runs_on}: run {}{}", repo.name, &once.sha[..12], once.run, if once.trusted { "" } else { ", untrusted" }))
+        .await;
+    Ok(json!({ "run": once.run, "sha": once.sha, "trusted": once.trusted }))
+}
+
+/// A run [`run_once`] started.
+struct Once {
+    run: String,
+    sha: String,
+    trusted: bool,
+    actor: String,
+}
+
+/// `files` as an editor has them, run once: committed on `git_ref`'s head (the default branch when
+/// empty), kept as an upload is, and the workflow at `workflow` among them started for
+/// `workflow_dispatch` with `inputs`. Trusted for the server's owner; a fork's for anyone else.
+#[allow(clippy::too_many_arguments)]
+async fn run_once(
+    hub: &Hub,
+    caller: Option<&Caller>,
+    repo: &Repo,
+    git_ref: &str,
+    files: &[(String, String)],
+    workflow: &str,
+    inputs: &serde_json::Map<String, Value>,
+    message: &str,
+) -> Result<Once, Fail> {
+    // The mirror, made now if nothing has needed it yet.
+    let m = match mirror(hub, repo) {
+        Ok(m) => m,
+        Err(_) => gitops::sync_mirror(hub, repo).await.map_err(|e| internal(&e))?.to_string_lossy().into_owned(),
     };
-    let tree = put(tip.clone(), path.clone(), ask.content.clone()).await?;
-    let tree = put(tree, TRY_PATH.to_owned(), try_workflow(&dir, &action, runs_on)).await?;
+    let r = if git_ref.is_empty() { super::events::facts(hub, repo).await.default_branch } else { git_ref.to_owned() };
+    let tip = load::resolve(hub, repo, &r).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{} has no branch, tag or commit `{r}`", repo.name)))?;
+    let mut tree = tip.clone();
+    for (file, text) in files {
+        let mode = gitops::run_git(hub, &["-C", &m, "ls-tree", &tree, "--", file], LS_REMOTE_TIMEOUT)
+            .await
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned))
+            .unwrap_or_else(|| "100644".into());
+        tree = super::diffs::tree_with(hub, &m, &tree, super::diffs::Edit::Put { file, mode: &mode, content: text.clone().into_bytes() }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    }
     let (actor, trusted) = match caller {
         None => ("admin".to_owned(), true),
         Some(c) => (c.name.clone(), c.is_owner()),
     };
     let (who, _) = super::diffs::author_of(&actor, caller.map(|c| c.kind));
     let who = who.strip_prefix("user:").unwrap_or(&who).to_owned();
-    let sha = super::diffs::make_commit(hub, &m, &tree, &tip, (&who, None), &who, &format!("Try {path}\n")).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    keep(hub, &repo, &m, &sha).await?;
-    let commit = load::load(hub, &repo, &sha).await.map_err(|e| internal(&e))?;
-    let l = commit.workflows.into_iter().find(|l| l.path == TRY_PATH).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "the workflow trying it wasn't read".to_owned()))?;
+    let sha = super::diffs::make_commit(hub, &m, &tree, &tip, (&who, None), &who, &format!("{message}\n")).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    keep(hub, repo, &m, &sha).await?;
+    let commit = load::load(hub, repo, &sha).await.map_err(|e| internal(&e))?;
+    let l = commit.workflows.into_iter().find(|l| l.path == workflow).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("{workflow} wasn't read")))?;
     if l.has_errors() {
         let said: Vec<String> = l.diagnostics.iter().filter(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{} {}", d.code, d.message)).collect();
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("it can't be tried as it is: {}", said.join("; "))));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("it can't be run as it is: {}", said.join("; "))));
     }
     let declared = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "workflow_dispatch")).map(|t| t.inputs.clone());
     let full_ref = if r.starts_with("refs/") { r.clone() } else { format!("refs/heads/{r}") };
-    let (mut event, typed) =
-        super::events::preview_event(hub, &repo, "workflow_dispatch", &full_ref, &sha, None, &ask.inputs, declared.as_deref(), &l.path).await.map_err(|r| (r.status, r.message))?;
+    let (mut event, typed) = super::events::preview_event(hub, repo, "workflow_dispatch", &full_ref, &sha, None, inputs, declared.as_deref(), &l.path).await.map_err(|r| (r.status, r.message))?;
     event.trusted = trusted;
     event.actor = actor.clone();
     event.source = kiln_ci::trigger::Source::Api;
     let (tx, rx) = async_channel::bounded(1);
     let given = Given { reply: Some(tx), ..Given::default() };
-    super::events::start_given(hub, &repo, &event, &l, (&format!("Try {path}"), &who), typed, given).await.map_err(|e| internal(&e))?;
-    let run = match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
-        Ok(Ok(id)) => id,
-        _ => return Err((StatusCode::INTERNAL_SERVER_ERROR, "the run didn't start".into())),
-    };
-    hub.store.audit(actor, "ci.actions.try".into(), format!("{} {path} at {} on {runs_on}: run {run}{}", repo.name, &sha[..12], if trusted { "" } else { ", untrusted" })).await;
-    Ok(json!({ "run": run, "sha": sha, "trusted": trusted }))
+    super::events::start_given(hub, repo, &event, &l, (message, &who), typed, given).await.map_err(|e| internal(&e))?;
+    match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+        Ok(Ok(run)) => Ok(Once { run, sha, trusted, actor }),
+        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "the run didn't start".into())),
+    }
+}
+
+#[derive(Deserialize)]
+struct BuildAsk {
+    name: String,
+    /// `dockerfile` (by default) or `agentfile`.
+    #[serde(default)]
+    kind: Option<String>,
+    content: String,
+    #[serde(default)]
+    platforms: Vec<String>,
+    runs_on: String,
+    #[serde(default)]
+    push: bool,
+    #[serde(default, rename = "ref")]
+    git_ref: String,
+}
+
+/// Where the build's workflow is, in the commit made for it.
+const BUILD_PATH: &str = ".kiln/kiln-build-image.yaml";
+
+/// `POST /api/ci/images/build?repo= { name, kind?, content, platforms?, runs_on, push?, ref? }`
+/// (W21-R08's image builder): an image's definition, as the editor has it, built once by
+/// `kiln/build-image@v1` on what `runs_on` names, from `.kiln/images/<name>/` in a commit made for
+/// it (as "Try it"'s is). With `push`, pushed to kiln's registry and registered, which only the
+/// server's owner's (trusted) runs may: anyone else's is a fork's, its token read-only. → `{ run,
+/// sha, trusted }`.
+pub async fn build(hub: &Hub, caller: Option<&Caller>, q: &HashMap<String, String>, body: Value) -> Result<Value, Fail> {
+    if !hub.ci.enabled() {
+        return Err((StatusCode::NOT_FOUND, "the CI engine is off ([ci] enabled)".into()));
+    }
+    let repo = find_repo(hub, q.get("repo").map_or("", String::as_str)).await?;
+    let ask: BuildAsk = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
+    let name = ask.name.trim().to_owned();
+    if name.contains('/') || !crate::ci::registry::valid_name(&name) {
+        return Err(bad(format!("`{name}` isn't an image name (lowercase letters, digits, `.`, `_`, `-`)")));
+    }
+    let agentfile = ask.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("agentfile"));
+    if !agentfile {
+        let c = ask.content.clone();
+        let found = crate::rt::blocking(move || kiln_ci::dockerfile::check(&c)).await.map_err(|e| internal(&e))?;
+        let errors: Vec<String> = found.iter().filter(|d| d.is_error()).map(|d| d.render("Dockerfile")).collect();
+        if !errors.is_empty() {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("the Dockerfile has errors, so it isn't built:\n{}", errors.join("\n"))));
+        }
+    }
+    let runs_on = ask.runs_on.trim();
+    if runs_on.is_empty() || !runs_on.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/+".contains(c)) {
+        return Err(bad(format!("`{runs_on}` isn't a label or a runner's name")));
+    }
+    if let Some(p) = ask.platforms.iter().find(|p| !p.split('/').all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))) {
+        return Err(bad(format!("`{p}` isn't a platform (`linux/amd64`, `linux/arm64`, …)")));
+    }
+    if ask.push && !caller.is_none_or(Caller::is_owner) {
+        return Err((StatusCode::FORBIDDEN, "pushing an image from the editor is the server owner's: save it to the repository, and its workflow pushes it".into()));
+    }
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let mut w = format!(
+        "name: {}\non: workflow_dispatch\njobs:\n  build:\n    runs-on: {}\n    permissions:\n      contents: read\n      packages: {}\n    steps:\n      - uses: kiln/build-image@v1\n        with:\n          name: {}\n          push: {}\n",
+        q(&format!("Build the {name} image")),
+        q(runs_on),
+        if ask.push { "write" } else { "read" },
+        q(&name),
+        q(if ask.push { "true" } else { "false" }),
+    );
+    if !ask.platforms.is_empty() {
+        w.push_str(&format!("          platforms: {}\n", q(&ask.platforms.join(","))));
+    }
+    let file = format!(".kiln/images/{name}/{}", if agentfile { "Agentfile" } else { "Dockerfile" });
+    let files = [(file, ask.content.clone()), (BUILD_PATH.to_owned(), w)];
+    let what = if ask.push { "Build and push" } else { "Build" };
+    let once = run_once(hub, caller, &repo, &ask.git_ref, &files, BUILD_PATH, &serde_json::Map::new(), &format!("{what} the {name} image")).await?;
+    hub.store
+        .audit(once.actor.clone(), "ci.images.build".into(), format!("{} {name} at {} on {runs_on}{}: run {}", repo.name, &once.sha[..12], if ask.push { ", pushed" } else { "" }, once.run))
+        .await;
+    Ok(json!({ "run": once.run, "sha": once.sha, "trusted": once.trusted }))
 }
 
 #[cfg(test)]

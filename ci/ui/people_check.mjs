@@ -12,12 +12,15 @@
 // - W21-R01: the editor's keys from the schema, on hover (desktop) and as one is typed; W21-R06:
 //   the plan preview's matrix as written, and the flow view's edits in the YAML.
 // - W21-R07: an action's inputs and outputs edited in place, and "Try it" starting its run.
+// - W21-R08: a pool's scaling history; the image builder (checked as typed, saved, built, its push
+//   refused but for the server's owner, an Agentfile).
 //
 //     docker run --rm --network host -e SIGNIN="$(cat /tmp/signin.json)" \
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/people-shots:/shots \
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/people_check.mjs
 import { readFileSync } from "node:fs";
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
+import { checkLayout } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
 const shots = "/shots";
@@ -54,14 +57,15 @@ const flow = async (label, f) => {
 const text = async (loc) => (await loc.innerText().catch(() => "")).replace(/\s+/g, " ");
 
 for (const [name, type, phone] of [
-  ["chromium", chromium, devices["Pixel 7"]],
+  // W21-AC01's phone: 390×844 in both (an iPhone 13's screen; Chromium as a Pixel at that size).
+  ["chromium", chromium, { ...devices["Pixel 7"], viewport: { width: 390, height: 844 } }],
   ["webkit", webkit, devices["iPhone 13"]],
 ]) {
   await flow(name, async () => {
     const browser = await type.launch();
     try {
       for (const [tag, options] of [
-        ["wide", { viewport: { width: 1280, height: 900 } }],
+        ["wide", { viewport: { width: 1440, height: 900 } }],
         ["phone", phone],
       ]) {
         const ctx = await browser.newContext(options);
@@ -94,6 +98,7 @@ for (const [name, type, phone] of [
         await grants.getByRole("listitem").filter({ hasText: "viewer" }).getByRole("button", { name: "Take it back" }).click();
         check(name, `${tag}: and taken back`, await until(async () => !/viewer/.test(await text(grants)) && /developer/.test(await text(grants))), await text(grants));
         check(name, `${tag}: the People page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the People page`, page);
         await page.screenshot({ path: `${shots}/people-${name}-${tag}.png`, fullPage: true });
         await row.getByRole("button", { name: "Remove" }).click();
         await page.getByRole("button", { name: `Remove ${sam}` }).click();
@@ -126,6 +131,7 @@ for (const [name, type, phone] of [
         await page.getByRole("button", { name: "Revoke it" }).click();
         check(name, `${tag}: and revoked`, await until(async () => /revoked/.test(await text(tokenRow))), await text(tokenRow));
         check(name, `${tag}: the Tokens page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the Tokens page`, page);
         await page.screenshot({ path: `${shots}/tokens-${name}-${tag}.png`, fullPage: true });
         // Pools: one added, heading for its minimum, edited in place, removed.
         await page.goto(`${cfg.base}/runners`);
@@ -149,10 +155,49 @@ for (const [name, type, phone] of [
         await page.getByRole("button", { name: "Save", exact: true }).click();
         check(name, `${tag}: edited in place`, await until(async () => /at most 2/.test(await text(poolsPanel))), await text(poolsPanel));
         check(name, `${tag}: the Runners page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the Runners page`, page);
         await page.screenshot({ path: `${shots}/pools-${name}-${tag}.png`, fullPage: true });
         await page.getByRole("button", { name: "Remove", exact: true }).click();
         await page.getByRole("button", { name: `Remove ${pool}` }).click();
         check(name, `${tag}: and removed`, await until(async () => (await poolRow.count()) === 0));
+        // A pool's scaling history (W21-R08): the configuration's, taken from the server's start.
+        await page.getByRole("table", { name: "Pools" }).getByRole("row").filter({ hasText: "steady" }).getByRole("button", { name: "steady" }).click();
+        const history = page.getByRole("region", { name: "steady's scaling history" });
+        check(name, `${tag}: a pool's scaling history, charted`, await until(async () => (await history.getByRole("img", { name: "steady's executors" }).count()) > 0 && (await history.getByRole("img", { name: "Legs waiting for steady" }).count()) > 0, 150000), await text(history));
+        await history.getByText("As a table").click();
+        check(name, `${tag}: and as a table, by the hour`, await until(async () => /Executors\s+Busy\s+Waiting/i.test(await text(history.getByRole("table", { name: "steady's size by the hour" })))), await text(history));
+        check(name, `${tag}: the Runners page fits, with it`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the Runners page`, page);
+        await page.screenshot({ path: `${shots}/pool-history-${name}-${tag}.png`, fullPage: true });
+        // The image builder (W21-R08): a Dockerfile checked as it's typed, saved to a repository,
+        // built once (a fork's run, here: no runner yet), its push the server owner's.
+        const builder = page.getByRole("region", { name: "A new image" });
+        const begin = async () => {
+          await page.getByRole("button", { name: "New image", exact: true }).click();
+          await builder.getByLabel("Its name").fill(`tools-${name}-${tag}`);
+          await builder.getByLabel("Repository").selectOption("acme/people");
+        };
+        await begin();
+        check(name, `${tag}: the starting Dockerfile, checked clean`, await until(async () => /No problems\./.test(await text(builder)), 20000), await text(builder));
+        await builder.locator(".cm-content").click();
+        await page.keyboard.press("Control+End");
+        await page.keyboard.insertText("FORM scratch\n");
+        check(name, `${tag}: a mistake, said where it is`, await until(async () => /1 error/.test(await text(builder)) && (await builder.locator(".cm-lintRange-error").count()) > 0, 20000), await text(builder));
+        // Begun again, from its example.
+        await builder.getByRole("button", { name: "Close", exact: true }).click();
+        await begin();
+        check(name, `${tag}: and clean again`, await until(async () => /No problems\./.test(await text(builder)), 20000), await text(builder));
+        await builder.getByRole("button", { name: "Save to repo", exact: true }).click();
+        check(name, `${tag}: saved to its repository, as a diff`, await until(async () => /opened: it lands through review/.test(await text(builder.getByRole("status").first())), 30000), await text(builder));
+        await builder.getByRole("button", { name: "Build", exact: true }).click();
+        check(name, `${tag}: built once: its run`, await until(async () => /Run #\d+/.test(await text(builder.getByRole("region", { name: "Its run" }))), 30000), await text(builder));
+        await builder.getByRole("button", { name: "Build and push", exact: true }).click();
+        check(name, `${tag}: its push, the server owner's`, await until(async () => /server owner/.test(await text(builder.getByRole("status").first())), 30000), await text(builder));
+        await builder.getByRole("group", { name: "Kind" }).getByRole("button", { name: "Agentfile", exact: true }).click();
+        check(name, `${tag}: an Agentfile, shards' to check`, await until(async () => /AGENT, HARNESS/.test(await text(builder.locator(".cm-content"))) && /shards/.test(await text(builder)), 20000), await text(builder));
+        check(name, `${tag}: the image builder fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the image builder`, page);
+        await page.screenshot({ path: `${shots}/image-builder-${name}-${tag}.png`, fullPage: true });
         // Settings → CI → OIDC (W10-R12): how the issuer is reached, laid out on this screen.
         await page.goto(`${cfg.base}/settings#ci.oidc`);
         const oidc = page.locator("[id='ci.oidc']").first();
@@ -160,6 +205,7 @@ for (const [name, type, phone] of [
         await until(async () => /From the internet/.test(await text(oidc)), 30000);
         check(name, `${tag}: how the issuer is reached`, /From the internet No: its URL is this network's/.test(await text(oidc)) && /AWS and Azure fetch/.test(await text(oidc)), (await text(oidc)).slice(0, 300));
         check(name, `${tag}: the OIDC settings fit`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the OIDC settings`, page);
         await oidc.screenshot({ path: `${shots}/oidc-${name}-${tag}.png` });
         // A repository's own secrets, on the Repositories page (W09-R11): set, never shown, removed.
         await page.goto(`${cfg.base}/repos`);
@@ -174,6 +220,7 @@ for (const [name, type, phone] of [
         const listed = await until(async () => (await text(repoPanel.getByRole("list", { name: "Secrets" }))).includes(key));
         check(name, `${tag}: a repository's secret, set on its page`, listed && !(await page.content()).includes("repo-secret-value-41"), await text(repoPanel));
         check(name, `${tag}: the Repositories page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the Repositories page`, page);
         await page.screenshot({ path: `${shots}/repo-secrets-${name}-${tag}.png`, fullPage: true });
         await repoPanel.getByRole("list", { name: "Secrets" }).getByRole("button", { name: "Remove", exact: true }).first().click();
         await repoPanel.getByRole("button", { name: `Remove ${key}` }).click();
@@ -188,6 +235,7 @@ for (const [name, type, phone] of [
         const vars = wfPanel.getByRole("list", { name: "Variables" });
         check(name, `${tag}: a workflow's variable, set in its editor`, await until(async () => /STAGE[\s\S]*blue/.test(await text(vars))), await text(wfPanel));
         check(name, `${tag}: the editor's page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the editor's page`, page);
         await page.screenshot({ path: `${shots}/workflow-secrets-${name}-${tag}.png`, fullPage: true });
         await vars.getByRole("button", { name: "Remove", exact: true }).first().click();
         check(name, `${tag}: and removed`, await until(async () => (await vars.count()) === 0 || !/STAGE/.test(await text(vars))), await text(wfPanel));
@@ -217,6 +265,7 @@ for (const [name, type, phone] of [
         const said = await committed.first().boundingBox();
         check(name, `${tag}: and said in a line that reads`, (said?.width ?? 0) >= 200, JSON.stringify(said));
         check(name, `${tag}: the editor fits, saved`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the editor`, page);
         const cut = await page.locator("section.panel").first().evaluate((el) => el.scrollWidth - el.clientWidth);
         check(name, `${tag}: nothing in the editor's panel is cut off`, cut <= 0, String(cut));
         // The plan preview's matrix (W21-R06): its axes and exclude as rows, the legs it makes.
@@ -257,6 +306,7 @@ for (const [name, type, phone] of [
         await osValues.press("Enter");
         check(name, `${tag}: an axis's values, and the plan follows`, await until(async () => /5 legs · 1 removed/i.test(await text(page.locator("main").first()))), await text(page.locator("main").first()));
         check(name, `${tag}: the flow view fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the flow view`, page);
         await page.screenshot({ path: `${shots}/workflow-flow-${name}-${tag}.png`, fullPage: true });
         await page.getByRole("group", { name: "View" }).getByRole("button", { name: "YAML", exact: true }).click();
         const yamlText = async () => await page.locator(".cm-content").innerText();
@@ -301,6 +351,7 @@ for (const [name, type, phone] of [
         await tryPane.getByRole("button", { name: "Try it", exact: true }).click();
         check(name, `${tag}: tried: its run, started`, await until(async () => /Run #\d+/.test(await text(tryPane.getByRole("region", { name: "Its run" }))), 30000), await text(tryPane));
         check(name, `${tag}: the action's page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the action's page`, page);
         await page.screenshot({ path: `${shots}/action-${name}-${tag}.png`, fullPage: true });
         check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
         await ctx.close();

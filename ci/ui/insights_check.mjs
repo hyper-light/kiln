@@ -11,6 +11,7 @@
 // - W10: dev's home their repository's, without the server's runners; lead's the server's;
 // - no page errors, no failed requests, nothing wider than the page.
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
+import { checkLayout } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.INSIGHTS);
 const shots = "/shots";
@@ -46,13 +47,14 @@ const overflow = (page) => page.evaluate(() => document.scrollingElement.scrollW
 const panel = (page, title) => page.locator("section.panel").filter({ has: page.locator(".panel-title", { hasText: title }) });
 
 for (const [name, type, phone] of [
-  ["chromium", chromium, devices["Pixel 7"]],
+  // W21-AC01's phone: 390×844 in both (Chromium as a Pixel at that size).
+  ["chromium", chromium, { ...devices["Pixel 7"], viewport: { width: 390, height: 844 } }],
   ["webkit", webkit, devices["iPhone 13"]],
 ]) {
   const browser = await type.launch();
   try {
     for (const [tag, options, who] of [
-      ["wide", { viewport: { width: 1280, height: 900 } }, "lead"],
+      ["wide", { viewport: { width: 1440, height: 900 } }, "lead"],
       ["phone", phone, "dev"],
     ]) {
       const ctx = await signedIn(browser, who, options);
@@ -88,6 +90,7 @@ for (const [name, type, phone] of [
       const names = (await bench.locator("tbody tr").allInnerTexts()).map((t) => t.replace(/\s+/g, " "));
       check(name, `${tag}: three benchmarks listed`, names.length === 3 && names.some((t) => /parse\/large_file/.test(t)), names.join(" | "));
       check(name, `${tag}: the repository page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the repository page`, page);
       await bench.getByRole("link", { name: "parse/large_file" }).click();
       await page.waitForURL(/metric=parse/, { timeout: 15000 });
       await page.getByRole("heading", { level: 1, name: "parse/large_file" }).waitFor({ timeout: 15000 });
@@ -96,6 +99,8 @@ for (const [name, type, phone] of [
       check(name, `${tag}: the metric's facts`, /Lower/.test(facts) && /Kinds of runner 2/.test(facts) && /Points 16/.test(facts), facts);
       const trends = page.locator("section.panel").filter({ has: page.locator("canvas") });
       await trends.first().locator("canvas").first().waitFor({ timeout: 15000 });
+      // Each chart draws once its own code has loaded: the second may come a moment after the first.
+      await until(async () => (await trends.count()) >= 2, 15000);
       const n = await trends.count();
       check(name, `${tag}: a chart per kind of runner`, n === 2, String(n));
       const titles = await trends.locator(".panel-title").allInnerTexts();
@@ -119,6 +124,7 @@ for (const [name, type, phone] of [
       const cell = (await trs.first().innerText()).replace(/\s+/g, " ");
       check(name, `${tag}: a row: when, commit, value`, /[0-9a-f]{7}/.test(cell) && /ms/.test(cell), cell);
       check(name, `${tag}: the metric page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the metric page`, page);
       await page.screenshot({ path: `${shots}/insights-${name}-${tag}-metric.png`, fullPage: true });
       // The run page: a metric opens its trend.
       await page.goto(`${cfg.base}/runs/${encodeURIComponent(cfg.runs[cfg.runs.length - 1])}`);
@@ -151,6 +157,7 @@ for (const [name, type, phone] of [
       const gateText = (await gates.innerText()).replace(/\s+/g, " ");
       check(name, `${tag}: the diff shows its failing gate`, /error/i.test(gateText) && /parse\/large_file is \d+\.\d% worse than main/.test(gateText), gateText);
       check(name, `${tag}: the diff page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the diff page`, page);
       await page.screenshot({ path: `${shots}/insights-${name}-${tag}-diff.png`, fullPage: true });
       // Settings → You: a rule of one's own, added and removed (W19-R06).
       await page.goto(`${cfg.base}/settings#you.notifications`);
@@ -162,6 +169,7 @@ for (const [name, type, phone] of [
       const ruleText = (await rules.innerText()).replace(/\s+/g, " ");
       check(name, `${tag}: a rule of one's own is kept`, /run\.failed/.test(ruleText) && /your inbox/.test(ruleText) && /only about you/.test(ruleText), ruleText);
       check(name, `${tag}: the settings page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the settings page`, page);
       await page.screenshot({ path: `${shots}/insights-${name}-${tag}-settings.png`, fullPage: true });
       await rules.getByRole("button", { name: "Remove" }).first().click();
       check(name, `${tag}: and removed`, await until(async () => (await page.getByRole("list", { name: "Your rules" }).count()) === 0));
@@ -207,6 +215,7 @@ for (const [name, type, phone] of [
         await oidcGroup.getByRole("button", { name: "Publish", exact: true }).click();
         check(name, `${tag}: published by hand`, await until(async () => /Published to \//.test(await oidcGroup.innerText())), (await oidcGroup.innerText().catch(() => "")).replace(/\s+/g, " ").slice(-300));
         check(name, `${tag}: the CI settings fit`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the CI settings`, page);
         await page.screenshot({ path: `${shots}/insights-${name}-${tag}-ci-settings.png`, fullPage: true });
       }
       // The Runners page: each runner's executors, as it last probed (W21-R08).
@@ -218,6 +227,7 @@ for (const [name, type, phone] of [
         const cell = fleet.locator("tbody tr").first().locator("td").nth(col);
         check(name, `${tag}: the runner's executors`, await until(async () => /\bhost\b/.test(await cell.innerText())), await cell.innerText().catch(() => ""));
         check(name, `${tag}: the Runners page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+        await checkLayout(check, `${name}: ${tag}: the Runners page`, page);
         await page.screenshot({ path: `${shots}/insights-${name}-${tag}-runners.png`, fullPage: true });
       }
       // The runs list: words typed narrow it, facets offered with counts, a sort chosen (W21-R03).
@@ -243,6 +253,7 @@ for (const [name, type, phone] of [
       check(name, `${tag}: runner and executor facets`, /Runner/i.test(facetText) && /Executor/i.test(facetText) && /host/.test(facetText), facetText.slice(0, 400));
       await page.keyboard.press("Escape");
       check(name, `${tag}: the runs page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the runs page`, page);
       await page.screenshot({ path: `${shots}/insights-${name}-${tag}-runs.png`, fullPage: true });
       // The home page: a person of one repository sees theirs, without the server's runners (W10).
       await page.goto(`${cfg.base}/`);
@@ -257,6 +268,7 @@ for (const [name, type, phone] of [
         check(name, `${tag}: lead's home is the server's`, h1 !== "acme/app" && /Slots busy/i.test(home) && /Server host/i.test(home), `${h1} · ${home.slice(0, 200)}`);
       }
       check(name, `${tag}: the home page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the home page`, page);
       await page.screenshot({ path: `${shots}/insights-${name}-${tag}-home.png`, fullPage: true });
       check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
       check(name, `${tag}: no failed requests`, bad.length === 0, bad.join(", "));

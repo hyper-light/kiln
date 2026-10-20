@@ -18,6 +18,7 @@ import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@
 import { Link, useSearchParams } from "@/lib/router";
 import { unifiedPatch } from "@/lib/patch";
 import { describe, keysAt, yamlSpot, type Schema } from "@/lib/yaml-spot";
+import { placed } from "@/lib/diagnostics";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
@@ -222,24 +223,7 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     const errors = r.diagnostics.filter((d) => d.severity === "error").length;
     setCounts({ errors, warnings: r.diagnostics.length - errors });
     if (errors === 0 && !isAction) ask(content, event);
-    const end = content.length;
-    const starts = [0];
-    for (let i = 0; i < content.length; i++) if (content[i] === "\n") starts.push(i + 1);
-    // Positions by line and column, which every diagnostic has.
-    const at = (p: { line: number; col: number }) => {
-      const line = starts[Math.max(0, p.line - 1)] ?? end;
-      const next = starts[p.line] ?? end + 1;
-      return Math.min(line + Math.max(0, p.col - 1), next - 1, end);
-    };
-    return r.diagnostics.map((d) => {
-      const from = at(d.range.start);
-      return {
-        from,
-        to: Math.min(Math.max(at(d.range.end), from + 1), end),
-        severity: d.severity === "error" ? "error" : d.severity === "warning" ? "warning" : "info",
-        message: `${d.code}: ${d.message}`,
-      };
-    });
+    return placed(content, r.diagnostics);
   };
 
   const complete = async (ctx: CompletionContext): Promise<CompletionResult | null> => {
@@ -278,7 +262,12 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
     if (uses) {
       if (!known.current.catalog) {
         const list = await ci.catalog("").catch(() => ({ actions: [] }));
-        known.current.catalog = list.actions.flatMap((a) => a.versions.slice(0, 3).map((v) => ({ label: `${a.uses}@${v.ref}`, detail: a.action?.description?.split("\n")[0] ?? v.sha.slice(0, 12) })));
+        // A mirrored action's latest versions; kiln's own, as they're used.
+        known.current.catalog = list.actions.flatMap((a) =>
+          a.versions?.length
+            ? a.versions.slice(0, 3).map((v) => ({ label: `${a.uses}@${v.ref}`, detail: a.action?.description?.split("\n")[0] ?? v.sha.slice(0, 12) }))
+            : [{ label: a.uses, detail: (a.description ?? a.action?.description ?? "").split("\n")[0] ?? "" }],
+        );
       }
       return { from: uses.from + (/^uses:\s*/.exec(uses.text)?.[0].length ?? 0), options: known.current.catalog };
     }

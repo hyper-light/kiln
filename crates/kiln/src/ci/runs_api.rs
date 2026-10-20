@@ -140,10 +140,106 @@ pub async fn get(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Res
 }
 
 /// `GET /api/ci/runs/:id/graph`: the jobs as nodes (their legs inside), `needs` as edges, and the
-/// critical path, the chain of jobs that took longest end to end.
+/// critical path, the chain of jobs that took longest end to end; and the workflow's jobs as the
+/// run's plan has them (`jobs`, `plan_jobs`).
 pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     run_json(hub, id).await?;
-    Ok(srv::json(StatusCode::OK, &graph_json(hub, id, attempt_of(q)).await?))
+    let mut g = graph_json(hub, id, attempt_of(q)).await?;
+    let jobs = plan_jobs(hub, id).await?;
+    if let Some(o) = g.as_object_mut() {
+        o.insert("jobs".into(), Value::Array(jobs));
+    }
+    Ok(srv::json(StatusCode::OK, &g))
+}
+
+/// The workflow's jobs as the run's plan has them (W21-R04), each whether its legs are made yet
+/// or not (a job's are made once what it needs is done): its name, what it needs, whether its
+/// matrix comes from what it needs (`matrix_waits`: then how many legs it has is known only once
+/// they're done), how many steps it has, whether it calls a workflow (its legs are then the
+/// called workflow's jobs, `<job>/<theirs>`), and how long it typically takes (`typical`,
+/// seconds; see `typical_spans`). None for a run without a plan (a v1 pipeline's, another
+/// provider's).
+async fn plan_jobs(hub: &Hub, id: &str) -> Result<Vec<Value>, Fail> {
+    use kiln_ci::wf::ir::{Axis, Matrix};
+    let run = id.to_owned();
+    let saved: Option<(String, Option<String>, String, i64)> = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row("SELECT p.workflow, r.workflow_id, r.repo_id, r.number FROM ci_plans p JOIN runs r ON r.id = p.run_id WHERE p.run_id = ?1", [&run], |x| {
+                Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))
+            })
+            .optional()?)
+        })
+        .await
+        .map_err(internal)?;
+    let Some((model, workflow, repo, number)) = saved else { return Ok(Vec::new()) };
+    let Ok(wf) = serde_json::from_str::<kiln_ci::wf::Workflow>(&model) else { return Ok(Vec::new()) };
+    let typical = match workflow {
+        Some(w) => typical_spans(hub, &repo, &w, number).await?,
+        None => HashMap::new(),
+    };
+    // An expression that reads what the job needs (`fromJSON(needs.plan.outputs.matrix)`).
+    let reads_needs = |s: &str| s.contains("${{") && s.contains("needs.");
+    Ok(wf
+        .jobs
+        .iter()
+        .map(|j| {
+            let waits = match j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
+                None => false,
+                Some(Matrix::Expr(t)) => reads_needs(&t.src),
+                Some(Matrix::Spec(m)) => {
+                    m.axes.iter().any(|(_, a)| matches!(a, Axis::Expr(t) if reads_needs(&t.src)))
+                        || [&m.include, &m.exclude].into_iter().flatten().any(|v| serde_json::to_string(v).is_ok_and(|s| reads_needs(&s)))
+                }
+            };
+            json!({
+                "job": j.id,
+                // Its name as written, unless an expression makes it (its legs then say it).
+                "name": j.name.as_ref().filter(|t| !t.has_expr()).map(|t| t.src.clone()),
+                "needs": j.needs.iter().map(|n| n.job()).collect::<Vec<_>>(),
+                "matrix_waits": waits,
+                "steps": j.steps.len(),
+                "calls": j.uses.is_some(),
+                "typical": typical.get(&j.id),
+            })
+        })
+        .collect())
+}
+
+/// How long each of a workflow's jobs typically takes, in seconds: the median of its spans (its
+/// first leg's start to its last leg's end) over the workflow's last 20 runs before run `number`
+/// that succeeded.
+async fn typical_spans(hub: &Hub, repo: &str, workflow: &str, number: i64) -> Result<HashMap<String, f64>, Fail> {
+    let (repo, workflow) = (repo.to_owned(), workflow.to_owned());
+    let spans: Vec<(String, i64)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT j.job_id, MAX(j.finished_at) - MIN(j.started_at)
+                 FROM (SELECT id, attempt FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND number < ?3 AND conclusion = 'success' ORDER BY number DESC LIMIT 20) r
+                 JOIN jobs j ON j.run_id = r.id AND j.run_attempt = r.attempt
+                 WHERE j.job_id IS NOT NULL AND j.started_at IS NOT NULL AND j.finished_at IS NOT NULL
+                 GROUP BY r.id, j.job_id",
+            )?;
+            let rows = st.query_map(params![repo, workflow, number], |x| Ok((x.get(0)?, x.get(1)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(internal)?;
+    let mut by_job: HashMap<String, Vec<i64>> = HashMap::new();
+    for (job, span) in spans {
+        by_job.entry(job).or_default().push(span.max(0));
+    }
+    Ok(by_job
+        .into_iter()
+        .map(|(job, mut s)| {
+            s.sort_unstable();
+            // The middle one, or the mean of the middle two.
+            let at = |i: usize| s.get(i).copied().unwrap_or(0) as f64;
+            let n = s.len();
+            (job, (at(n.saturating_sub(1) / 2) + at(n / 2)) / 2.0)
+        })
+        .collect())
 }
 
 /// A run's graph: its jobs with their legs and spans, the edges between them, and the critical

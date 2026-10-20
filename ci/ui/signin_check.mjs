@@ -3,6 +3,7 @@
 // password of their own in Settings → Sign-in; then the sign-in page asks for a name and offers
 // the passkey, and both sign lead in. WebKit and phones: the same pages laid out, nothing over.
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
+import { checkLayout } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
 const shots = "/shots";
@@ -49,7 +50,7 @@ await flow("chromium wide", async () => {
   const name = "chromium";
   const browser = await chromium.launch();
   try {
-    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();
     const errors = [];
     page.on("pageerror", (e) => errors.push(String(e)));
@@ -76,6 +77,7 @@ await flow("chromium wide", async () => {
     await page.getByRole("button", { name: "Set it" }).click();
     check(name, "wide: lead's password is set", await until(async () => /Set: sign in with your name and it/.test(await page.locator("[id='signin.mine']").innerText())));
     check(name, "wide: Settings fits", (await overflow(page)) <= 0, String(await overflow(page)));
+    await checkLayout(check, `${name}: wide: Settings`, page);
     await page.screenshot({ path: `${shots}/signin-${name}-wide-settings.png`, fullPage: true });
 
     // Signed out: a name, and the passkey, offered; the passkey signs lead in.
@@ -85,6 +87,7 @@ await flow("chromium wide", async () => {
     const byKey = page.getByRole("button", { name: "Sign in with a passkey" });
     check(name, "wide: the passkey is offered", (await byKey.count()) === 1);
     check(name, "wide: the sign-in page fits", (await overflow(page)) <= 0, String(await overflow(page)));
+    await checkLayout(check, `${name}: wide: the sign-in page`, page);
     await page.screenshot({ path: `${shots}/signin-${name}-wide-offered.png`, fullPage: true });
     await byKey.click();
     check(name, "wide: the passkey signs lead in", await until(async () => (await whoAmI(page)) === "user:lead"), String(await whoAmI(page)));
@@ -108,13 +111,13 @@ await flow("chromium wide", async () => {
 
 // Both browsers, wide and on phones: the pages laid out (WebKit's ceremonies aren't scriptable).
 for (const [name, type, phone] of [
-  ["chromium", chromium, devices["Pixel 7"]],
+  ["chromium", chromium, { ...devices["Pixel 7"], viewport: { width: 390, height: 844 } }],
   ["webkit", webkit, devices["iPhone 13"]],
 ]) await flow(name, async () => {
   const browser = await type.launch();
   try {
     for (const [tag, options] of [
-      ["wide", { viewport: { width: 1280, height: 900 } }],
+      ["wide", { viewport: { width: 1440, height: 900 } }],
       ["phone", phone],
     ]) {
       if (name === "chromium" && tag === "wide") continue;
@@ -125,6 +128,7 @@ for (const [name, type, phone] of [
       await signInPage(page);
       check(name, `${tag}: the name, the passkey and GitHub offered`, (await page.locator("#who").isVisible()) && (await page.getByRole("button", { name: "Sign in with a passkey" }).count()) === 1 && (await page.getByRole("link", { name: "Continue with GitHub" }).count()) === 1);
       check(name, `${tag}: the sign-in page fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: the sign-in page`, page);
       await page.screenshot({ path: `${shots}/signin-${name}-${tag}-page.png`, fullPage: true });
       await linkIn(ctx, "lead");
       await page.goto(`${cfg.base}/settings#signin.passkeys`);
@@ -132,6 +136,7 @@ for (const [name, type, phone] of [
       check(name, `${tag}: lead's passkey listed`, await until(async () => /Laptop/.test(await keys.innerText()), 30000));
       check(name, `${tag}: lead's password set`, await until(async () => /Set/.test(await page.locator("[id='signin.mine']").innerText())));
       check(name, `${tag}: Settings fits`, (await overflow(page)) <= 0, String(await overflow(page)));
+      await checkLayout(check, `${name}: ${tag}: Settings`, page);
       await page.screenshot({ path: `${shots}/signin-${name}-${tag}-settings.png`, fullPage: true });
       check(name, `${tag}: no page errors`, errors.length === 0, errors.join("; "));
       await ctx.close();

@@ -139,6 +139,33 @@ function set(e: Entry, patch: Partial<Snap>) {
 }
 
 /**
+ * How many keys' first loads have ended (with data or failed). `Loadable` re-renders as it
+ * changes, so a section that waited on one shows as it lands: React would hold it back until
+ * 300 ms after the loader showed (its throttle on revealing what suspended), and the loader
+ * itself shows only after a moment, so a fast load would show nothing and then wait.
+ */
+let landed = 0;
+const landing = new Set<() => void>();
+const subscribeLanded = (l: () => void) => {
+  landing.add(l);
+  return () => void landing.delete(l);
+};
+
+function land() {
+  landed++;
+  landing.forEach((l) => l());
+}
+
+/** `landed`, for `Loadable`. */
+export function useLanded(): number {
+  return useSyncExternalStore(
+    subscribeLanded,
+    () => landed,
+    () => landed,
+  );
+}
+
+/**
  * Loads `e`. One load at a time per key: a refresh asked for while one is on its way makes one more
  * load after it (however many were asked for), so a key whose events come faster than its fetch
  * still refreshes, instead of each refresh cancelling the last.
@@ -154,14 +181,20 @@ function load(e: Entry): Promise<void> {
     .fetcher(new AbortController().signal)
     .then(
       (data) => {
+        const first = !e.snap.has;
         // Settled for React before anyone hears of the data: the render it replays reads on at once.
         Object.assign(p, { status: "fulfilled", value: undefined });
         set(e, { data, has: true, error: undefined, failed: false, refreshing: false });
+        if (first) land();
       },
       (error: unknown) => {
         // A refresh that failed leaves the data that's shown; a first load that failed says so.
         if (e.snap.has) set(e, { refreshing: false });
-        else set(e, { error, failed: true, refreshing: false });
+        else {
+          Object.assign(p, { status: "fulfilled", value: undefined });
+          set(e, { error, failed: true, refreshing: false });
+          land();
+        }
       },
     )
     .finally(() => {

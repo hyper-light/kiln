@@ -65,6 +65,15 @@ enabled = false
 [ci]
 enabled = true
 
+# A pool from the start, for its scaling history (W21-R08).
+[[ci.pools]]
+name = "steady"
+executor = "docker"
+image = "kiln/runner-ubuntu-24.04"
+labels = ["steady"]
+min_idle = 0
+max = 2
+
 [sso.github]
 client_id = "kiln-check"
 client_secret_file = "{secret}"

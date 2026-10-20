@@ -91,6 +91,72 @@ pub async fn list(hub: &Hub, name: Option<&str>) -> Result<Response, Fail> {
     }
 }
 
+/// How far back a pool's scaling history goes (W21-R08).
+const KEEP_SAMPLES: i64 = 7 * 24 * 3600;
+
+/// Each pool's size (starting, idle, busy) and the legs waiting for it, a minute apart from the
+/// server's start, for its scaling history (W21-R08), kept a week.
+pub async fn sample_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
+    let mut first = true;
+    loop {
+        if !std::mem::take(&mut first) && !hub.shutdown.sleep(std::time::Duration::from_secs(60)).await {
+            return Ok(());
+        }
+        if !hub.ci.enabled() {
+            continue;
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
+        let Ok(Ok(live)) = crate::rt::timeout(std::time::Duration::from_secs(10), rx.recv()).await else { continue };
+        let n = |p: &Value, k: &str| p.get(k).and_then(Value::as_i64).unwrap_or(0);
+        let rows: Vec<(String, [i64; 4])> = live
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| (p.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(), [n(p, "starting"), n(p, "idle"), n(p, "busy"), n(p, "waiting")]))
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let now = crate::util::now_unix();
+        let kept = hub
+            .store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                for (pool, [starting, idle, busy, waiting]) in rows {
+                    tx.execute("INSERT OR REPLACE INTO ci_pool_samples (pool, ts, starting, idle, busy, waiting) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![pool, now, starting, idle, busy, waiting])?;
+                }
+                tx.execute("DELETE FROM ci_pool_samples WHERE ts < ?1", [now - KEEP_SAMPLES])?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await;
+        if let Err(e) = kept {
+            tracing::warn!(error = %format!("{e:#}"), "the pools' sizes weren't kept");
+        }
+    }
+}
+
+/// `GET /api/ci/pools/:name/history?hours=`: the pool's size and the legs waiting for it, a minute
+/// apart, oldest first, over the last `hours` (24 by default, a week at most).
+pub async fn history(hub: &Hub, name: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    let hours: i64 = q.get("hours").and_then(|h| h.parse().ok()).unwrap_or(24).clamp(1, 7 * 24);
+    let since = crate::util::now_unix() - hours * 3600;
+    let pool = name.to_owned();
+    let samples: Vec<Value> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT ts, starting, idle, busy, waiting FROM ci_pool_samples WHERE pool = ?1 AND ts >= ?2 ORDER BY ts")?;
+            let rows = st.query_map(params![pool, since], |r| {
+                Ok(json!({ "ts": r.get::<_, i64>(0)?, "starting": r.get::<_, i64>(1)?, "idle": r.get::<_, i64>(2)?, "busy": r.get::<_, i64>(3)?, "waiting": r.get::<_, i64>(4)? }))
+            })?;
+            Ok(rows.collect::<Result<Vec<Value>, _>>()?)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &json!({ "pool": name, "hours": hours, "samples": samples })))
+}
+
 /// `PUT /api/ci/pools/:name`.
 pub async fn put(hub: &Hub, name: &str, body: &Value) -> Result<Response, Fail> {
     if hub.cfg.ci.pools.iter().any(|p| p.name == name) {

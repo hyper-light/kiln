@@ -6,7 +6,7 @@
  */
 import * as React from "react";
 import { errorMessage } from "@/lib/hooks";
-import { retryFailed } from "@/lib/resource";
+import { retryFailed, useLanded } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 
 /** The loader. `block`: it stands in for a section, so it keeps some height. */
@@ -25,6 +25,8 @@ export function Loading({ label = "Loading", block, className }: { label?: strin
  * section, so nothing moves when it arrives.
  */
 export function Loadable({ children, label, fallback, className }: { children: React.ReactNode; label?: string; fallback?: React.ReactNode; className?: string }) {
+  // Rendered again as data lands, so what waited on it shows at once (see `useLanded`).
+  useLanded();
   return (
     <LoadBoundary label={label}>
       <React.Suspense fallback={fallback ?? <Loading label={label} block className={className} />}>{children}</React.Suspense>

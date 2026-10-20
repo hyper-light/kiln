@@ -143,6 +143,8 @@ export interface Job {
   cpu_seconds: number | null;
   steps: Step[];
   spec?: PlannedJob;
+  /** A CI matrix leg's values, by axis. */
+  matrix?: Record<string, unknown>;
 }
 
 export interface HostSample {

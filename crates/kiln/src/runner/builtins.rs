@@ -130,6 +130,7 @@ pub const BUILTINS: &[Builtin] = &[
             input("file", "The Dockerfile (`<context>/Dockerfile` by default).", None),
             input("platforms", "Platforms, comma-separated (`linux/amd64,linux/arm64`); the runner's own by default.", None),
             input("tag", "The tag (the commit's first twelve characters by default; `latest` too).", None),
+            input("push", "Push it and register it (`false`: built only, as a check; its outputs empty).", Some("true")),
         ],
         outputs: &[("image", "The image: `<registry>/<repository>@<digest>`."), ("digest", "Its digest.")],
     },

@@ -144,3 +144,41 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
     remove(&seen);
     result
 }
+
+/// W21-R08: a pool's scaling history. Its size and the legs waiting for it are taken from the
+/// server's start, a minute apart: here a pool no runner can start, nothing in it, nothing waiting.
+#[test]
+fn w21_r08_a_pools_history() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let extra = "[[ci.pools]]\nname = \"quiet\"\nexecutor = \"docker\"\nimage = \"kiln/runner-ubuntu-24.04\"\nlabels = [\"quiet\"]\nmin_idle = 0\nmax = 2\n";
+    let s = start(dir.path(), &Options { extra, ..Options::default() })?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let history = loop {
+        let (st, body) = common::http(s.port, "GET", "/api/ci/pools/quiet/history", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        if st == 200 && v.get("samples").and_then(Value::as_array).is_some_and(|l| !l.is_empty()) {
+            break v;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no sample: {st} {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let first = history.pointer("/samples/0").cloned().unwrap_or_default();
+    for k in ["starting", "idle", "busy", "waiting"] {
+        assert_eq!(first.get(k).and_then(Value::as_i64), Some(0), "{k}: {history}");
+    }
+    assert!(first.get("ts").and_then(Value::as_i64).is_some_and(|t| t > 0), "{history}");
+    assert_eq!(history.get("hours").and_then(Value::as_i64), Some(24), "a day by default: {history}");
+    // A day by default, an hour at least, a week at most.
+    for (asked, got) in [("0", 1), ("9999", 168)] {
+        let (_, body) = common::http(s.port, "GET", &format!("/api/ci/pools/quiet/history?hours={asked}"), &s.admin, None)?;
+        assert_eq!(serde_json::from_str::<Value>(&body)?.get("hours").and_then(Value::as_i64), Some(got), "{asked}: {body}");
+    }
+    // Who may not read the fleet doesn't read it.
+    let (st, body) = common::http(s.port, "POST", "/api/users", &s.admin, Some(&serde_json::json!({ "name": "nobody", "grants": [] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let (_, body) = common::http(s.port, "POST", "/api/tokens", &s.admin, Some(&serde_json::json!({ "kind": "pat", "user": "nobody", "grants": ["owner"] })))?;
+    let nobody = serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (st, _) = common::http(s.port, "GET", "/api/ci/pools/quiet/history", &nobody, None)?;
+    assert_eq!(st, 403);
+    Ok(())
+}
