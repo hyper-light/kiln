@@ -52,6 +52,7 @@ pub mod push;
 pub mod reach;
 pub mod runner;
 pub mod rt;
+pub mod secrets;
 pub mod server;
 pub mod store;
 pub mod sync;

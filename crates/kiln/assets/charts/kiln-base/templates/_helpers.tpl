@@ -62,7 +62,8 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- $out = append $out (dict "configMapRef" (dict "name" (include "kiln-base.partName" (dict "top" . "part" "env")))) -}}
 {{- end -}}
 {{- if .Values.kilnSecrets -}}
-{{- $out = append $out (dict "secretRef" (dict "name" (include "kiln-base.partName" (dict "top" . "part" "kiln")))) -}}
+{{- /* Named as KilnCD names it, `<release>-kiln`; optional, as an app without secrets has none. */ -}}
+{{- $out = append $out (dict "secretRef" (dict "name" (printf "%s-kiln" .Release.Name) "optional" true)) -}}
 {{- end -}}
 {{- $out = concat $out (default list .Values.envFrom) -}}
 {{- if $out }}

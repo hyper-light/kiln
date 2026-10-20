@@ -28,6 +28,7 @@ pub mod kilncd;
 pub mod metrics;
 pub mod model;
 pub mod ops;
+pub mod preflight;
 pub mod provider;
 pub mod reads;
 pub mod repo;

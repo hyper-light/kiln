@@ -1129,6 +1129,8 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, prune: Op
     // may be what broke, or its image still building. The deployment's are exactly as recorded.
     let (a, p) = cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
     back.add_artifacts(a, p);
+    // Its secrets as its definition pins them now: a rollback doesn't bring back older values.
+    back.add_secrets(cd.app_secrets(&def).await.map_err(|e| bad(format!("{e:#}")))?);
     let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
     propose(cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
     // The held inputs and their sync as one step: nothing syncs the app in between.
@@ -1228,7 +1230,22 @@ async fn follow(cx: Cx, v: Value) -> Out {
 
 async fn create(cx: Cx, v: Value) -> Out {
     let raw = v.get("definition").cloned().ok_or_else(|| bad("`definition` is required"))?;
-    let mut def: AppDef = serde_json::from_value(raw).map_err(|e| bad(format!("the definition doesn't read: {e}")))?;
+    let def: AppDef = serde_json::from_value(raw).map_err(|e| bad(format!("the definition doesn't read: {e}")))?;
+    // An app's secrets (docs/deploy-api.md §3.5) are named only by the release that delivers them:
+    // a definition from outside could name another app's, and have them rendered where it says.
+    if def.secrets.is_some() {
+        return Err(bad("`secrets` is kiln's to set: an app's secrets reach it through its releases (/api/deploy)"));
+    }
+    put(cx, def).await
+}
+
+/// A release's definition, from the deploy service (docs/deploy-api.md §8.2): as `cd.apps.create`
+/// takes one, and it may name the app's secrets, as only a release does.
+pub(crate) async fn put_released(cx: Cx, def: AppDef) -> Out {
+    put(cx, def).await
+}
+
+async fn put(cx: Cx, mut def: AppDef) -> Out {
     def.origin = Origin::Api;
     if def.sources.is_empty() || def.name.is_empty() {
         return Err(bad("an app needs a name and a source"));

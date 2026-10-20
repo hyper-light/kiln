@@ -291,6 +291,10 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
                 route: |v| Ok((Method::GET, registration_path(v, &["versions"])?, HashMap::new())),
                 run: |_cx: Cx, v: Value| async move { answer(json!({ "versions": api::versions(&*service()?, &text(&v, "app")?, &text(&v, "environment")?).await? })) }),
+            op!("deploy.secrets.list", "An app's secrets in an environment: each one's name, version, size, who set it and when. Never their values: no one reads them back, and agents neither set nor delete secrets (a person does, with `kiln app secret set`).", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["secrets"])?, HashMap::new())),
+                run: |cx: Cx, v: Value| async move { api::secrets_list(&*service()?, &Who::of(&cx.caller), &text(&v, "app")?, &text(&v, "environment")?).await }),
             op!("deploy.releases.get", "One release: its kind, state, version, artifacts, commit, who asked, its message, and what its provider last said.", ro: true, destructive: false,
                 input: || schema(json!({"id": {"type": "integer", "description": RELEASE}}), &["id"]),
                 route: |v| Ok((Method::GET, path(&["releases", &id(v)?.to_string()]), HashMap::new())),
@@ -307,7 +311,8 @@ pub fn ops() -> &'static [Op] {
                     "enabled": {"type": "boolean", "description": "Run the app here again (true), or stop running it (false)."},
                     "promote_from": {"type": "string", "description": "A promotion: exactly what this environment runs, the same version and artifacts."},
                     "keep": {"type": "boolean", "description": "With enabled false: leave what it runs in place."},
-                    "idempotency_key": {"type": "string", "description": KEY}
+                    "idempotency_key": {"type": "string", "description": KEY},
+                    "no_revert": {"type": "boolean", "description": "Failed after its commit, it isn't reverted: it's held for a person (a migration that can't run backwards). By default a failed release is reverted and what ran before runs again."}
                 }), &["app", "environment"]),
                 route: |_| Ok((Method::POST, path(&["releases"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {

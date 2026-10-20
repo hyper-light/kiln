@@ -123,3 +123,7 @@ being delivered (a delivery is reverted).
   (409), or queued where the environment says so. Wait for it, or cancel it if that's what the
   person asked.
 - A frozen environment holds every release until a person lifts the freeze: don't lift it.
+- Secrets (a password, an API key) are a person's to set: `kiln.deploy.secrets.list({ app,
+  environment })` says which exist and their versions, never values. When an app needs one that
+  isn't there, ask the person to run `kiln app secret set <app> <NAME> --env <env>` (its value
+  from their terminal); never put a secret in values, a commit or a message.
