@@ -905,6 +905,25 @@ fn read_tail(p: &std::path::Path, since: Option<u64>) -> Option<(String, u64, bo
     Some((String::from_utf8_lossy(&buf).into_owned(), start + buf.len() as u64, start > want || (since.is_none() && start > 0)))
 }
 
+/// An ending agent's group of processes, after `after` (its harness's time to stop): whatever is
+/// still in it ended at once, then the group removed.
+fn end_group(g: crate::os::contain::Group, after: Duration) {
+    crate::rt::spawn(async move {
+        crate::rt::sleep(after).await;
+        let _ = crate::rt::blocking(move || {
+            g.kill();
+            for _ in 0..20 {
+                if g.pids().is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            g.remove();
+        })
+        .await;
+    });
+}
+
 /// The processes under `root`, newest first: (pid, command line). Blocking.
 fn descendants(root: u32) -> Vec<(u32, Vec<String>)> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -2054,14 +2073,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
-                    // Marked as this session's, and so is everything it starts (`survivors`).
+                    // In the session's group of processes where the machine has them, and marked as
+                    // its, and so is everything it starts (`survivors`).
                     None => kind
                         .launch(&spec, &s.id)
                         .map(|mut p| {
                             p.env(super::survivors::MARK, &s.id);
                             p
                         })
-                        .and_then(crate::proc::spawn_duplex),
+                        .and_then(|p| crate::proc::spawn_duplex_in(p, crate::os::contain::Group::of(&s.id).as_ref())),
                 };
                 (adapter, spawned, Vec::new(), false)
             }
@@ -2340,8 +2360,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             let root = p.pid;
                             let left = std::mem::take(&mut *s.left.lock());
+                            let group = crate::os::contain::Group::existing(&s.id);
+                            let members = group.clone();
                             let _ = crate::rt::blocking(move || {
-                                let pids: Vec<u32> = descendants(root).into_iter().map(|(pid, _)| pid).collect();
+                                // Everything in its group where it has one (what left its tree
+                                // too), else what's under it now.
+                                let pids: Vec<u32> = match &members {
+                                    Some(g) => g.pids().into_iter().filter(|p| *p != root).collect(),
+                                    None => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
+                                };
                                 crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
                                 for r in &left {
                                     super::survivors::stop_tree(r);
@@ -2350,6 +2377,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
+                            if let Some(g) = group {
+                                end_group(g, Duration::from_millis(3500));
+                            }
                             if matches!(ctl, Some(Ctl::LetGo)) {
                                 tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
                                 (files.release)(&s.id);
@@ -2561,10 +2591,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     let _ = reply.send(None);
                 }
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
-                    // Ending the agent ends what it left running that kiln took back over.
+                    // Ending the agent ends what it left running that kiln took back over, and the
+                    // rest of its group of processes, which then goes.
                     let left = std::mem::take(&mut *s.left.lock());
                     if !left.is_empty() {
                         let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
+                    }
+                    if let Some(g) = crate::os::contain::Group::existing(&s.id) {
+                        end_group(g, Duration::ZERO);
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {
                         tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");

@@ -28,18 +28,34 @@ between turns. Files you attach go to it as their paths on its machine; its mode
 
 ## What an agent left running
 
-Every harness kiln starts carries `KILN_AGENT=<session id>` in its environment, and so does every
-process it starts, however it's parented later. Every ten seconds the runner notes what runs under
-each harness and what carries its mark apart from it, and keeps that in its record of its sessions
-(beside each one's harness process). What an agent started that runs on apart from its harness (a
-server started with `&` or `setsid`, a script left going) shows with its background tasks as "left
-running" (task id `left-<pid>`), until it ends; stopping that task stops it and what runs under it.
+Every agent session's processes are held together by the system where it can (`crate::os::contain`):
+
+| Where | How | What it gives |
+|---|---|---|
+| Linux with cgroup v2 the runner may write (a systemd user unit, a container with its own cgroup namespace) | a cgroup of its own, `kiln-agents/<session>` under the runner's | its harness joins it between fork and exec, so nothing it starts leaves it by forking, `setsid` or a double fork; its processes are its `cgroup.procs`; whose a process is, one read of `/proc/<pid>/cgroup`; ending them all, one write to `cgroup.kill` |
+| Windows | a job object of its own, `Local\kiln-agent-<session>` | its harness is created suspended, put in the job, then let run; the job lists its processes, says whether it holds one, and ends them all; it ends with the runner, as every job kiln makes |
+| macOS | followed fork by fork | its harness is watched with kqueue; whenever one of its processes forks, the children are listed and watched too; once a minute the user's processes are looked at for the agent's mark, for one that left between a fork and its listing |
+
+Every harness kiln starts also carries `KILN_AGENT=<session id>` in its environment, and so does
+every process it starts, however it's parented later: where the system holds nothing together
+(cgroup v1, a read-only cgroup filesystem, a cgroup another user owns), and for sessions whose
+harness started before the runner had groups, that mark is how their processes are found, which
+takes looking at every process on the machine. The runner logs how it holds them as it starts
+(`agents' processes are held together by`).
+
+Every ten seconds the runner notes what runs under each harness and what else is the agent's (in
+its group, or carrying its mark), and keeps that in its record of its sessions (beside each one's
+harness process). What an agent started that runs on apart from its harness (a server started with
+`&` or `setsid`, a script left going) shows with its background tasks as "left running" (task id
+`left-<pid>`), until it ends; stopping that task stops it and what runs under it.
 
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
 the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short.
-Ending the agent stops what it left running. kiln's own helpers and MCP servers aren't counted.
+Ending the agent stops what it left running, then ends whatever else is still in its group (what
+left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
+counted.
 
 ## API
 
@@ -314,7 +330,7 @@ its way is `working`. An agent kiln no longer lists has `ended`.
 |---|---|
 | kiln's MCP server on the server (`/api/mcp`) | the agent whose own MCP token it is: kiln gives every agent it starts on the server a token of its own (`kiln_mcp_session-<id>_…`, in a 0600 config file), which works only while kiln runs that agent |
 | kiln's MCP server on a runner (`kiln reach mcp`) | the agent session the runner runs it for |
-| `kiln spawn`, `kiln agents` on a machine | the agent whose command it is (its harness is an ancestor of the process, or the process carries the agent's `KILN_AGENT` mark), else the person in the kiln shell it runs in |
+| `kiln spawn`, `kiln agents` on a machine | the agent whose command it is (the process is in the agent's group of processes, its harness is an ancestor of the process, or the process carries the agent's `KILN_AGENT` mark), else the person in the kiln shell it runs in |
 
 An agent acts for whoever started it (the owner on a kiln nobody else signs in to): its calls
 are audited as `agent:<id>[@<machine>] for <them>`, and its children act for them too. A person's
