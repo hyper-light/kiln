@@ -769,6 +769,7 @@ function useKeeper(key: string) {
   const onScroll = () => {
     read();
     const s = k.current;
+    s.touched = null;
     window.clearTimeout(s.saving);
     s.saving = window.setTimeout(save, 250);
     return s.at?.id ?? null;
@@ -1014,6 +1015,13 @@ export const Timeline = React.memo(function Timeline({
   // end. Scrolled away from it, a pill floating over the bottom edge says so (nothing moves).
   const pending = onDecide ? approvals : NO_APPROVALS;
   const hasAsks = pending.length > 0;
+  const [endSeen, setEndSeen] = React.useState(true);
+  const endRef = React.useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    const io = new IntersectionObserver(([e]) => setEndSeen(Boolean(e?.isIntersecting)), { root: el.closest<HTMLElement>(".hx-timeline"), rootMargin: `0px 0px ${END_PX}px 0px` });
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
   const asksEl = React.useRef<HTMLDivElement | null>(null);
   const [asksSeen, setAsksSeen] = React.useState(true);
   const asksRef = React.useCallback((el: HTMLDivElement | null) => {
@@ -1086,8 +1094,9 @@ export const Timeline = React.memo(function Timeline({
             </div>
           )}
           {tail && footer}
+          <div ref={endRef} aria-hidden="true" />
           <div className="hx-waiting-anchor">
-            {!tail ? (
+            {!tail || (!hasAsks && !endSeen) ? (
               <button type="button" className="hx-waiting" onClick={latest}>
                 {hasAsks && <i aria-hidden="true" />}
                 {hasAsks ? (pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`) : "Latest"}
