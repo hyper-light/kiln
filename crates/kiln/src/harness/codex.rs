@@ -50,6 +50,34 @@ fn policy(mode: &str) -> (&'static str, &'static str, Value) {
     }
 }
 
+/// Whether permissions `a` (approval policy, sandbox) allow something `b` doesn't: they ask
+/// less or reach further. Unknown ones might, unless `b` is the most there is.
+fn exceeds(a: Option<&(String, String)>, b: &(String, String)) -> bool {
+    let asks = |p: &str| match p {
+        "untrusted" => 0,
+        "never" => 2,
+        _ => 1,
+    };
+    let reach = |s: &str| match s {
+        "read-only" => 0,
+        "danger-full-access" => 2,
+        _ => 1,
+    };
+    match a {
+        Some((approval, sandbox)) => asks(approval) > asks(&b.0) || reach(sandbox) > reach(&b.1),
+        None => asks(&b.0) < 2 || reach(&b.1) < 2,
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
@@ -65,6 +93,9 @@ enum Pending {
     Steer(String, Option<QueueItem>),
     Interrupt,
     PermissionInterrupt(String),
+    /// turn/interrupt of a native subagent's turn (its thread), as it works under other
+    /// permissions than the session's.
+    ChildInterrupt(String),
     Models,
     Suggest(String),
     Skills,
@@ -117,6 +148,8 @@ const LETTING_GO: &str = "Waiting for Codex to let go of the conversation (it st
 /// Turns of a resumed thread's history loaded (the latest).
 const HISTORY_TURNS: u32 = 100;
 const CHILD_REFRESH_MS: i64 = 5_000;
+/// How long a request is held back while the work that made it is stopped.
+const WITHHELD_MS: i64 = 30_000;
 
 /// A child's snapshots supplement notifications (which Codex does not always forward).
 #[derive(Default, Serialize, Deserialize)]
@@ -132,6 +165,16 @@ struct Child {
     seen: HashMap<String, u64>,
     #[serde(default)]
     failures: u32,
+    /// The approval policy and sandbox it started with, which Codex keeps for its life (None:
+    /// it started before kiln saw it).
+    #[serde(default)]
+    permissions: Option<(String, String)>,
+    /// Its turn kiln is stopping, as it works under other permissions than the session's.
+    #[serde(default)]
+    stopping: Option<String>,
+    /// Its turn Codex wouldn't stop (what it asks is the person's).
+    #[serde(default)]
+    unstoppable: Option<String>,
 }
 
 /// Whether a turn's error is the account's usage limit: `codexErrorInfo` says so
@@ -238,6 +281,17 @@ pub struct Codex {
     /// Notifications can finish a turn before its turn/start RPC reply arrives.
     #[serde(default)]
     completed_turn: Option<String>,
+    /// Subagents kiln stopped for working under other permissions than the session's, until
+    /// their parent is told.
+    #[serde(default)]
+    stopped: Vec<String>,
+    /// Requests for approval no work started with the session's permissions makes, kept from
+    /// the person while that work is moved onto them (shown after all if it can't be).
+    #[serde(default)]
+    withheld: HashMap<String, Approval>,
+    /// The turn kiln last interrupted to apply the session's permissions to (once each).
+    #[serde(default)]
+    applied: Option<String>,
     /// Effort levels per model, from model/list.
     efforts: HashMap<String, Vec<(String, String)>>,
     /// The turn each prompt started (rewinds and branches name a prompt).
@@ -326,6 +380,9 @@ impl Codex {
             permissions_changing: false,
             turn_permissions: None,
             completed_turn: None,
+            stopped: Vec::new(),
+            withheld: HashMap::new(),
+            applied: None,
             efforts: HashMap::new(),
             turns: HashMap::new(),
             skills: HashMap::new(),
@@ -420,18 +477,199 @@ impl Codex {
 
     fn permissions_changed(&mut self, core: &mut Core) {
         self.permission_controls(core);
-        if self.turn.is_none() && !self.pending.values().any(|p| matches!(p, Pending::Turn(_))) {
-            return;
+        let (approval, sandbox, _) = self.policies(core);
+        let now = (approval, sandbox);
+        // Subagents keep the permissions they started with: those allowed more stop now.
+        let over: Vec<(String, Option<String>)> = self.children.iter()
+            .filter(|(id, c)| c.turn.is_some() && exceeds(c.permissions.as_ref(), &now) && core.state.tasks.iter().any(|t| t.id == **id && t.live()))
+            .map(|(id, c)| (id.clone(), c.turn.clone()))
+            .collect();
+        for (child, turn) in over {
+            let _ = self.stop_child(core, &child, turn);
+        }
+        let running = self.turn.is_some() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)));
+        if running && (self.permissions_changing || self.turn_permissions.as_ref() != Some(&now)) {
+            if !self.permissions_changing {
+                self.notice(core, Level::Info, "Applying the new permissions: interrupting this turn, then continuing its work.");
+                self.permissions_changing = true;
+            }
+            self.interrupt_for_permissions(core);
+        }
+        self.reconcile(core);
+        // The change stopped work: the parent goes on with it now (one being interrupted, as
+        // it continues).
+        self.tell_parent(core, true);
+    }
+
+    /// A request for approval nothing started with the session's permissions makes: under
+    /// "never" nothing asks, so it comes from work started with earlier ones (a turn begun
+    /// before they changed, or a subagent, which keeps the permissions it started with).
+    fn outdated(&self, core: &Core, kind: AskKind, thread: Option<&str>) -> bool {
+        if !matches!(kind, AskKind::Command | AskKind::LegacyExec | AskKind::FileChange | AskKind::LegacyPatch | AskKind::Permissions) {
+            return false;
         }
         let (approval, sandbox, _) = self.policies(core);
-        if !self.permissions_changing && self.turn_permissions.as_ref() == Some(&(approval, sandbox)) {
+        if approval != "never" {
+            return false;
+        }
+        let now = (approval, sandbox);
+        match thread.filter(|t| self.thread.as_deref() != Some(*t)) {
+            Some(child) => self.children.get(child).and_then(|c| c.permissions.as_ref()) != Some(&now),
+            None => self.turn.is_some() && self.turn_permissions.as_ref() != Some(&now),
+        }
+    }
+
+    /// Move the work that asked (`thread`'s turn `turn`) onto the session's permissions rather
+    /// than ask the person, and never by answering for them: the session's own turn is
+    /// interrupted and goes on with them; a subagent is stopped and its parent told to start a
+    /// new one. False: it can't be (kiln tried for that turn, and Codex refused).
+    fn apply_permissions(&mut self, core: &mut Core, thread: Option<&str>, turn: Option<String>) -> bool {
+        match thread.filter(|t| self.thread.as_deref() != Some(*t)) {
+            Some(child) => self.stop_child(core, child, turn),
+            None => {
+                if self.permissions_changing {
+                    return true;
+                }
+                if self.turn.is_none() || self.applied == self.turn {
+                    return false;
+                }
+                self.applied.clone_from(&self.turn);
+                self.notice(core, Level::Info, "Applying your permissions: this turn started with earlier ones, so it's interrupted, then its work continues.");
+                self.permissions_changing = true;
+                self.interrupt_for_permissions(core);
+                true
+            }
+        }
+    }
+
+    /// Requests for approval shown, or held back, that only work started with earlier
+    /// permissions makes: that work is moved onto the session's.
+    fn reconcile(&mut self, core: &mut Core) {
+        let outdated: Vec<(Option<String>, Option<String>)> = core.state.approvals.iter().chain(self.withheld.values())
+            .filter(|a| self.asks.get(&a.id).is_some_and(|k| self.outdated(core, k.kind, a.input.get("threadId").and_then(Value::as_str))))
+            .map(|a| (a.input.get("threadId").and_then(Value::as_str).map(str::to_owned), a.input.get("turnId").and_then(Value::as_str).map(str::to_owned)))
+            .collect();
+        for (thread, turn) in outdated {
+            let _ = self.apply_permissions(core, thread.as_deref(), turn);
+        }
+    }
+
+    /// Stop a subagent's turn: it keeps the permissions it started with, and works under other
+    /// ones than the session's. What it asked goes with the turn. False: it can't be (kiln
+    /// tried for that turn, and Codex refused).
+    fn stop_child(&mut self, core: &mut Core, thread: &str, turn: Option<String>) -> bool {
+        let Some(turn) = turn.or_else(|| self.children.get(thread).and_then(|c| c.turn.clone())) else { return false };
+        let child = self.children.entry(thread.to_owned()).or_default();
+        if child.unstoppable.as_deref() == Some(turn.as_str()) {
+            return false;
+        }
+        if child.stopping.as_deref() == Some(turn.as_str()) {
+            return true;
+        }
+        child.stopping = Some(turn.clone());
+        if !self.stopped.iter().any(|s| s == thread) {
+            self.stopped.push(thread.to_owned());
+        }
+        let name = core.state.tasks.iter().find(|t| t.id == thread).map(|t| t.description.trim().to_owned()).filter(|d| !d.is_empty()).unwrap_or_else(|| thread.to_owned());
+        self.notice(core, Level::Info, format!("Stopping subagent {name}: it keeps the permissions it was started with, which differ from this session's now. Its parent is told to start a new one for its unfinished work."));
+        self.request(core, Pending::ChildInterrupt(thread.to_owned()), "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        true
+    }
+
+    /// What the parent hears about the subagents kiln stopped (and forgets them).
+    fn stopped_note(&mut self, core: &Core) -> Option<String> {
+        if self.stopped.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = std::mem::take(&mut self.stopped).iter()
+            .map(|id| core.state.tasks.iter().find(|t| t.id == *id).map(|t| t.description.trim()).filter(|d| !d.is_empty()).map_or_else(|| id.clone(), |d| format!("{d} ({id})")))
+            .collect();
+        let (they, them) = if names.len() == 1 { ("it", "it") } else { ("they", "them") };
+        Some(format!(
+            "kiln stopped your subagent{} {}: subagents keep the permissions they were started with, and {they} started with other ones than yours now. \
+             Start new subagents for any of {} work that isn't done (new ones get your current permissions) rather than sending {them} more.",
+            if names.len() == 1 { "" } else { "s" },
+            and_list(&names),
+            if names.len() == 1 { "its" } else { "their" },
+        ))
+    }
+
+    /// The parent hears which subagents kiln stopped: in its turn (steered in). Between turns,
+    /// `now` (a person's permission change stopped them) starts one to go on with their work;
+    /// else it hears with the next message it's sent. A turn interrupted for new permissions
+    /// hears as it goes on.
+    fn tell_parent(&mut self, core: &mut Core, now: bool) {
+        if self.permissions_changing || self.stopped.is_empty() {
             return;
         }
-        if !self.permissions_changing {
-            self.notice(core, Level::Info, "Applying the new permissions: interrupting this turn, then continuing its work.");
-            self.permissions_changing = true;
+        if self.turn.is_some() {
+            let Some(text) = self.stopped_note(core) else { return };
+            let id = format!("{}{}", super::pause::KILN_ID, crate::util::new_id());
+            self.send(core, QueueItem { id: id.clone(), text, at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Steer);
+            super::pause::from_kiln(core, &id);
+        } else if now && !self.busy(core) {
+            let Some(note) = self.stopped_note(core) else { return };
+            super::pause::continue_later(core, &format!("Your permissions were updated. {note}"));
+            self.next(core);
         }
-        self.interrupt_for_permissions(core);
+    }
+
+    /// Requests held back from the person are theirs after all (the work that asked could not
+    /// be stopped): those of `thread` (None: the session's own).
+    fn show_withheld(&mut self, core: &mut Core, thread: Option<&str>) {
+        let own = self.thread.clone();
+        let ids: Vec<String> = self.withheld.iter()
+            .filter(|(_, a)| {
+                let from = a.input.get("threadId").and_then(Value::as_str);
+                match thread {
+                    Some(t) => from == Some(t),
+                    None => from.is_none() || from == own.as_deref(),
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.release(core, ids);
+    }
+
+    fn release(&mut self, core: &mut Core, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            if let Some(a) = self.withheld.remove(&id) {
+                if let Some(tool) = a.tool_id.as_deref() {
+                    set_status(core, tool, ToolStatus::Pending);
+                }
+                core.add_approval(a);
+            }
+        }
+        self.settle(core);
+    }
+
+    /// Subagents a spawn the session saw start: Codex gives each its spawner's permissions.
+    fn note_spawns(&mut self, item: &Value, spawner: Option<&str>) {
+        let targets: Vec<String> = match item.get("type").and_then(Value::as_str) {
+            Some("collabAgentToolCall") if item.get("tool").and_then(Value::as_str) == Some("spawnAgent") => {
+                item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
+            }
+            Some("subAgentActivity") if item.get("kind").and_then(Value::as_str) == Some("started") => {
+                item.get("agentThreadId").and_then(Value::as_str).map(str::to_owned).into_iter().collect()
+            }
+            _ => return,
+        };
+        let permissions = match spawner {
+            None => self.turn_permissions.clone(),
+            Some(t) => self.children.get(t).and_then(|c| c.permissions.clone()),
+        };
+        for target in targets {
+            if self.thread.as_deref() == Some(target.as_str()) || spawner == Some(target.as_str()) {
+                continue;
+            }
+            let child = self.children.entry(target).or_default();
+            if child.permissions.is_none() {
+                child.permissions.clone_from(&permissions);
+            }
+        }
     }
 
     fn interrupt_for_permissions(&mut self, core: &mut Core) {
@@ -723,6 +961,8 @@ impl Codex {
         self.asks.clear();
         self.permissions_changing = false;
         self.turn_permissions = None;
+        self.withheld.clear();
+        self.stopped.clear();
         core.state.approvals.clear();
         core.state.exit = Some(ExitInfo { code, error });
         core.state.activity = None;
@@ -1016,7 +1256,14 @@ impl Codex {
         if matches!(core.state.status, Status::Starting | Status::Exited) {
             return;
         }
+        // Requests an older kiln showed that work under the session's permissions doesn't make.
+        self.reconcile(core);
+        self.tell_parent(core, false);
         let now = Core::now();
+        // Held back while the work that asked was stopped: Codex withdraws what a stopped turn
+        // asked at once, so one still waiting wasn't stopped, and it's the person's.
+        let overdue: Vec<String> = self.withheld.iter().filter(|(_, a)| now - a.at > WITHHELD_MS).map(|(id, _)| id.clone()).collect();
+        self.release(core, overdue);
         let children: Vec<String> = core.state.tasks.iter()
             .filter(|t| t.class.as_deref() == Some("agent"))
             .filter(|t| self.children.get(&t.id).is_some_and(|c| (c.refresh || t.live()) && now - c.read_at >= CHILD_REFRESH_MS))
@@ -1262,7 +1509,13 @@ impl Codex {
         self.thread_status = None;
         let (approval, sandbox_mode, sandbox) = self.policies(core);
         self.turn_permissions = Some((approval.clone(), sandbox_mode));
-        let items = self.items(&m);
+        let mut items = self.items(&m);
+        // Subagents kiln stopped that it hasn't heard of yet.
+        if let Some(note) = self.stopped_note(core)
+            && let Some(list) = items.as_array_mut()
+        {
+            list.push(json!({"type": "text", "text": format!("<kiln_note>\n{note}\n</kiln_note>")}));
+        }
         let mut params = json!({
             "threadId": thread,
             "input": items,
@@ -1567,6 +1820,17 @@ impl Codex {
                 Pending::PermissionInterrupt(turn) if self.permissions_changing && self.turn.as_deref() == Some(&turn) => {
                     self.permissions_changing = false;
                     self.notice(core, Level::Warn, format!("Codex could not interrupt to apply the permissions: {msg}. They apply when the next turn starts."));
+                    self.show_withheld(core, None);
+                    self.tell_parent(core, false);
+                }
+                // Not stopped (its turn may have just ended): what it asked is the person's after
+                // all. It isn't tried again for that turn.
+                Pending::ChildInterrupt(thread) => {
+                    if let Some(child) = self.children.get_mut(&thread) {
+                        child.unstoppable = child.stopping.take();
+                    }
+                    self.stopped.retain(|s| *s != thread);
+                    self.show_withheld(core, Some(&thread));
                 }
                 Pending::Models | Pending::Interrupt | Pending::PermissionInterrupt(_) | Pending::Hooks | Pending::Account => {}
                 Pending::Skills => {
@@ -2030,7 +2294,7 @@ impl Codex {
                     .unwrap_or_default();
                 core.reply(client, json!({"suggestions": files, "cwd": cwd}));
             }
-            Pending::Interrupt | Pending::PermissionInterrupt(_) => {}
+            Pending::Interrupt | Pending::PermissionInterrupt(_) | Pending::ChildInterrupt(_) => {}
         }
         self.settle(core);
     }
@@ -2179,6 +2443,15 @@ impl Codex {
                     .map_or_else(|| id.to_owned(), |t| t.description.clone())),
             at: Core::now(),
         };
+        let from = p.get("threadId").and_then(Value::as_str).map(str::to_owned);
+        self.asks.insert(id.clone(), Ask { rpc, kind, questions: question_ids, can_decline });
+        if self.outdated(core, kind, from.as_deref()) && self.apply_permissions(core, from.as_deref(), p.get("turnId").and_then(Value::as_str).map(str::to_owned)) {
+            // Not the person's to answer (nor answered for them): the work that asked goes on
+            // under the session's permissions instead, and this goes with its turn.
+            self.withheld.insert(id, approval);
+            self.tell_parent(core, false);
+            return;
+        }
         if let Some(tid) = item_id.as_deref() {
             set_status(core, tid, ToolStatus::Pending);
         }
@@ -2186,7 +2459,6 @@ impl Codex {
             ToolKind::Question => "Asking you a question".to_owned(),
             _ => "Waiting for your approval".to_owned(),
         });
-        self.asks.insert(id, Ask { rpc, kind, questions: question_ids, can_decline });
         core.add_approval(approval);
         self.settle(core);
     }
@@ -2311,6 +2583,7 @@ impl Codex {
             "item/started" | "item/completed" => {
                 if let Some(item) = p.get("item") {
                     self.item_in(core, item, method == "item/completed", Some(thread));
+                    self.note_spawns(item, Some(thread));
                 }
             }
             "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" | "item/plan/delta" => {
@@ -2354,6 +2627,21 @@ impl Codex {
                 }
                 child.runtime = None;
                 child.turn = None;
+                // What it asked goes with its turn (Codex withdraws it).
+                let ended = p.pointer("/turn/id").and_then(Value::as_str);
+                let gone: Vec<String> = core.state.approvals.iter().chain(self.withheld.values())
+                    .filter(|a| a.input.get("threadId").and_then(Value::as_str) == Some(thread))
+                    .filter(|a| a.input.get("turnId").and_then(Value::as_str).is_none_or(|id| ended.is_none_or(|e| e == id)))
+                    .map(|a| a.id.clone())
+                    .collect();
+                if !gone.is_empty() {
+                    for id in gone {
+                        self.asks.remove(&id);
+                        self.withheld.remove(&id);
+                        core.take_approval(&id);
+                    }
+                    self.settle(core);
+                }
                 if let Some(turn) = p.get("turn") {
                     self.child_history(core, thread, std::slice::from_ref(turn));
                 }
@@ -2401,6 +2689,7 @@ impl Codex {
                 }
                 self.steer_waiting(core);
                 self.interrupt_for_permissions(core);
+                self.tell_parent(core, false);
                 if core.state.turn_started.is_none() {
                     core.state.turn_started = Some(Core::now());
                 }
@@ -2459,12 +2748,13 @@ impl Codex {
                 // Interrupting a turn cancels its pending requests. Never answer them as an
                 // approval; native children's requests still belong to their own turns.
                 let ended = turn.get("id").and_then(Value::as_str);
-                let resolved: Vec<String> = core.state.approvals.iter()
+                let resolved: Vec<String> = core.state.approvals.iter().chain(self.withheld.values())
                     .filter(|a| a.input.get("threadId").and_then(Value::as_str).is_none_or(|id| self.thread.as_deref() == Some(id)))
                     .filter(|a| a.input.get("turnId").and_then(Value::as_str).is_none_or(|id| ended == Some(id)))
                     .map(|a| a.id.clone()).collect();
                 for id in resolved {
                     self.asks.remove(&id);
+                    self.withheld.remove(&id);
                     core.take_approval(&id);
                 }
                 self.turn = None;
@@ -2483,8 +2773,23 @@ impl Codex {
                 core.state.doing = None;
                 core.state.usage.turns += 1;
                 core.touch_state();
-                if permissions_changed && status == "interrupted" {
-                    super::pause::continue_later(core, "Your permissions were updated. Continue the work interrupted by that change, checking the state of any commands already started before retrying them. Existing subagents keep their own permissions.");
+                // Work the change stopped goes on: the turn's, and its subagents' (who keep the
+                // permissions they started with, so new ones take over). Otherwise subagents
+                // kiln stopped are heard of with the next message it's sent.
+                if permissions_changed && (status == "interrupted" || !self.stopped.is_empty()) {
+                    let mut text = "Your permissions were updated.".to_owned();
+                    if status == "interrupted" {
+                        text.push_str(" Continue the work interrupted by that change, checking the state of any commands already started before retrying them.");
+                    }
+                    let (approval, sandbox, _) = self.policies(core);
+                    let now = (approval, sandbox);
+                    if let Some(note) = self.stopped_note(core) {
+                        text.push(' ');
+                        text.push_str(&note);
+                    } else if core.state.tasks.iter().any(|t| t.class.as_deref() == Some("agent") && self.children.get(&t.id).and_then(|c| c.permissions.as_ref()) != Some(&now)) {
+                        text.push_str(" Subagents keep the permissions they were started with: start new ones rather than sending more work to those started before this change.");
+                    }
+                    super::pause::continue_later(core, &text);
                 }
                 self.settle(core);
                 self.next(core);
@@ -2498,6 +2803,7 @@ impl Codex {
                         self.turns.insert(key, turn.to_owned());
                     }
                     self.item(core, item, method == "item/completed");
+                    self.note_spawns(item, None);
                 }
             }
             "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" | "item/plan/delta" => {
@@ -2618,6 +2924,7 @@ impl Codex {
                     None => return,
                 };
                 self.asks.remove(&id);
+                self.withheld.remove(&id);
                 if core.take_approval(&id).is_some() {
                     self.settle(core);
                     self.next(core);
@@ -4225,7 +4532,12 @@ mod tests {
         assert_eq!(core.state.approvals.iter().find(|a| a.id == "child-ask").and_then(|a| a.agent.as_deref()), Some("Review"));
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         let w = written(&mut core);
-        assert_eq!(w.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt"))).count(), 1);
+        // The turn, and the subagent (it keeps the permissions it started with, which asked):
+        // both stopped, neither request answered.
+        let stopped: Vec<(&str, &str)> = w.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt")))
+            .filter_map(|v| Some((v.pointer("/params/threadId")?.as_str()?, v.pointer("/params/turnId")?.as_str()?)))
+            .collect();
+        assert_eq!(stopped, [("th1", "t1"), ("child", "t1")]);
         assert!(!w.iter().any(|v| v.get("result").is_some() || v.get("method") == Some(&json!("turn/start"))));
         // A duplicate choice does not interrupt twice or add another continuation.
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
@@ -4235,7 +4547,8 @@ mod tests {
         let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
         assert_eq!(next.pointer("/params/approvalPolicy"), Some(&json!("never")));
         assert_eq!(next.pointer("/params/sandboxPolicy"), Some(&json!({"type": "dangerFullAccess"})));
-        assert!(next.pointer("/params/input/0/text").and_then(Value::as_str).is_some_and(|s| s.contains("Continue the work")));
+        let said = next.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(said.contains("Continue the work") && said.contains("kiln stopped your subagent Review (child)") && said.contains("Start new subagents"), "{said}");
         assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m2"]);
         assert_eq!(core.state.approvals.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["child-ask"]);
         assert!(c.asks.contains_key("child-ask") && !c.asks.contains_key("own-ask"));
@@ -4391,6 +4704,232 @@ mod tests {
         c.pending.retain(|_, p| !matches!(p, Pending::PermissionInterrupt(_)));
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+    }
+
+    /// Thread `from`'s turn `turn` starts subagent `kid`, which starts its turn `<kid>-turn`.
+    fn spawn(c: &mut Codex, core: &mut Core, from: &str, turn: &str, kid: &str) {
+        feed(c, core, &[
+            json!({"method": "item/completed", "params": {"threadId": from, "turnId": turn, "item": {
+                "type": "collabAgentToolCall", "id": format!("spawn-{kid}"), "tool": "spawnAgent", "senderThreadId": from,
+                "receiverThreadIds": [kid], "status": "completed", "agentsStates": {kid: {"status": "running"}}, "prompt": "Audit the changes"}}}),
+            json!({"method": "turn/started", "params": {"threadId": kid, "turn": {"id": format!("{kid}-turn")}}}),
+        ]);
+    }
+
+    fn interrupts(w: &[Value]) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = w.iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt")))
+            .filter_map(|v| Some((v.pointer("/params/threadId")?.as_str()?.to_owned(), v.pointer("/params/turnId")?.as_str()?.to_owned())))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_owned(), b.to_owned())
+    }
+
+    #[test]
+    fn what_permissions_allow_beyond_others() {
+        let auto = pair("on-request", "workspace-write");
+        let full = pair("never", "danger-full-access");
+        assert!(exceeds(Some(&full), &auto) && !exceeds(Some(&auto), &full) && !exceeds(Some(&auto), &auto));
+        assert!(exceeds(Some(&pair("on-request", "danger-full-access")), &auto));
+        assert!(exceeds(Some(&auto), &pair("untrusted", "workspace-write")));
+        // Unknown ones might allow more, unless nothing is more.
+        assert!(exceeds(None, &auto) && !exceeds(None, &full));
+        assert_eq!(and_list(&["a".into()]), "a");
+        assert_eq!(and_list(&["a".into(), "b".into(), "c".into()]), "a, b and c");
+    }
+
+    #[test]
+    fn under_full_access_a_subagent_started_before_asks_nobody_and_is_replaced() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        // Auto: the turn, and the subagent it starts, work in the folder and ask beyond it.
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "review the PRs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        assert_eq!(c.children.get("kid").and_then(|k| k.permissions.clone()), Some(pair("on-request", "workspace-write")));
+        // Full access chosen mid-turn: the turn goes on with it. The subagent may now do more
+        // than it does, so it's left working.
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert_eq!(interrupts(&written(&mut core)), [pair("th1", "t1")]);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        let said = next.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(said.contains("Subagents keep the permissions they were started with"), "{said}");
+        respond(&mut c, &mut core, &w, "turn/start", json!({"turn": {"id": "t2", "status": "inProgress"}}));
+        // Then it asks, which nothing started with full access does. The person isn't asked and
+        // it isn't answered: the subagent is stopped, its parent told to start a new one.
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x1", "command": "gh api repos/o/r/pulls", "cwd": "/work"}})]);
+        assert!(core.state.approvals.is_empty());
+        let w = written(&mut core);
+        assert!(!w.iter().any(|v| v.get("result").is_some()));
+        assert_eq!(interrupts(&w), [pair("kid", "kid-turn")]);
+        let steer = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).ok_or_else(|| anyhow::anyhow!("parent not told"))?;
+        assert_eq!(steer.pointer("/params/expectedTurnId"), Some(&json!("t2")));
+        let told = steer.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(told.contains("kiln stopped your subagent Audit the changes (kid)") && told.contains("new ones get your current permissions"), "{told}");
+        assert!(core.events().any(|e| matches!(&e.body, Body::User { origin: Some(o), text, .. } if o == "kiln" && text.contains("kiln stopped"))));
+        // Its turn ends, and what it asked with it.
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/completed", "params": {"threadId": "kid", "turn": {"id": "kid-turn", "status": "interrupted"}}}),
+            json!({"method": "serverRequest/resolved", "params": {"threadId": "kid", "requestId": "kid-ask"}}),
+        ]);
+        assert!(c.withheld.is_empty() && !c.asks.contains_key("kid-ask") && core.state.approvals.is_empty());
+        // A subagent started now has full access: what it might still ask is the person's.
+        spawn(&mut c, &mut core, "th1", "t2", "kid2");
+        assert_eq!(c.children.get("kid2").and_then(|k| k.permissions.clone()), Some(pair("never", "danger-full-access")));
+        feed(&mut c, &mut core, &[json!({"id": "kid2-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid2", "turnId": "kid2-turn", "itemId": "x2", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid2-ask"));
+        assert!(interrupts(&written(&mut core)).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn narrowing_permissions_stops_subagents_allowed_more_and_the_parent_replaces_them() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        // A subagent's own subagent starts with its spawner's permissions.
+        spawn(&mut c, &mut core, "kid", "kid-turn", "grandkid");
+        assert_eq!(c.children.get("grandkid").and_then(|k| k.permissions.clone()), Some(pair("never", "danger-full-access")));
+        c.command(&mut core, Command::SetMode { mode: "auto".into() });
+        assert_eq!(interrupts(&written(&mut core)), [pair("grandkid", "grandkid-turn"), pair("kid", "kid-turn"), pair("th1", "t1")]);
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        assert_eq!(next.pointer("/params/approvalPolicy"), Some(&json!("on-request")));
+        let said = next.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(said.contains("Continue the work") && said.contains("kiln stopped your subagents") && said.contains("(kid)") && said.contains("(grandkid)"), "{said}");
+        assert!(c.stopped.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_between_turns_that_stops_subagents_goes_on_with_their_work() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}})]);
+        written(&mut core);
+        // The subagent works on after its parent's turn; read only is chosen.
+        c.command(&mut core, Command::SetMode { mode: "read-only".into() });
+        let w = written(&mut core);
+        assert_eq!(interrupts(&w), [pair("kid", "kid-turn")]);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("parent not told"))?;
+        assert_eq!(next.pointer("/params/sandboxPolicy/type"), Some(&json!("readOnly")));
+        assert!(next.pointer("/params/input/0/text").and_then(Value::as_str).is_some_and(|s| s.starts_with("Your permissions were updated. kiln stopped your subagent")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_adopted_session_already_in_full_access_moves_its_waiting_older_work_onto_it() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        for (id, thread, turn) in [("own-ask", "th1", "t1"), ("kid-ask", "kid", "kid-turn")] {
+            feed(&mut c, &mut core, &[json!({"id": id, "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": thread, "turnId": turn, "itemId": id, "command": "gh pr list", "cwd": "/work"}})]);
+        }
+        assert_eq!(core.state.approvals.len(), 2);
+        // An older kiln changed the label only: the turn and its subagent kept what they started
+        // with, and kiln didn't know what that was.
+        core.state.mode = "full-access".into();
+        c.allow_bypass = true;
+        c.turn_permissions = None;
+        if let Some(k) = c.children.get_mut("kid") {
+            k.permissions = None;
+        }
+        written(&mut core);
+        c.tick(&mut core);
+        let w = written(&mut core);
+        assert_eq!(interrupts(&w), [pair("kid", "kid-turn"), pair("th1", "t1")]);
+        assert!(!w.iter().any(|v| v.get("result").is_some()));
+        // Once each.
+        c.tick(&mut core);
+        assert!(interrupts(&written(&mut core)).is_empty());
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted"}}})]);
+        let w = written(&mut core);
+        let next = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).ok_or_else(|| anyhow::anyhow!("no continuation"))?;
+        assert_eq!(next.pointer("/params/approvalPolicy"), Some(&json!("never")));
+        assert!(next.pointer("/params/input/0/text").and_then(Value::as_str).is_some_and(|s| s.contains("Continue the work") && s.contains("(kid)")));
+        assert_eq!(core.state.approvals.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["kid-ask"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subagent_kiln_could_not_stop_leaves_its_request_to_the_person() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x1", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.is_empty());
+        let w = written(&mut core);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/threadId") == Some(&json!("kid"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no active turn"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid-ask") && c.withheld.is_empty() && c.stopped.is_empty());
+        // Not tried again for that turn, and never answered: what it asks next is shown at once.
+        c.tick(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask-2", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x2", "command": "gh run list", "cwd": "/work"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid-ask-2"));
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) || v.get("result").is_some()));
+    }
+
+    #[test]
+    fn a_request_held_back_is_shown_if_its_work_never_stops_and_a_refused_turn_asks_the_person() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        let interrupt = written(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "kid-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "kid", "turnId": "kid-turn", "itemId": "x1", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.is_empty());
+        // The stop was acknowledged, yet the turn goes on asking: after half a minute, the person's.
+        if let Some(a) = c.withheld.get_mut("kid-ask") {
+            a.at -= WITHHELD_MS + 1;
+        }
+        c.tick(&mut core);
+        assert!(core.state.approvals.iter().any(|a| a.id == "kid-ask") && c.withheld.is_empty());
+        // The session's own turn: Codex refuses the interrupt the change sent. What the turn asks
+        // then is held back while kiln tries once more for it; refused again, it's the person's,
+        // and so is what it asks after.
+        let id = interrupt.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt")) && v.pointer("/params/threadId") == Some(&json!("th1"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "cannot interrupt"}})]);
+        assert!(!c.permissions_changing);
+        written(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": "own-ask", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "th1", "turnId": "t1", "itemId": "x3", "command": "gh api", "cwd": "/work"}})]);
+        assert!(!core.state.approvals.iter().any(|a| a.id == "own-ask"));
+        let again = written(&mut core);
+        assert_eq!(interrupts(&again), [pair("th1", "t1")]);
+        let id = again.iter().find(|v| v.get("method") == Some(&json!("turn/interrupt"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "cannot interrupt"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "own-ask"));
+        feed(&mut c, &mut core, &[json!({"id": "own-ask-2", "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "th1", "turnId": "t1", "itemId": "x4", "command": "gh api", "cwd": "/work"}})]);
+        assert!(core.state.approvals.iter().any(|a| a.id == "own-ask-2"));
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt")) || v.get("result").is_some()));
     }
 
     #[test]

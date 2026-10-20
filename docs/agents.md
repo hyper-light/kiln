@@ -362,11 +362,24 @@ child starts: a person may change its mode later, as for any agent.
 Codex applies approval and sandbox settings per turn. Changing them during a turn interrupts
 that turn and continues its work with the new settings before queued messages. A stop or a new
 "Send now" message takes precedence over that continuation. Pending requests from the interrupted
-turn are cancelled, never approved automatically; existing native subagents keep their own
-permissions. Choosing approval and sandbox settings separately shows `Custom` unless they match
-a preset. An explicit Full access choice is retained across restarts.
+turn are cancelled, never approved automatically. Choosing approval and sandbox settings
+separately shows `Custom` unless they match a preset. An explicit Full access choice is retained
+across restarts.
 Runners advertise this behavior as `permissions_live`; the picker can also reapply the current
 preset to a turn inherited from an older runner. Older runners still show "From the next turn."
+
+A native Codex subagent keeps the settings it started with (its spawner's) for its whole life:
+Codex has no way to change them, and refuses kiln's input to a subagent. kiln notes them when it
+sees the spawn. A change stops (interrupts) subagents still working with more than the new
+settings allow. Under an approval policy of `never` (Full access), nothing started with the
+session's settings asks, so a request for approval comes from work started with earlier ones: the
+session's own turn (one inherited from an older runner) is interrupted and continued with the
+current settings, and a subagent is stopped. Such a request is held back from the person while
+that work stops, which withdraws it; it's never answered for them. Should Codex refuse to stop it
+(or it's still waiting after 30 s), it's shown after all. The parent hears which subagents kiln
+stopped and is told to start new ones for their unfinished work, since new ones take the current
+settings: in its turn, or in the turn continuing after the change (a change between turns that
+stopped some starts one), else with the next message it's sent.
 
 ### Waiting
 
@@ -859,7 +872,8 @@ Codex's native subagents keep their own threads and execution settings. kiln tra
 its native thread ID and keeps its work under the original spawning call, including later
 messages and follow-up work. Read-only `thread/read` and `thread/turns/list` requests fill in its
 status, latest 100 turns, elapsed time and result; live child notifications update that same
-view. Tracking never starts, resumes or attaches another executor to the child. Its messages,
+view. Tracking never starts, resumes or attaches another executor to the child (it may interrupt
+one working with other permissions than the session's: see permission modes above). Its messages,
 commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
 finishing does not mean the child has finished, and unavailable child history does not end the
 parent.
