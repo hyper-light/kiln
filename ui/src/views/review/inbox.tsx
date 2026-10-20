@@ -126,11 +126,13 @@ function Notes({ notes, unread }: { notes: InboxNote[]; unread: number }) {
       <ul className="rv-inbox-list">
         {notes.map((n) => {
           const path = inApp(n.url);
+          // The row is the link: the line's own copy of it (for chat) isn't shown.
+          const line = n.line.endsWith(` · ${n.url}`) ? n.line.slice(0, -(n.url.length + 3)) : n.line;
           const body = (
             <>
               <span className="rv-inbox-what">{n.title}</span>
               <span className="rv-sub">
-                {relativeTime(n.at)} · {n.line}
+                {relativeTime(n.at)} · {line}
               </span>
             </>
           );
