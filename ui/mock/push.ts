@@ -163,12 +163,31 @@ const fleet: AgentInfo[] = !FLEET
 /** The fleet's agents, beside the mock's own (`GET /api/harness/sessions`). */
 export const fleetInfos = () => fleet;
 
+let emitFleet: (info: AgentInfo) => void = () => {};
+/**
+ * A command to one of the fleet: answering a request takes it away (with none left it works on).
+ * False: not one of the fleet.
+ */
+export function fleetCommand(id: string, c: { type?: string; id?: string; decision?: string }): boolean {
+  const i = fleet.findIndex((a) => a.id === id);
+  const was = fleet[i];
+  if (!was) return false;
+  if (c.type === "approve") {
+    const approvals = was.approvals.filter((p) => p.id !== c.id);
+    const changed: AgentInfo = { ...was, approvals, status: approvals.length > 0 ? "waiting" : "running", doing: approvals.length > 0 ? was.doing : c.decision === "deny" ? "Trying another way" : "Going ahead", last_activity: Date.now() };
+    fleet[i] = changed;
+    emitFleet(changed);
+  }
+  return true;
+}
+
 /* ---------------------------- /api/push ---------------------------- */
 
 export async function handlePush(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";
   emitPush = () => ctx.emit({ type: "push" });
+  emitFleet = (info) => ctx.emit({ type: "harness", info });
   if (p === "/api/mock/push/outbox" && m === "GET") return (ctx.json(res, 200, { sent: outbox }), true);
   // For trying Mission control: one of the fleet as it comes to stand otherwise (what changes, as
   // the agent's own fields), told to the pages as the server tells them.
