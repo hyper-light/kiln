@@ -29,6 +29,7 @@
   --ch-pad: 24px;
   --ch-row: 44px;
   --ch-ctl: 36px;
+  --ch-input-size: 14px;
 
   position: relative;
   display: flex;
@@ -553,7 +554,7 @@
   border-radius: 5px;
   background: var(--ch-field);
   color: var(--ch-text);
-  font-size: 14px;
+  font-size: var(--ch-input-size);
   line-height: 1.5;
   outline: none;
   transition:
@@ -587,6 +588,9 @@ textarea.ch-free {
   font-size: 16px;
 }
 @media (pointer: coarse) {
+  .ch {
+    --ch-input-size: 16px;
+  }
   .ch :is(.ch-input, .ch-select),
   .ch .ch-mono {
     font-size: 16px;
@@ -1583,7 +1587,7 @@ textarea.ch-free {
   border-bottom: 1px solid #2c2f36;
   border-radius: 0;
   background: none;
-  font-size: 14px;
+  font-size: var(--ch-input-size);
   box-shadow: none;
 }
 .ch[data-layout="flow"] .ch-input:focus,
@@ -1609,4 +1613,16 @@ textarea.ch-free {
 .ch[data-layout="flow"] .ch-foot button svg {
   width: 14px;
   height: 14px;
+}
+@media (pointer: coarse) {
+  .ch[data-layout="flow"] {
+    --ch-ctl: 44px;
+  }
+  .ch[data-layout="flow"] .ch-row,
+  .ch[data-layout="flow"] .ch-foot button {
+    min-height: 44px;
+  }
+  .ch[data-layout="flow"] .ch-foot button {
+    height: auto;
+  }
 }

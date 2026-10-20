@@ -298,6 +298,7 @@ function MoreFields({
   onName,
   model,
   onModel,
+  models = [],
   reach,
   onReach,
   reachOptions,
@@ -310,6 +311,7 @@ function MoreFields({
   onName: (v: string) => void;
   model: string;
   onModel: (v: string) => void;
+  models?: KindInfo["models"];
   reach: string;
   onReach: (v: string) => void;
   reachOptions: { value: string; label: string }[];
@@ -325,7 +327,14 @@ function MoreFields({
       </label>
       <label className="sp-field">
         <span>Model</span>
-        <input className="hx-input" value={model} onChange={(e) => onModel(e.target.value)} placeholder="the harness's default" spellCheck={false} autoCapitalize="off" />
+        <select className="hx-select" value={model} onChange={(e) => onModel(e.target.value)} disabled={models.length === 0}>
+          <option value="">The harness's default</option>
+          {models.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label || m.id}
+            </option>
+          ))}
+        </select>
       </label>
       <label className="sp-field">
         <span>Commands</span>
@@ -358,12 +367,12 @@ function MoreFields({
 
 /** Until the machines have said what they have: the note where the chips go, and Start, not startable yet. */
 function Looking({ kept }: { kept: Kept }) {
-  const { count, more, name, setName, model, setModel, reach, setReach, busy } = kept;
+  const { count, more, name, setName, setModel, reach, setReach, busy } = kept;
   return (
     <>
       <div className="sp-note">Looking at your machines…</div>
       {more && (
-        <MoreFields count={count} name={name} onName={setName} model={model} onModel={setModel} reach={reach} onReach={setReach} reachOptions={[]} shell="" onShell={() => undefined} shells={[]} />
+        <MoreFields count={count} name={name} onName={setName} model="" onModel={setModel} reach={reach} onReach={setReach} reachOptions={[]} shell="" onShell={() => undefined} shells={[]} />
       )}
       <footer className="sp-foot">
         <span className="sp-foot-note" />
@@ -477,7 +486,7 @@ function Setup({
   onStarted: (agents: AgentInfo[]) => void;
   onOpenChange: (o: boolean) => void;
 }) {
-  const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, reach, setReach, busy, setBusy } = kept;
+  const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model: chosenModel, setModel, reach, setReach, busy, setBusy } = kept;
   // Each machine's harnesses, the machines and their shells: shown at once when known from before,
   // read again as it opens.
   const { byTarget, machines, shells, reach: reachRunners, workspaces } = useSuspenseResource("harness/spawn", askMachines).data;
@@ -496,6 +505,7 @@ function Setup({
   // Opened like another agent: its harness; else the one chosen last.
   const [preferred, setPreferred] = React.useState(defaults?.kind || remembered);
   const setKind = (k: string) => {
+    if (k !== kind) setModel("");
     setPreferred(k);
     remember(k);
   };
@@ -533,7 +543,9 @@ function Setup({
     setCwd(folder);
   }
 
-  const kindInfo = all.find((k) => k.id === kind);
+  const kindInfo = byTarget[target]?.find((k) => k.id === kind) ?? all.find((k) => k.id === kind);
+  // A remembered model is usable only if this machine's selected harness offers it.
+  const model = kindInfo?.models?.some((m) => m.id === chosenModel) ? chosenModel : "";
   const modes = modesFor(kindInfo);
   const safe = (id: string | undefined) => modes.some((m) => m.id === id && !m.dangerous);
   const mode = modes.some((m) => m.id === unchecked) ? unchecked : safe(modeByKind[kind]) ? (modeByKind[kind] ?? "") : (kindInfo?.default_mode ?? modes.find((m) => !m.dangerous)?.id ?? "");
@@ -648,6 +660,7 @@ function Setup({
             label={machineName(target)}
             value={target}
             onPick={(t) => {
+              if (!byTarget[t]?.find((k) => k.id === kind)?.models?.some((m) => m.id === model)) setModel("");
               setPicked(t);
               setShell("");
             }}
@@ -709,6 +722,7 @@ function Setup({
           onName={setName}
           model={model}
           onModel={setModel}
+          models={kindInfo?.models}
           reach={reach}
           onReach={setReach}
           reachOptions={reachChoices(reachRunners, target)}
