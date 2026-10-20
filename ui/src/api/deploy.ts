@@ -7,7 +7,7 @@ import { request } from "./client";
 import type { CdDiff, CdResourceKey } from "./types";
 
 export type ReleaseState = "waiting" | "waiting_approval" | "committing" | "delivering" | "succeeded" | "failed" | "cancelled" | "rolled_back" | "superseded";
-export type ReleaseKind = "deploy" | "config" | "rollback" | "enable" | "disable";
+export type ReleaseKind = "deploy" | "config" | "rollback" | "enable" | "disable" | "revert";
 
 export interface Artifact {
   repository: string;
@@ -37,7 +37,7 @@ export interface Release {
   environment: string;
   kind: ReleaseKind;
   state: ReleaseState;
-  origin: "api" | "git";
+  origin: "api" | "git" | "kiln";
   version?: string;
   artifacts?: Record<string, Artifact>;
   values?: string;
@@ -54,6 +54,16 @@ export interface Release {
   created_at: number;
   committed_at?: number;
   ended_at?: number;
+  /** Secrets' changes it delivers (docs/deploy-api.md §3.5): a secrets release's reason (`DB_PASSWORD v4`), or ones it took on while it waited. */
+  secrets?: string | null;
+  /** Failed after its commit, it isn't reverted: it's held for a person (§8.1). */
+  no_revert?: boolean;
+  /** A revert: the release it puts back what ran before. */
+  reverts?: number | null;
+  /** The revert that puts back what ran before it. */
+  reverted_by?: number | null;
+  /** What it runs on its way in that a revert couldn't undo (a migration's hook): failed, it's held rather than reverted. */
+  irreversible?: string | null;
 }
 
 export interface Registration {
@@ -63,6 +73,8 @@ export interface Registration {
   paused: boolean;
   running?: number;
   created_at: number;
+  /** Why what runs here needs a person (docs/deploy-api.md §8.1): a release failed and wasn't put back, or putting it back didn't land. The next release that lands clears it. */
+  degraded?: string | null;
 }
 
 export interface Gates {
@@ -213,6 +225,39 @@ export interface Metrics {
   by_day: { day: string; landed: number; failed: number }[];
 }
 
+/** One of an app's secrets in an environment, as listed: never its value (docs/deploy-api.md §3.5). */
+export interface SecretMeta {
+  name: string;
+  version: number;
+  size: number;
+  set_by: string;
+  set_at: number;
+}
+
+export interface SecretVersion {
+  version: number;
+  set_by: string;
+  set_at: number;
+  /** A deletion: the secret was gone from this version on. */
+  deleted: boolean;
+  /** Its value is no longer kept (older than the last ten), or it never had one. */
+  destroyed: boolean;
+}
+
+/** A secret's change on its way to what runs: the release that delivers it (made, or a waiting one it joined), and what happens next. */
+export interface SecretReleased {
+  release: Release | null;
+  next: string;
+}
+
+/** A read of an app's secrets for a delivery: who, for what, which versions (`DB_PASSWORD@3,API_KEY@1`). */
+export interface SecretRead {
+  by: string;
+  purpose: string;
+  versions: string;
+  at: number;
+}
+
 /** What a release asks for: exactly one of a version, values, enabled, or a promotion. */
 export interface ReleaseAsk {
   app: string;
@@ -280,6 +325,13 @@ export const deployApi = {
   },
   pause: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/pause`, {}),
   resume: (app: string, env: string) => request<Registration>("POST", `${reg(app, env)}/resume`, {}),
+  secrets: (app: string, env: string, signal?: AbortSignal) => request<{ backend: string; secrets: SecretMeta[] }>("GET", `${reg(app, env)}/secrets`, undefined, { signal }),
+  /** A secret's next version. Its value is never read back. */
+  setSecret: (app: string, env: string, name: string, value: string) => request<SecretMeta & SecretReleased>("PUT", `${reg(app, env)}/secrets/${enc(name)}`, { value }),
+  deleteSecret: (app: string, env: string, name: string) => request<SecretReleased>("DELETE", `${reg(app, env)}/secrets/${enc(name)}`),
+  secretVersions: (app: string, env: string, name: string, signal?: AbortSignal) =>
+    request<{ versions: SecretVersion[] }>("GET", `${reg(app, env)}/secrets/${enc(name)}/versions`, undefined, { signal }).then((r) => r.versions),
+  secretUses: (app: string, env: string, signal?: AbortSignal) => request<{ reads: SecretRead[] }>("GET", `${reg(app, env)}/secret-uses?limit=20`, undefined, { signal }).then((r) => r.reads),
 };
 
 export const boardHref = "/deployments/releases";
@@ -324,8 +376,10 @@ export function describe(r: Release): string {
       return r.promoted_from ? `promote ${r.version ?? ""} (from release ${r.promoted_from})` : `deploy ${r.version ?? ""}`;
     case "rollback":
       return `rollback to ${r.version ?? ""}${r.rollback_of ? ` (release ${r.rollback_of})` : ""}`;
+    case "revert":
+      return `revert of release ${r.reverts ?? ""}`;
     case "config":
-      return "config";
+      return r.secrets && !r.values ? `secrets: ${r.secrets}` : r.secrets ? `config (and secrets: ${r.secrets})` : "config";
     default:
       return r.kind;
   }

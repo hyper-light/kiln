@@ -327,6 +327,29 @@ impl Cluster {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// A server-side apply of `object` as `manager`, run dry, for a release's preflight
+    /// (docs/deploy-api.md §8.1): `Ok(Err(why))` when the API server refuses it (invalid, an
+    /// admission policy's no, over a quota, a field that can't change), `Err` when it can't be
+    /// asked (unreachable, throttled, failing itself).
+    pub async fn dry_run(&self, object: &Value, manager: &str) -> Result<std::result::Result<(), String>> {
+        let key = ResKey::new(obj::group(object), obj::kind(object), obj::namespace(object), obj::name(object));
+        let r = self.resource(&key.group, &key.kind)?;
+        let path = format!("{}?{}", k::object_path(&r, &key), k::apply_query(manager, true, true));
+        let body = Bytes::from(serde_json::to_vec(object)?);
+        let (status, bytes) = self.request(Method::PATCH, &path, Some("application/apply-patch+yaml"), Some(body)).await?;
+        match status {
+            200..=299 => Ok(Ok(())),
+            408 | 429 => bail!("{}", k::status_message(status, &bytes)),
+            400..=499 => Ok(Err(k::status_message(status, &bytes))),
+            _ => bail!("{}", k::status_message(status, &bytes)),
+        }
+    }
+
+    /// Whether objects of a kind live in namespaces, as discovery says (`None`: not served).
+    pub fn namespaced(&self, group: &str, kind: &str) -> Option<bool> {
+        self.discovery.read().get(group, kind).map(|r| r.namespaced)
+    }
+
     /// Deletes an object; `Ok` when it is gone or going.
     pub async fn delete(&self, key: &ResKey, propagation: &str) -> Result<()> {
         let r = self.resource(&key.group, &key.kind)?;

@@ -13,7 +13,7 @@ import * as React from "react";
 import { ExternalLink, RotateCw } from "lucide-react";
 import type { ToolCall } from "@/api/harness";
 import { useAuth } from "@/lib/auth";
-import { heightAt, heightsFor, pageOf, type ShownPage } from "./page-of";
+import { enginesOf, heightAt, heightsFor, ownEngine, pageOf, type ShownPage } from "./page-of";
 import { FilesContext } from "./files";
 import { Beam, PrismLabel } from "./signals";
 import { useDrafts } from "./state";
@@ -78,11 +78,18 @@ function Frame({ page, ev }: { page: ShownPage; ev: string }) {
   const ready = React.useRef(false);
   /** The document what was done in the page was last handed back to (the bridge's mark). */
   const restoredTo = React.useRef<string | null>(null);
+  /** Its heights as viewers' own engines measured them since it was shown (kiln keeps them), and
+   *  the heights this browser said of it. */
+  const [stored, setStored] = React.useState<ShownPage["engines"] | null>(null);
+  const storedRef = React.useRef<ShownPage["engines"] | null>(null);
+  const told = React.useRef(new Set<string>());
   const live = React.useRef({ page, agent, width });
   live.current = { page, agent, width };
 
-  // Measured in this browser's own engine, when its machine had it.
-  const measured = heightAt(heightsFor(page, typeof navigator === "undefined" ? "" : navigator.userAgent), width);
+  // Measured in this browser's own engine (its machine's, or a viewer's at about this width), else
+  // in Chromium.
+  const sized = stored ? { ...page, engines: { ...page.engines, ...stored } } : page;
+  const measured = heightAt(heightsFor(sized, typeof navigator === "undefined" ? "" : navigator.userAgent, width), width);
   const height = Math.min(MOST, reported ?? (measured != null && measured >= FILL_UNDER ? measured : fillHeight(width || 390)));
 
   const tell = React.useCallback((method: string, params: unknown) => {
@@ -117,6 +124,37 @@ function Frame({ page, ev }: { page: ShownPage; ev: string }) {
       );
       around.observe(el);
       let quiet: ReturnType<typeof setTimeout> | undefined;
+      // What viewers' own engines measured of it since it was shown: its frame at its height
+      // before it loads.
+      const asked = new AbortController();
+      const first = live.current;
+      if (first.agent)
+        void fetch(`/api/harness/sessions/${encodeURIComponent(first.agent)}/pages/${first.page.id}/heights`, { signal: asked.signal })
+          .then((r) => (r.ok ? (r.json() as Promise<{ engines?: unknown }>) : null))
+          .then((v) => {
+            const e = enginesOf(v?.engines);
+            if (Object.keys(e).length) {
+              storedRef.current = e;
+              setStored(e);
+            }
+          })
+          .catch(() => undefined);
+      // The height this browser's own engine has it at, once it's settled, said to kiln and kept
+      // with the page for the next viewer in this engine (Chromium's its machine measured).
+      const engine = ownEngine(navigator.userAgent);
+      let settle: ReturnType<typeof setTimeout> | undefined;
+      const seen = (h: number) => {
+        if (engine === "chromium") return;
+        clearTimeout(settle);
+        settle = setTimeout(() => {
+          const { page: p, agent: a, width: w } = live.current;
+          const key = `${w}:${h}`;
+          const known = [...(p.engines?.[engine] ?? []), ...(storedRef.current?.[engine] ?? [])];
+          if (!a || w < 200 || told.current.has(key) || known.some(([x, y]) => x === w && Math.abs(y - h) <= 1)) return;
+          told.current.add(key);
+          void fetch(`/api/harness/sessions/${encodeURIComponent(a)}/pages/${p.id}/heights`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ engine, width: w, height: h }) }).catch(() => undefined);
+        }, 1500);
+      };
       const onMessage = (e: MessageEvent) => {
         const f = frame.current;
         // Only its own frame, still showing its page (an opaque origin: a page that went
@@ -158,7 +196,10 @@ function Frame({ page, ev }: { page: ShownPage; ev: string }) {
           }
           case "ui/notifications/size-changed": {
             const h = Number(m.params?.height);
-            if (Number.isFinite(h) && h > 0) setReported(Math.ceil(h));
+            if (Number.isFinite(h) && h > 0) {
+              setReported(Math.ceil(h));
+              seen(Math.ceil(h));
+            }
             break;
           }
           case "ui/open-link": {
@@ -206,6 +247,8 @@ function Frame({ page, ev }: { page: ShownPage; ev: string }) {
         inView.disconnect();
         around.disconnect();
         clearTimeout(quiet);
+        clearTimeout(settle);
+        asked.abort();
         window.removeEventListener("message", onMessage);
       };
     },

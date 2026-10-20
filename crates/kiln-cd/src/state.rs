@@ -786,6 +786,7 @@ mod tests {
             artifacts: BTreeMap::new(),
             rollout: None,
             checks: BTreeMap::new(),
+            secrets: None,
         }
     }
 

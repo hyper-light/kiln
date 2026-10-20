@@ -54,7 +54,7 @@ fn dns_label(what: &str, s: &str) -> Result<(), Fail> {
 
 /// Tells every client, and whoever waits on it, that a release moved; one waiting for approval
 /// says so, and who may give it (`needs`, `approvers`).
-fn emit_release(d: &Deploy, r: &Release) {
+pub(super) fn emit_release(d: &Deploy, r: &Release) {
     let mut e = json!({
         "type": "deploy",
         "id": r.id,
@@ -273,6 +273,11 @@ pub async fn delete_environment(d: &Deploy, actor: &str, name: &str) -> Result<(
         return Err(missing(format!("no environment {name}")));
     }
     audit(d, actor, "deploy.environment.delete", name.to_owned()).await;
+    // Its apps' secrets there go with it (§3.5).
+    let secrets = crate::secrets::of(&d.hub);
+    for a in store::apps(&d.hub.store).await.map_err(internal)? {
+        secrets.forget(&crate::secrets::Scope::of(&a.name, name), actor).await.map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -358,6 +363,11 @@ pub async fn delete_app(d: &Deploy, who: &Who, name: &str, everywhere: bool, kee
         return Err(missing(format!("no app {name}")));
     }
     audit(d, actor, "deploy.app.delete", name.to_owned()).await;
+    // Its secrets go with it (§3.5): an app made later with its name doesn't get them.
+    let secrets = crate::secrets::of(&d.hub);
+    for e in store::environments(&d.hub.store).await.map_err(internal)? {
+        secrets.forget(&crate::secrets::Scope::of(name, &e.name), actor).await.map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -661,7 +671,7 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     }
     let message = format!("register {app_name} in {env_name}\n\n{REGISTRATION_TRAILER}: {app_name}/{env_name}\n{}: {actor}\n", repo::REQUESTED_BY_TRAILER);
     commit_files(d, &env, changes, message, actor).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    let reg = Registration { app: app_name.to_owned(), environment: env_name.to_owned(), enabled: false, paused: false, running: None, created_at: crate::util::now_unix() };
+    let reg = Registration { app: app_name.to_owned(), environment: env_name.to_owned(), enabled: false, paused: false, running: None, created_at: crate::util::now_unix(), degraded: None };
     store::put_registration(&d.hub.store, &reg).await.map_err(internal)?;
     audit(d, actor, "deploy.register", format!("{app_name} in {env_name}")).await;
     d.hub.emit(&json!({ "type": "deploy_registration", "registration": reg }));
@@ -754,6 +764,14 @@ pub struct Ask {
     /// Asked for again with the same key, it is the same release (a retry after a timeout).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// A secrets release (§3.5): the app's secrets at their versions now, its version and values
+    /// kept. What changed, in a few words (`DB_PASSWORD v4`).
+    #[serde(default)]
+    pub secrets: Option<String>,
+    /// Failed, it isn't reverted: it's held for a person (§8.1). For a change a revert would undo
+    /// harmfully: a secret rotated after a leak, a migration that can't run backwards.
+    #[serde(default)]
+    pub no_revert: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -921,9 +939,9 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     if a.archived {
         return Err(conflict(format!("{} is archived: no new releases", a.name)));
     }
-    let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some(), ask.promote_from.is_some()].iter().filter(|b| **b).count();
+    let asked = [ask.version.is_some(), ask.values.is_some(), ask.rollback.is_some(), ask.enabled.is_some(), ask.promote_from.is_some(), ask.secrets.is_some()].iter().filter(|b| **b).count();
     if asked != 1 {
-        return Err(bad("ask for exactly one of: a version, values, a rollback, enabled, or promote_from"));
+        return Err(bad("ask for exactly one of: a version, values, a rollback, enabled, promote_from, or secrets"));
     }
     let now = crate::util::now_unix();
     let mut r = Release {
@@ -950,6 +968,11 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         created_at: now,
         committed_at: None,
         ended_at: None,
+        secrets: None,
+        no_revert: ask.no_revert,
+        reverts: None,
+        reverted_by: None,
+        irreversible: None,
     };
     // Asked for before with this key: that release, whatever it has become.
     if let Some(k) = &r.idempotency_key
@@ -991,6 +1014,9 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         r.rollback_of = Some(to.id);
     } else if let Some(enabled) = ask.enabled {
         r.kind = if enabled { Kind::Enable } else { Kind::Disable };
+    } else if let Some(what) = ask.secrets {
+        r.kind = Kind::Config;
+        r.secrets = Some(Some(what.trim()).filter(|w| !w.is_empty()).unwrap_or("as they are").to_owned());
     } else if let Some(from) = ask.promote_from {
         if from == env.name {
             return Err(bad("a promotion comes from another environment"));
@@ -1170,6 +1196,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
     let now = crate::util::now_unix();
     let env = store::environment(st, &r.environment).await?;
     let timeout = env.as_ref().map_or(15 * 60, |e| i64::try_from(e.watch.timeout_secs).unwrap_or(900));
+    let unreachable = env.as_ref().map_or(6 * 60 * 60, |e| i64::try_from(e.watch.unreachable_secs).unwrap_or(21_600)).max(timeout);
     match r.state {
         State::Waiting | State::WaitingApproval => match store::in_flight(st, &r.app, &r.environment).await? {
             Some(o) if o.id != r.id => store::schedule(st, id, now + 2).await?,
@@ -1209,8 +1236,22 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             }
         },
         State::Committing => match commit_release(d, &r).await {
-            Ok(sha) => {
+            // What can be known to fail is refused while nothing has changed (§8.1). A rollback
+            // refused leaves running what it rolled back from: a person is needed.
+            Ok(Committed::Refused(why)) => {
+                let message = format!("refused before its commit, nothing changed: {why}");
+                if r.kind == Kind::Rollback {
+                    degrade(d, &r, &format!("release {} failed: {message}; what it rolled back from runs on", r.id)).await?;
+                }
+                finish(d, r, State::Failed, Some(message)).await?;
+            }
+            Ok(Committed::Done(sha, secrets, irreversible)) => {
+                r.irreversible = irreversible;
                 r.commit = Some(sha);
+                // What it changes of the app's secrets, as it pinned them (§3.5).
+                if let Some(changed) = secrets.filter(|c| !c.is_empty()) {
+                    r.secrets = Some(changed);
+                }
                 r.committed_at = Some(now);
                 r.state = State::Delivering;
                 r.message = None;
@@ -1261,9 +1302,11 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     store::update_release(st, &r, State::Delivering).await?;
                     store::schedule(st, id, now + settle.clamp(1, 5)).await?;
                 }
+                // A release that fails after its commit is reverted, as a release of its own,
+                // or held for a person (§8.1): see `aftermath`.
                 Ok((Landed::Failed(why), view)) => {
                     r.provider = view;
-                    finish(d, r, State::Failed, Some(why)).await?;
+                    failed(d, r, why).await?;
                 }
                 Ok((Landed::Refused(why), mut view)) => {
                     let since = r.provider.get("refused_at").and_then(Value::as_i64).unwrap_or(now);
@@ -1272,16 +1315,40 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     note(&mut view, "refused_at", json!(since));
                     r.provider = view;
                     if now - since >= grace {
-                        let undone = give_back(d, &r, &format!("{name} refused it: {why}")).await;
-                        return finish(d, r, State::Failed, Some(format!("{name} refused it: {why}; {undone}"))).await;
+                        return refused(d, r, format!("{name} refused it: {why}")).await;
                     }
                     r.message = Some(format!("{name} refuses it: {why} (it fails in {}s unless that clears)", grace - (now - since)));
                     store::update_release(st, &r, State::Delivering).await?;
                     store::schedule(st, id, now + 5).await?;
                 }
-                Ok((Landed::No, view)) if now - committed_at > timeout => {
+                // Evidence it doesn't run: failed, unless it recovers within `watch.degraded`.
+                Ok((Landed::Degraded(why), mut view)) => {
+                    let since = r.provider.get("degraded_at").and_then(Value::as_i64).unwrap_or(now);
+                    let grace = env.as_ref().map_or(60, |e| i64::try_from(e.watch.degraded_secs).unwrap_or(60));
+                    note(&mut view, "degraded_at", json!(since));
                     r.provider = view;
-                    finish(d, r, State::Failed, Some(format!("it didn't land within {}s (watch.timeout_secs)", timeout))).await?;
+                    if now - since >= grace {
+                        // Said object by object where the provider says it (Kubernetes' reason).
+                        let why = degraded_objects(d, &r).await.unwrap_or(why);
+                        return failed(d, r, format!("it is Degraded: {why}")).await;
+                    }
+                    r.message = Some(format!("Degraded: {why} (it fails in {}s unless it recovers)", grace - (now - since)));
+                    store::update_release(st, &r, State::Delivering).await?;
+                    store::schedule(st, id, now + 5).await?;
+                }
+                // Still progressing as its provider sees it (Kubernetes hasn't called the rollout
+                // stuck): a slow rollout isn't a failed one. It waits, up to three times its timeout.
+                Ok((Landed::No, view)) if now - committed_at > timeout && now - committed_at <= timeout * 3 && view.get("health").and_then(Value::as_str) == Some("Progressing") => {
+                    r.provider = view;
+                    r.message = Some(format!("still progressing past its {timeout}s; it waits up to {}s while it does", timeout * 3));
+                    store::update_release(st, &r, State::Delivering).await?;
+                    store::schedule(st, id, now + 5).await?;
+                }
+                Ok((Landed::No, view)) if now - committed_at > timeout => {
+                    let progressing = view.get("health").and_then(Value::as_str) == Some("Progressing");
+                    r.provider = view;
+                    let why = if progressing { format!("it didn't land within {}s, still progressing (three times watch.timeout_secs)", timeout * 3) } else { format!("it didn't land within {timeout}s (watch.timeout_secs)") };
+                    failed(d, r, why).await?;
                 }
                 Ok((Landed::No, view)) => {
                     r.provider = view;
@@ -1291,10 +1358,18 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 }
                 // The provider never held it: nothing changed there, and git goes back too.
                 Err(e) if now - committed_at > timeout && delivered.is_none() => {
-                    let undone = give_back(d, &r, &format!("it never reached the provider: {e}")).await;
-                    finish(d, r, State::Failed, Some(format!("it never reached the provider within {timeout}s: {e}; {undone}"))).await?;
+                    refused(d, r, format!("it never reached the provider within {timeout}s: {e}")).await?;
                 }
-                Err(e) if now - committed_at > timeout => finish(d, r, State::Failed, Some(e)).await?,
+                // It held it, and can't be asked since: what it did is unknown, and nothing is
+                // done blind. It's judged when the provider answers; past `unreachable_secs`, held.
+                Err(e) if now - committed_at > unreachable => {
+                    hold(d, r, &format!("the provider couldn't be asked for {unreachable}s: {e}"), "what it did is unknown").await?;
+                }
+                Err(e) if now - committed_at > timeout => {
+                    r.message = Some(format!("the provider can't be asked ({e}): it is judged when it answers"));
+                    store::update_release(st, &r, State::Delivering).await?;
+                    store::schedule(st, id, now + 30).await?;
+                }
                 Err(e) => {
                     r.message = Some(e);
                     store::update_release(st, &r, State::Delivering).await?;
@@ -1316,9 +1391,19 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Commits a release to its environment's release repository; the commit's id. A commit made
-/// before a crash is found by its trailer, not made again.
-async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
+/// What committing a release came to.
+enum Committed {
+    /// Its commit, what it changes of the app's secrets (§3.5), and what it runs that a revert
+    /// couldn't undo (§8.1).
+    Done(String, Option<String>, Option<String>),
+    /// Refused by its preflight (§8.1), why: nothing changed.
+    Refused(String),
+}
+
+/// Commits a release to its environment's release repository, once its preflight finds nothing
+/// against it: the commit, and what it changes of the app's secrets. A commit made before a crash
+/// is found by its trailer, not made again.
+async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
     let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let rr = env.release_repo.clone();
@@ -1328,7 +1413,7 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
         crate::rt::blocking(move || hosted.find_trailer(&rr.repo, &rr.branch, repo::RELEASE_TRAILER, &id.to_string())).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?
     };
     if let Some(sha) = found {
-        return Ok(sha);
+        return Ok(Committed::Done(sha, None, None));
     }
     let (hosted, release_path, values_path) = (d.hosted.clone(), repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name));
     let prior = {
@@ -1343,10 +1428,22 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
     };
     let enabled = match r.kind {
         Kind::Disable => false,
-        Kind::Config => prior.as_ref().is_some_and(|p| p.enabled),
+        Kind::Config | Kind::Revert => prior.as_ref().is_some_and(|p| p.enabled),
         Kind::Deploy | Kind::Rollback | Kind::Enable => true,
     };
-    let file = repo::release_json(&a, &env.name, r, prior.as_ref(), enabled);
+    let mut file = repo::release_json(&a, &env.name, r, prior.as_ref(), enabled);
+    // The app's secrets, at their versions now (§3.5): what runs gets these until a release pins
+    // others, a rollback included.
+    let pinned = crate::secrets::of(&d.hub).current(&crate::secrets::Scope::of(&a.name, &env.name)).await.map_err(|e| format!("the app's secrets: {e:#}"))?;
+    file.secrets = crate::secrets::versions_text(pinned.iter().map(|(n, v)| (n.as_str(), *v)));
+    let changed = secrets_changed(prior.as_ref().map_or("", |p| p.secrets.as_str()), &file.secrets);
+    // Checked before it changes anything: its secrets, its images, and on KilnCD its render and
+    // its cluster's dry run (§8.1).
+    let reg = store::registration(&d.hub.store, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+    let found = super::preflight::check(d, &a, &env, &reg, &file, r.values.as_deref()).await;
+    if let Some(why) = found.refused {
+        return Ok(Committed::Refused(why));
+    }
     let mut changes = vec![
         Change { path: repo::app_file(&rr, &a), content: Some(repo::app_yaml(&a).map_err(|e| format!("{e:#}"))?) },
         Change { path: release_path, content: Some(repo::encode(&file).map_err(|e| format!("{e:#}"))?) },
@@ -1354,7 +1451,18 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<String, String> {
     if let Some(v) = &r.values {
         changes.push(Change { path: values_path, content: Some(v.clone().into_bytes()) });
     }
-    commit_files(d, &env, changes, repo::message(&a, &env.name, r), &r.requested_by).await
+    let sha = commit_files(d, &env, changes, repo::message(&a, &env.name, r), &r.requested_by).await?;
+    Ok(Committed::Done(sha, Some(changed), found.irreversible))
+}
+
+/// What a release changes of the app's secrets, from the versions the one before pinned to its
+/// own: each set (`API_KEY v1`) or deleted (`DB_PASSWORD deleted`).
+fn secrets_changed(before: &str, after: &str) -> String {
+    let read = |t: &str| crate::secrets::parse_versions(t).unwrap_or_default().into_iter().collect::<BTreeMap<String, u32>>();
+    let (before, after) = (read(before), read(after));
+    let mut out: Vec<String> = after.iter().filter(|(n, v)| before.get(*n) != Some(*v)).map(|(n, v)| format!("{n} v{v}")).collect();
+    out.extend(before.keys().filter(|n| !after.contains_key(*n)).map(|n| format!("{n} deleted")));
+    out.join(", ")
 }
 
 /// What a release's commit holds for its registration.
@@ -1385,7 +1493,8 @@ pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, versi
         return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(internal)?;
-    let then = kilncd::definition(a, env, &reg, &file, &commit, &url).map_err(bad)?;
+    let chart = kilncd::git_chart(&cd, &a.package, version).await;
+    let then = kilncd::definition(a, env, &reg, &file, &commit, &url, chart).map_err(bad)?;
     futures::try_join!(cd.render_definition(now), cd.render_definition(then)).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))
 }
 
@@ -1440,7 +1549,8 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
         return Ok(());
     }
     let url = d.hosted.url(&env.release_repo.repo).map_err(|e| format!("{e:#}"))?;
-    let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url).map_err(Undelivered::Refused)?;
+    let chart = kilncd::git_chart(&cd, &a.package, file.version.as_deref().unwrap_or_default()).await;
+    let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url, chart).map_err(Undelivered::Refused)?;
     kilncd::deliver(&d.hub, &cd, &actor, &def).await
 }
 
@@ -1465,9 +1575,10 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
             return Ok((Landed::Yes, json!({ "application": app_name, "message": "registered and enabled; no version deployed yet" })));
         };
         // An Application that isn't this release's (lost to a restart, or replaced by hand) is
-        // written again.
-        let stamped = current.as_ref().and_then(|c| c.pointer("/metadata/annotations/kiln.dev~1release").and_then(Value::as_str).map(str::to_owned));
-        if stamped.as_deref() != Some(r.id.to_string().as_str()) {
+        // written again. Its commit says whose it is: a revert's (or a commit kiln didn't make)
+        // names in its release.json the release it puts back, not itself.
+        let stamped = current.as_ref().and_then(|c| c.pointer("/metadata/annotations/kiln.dev~1commit").and_then(Value::as_str).map(str::to_owned));
+        if stamped.as_deref() != Some(commit) {
             return match deliver(d, r).await {
                 Ok(()) => Ok((Landed::No, json!({ "application": app_name, "message": "written again" }))),
                 Err(Undelivered::Refused(why)) => Ok((Landed::Refused(why), json!({ "application": app_name }))),
@@ -1475,7 +1586,8 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
             };
         }
         let current = current.unwrap_or(Value::Null);
-        return Ok(argocd::landed(&current, r.id, &version));
+        // Delivered as its release.json says: a revert names the release it puts back.
+        return Ok(argocd::landed(&current, file.release, &version));
     }
     let cd = crate::cd::get().ok_or("KilnCD isn't running")?;
     let id = kilncd::app_id(&a, &env.name);
@@ -1516,10 +1628,13 @@ async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String
         && let Some(mut reg) = store::registration(st, &r.app, &r.environment).await?
     {
         let before = reg.running.replace(r.id);
+        // What runs is a release that landed: nothing here needs a person any more.
+        reg.degraded = None;
         match r.kind {
             Kind::Disable => reg.enabled = false,
             Kind::Deploy | Kind::Rollback | Kind::Enable => reg.enabled = true,
-            Kind::Config => {}
+            // A revert puts back what ran, enabled as it was.
+            Kind::Config | Kind::Revert => {}
         }
         store::put_registration(st, &reg).await?;
         if let Some(prev) = before.filter(|p| *p != r.id)
@@ -1578,6 +1693,13 @@ async fn promote_onward(d: &Deploy, landed: &Release) {
     };
     let who = Who { name: landed.requested_by.clone(), agent: false };
     for env in next {
+        // A registration that needs a person is theirs to release to.
+        if let Ok(Some(reg)) = store::registration(st, &landed.app, &env).await
+            && let Some(why) = reg.degraded
+        {
+            tracing::info!(app = %landed.app, from = %landed.environment, to = %env, %why, "deploy: a version doesn't promote by itself where a person is needed");
+            continue;
+        }
         let ask = Ask { app: landed.app.clone(), environment: env.clone(), promote_from: Some(landed.environment.clone()), idempotency_key: Some(format!("promote:{}:{env}", landed.id)), ..Ask::default() };
         match Box::pin(release(d, &who, ask)).await {
             Ok(r) => tracing::info!(app = %landed.app, from = %landed.environment, to = %env, release = r.id, "deploy: a version promoted by itself"),
@@ -1591,6 +1713,155 @@ const REVERT_TRAILER: &str = "Kiln-Reverts";
 
 /// What a release that couldn't land leaves in git: kiln's own commit is undone; a commit kiln
 /// didn't make is someone's, and stays.
+/// What's Degraded of a release's registration, object by object as its provider says it: the
+/// evidence it failed on (`Deployment web: ReplicaSet "web-6f9d" has timed out progressing`).
+async fn degraded_objects(d: &Deploy, r: &Release) -> Option<String> {
+    let a = store::app(&d.hub.store, &r.app).await.ok()??;
+    let env = store::environment(&d.hub.store, &r.environment).await.ok()??;
+    let read = super::reads::read(d, &a, &env, super::reads::Read::Resources).await.ok()?;
+    let text = |o: &Value, k: &str| o.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_owned);
+    let objects: Vec<String> = read
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|o| o.get("health").and_then(Value::as_str) == Some("Degraded"))
+        .map(|o| {
+            let said = text(o, "message").or_else(|| text(o, "why")).unwrap_or_else(|| "Degraded".to_owned());
+            format!("{} {}: {said}", text(o, "kind").unwrap_or_default(), text(o, "name").unwrap_or_default())
+        })
+        .collect();
+    (!objects.is_empty()).then(|| objects.join("; "))
+}
+
+/// What follows a release that failed after its commit (§8.1).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Aftermath {
+    /// What ran before is put back: its commit reverted, as a release followed until it lands.
+    Revert,
+    /// It stays as it is, for a person: why. The registration says it needs one.
+    Hold(String),
+}
+
+/// What follows a release that failed after its commit. A rollback isn't reverted (that would bring
+/// back what it rolled back from), nor a revert (kiln doesn't revert its own way back), nor a commit
+/// kiln didn't make (git is its author's), nor one asked not to be.
+pub(super) fn aftermath(r: &Release) -> Aftermath {
+    match (r.origin, r.kind) {
+        (Origin::Git, _) => Aftermath::Hold("it is a commit kiln didn't make: git is its author's".into()),
+        (_, Kind::Revert) => Aftermath::Hold(format!("putting back what ran before release {} didn't land either", r.reverts.unwrap_or_default())),
+        (_, Kind::Rollback) => Aftermath::Hold("it is a rollback: what it rolled back from isn't brought back".into()),
+        _ if r.no_revert => Aftermath::Hold("it was asked not to be reverted".into()),
+        _ if r.irreversible.is_some() => Aftermath::Hold(format!("it runs {} on its way in, which a revert couldn't undo", r.irreversible.as_deref().unwrap_or_default())),
+        _ => Aftermath::Revert,
+    }
+}
+
+/// A release that failed after its commit, for `why`: what ran before put back (a revert, followed
+/// until it lands), or the release held as it is for a person.
+async fn failed(d: &Deploy, mut r: Release, why: String) -> anyhow::Result<()> {
+    if let Aftermath::Hold(reason) = aftermath(&r) {
+        return hold(d, r, &why, &reason).await;
+    }
+    match revert(d, &r, &why).await {
+        Ok((Some(sha), _)) => match start_revert(d, &r, &sha).await {
+            Ok(back) => {
+                r.reverted_by = Some(back.id);
+                finish(d, r, State::Failed, Some(format!("{why}; release {} puts back what ran before", back.id))).await
+            }
+            Err(e) => hold(d, r, &why, &format!("its commit is reverted in {}, but putting that through failed: {e:#}", short(&sha))).await,
+        },
+        // Someone changed its files since: what runs is theirs.
+        Ok((None, _)) => finish(d, r, State::Failed, Some(format!("{why}; nothing of its commit was left to revert"))).await,
+        Err(e) => hold(d, r, &why, &format!("its commit couldn't be reverted ({e})")).await,
+    }
+}
+
+/// A release its provider refused, or never got: nothing of it was applied, and git goes back
+/// with it. A revert refused isn't reverted, and a rollback refused leaves running what it rolled
+/// back from: both need a person.
+async fn refused(d: &Deploy, r: Release, why: String) -> anyhow::Result<()> {
+    if r.kind == Kind::Revert {
+        return hold(d, r, &why, "putting back what ran before was refused too").await;
+    }
+    let undone = give_back(d, &r, &why).await;
+    let message = format!("{why}; {undone}");
+    if r.kind == Kind::Rollback {
+        degrade(d, &r, &format!("release {} failed: {message}; what it rolled back from runs on", r.id)).await?;
+    }
+    finish(d, r, State::Failed, Some(message)).await
+}
+
+/// Fails a release held as it is: the registration says it needs a person, and why.
+async fn hold(d: &Deploy, r: Release, why: &str, reason: &str) -> anyhow::Result<()> {
+    let message = format!("{why}; held: {reason}");
+    degrade(d, &r, &format!("release {} failed: {message}", r.id)).await?;
+    finish(d, r, State::Failed, Some(message)).await
+}
+
+/// Marks a release's registration as needing a person, for `why`.
+async fn degrade(d: &Deploy, r: &Release, why: &str) -> anyhow::Result<()> {
+    let st = &d.hub.store;
+    if let Some(mut reg) = store::registration(st, &r.app, &r.environment).await? {
+        reg.degraded = Some(why.to_owned());
+        store::put_registration(st, &reg).await?;
+    }
+    Ok(())
+}
+
+/// The release that puts back what ran before `failed`, whose commit `sha` reverted: delivered and
+/// followed as any release, so it says whether what ran before runs again. Asked for once however
+/// often this runs (a restart between the revert and its record).
+async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result<Release> {
+    let st = &d.hub.store;
+    let a = store::app(st, &failed.app).await?.ok_or_else(|| anyhow::anyhow!("no app {}", failed.app))?;
+    let env = store::environment(st, &failed.environment).await?.ok_or_else(|| anyhow::anyhow!("no environment {}", failed.environment))?;
+    let running = store::registration(st, &failed.app, &failed.environment).await?.and_then(|reg| reg.running);
+    let file = release_file_at(d, &a, &env, sha).await.ok();
+    let now = crate::util::now_unix();
+    let back = Release {
+        id: 0,
+        app: failed.app.clone(),
+        environment: failed.environment.clone(),
+        kind: Kind::Revert,
+        state: State::Delivering,
+        origin: Origin::Kiln,
+        version: file.as_ref().and_then(|f| f.version.clone()),
+        artifacts: file.map(|f| f.artifacts).unwrap_or_default(),
+        values: None,
+        commit: Some(sha.to_owned()),
+        requested_by: "kiln".to_owned(),
+        message: Some(format!("putting back what ran before release {}", failed.id)),
+        rollback_of: running,
+        rolled_back_by: None,
+        keep: true,
+        provider: Value::Null,
+        gates: Vec::new(),
+        approvals: Vec::new(),
+        promoted_from: None,
+        idempotency_key: Some(format!("revert:{}", failed.id)),
+        created_at: now,
+        committed_at: Some(now),
+        ended_at: None,
+        secrets: None,
+        no_revert: false,
+        reverts: Some(failed.id),
+        reverted_by: None,
+        irreversible: None,
+    };
+    let (back, new) = store::insert_release(st, &back).await?;
+    if new {
+        // Not handed over now, it is when it's followed: `follow` delivers what isn't there.
+        if let Err(e) = deliver(d, &back).await {
+            tracing::warn!(release = back.id, error = %e, "deploy: handing a revert to its provider failed; following it hands it again");
+        }
+        store::schedule(st, back.id, now + 2).await?;
+        audit(d, "kiln", "deploy.release", format!("revert of release {} in {}: release {}", failed.id, back.environment, back.id)).await;
+        emit_release(d, &back);
+    }
+    Ok(back)
+}
+
 async fn give_back(d: &Deploy, r: &Release, why: &str) -> String {
     if r.origin == Origin::Git {
         return "it is a commit kiln didn't make, so git keeps it".to_owned();
@@ -1598,8 +1869,8 @@ async fn give_back(d: &Deploy, r: &Release, why: &str) -> String {
     undo(d, r, why).await
 }
 
-/// Puts git and the provider back after a release that won't land (refused, or cancelled while
-/// delivering): its commit is reverted, and the provider handed what git says then. Nothing is
+/// Puts git and the provider back after a release that won't land (failed, refused, or cancelled
+/// while delivering): its commit is reverted, and the provider handed what git says then. Nothing is
 /// deleted on the way: a registration git says is disabled keeps its objects. What was done, as
 /// the release's message says it.
 async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
@@ -1733,6 +2004,11 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
                     created_at: now,
                     committed_at: Some(now),
                     ended_at: None,
+                    secrets: None,
+                    no_revert: false,
+                    reverts: None,
+                    reverted_by: None,
+                    irreversible: None,
                 };
                 let (r, _) = store::insert_release(st, &r).await?;
                 if let Err(e) = deliver(d, &r).await {
@@ -1827,6 +2103,65 @@ mod tests {
         assert_eq!(onward(&envs, &registered, "staging"), ["production"], "eu promotes by hand; canary doesn't run the app");
         assert!(onward(&envs, &registered, "production").is_empty(), "nothing comes after production");
         assert_eq!(serde_json::to_value(super::super::model::Gates::default()).ok(), Some(json!({})), "`manual`, the default, isn't written");
+    }
+
+    fn failed_release(kind: Kind, origin: Origin) -> Release {
+        Release {
+            id: 42,
+            app: "web".into(),
+            environment: "production".into(),
+            kind,
+            state: State::Delivering,
+            origin,
+            version: Some("1.5.0".into()),
+            artifacts: BTreeMap::new(),
+            values: None,
+            commit: Some("abc".into()),
+            requested_by: "ada".into(),
+            message: None,
+            rollback_of: None,
+            rolled_back_by: None,
+            keep: false,
+            provider: Value::Null,
+            gates: Vec::new(),
+            approvals: Vec::new(),
+            promoted_from: None,
+            idempotency_key: None,
+            created_at: 0,
+            committed_at: Some(0),
+            ended_at: None,
+            secrets: None,
+            no_revert: false,
+            reverts: None,
+            reverted_by: None,
+            irreversible: None,
+        }
+    }
+
+    /// §8.1: what ran before comes back after a release that failed, unless that would bring back
+    /// what someone chose to leave, undo kiln's own way back, or overrule git or the person who
+    /// asked: those are held for a person.
+    #[test]
+    fn a_failed_release_is_reverted_unless_that_would_make_things_worse() {
+        let held = |r: &Release| matches!(aftermath(r), Aftermath::Hold(_));
+        assert_eq!(aftermath(&failed_release(Kind::Deploy, Origin::Api)), Aftermath::Revert);
+        assert_eq!(aftermath(&failed_release(Kind::Config, Origin::Api)), Aftermath::Revert, "a secrets or values release too");
+        assert_eq!(aftermath(&failed_release(Kind::Enable, Origin::Api)), Aftermath::Revert);
+        assert!(held(&failed_release(Kind::Rollback, Origin::Api)), "a rollback doesn't bring back what it rolled back from");
+        assert!(held(&failed_release(Kind::Revert, Origin::Kiln)), "kiln doesn't revert its own way back");
+        assert!(held(&failed_release(Kind::Deploy, Origin::Git)), "git is its author's");
+        let asked = Release { no_revert: true, ..failed_release(Kind::Config, Origin::Api) };
+        assert!(matches!(aftermath(&asked), Aftermath::Hold(why) if why.contains("asked not to be reverted")));
+        let migrates = Release { irreversible: Some("Job web-migrate".into()), ..failed_release(Kind::Deploy, Origin::Api) };
+        assert!(matches!(aftermath(&migrates), Aftermath::Hold(why) if why.contains("Job web-migrate")), "a migration that ran isn't undone by putting the code back");
+    }
+
+    #[test]
+    fn a_release_says_what_it_changes_of_the_secrets() {
+        assert_eq!(secrets_changed("", "API_KEY@1,DB_PASSWORD@2"), "API_KEY v1, DB_PASSWORD v2");
+        assert_eq!(secrets_changed("API_KEY@1,DB_PASSWORD@2", "API_KEY@1,DB_PASSWORD@3,TOKEN@1"), "DB_PASSWORD v3, TOKEN v1");
+        assert_eq!(secrets_changed("API_KEY@1,DB_PASSWORD@2", "API_KEY@1"), "DB_PASSWORD deleted");
+        assert_eq!(secrets_changed("API_KEY@1", "API_KEY@1"), "", "nothing changed");
     }
 
     #[test]

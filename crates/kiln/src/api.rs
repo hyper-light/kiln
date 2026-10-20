@@ -6,7 +6,9 @@
 //! expiry under the admin token; job tokens are HMACs of the job id.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -166,7 +168,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     // A peered cluster's address (`peer-<slug>.<domain>`): every path there is the peer's.
     if let Some((f, slug)) = crate::peers::route(&hub, &req) {
         let secure = is_secure(&hub, &req);
-        return Ok(f.serve(&slug, req, secure).await);
+        return Ok(boxed(|| f.serve(&slug, req, secure)).await);
     }
     // A peered cluster under this one's own address (`/.kiln-peer/<slug>/`, kiln reached by
     // address): its API forwarded, its pages this cluster's app (in the browser) drawing it.
@@ -175,7 +177,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return Ok(crate::ui::shell(&req));
         }
         let secure = is_secure(&hub, &req);
-        return Ok(f.serve_path(&slug, req, secure).await);
+        return Ok(boxed(|| f.serve_path(&slug, req, secure)).await);
     }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
@@ -186,12 +188,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     if pages_site(&hub).is_some_and(|site| asks_for(&req, &site)) {
         return match (&method, s.as_slice()) {
             (&Method::GET | &Method::HEAD, ["v", "_", "fonts", name]) => Ok(page_font(name)),
-            (&Method::GET | &Method::HEAD, ["v", id, ..]) => page(&hub, id, &req).await,
+            (&Method::GET | &Method::HEAD, ["v", id, ..]) => boxed(|| page(&hub, id, &req)).await,
             // An agent's app opened on a person's device (`crate::harness::opened`): its link's
             // code, then whatever its device asks of it.
             (&Method::GET, ["o", code]) => Ok(crate::harness::opened::enter(&hub, code)),
             _ => match crate::harness::opened::of_request(&hub, &req) {
-                crate::harness::opened::Holds::Open(o) => Ok(crate::harness::opened::forward(&hub, &o, req).await),
+                crate::harness::opened::Holds::Open(o) => Ok(boxed(|| crate::harness::opened::forward(&hub, &o, req)).await),
                 crate::harness::opened::Holds::Ended => Ok(crate::harness::opened::ended()),
                 crate::harness::opened::Holds::Nothing => Err(err(StatusCode::NOT_FOUND, "not found")),
             },
@@ -202,11 +204,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     // of its own (an upload streams for as long as it takes).
     if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
         let h = Arc::clone(&hub);
-        return crate::rt::spawn(async move { crate::ci::registry::proxy::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
+        return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::proxy::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
     }
     if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
         let h = Arc::clone(&hub);
-        return crate::rt::spawn(async move { crate::ci::registry::handle(&h, req).await }).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
+        return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
     }
 
     // Open routes (their own auth, if any).
@@ -216,7 +218,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             // user's session or token, whose operations the route table judges one by one.
             let caller = match crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers())) {
                 // An agent session's own token: that agent, acting for whoever started it.
-                Some(actor) => match crate::mcp::token_caller(&hub, &actor).await {
+                Some(actor) => match boxed(|| crate::mcp::token_caller(&hub, &actor)).await {
                     Some(Ok(c)) => Some(c),
                     Some(Err(why)) => return Err(err(StatusCode::UNAUTHORIZED, why)),
                     None => {
@@ -225,19 +227,19 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                         Some(c)
                     }
                 },
-                None => caller_of(&hub, req.headers()).await,
+                None => boxed(|| caller_of(&hub, req.headers())).await,
             };
             return match caller {
-                Some(caller) => crate::mcp::http(&hub, caller, req.into_body()).await.map_err(|(c, m)| err(c, m)),
+                Some(caller) => boxed(|| crate::mcp::http(&hub, caller, req.into_body())).await.map_err(|(c, m)| err(c, m)),
                 None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
             };
         }
-        (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
+        (&Method::POST, ["api", "auth", "login"]) => return boxed(|| login(&hub, req)).await,
         // SSO with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
-        (&Method::GET, ["api", "auth", "sso"]) => return Ok(srv::json(StatusCode::OK, &crate::authz::sso::providers(&hub).await)),
+        (&Method::GET, ["api", "auth", "sso"]) => return Ok(srv::json(StatusCode::OK, &boxed(|| crate::authz::sso::providers(&hub)).await)),
         (&Method::GET, ["api", "auth", provider, "start"]) => {
             let q = srv::query(&req);
-            return match crate::authz::sso::start(&hub, provider, q.get("return").map(String::as_str)).await {
+            return match boxed(|| crate::authz::sso::start(&hub, provider, q.get("return").map(String::as_str))).await {
                 Ok(to) => Ok(srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &to)),
                 Err((c, m)) => Err(err(c, m)),
             };
@@ -245,7 +247,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "auth", provider, "callback"]) => {
             let q = srv::query(&req);
             let (code, state) = (q.get("code").cloned().unwrap_or_default(), q.get("state").cloned().unwrap_or_default());
-            return match crate::authz::sso::callback(&hub, provider, &code, &state).await {
+            return match boxed(|| crate::authz::sso::callback(&hub, provider, &code, &state)).await {
                 Ok((session, _, back)) => {
                     let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &back);
                     Ok(srv::with_header(r, header::SET_COOKIE, &cookie_for(&session, is_secure(&hub, &req))))
@@ -253,41 +255,41 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 Err((c, m)) => Err(err(c, m)),
             };
         }
-        (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req).await),
-        (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
-        (&Method::POST, ["api", "auth", "password"]) => return login_password(&hub, req).await,
+        (&Method::GET, ["api", "auth", "otp"]) => return Ok(boxed(|| otp(&hub, &req)).await),
+        (&Method::GET, ["api", "auth", "methods"]) => return Ok(boxed(|| auth_methods(&hub)).await),
+        (&Method::POST, ["api", "auth", "password"]) => return boxed(|| login_password(&hub, req)).await,
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
-        (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers()).await),
-        (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
-        (&Method::POST, ["api", "agents", "instance"]) => return enroll_instance(&hub, req).await,
+        (&Method::GET, ["api", "me"]) => return Ok(boxed(|| me(&hub, req.headers())).await),
+        (&Method::POST, ["api", "agents", "enroll"]) => return boxed(|| enroll(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "instance"]) => return boxed(|| enroll_instance(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
-        (&Method::POST, ["api", "join-requests"]) => return create_join(&hub, req).await,
+        (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
         (&Method::GET, ["api", "join-requests", id]) => {
             let id = (*id).to_owned();
-            return poll_join(&hub, &id, req.headers()).await;
+            return boxed(|| poll_join(&hub, &id, req.headers())).await;
         }
         (&Method::GET, ["api", "join", "invited"]) => return Ok(join_invited(&hub, &req)),
-        (&Method::GET, ["api", "jobs", id, "source"]) => return job_source(&hub, id, req.headers()).await,
+        (&Method::GET, ["api", "jobs", id, "source"]) => return boxed(|| job_source(&hub, id, req.headers())).await,
         (&Method::PUT, ["api", "jobs", id, "artifacts", "upload"]) => {
             let id = (*id).to_owned();
-            return put_artifacts(&hub, &id, req).await;
+            return boxed(|| put_artifacts(&hub, &id, req)).await;
         }
-        (&Method::POST, ["api", "hooks", "github"]) => return github_hook(&hub, req).await,
+        (&Method::POST, ["api", "hooks", "github"]) => return boxed(|| github_hook(&hub, req)).await,
         // The GitHub App's events and GitHub's return from making it (W14-R10): open, they carry
         // their own proof (a signature; a state kiln handed out).
-        (&Method::POST, ["api", "hooks", "github", "app"]) => return crate::githost::web::webhook(&hub, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "hooks", "github", "app"]) => return boxed(|| crate::githost::web::webhook(&hub, req)).await.map_err(|(c, m)| err(c, m)),
         // GitLab's and Bitbucket's webhooks, checked with their secrets (docs/ci.md W23-R04, R05).
-        (&Method::POST, ["api", "hooks", "gitlab"]) => return crate::githost::hooks::gitlab(&hub, req).await.map_err(|(c, m)| err(c, m)),
-        (&Method::POST, ["api", "hooks", "bitbucket"]) => return crate::githost::hooks::bitbucket(&hub, req).await.map_err(|(c, m)| err(c, m)),
-        (&Method::GET, ["api", "ci", "github", "app", "callback"]) => return crate::githost::web::callback(&hub, &req).await.map_err(|(c, m)| err(c, m)),
-        (&Method::GET, ["api", "shared", "plans", token]) => return shared_plan(&hub, token).await,
+        (&Method::POST, ["api", "hooks", "gitlab"]) => return boxed(|| crate::githost::hooks::gitlab(&hub, req)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "hooks", "bitbucket"]) => return boxed(|| crate::githost::hooks::bitbucket(&hub, req)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ci", "github", "app", "callback"]) => return boxed(|| crate::githost::web::callback(&hub, &req)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "shared", "plans", token]) => return boxed(|| shared_plan(&hub, token)).await,
         (&Method::GET | &Method::HEAD, ["api", "sync", "blobs", hash]) => {
             let hash = (*hash).to_owned();
             return sync_blob_get(&hub, &hash, &req);
         }
         (&Method::PUT, ["api", "sync", "blobs", hash]) => {
             let hash = (*hash).to_owned();
-            return sync_blob_put(&hub, &hash, req).await;
+            return boxed(|| sync_blob_put(&hub, &hash, req)).await;
         }
         (&Method::GET, ["api", "sync", "bundles", batch]) => {
             let batch = (*batch).to_owned();
@@ -295,21 +297,21 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         (&Method::PUT, ["api", "sync", "bundles", batch]) => {
             let batch = (*batch).to_owned();
-            return sync_bundle_put(&hub, &batch, req).await;
+            return boxed(|| sync_bundle_put(&hub, &batch, req)).await;
         }
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
-        (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
+        (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
-        (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
-        (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
-        (&Method::GET, ["dl", "kiln", target, build]) => return download_build(&hub, target, build).await,
+        (&Method::GET, ["dl", "kiln"]) => return boxed(download_binary).await,
+        (&Method::GET, ["dl", "kiln", target]) => return boxed(|| download_for(&hub, target)).await,
+        (&Method::GET, ["dl", "kiln", target, build]) => return boxed(|| download_build(&hub, target, build)).await,
         // A machine building kiln itself (`crate::fleet`), with its build's token.
-        (&Method::GET, ["api", "updates", "jobs", id, "source"]) => return build_source(&hub, id, req.headers()).await,
+        (&Method::GET, ["api", "updates", "jobs", id, "source"]) => return boxed(|| build_source(&hub, id, req.headers())).await,
         (&Method::POST, ["api", "updates", "jobs", id, "binary"]) => {
             let id = (*id).to_owned();
             let q = srv::query(&req);
-            return build_binary(&hub, &id, &q, req).await;
+            return boxed(|| build_binary(&hub, &id, &q, req)).await;
         }
         (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
         (&Method::GET, ["install.ps1"]) => return Ok(install_powershell(&hub)),
@@ -322,12 +324,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         // With an address of their own, pages are served only there.
         (&Method::GET | &Method::HEAD, ["v", ..]) if hub.cfg.server.pages_url.is_some() => return Ok(to_pages(&hub, &req)),
         (&Method::GET | &Method::HEAD, ["v", "_", "fonts", name]) => return Ok(page_font(name)),
-        (&Method::GET | &Method::HEAD, ["v", id, ..]) => return page(&hub, id, &req).await,
+        (&Method::GET | &Method::HEAD, ["v", id, ..]) => return boxed(|| page(&hub, id, &req)).await,
         _ => {}
     }
     // CI's open routes: runtime services, job ID tokens, the OIDC issuer (docs/ci.md §2.6).
     if crate::ci::api::is_open(&s) {
-        return match crate::ci::api::open(&hub, &s, req).await {
+        return match boxed(|| crate::ci::api::open(&hub, &s, req)).await {
             Some(r) => r.map_err(|(c, m)| err(c, m)),
             None => Err(err(StatusCode::NOT_FOUND, "not found")),
         };
@@ -335,23 +337,31 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     let is_api = s.first() == Some(&"api");
     if !is_api {
-        return Ok(crate::uiserver::serve(req).await);
+        return Ok(boxed(|| crate::uiserver::serve(req)).await);
     }
-    let Some(caller) = caller_of(&hub, req.headers()).await else {
+    let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
     if method == Method::GET || method == Method::HEAD {
-        return authorized(hub, caller, req).await;
+        return boxed(|| authorized(hub, caller, req)).await;
     }
     // A change is audited (W19-R05): one row for the request, refused or not, which takes what
     // its handlers record on the way.
     let (who, q, ip) = (caller.clone(), srv::query(&req), srv::remote_ip(&req));
     let h = Arc::clone(&hub);
-    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, authorized(hub, caller, req), |r: &R| match r {
+    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, boxed(|| authorized(hub, caller, req)), |r: &R| match r {
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.0.as_u16(),
     })
     .await
+}
+
+/// A future made and boxed in a frame of its own. A debug build gives each temporary of an async
+/// function its own stack slot, so a router awaiting many futures inline made one of every future
+/// it could await, in its poll frame: `authorized`'s was 772 KiB, and a request that reached out
+/// (a webhook's verify) overflowed a shard's 2 MiB stack. Boxed, each is a pointer there.
+pub(crate) fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>> {
+    Box::pin(make())
 }
 
 /// The API past authentication: everyone but the owner is held to the route table (W10-R05).
@@ -362,169 +372,170 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
     let s: Vec<&str> = seg.iter().map(String::as_str).collect();
     let q = srv::query(&req);
     if !caller.is_owner() {
-        crate::authz::gate::check(&hub, &caller, &method, &s, &q).await.map_err(|(c, m)| err(c, m))?;
+        boxed(|| crate::authz::gate::check(&hub, &caller, &method, &s, &q)).await.map_err(|(c, m)| err(c, m))?;
     }
     let mut req = req;
     req.extensions_mut().insert(caller.clone());
     if matches!(s.get(1), Some(&("users" | "grants" | "roles" | "tokens"))) {
-        return match crate::authz::api::route(&hub, &caller, &method, &s, &q, req).await {
+        return match boxed(|| crate::authz::api::route(&hub, &caller, &method, &s, &q, req)).await {
             Some(r) => r.map_err(|(c, m)| err(c, m)),
             None => Err(err(StatusCode::NOT_FOUND, "not found")),
         };
     }
     match (&method, s.as_slice()) {
         (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION")))),
-        (&Method::GET, ["api", "peers"]) => crate::peers::list(&hub).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "peers"]) => boxed(|| crate::peers::list(&hub)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "peers", "open"]) => crate::peers::openable(&hub).map_err(|(c, m)| err(c, m)),
-        (&Method::POST, ["api", "peers"]) => crate::peers::register(&hub, &caller.name, req).await.map_err(|(c, m)| err(c, m)),
-        (&Method::POST, ["api", "peers", "authorize"]) => crate::peers::authorize(&hub, &caller.name, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "peers"]) => boxed(|| crate::peers::register(&hub, &caller.name, req)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "peers", "authorize"]) => boxed(|| crate::peers::authorize(&hub, &caller.name, req)).await.map_err(|(c, m)| err(c, m)),
         (&Method::POST, ["api", "peers", id, "complete"]) => {
             let id = (*id).to_owned();
-            crate::peers::complete(&hub, &caller.name, &id, req).await.map_err(|(c, m)| err(c, m))
+            boxed(|| crate::peers::complete(&hub, &caller.name, &id, req)).await.map_err(|(c, m)| err(c, m))
         }
-        (&Method::POST, ["api", "peers", id, "challenge"]) => crate::peers::rechallenge(&hub, &caller.name, id).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "peers", id, "challenge"]) => boxed(|| crate::peers::rechallenge(&hub, &caller.name, id)).await.map_err(|(c, m)| err(c, m)),
         (&Method::POST, ["api", "peers", id, "frame"]) => {
             let host = srv::header_str(&req, &header::HOST).unwrap_or_default().to_owned();
             crate::peers::frame(&hub, &caller, id, &host, is_secure(&hub, &req)).map_err(|(c, m)| err(c, m))
         }
         (&Method::PUT, ["api", "peers", id]) => {
             let id = (*id).to_owned();
-            crate::peers::readdress(&hub, &caller.name, &id, req).await.map_err(|(c, m)| err(c, m))
+            boxed(|| crate::peers::readdress(&hub, &caller.name, &id, req)).await.map_err(|(c, m)| err(c, m))
         }
-        (&Method::DELETE, ["api", "peers", id]) => crate::peers::remove(&hub, &caller.name, id).await.map_err(|(c, m)| err(c, m)),
-        (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
-        (_, ["api", "deploy", rest @ ..]) => crate::deploy::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::DELETE, ["api", "peers", id]) => boxed(|| crate::peers::remove(&hub, &caller.name, id)).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "cd", rest @ ..]) => boxed(|| crate::cd::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "deploy", rest @ ..]) => boxed(|| crate::deploy::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ci", "legs", id, "terminal"]) => {
             let id = (*id).to_owned();
-            leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
+            boxed(|| leg_terminal_ws(hub.clone(), &id, q, &caller, req)).await
         }
-        (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
-        (_, ["api", "push", rest @ ..]) => crate::push::api::route(&hub, &caller, &method, rest, req).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "ci", rest @ ..]) => boxed(|| crate::ci::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "push", rest @ ..]) => boxed(|| crate::push::api::route(&hub, &caller, &method, rest, req)).await.map_err(|(c, m)| err(c, m)),
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
-            let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
-            crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body).await.map_err(|(c, m)| err(c, m))
+            let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
+            boxed(|| crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body)).await.map_err(|(c, m)| err(c, m))
         }
-        (&Method::GET, ["api", "overview"]) => overview(&hub).await,
-        (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
-        (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
-        (&Method::GET, ["api", "updates"]) => Ok(updates_overview(&hub, false).await),
-        (&Method::POST, ["api", "updates", "check"]) => Ok(updates_overview(&hub, true).await),
-        (&Method::GET, ["api", "updates", "runners"]) => Ok(srv::json(StatusCode::OK, &crate::doctor::updates_for(&hub, &caller).await)),
-        (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
-        (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
-        (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name, req).await,
-        (&Method::PUT, ["api", "updates", "runners", name]) => set_runner_policy(&hub, name, req).await,
-        (&Method::PUT, ["api", "updates", "policy"]) => set_policies(&hub, req).await,
-        (&Method::PUT, ["api", "updates", "waits"]) => set_waits(&hub, req).await,
-        (&Method::DELETE, ["api", "updates", "waits"]) => reset_waits(&hub).await,
-        (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
-        (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
-        (&Method::DELETE, ["api", "updates", "binaries", target]) => delete_binary(&hub, target).await,
+        (&Method::GET, ["api", "overview"]) => boxed(|| overview(&hub)).await,
+        (&Method::GET, ["api", "system"]) => Ok(boxed(|| system(&hub)).await),
+        (&Method::GET, ["api", "audit"]) => boxed(|| audit(&hub, &q)).await,
+        (&Method::GET, ["api", "updates"]) => Ok(boxed(|| updates_overview(&hub, false)).await),
+        (&Method::POST, ["api", "updates", "check"]) => Ok(boxed(|| updates_overview(&hub, true)).await),
+        (&Method::GET, ["api", "updates", "runners"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::updates_for(&hub, &caller)).await)),
+        (&Method::POST, ["api", "updates", "runners"]) => Ok(boxed(|| upgrade_all_runners(&hub)).await),
+        (&Method::POST, ["api", "updates", "build"]) => boxed(|| build_every_platform(&hub)).await,
+        (&Method::POST, ["api", "updates", "runners", name]) => boxed(|| upgrade_runner(&hub, name, req)).await,
+        (&Method::PUT, ["api", "updates", "runners", name]) => boxed(|| set_runner_policy(&hub, name, req)).await,
+        (&Method::PUT, ["api", "updates", "policy"]) => boxed(|| set_policies(&hub, req)).await,
+        (&Method::PUT, ["api", "updates", "waits"]) => boxed(|| set_waits(&hub, req)).await,
+        (&Method::DELETE, ["api", "updates", "waits"]) => boxed(|| reset_waits(&hub)).await,
+        (&Method::POST, ["api", "updates", "server"]) => boxed(|| upgrade_server(&hub, req)).await,
+        (&Method::POST, ["api", "updates", "binaries"]) => boxed(|| upload_binary(&hub, &q, req)).await,
+        (&Method::DELETE, ["api", "updates", "binaries", target]) => boxed(|| delete_binary(&hub, target)).await,
         (&Method::GET, ["api", "updates", "jobs", id]) => match hub.updates.job(id) {
             Some(j) => Ok(srv::json(StatusCode::OK, &j)),
             None => Err(err(StatusCode::NOT_FOUND, "no such upgrade")),
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
         (&Method::GET, ["api", "repos"]) => {
-            let mut repos = hub.store.repos().await?;
+            let mut repos = boxed(|| hub.store.repos()).await?;
             repos.retain(|r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }));
             Ok(srv::json(StatusCode::OK, &repos))
         }
-        (&Method::POST, ["api", "repos"]) => add_repo(&hub, req).await,
-        (&Method::DELETE, ["api", "repos", id]) => delete_repo(&hub, id).await,
-        (&Method::POST, ["api", "repos", id, "poll"]) => poll_repo(&hub, id).await,
+        (&Method::POST, ["api", "repos"]) => boxed(|| add_repo(&hub, req)).await,
+        (&Method::DELETE, ["api", "repos", id]) => boxed(|| delete_repo(&hub, id)).await,
+        (&Method::POST, ["api", "repos", id, "poll"]) => boxed(|| poll_repo(&hub, id)).await,
         (&Method::POST, ["api", "repos", id, "trigger"]) => {
             let id = (*id).to_owned();
-            trigger(&hub, &id, req).await
+            boxed(|| trigger(&hub, &id, req)).await
         }
-        (&Method::GET, ["api", "runs"]) => runs(&hub, &q).await,
-        (&Method::GET, ["api", "runs", id]) => run(&hub, id, &q).await,
-        (&Method::POST, ["api", "runs", id, "cancel"]) => cancel(&hub, id).await,
+        (&Method::GET, ["api", "runs"]) => boxed(|| runs(&hub, &q)).await,
+        (&Method::GET, ["api", "runs", id]) => boxed(|| run(&hub, id, &q)).await,
+        (&Method::POST, ["api", "runs", id, "cancel"]) => boxed(|| cancel(&hub, id)).await,
         (&Method::POST, ["api", "runs", id, "retry"]) => {
             let id = (*id).to_owned();
-            retry(&hub, &id, req).await
+            boxed(|| retry(&hub, &id, req)).await
         }
-        (&Method::GET, ["api", "jobs", id]) => job(&hub, id).await,
-        (&Method::GET, ["api", "jobs", id, "logs"]) => job_logs(&hub, id, &q).await,
+        (&Method::GET, ["api", "jobs", id]) => boxed(|| job(&hub, id)).await,
+        (&Method::GET, ["api", "jobs", id, "logs"]) => boxed(|| job_logs(&hub, id, &q)).await,
         (&Method::GET, ["api", "jobs", id, "logs", "ws"]) => {
             let (id, step) = ((*id).to_owned(), q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0));
             job_logs_ws(hub.clone(), id, step, req)
         }
-        (&Method::GET, ["api", "jobs", id, "artifacts"]) => get_artifacts(&hub, id).await,
-        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &crate::doctor::runners_for(&hub, &caller).await)),
+        (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
+        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::runners_for(&hub, &caller)).await)),
         (&Method::GET, ["api", "reach", "runners"]) => {
             let want = srv::query(&req).get("want").cloned();
             reach_runners(&hub, want.as_deref())
         }
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
         (&Method::POST, ["api", "outposts", "invite"]) => Ok(outpost_invite(&hub)),
-        (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
-        (&Method::POST, ["api", "discovery", "scan"]) => discovery_scan(&hub, req).await,
-        (&Method::POST, ["api", "discovery", "probe"]) => discovery_probe(&hub, req).await,
-        (&Method::POST, ["api", "discovery", "invite"]) => discovery_invite(&hub, req).await,
-        (&Method::DELETE, ["api", "discovery", "invite", id]) => Ok(discovery_uninvite(&hub, id).await),
+        (&Method::GET, ["api", "discovery"]) => Ok(boxed(|| discovery(&hub)).await),
+        (&Method::POST, ["api", "discovery", "scan"]) => boxed(|| discovery_scan(&hub, req)).await,
+        (&Method::POST, ["api", "discovery", "probe"]) => boxed(|| discovery_probe(&hub, req)).await,
+        (&Method::POST, ["api", "discovery", "invite"]) => boxed(|| discovery_invite(&hub, req)).await,
+        (&Method::DELETE, ["api", "discovery", "invite", id]) => Ok(boxed(|| discovery_uninvite(&hub, id)).await),
         (&Method::GET, ["api", "join-requests"]) => Ok(srv::json(StatusCode::OK, &hub.joins.list(Instant::now(), &hub.pki.ca_der))),
         (&Method::POST, ["api", "join-requests", id, "approve"]) => {
             let id = (*id).to_owned();
-            approve_join(&hub, &id, req).await
+            boxed(|| approve_join(&hub, &id, req)).await
         }
-        (&Method::POST, ["api", "join-requests", id, "deny"]) => deny_join(&hub, id).await,
-        (&Method::DELETE, ["api", "agents", name]) => forget_agent(&hub, name).await,
+        (&Method::POST, ["api", "join-requests", id, "deny"]) => boxed(|| deny_join(&hub, id)).await,
+        (&Method::DELETE, ["api", "agents", name]) => boxed(|| forget_agent(&hub, name)).await,
         // What's wrong with a runner, and repairs to it (`crate::doctor`, docs/releases.md).
-        (&Method::GET, ["api", "agents", name, "diagnose"]) => crate::doctor::diagnose(&hub, name).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "agents", name, "diagnose"]) => boxed(|| crate::doctor::diagnose(&hub, name)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
         (&Method::POST, ["api", "agents", name, "repair"]) => {
             let name = (*name).to_owned();
-            let ask: crate::doctor::Ask = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-            crate::doctor::repair(&hub, &name, &ask).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+            let ask: crate::doctor::Ask = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::doctor::repair(&hub, &name, &ask)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
         }
         (&Method::POST, ["api", "agents", name, "drain"]) => {
             let name = (*name).to_owned();
-            drain_agent(&hub, &name, req).await
+            boxed(|| drain_agent(&hub, &name, req)).await
         }
-        (&Method::GET, ["api", "front-doors"]) => front_door(crate::frontdoor::control::list(&hub).await),
-        (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(crate::frontdoor::control::get(&hub, name).await),
+        (&Method::GET, ["api", "front-doors"]) => front_door(boxed(|| crate::frontdoor::control::list(&hub)).await),
+        (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(boxed(|| crate::frontdoor::control::get(&hub, name)).await),
         (&Method::PUT, ["api", "runners", name, "front-door"]) => {
             let name = (*name).to_owned();
-            front_door(crate::frontdoor::control::put(&hub, &name, req).await)
+            front_door(boxed(|| crate::frontdoor::control::put(&hub, &name, req)).await)
         }
         (&Method::POST, ["api", "runners", name, "front-door", "cert"]) => {
             let name = (*name).to_owned();
-            front_door(crate::frontdoor::control::upload(&hub, &name, req).await)
+            front_door(boxed(|| crate::frontdoor::control::upload(&hub, &name, req)).await)
         }
-        (&Method::GET, ["api", "runners", name, "front-door", "cert"]) => front_door(crate::frontdoor::control::download(&hub, name).await),
-        (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(crate::frontdoor::control::renew(&hub, name).await),
-        (&Method::GET, ["api", "tailscale"]) => front_door(crate::frontdoor::tailnet::get(&hub).await),
-        (&Method::PUT, ["api", "tailscale"]) => front_door(crate::frontdoor::tailnet::put(&hub, req).await),
-        (&Method::DELETE, ["api", "tailscale"]) => front_door(crate::frontdoor::tailnet::delete(&hub).await),
-        (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
-        (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
+        (&Method::GET, ["api", "runners", name, "front-door", "cert"]) => front_door(boxed(|| crate::frontdoor::control::download(&hub, name)).await),
+        (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
+        (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
+        (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),
+        (&Method::DELETE, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::delete(&hub)).await),
+        (&Method::PUT, ["api", "settings", "password"]) => boxed(|| set_password(&hub, req)).await,
+        (&Method::DELETE, ["api", "settings", "password"]) => boxed(|| clear_password(&hub)).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
-        (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
-        (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
-        (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid, &q, req).await,
-        (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => ai_fork(&hub, machine, pid).await,
+        (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => boxed(|| ai_transcript(&hub, machine, pid)).await,
+        (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => boxed(|| ai_view(&hub, machine, pid)).await,
+        (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => boxed(|| ai_takeover(&hub, machine, pid, &q, req)).await,
+        (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => boxed(|| ai_fork(&hub, machine, pid)).await,
         (&Method::GET, ["api", "sync"]) => Ok(srv::json(StatusCode::OK, &hub.sync.view())),
-        (&Method::POST, ["api", "sync"]) => sync_create(&hub, req).await,
-        (&Method::DELETE, ["api", "sync", id]) => sync_ask(&hub, "sync.delete", id, crate::sync::server::Ask::Delete { repo: (*id).to_owned() }).await,
-        (&Method::POST, ["api", "sync", id, "copies"]) => sync_add_copy(&hub, id, req).await,
+        (&Method::GET, ["api", "sync", "activity"]) => Ok(sync_activity(&hub, &req)),
+        (&Method::POST, ["api", "sync"]) => boxed(|| sync_create(&hub, req)).await,
+        (&Method::DELETE, ["api", "sync", id]) => boxed(|| sync_ask(&hub, "sync.delete", id, crate::sync::server::Ask::Delete { repo: (*id).to_owned() })).await,
+        (&Method::POST, ["api", "sync", id, "copies"]) => boxed(|| sync_add_copy(&hub, id, req)).await,
         (&Method::DELETE, ["api", "sync", id, "copies", member]) => {
             let member: u64 = member.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad member"))?;
-            sync_ask(&hub, "sync.copy.remove", id, crate::sync::server::Ask::RemoveCopy { repo: (*id).to_owned(), member }).await
+            boxed(|| sync_ask(&hub, "sync.copy.remove", id, crate::sync::server::Ask::RemoveCopy { repo: (*id).to_owned(), member })).await
         }
-        (&Method::POST, ["api", "sync", id, "conflicts", "resolve"]) => sync_resolve(&hub, id, req).await,
-        (&Method::GET, ["api", "places"]) => Ok(srv::json(StatusCode::OK, &crate::sync::places::now(&hub).await?)),
-        (&Method::POST, ["api", "places", "look"]) => Ok(places_look(&hub).await),
+        (&Method::POST, ["api", "sync", id, "conflicts", "resolve"]) => boxed(|| sync_resolve(&hub, id, req)).await,
+        (&Method::GET, ["api", "places"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::sync::places::now(&hub)).await?)),
+        (&Method::POST, ["api", "places", "look"]) => Ok(boxed(|| places_look(&hub)).await),
         (&Method::POST, ["api", "places", kind @ ("clone" | "sync" | "move" | "remove")]) => {
             let kind = (*kind).to_owned();
-            places_start(&hub, &kind, req).await
+            boxed(|| places_start(&hub, &kind, req)).await
         }
         (&Method::POST, ["api", "places", "tasks", id, "retry"]) => {
-            let tasks = crate::sync::tasks::retry(&hub, id).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
-            hub.store.audit("admin".into(), "places.retry".into(), (*id).to_owned()).await;
+            let tasks = boxed(|| crate::sync::tasks::retry(&hub, id)).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+            boxed(|| hub.store.audit("admin".into(), "places.retry".into(), (*id).to_owned())).await;
             Ok(srv::json(StatusCode::CREATED, &tasks))
         }
         (&Method::DELETE, ["api", "places", "tasks", id]) => {
@@ -535,150 +546,156 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 Err(err(StatusCode::CONFLICT, "no such task, or it is still under way"))
             }
         }
-        // A plan run as one agent per step (docs/plans.md): its own page's routes.
         // Agents attached to what they look after, and their incidents (docs/ci.md W20-R08 to R10).
-        (&Method::GET, ["api", "attachments"]) => own_op(&hub, &caller, "attachments.list", query_value(&q)).await,
+        (&Method::GET, ["api", "attachments"]) => boxed(|| own_op(&hub, &caller, "attachments.list", query_value(&q))).await,
         (&Method::POST, ["api", "attachments", "pause"]) => {
             let body = body_value(req).await?;
-            own_op(&hub, &caller, "attachments.pause", body).await
+            boxed(|| own_op(&hub, &caller, "attachments.pause", body)).await
         }
         (&Method::POST, ["api", "attachments"]) => {
             let body = body_value(req).await?;
-            own_op(&hub, &caller, "attachments.save", body).await
+            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
         }
-        (&Method::GET, ["api", "attachments", a]) => own_op(&hub, &caller, "attachments.get", json!({ "attachment": a })).await,
+        (&Method::GET, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.get", json!({ "attachment": a }))).await,
         (&Method::PUT, ["api", "attachments", a]) => {
             let a = (*a).to_owned();
             let mut body = body_value(req).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("attachment".into(), json!(a));
             }
-            own_op(&hub, &caller, "attachments.save", body).await
+            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
         }
-        (&Method::DELETE, ["api", "attachments", a]) => own_op(&hub, &caller, "attachments.remove", json!({ "attachment": a })).await,
-        (&Method::GET, ["api", "incidents"]) => own_op(&hub, &caller, "incidents.list", query_value(&q)).await,
-        (&Method::GET, ["api", "incidents", i]) => own_op(&hub, &caller, "incidents.get", json!({ "incident": i })).await,
+        (&Method::DELETE, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.remove", json!({ "attachment": a }))).await,
+        (&Method::GET, ["api", "incidents"]) => boxed(|| own_op(&hub, &caller, "incidents.list", query_value(&q))).await,
+        (&Method::GET, ["api", "incidents", i]) => boxed(|| own_op(&hub, &caller, "incidents.get", json!({ "incident": i }))).await,
         (&Method::POST, ["api", "incidents", i, "report"]) => {
             let i = (*i).to_owned();
             let mut body = body_value(req).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("incident".into(), json!(i));
             }
-            own_op(&hub, &caller, "incidents.report", body).await
+            boxed(|| own_op(&hub, &caller, "incidents.report", body)).await
         }
-        (&Method::GET, ["api", "plans", "runs"]) => own_op(&hub, &caller, "plans.runs.list", query_value(&q)).await,
-        (&Method::GET, ["api", "plans", "runs", run]) => own_op(&hub, &caller, "plans.runs.get", json!({ "run": run })).await,
-        (&Method::POST, ["api", "plans", "runs", run, "stop"]) => own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run })).await,
-        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "retry"]) => own_op(&hub, &caller, "plans.runs.retry", json!({ "run": run, "step": n })).await,
+        // A plan run as one agent per step (docs/plans.md): its own page's routes.
+        (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
+        (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
+        (&Method::POST, ["api", "plans", "runs", run, "stop"]) => boxed(|| own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run }))).await,
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "retry"]) => boxed(|| own_op(&hub, &caller, "plans.runs.retry", json!({ "run": run, "step": n }))).await,
         // Taking a step over, and saying it's met, are a person's: no operation does them.
         (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
             let by = caller.name.clone();
-            let r = if *what == "take" { crate::plans::agents::take(&hub, run, n, &by).await } else { crate::plans::agents::met(&hub, run, n, &by).await };
+            let r = if *what == "take" { boxed(|| crate::plans::agents::take(&hub, run, n, &by)).await } else { boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await };
             r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
-        (&Method::GET, ["api", "plans"]) => plans_list(&hub, &q).await,
-        (&Method::POST, ["api", "plans"]) => plans_create(&hub, req).await,
-        (&Method::GET, ["api", "plans", id]) => crate::plans::get(&hub, id).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
-        (&Method::PATCH, ["api", "plans", id]) => plans_update(&hub, id, req).await,
-        (&Method::DELETE, ["api", "plans", id]) => plans_delete(&hub, id).await,
-        (&Method::GET, ["api", "plans", id, "versions"]) => crate::plans::versions(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
-        (&Method::GET, ["api", "plans", id, "runs"]) => crate::plans::runs(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
-        (&Method::POST, ["api", "plans", id, "restore"]) => plans_restore(&hub, id, req).await,
+        (&Method::GET, ["api", "plans"]) => boxed(|| plans_list(&hub, &q)).await,
+        (&Method::POST, ["api", "plans"]) => boxed(|| plans_create(&hub, req)).await,
+        (&Method::GET, ["api", "plans", id]) => boxed(|| crate::plans::get(&hub, id)).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
+        (&Method::PATCH, ["api", "plans", id]) => boxed(|| plans_update(&hub, id, req)).await,
+        (&Method::DELETE, ["api", "plans", id]) => boxed(|| plans_delete(&hub, id)).await,
+        (&Method::GET, ["api", "plans", id, "versions"]) => boxed(|| crate::plans::versions(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
+        (&Method::GET, ["api", "plans", id, "runs"]) => boxed(|| crate::plans::runs(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
+        (&Method::POST, ["api", "plans", id, "restore"]) => boxed(|| plans_restore(&hub, id, req)).await,
         (&Method::POST, ["api", "plans", id, "run"]) => {
             let id = (*id).to_owned();
-            let mut body = body_value(req).await?;
+            let mut body = boxed(|| body_value(req)).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("id".into(), json!(id));
             }
-            own_op(&hub, &caller, "plans.run", body).await
+            boxed(|| own_op(&hub, &caller, "plans.run", body)).await
         }
-        (&Method::POST, ["api", "plans", id, "share"]) => plans_share(&hub, id, req).await,
+        (&Method::POST, ["api", "plans", id, "share"]) => boxed(|| plans_share(&hub, id, req)).await,
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
-        (&Method::POST, ["api", "voice", "transcribe"]) => voice_transcribe(&hub, &q, req).await,
-        (&Method::GET, ["api", "accounts"]) => accounts_status(&hub, &q).await,
-        (&Method::POST, ["api", "accounts", "login"]) => accounts_login(&hub, req).await,
-        (&Method::POST, ["api", "accounts", "logout"]) => accounts_logout(&hub, req).await,
+        (&Method::POST, ["api", "voice", "transcribe"]) => boxed(|| voice_transcribe(&hub, &q, req)).await,
+        (&Method::GET, ["api", "accounts"]) => boxed(|| accounts_status(&hub, &q)).await,
+        (&Method::POST, ["api", "accounts", "login"]) => boxed(|| accounts_login(&hub, req)).await,
+        (&Method::POST, ["api", "accounts", "logout"]) => boxed(|| accounts_logout(&hub, req)).await,
         (&Method::GET, ["api", "accounts", "flows", id]) => {
             crate::accounts::get(id).map(|f| srv::json(StatusCode::OK, &f)).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such sign-in"))
         }
-        (&Method::POST, ["api", "accounts", "flows", id, "input"]) => accounts_input(id, req).await,
+        (&Method::POST, ["api", "accounts", "flows", id, "input"]) => boxed(|| accounts_input(id, req)).await,
         (&Method::DELETE, ["api", "accounts", "flows", id]) => {
             crate::accounts::cancel(id).map(|()| srv::status(StatusCode::NO_CONTENT)).map_err(|e| err(StatusCode::NOT_FOUND, format!("{e:#}")))
         }
-        (&Method::GET, ["api", "machines", target, "dirs"]) => machine_dirs(&hub, target, &q).await,
+        (&Method::GET, ["api", "machines", target, "dirs"]) => boxed(|| machine_dirs(&hub, target, &q)).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.visible())),
-        (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
-        (&Method::PUT, ["api", "terminal", "sessions", id, "name"]) => rename_terminal(&hub, id, req).await,
+        (&Method::POST, ["api", "terminal", "sessions"]) => boxed(|| create_terminal(&hub, req)).await,
+        (&Method::PUT, ["api", "terminal", "sessions", id, "name"]) => boxed(|| rename_terminal(&hub, id, req)).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
             if let Some(s) = hub.terminals.get(id) {
                 s.close();
-                hub.store.audit("admin".into(), "terminal.close".into(), s.target.clone()).await;
+                boxed(|| hub.store.audit("admin".into(), "terminal.close".into(), s.target.clone())).await;
             }
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
-        (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
+        (&Method::GET, ["api", "terminal", "ws"]) => boxed(|| terminal_ws(hub.clone(), q, req)).await,
         // Agents that run agents (`agents.*`, docs/agents.md): each operation is its route.
-        (&Method::GET, ["api", "harness", "agents"]) => own_op(&hub, &caller, "agents.list", query_value(&q)).await,
+        (&Method::GET, ["api", "harness", "agents"]) => boxed(|| own_op(&hub, &caller, "agents.list", query_value(&q))).await,
         (&Method::POST, ["api", "harness", "agents"]) => {
-            let body = body_value(req).await?;
-            own_op(&hub, &caller, "agents.start", body).await
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agents.start", body)).await
         }
-        (&Method::GET, ["api", "harness", "agents", "wait"]) => own_op(&hub, &caller, "agents.wait", query_value(&q)).await,
-        (&Method::GET, ["api", "harness", "agents", id]) => own_op(&hub, &caller, "agents.get", json!({ "agent": id })).await,
-        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => own_op(&hub, &caller, &format!("agents.{what}"), json!({ "agent": id })).await,
-        (&Method::GET, ["api", "harness", "changes"]) => own_op(&hub, &caller, "agents.changes", query_value(&q)).await,
-        (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => own_op(&hub, &caller, "agents.workspace", json!({ "agent": id })).await,
+        (&Method::GET, ["api", "harness", "agents", "wait"]) => boxed(|| own_op(&hub, &caller, "agents.wait", query_value(&q))).await,
+        (&Method::GET, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.get", json!({ "agent": id }))).await,
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => {
+            let op = format!("agents.{what}");
+            boxed(|| own_op(&hub, &caller, &op, json!({ "agent": id }))).await
+        }
+        (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
+        (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
         (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
-            let mut body = body_value(req).await?;
+            let mut body = boxed(|| body_value(req)).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("agent".into(), json!(id));
             }
-            own_op(&hub, &caller, &name, body).await
+            boxed(|| own_op(&hub, &caller, &name, body)).await
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
-        (&Method::GET, ["api", "harness", "workspaces"]) => Ok(harness_workspaces(&hub).await),
+        (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.harness.list())),
-        (&Method::POST, ["api", "harness", "sessions"]) => harness_open(&hub, req).await,
+        (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
             Some(info) => Ok(srv::json(StatusCode::OK, &info)),
             None => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
         },
         (&Method::DELETE, ["api", "harness", "sessions", id]) => {
             let id = (*id).to_owned();
-            if hub.harness.close(&hub, &id).await {
-                let _ = crate::goals::forget(&hub, &id).await;
-                hub.store.audit("admin".into(), "agent.close".into(), id).await;
+            if boxed(|| hub.harness.close(&hub, &id)).await {
+                let _ = boxed(|| crate::goals::forget(&hub, &id)).await;
+                boxed(|| hub.store.audit("admin".into(), "agent.close".into(), id)).await;
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
                 Err(err(StatusCode::NOT_FOUND, "no such agent session"))
             }
         }
-        (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
-        (&Method::POST, ["api", "harness", "broadcast", "preview"]) => harness_broadcast_preview(&hub, req).await,
-        (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => harness_recover(&hub, machine, req).await,
+        (&Method::POST, ["api", "harness", "broadcast"]) => boxed(|| harness_broadcast(&hub, req)).await,
+        (&Method::POST, ["api", "harness", "broadcast", "preview"]) => boxed(|| harness_broadcast_preview(&hub, req)).await,
+        (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => boxed(|| harness_recover(&hub, machine, req)).await,
         (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
-            let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
             let now = body.get("now").and_then(serde_json::Value::as_bool).unwrap_or(false);
             // Going on there in another harness, its conversation carried over (optional).
             let text = |k: &str| body.get(k).and_then(serde_json::Value::as_str).filter(|v| !v.is_empty()).map(str::to_owned);
             // Its machine away: from the server's copy of its conversation (`relocate::start`).
-            match crate::harness::relocate::start(&hub, id, &to, now, text("kind"), text("model")).await {
+            match boxed(|| crate::harness::relocate::start(&hub, id, &to, now, text("kind"), text("model"))).await {
                 Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
                 Err(e) => Err(err(StatusCode::CONFLICT, e)),
             }
         }
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();
-            harness_command(&hub, &id, req).await
+            boxed(|| harness_command(&hub, &id, req)).await
         }
-        (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
-        (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
+        (&Method::POST, ["api", "harness", "command"]) => boxed(|| harness_command_many(&hub, req)).await,
+        (&Method::POST, ["api", "harness", "files"]) => boxed(|| harness_upload(&hub, &q, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        // A page it showed: its heights, as its machine and its viewers' own browsers measured them.
+        (&Method::GET, ["api", "harness", "sessions", id, "pages", page, "heights"]) => boxed(|| page_heights(&hub, id, page)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "pages", page, "heights"]) => boxed(|| page_seen(&hub, id, page, req)).await,
         // Pages streamed from its machine (`crate::harness::streams`).
         (&Method::GET, ["api", "harness", "sessions", id, "streams"]) => {
             let me = person(&req);
@@ -686,65 +703,65 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::POST, ["api", "harness", "sessions", id, "streams"]) => {
             let id = (*id).to_owned();
-            stream_open(&hub, &id, req).await
+            boxed(|| stream_open(&hub, &id, req)).await
         }
         (&Method::GET, ["api", "harness", "sessions", id, "streams", sid, "ws"]) => stream_ws(hub.clone(), id, sid, req),
         // Its apps opened on people's own devices (`crate::harness::opened`): theirs alone.
         (&Method::POST, ["api", "harness", "sessions", id, "opened"]) => {
             let id = (*id).to_owned();
-            open_on_device(&hub, &id, req).await
+            boxed(|| open_on_device(&hub, &id, req)).await
         }
         (&Method::GET, ["api", "harness", "sessions", id, "opened"]) => Ok(srv::json(StatusCode::OK, &hub.harness.opened.of(id, person(&req).as_deref()))),
         (&Method::DELETE, ["api", "harness", "sessions", id, "opened", oid]) => {
             if hub.harness.opened.end(id, oid, person(&req).as_deref()) {
-                hub.store.audit("admin".into(), "agent.opened.end".into(), format!("{id}: {oid}")).await;
+                boxed(|| hub.store.audit("admin".into(), "agent.opened.end".into(), format!("{id}: {oid}"))).await;
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
                 Err(err(StatusCode::NOT_FOUND, "no such opening"))
             }
         }
-        (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => preview_look(&hub, id, "look").await,
-        (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => preview_look(&hub, id, "stop").await,
+        (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => boxed(|| preview_look(&hub, id, "look")).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => boxed(|| preview_look(&hub, id, "stop")).await,
         (&Method::DELETE, ["api", "harness", "sessions", id, "streams", sid]) => {
             let me = person(&req);
             let ours = hub.harness.streams.get(sid).is_some_and(|l| l.session == *id && l.for_whom(me.as_deref()));
-            if ours && hub.harness.streams.close(&hub, sid).await {
-                hub.store.audit("admin".into(), "agent.stream.close".into(), format!("{id}: {sid}")).await;
+            if ours && boxed(|| hub.harness.streams.close(&hub, sid)).await {
+                boxed(|| hub.store.audit("admin".into(), "agent.stream.close".into(), format!("{id}: {sid}"))).await;
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
                 Err(err(StatusCode::NOT_FOUND, "no such stream"))
             }
         }
-        (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
-        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, &caller, id, req).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, &caller, id, req).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => goals_control(&hub, &caller, id, action).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
+        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, &caller, id, action)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
-            harness_terminal(&hub, &id, req).await
+            boxed(|| harness_terminal(&hub, &id, req)).await
         }
-        (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
-        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => conversation_events(&hub, id, &q).await,
-        (&Method::GET, ["api", "conversations", "search"]) => conversation_search(&hub, &q).await,
+        (&Method::GET, ["api", "harness", "history"]) => boxed(|| harness_history(&hub, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events(&hub, id, &q)).await,
+        (&Method::GET, ["api", "conversations", "search"]) => boxed(|| conversation_search(&hub, &q)).await,
         // The runners that keep a copy of the server's conversation store (docs/conversations.md, "Mirrors").
         (&Method::GET, ["api", "conversations", "mirrors"]) => Ok(srv::json(StatusCode::OK, &json!({ "mirrors": hub.harness.copies.as_ref().map(|m| m.view()).unwrap_or_default() }))),
         // Restoring the server's conversation store from a mirror's copy (admins: unlisted in authz).
         (&Method::GET, ["api", "conversations", "restore"]) => Ok(srv::json(StatusCode::OK, &hub.harness.restore_view())),
-        (&Method::POST, ["api", "conversations", "restore"]) => conversation_restore(&hub, req).await,
+        (&Method::POST, ["api", "conversations", "restore"]) => boxed(|| conversation_restore(&hub, req)).await,
         // Every conversation store, as the server sees it, and one store's series (the System
         // page; docs/conversations.md, "Telemetry").
         (&Method::GET, ["api", "conversations", "status"]) => Ok(srv::json(StatusCode::OK, &crate::harness::stores::status(&hub))),
         (&Method::GET, ["api", "conversations", "series"]) => conversation_series(&hub, &q),
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
-        (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => harness_kept_file(&hub, id, sha, &req).await,
-        (&Method::GET, ["api", "harness", "sessions", id, "file"]) => harness_file(&hub, id, q.get("path").cloned(), &req).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => boxed(|| harness_kept_file(&hub, id, sha, &req)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "file"]) => boxed(|| harness_file(&hub, id, q.get("path").cloned(), &req)).await,
         // Recordings of its streams (`crate::browser::record`): theirs a person's own profile's.
         (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
-        (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => recording_file(&hub, id, rid, what, &req).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => boxed(|| recording_file(&hub, id, rid, what, &req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
-            match hub.harness.task_output(&hub, id, task, since).await {
+            match boxed(|| hub.harness.task_output(&hub, id, task, since)).await {
                 Ok(Some(v)) => Ok(srv::json(StatusCode::OK, &v)),
                 Ok(None) => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
                 Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
@@ -1295,17 +1312,55 @@ fn sync_token_ok(hub: &Hub, req: &Request) -> bool {
         || authed(hub, req.headers())
 }
 
+/// What happened in the synced repos (`?since=` the number to start from, `&repo=`, `&limit=`):
+/// the newest events first, and the number the next one gets.
+fn sync_activity(hub: &Hub, req: &Request) -> Response {
+    let q = srv::query(req);
+    let since = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100).min(500);
+    let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
+    let (events, next) = hub.sync.activity(since, repo, limit);
+    srv::json(StatusCode::OK, &serde_json::json!({ "events": events, "next": next }))
+}
+
+/// A machine's request for contents, counted: `direction` `up` (sent, or asked whether the server
+/// has it) or `down` (fetched). Its machine is named only once its token checked out.
+fn sync_blob_counted(machine: &str, direction: &str, result: &str, bytes: u64) {
+    let m = crate::metrics::sync();
+    m.blob_requests.inc(&[machine, direction, result]);
+    if bytes > 0 {
+        m.blob_bytes.add(&[machine, direction], bytes);
+    }
+}
+
+/// The machine a blob request names.
+fn sync_machine(req: &Request) -> String {
+    srv::query(req).get("machine").cloned().unwrap_or_default()
+}
+
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
 fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
+    let direction = if req.method() == Method::HEAD { "up" } else { "down" };
     if !sync_token_ok(hub, req) {
+        sync_blob_counted("", direction, "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
+    let machine = sync_machine(req);
     let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
-    let path = blobs.path(hash).filter(|p| p.is_file()).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    let Some(path) = blobs.path(hash).filter(|p| p.is_file()) else {
+        sync_blob_counted(&machine, direction, "missing", 0);
+        return Err(err(StatusCode::NOT_FOUND, "no such blob"));
+    };
     if req.method() == Method::HEAD {
+        sync_blob_counted(&machine, direction, "present", 0);
         return Ok(srv::status(StatusCode::OK));
     }
-    let body = crate::rt::file_source(path).map_err(|_| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+    let Ok(body) = crate::rt::file_source(path) else {
+        sync_blob_counted(&machine, direction, "missing", 0);
+        return Err(err(StatusCode::NOT_FOUND, "no such blob"));
+    };
+    sync_blob_counted(&machine, direction, "ok", bytes);
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 
@@ -1318,26 +1373,44 @@ const SYNC_DISK_FLOOR: u64 = 2 << 30;
 /// [`SYNC_BLOB_MAX`], or while the server's disk has less than [`SYNC_DISK_FLOOR`] free.
 async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     if !sync_token_ok(hub, &req) {
+        sync_blob_counted("", "up", "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
+    let machine = sync_machine(&req);
+    let counted = |result: &str, bytes: u64| sync_blob_counted(&machine, "up", result, bytes);
     let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
     if !crate::sync::blobs::valid_hash(hash) {
+        counted("refused", 0);
         return Err(err(StatusCode::BAD_REQUEST, "not a SHA-256"));
     }
     if blobs.has(hash) {
+        counted("present", 0);
         return Ok(srv::status(StatusCode::OK));
     }
     let length = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     if length.is_some_and(|n| n > SYNC_BLOB_MAX) {
+        counted("refused", 0);
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("contents are synced up to {} MiB", SYNC_BLOB_MAX >> 20)));
     }
     if blobs.free_bytes().is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+        counted("refused", 0);
+        tracing::warn!(target: "kiln.sync", event = "sync.blob_refused", machine = %machine, reason = "disk_full", "the server's disk is nearly full: sync takes no more contents");
         return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full: sync takes no more contents until there is room"));
     }
     let tmp = blobs.incoming();
-    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX)?;
+    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX).inspect_err(|_| counted("failed", 0))?;
     let mut body = req.into_body();
-    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+    let mut bytes = 0u64;
+    loop {
+        let chunk = match srv::next_chunk(&mut body).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                counted("failed", 0);
+                return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
+            }
+        };
+        bytes = bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         if sink.send(chunk).await.is_err() {
             break;
         }
@@ -1345,15 +1418,28 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     drop(sink);
     if let Err(e) = done.await {
         let _ = std::fs::remove_file(&tmp);
+        counted("failed", 0);
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
     }
     let store = blobs.clone();
     let name = hash.to_owned();
-    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| {
+        counted("failed", 0);
+        err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+    })?;
     match kept {
-        Ok(true) => Ok(srv::status(StatusCode::CREATED)),
-        Ok(false) => Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name")),
-        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Ok(true) => {
+            counted("ok", bytes);
+            Ok(srv::status(StatusCode::CREATED))
+        }
+        Ok(false) => {
+            counted("refused", 0);
+            Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name"))
+        }
+        Err(e) => {
+            counted("failed", 0);
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
     }
 }
 
@@ -3734,6 +3820,30 @@ async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
         hub.store.audit("admin".into(), "agent.app.stop".into(), id.to_owned()).await;
     }
     Ok(srv::json(StatusCode::OK, &v))
+}
+
+/// `GET /api/harness/sessions/:id/pages/:page/heights`: a page the session showed, its heights:
+/// `heights` as its machine's Chromium measured them at each width, `engines` as other engines did
+/// (its machine's Firefox; viewers' own browsers at their widths).
+async fn page_heights(hub: &Arc<Hub>, session: &str, page: &str) -> R {
+    let (h, id) = (hub.clone(), page.to_owned());
+    let v = crate::rt::blocking(move || h.harness.visuals.get(&id)).await.ok().flatten().filter(|v| v.session == session).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such page"))?;
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({"heights": v.heights, "engines": v.engines})))
+}
+
+/// `POST /api/harness/sessions/:id/pages/:page/heights` with `{engine, width, height}`: the height
+/// a viewer's own browser measured the page at, at its width (`crate::harness::visuals::Visuals::seen`).
+async fn page_seen(hub: &Arc<Hub>, session: &str, page: &str, req: Request) -> R {
+    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let n = |k: &str| b.get(k).and_then(serde_json::Value::as_u64).and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+    let (width, height) = (n("width"), n("height"));
+    let engine = b.get("engine").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+    let (h, id, s) = (hub.clone(), page.to_owned(), session.to_owned());
+    crate::rt::blocking(move || h.harness.visuals.seen(&id, &s, &engine, width, height))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// `GET /api/harness/sessions/:id/streams/:stream/ws`: a viewer of a stream. It's sent the

@@ -415,6 +415,10 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
+    // An app's secrets (§3.5) are read as the rest of it (names and versions: no value is read
+    // back), and set or deleted by those who manage secrets.
+    any("/api/deploy/apps/*/environments/*/secrets/*", "secrets.manage", At::Server),
+    r("POST", "/api/deploy/secret-keys/rotate", "secrets.manage", At::Server),
     any("/api/deploy/**", "environments.manage", At::Server),
     // Runners and machines. The list is of the runners the caller may read (`crate::doctor::readable`).
     r("GET", "/api/agents", "runners.read", At::Anywhere),
@@ -609,6 +613,12 @@ mod tests {
             (Method::DELETE, "/api/ci/repos/r/caches/9", "caches.write"),
             (Method::DELETE, "/api/updates/binaries/x86_64-linux", "settings.manage"),
             (Method::HEAD, "/api/ci/runs/r1", "runs.read"),
+            (Method::GET, "/api/deploy/apps/web/environments/staging/secrets", "runs.read"),
+            (Method::GET, "/api/deploy/apps/web/environments/staging/secrets/DB_PASSWORD/versions", "runs.read"),
+            (Method::PUT, "/api/deploy/apps/web/environments/staging/secrets/DB_PASSWORD", "secrets.manage"),
+            (Method::DELETE, "/api/deploy/apps/web/environments/staging/secrets/DB_PASSWORD", "secrets.manage"),
+            (Method::POST, "/api/deploy/secret-keys/rotate", "secrets.manage"),
+            (Method::POST, "/api/deploy/apps/web/environments/staging", "environments.manage"),
         ] {
             assert_eq!(super::rule(&m, &segs(p)).capability, cap, "{m} {p}");
         }

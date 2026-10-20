@@ -1566,6 +1566,28 @@ export interface SyncCopyStatus {
   looked?: boolean;
   /** It waits to take the group's files (a folder kiln just cloned). */
   adopting?: boolean;
+  /** The contents it moved with the server since its runner started (older runners: none). */
+  traffic?: SyncTraffic;
+  /** How long the last change from another machine took to reach its folder, in ms. */
+  lag_ms?: number | null;
+}
+
+/** What a copy moved with the server since its runner started. */
+export interface SyncTraffic {
+  sent: number;
+  sent_bytes: number;
+  fetched: number;
+  fetched_bytes: number;
+  /** Transfers that failed, and those tried again after. */
+  failed: number;
+  retried: number;
+  /** Contents the server no longer had: versions later steps replaced. */
+  gone: number;
+  /** Steps sent again, the log not having brought them back yet. */
+  resent: number;
+  last_failure: string | null;
+  /** Unix seconds. */
+  failed_at: number;
 }
 
 export type SyncCopyState = "in step" | "catching up" | "fetching" | "sending" | "starting" | "offline" | "error";
@@ -1577,6 +1599,10 @@ export interface SyncCopy {
   added: number;
   state: SyncCopyState;
   status: SyncCopyStatus | null;
+  /** When the server last heard how it is (unix ms). */
+  heard?: number | null;
+  /** Log entries its folder hasn't taken yet. */
+  lag?: number;
 }
 
 export interface SyncConflict {
@@ -1598,6 +1624,76 @@ export interface SyncRepo {
   error: string | null;
   /** Synced only while a move is under way (that task's batch). */
   transient?: string | null;
+  /** What its sync did since the server started (older servers: none). */
+  stats?: SyncStats;
+}
+
+/** What a repo's sync did since the server started (`since`, unix ms). */
+export interface SyncStats {
+  since: number;
+  steps: number;
+  files: number;
+  bytes: number;
+  conflicts: number;
+  dropped: number;
+  retries: number;
+  errors: number;
+  /** When the newest step was committed (unix ms). */
+  last_step: number | null;
+}
+
+export type SyncEventKind = "step" | "copy" | "state" | "error" | "dropped" | "retry" | "resolved" | "move";
+export type SyncTone = "info" | "ok" | "warn" | "fail";
+
+/** One of a committed step's changes. */
+export interface SyncFileEvent {
+  path: string;
+  kind: "added" | "changed" | "deleted";
+  /** What the log did with it. */
+  outcome: "taken" | "same" | "conflict" | "refused";
+  size?: number;
+  /** A conflict: the name its version went under beside the path. */
+  beside?: string;
+  link?: boolean;
+}
+
+/** A step the log committed. */
+export interface SyncStepEvent {
+  /** Its log index: a copy whose `applied` is this far has it. */
+  index: number;
+  /** When its machine looked and saw the changes (unix ms, that machine's clock). */
+  seen: number;
+  /** From its arrival at the server to its commit (ms). */
+  commit_ms: number | null;
+  /** The first 40 of its changes. */
+  files: SyncFileEvent[];
+  added: number;
+  changed: number;
+  deleted: number;
+  conflicts: number;
+  refused: number;
+  bytes: number;
+}
+
+/** Something that happened in a synced repo (GET /api/sync/activity). */
+export interface SyncEvent {
+  seq: number;
+  repo: string;
+  /** Unix ms, the server's clock. */
+  at: number;
+  kind: SyncEventKind;
+  /** The machine it's about: a step's maker ("kiln" for the server's own). */
+  machine: string;
+  text?: string;
+  tone: SyncTone;
+  step?: SyncStepEvent;
+}
+
+export interface SyncActivity {
+  /** Newest first. */
+  events: SyncEvent[];
+  /** The number the next event gets: ask `since` it for what's new. */
+  next: number;
 }
 
 export interface SyncView {
