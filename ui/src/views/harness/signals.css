@@ -39,25 +39,18 @@
   transform: rotate(-35deg) scaleX(0.55) rotate(calc(var(--i) * 5deg));
   opacity: calc(0.6 + var(--i) * 0.13);
 }
-.sg-optic[data-state="idle"] > span {
-  animation:
-    sg-optic-breathe 14s ease-in-out infinite,
-    sg-optic-chroma 18s linear infinite;
-  animation-delay: calc(var(--i) * -0.55s), calc(var(--i) * -0.9s);
-}
-/* Thinking: the idle motion, quickened. */
+/* Idle, the rings hold still in the settled prism. They move only while it works: the shape, which
+   the GPU moves (a colour change in a border is painted again every frame, the whole page with
+   it, so the colours hold still). */
+/* Thinking: the rings breathe. */
 .sg-optic[data-state="thinking"] > span {
-  animation:
-    sg-optic-breathe 3.5s ease-in-out infinite,
-    sg-optic-chroma 4.5s linear infinite;
-  animation-delay: calc(var(--i) * -0.14s), calc(var(--i) * -0.22s);
+  animation: sg-optic-breathe 3.5s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.14s);
 }
-/* Tool: colour runs fast through the rings while the shape barely moves. */
+/* Tool: the shape barely sways. */
 .sg-optic[data-state="tool"] > span {
-  animation:
-    sg-optic-sway 2.4s ease-in-out infinite,
-    sg-optic-chroma 1.6s linear infinite;
-  animation-delay: calc(var(--i) * -0.1s), calc(var(--i) * -0.4s);
+  animation: sg-optic-sway 2.4s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.1s);
 }
 /* Waiting on you: held still in amber, the outer ring lit. */
 .sg-optic[data-state="waiting"] {
@@ -93,18 +86,6 @@
   }
   50% {
     transform: rotate(-32deg) scaleX(0.6) rotate(calc(var(--i) * 5deg + 2deg));
-  }
-}
-@keyframes sg-optic-chroma {
-  0%,
-  100% {
-    border-color: #b8d9d2 #b8a6d5 #a6c4ed #d6a2aa;
-  }
-  33.333% {
-    border-color: #d8cbb0 #a6c4ed #b8d9d2 #b8a6d5;
-  }
-  66.667% {
-    border-color: #b8a6d5 #b8d9d2 #d6a2aa #a6c4ed;
   }
 }
 

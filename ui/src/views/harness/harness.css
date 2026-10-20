@@ -1460,6 +1460,10 @@ textarea.hx-input {
   flex-direction: column;
   gap: 8px;
 }
+/* While you type, the box is a layer of its own: a keystroke repaints it, not the page around it. */
+.hx-compose-box:focus-within {
+  will-change: transform;
+}
 .hx-compose-box {
   border: 1px solid #272930;
   border-radius: 16px;
