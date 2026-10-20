@@ -1,0 +1,71 @@
+# Every project kiln vendors: where it comes from, the revision kiln takes, and what in its folder
+# is kiln's own (docs/vendoring.md). scripts/vendor.py reads it:
+#
+#   scripts/vendor.py <project> <revision>    take a project at a revision, kiln's recorded changes
+#                                             re-applied, the pins checked, the gate run
+#   scripts/vendor.py check                   every vendored folder is its upstream at its revision
+#                                             plus its recorded changes, byte for byte
+#   scripts/vendor.py record <project> <title> --why <why>
+#                                             record an edit made in a vendored folder
+#
+# A project's recorded changes are vendor/patches/<project>/*.patch, applied in name order, each a
+# row of its UPSTREAM.md. kiln holds one copy of each project: a product that vendors another takes
+# it at the revision kiln takes, and `[patch]` in Cargo.toml points every dependency on it here.
+format = 1
+
+# kiln's gate, run from the repository's root after a re-vendor: the critical path's (its master plan
+# §3): tests, clippy, the macOS and Windows cross-checks, tsc and eslint, and the UI's build. The
+# cross-checks are clippy through zig, as ci/release/build.sh builds those platforms: they need zig
+# and cargo-zigbuild where the gate runs, and the two targets added to rustup. The UI's packages
+# install without their scripts: no native build (node-pty's needs a C++ compiler), and none of
+# their code runs to install them.
+gate = [
+  "cargo clippy --locked --all-targets -- -D warnings",
+  "cargo test --locked --no-fail-fast",
+  "cargo-zigbuild clippy --locked --all-targets --target aarch64-apple-darwin -- -D warnings",
+  "cargo-zigbuild clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
+  "npm ci --ignore-scripts --prefix ui --no-audit --no-fund",
+  "npm run --prefix ui typecheck",
+  "npm run --prefix ui lint",
+  "KILN_UI_SERVER=off npm run --prefix ui build",
+]
+
+# The conversation store's engine (docs/conversations.md): four of Turso's crates, Rust only.
+[projects.turso]
+kind = "git"
+repository = "https://github.com/tursodatabase/turso"
+commit = "3e09a82750d8290ef96e3830896e7205b7c0b9e6"
+path = "vendor/turso"
+# What kiln takes of upstream's tree, at upstream's paths.
+take = ["Cargo.toml", "LICENSE.md", "NOTICE.md", "core", "extensions/core", "macros", "sqlite/parser"]
+own = ["UPSTREAM.md"]
+
+# The Bun kiln carries to run its UI server (vendor/bun/README.md). Its revision is a release.
+[projects.bun]
+kind = "bun"
+version = "1.4.3"
+path = "vendor/bun"
+own = ["README.md", "NOTICE"]
+# The musl runtime Bun's musl build needs comes from Oven's Alpine image, pinned by its index.
+image = "docker.io/oven/bun"
+image_tag = "{version}-alpine"
+image_digest = "sha256:629e17411f1f129dbec3af78d5af9c9f2a937435c80349437206c6b0b7422373"
+# Packing the UI server downloads this machine's Bun and checks it against bun.json (after kiln's
+# gate, whose tests must not run against a binary with the UI server packed in).
+gate = ["npm run --prefix ui build"]
+
+# Each license file and its source. {musl} and {gcc} are the versions the image's packages hold.
+[projects.bun.licenses]
+"licenses/bun-LICENSE.md" = "https://raw.githubusercontent.com/oven-sh/bun/bun-v{version}/LICENSE.md"
+"licenses/musl-COPYRIGHT" = "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v{musl}"
+"licenses/GPL-3.0" = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/GPL-3.0-only.txt"
+"licenses/GCC-RUNTIME-LIBRARY-EXCEPTION" = "https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-{gcc}/COPYING.RUNTIME"
+
+# musl/<arch>/<file>, each from its path in the image's platform.
+[projects.bun.musl.x86_64]
+platform = "linux/amd64"
+files = { "ld-musl-x86_64.so.1" = "/lib/ld-musl-x86_64.so.1", "libstdc++.so.6" = "/usr/lib/libstdc++.so.6", "libgcc_s.so.1" = "/usr/lib/libgcc_s.so.1" }
+
+[projects.bun.musl.aarch64]
+platform = "linux/arm64"
+files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6" = "/usr/lib/libstdc++.so.6", "libgcc_s.so.1" = "/usr/lib/libgcc_s.so.1" }
