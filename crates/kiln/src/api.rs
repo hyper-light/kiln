@@ -170,6 +170,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         let secure = is_secure(&hub, &req);
         return Ok(boxed(|| f.serve(&slug, req, secure)).await);
     }
+    // A peered cluster under this one's own address (`/.kiln-peer/<slug>/`, kiln reached by
+    // address): its API forwarded, its pages this cluster's app (in the browser) drawing it.
+    if let Some((f, slug, page)) = crate::peers::route_path(&hub, &req) {
+        if page {
+            return Ok(crate::ui::shell(&req));
+        }
+        let secure = is_secure(&hub, &req);
+        return Ok(boxed(|| f.serve_path(&slug, req, secure)).await);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let seg = segments(&path);
@@ -705,6 +714,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Restoring the server's conversation store from a mirror's copy (admins: unlisted in authz).
         (&Method::GET, ["api", "conversations", "restore"]) => Ok(srv::json(StatusCode::OK, &hub.harness.restore_view())),
         (&Method::POST, ["api", "conversations", "restore"]) => boxed(|| conversation_restore(&hub, req)).await,
+        // Every conversation store, as the server sees it, and one store's series (the System
+        // page; docs/conversations.md, "Telemetry").
+        (&Method::GET, ["api", "conversations", "status"]) => Ok(srv::json(StatusCode::OK, &crate::harness::stores::status(&hub))),
+        (&Method::GET, ["api", "conversations", "series"]) => conversation_series(&hub, &q),
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
         (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => boxed(|| harness_kept_file(&hub, id, sha, &req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "file"]) => boxed(|| harness_file(&hub, id, q.get("path").cloned(), &req)).await,
@@ -3349,6 +3362,16 @@ async fn conversation_search(hub: &Hub, q: &HashMap<String, String>) -> R {
         })
         .collect();
     Ok(srv::json(StatusCode::OK, &json!({ "hits": hits })))
+}
+
+/// `GET /api/conversations/series?key=&window=`: store `key`'s series over the last `window`
+/// seconds (3600 unless said; up to a day), a column each; none yet (a store the board hasn't
+/// sampled since the server started): empty.
+fn conversation_series(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let key = q.get("key").map(String::as_str).unwrap_or(crate::convo::board::SERVER);
+    let window = q.get("window").and_then(|v| v.parse::<i64>().ok()).unwrap_or(3600).clamp(60, 86_400);
+    let series = hub.harness.board.series(key, window, crate::util::now_ms()).unwrap_or_else(|| crate::convo::board::SeriesView { key: key.to_owned(), ..Default::default() });
+    Ok(srv::json(StatusCode::OK, &series))
 }
 
 fn goals_err(e: crate::goals::Error) -> ApiError {

@@ -27,10 +27,10 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 |---|---|---|---|
 | N | Notifications and a phone-first Mission Control | — | done: N1–N3 (docs/notifications.md); an iPhone check by a person is left |
 | O | Agents that run agents | — | built: O1–O5 (docs/agents.md, "Agents that run agents"), tested on a hub in process; O-AC1 with real harnesses across two machines not run yet |
-| P | A plan run as one agent per step | O (W for parallel steps) | built: P1–P3 for steps in order (parallel steps run one at a time until workspaces exist, and say so); P4 waits on C |
+| P | A plan run as one agent per step | O (W for parallel steps) | built: P1–P4 for steps in order: each met step's work goes up as one diff on the step before's, so the run ends as a stack (P-AC1, tested in process against kiln's own git hosting). Parallel steps run one at a time and say so: side by side they need workspaces of their own, held with Slates |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R3 and R5 (docs/releases.md, "Diagnosing and repairing a runner"); R4, a runner doctor that wakes by itself, waits on attachments (ci.md W20-R08) |
-| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes; Linux landing: its issuer surface), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk on a person's go-ahead where Slates takes one from kiln: macOS, Windows); W5 merging waits on Slates' mountable work volumes, Linux landing on its issuer surface, moving a volume on cloning an overlay's snapshot, installing Slates from kiln's releases is to do, W8 waits on Shards |
-| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI. Agents reply in threads once review operations agents can call exist (W14's); until then they answer with a new version |
+| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes; Linux landing: its issuer surface), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk on a person's go-ahead where Slates takes one from kiln: macOS). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents, moving an agent with a volume to another machine (refused, saying why), installing Slates from kiln's releases, workspaces on Windows (no mount there yet), writing to disk on Linux (Slates' issuer surface). W8 waits on Shards |
+| C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI; a plan run's steps go up as a stack, one diff per step (P4). Agents reply in threads once review operations agents can call exist (W14's, being built); until then they answer with a new version |
 | K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | coordinating |
 
 ## N: Notifications
@@ -147,6 +147,18 @@ Mission Control groups the run's agents under it ("Plan: retry rework · 3 of 5 
 The run ends as one change request, or as a stack with one diff per step when the steps ran in
 order (C1).
 
+Built, for steps in order (docs/agents.md, "Change requests from agents"): as each step is met,
+the files its agent changed become one commit on the step before's, made beside the folder (C1's
+scratch index), and go up for review at once. On a repository kiln hosts, each is pushed to
+`refs/for/<trunk>` (topic `plan-<run>`) with its own agent's token, so each diff's author is the
+agent that did its step and kiln links them as a stack; elsewhere, a branch per step with each
+pull request onto the one before. A step that changed nothing has no diff; one whose commit
+couldn't be made hands its files on to the next. What review and CI say to a step's agent waits
+until the run ends (the next step works in the same folder); then `agents.change` from that
+agent makes a new version of its own diff and makes the steps above again on it, or says why it
+can't (its change touches what a step above changed too). Merging steps that ran side by side
+into one workspace (W5) is held with Slates.
+
 **Acceptance.** P-AC1: a three-step plan runs as three agents in order, each starting once the
 step before is met, and ends as a stack of three diffs.
 
@@ -260,8 +272,8 @@ For a repository whose provider is elsewhere (GitHub, GitLab, Bitbucket), a bran
 and a pull request opened through that provider. Built: the commit is made beside the folder (a
 scratch index from its last commit, with the agent's files), so a person's branch, index, working
 tree and own edits are never touched; where kiln has no integration with the provider, the branch
-is pushed with the machine's credentials and the change's link opens the pull request. A stack of
-an agent's work (W14-R03) comes with P4.
+is pushed with the machine's credentials and the change's link opens the pull request. A plan
+run's steps go up as a stack, one diff per step (P4).
 
 **C2 CI comes back to the agent.** The checks on its change show in its Changes; a failure goes to
 the agent as a message with the failure excerpt (W20-R10's bundle) when its person allows it

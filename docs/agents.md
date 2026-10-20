@@ -393,11 +393,25 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   only when **Fix failing checks by itself** is on, which it is unless you turn it off when
   opening it), and the land queue taking it out (with the reason). Approvals and landing only
   update where it stands. An agent that has ended is sent nothing.
+- **A plan run's steps** (`plans.run` with `mode: "agents"`, steps in order; docs/agentic.md P4)
+  go up by themselves, as each step is met: the files the step's agent changed, as one commit on
+  the step before's. On a repository kiln hosts that is one diff per step (`D12`), pushed to
+  `refs/for/<trunk>` under the run's topic (`plan-<run>`) as that step's agent, and kiln links
+  them as a stack; elsewhere, a branch per step (`agents/<plan>-<run>-<step>`), each pull request
+  onto the one before. A step that changed nothing has no diff; one whose commit couldn't be made
+  hands its files on to the next step's. What review and CI say to a step's agent waits while the
+  run goes on (the next step works in the same folder) and reaches it when the run ends. Then
+  `agents.change` from that agent makes a new version of its own diff: what it changed since,
+  taken against the stack's top, goes into its step's commit, and the steps above are made again
+  on it. When its change touches what a step above changed too, it's refused, saying so. Before
+  the run ends, `agents.change` from a step's agent is refused, saying why. The run's page shows
+  each step's diff and where it stands.
 
 A `Change` is `{agent, repo?, provider, change?, url, branch, trunk, sha, version, files,
-title, state, review?, checks?, fix_checks, opened_at, updated_at}`: `provider` is `kiln`,
-`github`, `gitlab`, `bitbucket` or `git`; `change` is `CR12` or `#34` (none until a pull request
-is opened); `state` is `open`, `landed` or `closed`. Mission Control shows each agent's change
+title, state, review?, checks?, fix_checks, opened_at, updated_at, stack?}`: `provider` is `kiln`,
+`github`, `gitlab`, `bitbucket` or `git`; `change` is `CR12`, `D12` or `#34` (none until a pull
+request is opened); `state` is `open`, `landed` or `closed`; `stack` (`{run, step}`) says it is a
+step of a plan run's stack. Mission Control shows each agent's change
 on its row, with **Review** on a finished agent's open one; the Changes tab shows where it
 stands, linked, and pushes new versions. Replying in a review thread as the agent comes with
 review operations agents can call; until then an agent answers a comment with a new version.

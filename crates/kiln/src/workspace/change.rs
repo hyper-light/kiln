@@ -67,6 +67,17 @@ pub struct Record {
     pub fix_checks: bool,
     pub opened_at: i64,
     pub updated_at: i64,
+    /// The plan run whose stack it is a step of (docs/agentic.md P4), when it is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<InStack>,
+}
+
+/// A change that is one step of a plan run's stack.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InStack {
+    pub run: String,
+    /// Its step, from 1.
+    pub step: usize,
 }
 
 /// What a person or the agent asks for.
@@ -174,8 +185,15 @@ pub fn matched<'a>(repos: &'a [Repo], remotes: &[Remote], public_url: &str) -> O
 /// Agent branches: `agents/<what it's about>-<its id's start>`.
 pub fn branch_for(info: &Info) -> String {
     let about = [&info.title, &info.goal, &info.name].into_iter().map(|s| s.trim()).find(|s| !s.is_empty()).unwrap_or("work");
+    let (slug, short) = (slug(about), id_end(&info.id));
+    if slug.is_empty() { format!("agents/{short}") } else { format!("agents/{slug}-{short}") }
+}
+
+/// `text` as a branch name takes it: lower case letters and digits, `-` between words, at most
+/// about 40 of them.
+pub fn slug(text: &str) -> String {
     let mut slug = String::new();
-    for c in about.chars().flat_map(char::to_lowercase) {
+    for c in text.chars().flat_map(char::to_lowercase) {
         if c.is_ascii_alphanumeric() {
             slug.push(c);
         } else if !slug.ends_with('-') && !slug.is_empty() {
@@ -185,12 +203,14 @@ pub fn branch_for(info: &Info) -> String {
             break;
         }
     }
-    let slug = slug.trim_end_matches('-');
-    // The end of its id: kiln's ids start with the time they were made, so agents started within a
-    // minute of each other share their beginnings, never their ends.
-    let alnum: Vec<char> = info.id.chars().filter(char::is_ascii_alphanumeric).collect();
-    let short: String = alnum.get(alnum.len().saturating_sub(8)..).unwrap_or_default().iter().collect();
-    if slug.is_empty() { format!("agents/{short}") } else { format!("agents/{slug}-{short}") }
+    slug.trim_end_matches('-').to_owned()
+}
+
+/// The end of a kiln id: its ids start with the time they were made, so those made within a
+/// minute of each other share their beginnings, never their ends.
+pub fn id_end(id: &str) -> String {
+    let alnum: Vec<char> = id.chars().filter(char::is_ascii_alphanumeric).collect();
+    alnum.get(alnum.len().saturating_sub(8)..).unwrap_or_default().iter().collect()
 }
 
 /// Where to open a pull request for `branch` into `trunk` on a known host, by its remote's URL.
@@ -205,7 +225,7 @@ pub fn compare_url(remote_url: &str, trunk: &str, branch: &str) -> Option<String
     }
 }
 
-fn provider_of(host: Option<&crate::githost::GitHost>) -> &'static str {
+pub(crate) fn provider_of(host: Option<&crate::githost::GitHost>) -> &'static str {
     match host {
         Some(crate::githost::GitHost::Kiln) => "kiln",
         Some(crate::githost::GitHost::Github(_)) => "github",
@@ -225,8 +245,13 @@ fn title_of(info: &Info, want: &Want) -> String {
 /// Opens agent `info`'s change request from its work, or pushes a new version of the one it has.
 /// `actor` is who asked, as the audit trail names them.
 pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Result<Record, Fail> {
-    let (_, _, changes) = hub.harness.conclusion(&info.id).unwrap_or_default();
-    let paths: Vec<String> = changes.as_array().into_iter().flatten().filter_map(|f| f.get("path").and_then(Value::as_str)).map(str::to_owned).collect();
+    // A plan step's agent: its work is its step's in the run's stack.
+    if let Some(run) = info.plan_run.as_deref().filter(|r| !r.is_empty())
+        && let Some(r) = crate::plans::stack::amend(hub, actor, info, &want, run).await?
+    {
+        return Ok(r);
+    }
+    let paths = paths_of(hub, &info.id);
     // In a workspace of its own, everything that changed there is its: its commands' changes too.
     let own = info.workspace.as_ref().is_some_and(|w| w.made.is_some());
     if paths.is_empty() && !own {
@@ -343,6 +368,7 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
         fix_checks: want.fix_checks.or(previous.as_ref().map(|p| p.fix_checks)).unwrap_or(true),
         opened_at: previous.as_ref().map_or(now, |p| p.opened_at),
         updated_at: now,
+        stack: None,
     };
     save(hub, &record).await;
     let what = record.change.clone().unwrap_or_else(|| format!("branch {branch}"));
@@ -352,6 +378,12 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
 
 fn lineage_short(id: &str) -> &str {
     crate::harness::lineage::short(id)
+}
+
+/// The files agent `id` changed, as its changeset names them.
+pub fn paths_of(hub: &Hub, id: &str) -> Vec<String> {
+    let (_, _, changes) = hub.harness.conclusion(id).unwrap_or_default();
+    changes.as_array().into_iter().flatten().filter_map(|f| f.get("path").and_then(Value::as_str)).map(str::to_owned).collect()
 }
 
 /// A record as `agents.change` and `agents.result` answer with it.

@@ -56,6 +56,35 @@
 
 
 /* ---------------------------------------------------------------- agent page head */
+.ag-ready {
+  animation: ag-ready 0.18s ease-out;
+}
+@keyframes ag-ready {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.ag-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.ag-loading .sg-trace {
+  width: 44px;
+  height: 44px;
+}
+.ag-loading .sg-trace path {
+  stroke-width: 1.1;
+}
+:root[data-motion="paused"] .ag-ready {
+  animation: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ag-ready {
+    animation: none;
+  }
+}
 .ag-head {
   container-type: inline-size;
   padding: 18px 24px 14px;
