@@ -118,14 +118,16 @@ export function AgentHeader({
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
   // Settings always: kiln's own (usage limits) are there whatever the harness offers.
   const extra = [...(left > 0 && onBackground ? [{ label: `${left} left running…`, onSelect: onBackground }] : []), ...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), { label: "Settings…", onSelect: onSettings }];
-  // Codex takes a new permission mode, model or effort from its next turn.
-  const nextTurn = info?.kind === "codex" ? { mode: true, model: true, effort: true } : undefined;
+  // Newer Codex adapters can interrupt and continue a turn to apply its permissions immediately.
+  const permissionsLive = features.includes("permissions_live");
+  const nextTurn = info?.kind === "codex" ? { mode: !permissionsLive, model: true, effort: true } : undefined;
   // How it runs, as one line; with the other harnesses' models on its machine where it can go on in them.
   const line: RunSettingsProps = {
     className: "ag-run",
     modes: meta?.modes ?? [],
     mode: state?.mode ?? info?.mode ?? "",
     onMode: features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined,
+    modeCanReapply: permissionsLive && running,
     models: meta?.models ?? [],
     model: state?.switching?.model ?? state?.model ?? info?.model ?? "",
     onModel: features.includes("set_model") ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m }) : undefined,

@@ -1,0 +1,14 @@
+Subject: core/io/windows_lock.rs allows dead code
+Why: Its shared-WAL locks are unused in kiln's build, so a Windows build warned 17 times.
+
+diff --git a/core/io/windows_lock.rs b/core/io/windows_lock.rs
+index 063df5a15e8e6158b974be7cca39ff448d249af1..c21704c1f4b20cbe3e3af3e3efa4ef82b4dc4d02 100644
+--- a/core/io/windows_lock.rs
++++ b/core/io/windows_lock.rs
+@@ -1,3 +1,6 @@
++// kiln: its shared-WAL locks are unused in kiln's build, which would warn on Windows.
++#![allow(dead_code)]
++
+ use crate::sync::{Arc, Mutex};
+ use crate::{LimboError, Result};
+ use std::collections::HashMap;

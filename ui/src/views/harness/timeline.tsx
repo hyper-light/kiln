@@ -10,7 +10,7 @@ import { useSession, type Approval, type Command, type Delivery, type HEvent, ty
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { AccountCard, saysSignedOut } from "./account-card";
-import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
+import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, taskDot, taskDuration, taskLive, taskOfCall, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
@@ -89,6 +89,13 @@ function Elapsed({ from, to }: { from: number; to?: number | null }) {
 function Ticking({ from }: { from: number }) {
   const now = useNow();
   return <span className="hx-meta-num">{duration(now - from)}</span>;
+}
+
+/** A live child keeps counting even when the harness has reported an earlier duration. */
+export function TaskElapsed({ task }: { task: Task }) {
+  if (task.ended === undefined && taskLive(task)) return <Elapsed from={task.started} />;
+  const ms = taskDuration(task);
+  return ms !== undefined ? <span className="hx-meta-num">{duration(ms)}</span> : null;
 }
 
 /* ------------------------------------------------------------------ step bodies */
@@ -285,20 +292,24 @@ function AgentBody({ calls, tasks, onOpenTask }: { calls: ToolEvent[]; tasks: Ta
   return (
     <div className="hx-stack">
       {calls.map((c) => {
-        const task = tasks.find((t) => t.tool_id === c.tool_id || t.id === c.task);
+        const task = taskOfCall(c, tasks);
+        const codexActivity = c.name === "collabAgentToolCall" || c.name === "subAgentActivity";
+        const thread = task?.tool_id ?? (c.task || !codexActivity ? c.tool_id : undefined);
+        const live = task ? taskLive(task) : false;
         return (
           <div key={c.id} className="hx-sub" data-ev={c.id}>
             <div className="hx-sub-head">
-              <i className="dot" data-status={dotFor(task?.status === "running" ? "running" : c.status)} aria-hidden="true" />
-              <span className="hx-sub-title">{task?.description ?? c.title}</span>
-              {task?.kind && <span className="hx-tag">{task.kind}</span>}
+              <i className="dot" data-status={task ? taskDot(task) : dotFor(c.status)} aria-hidden="true" />
+              <span className="hx-sub-title min-w-0 break-words">{task?.description ?? c.title}</span>
+              {task?.kind && <span className="hx-tag shrink-0">{task.kind}</span>}
             </div>
             <div className="hx-sub-meta">
+              {task && <span>{task.status}</span>}
               {task?.tool_uses ? <span>{task.tool_uses} steps</span> : null}
-              {task?.duration_ms ? <span>{duration(task.duration_ms)}</span> : task && !task.ended ? <Elapsed from={task.started} /> : null}
-              {task?.last_tool && !task.ended && <span className="hx-trunc">{task.last_tool}</span>}
-              {onOpenTask && (
-                <button type="button" className="hx-link" onClick={() => onOpenTask(c.tool_id)}>
+              {task && <TaskElapsed task={task} />}
+              {task?.last_tool && live && <span className="hx-trunc">{task.last_tool}</span>}
+              {onOpenTask && thread && (
+                <button type="button" className="hx-link" onClick={() => onOpenTask(thread)}>
                   Open its work →
                 </button>
               )}
@@ -342,7 +353,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
               .map((c) => (c.tool === "read" ? relPath(c.title, cwd).split("/").pop() : c.title))
               .join(", ")
           : step.group === "agent"
-            ? (tasks.find((t) => t.tool_id === first?.tool_id)?.description ?? first?.title)
+            ? (taskOfCall(first, tasks)?.description ?? first?.title)
             : step.calls.length === 1
               ? first?.title
               : undefined;
@@ -744,6 +755,18 @@ function useKeeper(key: string) {
       // Something changed size (it came in, loaded, opened, the view resized): before it's painted,
       // the end stays at the end, or what you were reading stays where it was.
       const hold = () => {
+        // A keyboard or a growing answer can resize the pane while a question is being answered.
+        // Keep that field visible instead of pinning an unrelated row (or the transcript's end).
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement && root.contains(focused) && focused.matches("input, textarea, [contenteditable='true']")) {
+          const field = focused.getBoundingClientRect();
+          const pane = root.getBoundingClientRect();
+          if (field.top < pane.top + 12) root.scrollTop += field.top - pane.top - 12;
+          else if (field.bottom > pane.bottom - 12) root.scrollTop += field.bottom - pane.bottom + 12;
+          s.touched = null;
+          read();
+          return;
+        }
         const t = s.touched;
         if (t && performance.now() - t.t < TOUCH_MS && t.el.isConnected && t.el.offsetHeight !== t.h) {
           // What you just opened (or closed) opens in place; where that leaves you is where you are.
@@ -882,7 +905,7 @@ export const Timeline = React.memo(function Timeline({
   const keptFiles = useSession(store, (s) => s.files);
   const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
-  const going = parent ? task?.status === "running" || task?.status === "pending" : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
+  const going = parent ? Boolean(task && taskLive(task)) : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
   // Turns that didn't change stay the same objects, so only what changed renders again.
   const [kept] = React.useState(() => new Map<string, Turn>());
   const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
@@ -1063,7 +1086,15 @@ export const Timeline = React.memo(function Timeline({
               <div className="hx-sub-empty">
                 <p className="hx-sub-what">{task?.description || "Subagent"}</p>
                 {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
-                {going ? <PrismLabel live>Starting</PrismLabel> : <p className="hx-dim text-[12px]">Nothing from this subagent has reached kiln.</p>}
+                {task && (
+                  <div className="hx-sub-meta">
+                    <i className="dot" data-status={taskDot(task)} aria-hidden="true" />
+                    <PrismLabel live={going}>{task.status}</PrismLabel>
+                    <TaskElapsed task={task} />
+                    {going && task.last_tool && <span className="hx-trunc">{task.last_tool}</span>}
+                  </div>
+                )}
+                {task?.summary ? <Prose text={task.summary} className="hx-sub-result" /> : <p className="hx-dim text-[12px]">No work has been reported in this thread yet.</p>}
               </div>
             ) : (
               <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>

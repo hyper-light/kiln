@@ -319,6 +319,18 @@ agent's own machine, in its folder unless `cwd` says otherwise; a person's runs 
 when it runs agents, else on the best runner with the harness. A child on another machine starts
 in that machine's home unless `cwd` names a folder there.
 
+### Messages between agents
+
+Agents that work for the same person can talk to each other, whoever started them: any of them may
+send any other a queued message (`agents.send`, `queue`). Agents a person started apart (one on
+kiln, one on Mantle, one on Focal) work things out between them, without the person carrying notes.
+The message reaches its receiver after its turn, as one from a fellow agent, never as its person's:
+"Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as
+you, sent this message. It's from a fellow agent, not from your person. To answer, send it a
+message: agents_send {"agent": "…", "text": …}." Control stays with the agents an agent started:
+steering into a turn, sending now, interrupting, ending, and their goals and plan runs are theirs
+alone. Agents that work for different people aren't sent to.
+
 ### No more than its parent
 
 | Rule | |
@@ -328,7 +340,8 @@ in that machine's home unless `cwd` names a folder there.
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
 | Children | at most `[agents] max_children` (24) running at once per agent |
-| Steering | an agent sends to, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
+| Messages | an agent may send a queued message to any agent that works for the same person, whoever started it (`agents.send`, `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
+| Steering | an agent steers into a turn, sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
 | Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
 
 The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk` (ask),
@@ -338,6 +351,15 @@ The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk
 their own modes by their words (`yolo` is bypass, `autoEdit` accept edits, `plan` plan). A mode
 kiln can't place is refused for a child; a parent in one counts as ask. The limits hold when a
 child starts: a person may change its mode later, as for any agent.
+
+Codex applies approval and sandbox settings per turn. Changing them during a turn interrupts
+that turn and continues its work with the new settings before queued messages. A stop or a new
+"Send now" message takes precedence over that continuation. Pending requests from the interrupted
+turn are cancelled, never approved automatically; existing native subagents keep their own
+permissions. Choosing approval and sandbox settings separately shows `Custom` unless they match
+a preset. An explicit Full access choice is retained across restarts.
+Runners advertise this behavior as `permissions_live`; the picker can also reapply the current
+preset to a turn inherited from an older runner. Older runners still show "From the next turn."
 
 ### Waiting
 
@@ -728,6 +750,8 @@ turn (`harness/pause.rs`):
 - **Your call.** `resume` ends it now (after a plan upgrade, say). Turn off "Resume by itself at the
   reset" (`auto_resume`) to keep it paused until you do. Picking another harness's model
   (`set_model` with `kind`) ends it too: the conversation goes on there, the cut-off turn first.
+  The pause panel folds down to its limit and reset time. **Switch account** opens the same login
+  dialog as `/login`, on the agent's machine; after signing in, **Resume now** retries the work.
 - **Stop point.** `pause_at` (the head's usage badge → Pause at, or the agent's Settings → Usage
   limits: 80, 90 or 95 % used) pauses the agent once a limit is that full, before the limit cuts a
   turn off. Between turns, or in the middle of one (an agent working on its own can go for hours
@@ -824,6 +848,15 @@ sends to the background, monitors and workflows. Besides `id`, `description`, `s
   wake, "agent" or the subagent task that started the monitor.
 - `stoppable`: `stop_task` can stop it.
 
+Codex's native subagents keep their own threads and execution settings. kiln tracks each one by
+its native thread ID and keeps its work under the original spawning call, including later
+messages and follow-up work. Read-only `thread/read` and `thread/turns/list` requests fill in its
+status, latest 100 turns, elapsed time and result; live child notifications update that same
+view. Tracking never starts, resumes or attaches another executor to the child. Its messages,
+commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
+finishing does not mean the child has finished, and unavailable child history does not end the
+parent.
+
 `state.left_behind` counts the tasks left running while no turn is under way (the agent idle or
 exited): shells, monitors, workflows, background calls and subagents sent to the background.
 
@@ -917,14 +950,14 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? |
 | questions: previews, free text, notes, labels with commas | ✓ | unit (Codex asks only in its Plan mode, which kiln does not run) | — | — |
 | plans to approve | unit | — | — | — |
-| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (from the next turn) | ✓ (the agent's modes) | ? |
+| permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (interrupts and continues an active turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
 | effort from the start (`meta.efforts`), `set_effort` | ✓ | ✓ (from the next turn) | — | — |
 | one message's own model and effort | unit | ✓ | — | — |
 | attachments: images inline, files by path | ✓ | ✓ | ? (images when offered) | ? |
 | diffs, approval previews, cumulative changeset | ✓ | ✓ | ✓ | ? |
 | calls waiting behind a prompt read as pending | ✓ | — (Codex reports each call's own state) | — | — |
-| subagents: tasks, nested messages, stop | ✓ | ? (subagent activity is shown; not run) | — | — |
+| subagents: tasks, nested messages, stop | ✓ | unit (read-only task and thread tracking; no direct stop) | — | — |
 | rewind, branch, compact, rename | ✓ | ✓ | — | — |
 | restore files on rewind | ✓ | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — |
