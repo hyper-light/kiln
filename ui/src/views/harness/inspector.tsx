@@ -6,12 +6,12 @@ import * as React from "react";
 import { Bot, Square } from "lucide-react";
 import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
-import { changesetOf, duration, editsOf, money, relPath, runsOf, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
+import { changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
-import { TodoList } from "./timeline";
+import { TaskElapsed, TodoList } from "./timeline";
 import { Background, isBackground } from "./background";
 import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
@@ -146,7 +146,7 @@ const Runs = React.memo(function Runs({ runs: ran }: { runs: ToolEvent[] }) {
 });
 
 function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void }) {
-  const running = t.status === "running" || t.status === "pending";
+  const live = taskLive(t);
   const [out, setOut] = React.useState<string | null>(null);
   const fetchOutput = async () => {
     const v = await store.request((client) => ({ type: "control", id: "task_output", value: { task: t.id, client } }));
@@ -155,12 +155,12 @@ function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number;
   return (
     <li className="hx-task" style={{ paddingLeft: depth * 14 }}>
       <div className="hx-task-head">
-        <i className="dot" data-status={running ? "running" : t.status === "completed" ? "succeeded" : t.status === "failed" ? "failed" : "cancelled"} aria-hidden="true" />
+        <i className="dot" data-status={taskDot(t)} aria-hidden="true" />
         <Bot size={12} className="text-[var(--color-subtle)]" />
         <button type="button" className="hx-task-title" disabled={!onOpen || !t.tool_id} onClick={() => t.tool_id && onOpen?.(t.tool_id)}>
           {t.description}
         </button>
-        {canStop && running && (
+        {canStop && live && t.stoppable !== false && (
           <button type="button" className="hx-icon" aria-label={`Stop ${t.description}`} onClick={() => store.send({ type: "stop_task", task: t.id })}>
             <Square size={10} fill="currentColor" />
           </button>
@@ -172,8 +172,8 @@ function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number;
         <span>{t.status}</span>
         {t.tool_uses ? <span>{t.tool_uses} steps</span> : null}
         {t.tokens ? <span>{tokens(t.tokens)} tokens</span> : null}
-        {t.duration_ms ? <span>{duration(t.duration_ms)}</span> : null}
-        {running && t.last_tool && <span className="hx-trunc">{t.last_tool}</span>}
+        <TaskElapsed task={t} />
+        {live && t.last_tool && <span className="hx-trunc">{t.last_tool}</span>}
         <button type="button" className="hx-link" onClick={() => (out === null ? void fetchOutput() : setOut(null))}>
           {out === null ? "Output" : "Hide output"}
         </button>
@@ -309,7 +309,7 @@ export function Inspector({
   // The plan it last proposed (plan mode), to read and keep.
   const proposed = React.useMemo(() => {
     if (tab !== "plan") return "";
-    const e = events.findLast((e) => e.kind === "tool" && e.tool === "plan");
+    const e = events.findLast((e) => !e.parent && e.kind === "tool" && e.tool === "plan");
     return e?.kind === "tool" ? ((e.input as { plan?: string } | null)?.plan ?? e.output ?? "") : "";
   }, [events, tab]);
   const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
