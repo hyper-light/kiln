@@ -95,4 +95,5 @@ command-group = "5.0.1"
 workspace = true
 
 [dev-dependencies]
+kiln-sim = { path = "../kiln-sim" }
 tempfile = "3.27.0"

@@ -16,6 +16,11 @@ pub mod migrations;
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    /// A test build's store whose calls run on the calling task, each after yielding once
+    /// ([`Store::in_memory_inline`]): what kiln-sim's models drive under their seeded scheduler, a
+    /// crash able to come at each call's wait.
+    #[cfg(test)]
+    inline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,14 +240,29 @@ impl Store {
         let mut conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
         migrations::apply(&mut conn).context("apply migrations")?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            #[cfg(test)]
+            inline: false,
+        })
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            #[cfg(test)]
+            inline: false,
+        })
+    }
+
+    /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
+    /// models drive it under their seeded scheduler, so a crash can come at each call (CP-T6.1).
+    #[cfg(test)]
+    pub fn in_memory_inline() -> anyhow::Result<Self> {
+        Ok(Self { inline: true, ..Self::in_memory()? })
     }
 
     /// Run `f` with the connection on the blocking pool.
@@ -251,6 +271,20 @@ impl Store {
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(test)]
+        if self.inline {
+            let mut yielded = false;
+            futures::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    return std::task::Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            })
+            .await;
+            let mut g = self.conn.lock();
+            return f(&mut g);
+        }
         let conn = self.conn.clone();
         crate::rt::blocking(move || {
             let mut g = conn.lock();

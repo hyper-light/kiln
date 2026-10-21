@@ -2175,6 +2175,7 @@ dependencies = [
  "kiln-cd",
  "kiln-ci",
  "kiln-seams",
+ "kiln-sim",
  "mime_guess",
  "nix 0.31.3",
  "parking_lot",

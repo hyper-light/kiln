@@ -316,6 +316,10 @@ pub struct Feed {
     pub outcomes: VecDeque<Outcome>,
     /// Steps the folder took since the runner last looked (its metrics and status).
     pub took: Vec<Took>,
+    /// A test build's planted bug (kiln-sim's T-T6.1.1): the saved state written over itself in
+    /// place and never fsynced, so a power loss tears it and the write it held is lost.
+    #[cfg(test)]
+    pub planted_in_place: bool,
 }
 
 /// A committed step a copy's folder took: whose, when its machine saw it, and what it did to the
@@ -372,6 +376,8 @@ impl Feed {
             install: saved.install,
             outcomes: VecDeque::new(),
             took: Vec::new(),
+            #[cfg(test)]
+            planted_in_place: false,
         })
     }
 
@@ -449,6 +455,14 @@ impl Feed {
             install: self.install.clone(),
         };
         let bytes = serde_json::to_vec(&saved)?;
+        #[cfg(test)]
+        if self.planted_in_place {
+            use std::io::Write as _;
+            self.copy.fs.create(&self.file)?.write_all(&bytes)?;
+            self.durable = self.reached;
+            self.durable_conf = self.reached_conf.clone();
+            return Ok(());
+        }
         save_atomic_on(self.copy.fs.as_ref(), &self.file, &bytes)?;
         self.durable = self.reached;
         self.durable_conf = self.reached_conf.clone();

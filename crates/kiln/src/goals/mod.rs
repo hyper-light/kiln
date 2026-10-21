@@ -18,6 +18,8 @@
 
 pub mod keep;
 pub mod ops;
+#[cfg(test)]
+mod sim;
 
 use std::pin::pin;
 use std::sync::Arc;
