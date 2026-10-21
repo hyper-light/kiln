@@ -106,6 +106,41 @@ pub struct Standing {
     pub error: Option<String>,
 }
 
+/// A look at `feed`'s folder now, as a session leaving it asks (`Owner::look_now`): none when the
+/// runner isn't `ready` (connected, and told its copies), or the folder hasn't taken everything
+/// committed or is adopting the group's files; else how many steps it proposed (saved) and what
+/// went wrong saving them, or what went wrong looking.
+pub fn look_now_at(feed: &mut Feed, blobs: &Blobs, ready: bool, at_ms: i64) -> Option<Result<(usize, Option<String>), String>> {
+    if !ready || !feed.idle() || feed.copy.adopting() {
+        return None;
+    }
+    Some(match feed.copy.propose(blobs, at_ms) {
+        Ok(steps) => Ok((steps.len(), if steps.is_empty() { None } else { feed.save().err().map(|e| format!("the copy's state: {e}")) })),
+        Err(e) => Err(format!("looking at the folder: {e}")),
+    })
+}
+
+/// How `feed`'s copy stands: through where its folder has taken the log, what it hasn't taken
+/// yet, its own changes the log hasn't brought back, and what its last look left out.
+pub fn stand(feed: &Feed) -> Standing {
+    let (reached, behind) = feed.progress();
+    Standing { skipped: feed.copy.skipped.iter().map(|s| s.path.clone()).collect(), reached, behind, unsent: feed.copy.state.sent.len(), ..Standing::default() }
+}
+
+/// Where a session leaving a copy leaves its folder's log from: once a look at it now found
+/// nothing new and nothing of its own is unsent or untaken, the index its folder has taken the
+/// log through; none until then (`harness::session`'s `files_out` asks again till there is).
+pub fn left_at(looked: &Looked, st: &Standing) -> Option<Mark> {
+    (looked.looked && looked.proposed == 0 && st.unsent == 0 && st.behind == 0).then(|| Mark { repo: looked.repo.clone(), index: st.reached })
+}
+
+/// Whether a session that moved to a copy may go on there: the copy is of the repo it left, and
+/// its folder has taken the log as far as the folder it left had (`harness::session`'s
+/// `files_in`).
+pub fn arrived(st: &Standing, mark: &Mark) -> bool {
+    st.repo == mark.repo && st.reached >= mark.index
+}
+
 static GLOBAL: std::sync::OnceLock<Runner> = std::sync::OnceLock::new();
 
 /// This process's sync, once the agent started it: what an agent session moving between machines
@@ -600,40 +635,34 @@ impl Owner {
         let ready = self.connected && self.told;
         let h = self.held.get_mut(&key)?;
         let mut out = Looked { repo: h.spec.repo.clone(), ..Looked::default() };
-        if !ready || !h.r.machine().idle() || h.r.machine().copy.adopting() {
-            return Some(out);
-        }
-        let feed = h.r.machine_mut();
         let started = Instant::now();
-        let proposed = feed.copy.propose(&self.blobs, now_ms());
-        looked(&h.spec.name, started, proposed.as_ref().map_or(0, Vec::len));
-        match proposed {
-            Ok(steps) => {
-                h.errors[E_LOOK] = if steps.is_empty() { None } else { feed.save().err().map(|e| format!("the copy's state: {e}")) };
+        match look_now_at(h.r.machine_mut(), &self.blobs, ready, now_ms()) {
+            None => {}
+            Some(Ok((proposed, error))) => {
+                looked(&h.spec.name, started, proposed);
+                h.errors[E_LOOK] = error;
                 h.looked = true;
                 out.looked = true;
-                out.proposed = steps.len();
+                out.proposed = proposed;
             }
-            Err(e) => h.errors[E_LOOK] = Some(format!("looking at the folder: {e}")),
+            Some(Err(e)) => {
+                looked(&h.spec.name, started, 0);
+                h.errors[E_LOOK] = Some(e);
+            }
         }
         Some(out)
     }
 
     fn standing(&self, folder: &Path) -> Option<Standing> {
         let h = self.held.get(&self.copy_of(folder)?)?;
-        let feed = h.r.machine();
-        let (reached, behind) = feed.progress();
         Some(Standing {
             repo: h.spec.repo.clone(),
             name: h.spec.name.clone(),
             folder: h.spec.path.clone(),
-            skipped: feed.copy.skipped.iter().map(|s| s.path.clone()).collect(),
-            reached,
-            behind,
-            unsent: feed.copy.state.sent.len(),
             waiting: h.waiting,
             connected: self.connected,
             error: h.errors.iter().flatten().next().cloned().or_else(|| self.error.clone()),
+            ..stand(h.r.machine())
         })
     }
 

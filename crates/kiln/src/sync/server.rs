@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Wake, Waker};
 use std::time::{Duration, Instant, SystemTime};
 
-use hyper_durable::{LogStore as _, Output, Replica, ReplicaError, Unbounded};
+use hyper_durable::{LogStore, Output, Replica, ReplicaError, Unbounded};
 use hyper_raft::proto::{Message, MessageType};
 use hyper_raft::wire::Record as _;
 use serde::{Deserialize, Serialize};
@@ -584,58 +584,13 @@ impl Owner {
     fn steps(&mut self, machine: &str, repo: &str, steps: Vec<Step>) {
         let mine = self.members_on(repo, machine);
         let Some(g) = self.groups.get_mut(repo) else { return };
-        let mut want: Vec<String> = Vec::new();
-        // What was let go (and why), and how many came again, taken already.
-        let mut dropped: Vec<(&'static str, String)> = Vec::new();
-        let mut again = 0u64;
-        for mut step in steps {
-            if !mine.contains(&step.member) {
-                dropped.push(("not_member", format!("a step from {machine} for a copy that isn't on it: let go")));
-                continue;
-            }
-            if step.changes.len() > STEP_CHANGES {
-                dropped.push(("too_many_changes", format!("a step from {machine} of {} changes, more than {STEP_CHANGES}: let go", step.changes.len())));
-                continue;
-            }
-            step.by = machine.to_owned();
-            let taken = g.r.machine().tree.seqs.get(&step.member).copied().unwrap_or(0);
-            let next = g.next.get(&step.member).copied().unwrap_or(0).max(taken.saturating_add(1));
-            if step.seq < next {
-                again += 1;
-                continue;
-            }
-            if step.seq > next {
-                // One before it went missing: they all come again.
-                dropped.push(("out_of_order", format!("steps from {machine} came out of order (#{} before #{next}): they come again", step.seq)));
-                break;
-            }
-            let lacking: Vec<String> = step
-                .changes
-                .iter()
-                .filter_map(|c| match &c.to {
-                    Some(Version::File { hash, .. }) if !self.blobs.has(hash) => Some(hash.clone()),
-                    _ => None,
-                })
-                .collect();
-            if !lacking.is_empty() {
-                want.extend(lacking);
-                break;
-            }
-            let entry = group::entry(&step);
-            if entry.len() > ENTRY {
-                dropped.push(("too_big", format!("a step from {machine} too big for the log ({} KiB, {} changes): left out", entry.len() >> 10, step.changes.len())));
-                g.next.insert(step.member, step.seq.saturating_add(1));
-                continue;
-            }
-            if let Err(e) = g.r.propose(Vec::new(), entry) {
-                dropped.push((why(&e), format!("the log didn't take a step from {machine} ({e}): it comes again")));
-                break;
-            }
+        let blobs = &self.blobs;
+        let Taking { again, dropped, mut want, proposed } = take_steps(&mut g.r, &mut g.next, |h| blobs.has(h), machine, &mine, steps);
+        for at in proposed {
             if g.arrived.len() >= ARRIVED {
                 g.arrived.clear();
             }
-            g.arrived.insert((step.member, step.seq), Instant::now());
-            g.next.insert(step.member, step.seq.saturating_add(1));
+            g.arrived.insert(at, Instant::now());
         }
         let name = self.name_of(repo);
         if again > 0 {
@@ -1128,6 +1083,76 @@ impl Owner {
 }
 
 /// A refusal of a repo's log, as the metrics' `reason` names it.
+/// What the steps a machine sent came to (`take_steps`).
+#[derive(Debug, Default)]
+pub struct Taking {
+    /// Steps sent again that the log has taken already.
+    pub again: u64,
+    /// What was let go, and why (`kiln_sync_dropped_total`'s reasons).
+    pub dropped: Vec<(&'static str, String)>,
+    /// Contents the steps name that the server doesn't hold yet: asked for again.
+    pub want: Vec<String>,
+    /// The steps proposed to the log: each one's member and number.
+    pub proposed: Vec<(u64, u64)>,
+}
+
+/// Takes the steps `machine` sent for its copies (`mine`, their members) into the repo's group
+/// `r`, each member's in order, each once, and each only once the server holds the contents it
+/// names (`has`): one sent again is passed over; one out of order stops the rest (they all come
+/// again); one whose contents aren't here yet stops them too (they're asked for). `next` is the
+/// number of the next step taken from each member, kept from one call to the next. The server's
+/// sync thread does this with every `steps` message; kiln-sim's sync model does the same.
+pub fn take_steps<L: LogStore>(r: &mut Replica<L, Index>, next: &mut HashMap<u64, u64>, has: impl Fn(&str) -> bool, machine: &str, mine: &[u64], steps: Vec<Step>) -> Taking {
+    let mut out = Taking::default();
+    for mut step in steps {
+        if !mine.contains(&step.member) {
+            out.dropped.push(("not_member", format!("a step from {machine} for a copy that isn't on it: let go")));
+            continue;
+        }
+        if step.changes.len() > STEP_CHANGES {
+            out.dropped.push(("too_many_changes", format!("a step from {machine} of {} changes, more than {STEP_CHANGES}: let go", step.changes.len())));
+            continue;
+        }
+        step.by = machine.to_owned();
+        let taken = r.machine().tree.seqs.get(&step.member).copied().unwrap_or(0);
+        let want_next = next.get(&step.member).copied().unwrap_or(0).max(taken.saturating_add(1));
+        if step.seq < want_next {
+            out.again = out.again.saturating_add(1);
+            continue;
+        }
+        if step.seq > want_next {
+            // One before it went missing: they all come again.
+            out.dropped.push(("out_of_order", format!("steps from {machine} came out of order (#{} before #{want_next}): they come again", step.seq)));
+            break;
+        }
+        let lacking: Vec<String> = step
+            .changes
+            .iter()
+            .filter_map(|c| match &c.to {
+                Some(Version::File { hash, .. }) if !has(hash) => Some(hash.clone()),
+                _ => None,
+            })
+            .collect();
+        if !lacking.is_empty() {
+            out.want.extend(lacking);
+            break;
+        }
+        let entry = group::entry(&step);
+        if entry.len() > ENTRY {
+            out.dropped.push(("too_big", format!("a step from {machine} too big for the log ({} KiB, {} changes): left out", entry.len() >> 10, step.changes.len())));
+            next.insert(step.member, step.seq.saturating_add(1));
+            continue;
+        }
+        if let Err(e) = r.propose(Vec::new(), entry) {
+            out.dropped.push((why(&e), format!("the log didn't take a step from {machine} ({e}): it comes again")));
+            break;
+        }
+        out.proposed.push((step.member, step.seq));
+        next.insert(step.member, step.seq.saturating_add(1));
+    }
+    out
+}
+
 fn why(e: &ReplicaError) -> &'static str {
     match e {
         ReplicaError::Refused(_) => "refused",

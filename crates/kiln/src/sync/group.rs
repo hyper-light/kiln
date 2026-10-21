@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeType, 
 use hyper_raft::{Config, Elections, Limits, Stated};
 use serde::{Deserialize, Serialize};
 
+use super::fs::Fs;
 use super::scan::Limits as CopyLimits;
 use super::{Blobs, Change, Copy, Decision, Outcome, State, Step, Tree};
 
@@ -135,23 +137,26 @@ impl From<&Conf> for ConfState {
 /// Writes `bytes` to `path` whole or not at all, durably: a temporary file beside it, flushed,
 /// renamed over it, and the folder flushed.
 pub fn save_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    save_atomic_on(&super::fs::Std, path, bytes)
+}
+
+/// [`save_atomic`], on `fs`.
+pub fn save_atomic_on(fs: &dyn Fs, path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("tmp-{}", crate::util::new_id()));
+    fs.create_dir_all(dir)?;
+    let tmp = path.with_extension(format!("tmp-{}", fs.temp_id()));
     let written = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = fs.create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        fs.rename(&tmp, path)
     })();
     if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = fs.remove_file(&tmp);
     }
     written?;
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    fs.sync_dir(dir)
 }
 
 // ------------------------------------------------------------------------------ the server's member
@@ -346,11 +351,16 @@ impl Took {
 impl Feed {
     /// The copy at `root`, its state saved at `file` (a new copy's when there is none).
     pub fn open(root: &Path, me: &str, member: u64, limits: CopyLimits, file: PathBuf) -> anyhow::Result<Self> {
-        let saved: Saved = if file.exists() { serde_json::from_slice(&std::fs::read(&file)?)? } else { Saved { conf: (&founded()).into(), ..Saved::default() } };
+        Self::open_on(super::fs::std_fs(), root, me, member, limits, file)
+    }
+
+    /// [`Feed::open`], its folder and saved state on `fs`.
+    pub fn open_on(fs: Arc<dyn Fs>, root: &Path, me: &str, member: u64, limits: CopyLimits, file: PathBuf) -> anyhow::Result<Self> {
+        let saved: Saved = if fs.exists(&file) { serde_json::from_slice(&super::fs::read(fs.as_ref(), &file)?)? } else { Saved { conf: (&founded()).into(), ..Saved::default() } };
         let at = Point { index: saved.index, term: saved.term };
         let conf: ConfState = (&saved.conf).into();
         Ok(Self {
-            copy: Copy::new(root, me, member, limits, saved.state),
+            copy: Copy::on(fs, root, me, member, limits, saved.state),
             file,
             queue: VecDeque::new(),
             applied: at,
@@ -438,7 +448,8 @@ impl Feed {
             conf: (&self.reached_conf).into(),
             install: self.install.clone(),
         };
-        save_atomic(&self.file, &serde_json::to_vec(&saved)?)?;
+        let bytes = serde_json::to_vec(&saved)?;
+        save_atomic_on(self.copy.fs.as_ref(), &self.file, &bytes)?;
         self.durable = self.reached;
         self.durable_conf = self.reached_conf.clone();
         Ok(())

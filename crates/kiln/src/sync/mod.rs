@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod blobs;
 pub mod disk;
+pub mod fs;
 pub mod git;
 pub mod group;
 pub mod places;
@@ -25,10 +26,12 @@ pub mod wire;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 pub use blobs::Blobs;
+use fs::Fs;
 use scan::{Entry, Limits};
 
 /// What a path holds.
@@ -183,6 +186,8 @@ pub struct Copy {
     /// Contents the server no longer has: versions later steps replaced, for a copy far behind.
     /// Such a version is never written here; the later one is.
     pub gone: HashSet<String>,
+    /// The filesystem its folder is on (the machine's own; a simulated one in kiln-sim's models).
+    pub fs: Arc<dyn Fs>,
 }
 
 /// Whether a path from a step may be written here: relative, `/`-separated, without `.`, `..` or
@@ -228,24 +233,29 @@ fn set(map: &mut BTreeMap<String, Version>, path: &str, v: Option<Version>) {
 
 impl Copy {
     pub fn new(root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
-        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new() }
+        Self::on(fs::std_fs(), root, me, member, limits, state)
+    }
+
+    /// A copy whose folder is on `fs`.
+    pub fn on(fs: Arc<dyn Fs>, root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
+        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new(), fs }
     }
 
     /// What this copy's file at `path` holds now (none: no file).
     fn now(&self, path: &str) -> io::Result<Option<Version>> {
         let full = self.root.join(path);
-        let meta = match std::fs::symlink_metadata(&full) {
+        let meta = match self.fs.meta(&full) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if meta.file_type().is_symlink() {
-            return Ok(Some(Version::Link { target: std::fs::read_link(&full)?.to_string_lossy().replace('\\', "/") }));
+        if meta.is_symlink() {
+            return Ok(Some(Version::Link { target: self.fs.read_link(&full)?.to_string_lossy().replace('\\', "/") }));
         }
         if !meta.is_file() {
             return Ok(None);
         }
-        Ok(Some(Version::File { hash: blobs::hash_file(&full)?, exec: scan::executable(&meta) }))
+        Ok(Some(Version::File { hash: blobs::hash_file_on(self.fs.as_ref(), &full)?, exec: meta.exec }))
     }
 
     /// Whether every folder on the way to `path` is a real folder under the root: a link among them
@@ -255,8 +265,8 @@ impl Copy {
         let parts: Vec<&str> = path.split('/').collect();
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
             at.push(part);
-            match std::fs::symlink_metadata(&at) {
-                Ok(m) if m.file_type().is_symlink() => return false,
+            match self.fs.meta(&at) {
+                Ok(m) if m.is_symlink() => return false,
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
                 Err(_) => return false,
@@ -272,7 +282,7 @@ impl Copy {
         if self.adopting() {
             return Ok(Vec::new());
         }
-        let (found, skipped) = scan::scan(&self.root, &self.state.seen, &self.limits)?;
+        let (found, skipped) = scan::scan(self.fs.as_ref(), &self.root, &self.state.seen, &self.limits)?;
         self.skipped = skipped;
         let mut paths: BTreeSet<String> = found.keys().cloned().collect();
         paths.extend(self.state.synced.keys().cloned());
@@ -288,7 +298,7 @@ impl Copy {
                 continue;
             }
             // Not listed but still there (left out: too big, excluded, unreadable): not deleted.
-            if here.is_none() && std::fs::symlink_metadata(self.root.join(&path)).is_ok() {
+            if here.is_none() && self.fs.meta(&self.root.join(&path)).is_ok() {
                 continue;
             }
             if let Some(Version::File { hash, .. }) = &here
@@ -320,7 +330,7 @@ impl Copy {
     /// log index it takes the group's files through). A clone of the source's commit then becomes
     /// the source's working tree, uncommitted work and all, with no conflict copies.
     pub fn adopt(&mut self, at: u64) -> io::Result<()> {
-        let (found, skipped) = scan::scan(&self.root, &BTreeMap::new(), &self.limits)?;
+        let (found, skipped) = scan::scan(self.fs.as_ref(), &self.root, &BTreeMap::new(), &self.limits)?;
         self.skipped = skipped;
         self.state.synced = found.iter().map(|(p, e)| (p.clone(), e.version.clone())).collect();
         self.state.seen = found;
@@ -483,11 +493,11 @@ impl Copy {
         };
         match v {
             None => {
-                gone(std::fs::remove_file(&full))?;
+                gone(self.fs.remove_file(&full))?;
                 // Folders left empty go too, as git leaves none behind.
                 let mut dir = full.parent();
                 while let Some(d) = dir.filter(|d| *d != self.root && d.starts_with(&self.root)) {
-                    if std::fs::remove_dir(d).is_err() {
+                    if self.fs.remove_dir(d).is_err() {
                         break;
                     }
                     dir = d.parent();
@@ -497,49 +507,25 @@ impl Copy {
             Some(Version::File { hash, exec }) => {
                 let src = blobs.path(hash).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a SHA-256"))?;
                 if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    self.fs.create_dir_all(parent)?;
                 }
-                let tmp = full.with_file_name(format!("{}{}.tmp", scan::TEMP_PREFIX, crate::util::new_id()));
-                std::fs::copy(&src, &tmp)?;
-                let made = set_exec(&tmp, *exec).and_then(|()| std::fs::rename(&tmp, &full));
+                let tmp = full.with_file_name(format!("{}{}.tmp", scan::TEMP_PREFIX, self.fs.temp_id()));
+                self.fs.copy(&src, &tmp)?;
+                let made = self.fs.set_exec(&tmp, *exec).and_then(|()| self.fs.rename(&tmp, &full));
                 if made.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+                    let _ = self.fs.remove_file(&tmp);
                 }
                 made
             }
             Some(Version::Link { target }) => {
                 if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    self.fs.create_dir_all(parent)?;
                 }
-                gone(std::fs::remove_file(&full))?;
-                link(target, &full)
+                gone(self.fs.remove_file(&full))?;
+                self.fs.symlink(target, &full)
             }
         }
     }
-}
-
-#[cfg(unix)]
-fn set_exec(path: &Path, exec: bool) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mut p = std::fs::metadata(path)?.permissions();
-    let mode = p.mode();
-    p.set_mode(if exec { mode | 0o111 } else { mode & !0o111 });
-    std::fs::set_permissions(path, p)
-}
-
-#[cfg(not(unix))]
-fn set_exec(_path: &Path, _exec: bool) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn link(target: &str, at: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, at)
-}
-
-#[cfg(not(unix))]
-fn link(_target: &str, _at: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "links aren't synced on this system yet"))
 }
 
 #[cfg(test)]
@@ -598,7 +584,7 @@ mod tests {
         /// Every synced file of a copy, path → contents.
         fn files(c: &Copy) -> anyhow::Result<BTreeMap<String, String>> {
             let mut out = BTreeMap::new();
-            for p in scan::list(&c.root, &Limits::default())? {
+            for p in scan::list(&fs::Std, &c.root, &Limits::default())? {
                 out.insert(p.clone(), Self::read(c, &p).unwrap_or_default());
             }
             Ok(out)
