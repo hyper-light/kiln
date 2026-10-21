@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use kiln_seams::Clock;
-use kiln_seams::blobs::{Blobs, Listing, Meta, Method, Put, Range, Refusal};
+use kiln_seams::blobs::{Access, Blobs, Listing, Meta, Put, Range, Refusal};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -284,10 +284,10 @@ impl<B: Blobs> Blobs for Metered<B> {
         })
     }
 
-    fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
+    fn presign<'a>(&'a self, key: &'a str, access: Access, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
         Box::pin(async move {
             let began = Instant::now();
-            let r = self.inner.presign(key, method, expires).await;
+            let r = self.inner.presign(key, access, expires).await;
             self.seen("presign", began, &r, 0, 0);
             r
         })

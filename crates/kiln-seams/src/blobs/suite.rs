@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
-use super::{Blobs, BlobsFixture, Cond, LIST_MAX, Listed, Listing, Meta, Method, PARTS_MAX, PRESIGN_MAX, Put, Range, Refusal};
+use super::{Access, Blobs, BlobsFixture, Cond, LIST_MAX, Listed, Listing, Meta, Method, PARTS_MAX, PRESIGN_MAX, Put, Range, Refusal};
 use crate::conformance::{Case, Failure, ensure, fine, refused, same};
 use crate::sha256_hex;
 
@@ -314,17 +314,17 @@ clause!(c12, f, b, {
 
 clause!(c13, f, b, {
     put(b, "shared", b"for you").await?;
-    let url = fine("presign", b.presign("shared", Method::Get, Duration::from_secs(3)).await)?;
+    let url = fine("presign", b.presign("shared", Access::Get, Duration::from_secs(3)).await)?;
     same("a get through it", f.redeem(&url, Method::Get, None).await, Ok(Some(b"for you".to_vec())))?;
     f.pass(Duration::from_secs(4)).await;
     same("a get once it has expired", f.redeem(&url, Method::Get, None).await, Err(Refusal::Expired))?;
-    invalid("a URL for more than 7 days", b.presign("shared", Method::Get, PRESIGN_MAX.saturating_add(Duration::from_secs(1))).await)?;
-    invalid("a URL for no time", b.presign("shared", Method::Get, Duration::ZERO).await)?;
-    fine("a URL for 7 days", b.presign("shared", Method::Get, PRESIGN_MAX).await).map(|_| ())
+    invalid("a URL for more than an hour", b.presign("shared", Access::Get, PRESIGN_MAX.saturating_add(Duration::from_secs(1))).await)?;
+    invalid("a URL for no time", b.presign("shared", Access::Get, Duration::ZERO).await)?;
+    fine("a URL for an hour", b.presign("shared", Access::Get, PRESIGN_MAX).await).map(|_| ())
 });
 
 clause!(c14, f, b, {
-    let url = fine("presign", b.presign("dropped", Method::Put, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("dropped", Access::Put { length: 9 }, Duration::from_secs(60)).await)?;
     same("a put through it", f.redeem(&url, Method::Put, Some(b"left here".to_vec())).await, Ok(None))?;
     same("the object", get(b, "dropped").await?, b"left here".to_vec())?;
     // Its last character changed (a presigned URL ends in its signature, S3's as this one's).
@@ -438,7 +438,7 @@ clause!(c27, f, b, {
     invalid("head", b.head("a//b").await)?;
     invalid("delete", b.delete("a//b").await)?;
     invalid("start_upload", b.start_upload("a//b").await)?;
-    invalid("presign", b.presign("a//b", Method::Get, Duration::from_secs(60)).await)
+    invalid("presign", b.presign("a//b", Access::Get, Duration::from_secs(60)).await)
 });
 
 clause!(c28, f, b, {
@@ -1017,7 +1017,7 @@ clause!(c99, f, b, {
 });
 
 clause!(c100, f, b, {
-    let url = fine("presign", b.presign("via/presigned", Method::Put, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("via/presigned", Access::Put { length: 1 }, Duration::from_secs(60)).await)?;
     fine("a put through it", f.redeem(&url, Method::Put, Some(b"p".to_vec())).await)?;
     upload(b, "via/parts", &[b"q".to_vec()]).await?;
     put(b, "via/put", b"r").await?;
@@ -1306,34 +1306,34 @@ clause!(c132, f, b, {
 // ------------------------------------------------------------------------------------- presign
 
 clause!(c133, f, b, {
-    let url = fine("presign", b.presign("not-yet", Method::Get, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("not-yet", Access::Get, Duration::from_secs(60)).await)?;
     not_found("a get of nothing", f.redeem(&url, Method::Get, None).await)
 });
 
 clause!(c134, f, b, {
     put(b, "changing", b"before").await?;
-    let url = fine("presign", b.presign("changing", Method::Get, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("changing", Access::Get, Duration::from_secs(60)).await)?;
     put(b, "changing", b"after").await?;
     same("a get through it", f.redeem(&url, Method::Get, None).await, Ok(Some(b"after".to_vec())))
 });
 
 clause!(c135, f, b, {
     put(b, "over-it", b"old").await?;
-    let url = fine("presign", b.presign("over-it", Method::Put, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("over-it", Access::Put { length: 3 }, Duration::from_secs(60)).await)?;
     fine("a put through it", f.redeem(&url, Method::Put, Some(b"new".to_vec())).await)?;
     same("the object", get(b, "over-it").await?, b"new".to_vec())
 });
 
 clause!(c136, f, b, {
     let body = noise(10_000, 136);
-    let url = fine("presign", b.presign("hashed", Method::Put, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("hashed", Access::Put { length: 10000 }, Duration::from_secs(60)).await)?;
     fine("a put through it", f.redeem(&url, Method::Put, Some(body.clone())).await)?;
     let h = head(b, "hashed").await?;
     same("its size and etag", (h.size, h.etag), (10_000, sha256_hex(&body)))
 });
 
 clause!(c137, f, b, {
-    let url = fine("presign", b.presign("late", Method::Put, Duration::from_secs(3)).await)?;
+    let url = fine("presign", b.presign("late", Access::Put { length: 1 }, Duration::from_secs(3)).await)?;
     f.pass(Duration::from_secs(4)).await;
     same("a put once it has expired", f.redeem(&url, Method::Put, Some(b"x".to_vec())).await, Err(Refusal::Expired))?;
     not_found("what it stored", b.head("late").await)
@@ -1341,8 +1341,8 @@ clause!(c137, f, b, {
 
 clause!(c138, f, b, {
     put(b, "either-way", b"v").await?;
-    let get_url = fine("presign a get", b.presign("either-way", Method::Get, Duration::from_secs(60)).await)?;
-    let put_url = fine("presign a put", b.presign("either-way", Method::Put, Duration::from_secs(60)).await)?;
+    let get_url = fine("presign a get", b.presign("either-way", Access::Get, Duration::from_secs(60)).await)?;
+    let put_url = fine("presign a put", b.presign("either-way", Access::Put { length: 1 }, Duration::from_secs(60)).await)?;
     ensure(f.redeem(&get_url, Method::Put, Some(b"w".to_vec())).await.is_err(), || "a get's URL put".into())?;
     ensure(f.redeem(&put_url, Method::Get, None).await.is_err(), || "a put's URL got".into())?;
     same("the object", get(b, "either-way").await?, b"v".to_vec())
@@ -1351,7 +1351,7 @@ clause!(c138, f, b, {
 clause!(c139, f, b, {
     put(b, "k-one", b"one's").await?;
     put(b, "k-two", b"two's").await?;
-    let url = fine("presign", b.presign("k-one", Method::Get, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("k-one", Access::Get, Duration::from_secs(60)).await)?;
     // The key as the URL carries it: every store's URL names it once, as it is.
     let other = url.replacen("k-one", "k-two", 1);
     ensure(other != url, || format!("the key isn't in the URL {url:?} as k-one"))?;
@@ -1360,19 +1360,19 @@ clause!(c139, f, b, {
 });
 
 clause!(c140, f, b, {
-    fine("presign", b.presign("unmade", Method::Put, Duration::from_secs(60)).await)?;
+    fine("presign", b.presign("unmade", Access::Put { length: 0 }, Duration::from_secs(60)).await)?;
     not_found("the object", b.head("unmade").await)
 });
 
 clause!(c141, f, b, {
     put(b, "removed", b"v").await?;
-    let url = fine("presign", b.presign("removed", Method::Get, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("removed", Access::Get, Duration::from_secs(60)).await)?;
     fine("delete", b.delete("removed").await)?;
     not_found("a get through it", f.redeem(&url, Method::Get, None).await)
 });
 
 clause!(c142, f, b, {
-    let url = fine("presign", b.presign("void", Method::Put, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("void", Access::Put { length: 0 }, Duration::from_secs(60)).await)?;
     fine("an empty put through it", f.redeem(&url, Method::Put, Some(Vec::new())).await)?;
     same("its size", head(b, "void").await?.size, 0)
 });
@@ -1380,21 +1380,21 @@ clause!(c142, f, b, {
 clause!(c143, f, b, {
     let key = "ünï/日本/😀.txt";
     put(b, key, b"far").await?;
-    let url = fine("presign", b.presign(key, Method::Get, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign(key, Access::Get, Duration::from_secs(60)).await)?;
     same("a get through it", f.redeem(&url, Method::Get, None).await, Ok(Some(b"far".to_vec())))
 });
 
 clause!(c144, f, b, {
     let key = "q?x=1&y=2 #frag+plus";
     put(b, key, b"reserved").await?;
-    let url = fine("presign", b.presign(key, Method::Get, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign(key, Access::Get, Duration::from_secs(60)).await)?;
     same("a get through it", f.redeem(&url, Method::Get, None).await, Ok(Some(b"reserved".to_vec())))
 });
 
 clause!(c145, f, b, {
     let data = noise(2 << 20, 145);
     put(b, "big-share", &data).await?;
-    let url = fine("presign", b.presign("big-share", Method::Get, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("big-share", Access::Get, Duration::from_secs(60)).await)?;
     same("a get through it", f.redeem(&url, Method::Get, None).await, Ok(Some(data)))
 });
 
@@ -1480,7 +1480,7 @@ clause!(c152, f, b, {
 });
 
 clause!(c153, f, b, {
-    let url = fine("presign", b.presign("ranged-share", Method::Put, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("ranged-share", Access::Put { length: 100000 }, Duration::from_secs(60)).await)?;
     let body = noise(100_000, 153);
     fine("a put through it", f.redeem(&url, Method::Put, Some(body.clone())).await)?;
     same("bytes 500-599", fine("get", range(b, "ranged-share", 500, Some(599)).await)?, slice(&body, 500, 600))
@@ -1543,13 +1543,22 @@ clause!(c160, f, b, {
     let ks = ["mixed/a", "mixed/b", "mixed/c"];
     put(b, "mixed/a", b"put").await?;
     upload(b, "mixed/b", &[b"parts".to_vec()]).await?;
-    let url = fine("presign", b.presign("mixed/c", Method::Put, Duration::from_secs(60)).await)?;
+    let url = fine("presign", b.presign("mixed/c", Access::Put { length: 9 }, Duration::from_secs(60)).await)?;
     fine("a put through it", f.redeem(&url, Method::Put, Some(b"presigned".to_vec())).await)?;
     for (k, v) in ks.iter().zip([&b"put"[..], b"parts", b"presigned"]) {
         let h = head(b, k).await?;
         same(&format!("{k}'s etag"), h.etag, sha256_hex(v))?;
     }
     Ok(())
+});
+
+clause!(c161, f, b, {
+    let url = fine("presign", b.presign("declared", Access::Put { length: 5 }, Duration::from_secs(60)).await)?;
+    ensure(f.redeem(&url, Method::Put, Some(b"123456".to_vec())).await.is_err(), || "a body longer than its URL declares was taken".into())?;
+    ensure(f.redeem(&url, Method::Put, Some(b"1234".to_vec())).await.is_err(), || "a body shorter than its URL declares was taken".into())?;
+    not_found("what they stored", b.head("declared").await)?;
+    same("a body of the length declared", f.redeem(&url, Method::Put, Some(b"12345".to_vec())).await, Ok(None))?;
+    same("the object", get(b, "declared").await?, b"12345".to_vec())
 });
 
 /// The `Blobs` contract, clause by clause (docs/seams.md, "Blobs").
@@ -1567,7 +1576,7 @@ pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
         Case { id: "BLOBS-10", says: "a multipart upload's parts, uploaded in any order, are joined in part order into one object", check: c10::<F> },
         Case { id: "BLOBS-11", says: "a multipart upload is refused when a part but the last is under the minimum or parts are named out of order; part numbers run 1 to 10,000", check: c11::<F> },
         Case { id: "BLOBS-12", says: "an aborted upload is gone: completing it is refused NoSuchUpload", check: c12::<F> },
-        Case { id: "BLOBS-13", says: "a presigned get works until it expires by the store's clock, then is refused Expired; a URL's lifetime is more than 0 and at most 7 days", check: c13::<F> },
+        Case { id: "BLOBS-13", says: "a presigned get works until it expires by the store's clock, then is refused Expired; a URL's lifetime is more than 0 and at most an hour", check: c13::<F> },
         Case { id: "BLOBS-14", says: "a presigned put stores what its holder sends; a URL changed after signing is refused", check: c14::<F> },
         Case { id: "BLOBS-15", says: "keys are 1 to 960 bytes: an empty or longer one is refused Invalid", check: c15::<F> },
         Case { id: "BLOBS-16", says: "a key of multibyte UTF-8 is kept as it is: its object is got back by it, and head names it so", check: c16::<F> },
@@ -1715,5 +1724,6 @@ pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
         Case { id: "BLOBS-158", says: "If-Match chains: each replace names the etag the last answered, and an older etag is refused PreconditionFailed", check: c158::<F> },
         Case { id: "BLOBS-159", says: "If-Match compares content, not size: an etag of same-sized, other content is refused PreconditionFailed", check: c159::<F> },
         Case { id: "BLOBS-160", says: "objects stored by a put, an upload and a presigned put each have their content's SHA-256 as their etag", check: c160::<F> },
+        Case { id: "BLOBS-161", says: "a presigned put takes a body of exactly the length its URL declares: one longer or shorter is refused and stores nothing", check: c161::<F> },
     ]
 }

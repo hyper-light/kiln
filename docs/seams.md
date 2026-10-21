@@ -149,7 +149,9 @@ takes. A put is checked in this order: its key, its size, its checksum, then its
 - **Bounds:** keys 1 to 960 bytes (S3's 1024, less 64 a store may put before them), in segments of
   1 to 255 bytes between `/`s, none `.` or `..`, with no control characters and no backslash;
   1000 keys a listing (S3's); part numbers 1 to 10,000, every part but the last at least 5 MiB
-  (S3's); presigned URLs for up to 7 days (S3's), their lifetimes rounded up to whole seconds.
+  (S3's); presigned URLs for up to an hour (S3 allows 7 days: a URL is a credential, kept short),
+  their lifetimes rounded up to whole seconds. A presigned URL's signature covers its method, its
+  exact key, its expiry and, for a put, the length of the body it takes.
 
 Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, `complete_upload`, `abort_upload`, `presign`.
 
@@ -165,7 +167,7 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 - **BLOBS-10** a multipart upload's parts, uploaded in any order, are joined in part order into one object
 - **BLOBS-11** a multipart upload is refused when a part but the last is under the minimum or parts are named out of order; part numbers run 1 to 10,000
 - **BLOBS-12** an aborted upload is gone: completing it is refused NoSuchUpload
-- **BLOBS-13** a presigned get works until it expires by the store's clock, then is refused Expired; a URL's lifetime is more than 0 and at most 7 days
+- **BLOBS-13** a presigned get works until it expires by the store's clock, then is refused Expired; a URL's lifetime is more than 0 and at most an hour
 - **BLOBS-14** a presigned put stores what its holder sends; a URL changed after signing is refused
 - **BLOBS-15** keys are 1 to 960 bytes: an empty or longer one is refused Invalid
 - **BLOBS-16** a key of multibyte UTF-8 is kept as it is: its object is got back by it, and head names it so
@@ -313,6 +315,7 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 - **BLOBS-158** If-Match chains: each replace names the etag the last answered, and an older etag is refused PreconditionFailed
 - **BLOBS-159** If-Match compares content, not size: an etag of same-sized, other content is refused PreconditionFailed
 - **BLOBS-160** objects stored by a put, an upload and a presigned put each have their content's SHA-256 as their etag
+- **BLOBS-161** a presigned put takes a body of exactly the length its URL declares: one longer or shorter is refused and stores nothing
 
 ## Secrets
 

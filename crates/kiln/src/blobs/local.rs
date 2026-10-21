@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kiln_seams::Clock;
-use kiln_seams::blobs::{self as seam, Blobs, Cond, Listed, Listing, Meta, Method, Put, Range, Refusal};
+use kiln_seams::blobs::{self as seam, Access, Blobs, Cond, Listed, Listing, Meta, Method, Put, Range, Refusal};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
@@ -191,13 +191,10 @@ fn remove_if_there(path: &str) -> io::Result<()> {
     }
 }
 
-/// A presigned URL's signature: HMAC-SHA256 of its method, key and expiry under `key`.
-fn signature(key: &[u8; 32], method: Method, object: &str, expires_ms: i64) -> String {
-    let m = match method {
-        Method::Get => "GET",
-        Method::Put => "PUT",
-    };
-    crate::util::hmac_hex(key, format!("{m}\n{object}\n{expires_ms}").as_bytes())
+/// A presigned URL's signature: HMAC-SHA256 under `key` of what it covers (its method, its exact
+/// key, its expiry and, for a put, its body's length: `seam::signed`).
+fn signature(key: &[u8; 32], access: Access, object: &str, expires_ms: i64) -> String {
+    crate::util::hmac_hex(key, seam::signed(access, object, expires_ms).as_bytes())
 }
 
 impl LocalBlobs {
@@ -246,20 +243,29 @@ impl LocalBlobs {
         }
     }
 
-    /// Checks a presigned URL's key, expiry and signature for `method`: its key.
-    pub fn check_presigned(&self, encoded_key: &str, query: &str, method: Method) -> Result<String, Refusal> {
+    /// Checks a presigned URL used with `method`: its key, what it grants (a put, the length of
+    /// its body) and its signature, in constant time, before anything is read or written; then its
+    /// expiry. Its key, and what it grants.
+    pub fn check_presigned(&self, encoded_key: &str, query: &str, method: Method) -> Result<(String, Access), Refusal> {
         let field = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('='))).map(str::to_owned);
         let key = seam::decode_key(encoded_key).ok_or_else(|| Refusal::Forbidden("a bad key".into()))?;
         seam::check_key(&key).map_err(|_| Refusal::Forbidden("a bad key".into()))?;
         let expires_ms: i64 = field("expires").and_then(|e| e.parse().ok()).ok_or_else(|| Refusal::Forbidden("no expiry".into()))?;
+        let access = match method {
+            Method::Get => Access::Get,
+            Method::Put => Access::Put { length: field("length").and_then(|l| l.parse().ok()).ok_or_else(|| Refusal::Forbidden("no length".into()))? },
+        };
         let sig = field("sig").ok_or_else(|| Refusal::Forbidden("no signature".into()))?;
-        if !crate::util::ct_eq(sig.as_bytes(), signature(&self.presign.key, method, &key, expires_ms).as_bytes()) {
+        if !crate::util::ct_eq(sig.as_bytes(), signature(&self.presign.key, access, &key, expires_ms).as_bytes()) {
             return Err(Refusal::Forbidden("the signature doesn't match".into()));
         }
-        if self.clock.unix_ms() >= expires_ms {
+        // A URL lasts an hour at the most, however its expiry was made.
+        let longest = i64::try_from(seam::PRESIGN_MAX.as_millis()).unwrap_or(i64::MAX);
+        let now = self.clock.unix_ms();
+        if now >= expires_ms || expires_ms.saturating_sub(now) > longest {
             return Err(Refusal::Expired);
         }
-        Ok(key)
+        Ok((key, access))
     }
 
     /// Uses one of this store's presigned URLs as its holder would (a get's bytes; a put stores
@@ -267,10 +273,16 @@ impl LocalBlobs {
     pub async fn redeem(&self, url: &str, method: Method, body: Option<Vec<u8>>) -> Result<Option<Vec<u8>>, Refusal> {
         let rest = url.strip_prefix(&format!("{}/", self.presign.base)).ok_or_else(|| Refusal::Forbidden("not one of this store's URLs".into()))?;
         let (path, query) = rest.split_once('?').ok_or_else(|| Refusal::Forbidden("no signature".into()))?;
-        let key = self.check_presigned(path, query, method)?;
-        match method {
-            Method::Get => self.get(&key, None).await.map(|(_, b)| Some(b)),
-            Method::Put => self.put(&key, body.unwrap_or_default(), Put::default()).await.map(|_| None),
+        let (key, access) = self.check_presigned(path, query, method)?;
+        match access {
+            Access::Get => self.get(&key, None).await.map(|(_, b)| Some(b)),
+            Access::Put { length } => {
+                let body = body.unwrap_or_default();
+                if len64(body.len()) != length {
+                    return Err(Refusal::Forbidden(format!("the body is {} bytes; its URL takes {length}", body.len())));
+                }
+                self.put(&key, body, Put::default()).await.map(|_| None)
+            }
         }
     }
 
@@ -626,12 +638,16 @@ impl Blobs for LocalBlobs {
         })
     }
 
-    fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
+    fn presign<'a>(&'a self, key: &'a str, access: Access, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
         Box::pin(async move {
             seam::check_key(key)?;
             let secs = seam::lifetime_secs(expires)?;
             let expires_ms = self.clock.unix_ms().saturating_add(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX));
-            Ok(format!("{}/{}?expires={expires_ms}&sig={}", self.presign.base, seam::encode_key(key), signature(&self.presign.key, method, key, expires_ms)))
+            let length = match access {
+                Access::Get => String::new(),
+                Access::Put { length } => format!("&length={length}"),
+            };
+            Ok(format!("{}/{}?expires={expires_ms}{length}&sig={}", self.presign.base, seam::encode_key(key), signature(&self.presign.key, access, key, expires_ms)))
         })
     }
 }

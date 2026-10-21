@@ -83,11 +83,30 @@ pub struct Listing {
     pub truncated: bool,
 }
 
-/// What a presigned URL lets its holder do.
+/// How a presigned URL is used: the HTTP method its holder sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
     Put,
+}
+
+/// What a presigned URL lets its holder do: get the object, or put one of exactly `length` bytes
+/// (a body longer or shorter is refused). The signature covers the method, the exact key, the
+/// expiry and, for a put, the length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Get,
+    Put { length: u64 },
+}
+
+impl Access {
+    /// The method its URL is used with.
+    pub fn method(self) -> Method {
+        match self {
+            Self::Get => Method::Get,
+            Self::Put { .. } => Method::Put,
+        }
+    }
 }
 
 /// Why a request was refused.
@@ -135,9 +154,9 @@ pub trait Blobs: Send + Sync + 'static {
     /// Joins the parts named (ascending, each with its etag) into the object.
     fn complete_upload<'a>(&'a self, upload: &'a str, parts: Vec<(u32, String)>) -> BoxFuture<'a, Result<Meta, Refusal>>;
     fn abort_upload<'a>(&'a self, upload: &'a str) -> BoxFuture<'a, Result<(), Refusal>>;
-    /// A URL that lets its holder get or put `key` until `expires` from now (rounded up to a whole
-    /// second, at most 7 days).
-    fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>>;
+    /// A URL that lets its holder get `key`, or put it with a body of the length `access` names,
+    /// until `expires` from now (rounded up to a whole second, at most an hour).
+    fn presign<'a>(&'a self, key: &'a str, access: Access, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>>;
 }
 
 /// A store shared: what it answers, an `Arc` of it answers.
@@ -169,8 +188,8 @@ impl<B: Blobs + ?Sized> Blobs for Arc<B> {
     fn abort_upload<'a>(&'a self, upload: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
         self.as_ref().abort_upload(upload)
     }
-    fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
-        self.as_ref().presign(key, method, expires)
+    fn presign<'a>(&'a self, key: &'a str, access: Access, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
+        self.as_ref().presign(key, access, expires)
     }
 }
 
@@ -186,8 +205,9 @@ pub const LIST_MAX: usize = 1000;
 pub const PARTS_MAX: u32 = 10_000;
 /// The smallest a part other than the last may be (S3's).
 pub const PART_MIN: usize = 5 << 20;
-/// The longest a presigned URL lasts (S3's).
-pub const PRESIGN_MAX: Duration = Duration::from_secs(7 * 24 * 3600);
+/// The longest a presigned URL lasts: an hour, for every store (S3 allows 7 days; a URL is a
+/// credential, and kiln keeps its lifetime short).
+pub const PRESIGN_MAX: Duration = Duration::from_secs(3600);
 
 /// Whether a store takes `key`: 1 to [`KEY_MAX`] bytes of UTF-8 with no control character and no
 /// backslash, its `/`-separated segments each 1 to [`SEGMENT_MAX`] bytes and none `.` or `..` (so
@@ -294,9 +314,18 @@ pub fn check_parts(parts: &[(u32, String)]) -> Result<(), Refusal> {
 pub fn lifetime_secs(expires: Duration) -> Result<u64, Refusal> {
     let whole = expires.as_secs().saturating_add(u64::from(expires.subsec_nanos() > 0));
     if whole == 0 || whole > PRESIGN_MAX.as_secs() {
-        return Err(Refusal::Invalid { what: "a presigned URL's lifetime", why: format!("{expires:?} (more than 0, at most 7 days)") });
+        return Err(Refusal::Invalid { what: "a presigned URL's lifetime", why: format!("{expires:?} (more than 0, at most an hour)") });
     }
     Ok(whole)
+}
+
+/// What a presigned URL's signature covers, as one string: its method, its exact key, its expiry
+/// (Unix milliseconds) and, for a put, the length of the body it takes.
+pub fn signed(access: Access, key: &str, expires_ms: i64) -> String {
+    match access {
+        Access::Get => format!("GET\n{key}\n{expires_ms}"),
+        Access::Put { length } => format!("PUT\n{key}\n{expires_ms}\n{length}"),
+    }
 }
 
 /// A key as a URL's path carries it: RFC 3986's unreserved characters and `/` as they are, every
@@ -386,8 +415,8 @@ impl SimBlobs {
         Self { inner: Arc::default(), clock, limits, secret }
     }
 
-    fn sign(&self, method: Method, key: &str, expires_ms: i64) -> String {
-        sha256_hex(format!("{}\n{method:?}\n{key}\n{expires_ms}", self.secret).as_bytes())
+    fn sign(&self, access: Access, key: &str, expires_ms: i64) -> String {
+        sha256_hex(format!("{}\n{}", self.secret, signed(access, key, expires_ms)).as_bytes())
     }
 
     fn store(&self, st: &mut SimState, key: &str, bytes: Vec<u8>, cond: &Cond) -> Result<Meta, Refusal> {
@@ -411,23 +440,34 @@ impl SimBlobs {
     }
 
     /// Uses a presigned URL as its holder would, with `method`: a get gives the bytes, a put
-    /// stores `body`. A URL used with the other method, or changed after signing, is `Forbidden`.
+    /// stores `body`. A URL used with the other method, changed after signing, or a put's body of
+    /// another length than its URL declares, is `Forbidden`.
     pub fn redeem(&self, url: &str, method: Method, body: Option<Vec<u8>>) -> Result<Option<Vec<u8>>, Refusal> {
         let rest = url.strip_prefix("sim://blobs/").ok_or_else(|| Refusal::Forbidden("not one of this store's URLs".into()))?;
         let (path, query) = rest.split_once('?').ok_or_else(|| Refusal::Forbidden("no signature".into()))?;
         let field = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('='))).map(str::to_owned);
         let key = decode_key(path).ok_or_else(|| Refusal::Forbidden("a bad key".into()))?;
         let expires_ms: i64 = field("expires").and_then(|e| e.parse().ok()).ok_or_else(|| Refusal::Forbidden("no expiry".into()))?;
-        if field("sig").as_deref() != Some(self.sign(method, &key, expires_ms).as_str()) {
+        let access = match method {
+            Method::Get => Access::Get,
+            Method::Put => Access::Put { length: field("length").and_then(|l| l.parse().ok()).ok_or_else(|| Refusal::Forbidden("no length".into()))? },
+        };
+        if field("sig").as_deref() != Some(self.sign(access, &key, expires_ms).as_str()) {
             return Err(Refusal::Forbidden("the signature doesn't match".into()));
         }
         if self.clock.unix_ms() >= expires_ms {
             return Err(Refusal::Expired);
         }
         let mut st = self.inner.lock();
-        match method {
-            Method::Get => st.objects.get(&key).map(|(_, b)| Some(b.as_ref().clone())).ok_or(Refusal::NotFound(key)),
-            Method::Put => self.store(&mut st, &key, body.unwrap_or_default(), &Cond::Always).map(|_| None),
+        match access {
+            Access::Get => st.objects.get(&key).map(|(_, b)| Some(b.as_ref().clone())).ok_or(Refusal::NotFound(key)),
+            Access::Put { length } => {
+                let body = body.unwrap_or_default();
+                if len64(body.len()) != length {
+                    return Err(Refusal::Forbidden(format!("the body is {} bytes; its URL takes {length}", body.len())));
+                }
+                self.store(&mut st, &key, body, &Cond::Always).map(|_| None)
+            }
         }
     }
 }
@@ -588,12 +628,16 @@ impl Blobs for SimBlobs {
         Box::pin(async move { out })
     }
 
-    fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
+    fn presign<'a>(&'a self, key: &'a str, access: Access, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
         let out = (|| {
             check_key(key)?;
             let secs = lifetime_secs(expires)?;
             let expires_ms = self.clock.unix_ms().saturating_add(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX));
-            Ok(format!("sim://blobs/{}?expires={expires_ms}&sig={}", encode_key(key), self.sign(method, key, expires_ms)))
+            let length = match access {
+                Access::Get => String::new(),
+                Access::Put { length } => format!("&length={length}"),
+            };
+            Ok(format!("sim://blobs/{}?expires={expires_ms}{length}&sig={}", encode_key(key), self.sign(access, key, expires_ms)))
         })();
         Box::pin(async move { out })
     }
@@ -707,7 +751,7 @@ mod tests {
         assert_eq!(byte_range(Range { start: 0, end: None }, 0), Err(Refusal::InvalidRange { size: 0 }));
         assert_eq!(byte_range(Range { start: 5, end: Some(4) }, 10), Err(Refusal::InvalidRange { size: 10 }));
         assert_eq!(lifetime_secs(Duration::from_millis(1500)), Ok(2));
-        assert_eq!(lifetime_secs(PRESIGN_MAX), Ok(604_800));
+        assert_eq!(lifetime_secs(PRESIGN_MAX), Ok(3600));
         assert!(lifetime_secs(PRESIGN_MAX.saturating_add(Duration::from_millis(1))).is_err());
         assert!(lifetime_secs(Duration::ZERO).is_err());
         assert_eq!(decode_key(&encode_key("a b+c%/ü?#")).as_deref(), Some("a b+c%/ü?#"));

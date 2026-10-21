@@ -41,7 +41,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use kiln_seams::Clock;
-use kiln_seams::blobs::{self as seam, Blobs, Cond, Listed, Listing, Meta, Method, Put, Range, Refusal};
+use kiln_seams::blobs::{self as seam, Access, Blobs, Cond, Listed, Listing, Meta, Method, Put, Range, Refusal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -957,29 +957,30 @@ impl Blobs for S3Blobs {
         })
     }
 
-    fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
+    fn presign<'a>(&'a self, key: &'a str, access: Access, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
         Box::pin(async move {
             seam::check_key(key)?;
             let secs = seam::lifetime_secs(expires)?;
             let amz = amz_date(self.clock.unix_ms());
             let date = amz.get(..8).unwrap_or(&amz);
             let scope = format!("{date}/{}/s3/aws4_request", self.region);
+            // A put's length is signed: S3 refuses a body of any other.
+            let (m, headers) = match access {
+                Access::Get => ("GET", vec![("host".to_owned(), self.authority.clone())]),
+                Access::Put { length } => ("PUT", vec![("content-length".to_owned(), length.to_string()), ("host".to_owned(), self.authority.clone())]),
+            };
+            let signed_headers = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
             let mut query = vec![
                 ("X-Amz-Algorithm".to_owned(), "AWS4-HMAC-SHA256".to_owned()),
                 ("X-Amz-Credential".to_owned(), format!("{}/{scope}", self.creds.access_key_id)),
                 ("X-Amz-Date".to_owned(), amz.clone()),
                 ("X-Amz-Expires".to_owned(), secs.to_string()),
-                ("X-Amz-SignedHeaders".to_owned(), "host".to_owned()),
+                ("X-Amz-SignedHeaders".to_owned(), signed_headers),
             ];
             if let Some(t) = &self.creds.session_token {
                 query.push(("X-Amz-Security-Token".to_owned(), t.clone()));
             }
             let path = self.path(Some(&self.object(key)));
-            let headers = vec![("host".to_owned(), self.authority.clone())];
-            let m = match method {
-                Method::Get => "GET",
-                Method::Put => "PUT",
-            };
             let (canonical, _) = aws::canonical_request(&Signable { method: m, path: &path, query: &query, headers: &headers, payload_sha256: "UNSIGNED-PAYLOAD" }, false);
             let to_sign = format!("AWS4-HMAC-SHA256\n{amz}\n{scope}\n{}", crate::util::sha256_hex(canonical.as_bytes()));
             let signature = crate::util::hmac_hex(&aws::signing_key(&self.creds.secret_access_key, date, &self.region, "s3"), to_sign.as_bytes());

@@ -287,6 +287,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let hash = (*hash).to_owned();
             return sync_blob_get(&hub, &hash, &req);
         }
+        // The local store's presigned URLs (docs/blobs.md): the URL is the credential.
+        (&Method::GET | &Method::HEAD | &Method::PUT, ["api", "blobs", _, ..]) => {
+            let encoded = path.strip_prefix("/api/blobs/").unwrap_or_default().to_owned();
+            return boxed(|| presigned(&hub, &encoded, req)).await;
+        }
         (&Method::PUT, ["api", "sync", "blobs", hash]) => {
             let hash = (*hash).to_owned();
             return boxed(|| sync_blob_put(&hub, &hash, req)).await;
@@ -1373,6 +1378,79 @@ fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
     sync_blob_counted(&machine, direction, "ok", bytes);
     let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
     Ok(srv::with_header(r, header::CONTENT_LENGTH, &bytes.to_string()))
+}
+
+/// What a presigned URL is answered when it gives nothing: one answer for a bad signature, another
+/// method's or key's URL, an expired one, a body of another length, and no such object, so the
+/// route tells its holder nothing it doesn't already know.
+fn not_granted() -> ApiError {
+    err(StatusCode::FORBIDDEN, "this URL grants nothing here")
+}
+
+/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local store's presigned
+/// URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential: its signature covers
+/// the method, the exact key, the expiry (at most an hour) and a put's length, and is checked in
+/// constant time before anything is read or written. A get streams the one object it names, in a
+/// range when one is asked; a put keeps a body of exactly the length declared, or nothing. No
+/// listing, no prefixes, and keys with `.` or `..` segments are refused as any bad key is. An S3
+/// store's presigned URLs lead to the S3, not here.
+async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
+    use kiln_seams::blobs::{Access, Method as Signed, Refusal};
+    let local = hub.blobs.local.clone().ok_or_else(not_granted)?;
+    let signed = if req.method() == Method::PUT { Signed::Put } else { Signed::Get };
+    let query = req.uri().query().unwrap_or_default().to_owned();
+    let (key, access) = local.check_presigned(encoded, &query, signed).map_err(|_| not_granted())?;
+    let blobs = Arc::clone(&hub.blobs.blobs);
+    let failed = |e: Refusal| match e {
+        Refusal::Unavailable(_) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        _ => not_granted(),
+    };
+    if let Access::Put { length } = access {
+        let said = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+        if said.is_some_and(|n| n != length) {
+            return Err(not_granted());
+        }
+        let mut writer = crate::blobs::io::Writer::new(blobs.as_ref(), &key);
+        let mut body = req.into_body();
+        let mut got = 0u64;
+        loop {
+            let chunk = match srv::next_chunk(&mut body).await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(e) => {
+                    writer.abort().await;
+                    return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
+                }
+            };
+            got = got.saturating_add(chunk.len() as u64);
+            if got > length {
+                writer.abort().await;
+                return Err(not_granted());
+            }
+            if let Err(e) = writer.write(&chunk).await {
+                writer.abort().await;
+                return Err(failed(e));
+            }
+        }
+        if got != length {
+            writer.abort().await;
+            return Err(not_granted());
+        }
+        writer.finish().await.map_err(failed)?;
+        return Ok(srv::status(StatusCode::OK));
+    }
+    let meta = blobs.head(&key).await.map_err(failed)?;
+    let Ok(range) = byte_range(&req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+    let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+    let length = if meta.size == 0 { 0 } else { end.saturating_sub(start).saturating_add(1) };
+    let body = if req.method() == Method::HEAD || meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(blobs, key, start, end) };
+    let mut r = srv::response(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK }, "application/octet-stream", srv::channel_body(body));
+    r = srv::with_header(r, header::CONTENT_LENGTH, &length.to_string());
+    r = srv::with_header(r, header::ACCEPT_RANGES, "bytes");
+    if range.is_some() {
+        r = srv::with_header(r, header::CONTENT_RANGE, &format!("bytes {start}-{end}/{}", meta.size));
+    }
+    Ok(r)
 }
 
 /// The largest contents a machine sends (a copy leaves out files over 256 MiB unless told otherwise).
