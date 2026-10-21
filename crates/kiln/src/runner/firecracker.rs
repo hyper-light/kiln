@@ -526,6 +526,12 @@ impl Booted {
 async fn boot_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Booted> {
     let kiln = kiln_disk(m, cache).await.context("kiln's disk for the microVM")?;
     let root = super::rootfs::prepare(m, cache, &kiln, image, pull).await.with_context(|| format!("the image {image}"))?;
+    boot_from(m, cache, key, &kiln, root, image).await
+}
+
+/// [`boot_for`] with kiln's disk and the image's root file system made: its scratch disk, its
+/// ways out, its boot, and its guest's word that it's ready.
+async fn boot_from(m: &Machine, cache: &Path, key: &str, kiln: &Path, root: super::rootfs::Rootfs, image: &str) -> anyhow::Result<Booted> {
     let dir = cache.join("vms").join(key);
     let socks = Socks::new(key)?;
     let _ = std::fs::remove_dir_all(&dir);
@@ -545,7 +551,7 @@ async fn boot_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &supe
         m,
         &dir,
         &socks,
-        &[Drive { id: "kiln", path: &kiln, read_only: true }, Drive { id: "image", path: &root.path, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
+        &[Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: &root.path, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
         "init",
         pool_vcpus(),
         POOL_MEMORY_MIB,
@@ -557,6 +563,35 @@ async fn boot_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &supe
     })
     .await?;
     Ok(Booted { vm, socks, dir, conn: conn?, stop, proxy_to, server_to, image: image.to_owned(), env: root.env, restored: false })
+}
+
+/// W13-AC05: how soon a leg's microVM is ready here, cold (booted) and warm (restored from its
+/// image's snapshot, where VMMs are jailed): `runs` of each, each timed from its start to its
+/// guest's word that it's ready, kiln's disk, the image and its template made beforehand.
+pub async fn start_times(cache: &Path, image: &str, runs: usize) -> anyhow::Result<(Vec<f64>, Vec<f64>)> {
+    let m = crate::rt::blocking(Machine::find).await?.context("this machine runs no microVMs: KVM, Firecracker, its guest kernel and e2fsprogs")?;
+    let pull = super::rootfs::Pull::default();
+    let kiln = kiln_disk(&m, cache).await?;
+    let root = super::rootfs::prepare(&m, cache, &kiln, image, &pull).await?;
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let mut cold = Vec::new();
+    for i in 0..runs {
+        let t = Instant::now();
+        let b = boot_from(&m, cache, &format!("bench-cold-{i}"), &kiln, root.clone(), image).await?;
+        cold.push(ms(t));
+        b.discard().await;
+    }
+    let mut warm = Vec::new();
+    if m.jail {
+        let made = template(&m, cache, image, &pull).await?;
+        for i in 0..runs {
+            let t = Instant::now();
+            let b = restore_from(&m, cache, &format!("bench-warm-{i}"), made.clone(), image).await?;
+            warm.push(ms(t));
+            b.discard().await;
+        }
+    }
+    Ok((cold, warm))
 }
 
 /// What a guest dialling in says first, within `within`: ready, else why not.
@@ -575,6 +610,7 @@ fn ready(vm: &mut Vm, control: &UnixListener, within: Duration) -> anyhow::Resul
 /// A pool's image as a snapshot (W13-R09): a microVM of it booted to where its guest waits for
 /// the host, paused and snapshotted (its state, its memory, its scratch disk as it was), kept in
 /// `dir` until anything it depends on changes.
+#[derive(Clone)]
 struct Template {
     dir: PathBuf,
     kiln: PathBuf,
@@ -651,6 +687,12 @@ fn make_template(m: &Machine, image_dir: &Path, dir: &Path, kiln: &Path, root: &
 /// its scratch disk a copy of the template's, its guest dialling in as it runs again.
 async fn restore_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Booted> {
     let t = template(m, cache, image, pull).await?;
+    restore_from(m, cache, key, t, image).await
+}
+
+/// [`restore_for`] with the template made: its scratch disk copied, its ways out, the restore, and
+/// its guest's word that it's ready.
+async fn restore_from(m: &Machine, cache: &Path, key: &str, t: Template, image: &str) -> anyhow::Result<Booted> {
     let dir = cache.join("vms").join(key);
     let socks = Socks::new(key)?;
     let _ = std::fs::remove_dir_all(&dir);

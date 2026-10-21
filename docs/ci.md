@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for every D.1 ecosystem (AC03 with the real tools for eight), vcpkg's binary cache kept by kiln; jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
-| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); each VMM in a jail of its own (namespaces, no root), pools restored from snapshots, services and job containers in microVMs; `shards` left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); each VMM in a jail of its own (namespaces, no root), pools restored from snapshots, services and job containers in microVMs; AC02 on host, docker and firecracker, AC03, AC05 (a cold start 0.64 s, a warm one 35 ms); `shards` left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare, search), GraphQL (pull requests, comments, labels, reviews, checks, search; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); GraphQL's merges left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container deployments (Compose stacks, healthy, outliving their jobs) and microVM ones (long-lived Firecracker microVMs, health-checked, taking over their ports, booted again with their runner); shards' microVMs, previews and the live-cluster ACs left (with CD) |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
@@ -2199,9 +2199,12 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
   `sh` doesn't; PowerShell (`$ErrorActionPreference = 'stop'`) and `cmd` on Windows; `python`; a
   custom template (`perl {0}`). Each failing step says its exit code as GitHub does, and
   `working-directory` is where the step runs. Run on Linux (x86-64) and macOS (arm64).
+- *Done.* AC04's run on Windows (x86-64, Windows PowerShell 5.1, MSYS2's bash and perl) found
+  `shell: cmd` broken there: std's quoting escaped the quotes inside GitHub's `/S /C "CALL "{0}""`,
+  which cmd doesn't take escaped, so every `cmd` step failed. Its line goes as written now
+  (`raw_arg`). PowerShell's exit codes are `-command`'s, as on GitHub: a failure is 1.
 - *Left.*
-  - AC04's run on Windows: the same test on a Windows runner (`cargo test -p kiln --lib
-    w06_ac04`).
+  - AC04 again on Windows, with the `cmd` fix.
   - AC07 (with W22-AC01).
 
 ### W07 Actions
@@ -3752,7 +3755,19 @@ enforcement points to W18, agent isolation to W20.
   - the post step's state;
   - `getIDToken` from kiln's own issuer, for its audience and the repository's subject, masked.
 
-  Firecracker, shards and `k8s` follow when their executors do.
+  In a Firecracker microVM of `alpine:3.20` too, its JavaScript on the musl Node W07-R05 fetches
+  (`w13_ac02_toolkit_conformance_in_a_microvm`): every effect above, `getIDToken` from the
+  server's issuer through the guest's way out. shards and `k8s` follow when theirs do.
+- *Done.* AC03 (`tests/services.rs`): a Postgres service with a health check, the leg's steps
+  starting once it's healthy, reached at `localhost` on its published port from a job on the
+  host, and by its name from a job container and from a leg in the `docker` executor. A `k8s`
+  pod's service is a sidecar `hostAliases` names (tests/k8s_pool.rs), and the live cluster's is
+  W22-AC05's.
+- *Done.* AC05, measured by `kiln ci bench --only firecracker` (alpine's microVM, each timed from
+  its start to its guest's word that it's ready, its image and template made first). On this
+  host, a debug build (2026-10-21): a cold start's p50 638.7 ms (≤ 1.5 s) and a warm start's,
+  restored from the image's snapshot, 34.9 ms (≤ 300 ms). The guest's only way out is the egress
+  proxy (W13-R05).
 
 - *Done.* `crates/kiln/src/runner/docker.rs`, on the host executor through Docker or Podman
   (R03, R08), as GitHub's self-hosted runner does it:
@@ -6571,6 +6586,8 @@ and AC02.
     - the cache's store: a 1 GiB entry saved, then restored as a restore streams it;
     - a restart (W05-AC09): 10,000 legs queued by one hub on a store on disk, for runners there
       aren't, rebuilt by a second hub on that store, as the server is when it starts again.
+  - With `--only firecracker`, on a machine that runs microVMs: a leg's microVM started cold and
+    warm, from its image's snapshot (W13-AC05).
 
     The network's part (the runner's link, HTTP, the browser) is the live cluster's to confirm.
 

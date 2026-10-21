@@ -54,7 +54,8 @@ pub struct BenchArgs {
     /// The scheduler's alone (W05-AC08).
     #[arg(long)]
     scheduler: bool,
-    /// Only these: `scheduler`, `expressions`, `parsing`, `runs`, `logs`, `cache`, `list`, `restart` (comma-separated).
+    /// Only these: `scheduler`, `expressions`, `parsing`, `runs`, `logs`, `cache`, `list`, `restart` (comma-separated); `firecracker`
+    /// too, which runs only when named (a microVM's cold and warm start, W13-AC05).
     #[arg(long, value_delimiter = ',')]
     only: Vec<String>,
     /// Pushes for run creation.
@@ -548,8 +549,8 @@ async fn bench(a: BenchArgs) -> Result<u8> {
     }
     for o in &only {
         anyhow::ensure!(
-            matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache" | "list" | "restart"),
-            "`{o}`: scheduler, expressions, parsing, runs, logs, cache, list or restart"
+            matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache" | "list" | "restart" | "firecracker"),
+            "`{o}`: scheduler, expressions, parsing, runs, logs, cache, list, restart or firecracker"
         );
     }
     let want = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
@@ -591,6 +592,17 @@ async fn bench(a: BenchArgs) -> Result<u8> {
         let measured = list(&dir, a.list_runs.max(100), runs).await;
         let _ = std::fs::remove_dir_all(&dir);
         measures.extend(measured?);
+    }
+    // W13-AC05, on a machine that runs microVMs (and only when asked: it pulls an image).
+    #[cfg(target_os = "linux")]
+    if only.iter().any(|o| o == "firecracker") {
+        let dir = a.data.join("firecracker");
+        std::fs::create_dir_all(&dir)?;
+        let (cold, warm) = crate::runner::firecracker::start_times(&dir, "docker.io/library/alpine:3.20", runs).await?;
+        measures.push(Measure::new("firecracker.cold_start_ms", "ms", Better::Lower, 1_500.0, cold));
+        if !warm.is_empty() {
+            measures.push(Measure::new("firecracker.warm_start_ms", "ms", Better::Lower, 300.0, warm));
+        }
     }
     if want("restart") {
         let dir = a.data.join(crate::util::new_id());

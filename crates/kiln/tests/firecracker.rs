@@ -485,3 +485,62 @@ fn w13_r05_services_and_a_job_container_in_a_microvm() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// W13-AC02 on `firecracker` (with W06-AC01): F-20, the toolkit conformance action, in a microVM of
+/// `alpine:3.20`, its JavaScript on the musl Node W07-R05 fetches for it. Each effect is as on the
+/// host executor: its inputs, the secret it masks, `exec` and `io`, its outputs, variable and path
+/// in a later step, its post step's state, and `getIDToken` from kiln's issuer, masked.
+#[test]
+fn w13_ac02_toolkit_conformance_in_a_microvm() -> anyhow::Result<()> {
+    let Some((fc, kernel)) = machine() else {
+        eprintln!("skipped: KILN_TEST_FIRECRACKER and KILN_TEST_FIRECRACKER_KERNEL don't name Firecracker and its kernel, or /dev/kvm can't be opened");
+        return Ok(());
+    };
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let (s, home, work, push) = vm_server(dir.path(), &fc, &kernel, "")?;
+    // The action, the repository's own.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolkit-action");
+    let to = work.join(".github/actions/toolkit");
+    std::fs::create_dir_all(to.join("dist"))?;
+    std::fs::copy(fixture.join("action.yml"), to.join("action.yml"))?;
+    for f in ["main.mjs", "post.mjs", "shared.mjs"] {
+        std::fs::copy(fixture.join("dist").join(f), to.join("dist").join(f))?;
+    }
+    let workflow = r#"on: push
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  t:
+    runs-on: microvm
+    steps:
+      - uses: kiln/checkout@v1
+      - id: t
+        uses: ./.github/actions/toolkit
+        with:
+          required: yes-req
+      - run: |
+          echo "o1=${{ steps.t.outputs.o1 }} EXPORTED=$EXPORTED"
+          case "$PATH" in /opt/f20-bin:*) echo "path first" ;; esac
+          echo "the secret again: super-secret-f20"
+"#;
+    let (run, leg) = push_run(&s, &home, &work, &push, ".github/workflows/toolkit.yml", workflow)?;
+    until(&s, 1200, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        let done = runs.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id") == Some(&json!(run)) && r.get("finished_at").is_some_and(|f| !f.is_null()));
+        Ok((!done).then_some(body))
+    })?;
+    let (about, log) = leg_and_log(&s, &leg)?;
+    assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{about}\n{log}\n{}", s.log());
+    assert_eq!(about.pointer("/leg/executor"), Some(&json!("firecracker")), "{about}");
+    assert!(log.contains(r#"inputs: required=yes-req missing=[] padded=[spaced] raw=[  spaced  ] flag=true lines=["a","b","c"]"#), "{log}");
+    assert!(log.contains("required absent: Input required and not supplied: absent"), "{log}");
+    assert!(log.contains("printing the secret: ***") && !log.contains("super-secret-f20"), "setSecret masks it from then on: {log}");
+    assert!(log.contains("exec output: captured (exit 0)") && log.contains("which sh: true"), "{log}");
+    assert!(log.contains(r#"o1=v1 EXPORTED=e1"#) && log.contains("path first") && log.contains("the secret again: ***"), "{log}");
+    assert!(log.contains("post: state=state-v"), "the post step reads the state: {log}");
+    assert!(log.contains("id token: aud=kiln-f20 sub=repo:acme/vm:ref:refs/heads/main"), "kiln's issuer, for its audience: {log}");
+    assert!(log.contains("the token itself: ***"), "the token is masked: {log}");
+    Ok(())
+}

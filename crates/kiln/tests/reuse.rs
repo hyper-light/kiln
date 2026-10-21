@@ -167,14 +167,14 @@ jobs:
       - run: echo "documented $(cat docs/note) as $(date +%s%N)"
 "#;
 
-/// The newest `pull_request` run made at `since` or after, once it has finished: its legs by key,
-/// each its detail and its log.
-fn pull_run(s: &Server, since: i64) -> anyhow::Result<std::collections::BTreeMap<String, (Value, String)>> {
+/// The newest `pull_request` run but those in `seen`, once it has finished: its id, and its legs by
+/// key, each its detail and its log.
+fn pull_run(s: &Server, seen: &[String]) -> anyhow::Result<(String, std::collections::BTreeMap<String, (Value, String)>)> {
     let mut run = String::new();
     until(s, 300, "the pull request's run", || {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/reuse&limit=20", &s.admin, None)?;
         let runs = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
-        let newest = runs.into_iter().find(|r| r.get("event").and_then(Value::as_str) == Some("pull_request") && r.get("created_at").and_then(Value::as_i64).is_some_and(|c| c >= since));
+        let newest = runs.into_iter().find(|r| r.get("event").and_then(Value::as_str) == Some("pull_request") && !r.get("id").and_then(Value::as_str).is_some_and(|id| seen.iter().any(|s| s == id)));
         match newest {
             Some(r) if r.get("finished_at").is_some_and(|f| !f.is_null()) => {
                 run = r.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -189,7 +189,7 @@ fn pull_run(s: &Server, since: i64) -> anyhow::Result<std::collections::BTreeMap
         let (about, log) = leg_now(s, l.get("id").and_then(Value::as_str).unwrap_or_default())?;
         legs.insert(about.pointer("/leg/key").and_then(Value::as_str).unwrap_or_default().to_owned(), (about, log));
     }
-    Ok(legs)
+    Ok((run, legs))
 }
 
 /// W08-R10 with W14: a diff that only rebases reuses every leg whose paths it didn't touch. Its
@@ -226,9 +226,8 @@ fn w08_r10_a_rebased_diff_reuses_what_it_did_not_touch() -> anyhow::Result<()> {
     std::fs::write(work.join("src/version"), "2\n")?;
     git(&home, &work, &["add", "."])?;
     git(&home, &work, &["commit", "-qm", "version 2\n\nChange-Id: I3333333333333333333333333333333333333333"])?;
-    let since = now();
     git(&home, &work, &["push", "-q", &push, "HEAD:refs/for/main"])?;
-    let first = pull_run(&s, since)?;
+    let (first_run, first) = pull_run(&s, &[])?;
     for key in ["build", "docs"] {
         let (about, log) = first.get(key).cloned().unwrap_or_default();
         assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{key}: {about}\n{log}\n{}", s.log());
@@ -246,9 +245,8 @@ fn w08_r10_a_rebased_diff_reuses_what_it_did_not_touch() -> anyhow::Result<()> {
     // The diff rebased onto it, its own change the same: a new version.
     git(&home, &work, &["checkout", "-q", "diff"])?;
     git(&home, &work, &["rebase", "-q", "main"])?;
-    let since = now();
     git(&home, &work, &["push", "-q", &push, "HEAD:refs/for/main"])?;
-    let second = pull_run(&s, since)?;
+    let (_, second) = pull_run(&s, &[first_run])?;
     let (build, build_log) = second.get("build").cloned().unwrap_or_default();
     assert_eq!(build.pointer("/leg/conclusion"), Some(&json!("success")), "{build}\n{build_log}");
     assert!(build.pointer("/leg/reused_from").is_some_and(|r| !r.is_null()), "the build's paths are as they were: {build}\n{}", s.log());
@@ -258,9 +256,4 @@ fn w08_r10_a_rebased_diff_reuses_what_it_did_not_touch() -> anyhow::Result<()> {
     assert!(docs.pointer("/leg/reused_from").is_none_or(Value::is_null), "the trunk changed the docs: {docs}");
     assert!(docs_log.contains("documented second"), "{docs_log}");
     Ok(())
-}
-
-/// Now, in Unix seconds (a run's `created_at`).
-fn now() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
