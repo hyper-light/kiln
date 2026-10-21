@@ -118,30 +118,66 @@ pub enum Retired {
 }
 
 /// The old service was told about by `<instance dir>/replaces.json`: stop and disable it, once its
-/// processes hold no terminal (checked here as well as by the server). Blocking: runs the
+/// processes hold no terminal (checked here as well as by the server). Its own, else one an
+/// earlier instance of this machine took on and never carried out ([`duties`]). Blocking: runs the
 /// platform's service manager.
 pub fn retire(state_dir: &Path, me: &str) -> anyhow::Result<Retired> {
-    let path = instance_dir(state_dir, me).join("replaces.json");
-    let Some(mut r) = read_json::<Replaces>(&path) else { return Ok(Retired::Nothing) };
+    for (i, path) in duties(state_dir, me).into_iter().enumerate() {
+        match retire_from(&path, i == 0)? {
+            Retired::Nothing => {}
+            done => return Ok(done),
+        }
+    }
+    Ok(Retired::Nothing)
+}
+
+/// The services this instance may stop, as the `replaces.json` naming each: its own first, then
+/// those other instances of this machine took on and never carried out, the newest first. An
+/// instance replaced by an upgrade (a new instance each time) before the service it replaces held
+/// nothing left that service to no one: fedora's ran two runners for two days. kiln started both.
+pub fn duties(state_dir: &Path, me: &str) -> Vec<PathBuf> {
+    let own = instance_dir(state_dir, me).join("replaces.json");
+    let mut others: Vec<(i64, PathBuf)> = std::fs::read_dir(state_dir.join("instances"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|d| d.file_name().to_str().map(str::to_owned))
+        .filter(|id| id != me)
+        .map(|id| (created_at(state_dir, &id), instance_dir(state_dir, &id).join("replaces.json")))
+        .filter(|(_, p)| read_json::<Replaces>(p).is_some_and(|r| r.retired_at.is_none()))
+        .collect();
+    others.sort_by_key(|a| std::cmp::Reverse(a.0));
+    std::iter::once(own).chain(others.into_iter().map(|(_, p)| p)).collect()
+}
+
+/// `own`: the duty is this instance's (it replaced that service itself).
+fn retire_from(path: &Path, own: bool) -> anyhow::Result<Retired> {
+    let Some(mut r) = read_json::<Replaces>(path) else { return Ok(Retired::Nothing) };
     // Retired before and not running again (someone may have started it again: stop it again).
     if r.retired_at.is_some() && !service_active(&r.boot, r.system, &r.unit) {
         return Ok(Retired::Nothing);
     }
     let pids = service_pids(&r);
+    // Never the service this runner runs in (its own duty can't name it; another's might).
+    if pids.contains(&std::process::id()) {
+        return Ok(Retired::Nothing);
+    }
     let held: usize = pids.iter().map(|p| crate::os::pty_masters(*p).unwrap_or(0)).sum();
     if held > 0 {
         return Ok(Retired::Busy(held));
     }
     stop_service(&r)?;
-    // The old supervisor no longer watches its binary: bring the `kiln` command up to date.
-    if let Some(bin) = &r.cli_bin {
+    // The old supervisor no longer watches its binary: bring the `kiln` command up to date. Not for
+    // another instance's duty: that binary may be the one this runner's own supervisor runs, and
+    // replacing it would start an upgrade nobody asked for.
+    if let Some(bin) = r.cli_bin.as_ref().filter(|_| own) {
         match std::env::current_exe().and_then(|exe| copy_atomic(&exe, bin)) {
             Ok(()) => tracing::info!(path = %bin.display(), "updated the kiln command to this runner's version"),
             Err(e) => tracing::warn!(error = %e, path = %bin.display(), "could not update the kiln command"),
         }
     }
     r.retired_at = Some(crate::util::now_unix());
-    write_json(&path, &r)?;
+    write_json(path, &r)?;
     Ok(Retired::Stopped(r.unit))
 }
 
@@ -693,6 +729,32 @@ mod tests {
         assert_eq!(created_at(dir.path(), "abc"), 42);
         assert_eq!(replacing(dir.path(), "kiln-agent").len(), 1);
         assert!(replacing(dir.path(), "other").is_empty());
+        Ok(())
+    }
+
+    /// A duty an earlier instance took on and never carried out is this one's too: an upgrade
+    /// started a new instance before the service it replaces held nothing, and that service ran on
+    /// beside the new runner for two days (fedora, 2026-10-21). One carried out is not.
+    #[test]
+    fn duties_left_by_earlier_instances_are_carried_out_newest_first() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let put = |id: &str, created: i64, unit: Option<(&str, Option<i64>)>| -> anyhow::Result<()> {
+            let d = instance_dir(dir.path(), id);
+            std::fs::create_dir_all(&d)?;
+            write_json(&d.join("instance.json"), &InstanceRecord { id: id.into(), created_at: created })?;
+            if let Some((unit, retired_at)) = unit {
+                write_json(&d.join("replaces.json"), &Replaces { boot: "systemd".into(), system: false, unit: unit.into(), cli_bin: None, retired_at })?;
+            }
+            Ok(())
+        };
+        // The first replaced the original service and retired it; the second replaced the first,
+        // and was itself replaced before it could; the newest (me) replaces nothing of its own.
+        put("first", 10, Some(("kiln-agent", Some(11))))?;
+        put("second", 20, Some(("kiln-agent-first", None)))?;
+        put("third", 30, Some(("kiln-agent-second", None)))?;
+        put("me", 40, None)?;
+        let names: Vec<String> = duties(dir.path(), "me").iter().map(|p| p.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+        assert_eq!(names, ["me", "third", "second"], "its own first, then those not carried out, the newest first");
         Ok(())
     }
 }

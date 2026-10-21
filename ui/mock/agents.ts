@@ -164,6 +164,8 @@ for (const m of [
 interface MockStep {
   title: string;
   goal: string;
+  /** The steps it waits for, by number. */
+  needs: number[];
   status: "waiting" | "started" | "taken" | "met" | "unmet" | "stopped";
   agent: string | null;
   reason: string | null;
@@ -176,9 +178,9 @@ const run = {
   reason: null as string | null,
   at: Math.floor((t0 + 30_000) / 1000),
   steps: [
-    { title: "Freeze main", goal: family.get("run-freeze")?.info.goal ?? "", status: "met", agent: "run-freeze", reason: "Claude Code's check: the condition holds.", tries: 1, started_at: null, ended_at: null },
-    { title: "Run the full bench", goal: family.get("run-bench")?.info.goal ?? "", status: "started", agent: "run-bench", reason: null, tries: 1, started_at: null, ended_at: null },
-    { title: "Tag and publish", goal: 'Step 3 of 3 of the plan "Cut the 0.2 release": Tag and publish', status: "waiting", agent: null, reason: null, tries: 0, started_at: null, ended_at: null },
+    { title: "Freeze main", goal: family.get("run-freeze")?.info.goal ?? "", needs: [], status: "met", agent: "run-freeze", reason: "the agent said so: branch protection requires a release label", tries: 1, started_at: null, ended_at: null },
+    { title: "Run the full bench", goal: family.get("run-bench")?.info.goal ?? "", needs: [1], status: "started", agent: "run-bench", reason: null, tries: 1, started_at: null, ended_at: null },
+    { title: "Tag and publish", goal: 'Step 3 of 3 of the plan "Cut the 0.2 release": Tag and publish', needs: [1, 2], status: "waiting", agent: null, reason: null, tries: 0, started_at: null, ended_at: null },
   ] as MockStep[],
 };
 
@@ -186,7 +188,7 @@ function runView() {
   const steps = run.steps.map((s, i) => {
     const m = s.agent ? family.get(s.agent) : undefined;
     const stand = s.status === "started" ? (m && (m.info.approvals.length || m.info.status === "waiting") ? "needs_you" : "working") : s.status === "taken" ? "yours" : s.status;
-    return { n: i + 1, title: s.title, goal: s.goal, stand, agent: m ? brief(m.info) : null, agent_id: s.agent, started_at: s.started_at, ended_at: s.ended_at, reason: s.reason, tries: s.tries };
+    return { n: i + 1, title: s.title, goal: s.goal, stand, needs: s.needs, given: false, agent: m ? brief(m.info) : null, agent_id: s.agent, started_at: s.started_at, ended_at: s.ended_at, reason: s.reason, tries: s.tries };
   });
   const met = steps.filter((s) => s.stand === "met").length;
   // Each met step's diff, on the one before's (docs/agentic.md P4).

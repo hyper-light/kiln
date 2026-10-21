@@ -24,7 +24,7 @@ import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
-import { latestThought, thinkingStarted, thoughtIsLive, type ThoughtItem } from "./thinking";
+import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
@@ -418,7 +418,8 @@ function Thought({ item, live, since }: { item: ThoughtItem; live: boolean; sinc
     (id) => id === e.id || more.some((m) => m.id === id),
     () => setOpen(true),
   );
-  if (e.redacted) return null;
+  // Nothing to show yet (or ever): no row, so none comes and goes; the live tail says it thinks.
+  if (e.redacted || !thoughtShown(item)) return null;
   const all = [e, ...more].filter((x) => !x.redacted);
   return (
     <div className="hx-thought" data-ev={all.map((x) => x.id).join(" ")}>
@@ -560,7 +561,7 @@ function moving(items: Item[], turnStarted?: number): boolean {
   const last = items.findLast((item) => item.type !== "notice");
   if (!last) return false;
   if (last.type === "note") return Boolean(last.event.streaming);
-  if (last.type === "thought") return thoughtIsLive(last, true, turnStarted);
+  if (last.type === "thought") return thoughtIsLive(last, true, turnStarted) && thoughtShown(last);
   if (last.type === "step") return last.calls.some((c) => c.status === "running" || c.status === "pending");
   if (last.type === "page" || last.type === "live") return last.event.status === "running" || last.event.status === "pending";
   return false;
