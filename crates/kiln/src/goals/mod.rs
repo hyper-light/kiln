@@ -724,6 +724,12 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool, push: bo
         if !(free || (fresh && idle)) {
             return Next::Wait;
         }
+        // Claude Code judges its /goal when a turn ends with nothing of its own still at work in the
+        // background (agents, shells): it's woken when those end. Sent again before then, the goal
+        // only starts over and the judgement it would have made is lost.
+        if !fresh && item.how.as_deref() == Some("goal") && info.tasks_running > 0 {
+            return Next::Wait;
+        }
         // Since it was last sent (never, for a fresh one: at once).
         if now.saturating_sub(item.reminded_at) < gap(item.reminders) {
             return Next::Wait;
@@ -878,6 +884,25 @@ mod tests {
         assert!(matches!(decide(&stack(vec![item("active", Some("goal"))]), Some(&paused), LATER * 10, false, false), Next::Wait));
         // Once it goes on, so does the stack.
         assert!(matches!(decide(&stack(vec![item("pending", None)]), Some(&info(Status::Idle, None)), 2_000, false, false), Next::Start { .. }));
+    }
+
+    #[test]
+    fn a_claude_code_goal_is_not_sent_again_while_its_agent_has_background_work() {
+        let native = stack(vec![item("active", Some("goal"))]);
+        let busy_behind = Info { tasks_running: 2, ..info(Status::Idle, None) };
+        // Its turn ended with agents or shells of its own still at work: Claude Code hasn't
+        // judged the goal yet, and sending it again would start it over.
+        assert!(matches!(decide(&native, Some(&busy_behind), LATER * 100, false, false), Next::Wait));
+        // Their end wakes it; once a turn ends with none left, a goal still unmet goes again.
+        assert!(matches!(decide(&native, Some(&info(Status::Idle, None)), LATER, false, false), Next::Remind { .. }));
+        // Its verdict is taken whatever is still at work.
+        assert!(matches!(decide(&native, Some(&Info { tasks_running: 2, ..info(Status::Idle, Some(obj("met", 9))) }), LATER, false, false), Next::End { status: "met", .. }));
+        // Other harnesses' goals aren't held: their goal doesn't start over when sent again.
+        assert!(matches!(decide(&stack(vec![item("active", Some("goal_control"))]), Some(&busy_behind), LATER, false, false), Next::Remind { .. }));
+        assert!(matches!(decide(&stack(vec![item("active", None)]), Some(&busy_behind), LATER, false, false), Next::Remind { .. }));
+        // One you resumed (not sent since) still goes at once.
+        let resumed = Item { reminded_at: 0, ..item("active", Some("goal")) };
+        assert!(matches!(decide(&stack(vec![resumed]), Some(&busy_behind), LATER, false, false), Next::Remind { fresh: true, .. }));
     }
 
     #[test]
