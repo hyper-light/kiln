@@ -170,7 +170,7 @@ fn server_for(dir: &Path, src: &Path, repo: &Path) -> anyhow::Result<common::Ser
         std::os::unix::fs::symlink(&node, bin.join("node"))?;
     }
     let ci = format!("\n[[ci.actions.sources]]\nowners = [\"kinds\"]\nurl = \"file://{}/{{owner}}/{{repo}}\"\n", src.display());
-    let extra = format!("[[repos]]\nname = \"acme/kinds\"\nclone_url = \"file://{}\"\nbranches = [\"main\", \"cancel\", \"paths\"]\npoll_seconds = 1\n", repo.display());
+    let extra = format!("[[repos]]\nname = \"acme/kinds\"\nclone_url = \"file://{}\"\nbranches = [\"main\", \"cancel\", \"cancel-in\", \"paths\"]\npoll_seconds = 1\n", repo.display());
     let s = start(dir, &Options { agent: true, ci: &ci, extra: &extra })?;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -295,13 +295,7 @@ fn w06_ac05_post_steps_cancellation_and_timeouts() -> anyhow::Result<()> {
     // W05-AC07: GitHub's cancel sequence, timed. SIGINT at once, SIGTERM 7.5 s on, and killed at
     // 10 s (its last heartbeat), each ± 0.5 s.
     if cfg!(target_os = "linux") {
-        let times = |what: &str| -> Vec<u128> { log.lines().filter_map(|l| l.split_once(what).and_then(|(_, t)| t.trim().parse::<u128>().ok())).collect() };
-        let (int, term, alive) = (times("got INT at "), times("got TERM at "), times("alive at "));
-        let secs = |a: u128, b: u128| b.saturating_sub(a) as f64 / 1e9;
-        let (Some(&int), Some(&term), Some(&last)) = (int.first(), term.first(), alive.last()) else { anyhow::bail!("its signals and heartbeats:\n{log}") };
-        assert!(secs(cancelled_at, int) < 1.5, "SIGINT {}s after the cancel:\n{log}", secs(cancelled_at, int));
-        assert!((7.0..=8.0).contains(&secs(int, term)), "SIGTERM {}s after SIGINT:\n{log}", secs(int, term));
-        assert!((9.4..=10.5).contains(&secs(int, last)), "killed {}s after SIGINT:\n{log}", secs(int, last));
+        cancel_timed(&log, cancelled_at, 7.0..=8.0, 9.4..=10.5)?;
     }
     let step = |what: &str| steps.iter().find(|(n, _, _)| n.contains(what)).cloned().unwrap_or_default();
     let (_, ran, out) = step("always after");
@@ -309,6 +303,88 @@ fn w06_ac05_post_steps_cancellation_and_timeouts() -> anyhow::Result<()> {
     let (_, skipped, out) = step("never after");
     assert!(skipped == "skipped" && out.is_empty(), "the next one doesn't:\n{log}");
     assert!(log.contains("tell post four"), "its post step:\n{log}");
+    Ok(())
+}
+
+/// W05-AC07's timings in a cancelled step's `log` (its traps' and heartbeats' nanoseconds): SIGINT
+/// within 1.5 s of `cancelled_at`, SIGTERM `term` seconds after it, and killed `killed` seconds
+/// after it (its last heartbeat).
+fn cancel_timed(log: &str, cancelled_at: u128, term: std::ops::RangeInclusive<f64>, killed: std::ops::RangeInclusive<f64>) -> anyhow::Result<()> {
+    let times = |what: &str| -> Vec<u128> { log.lines().filter_map(|l| l.split_once(what).and_then(|(_, t)| t.trim().parse::<u128>().ok())).collect() };
+    let (int, got_term, alive) = (times("got INT at "), times("got TERM at "), times("alive at "));
+    let secs = |a: u128, b: u128| b.saturating_sub(a) as f64 / 1e9;
+    let (Some(&int), Some(&got_term), Some(&last)) = (int.first(), got_term.first(), alive.last()) else { anyhow::bail!("its signals and heartbeats:\n{log}") };
+    assert!(secs(cancelled_at, int) < 1.5, "SIGINT {}s after the cancel:\n{log}", secs(cancelled_at, int));
+    assert!(term.contains(&secs(int, got_term)), "SIGTERM {}s after SIGINT:\n{log}", secs(int, got_term));
+    assert!(killed.contains(&secs(int, last)), "killed {}s after SIGINT:\n{log}", secs(int, last));
+    Ok(())
+}
+
+const CANCEL_IN: &str = r#"on:
+  push:
+    branches: [cancel-in]
+jobs:
+  stopped:
+    runs-on: local
+    container: ubuntu:24.04
+    steps:
+      - name: sleep 300
+        run: |
+          trap 'echo "got INT at $(date +%s%N)"' INT
+          trap 'echo "got TERM at $(date +%s%N)"' TERM
+          echo started-sleeping
+          for i in $(seq 1 3000); do echo "alive at $(date +%s%N)"; sleep 0.1 || true; done
+      - if: always()
+        run: echo "always after the cancel"
+"#;
+
+/// W05-AC07 in a job container: `docker exec` passes no signal on, so the cancel reaches the
+/// step's process there through the pid it kept, in GitHub's sequence as on the host (each signal
+/// a `docker exec` of its own, so a little later), and the `always()` step runs after.
+#[test]
+fn w05_ac07_cancel_sequence_in_a_job_container() -> anyhow::Result<()> {
+    if !docker_works() {
+        eprintln!("w05_ac07_cancel_sequence_in_a_job_container: skipped, no Docker");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src)?;
+    let repo = dir.path().join("repo");
+    let s = server_for(dir.path(), &src, &repo)?;
+    git(&repo, &["checkout", "-q", "-b", "cancel-in"])?;
+    commit(&repo, &[(".github/workflows/cancel-in.yml", CANCEL_IN)], None)?;
+    let run = run_on(&s, "cancel-in", 300, |_| true)?;
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let detail = get(&s, &format!("/api/ci/runs/{id}"))?;
+        let leg = detail.pointer("/legs/0/id").and_then(Value::as_str).map(str::to_owned).unwrap_or_default();
+        let about = if leg.is_empty() { Value::Null } else { get(&s, &format!("/api/ci/legs/{leg}"))? };
+        let sleeping = about
+            .get("steps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|x| x.get("name").and_then(Value::as_str).is_some_and(|n| n.contains("sleep 300")) && x.get("status").and_then(Value::as_str) == Some("running"));
+        if sleeping {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "never started sleeping: {about}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let cancelled_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{id}/cancel"), &s.admin, Some(&json!({})))?;
+    anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
+    let run = run_on(&s, "cancel-in", 120, |r| r.get("finished_at").is_some_and(|f| !f.is_null()))?;
+    assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("cancelled"), "{run}");
+    let all = legs(&s, &id)?;
+    let (_, conclusion, steps) = all.first().cloned().unwrap_or_default();
+    let log = said(&steps);
+    assert_eq!(conclusion, "cancelled", "{log}");
+    cancel_timed(&log, cancelled_at, 7.0..=8.5, 9.4..=11.0)?;
+    assert!(steps.iter().any(|(_, c, l)| c == "success" && l.contains("always after the cancel")), "the `always()` step runs to its end:\n{log}");
     Ok(())
 }
 

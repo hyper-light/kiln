@@ -11,7 +11,10 @@
 //! - `POST /pulls` (a change request for a branch a job pushed), `PATCH /pulls/{n}` (title,
 //!   description, closed or open again);
 //! - labels: `GET`/`POST`/`PUT`/`DELETE /issues/{n}/labels`, `DELETE /issues/{n}/labels/{name}`
-//!   (what `actions/labeler` and `create-pull-request` set).
+//!   (what `actions/labeler` and `create-pull-request` set);
+//! - landing, as on a GitHub branch that requires a merge queue (every kiln trunk lands through
+//!   its land queue): `GET /pulls/{n}/merge`, a `PUT` there refused; GraphQL's auto-merge and
+//!   enqueueing over [`auto_merge`] and [`queue`]; a job that writes contents and pull requests may.
 //!
 //! A job writes as `github-actions[bot]`; its reviews are an agent's (they count only where
 //! `agents-can-approve`). Comments' ids are numbers, as GitHub's are.
@@ -46,6 +49,16 @@ fn invalid(m: &str) -> Response {
 
 fn forbidden(scope: &str) -> Response {
     srv::json(StatusCode::FORBIDDEN, &json!({ "message": format!("Resource not accessible by integration: the job's token lacks `{scope}: write`") }))
+}
+
+/// A land strategy as GitHub names a merge method: kiln's that make one commit are its squash,
+/// those that keep each commit its rebase.
+fn merge_method(strategy: &str) -> &'static str {
+    match strategy {
+        "squash" | "stack-squash" => "squash",
+        "merge" => "merge",
+        _ => "rebase",
+    }
 }
 
 /// A principal as GitHub shows a user.
@@ -145,6 +158,13 @@ async fn pr_json(s: &Site<'_>, d: &Diff, vs: &[Version]) -> Value {
         (Some(_), Some(v)) => s.hub_text(&["rev-list", "--count", &format!("{}..{}", v.base, v.commit)]).await.and_then(|c| c.trim().parse::<i64>().ok()).unwrap_or(1),
         _ => 1,
     };
+    // Waiting to land when ready (GitHub's auto-merge), or in the land queue (its merge queue).
+    let auto = crate::ci::land::when_ready_of(s.hub, d)
+        .await
+        .map(|w| json!({ "enabled_by": user(&w.by), "merge_method": merge_method(&w.strategy), "commit_title": w.title, "commit_message": w.message, "enabled_at": rfc3339(w.at) }));
+    let queued = crate::ci::land::queued_of(s.hub, d)
+        .await
+        .map(|(entry, state, position, at, by)| json!({ "entry": entry, "state": state, "position": position, "enqueued_at": rfc3339(at), "enqueued_by": user(&by) }));
     let url = format!("{}/pulls/{n}", s.api);
     let mut v = json!({
         "url": url, "id": n, "node_id": format!("kiln-pr-{}", d.id), "number": n,
@@ -158,8 +178,8 @@ async fn pr_json(s: &Site<'_>, d: &Diff, vs: &[Version]) -> Value {
         "closed_at": if closed { Value::String(rfc3339(merged_at.unwrap_or(d.updated_at))) } else { Value::Null }, "merged_at": merged_at.map(rfc3339),
         "merged": d.state == "landed", "merge_commit_sha": merge_commit, "mergeable": if closed { Value::Null } else { Value::Bool(true) }, "mergeable_state": if d.state == "accepted" { "clean" } else { "blocked" },
         "head": side(&head_ref, &head), "base": side(&d.trunk, &base),
-        "author_association": "MEMBER", "auto_merge": null, "comments": comments, "review_comments": review_comments, "commits": commits, "additions": adds, "deletions": dels, "changed_files": files,
-        "kiln": { "id": d.name, "kind": d.kind, "state": d.state, "version": latest.map(|v| v.n) },
+        "author_association": "MEMBER", "auto_merge": auto, "comments": comments, "review_comments": review_comments, "commits": commits, "additions": adds, "deletions": dels, "changed_files": files,
+        "kiln": { "id": d.name, "kind": d.kind, "state": d.state, "version": latest.map(|v| v.n), "queue": queued },
     });
     if let (Some(o), Value::Object(m)) = (v.as_object_mut(), more) {
         o.extend(m);
@@ -686,6 +706,102 @@ pub async fn update(s: &Site<'_>, n: &str, job: &Job, body: &Value) -> Result<Re
         .await
         .map_err(internal)?;
     s.hub.store.audit(format!("job:{}", job.leg), "diffs.update".into(), format!("{} {}{}", d.repo, d.name, to.map(|t| format!(" {t}")).unwrap_or_default())).await;
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &pr_json(s, &d, &vs).await))
+}
+
+/// `GET /pulls/{n}/merge`: 204 once it landed, else 404. `PUT`: refused, as GitHub refuses it
+/// where a branch requires a merge queue: a kiln trunk lands only through its land queue (GraphQL's
+/// `enablePullRequestAutoMerge` and `enqueuePullRequest` put a pull request in it).
+pub async fn merge(s: &Site<'_>, n: &str, put: bool) -> Result<Response, Fail> {
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    if !put {
+        return Ok(if d.state == "landed" { srv::status(StatusCode::NO_CONTENT) } else { not_found() });
+    }
+    let message = if matches!(d.state.as_str(), "landed" | "abandoned") { "Pull Request is not mergeable" } else { "Changes must be made through the merge queue" };
+    Ok(srv::json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "message": message, "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request" })))
+}
+
+/// What GitHub says of a land queue refusal: 409 as kiln's (what keeps it from landing), the rest
+/// as they are.
+fn refused(code: StatusCode, why: &str) -> Response {
+    srv::json(if code == StatusCode::CONFLICT { StatusCode::UNPROCESSABLE_ENTITY } else { code }, &json!({ "message": why }))
+}
+
+/// May a job land pull requests: its token writes contents and pull requests, as on GitHub, and
+/// whoever started its run may land here (`diffs.land`): a job never does more than its starter
+/// (a run nobody started, a schedule's, is the repository's own). Who its land entry is held to
+/// then (its candidate's runs, W10-R02), or why not.
+async fn may_land(s: &Site<'_>, job: &Job) -> Result<Option<Value>, Box<Response>> {
+    if !job.may("contents", Level::Write) {
+        return Err(Box::new(forbidden("contents")));
+    }
+    if !job.may("pull-requests", Level::Write) {
+        return Err(Box::new(forbidden("pull-requests")));
+    }
+    let run = job.run.clone();
+    let input: Option<String> = s.hub.store.call(move |c| Ok(c.query_row("SELECT input FROM ci_plans WHERE run_id = ?1", [&run], |r| r.get(0)).optional()?)).await.ok().flatten();
+    let starter = input.and_then(|i| serde_json::from_str::<Value>(&i).ok()).and_then(|v| v.pointer("/event/started_by").cloned()).filter(|v| !v.is_null());
+    if let Some(by) = &starter
+        && !crate::authz::gate::starter_may(s.hub, by, "diffs.land", &Scope::Repo { repo: s.repo.name.clone() }).await
+    {
+        let who = by.get("name").and_then(Value::as_str).unwrap_or("whoever started the run");
+        return Err(Box::new(srv::json(StatusCode::FORBIDDEN, &json!({ "message": format!("Resource not accessible by integration: {who}, who started the run, may not land here (`diffs.land`)") }))));
+    }
+    Ok(starter)
+}
+
+/// GitHub's auto-merge for a job (GraphQL's `enablePullRequestAutoMerge` with `Some(method, title,
+/// message)`, `disablePullRequestAutoMerge` with `None`): the pull request lands through the queue
+/// as soon as its trunk's policy lets it, by `method` if given (`SQUASH`, `REBASE`, `MERGE`; a
+/// stack of diffs' `REBASE` is its `stack`, and its `MERGE` the trunk's default). The pull request
+/// after.
+pub async fn auto_merge(s: &Site<'_>, n: &str, job: &Job, on: Option<(Option<&str>, Option<String>, Option<String>)>) -> Result<Response, Fail> {
+    let starter = match may_land(s, job).await {
+        Ok(by) => by,
+        Err(no) => return Ok(*no),
+    };
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let by = format!("job:{}", job.leg);
+    let done = match on {
+        Some((method, title, message)) => {
+            // A stack of diffs lands squashed or a commit each (no merge commit); a change request
+            // as GitHub's do.
+            let stack = d.kind == "diff";
+            let strategy = match method {
+                None => None,
+                Some("SQUASH") => Some("squash"),
+                Some("REBASE") => Some(if stack { "stack" } else { "rebase" }),
+                Some("MERGE") => (!stack).then_some("merge"),
+                Some(other) => return Ok(invalid(&format!("merge method `{other}`: MERGE, SQUASH or REBASE"))),
+            };
+            crate::ci::land::land_when_ready(s.hub, &d, &by, starter, strategy, title, message).await.map(|_| ())
+        }
+        None => crate::ci::land::not_when_ready(s.hub, &d, &by).await.map(|_| ()),
+    };
+    if let Err((code, why)) = done {
+        return Ok(refused(code, &why));
+    }
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &pr_json(s, &d, &vs).await))
+}
+
+/// GitHub's merge queue for a job (GraphQL's `enqueuePullRequest`, `dequeuePullRequest`): the pull
+/// request into kiln's land queue now, if its trunk's policy lets it, or out of it. The pull request
+/// after.
+pub async fn queue(s: &Site<'_>, n: &str, job: &Job, on: bool) -> Result<Response, Fail> {
+    let starter = match may_land(s, job).await {
+        Ok(by) => by,
+        Err(no) => return Ok(*no),
+    };
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let done =
+        if on { crate::ci::land::enqueue_as(s.hub, &d, &format!("job:{}", job.leg), starter, &json!({})).await } else { crate::ci::land::dequeue(s.hub, &d, &job_caller(job, &s.repo.name)).await };
+    if let Err((code, why)) = done {
+        return Ok(refused(code, &why));
+    }
     let Some(d) = find(s, n).await? else { return Ok(not_found()) };
     let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
     Ok(srv::json(StatusCode::OK, &pr_json(s, &d, &vs).await))

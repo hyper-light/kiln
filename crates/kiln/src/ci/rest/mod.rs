@@ -92,6 +92,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::GET, ["repos", _, _, "attestations", ..]) => Some(("attestations", Level::Read)),
         (&Method::GET, ["repos", _, _, "pulls", ..]) | (&Method::GET, ["search", "issues"]) => Some(("pull-requests", Level::Read)),
         (&Method::POST, ["repos", _, _, "pulls"]) | (&Method::PATCH, ["repos", _, _, "pulls", _]) => Some(("pull-requests", Level::Write)),
+        (&Method::PUT, ["repos", _, _, "pulls", _, "merge"]) => Some(("contents", Level::Write)),
         (&Method::POST, ["repos", _, _, "attestations"]) => Some(("attestations", Level::Write)),
         (&Method::POST | &Method::PUT, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Write)),
         (&Method::GET, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Read)),
@@ -159,6 +160,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::POST, ["pulls", n, "comments"]) => pulls::review_comments(&s, n, &claims, Some(&body(req).await?)).await,
             (&Method::GET, ["pulls", n, "reviews"]) => pulls::reviews(&s, n, &claims, None).await,
             (&Method::POST, ["pulls", n, "reviews"]) => pulls::reviews(&s, n, &claims, Some(&body(req).await?)).await,
+            (&Method::GET | &Method::PUT, ["pulls", n, "merge"]) => pulls::merge(&s, n, method == Method::PUT).await,
             (&Method::GET | &Method::PATCH | &Method::DELETE, ["issues", "comments", id]) => {
                 let b = if method == Method::PATCH { Some(body(req).await?) } else { None };
                 pulls::comment(&s, id, &claims, &method, b.as_ref(), false).await

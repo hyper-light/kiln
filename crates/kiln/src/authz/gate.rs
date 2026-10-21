@@ -268,6 +268,44 @@ async fn withheld_from(hub: &Hub, by: &serde_json::Value, names: Vec<String>, ta
         })
 }
 
+/// Whether the principal a run recorded ([`Caller::started_by`]) may `capability` at `target`, as
+/// [`withheld_secrets`] judges a secret: by the user it acts for as they are now (gone or
+/// disabled: no), within the grants it started with; every one of a batch's (`all`).
+pub async fn starter_may(hub: &Hub, by: &serde_json::Value, capability: &str, target: &Scope) -> bool {
+    let each: Vec<&serde_json::Value> = match by.get("all").and_then(serde_json::Value::as_array) {
+        Some(all) => all.iter().collect(),
+        None => vec![by],
+    };
+    for one in each {
+        let grants = |k: &str| one.get(k).and_then(serde_json::Value::as_array).map(|l| l.iter().filter_map(|g| g.as_str().and_then(|t| Grant::parse(t).ok())).collect::<Vec<_>>());
+        let (user, rights, limit) = (one.get("user").and_then(serde_json::Value::as_str).map(str::to_owned), grants("rights"), grants("limit"));
+        let (what, target) = (capability.to_owned(), target.clone());
+        let may = hub
+            .store
+            .call(move |c| {
+                let custom = custom_roles(c)?;
+                let live = match &user {
+                    Some(uid) => match user_rights(c, uid)? {
+                        Some((_, r)) => Some(r),
+                        None => return Ok(false),
+                    },
+                    None => rights.map(|grants| Rights { grants, custom: custom.clone() }),
+                };
+                let limit = limit.map(|grants| Rights { grants, custom });
+                Ok([&live, &limit].into_iter().flatten().all(|r| r.allows(&what, &target)))
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %format!("{e:#}"), "what a run's starter may do could not be read; taken as nothing");
+                false
+            });
+        if !may {
+            return false;
+        }
+    }
+    true
+}
+
 /// User `id` as a caller, as they are now (disabled or gone: none): who something they said
 /// elsewhere acts as (a reply to kiln's review email, or in a chat's thread: docs/ci.md W14-R05).
 pub async fn user_caller(hub: &Hub, id: &str) -> Option<Caller> {

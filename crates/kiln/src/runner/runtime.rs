@@ -194,6 +194,29 @@ struct Located {
 const SIGINT_GRACE: Duration = Duration::from_millis(7_500);
 const SIGTERM_GRACE: Duration = Duration::from_millis(2_500);
 
+/// A step running in a job container, as a cancel reaches it: by the mark (`KILN_STEP=…`) in the
+/// environment of what it started ([`super::docker::Cli::signal_in`]).
+struct InContainer {
+    cli: super::docker::Cli,
+    id: String,
+    user: Option<String>,
+    marker: String,
+}
+
+/// GitHub's cancel sequence for a step in a job container: each of `signals` given its grace to end
+/// the step, then `KILL`, each sent to the step's processes there; then the `docker exec` on the
+/// host.
+async fn signal_in(c: &InContainer, running: &mut crate::proc::Running, signals: &[(&str, Duration)]) {
+    for (signal, grace) in signals {
+        c.cli.signal_in(&c.id, c.user.as_deref(), &c.marker, signal).await;
+        if crate::rt::timeout(*grace, running.wait()).await.is_ok() {
+            return;
+        }
+    }
+    c.cli.signal_in(&c.id, c.user.as_deref(), &c.marker, "KILL").await;
+    running.kill_group();
+}
+
 /// Background steps running at once in a leg (W06-R17); more wait their turn.
 const MAX_BACKGROUND: usize = 10;
 /// `cancel:` of a background step: SIGTERM, then SIGKILL after this.
@@ -2223,6 +2246,7 @@ impl Leg {
             (Run::Script { .. }, None) => anyhow::bail!("no script"),
         };
         let job_container = if in_job { st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c.cli.clone(), j.clone()))) } else { None };
+        let mut in_container: Option<InContainer> = None;
         let cmd = if let Some((cli, image, entrypoint, args)) = container_run {
             // A Docker action: GitHub's mounts, every value by name.
             let map = self.action_paths(st);
@@ -2249,6 +2273,13 @@ impl Leg {
             inner.insert("PATH".into(), path);
             inner.insert("HOME".into(), j.home.clone());
             let args: Vec<String> = args.iter().map(|a| j.map.translate(a)).collect();
+            // What it starts carries a mark of the step, so a cancel reaches it in the container
+            // as GitHub's reaches a step on the host (`docker exec` passes no signal on).
+            if j.has_sh {
+                let marker = format!("{}-{idx}", self.a.job_id);
+                inner.insert("KILN_STEP".into(), marker.clone());
+                in_container = Some(InContainer { cli: cli.clone(), id: j.id.clone(), user: j.user.clone(), marker: format!("KILN_STEP={marker}") });
+            }
             cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
         } else {
             let mut c = shell_program(&prog, &args, shell);
@@ -2321,17 +2352,19 @@ impl Leg {
                 Ev::Chunk(None) => output_done = true,
                 Ev::Exit(code) => end = Some(End::Exit(code)),
                 Ev::Flush => self.partial(st, idx, &mut r).await,
-                Ev::Cancel => {
-                    crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await;
-                    end = Some(End::Cancelled);
+                e @ (Ev::Cancel | Ev::Deadline) => {
+                    match &in_container {
+                        Some(c) => signal_in(c, &mut running, &[("INT", SIGINT_GRACE), ("TERM", SIGTERM_GRACE)]).await,
+                        None => crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await,
+                    }
+                    end = Some(if matches!(e, Ev::Cancel) { End::Cancelled } else { End::TimedOut });
                 }
                 Ev::Stop => {
-                    crate::proc::terminate_group(&mut running, BACKGROUND_GRACE).await;
+                    match &in_container {
+                        Some(c) => signal_in(c, &mut running, &[("TERM", BACKGROUND_GRACE)]).await,
+                        None => crate::proc::terminate_group(&mut running, BACKGROUND_GRACE).await,
+                    }
                     end = Some(End::Cancelled);
-                }
-                Ev::Deadline => {
-                    crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await;
-                    end = Some(End::TimedOut);
                 }
                 Ev::Oom => {
                     oom_at = None;

@@ -206,6 +206,11 @@ async fn stack_below(hub: &Hub, d: &Diff) -> Result<Vec<Diff>, Fail> {
 
 /// `POST /api/diffs/:id/land` `{ strategy }`: the diff and those below it, into the queue.
 pub async fn enqueue(hub: &Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    enqueue_as(hub, d, &caller.name, caller.started_by(), body).await
+}
+
+/// [`enqueue`] as `by` (the audit's name), its candidate's runs held to `started_by`.
+pub(crate) async fn enqueue_as(hub: &Arc<Hub>, d: &Diff, by: &str, started_by: Option<Value>, body: &Value) -> Result<Value, Fail> {
     let (repo, path) = diffs::home(hub, d).await?;
     let (policy, _) = super::review::policy(hub, &path, &d.trunk).await;
     let asked = match body.get("strategy").and_then(Value::as_str) {
@@ -228,23 +233,23 @@ pub async fn enqueue(hub: &Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) ->
     }
     let ids: Vec<String> = chain.iter().map(|x| x.id.clone()).collect();
     let names: Vec<String> = chain.iter().map(|x| x.name.clone()).collect();
-    let (entry, repo_id, trunk, by, list) = (crate::util::new_id(), repo.id.clone(), d.trunk.clone(), caller.name.clone(), serde_json::to_string(&ids).unwrap_or_default());
+    let (entry, repo_id, trunk, who, list) = (crate::util::new_id(), repo.id.clone(), d.trunk.clone(), by.to_owned(), serde_json::to_string(&ids).unwrap_or_default());
     let e2 = entry.clone();
-    let started_by = caller.started_by().map(|v| v.to_string());
+    let started_by = started_by.map(|v| v.to_string());
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
             c.execute(
                 "INSERT INTO land_queue (id, repo_id, trunk, diffs, strategy, state, enqueued_by, created_at, updated_at, started_by) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?7, ?8)",
-                params![e2, repo_id, trunk, list, strategy.as_str(), by, now, started_by],
+                params![e2, repo_id, trunk, list, strategy.as_str(), who, now, started_by],
             )?;
             Ok(())
         })
         .await
         .map_err(fail)?;
     set_diff_state(hub, &ids, State::Landing).await.map_err(fail)?;
-    hub.store.audit(caller.name.clone(), "diffs.land".into(), format!("{} {} ({}) by {}", repo.name, names.join(" "), d.trunk, strategy.as_str())).await;
-    queue_event(hub, &ids, "enqueued", None, &caller.name).await;
+    hub.store.audit(by.to_owned(), "diffs.land".into(), format!("{} {} ({}) by {}", repo.name, names.join(" "), d.trunk, strategy.as_str())).await;
+    queue_event(hub, &ids, "enqueued", None, by).await;
     kick();
     Ok(json!({ "entry": entry, "diffs": names, "trunk": d.trunk, "strategy": strategy.as_str(), "state": "queued" }))
 }
@@ -306,6 +311,164 @@ pub async fn cancel(hub: &Hub, entry: &str, caller: &Caller) -> Result<Value, Fa
     queue_event(hub, &e.diffs, "dequeued", Some("MANUAL"), &caller.name).await;
     kick();
     Ok(json!({ "entry": e.id, "state": "cancelled" }))
+}
+
+/// The queue entry `d` is in, if it's in one: `(entry, state, position in its trunk's queue,
+/// when, by whom)`.
+pub async fn queued_of(hub: &Hub, d: &Diff) -> Option<(String, String, i64, i64, String)> {
+    let id = d.id.clone();
+    hub.store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT q.id, q.state, (SELECT COUNT(*) FROM land_queue o WHERE o.repo_id = q.repo_id AND o.trunk = q.trunk AND o.state IN ('queued', 'testing') AND o.created_at <= q.created_at), q.created_at, q.enqueued_by
+                 FROM land_queue q WHERE q.state IN ('queued', 'testing') AND EXISTS (SELECT 1 FROM json_each(q.diffs) WHERE value = ?1) ORDER BY q.created_at DESC LIMIT 1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?)
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `d` out of the queue it's in, as [`cancel`] takes an entry out.
+pub async fn dequeue(hub: &Hub, d: &Diff, caller: &Caller) -> Result<Value, Fail> {
+    let Some((entry, ..)) = queued_of(hub, d).await else { return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} isn't in the land queue", d.name))) };
+    cancel(hub, &entry, caller).await
+}
+
+// ------------------------------------------------------------------ landing when ready
+
+/// A diff waiting to land as soon as its trunk's policy lets it: GitHub's auto-merge as a branch
+/// that requires a merge queue has it (every kiln trunk lands through its queue), into the queue
+/// then, as whoever asked.
+#[derive(Debug, Clone)]
+pub struct WhenReady {
+    /// The strategy it lands by, as asked or else its trunk's policy's own.
+    pub strategy: String,
+    pub by: String,
+    started_by: Option<Value>,
+    pub at: i64,
+    pub title: Option<String>,
+    pub message: Option<String>,
+}
+
+/// What `d` waits to land by, if it does.
+pub async fn when_ready_of(hub: &Hub, d: &Diff) -> Option<WhenReady> {
+    let id = d.id.clone();
+    hub.store
+        .call(move |c| {
+            Ok(c.query_row("SELECT strategy, enabled_by, started_by, enabled_at, commit_title, commit_message FROM land_when_ready WHERE diff_id = ?1", [&id], |r| {
+                let started: Option<String> = r.get(2)?;
+                Ok(WhenReady { strategy: r.get(0)?, by: r.get(1)?, started_by: started.and_then(|s| serde_json::from_str(&s).ok()), at: r.get(3)?, title: r.get(4)?, message: r.get(5)? })
+            })
+            .optional()?)
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `d` (and the diffs below it) to land as soon as its trunk's policy lets it, as `by` asks (the
+/// audit's name), held to `started_by` as [`enqueue_as`] holds an entry: by `strategy` if asked
+/// (one the trunk allows), else the policy's. Into the queue at once if it may land now; whether
+/// it went.
+pub async fn land_when_ready(hub: &Arc<Hub>, d: &Diff, by: &str, started_by: Option<Value>, strategy: Option<&str>, title: Option<String>, message: Option<String>) -> Result<bool, Fail> {
+    match d.state.as_str() {
+        "landed" | "abandoned" => return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} is {}", d.name, d.state))),
+        "landing" => return Err((StatusCode::CONFLICT, format!("{} is in the land queue already", d.name))),
+        _ => {}
+    }
+    let (_, path) = diffs::home(hub, d).await?;
+    let (policy, _) = super::review::policy(hub, &path, &d.trunk).await;
+    let asked = match strategy {
+        Some(s) => Some(Strategy::parse(s).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("no strategy `{s}`: stack, stack-squash, squash, rebase, merge or ff-only")))?),
+        None => None,
+    };
+    let strategy = policy.strategy(asked, d.kind != "diff").map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let (id, s, who, started, now) = (d.id.clone(), strategy.as_str().to_owned(), by.to_owned(), started_by.map(|v| v.to_string()), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO land_when_ready (diff_id, strategy, enabled_by, started_by, enabled_at, commit_title, commit_message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (diff_id) DO UPDATE SET strategy = ?2, enabled_by = ?3, started_by = ?4, enabled_at = ?5, commit_title = ?6, commit_message = ?7",
+                params![id, s, who, started, now, title, message],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(fail)?;
+    hub.store.audit(by.to_owned(), "diffs.land_when_ready".into(), format!("{} {} ({}) by {}", d.repo, d.name, d.trunk, strategy.as_str())).await;
+    queue_event(hub, std::slice::from_ref(&d.id), "auto_merge_enabled", None, by).await;
+    Ok(ready(hub, d).await)
+}
+
+/// `d` no longer waiting to land, as `by` asks. Whether it was.
+pub async fn not_when_ready(hub: &Hub, d: &Diff, by: &str) -> Result<bool, Fail> {
+    let id = d.id.clone();
+    let was = hub.store.call(move |c| Ok(c.execute("DELETE FROM land_when_ready WHERE diff_id = ?1", [&id])? > 0)).await.map_err(fail)?;
+    if was {
+        hub.store.audit(by.to_owned(), "diffs.land_when_ready".into(), format!("{} {} no longer", d.repo, d.name)).await;
+        queue_event(hub, std::slice::from_ref(&d.id), "auto_merge_disabled", None, by).await;
+    }
+    Ok(was)
+}
+
+async fn forget(hub: &Hub, diff: &str) {
+    let id = diff.to_owned();
+    if let Err(e) = hub.store.call(move |c| Ok(c.execute("DELETE FROM land_when_ready WHERE diff_id = ?1", [&id]).map(|_| ())?)).await {
+        tracing::warn!(diff = %diff, error = %format!("{e:#}"), "a diff's wait to land couldn't end");
+    }
+}
+
+/// Into the queue if `d` may land now, as whoever asked it to land when ready, its wait over then.
+/// One its trunk won't take any more (its strategy no longer allowed, say) stops waiting.
+async fn ready(hub: &Arc<Hub>, d: &Diff) -> bool {
+    let Some(w) = when_ready_of(hub, d).await else { return false };
+    match enqueue_as(hub, d, &w.by, w.started_by.clone(), &json!({ "strategy": w.strategy })).await {
+        Ok(_) => {
+            forget(hub, &d.id).await;
+            true
+        }
+        // Not yet: what keeps it from landing.
+        Err((StatusCode::CONFLICT, _)) => false,
+        Err((code, why)) if code.is_client_error() => {
+            tracing::info!(diff = %d.name, %why, "a diff waiting to land can't any more: its wait ends");
+            forget(hub, &d.id).await;
+            queue_event(hub, std::slice::from_ref(&d.id), "auto_merge_disabled", Some(why.as_str()), "kiln").await;
+            false
+        }
+        Err((_, why)) => {
+            tracing::warn!(diff = %d.name, %why, "a diff waiting to land couldn't be put in the queue");
+            false
+        }
+    }
+}
+
+/// The diffs waiting to land when ready: each into the queue once it may, its wait over once it's
+/// in one (whoever put it there), landed or abandoned.
+async fn waiting(hub: &Arc<Hub>) {
+    let ids: Vec<String> = hub
+        .store
+        .call(|c| {
+            let mut st = c.prepare("SELECT diff_id FROM land_when_ready ORDER BY enabled_at")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .unwrap_or_default();
+    for id in ids {
+        match diffs::find(hub, &id).await {
+            Ok(Some(d)) if matches!(d.state.as_str(), "landing" | "landed" | "abandoned") => forget(hub, &id).await,
+            Ok(Some(d)) if d.state != "draft" => {
+                ready(hub, &d).await;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => forget(hub, &id).await,
+            Err(e) => tracing::warn!(diff = %id, error = %format!("{e:#}"), "a diff waiting to land couldn't be read"),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ building candidates
@@ -625,6 +788,7 @@ fn uncovered(required: &[String], started: &[String], names: &BTreeMap<String, O
 // ------------------------------------------------------------------ the queue's step
 
 async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    waiting(hub).await;
     let groups: Vec<(String, String)> = hub
         .store
         .call(|c| {

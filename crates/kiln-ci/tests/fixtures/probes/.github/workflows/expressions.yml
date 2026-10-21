@@ -1,0 +1,60 @@
+# F-22 (docs/ci.md W22-AC03, A.8): `toJSON` formatting, number formatting in interpolation, and
+# `if:` truthiness of mixed literals. Each `PROBE key=value` line is what's compared.
+name: probe expressions
+on: [push, workflow_dispatch]
+jobs:
+  formatting:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { n: 1, s: "a b", list: [1, "two", true, null] }
+    env:
+      OBJ: ${{ toJSON(matrix) }}
+    steps:
+      - name: toJSON
+        run: |
+          printf 'PROBE tojson.matrix=%s\n' "$(printf '%s' "$OBJ" | base64 -w0)"
+          printf 'PROBE tojson.list=%s\n' "$(printf '%s' '${{ toJSON(matrix.list) }}' | base64 -w0)"
+          printf 'PROBE tojson.string=%s\n' "$(printf '%s' '${{ toJSON('quo"te') }}' | base64 -w0)"
+          printf 'PROBE tojson.number=%s\n' "$(printf '%s' '${{ toJSON(1.50) }}' | base64 -w0)"
+          printf 'PROBE tojson.null=%s\n' "$(printf '%s' '${{ toJSON(null) }}' | base64 -w0)"
+          printf 'PROBE tojson.event-keys=%s\n' "$(printf '%s' '${{ toJSON(fromJSON('{"b":1,"a":[2,{"c":null}]}')) }}' | base64 -w0)"
+      - name: numbers
+        run: |
+          echo "PROBE number.one-point-oh=${{ 1.0 }}"
+          echo "PROBE number.tenth=${{ 0.1 }}"
+          echo "PROBE number.exp=${{ 1e3 }}"
+          echo "PROBE number.big=${{ 12345678901234567890 }}"
+          echo "PROBE number.negative-zero=${{ -0 }}"
+          echo "PROBE number.hex=${{ 0x10 }}"
+          echo "PROBE number.from-json=${{ fromJSON('1.50') }}"
+          echo "PROBE number.from-string=${{ fromJSON('"7"') }}"
+          echo "PROBE number.true-plus=${{ true == 1 }}"
+          echo "PROBE number.nan=${{ fromJSON('"abc"') == 0 }}"
+  truthiness:
+    runs-on: ubuntu-latest
+    steps:
+      - if: ${{ 'false' }}
+        run: echo "PROBE if.string-false=ran"
+      - if: "'false'"
+        run: echo "PROBE if.quoted-false=ran"
+      - if: ${{ 0 }}
+        run: echo "PROBE if.zero=ran"
+      - if: ${{ '0' }}
+        run: echo "PROBE if.string-zero=ran"
+      - if: ${{ '' }}
+        run: echo "PROBE if.empty=ran"
+      - if: ${{ null }}
+        run: echo "PROBE if.null=ran"
+      - if: ${{ fromJSON('[]') }}
+        run: echo "PROBE if.empty-array=ran"
+      - if: ${{ fromJSON('{}') }}
+        run: echo "PROBE if.empty-object=ran"
+      - if: success() && 'x'
+        run: echo "PROBE if.and-string=ran"
+      - if: ${{ 'abc' == 'ABC' }}
+        run: echo "PROBE if.case-insensitive=ran"
+      - if: ${{ 1 == '1' }}
+        run: echo "PROBE if.number-string=ran"
+      - run: echo "PROBE if.done=yes"

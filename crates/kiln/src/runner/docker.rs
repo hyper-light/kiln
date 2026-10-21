@@ -413,6 +413,23 @@ impl Cli {
         self.command(&a, env)
     }
 
+    /// Sends `signal` (`INT`, `TERM`, `KILL`) to every process in `container` whose environment
+    /// carries `marker` (`KILN_STEP=…`, a step's: what it started inherits it), as `user` (the
+    /// step's, so it may): `docker exec` passes no signal on, so a cancel would otherwise reach only
+    /// the CLI on the host. Found by their environments, not by a shell wrapped around the step, as
+    /// a shell (dash) drops the names it can't take, GitHub's `INPUT_PERSIST-CREDENTIALS` among them.
+    pub async fn signal_in(&self, container: &str, user: Option<&str>, marker: &str, signal: &str) {
+        let mut a = vec![s("exec")];
+        if let Some(u) = user {
+            a.extend([s("--user"), u.to_owned()]);
+        }
+        let kill = format!(r#"for p in /proc/[0-9]*; do if tr '\000' '\n' < "$p/environ" 2>/dev/null | grep -qx "$0"; then kill -s {signal} "${{p#/proc/}}" 2>/dev/null; fi; done"#);
+        a.extend([container.to_owned(), s("sh"), s("-c"), kill, marker.to_owned()]);
+        if let Err(e) = self.run(&a, &BTreeMap::new(), Duration::from_secs(20)).await {
+            tracing::debug!(%container, %signal, error = %format!("{e:#}"), "a step in a container couldn't be signalled (it may have ended)");
+        }
+    }
+
     /// Records credentials for `image`'s registry in the leg's credential store.
     pub fn login(&self, image: &str, user: &str, password: &str) -> anyhow::Result<()> {
         let reg = registry(image);
@@ -557,6 +574,8 @@ pub struct JobContainer {
     pub home: String,
     /// The image's `PATH`, to which `GITHUB_PATH` entries are prepended.
     pub path: String,
+    /// It has `sh`, which a step's cancel reaches the step through ([`Cli::signal_in`]).
+    pub has_sh: bool,
     pub has_bash: bool,
     /// Its C library is musl (Alpine's), so its JavaScript actions get a musl Node (W07-R05).
     pub musl: bool,
@@ -759,13 +778,17 @@ impl Containers {
                 let id = c.cli.run(&args, &env, CALL).await?;
                 c.cli.run(&[s("start"), id.clone()], &none, CALL).await?;
                 let path = c.image_path(&image).await.unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
-                let has_bash = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s("command -v bash")], &none, CALL).await.is_ok_and(|o| !o.is_empty());
+                // Its shells: `sh` (none in a distroless image), and `bash` if it has that too.
+                let (has_sh, has_bash) = match c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s("command -v bash || echo sh")], &none, CALL).await {
+                    Ok(o) => (true, !o.is_empty() && o.trim() != "sh"),
+                    Err(_) => (false, false),
+                };
                 let musl = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s(MUSL_PROBE)], &none, CALL).await.is_ok_and(|o| o.trim() == "musl");
                 let (user, home) = match user {
                     Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
                     None => (as_runner, "/github/home".to_owned()),
                 };
-                c.job = Some(JobContainer { id, user, home, path, has_bash, musl, map });
+                c.job = Some(JobContainer { id, user, home, path, has_sh, has_bash, musl, map });
             }
             // Health checks, then the ports the host got.
             let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();

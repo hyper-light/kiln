@@ -130,7 +130,7 @@ fn refused(cx: &Cx<'_>, path: &[Value], (status, v): (u16, Value)) -> Value {
     let kind = match status {
         404 => "NOT_FOUND",
         403 => "FORBIDDEN",
-        422 => "UNPROCESSABLE",
+        405 | 409 | 422 => "UNPROCESSABLE",
         _ => "INTERNAL",
     };
     cx.error(path, Some(kind), v.get("message").and_then(Value::as_str).unwrap_or("it went wrong"));
@@ -207,7 +207,7 @@ async fn repository(s: &Site<'_>, claims: &Job) -> Value {
             "hasIssuesEnabled": false, "hasWikiEnabled": false, "hasProjectsEnabled": false, "hasDiscussionsEnabled": false,
         }),
         json!({
-            "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": true, "deleteBranchOnMerge": false, "autoMergeAllowed": false,
+            "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": true, "deleteBranchOnMerge": false, "autoMergeAllowed": true,
             "viewerPermission": permission, "viewerCanAdminister": false, "viewerCanCreateProjects": false, "viewerSubscription": "UNSUBSCRIBED",
             "createdAt": text(&r, "created_at"), "updatedAt": text(&r, "updated_at"), "pushedAt": text(&r, "pushed_at"),
             "defaultBranchRef": default, "parent": Value::Null, "templateRepository": Value::Null, "stargazerCount": 0, "forkCount": 0,
@@ -272,6 +272,20 @@ fn pr_obj(cx_repo: &Value, p: &Value) -> Value {
         p.get("requested_reviewers").and_then(Value::as_array).into_iter().flatten().map(|u| json!({ "__typename": "ReviewRequest", "requestedReviewer": actor(u), "asCodeOwner": false })).collect();
     let kiln_state = p.pointer("/kiln/state").and_then(Value::as_str).unwrap_or_default();
     let open = state == "OPEN";
+    // Every kiln trunk lands through its land queue: GitHub's merge queue, required. Auto-merge
+    // waits to put a pull request in it.
+    let auto = p.get("auto_merge").filter(|a| !a.is_null()).map(|a| {
+        json!({
+            "__typename": "AutoMergeRequest", "enabledAt": a.get("enabled_at"), "enabledBy": actor(a.get("enabled_by").unwrap_or(&Value::Null)),
+            "mergeMethod": text(a, "merge_method").to_ascii_uppercase(), "commitHeadline": a.get("commit_title"), "commitBody": a.get("commit_message"), "authorEmail": Value::Null,
+        })
+    });
+    let entry = p.pointer("/kiln/queue").filter(|q| !q.is_null()).map(|q| {
+        json!({
+            "__typename": "MergeQueueEntry", "id": format!("kiln-queue-{}", text(q, "entry")), "position": q.get("position"), "state": if text(q, "state") == "testing" { "AWAITING_CHECKS" } else { "QUEUED" },
+            "enqueuedAt": q.get("enqueued_at"), "enqueuer": actor(q.get("enqueued_by").unwrap_or(&Value::Null)), "estimatedTimeToMerge": Value::Null, "jump": false, "solo": false, "baseCommit": Value::Null, "headCommit": Value::Null,
+        })
+    });
     joined(vec![
         json!({
             "__typename": "PullRequest", "id": text(p, "node_id"), "databaseId": p.get("id"), "number": n, "title": text(p, "title"), "body": text(p, "body"), "bodyText": text(p, "body"),
@@ -289,7 +303,8 @@ fn pr_obj(cx_repo: &Value, p: &Value) -> Value {
             "mergeable": if open { "MERGEABLE" } else { "UNKNOWN" }, "mergeStateStatus": if kiln_state == "accepted" { "CLEAN" } else { "BLOCKED" },
             "reviewDecision": if kiln_state == "accepted" { "APPROVED" } else { "REVIEW_REQUIRED" },
             "mergeCommit": p.get("merge_commit_sha").and_then(Value::as_str).map(|sha| json!({ "__typename": "Commit", "id": format!("kiln-commit-{sha}"), "oid": sha })),
-            "milestone": Value::Null, "autoMergeRequest": Value::Null, "isInMergeQueue": false, "isMergeQueueEnabled": false,
+            "milestone": Value::Null, "isInMergeQueue": entry.is_some(), "isMergeQueueEnabled": true, "mergeQueueEntry": entry,
+            "viewerCanEnableAutoMerge": open && auto.is_none(), "viewerCanDisableAutoMerge": auto.is_some(), "viewerCanMergeAsAdmin": false, "autoMergeRequest": auto,
             "viewerDidAuthor": p.pointer("/user/login").and_then(Value::as_str) == Some("github-actions[bot]"), "viewerCanUpdate": true, "viewerCanClose": open, "viewerCanReopen": !open,
             "_labels": labels, "_requests": requests,
         }),
@@ -721,6 +736,12 @@ fn introspect(name: &str) -> Value {
             "mergeCommit",
             "milestone",
             "autoMergeRequest",
+            "isInMergeQueue",
+            "isMergeQueueEnabled",
+            "mergeQueueEntry",
+            "viewerCanEnableAutoMerge",
+            "viewerCanDisableAutoMerge",
+            "viewerCanMergeAsAdmin",
             "viewerDidAuthor",
             "viewerCanUpdate",
             "viewerCanClose",
@@ -918,6 +939,48 @@ async fn mutate(cx: &Cx<'_>, name: &str, input: Value, path: &[Value]) -> Value 
             match rest(pulls::reviews(&cx.site, &n, cx.claims, Some(&json!({ "event": input.get("event"), "body": input.get("body") }))).await).await {
                 (200 | 201, r) => payload("AddPullRequestReview", json!({ "pullRequestReview": review_obj(&r) })),
                 other => refused(cx, path, other),
+            }
+        }
+        // Landing: every kiln trunk requires its land queue, as a GitHub branch can require a merge
+        // queue. Auto-merge waits to put a pull request in it, enqueueing puts it in now (each as
+        // its trunk's policy lets it), and a merge of its own is refused (`pulls::merge`).
+        "enablePullRequestAutoMerge" | "disablePullRequestAutoMerge" | "enqueuePullRequest" | "dequeuePullRequest" | "mergePullRequest" => {
+            let id = pr_of(if name == "dequeuePullRequest" { "id" } else { "pullRequestId" });
+            let Some(n) = number(id.clone()).await else { return not_pr(&id) };
+            if let Some(want) = input.get("expectedHeadOid").and_then(Value::as_str) {
+                let (_, p) = rest(pulls::get(&cx.site, &n).await).await;
+                if p.pointer("/head/sha").and_then(Value::as_str) != Some(want) {
+                    cx.error(path, Some("UNPROCESSABLE"), "Head branch was modified. Review and try the merge again.");
+                    return Value::Null;
+                }
+            }
+            let before = if name == "dequeuePullRequest" { pr_by_number(cx, &n, path).await } else { Value::Null };
+            let done = match name {
+                "enablePullRequestAutoMerge" => {
+                    let s = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_owned);
+                    rest(pulls::auto_merge(&cx.site, &n, cx.claims, Some((input.get("mergeMethod").and_then(Value::as_str), s("commitHeadline"), s("commitBody")))).await).await
+                }
+                "disablePullRequestAutoMerge" => rest(pulls::auto_merge(&cx.site, &n, cx.claims, None).await).await,
+                "enqueuePullRequest" => rest(pulls::queue(&cx.site, &n, cx.claims, true).await).await,
+                "dequeuePullRequest" => rest(pulls::queue(&cx.site, &n, cx.claims, false).await).await,
+                _ => rest(pulls::merge(&cx.site, &n, true).await).await,
+            };
+            let p = match done {
+                (200, p) => p,
+                other => return refused(cx, path, other),
+            };
+            let pr = pr_obj(&cx.repo, &p);
+            match name {
+                "enablePullRequestAutoMerge" => payload("EnablePullRequestAutoMerge", json!({ "pullRequest": pr, "actor": viewer() })),
+                "disablePullRequestAutoMerge" => payload("DisablePullRequestAutoMerge", json!({ "pullRequest": pr, "actor": viewer() })),
+                "enqueuePullRequest" => {
+                    let mut entry = pr.get("mergeQueueEntry").cloned().unwrap_or(Value::Null);
+                    if let Some(o) = entry.as_object_mut() {
+                        o.insert("pullRequest".into(), pr.clone());
+                    }
+                    payload("EnqueuePullRequest", json!({ "mergeQueueEntry": entry }))
+                }
+                _ => payload("DequeuePullRequest", json!({ "mergeQueueEntry": before.get("mergeQueueEntry").cloned().unwrap_or(Value::Null) })),
             }
         }
         other => {

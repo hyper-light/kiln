@@ -185,7 +185,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for every D.1 ecosystem (AC03 with the real tools for eight), vcpkg's binary cache kept by kiln; jobs' registry credentials through `docker-credential-kiln`, federated for every D.2 registry that federates (Alibaba's and Oracle's among them); offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); each VMM in a jail of its own (namespaces, no root), pools restored from snapshots, services and job containers in microVMs; AC02 on host, docker and firecracker, AC03, AC05 (a cold start 0.64 s, a warm one 35 ms); `shards` left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare, search), GraphQL (pull requests, comments, labels, reviews, checks, search; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); replies by email and in Slack threads, posted as their people (R05); GraphQL's merges left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare, search), GraphQL (pull requests, comments, labels, reviews, checks, search; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); replies by email and in Slack threads, posted as their people (R05); landing through the queue as GitHub lands where a merge queue is required (`gh pr merge --auto`) |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container deployments (Compose stacks, healthy, outliving their jobs) and microVM ones (long-lived Firecracker microVMs, health-checked, taking over their ports, booted again with their runner); previews of diffs, stacks and pull requests (AC04; their containers and microVMs taken down as they go); shards' microVMs, CD's preview apps and the live-cluster ACs left |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; in Firecracker microVMs terminals, keeping, extend and release, and reruns in place (W13-R05); shards' left |
@@ -1907,6 +1907,15 @@ W20.
   `w06_ac05_post_steps_cancellation_and_timeouts`): a step trapping both signals gets SIGINT as the
   run is cancelled, SIGTERM 7.5 s on, and is killed at 10 s, each within half a second; then the
   `always()` step and the post step run.
+  - In a job container too (`w05_ac07_cancel_sequence_in_a_job_container`), which is where kiln
+    runs `ubuntu-latest` (W13-R04): `docker exec` passes no signal on, so a cancel reached only the
+    CLI on the host, and the step ran on, its traps never told, until its container stopped (F-22's
+    cancellation probe found it). What a step starts there carries a mark in its environment
+    (`KILN_STEP`), and each signal goes to every process that has it, then the CLI goes. Each is a
+    `docker exec` of its own, so a little later than on the host. An image without `sh` keeps the
+    old way. Not a shell around the step's program: dash drops the variables whose names it can't
+    take, GitHub's `INPUT_PERSIST-CREDENTIALS` among them, which `actions/checkout` then reads as
+    false (`w07_r09_checkout_v7_persists_its_credentials` caught it).
 - *Done.* AC09 (`tests/restart.rs`, `w05_ac09_a_restart_rebuilds_the_queue`): a run of two slow
   legs on a runner of its own and 1,000 legs queued for runners there aren't; the server killed and
   started again on its ports and data while the slow legs' steps run.
@@ -4265,7 +4274,7 @@ adapts [review.md](review.md), which it replaces.
 
 **Progress.** In progress: native hosting, stacked diffs, change requests, review, policy, the
 land queue, the GitHub App and the review UI (AC06) are built, and the facade's REST subset and
-GraphQL; merging through GraphQL is left.
+GraphQL, landing through the queue as a branch that requires a merge queue lands.
 
 - *Done.* Pushing to a new repository (R01, R02), as on GitHub
   (`w14_r01_first_branch_and_refusals_said`): the first branch pushed to an empty repository is
@@ -4530,7 +4539,7 @@ GraphQL; merging through GraphQL is left.
       (its head commit's check runs and statuses, rolled up as GitHub rolls them);
     - mutations `addComment`, `updateIssueComment`, `deleteIssueComment`, `createPullRequest`,
       `updatePullRequest`, `closePullRequest`, `reopenPullRequest`, `addLabelsToLabelable`,
-      `removeLabelsFromLabelable` and `addPullRequestReview`;
+      `removeLabelsFromLabelable` and `addPullRequestReview`; landing's (below);
     - `__type(name:)`'s fields, which `gh` asks an Enterprise Server for before it decides what
       to ask.
 
@@ -4560,6 +4569,30 @@ GraphQL; merging through GraphQL is left.
     removes labels. `/meta` says an Enterprise Server version (3.18.0), which `gh` reads to know
     what it may ask (as a body field only, so clients that look for the header still take kiln
     for github.com).
+  - Landing, as GitHub lands where a branch requires a merge queue: every kiln trunk lands only
+    through its land queue (R08).
+    - A pull request says `isMergeQueueEnabled`, `isInMergeQueue` and its `mergeQueueEntry`
+      (position, state, who put it there), and its `autoMergeRequest`. `__type` lists them, which
+      is how `gh` learns the queue is required, and the REST pull request has `auto_merge`.
+    - `enablePullRequestAutoMerge` has a diff wait to land: into the queue as soon as its trunk's
+      policy lets it (at once if it does already; `land_when_ready`), by the method asked
+      (`SQUASH`; a stack of diffs' `REBASE` is its `stack`, and its `MERGE` the trunk's default).
+      `disablePullRequestAutoMerge` ends the wait. `enqueuePullRequest` and `dequeuePullRequest`
+      put it in now (if its policy lets it) and take it out. `expectedHeadOid` is checked.
+    - `mergePullRequest`, and REST's `PUT /pulls/{n}/merge`, are refused as GitHub refuses them
+      there ("Changes must be made through the merge queue", 405); `GET /pulls/{n}/merge` says
+      whether it landed.
+    - A job may land if its token writes contents and pull requests, as on GitHub, and whoever
+      started its run may land here (`diffs.land`): a job never does more than its starter, so a
+      developer's workflow can't land their own diff (a run no one started, a schedule's, is the
+      repository's). Its land entry is held to that starter, as the candidate's runs are to a
+      person's landing (W10-R02's `secrets.use`). `auto_merge_enabled` and `_disabled` are said as
+      `pull_request` actions (what a job does starts no run, as on GitHub).
+    - Checked with `gh pr merge` (`w14_r11_gh_lands_through_the_queue`): in a maintainer's diff's
+      job, `--auto --squash` has it wait (`gh` saw the queue required and asked auto-merge),
+      `--disable-auto` ends the wait and a second `--auto` starts it again, and REST's merge is
+      refused; accepted, it lands through the queue as one commit. In a developer's diff's job, the
+      same is refused: the developer started the run and doesn't land here.
   - Checked end to end:
     - `github-script` (statuses, checks, repository, commit, contents);
     - `docker/metadata-action`;
@@ -4591,8 +4624,6 @@ GraphQL; merging through GraphQL is left.
   - On the way: a repository kiln hosts has its trunk's files (rules, environments, settings)
     read from its own git, not its mirror, which has a push only after the next poll.
 - *Left.* Everything else:
-  - GraphQL's merge mutations (`mergePullRequest`, `enablePullRequestAutoMerge`) and the land
-    queue's equivalent for jobs;
   - AC07, which needs a test repository on GitHub (user-assisted). AC06 is done (above), and so
     is AC05: `github-script`, the release with an asset and `actions/checkout` from the facade
     above, and a checkout at a diff's version with its submodules and `download-artifact` across
@@ -6748,10 +6779,25 @@ and AC02.
   succeeds. It passed on 2026-10-19.
 - *Done.* AC06: the UI suite (W21-AC01) runs in kiln's own CI, `.kiln/ci.yaml`'s `ui-checks`
   (`ci/ui/run-all.sh`).
+- *AC03, kiln's half.* F-22's probes are `crates/kiln-ci/tests/fixtures/probes` (A.8's list, and
+  the cancel sequence W06-R17's `cancel:` takes its grace from), each saying what it finds as `PROBE
+  key=value` lines. `ci/conformance/probes.py` runs them on a provider and keeps what they said,
+  each run's conclusion, its jobs' conclusions and their annotations, as JSON. `kiln` runs them on
+  a server's native repository, `github` on a public repository the user owns (their token), and
+  `compare` lists every difference (kiln's annotations counted as GitHub shows a job's, W06-R16).
+  - On kiln (the conformance lab at 3bc7547): matrix outputs take the last leg to finish; a
+    status function under cancellation runs as GitHub's do; 50 calls of different reusable
+    workflows run, and a 51st fails the run there; 51 of the same one run; 11 levels of
+    workflows run (the caller and ten nested); every annotation is kept (R16's 1,000); an
+    oversized step summary is a warning. Numbers interpolate as `12345678901234567000`, `1000`,
+    `0.1` and `16`.
+  - Found on the way, and fixed: a cancelled step in a job container was never signalled (W05's
+    AC07 note), and the probes' own matrix one didn't test an empty value written last.
 - *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03 and AC05; F-21's last two (`azure/login` with a tenant,
-  `attest-build-provenance` with GitHub's Sigstore); an authenticated way for legs to read
-  github.com's API (W18's egress proxy).
+  with test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
+  a public repository the user owns, then `compare` run against kiln), and AC05; F-21's last two
+  (`azure/login` with a tenant, `attest-build-provenance` with GitHub's Sigstore); an
+  authenticated way for legs to read github.com's API (W18's egress proxy).
 
 ---
 
@@ -7260,7 +7306,7 @@ The cache service v2 isn't needed: the toolkit uses it only on github.com.
 | Step summary | 1 MiB per step | same |
 | Job execution time | 6 h hosted, 5 days self-hosted | `[ci] max_job_minutes` (default 7 days) |
 | Workflow run time | 35 days | 35 days |
-| Reusable workflow nesting | GitHub's current limit | the same (W22-AC03 confirms the value) |
+| Reusable workflow nesting | GitHub's current limit | the same (W22-AC03 confirms the value): 10 calls deep, and 50 different workflows a run |
 | `workflow_run` chain depth | 3 | 3 (kiln dialect up to 10) |
 | Cache per repository | 10 GiB | 10 GiB (configurable) |
 | `workflow_dispatch` inputs | GitHub's current limit | 100 |
@@ -7283,7 +7329,9 @@ literals.
 minimum or auto-disable (W03-R10); the v1 cache protocol kept (W08-R07); 1,000 stored annotations
 per leg (W06-R16); kiln dialect's v1 forms and defaults (W02-R06); unmasked short secrets flagged
 (W06-R08); a lenient YAML fallback for files GitHub accepts and the strict reader refuses
-(`KCI1004`, W02-R03).
+(`KCI1004`, W02-R03); pull requests land only through the land queue, as on a GitHub branch that
+requires a merge queue (a merge of a job's own refused, auto-merge waiting for the queue, a job
+landing only what its run's starter may: W14-R11).
 
 ## Appendix B. Where each context is available
 
