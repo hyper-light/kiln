@@ -251,7 +251,7 @@ fn w08_r10_a_rebased_diff_reuses_what_it_did_not_touch() -> anyhow::Result<()> {
     let second = pull_run(&s, since)?;
     let (build, build_log) = second.get("build").cloned().unwrap_or_default();
     assert_eq!(build.pointer("/leg/conclusion"), Some(&json!("success")), "{build}\n{build_log}");
-    assert!(build.pointer("/leg/reused_from").is_some_and(|r| !r.is_null()), "the build's paths are as they were: {build}");
+    assert!(build.pointer("/leg/reused_from").is_some_and(|r| !r.is_null()), "the build's paths are as they were: {build}\n{}", s.log());
     assert_eq!(built(&build_log), built_first, "its log is the first version's");
     let (docs, docs_log) = second.get("docs").cloned().unwrap_or_default();
     assert_eq!(docs.pointer("/leg/conclusion"), Some(&json!("success")), "{docs}\n{docs_log}");

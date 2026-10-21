@@ -17,6 +17,8 @@ pub mod firecracker;
 #[cfg(target_os = "linux")]
 pub mod guest;
 pub mod hashfiles;
+#[cfg(target_os = "linux")]
+pub mod jail;
 pub mod kept;
 pub mod probe;
 #[cfg(target_os = "linux")]

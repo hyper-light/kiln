@@ -89,8 +89,10 @@ async fn executors() -> BTreeMap<String, Executor> {
     #[cfg(target_os = "linux")]
     if let Ok(Some(m)) = crate::rt::blocking(super::firecracker::Machine::find).await {
         let kernel = m.kernel.to_string_lossy().into_owned();
+        // How its VMMs are confined (W13-R05): a jail of namespaces each, or none here.
+        let jail = if m.jail { "namespaces" } else { "none" }.to_owned();
         let version = crate::rt::blocking(move || m.version()).await.ok().flatten();
-        out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel)].into() });
+        out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel), ("jail".to_owned(), jail)].into() });
     }
     let Ok(Some(bin)) = crate::rt::blocking(super::docker::find).await else { return out };
     let engine = if bin.ends_with("podman") { "podman" } else { "docker" };

@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for every D.1 ecosystem (AC03 with the real tools for eight), vcpkg's binary cache kept by kiln; jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
-| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); its jailer and snapshot restores, and `shards`, left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); each VMM in a jail of its own (namespaces, no root), pools restored from snapshots, services and job containers in microVMs; `shards` left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare, search), GraphQL (pull requests, comments, labels, reviews, checks, search; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); GraphQL's merges left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container deployments (Compose stacks, healthy, outliving their jobs) and microVM ones (long-lived Firecracker microVMs, health-checked, taking over their ports, booted again with their runner); shards' microVMs, previews and the live-cluster ACs left (with CD) |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
@@ -3984,6 +3984,21 @@ enforcement points to W18, agent isolation to W20.
     root.
   - What the proxy refuses is annotated on the step, as elsewhere. The microVM ends with its leg
     (a kept leg's stays: W17-R02), and a leg that outruns its own timeout and cleanup is stopped.
+  - Each VMM runs in a jail of its own (`jail.rs`, `kiln vmm-jail`). Firecracker's jailer needs
+    root, so kiln confines the VMM without it:
+    - namespaces of its own (user, mount, PID, network, IPC and UTS);
+    - a root of its own on a tmpfs, read-only, holding only what its microVM needs (Firecracker,
+      the guest kernel, its disks, its vsock sockets' directory, `/dev/kvm`, `/dev/urandom` and
+      `/dev/null`), with nothing else of the host's and nothing writable but its scratch disk and
+      sockets;
+    - no network at all, not even the host's loopback;
+    - PID 1 of its PID namespace, no new privileges, and gone with its jail.
+
+    Root in its user namespace is the runner's user outside it. Where a machine allows no
+    unprivileged user namespaces (or `KILN_FIRECRACKER_JAIL=off`), microVMs run unjailed; the
+    runner's facts say which (`executors.firecracker.jail`: `namespaces` or `none`). Checked
+    (`tests/jail.rs`): a shell in Firecracker's place sees only its binds and its `/proc`, is
+    root there as this user, has only a loopback, is PID 1, and writes only its writable bind.
   - When the leg's image has Docker (`dockerd`), the guest starts its daemon: cgroups mounted, its
     data on the scratch disk, no bridge or iptables of its own. The leg's Docker actions run there
     on the guest's network, their images pulled through the egress proxy
@@ -3992,9 +4007,25 @@ enforcement points to W18, agent isolation to W20.
     (`w22_ac02_setup_qemu_in_a_microvm`).
   - A `microvm` environment's deployments run in microVMs of their own that outlive their jobs
     (`kiln guest serve`, W15-R02).
-  - R09's `firecracker` pools: each executor is a microVM of the pool's image, booted and waiting,
+  - R09's `firecracker` pools: each executor is a microVM of the pool's image, ready and waiting,
     so a leg for the pool starts in it at once (its image ready, its microVM up), and the pool
-    boots another for the next (`w13_r09_a_firecracker_pool_keeps_a_microvm_ready`).
+    readies another for the next (`w13_r09_a_firecracker_pool_keeps_a_microvm_ready`).
+  - Where VMMs are jailed, a pool's microVMs are restored from a snapshot of its image, not
+    booted:
+    - A template microVM is booted once per image (and kiln build, guest kernel, Firecracker
+      version and size) to where its guest waits for the host, then paused and snapshotted, its
+      scratch disk kept as it was.
+    - Each of the pool's microVMs restores it in a jail of its own, whose paths are the
+      snapshot's, its scratch disk a copy (reflinked where the file system can).
+    - The guest takes its leg in PID 1 before its runner starts: it sets its clock from the
+      host's and reseeds its kernel's randomness with the host's. Restored microVMs neither keep
+      the snapshot's time nor share randomness, and the runner seeds its own after.
+    - The pool test checks it: two pooled legs, each in a restored microVM with the host's time
+      and randomness of its own.
+  - A leg's services and job container in a microVM whose image has Docker run on the guest's
+    Docker and network, with a network policy too: the microVM is what contains them, its one way
+    out the host's egress proxy (`w13_r05_services_and_a_job_container_in_a_microvm`: a service
+    answering the leg's steps at its port, and a job container reaching it by name).
   - Checked end to end (`w13_r05_a_leg_runs_in_a_firecracker_microvm`, with Firecracker 1.17 and
     its 6.1 kernel, when `KILN_TEST_FIRECRACKER` and `KILN_TEST_FIRECRACKER_KERNEL` name them):
     an Alpine job runs on the guest's kernel, `/etc/shadow` keeps Alpine's `shadow` group, the
@@ -4002,13 +4033,8 @@ enforcement points to W18, agent isolation to W20.
     proxy. Unit-tested: layers' whiteouts, frames, pulls through kiln, `ldd`'s libraries,
     private networks through the guest's proxy.
 - *Left.*
-  - R05's jailer around each VMM: it needs root (the VMM runs as the runner's user, under
-    Firecracker's own seccomp filters).
-  - Pools restored from a booted snapshot of each image, rather than booted each: a snapshot
-    names the disks and sockets of the microVM it was taken in, so each restore needs those
-    paths of its own (the jailer's chroot, or a mount namespace).
-  - Services and job containers in a microVM whose image has Docker reach out only on the guest's
-    own network: their bridges lead nowhere.
+  - Firecracker's own jailer where the runner is root (kiln's jail needs no root, and confines as
+    it does but for its cgroups).
   - The `shards` executor (R06) and its pool kind.
   - R11's other parts: checking Agentfiles by shards' own parser (its `agentfile` crate isn't
     one kiln can build against yet), kiln's shipped definitions beyond the runner image, and

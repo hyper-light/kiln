@@ -254,8 +254,10 @@ fn idle(s: &Server, pool: &str) -> anyhow::Result<Vec<String>> {
     Ok(list.iter().filter(|e| e.get("state") == Some(&json!("idle"))).filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned)).collect())
 }
 
-/// W13-R09 with R05: a `firecracker` pool keeps a microVM of its image booted and waiting; a leg
-/// for the pool runs in it at once, and the pool boots another for the next.
+/// W13-R09 with R05: a `firecracker` pool keeps a microVM of its image ready, and a leg for the
+/// pool runs in it at once, the pool readying another for the next. Where its VMMs are jailed,
+/// each is restored from a snapshot of its image booted once: its clock is the host's, not the
+/// snapshot's, and its randomness its own, not its siblings'.
 #[test]
 fn w13_r09_a_firecracker_pool_keeps_a_microvm_ready() -> anyhow::Result<()> {
     let Some((fc, kernel)) = machine() else {
@@ -270,23 +272,44 @@ fn w13_r09_a_firecracker_pool_keeps_a_microvm_ready() -> anyhow::Result<()> {
         first = idle(&s, "vms")?;
         Ok(first.is_empty().then(|| "none idle".to_owned()))
     })?;
-    let workflow = "on: push\njobs:\n  pooled:\n    runs-on: vmpool\n    steps:\n      - shell: sh\n        run: echo \"pooled-on-$(cat /proc/sys/kernel/osrelease)\"\n";
-    let (run, leg) = push_run(&s, &home, &work, &push, ".github/workflows/pooled.yml", workflow)?;
-    until(&s, 300, "the pooled run", || {
+    let workflow = "on: push\njobs:\n  pooled:\n    runs-on: vmpool\n    strategy:\n      matrix:\n        n: [1, 2]\n      max-parallel: 1\n    steps:\n      - shell: sh\n        run: echo \"pooled-on-$(cat /proc/sys/kernel/osrelease) at $(date +%s) random $(head -c 16 /dev/urandom | od -An -tx1 | tr -d \' \\n\')\"\n";
+    let (run, _) = push_run(&s, &home, &work, &push, ".github/workflows/pooled.yml", workflow)?;
+    until(&s, 600, "the pooled run", || {
         let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
         let runs: Value = serde_json::from_str(&body)?;
         let done = runs.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id") == Some(&json!(run)) && r.get("finished_at").is_some_and(|f| !f.is_null()));
         Ok((!done).then_some(body))
     })?;
-    let (about, log) = leg_and_log(&s, &leg)?;
-    assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{about}\n{log}\n{}", s.log());
-    assert!(log.contains("pooled-on-"), "{log}");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+    let mut randoms = Vec::new();
+    for l in serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let (about, log) = leg_and_log(&s, l.get("id").and_then(Value::as_str).unwrap_or_default())?;
+        assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{about}\n{log}\n{}", s.log());
+        let line = log.lines().find(|l| l.contains("pooled-on-")).unwrap_or_default().to_owned();
+        let word = |after: &str| line.split(after).nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or_default().to_owned();
+        let at: u64 = word(" at ").parse().unwrap_or(0);
+        assert!(at + 600 >= now && at <= now + 5, "the guest's clock is the host's ({at}, now {now}): {line}");
+        randoms.push(word(" random "));
+    }
+    assert_eq!(randoms.len(), 2, "{randoms:?}");
+    assert!(randoms.iter().all(|r| r.len() == 32) && randoms.first() != randoms.get(1), "each microVM's randomness its own: {randoms:?}");
+    // Restored from the image's snapshot where its VMMs are jailed.
+    if namespaces() {
+        let log = std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
+        assert!(log.lines().any(|l| l.contains("pool microVM ready") && l.contains("restored=true")), "restored from a snapshot:\n{}", s.log());
+    }
     // The microVM it ran in is gone, and another stands ready.
     until(&s, 600, "the pool's next microVM", || {
         let now = idle(&s, "vms")?;
         Ok((now.is_empty() || now.iter().any(|e| first.contains(e))).then(|| format!("{now:?} (first {first:?})")))
     })?;
     Ok(())
+}
+
+/// Whether this machine allows the jail's namespaces (a jailed VMM's, `jail.rs`).
+fn namespaces() -> bool {
+    Command::new("unshare").args(["-Urmpnf", "--mount-proc", "true"]).output().is_ok_and(|o| o.status.success())
 }
 
 /// W13-R05's last part: in a microVM whose image has Docker (`docker:dind`), the guest starts its
@@ -360,7 +383,8 @@ fn fetch(port: u16) -> anyhow::Result<String> {
     Ok(answer.split_once("\r\n\r\n").map(|(_, body)| body.trim().to_owned()).unwrap_or(answer))
 }
 
-/// The Firecracker processes booted from under `dir`.
+/// The microVMs booted from under `dir`: their VMMs (`--config-file <dir>/…/vm.json`), or the jails
+/// they run in (`kiln vmm-jail <dir>/…/jail.json`; a jailed VMM's own paths are its jail's).
 fn microvms_under(dir: &Path) -> Vec<u32> {
     let under = dir.to_string_lossy().into_owned();
     std::fs::read_dir("/proc")
@@ -368,8 +392,12 @@ fn microvms_under(dir: &Path) -> Vec<u32> {
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
-        .filter(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains("--config-file") && String::from_utf8_lossy(&c).contains("firecracker")))
-        .filter(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|d| d.to_string_lossy().starts_with(&under)))
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                let c = String::from_utf8_lossy(&c);
+                c.contains(&under) && (c.contains("vmm-jail") || (c.contains("--config-file") && c.contains("firecracker")))
+            })
+        })
         .collect()
 }
 
@@ -418,6 +446,42 @@ fn w15_r02_a_microvm_environment_deploys_an_image() -> anyhow::Result<()> {
     while !microvms_under(dir.path()).is_empty() {
         anyhow::ensure!(Instant::now() < deadline, "the deployment's microVM outlived its runner: {:?}", microvms_under(dir.path()));
         std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+/// W13-R05 with W06's containers: in a microVM whose image has Docker, a leg's service and its job
+/// container run on the guest's Docker, on the guest's network, with a network policy too (the
+/// microVM is what contains them: its one way out is this runner's egress proxy). The service
+/// answers the leg's steps at its port, and a job container reaches it by its name.
+#[test]
+fn w13_r05_services_and_a_job_container_in_a_microvm() -> anyhow::Result<()> {
+    let Some((fc, kernel)) = machine() else {
+        eprintln!("skipped: KILN_TEST_FIRECRACKER and KILN_TEST_FIRECRACKER_KERNEL don't name Firecracker and its kernel, or /dev/kvm can't be opened");
+        return Ok(());
+    };
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let docker = "\n[[ci.routing]]\nmatch = { labels = [\"dockervm\"] }\nexecutor = [\"firecracker\"]\nimage = \"docker.io/library/docker:dind\"\n";
+    let (s, home, work, push) = vm_server(dir.path(), &fc, &kernel, docker)?;
+    let ping = "printf 'PING\\r\\n' | nc -w 5 $HOST 6379 | tr -d '\\r'";
+    let workflow = format!(
+        "on: push\njobs:\n  steps:\n    runs-on: dockervm\n    services:\n      cache:\n        image: docker.io/library/redis:7-alpine\n    steps:\n      - run: |\n          for i in $(seq 1 60); do nc -z 127.0.0.1 6379 && break; sleep 1; done\n          echo \"at its port: $(HOST=127.0.0.1; {ping})\"\n  contained:\n    runs-on: dockervm\n    network: {{ egress: {{ allow: [\"*\"] }} }}\n    container: docker.io/library/alpine:3.20\n    services:\n      cache:\n        image: docker.io/library/redis:7-alpine\n    steps:\n      - run: |\n          for i in $(seq 1 60); do nc -z cache 6379 && break; sleep 1; done\n          echo \"by its name: $(HOST=cache; {ping})\"\n"
+    );
+    let (run, _) = push_run(&s, &home, &work, &push, ".kiln/services.yaml", &workflow)?;
+    until(&s, 1200, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        let done = runs.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id") == Some(&json!(run)) && r.get("finished_at").is_some_and(|f| !f.is_null()));
+        Ok((!done).then_some(body))
+    })?;
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+    for l in serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let (id, key) = (l.get("id").and_then(Value::as_str).unwrap_or_default(), l.get("key").and_then(Value::as_str).unwrap_or_default().to_owned());
+        let (about, log) = leg_and_log(&s, id)?;
+        assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{key}: {about}\n{log}\n{}", s.log());
+        assert_eq!(about.pointer("/leg/executor"), Some(&json!("firecracker")), "{key} ran in a microVM: {about}");
+        let said = if key == "contained" { "by its name: +PONG" } else { "at its port: +PONG" };
+        assert!(log.contains(said), "{key}: {log}");
     }
     Ok(())
 }

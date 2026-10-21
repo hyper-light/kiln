@@ -114,6 +114,12 @@ pub struct LegStart {
     pub ca: Option<Vec<u8>>,
     /// The server's port on the host's loopback, forwarded to the guest's.
     pub server_port: Option<u16>,
+    /// The host's time as it sent the leg (Unix nanoseconds): a microVM restored from a snapshot
+    /// (W13-R09) takes it, its own clock being the snapshot's.
+    pub now_ns: u128,
+    /// Randomness of the host's, mixed into the guest kernel's and reseeding it: microVMs restored
+    /// from one snapshot would otherwise share its state.
+    pub entropy: Vec<u8>,
 }
 
 /// A deployment's service (W15-R02): what a `microvm` environment's microVM runs and keeps
@@ -277,22 +283,74 @@ fn system(root: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A leg: its image entered, and its runner forked.
+/// A leg: its image entered, the host dialled and the leg taken, then its runner forked. A pool's
+/// snapshot is taken while it waits for the host (W13-R09), so a microVM restored from it sets its
+/// clock and reseeds its randomness from what the host sends before the runner starts, which seeds
+/// its own after.
 fn leg() -> anyhow::Result<()> {
     enter()?;
+    let (start, conn) = take_leg()?;
+    fresh(&start);
     #[allow(unsafe_code)]
     // SAFETY: PID 1 has one thread here (no runtime has started and nothing has spawned one), so
     // the child may go on as this program does.
     let forked = unsafe { nix::unistd::fork() }.context("starting the leg's runner")?;
     match forked {
         nix::unistd::ForkResult::Child => {
-            let code = runner();
+            let code = runner(start, conn);
             #[allow(clippy::exit)]
             std::process::exit(code)
         }
         nix::unistd::ForkResult::Parent { child } => reap(child),
     }
     Ok(())
+}
+
+/// The host dialled (again and again until it listens: a snapshot's template waits here) and the
+/// leg taken.
+fn take_leg() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
+    // What's written so far is on its disk: a snapshot taken from here goes with that disk.
+    nix::unistd::sync();
+    eprintln!("{WAITING}");
+    let mut conn = loop {
+        match dial(CONTROL_PORT) {
+            Ok(c) => break c,
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    send(&mut conn, &FromGuest::Ready)?;
+    match recv::<ToGuest>(&mut conn)? {
+        Some(ToGuest::Leg(start)) => Ok((start, conn)),
+        Some(other) => anyhow::bail!("the host sent {other:?} where a leg goes"),
+        None => anyhow::bail!("the host hung up before sending the leg"),
+    }
+}
+
+/// What a guest says on its console as it waits for the host: up, a template's snapshot to take.
+pub const WAITING: &str = "kiln guest: waiting for the host";
+
+/// The host's time, and its randomness mixed into the kernel's, reseeding it.
+fn fresh(start: &LegStart) {
+    if let Ok(ns) = i64::try_from(start.now_ns) {
+        let t = nix::sys::time::TimeSpec::new(ns / 1_000_000_000, ns % 1_000_000_000);
+        if let Err(e) = nix::time::clock_settime(nix::time::ClockId::CLOCK_REALTIME, t) {
+            eprintln!("kiln guest: setting the clock: {e}");
+        }
+    }
+    if start.entropy.is_empty() {
+        return;
+    }
+    let mixed = std::fs::OpenOptions::new().write(true).open("/dev/urandom").and_then(|mut f| {
+        f.write_all(&start.entropy)?;
+        // RNDRESEEDCRNG: the kernel's generator reseeds now from what it has, this included.
+        #[allow(unsafe_code)]
+        // SAFETY: `f` is open, and RNDRESEEDCRNG takes no argument.
+        let r = unsafe { nix::libc::ioctl(f.as_raw_fd(), 0x5207 as _) };
+        if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    });
+    if let Err(e) = mixed {
+        eprintln!("kiln guest: reseeding its randomness: {e}");
+    }
 }
 
 /// The image under an overlay on the scratch disk, moved into with kiln's disk at `/.kiln`.
@@ -404,9 +462,9 @@ pub fn blocked() -> Option<async_channel::Receiver<String>> {
 
 /// The forked runner: dialled in, given its leg, then the leg run on a runtime of its own. Its
 /// exit code is 0 when it ran the leg to its result, whatever that was.
-fn runner() -> i32 {
-    match prepare() {
-        Ok((start, conn)) => {
+fn runner(start: Box<LegStart>, conn: UnixStream) -> i32 {
+    match prepare(&start) {
+        Ok(()) => {
             crate::rt::configure(crate::rt::Profile::agent());
             match crate::rt::block_on(run(*start, conn)) {
                 Ok(()) => 0,
@@ -423,16 +481,9 @@ fn runner() -> i32 {
     }
 }
 
-/// Before the runtime starts (with one thread, so the environment may be set): the host dialled,
-/// the leg taken, its environment set, and the forwarders started.
-fn prepare() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
-    let mut conn = dial(CONTROL_PORT)?;
-    send(&mut conn, &FromGuest::Ready)?;
-    let start = match recv::<ToGuest>(&mut conn)? {
-        Some(ToGuest::Leg(start)) => start,
-        Some(other) => anyhow::bail!("the host sent {other:?} where a leg goes"),
-        None => anyhow::bail!("the host hung up before sending the leg"),
-    };
+/// Before the runtime starts (with one thread, so the environment may be set): the leg's
+/// environment set, and the forwarders started.
+fn prepare(start: &LegStart) -> anyhow::Result<()> {
     let proxy = format!("http://127.0.0.1:{LOCAL_PROXY}");
     let mut env: Vec<(String, String)> = vec![("HOME".into(), "/root".into()), ("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into())];
     env.extend(start.env.iter().cloned());
@@ -462,7 +513,7 @@ fn prepare() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
     if let Err(e) = docker_daemon() {
         eprintln!("kiln guest: the image's Docker: {e:#}");
     }
-    Ok((start, conn))
+    Ok(())
 }
 
 /// When the image has Docker (`dockerd`), its daemon, for the leg's Docker actions and services

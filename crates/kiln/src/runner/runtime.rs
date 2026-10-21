@@ -666,7 +666,8 @@ fn shell_command(shell: Option<&str>, script: &Path) -> Result<(String, Vec<Stri
         Some("bash") => simple("bash", &["--noprofile", "--norc", "-eo", "pipefail", "{0}"]),
         Some("sh") => simple("sh", &["-e", "{0}"]),
         Some(ps @ ("pwsh" | "powershell")) => (ps.to_owned(), vec!["-command".into(), format!(". '{path}'")]),
-        Some("cmd") => (std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()), vec!["/D".into(), "/E:ON".into(), "/V:OFF".into(), "/S".into(), "/C".into(), format!("CALL \"{path}\"")]),
+        // GitHub's `/S /C "CALL "{0}""`, which cmd takes as written (`shell_program`).
+        Some("cmd") => (std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()), vec!["/D".into(), "/E:ON".into(), "/V:OFF".into(), "/S".into(), "/C".into(), format!("\"CALL \"{path}\"\"")]),
         Some("python") => simple("python", &["{0}"]),
         Some(custom) => {
             if !custom.contains("{0}") {
@@ -677,6 +678,24 @@ fn shell_command(shell: Option<&str>, script: &Path) -> Result<(String, Vec<Stri
             (prog, parts.map(|a| a.replace("{0}", &path)).collect())
         }
     })
+}
+
+/// A step's program with its arguments, as its shell takes them. On Windows `cmd` parses its own
+/// command line, which goes to it as written (`raw_arg`): std's quoting would escape the quotes
+/// inside GitHub's `/S /C "CALL "{0}""`, and cmd doesn't take them escaped.
+fn shell_program(prog: &str, args: &[String], shell: Option<&str>) -> Command {
+    let mut c = Command::new(prog);
+    #[cfg(windows)]
+    if shell.map(str::trim) == Some("cmd") {
+        use std::os::windows::process::CommandExt as _;
+        for a in args {
+            c.raw_arg(a);
+        }
+        return c;
+    }
+    let _ = shell;
+    c.args(args);
+    c
 }
 
 /// The script's extension and text for a shell (W06-R05): `.sh`, `.ps1` (with GitHub's wrapper),
@@ -2047,7 +2066,8 @@ impl Leg {
         let workdir = map.translate(&l.workspace.to_string_lossy());
         // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
         // A leg with a network policy never gets the host's Docker socket: it would get around it.
-        let open = a.network.is_none();
+        // In a microVM the socket is the guest's own, and the microVM is what contains it.
+        let open = a.network.is_none() || in_microvm();
         let job = match (&a.job_container, &a.executor.image) {
             (Some(c), _) => Some(super::docker::Spec { docker_socket: open, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
             (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: open && self.docker_inside(), ..super::docker::Spec::default() }),
@@ -2059,6 +2079,9 @@ impl Leg {
         // proxy. A runner without a static kiln for the relay can't contain it: an untrusted leg
         // stops here; a trusted one runs as it would without its policy, and says so.
         let egress = match (&a.network, &job) {
+            // A microVM's leg is contained already: its one way out is the host's egress proxy,
+            // with this policy (W13-R05), and its containers share its network.
+            (Some(_), Some(_)) if in_microvm() => None,
             (Some(n), Some(_)) => match super::egress::relay_binary() {
                 Some(binary) => Some((super::docker::EgressSpec { binary, token: crate::util::random_token() }, n.clone())),
                 None if n.untrusted => anyhow::bail!("this untrusted leg's network can't be contained here: the runner has no static kiln for its egress relay (a musl build of kiln, or KILN_EGRESS_BINARY)"),
@@ -2223,8 +2246,8 @@ impl Leg {
             let args: Vec<String> = args.iter().map(|a| j.map.translate(a)).collect();
             cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
         } else {
-            let mut c = Command::new(&prog);
-            c.args(&args).current_dir(wd).envs(&env);
+            let mut c = shell_program(&prog, &args, shell);
+            c.current_dir(wd).envs(&env);
             c
         };
         let mut running = crate::proc::spawn_group(cmd)?;
@@ -4119,6 +4142,19 @@ impl Leg {
     }
 }
 
+/// Whether this leg runs in a Firecracker microVM (W13-R05), whose host's egress proxy contains
+/// it.
+fn in_microvm() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        super::guest::blocked().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Waits between tries at the server while it's away (a restart): 1 s, doubling to 15 s, for two
 /// minutes in all.
 struct Again {
@@ -4481,7 +4517,8 @@ mod tests {
         if cfg!(windows) {
             let ps = if have("pwsh") { "pwsh" } else { "powershell" };
             cases.push((ps.into(), "Write-Output ps-ok", None, "ps-ok"));
-            cases.push((ps.into(), "exit 4", Some(4), ""));
+            // Under `-command`, PowerShell makes a script's exit code 1 (as on GitHub's runners).
+            cases.push((ps.into(), "exit 4", Some(1), ""));
             cases.push((ps.into(), "Write-Error 'failing'\nWrite-Output never", Some(1), ""));
             cases.push(("cmd".into(), "echo cmd-ok", None, "cmd-ok"));
             cases.push(("cmd".into(), "exit /b 6", Some(6), ""));

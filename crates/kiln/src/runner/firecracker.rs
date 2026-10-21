@@ -16,10 +16,12 @@
 //!   (`kiln guest serve`) that outlives its job. Its service is kept running and checked in there;
 //!   this runner's ports reach it over vsock, and it takes them from the deployment before it once
 //!   it's healthy. Kept in the cache, so the runner boots it again when it starts.
-//! - **Still to come**: the jailer around each VMM, and warm pools of booted snapshots.
+//! - **Its jail** (`jail.rs`): each VMM in namespaces of its own, as Firecracker's jailer confines
+//!   one, without root, where this machine allows unprivileged user namespaces.
+//! - **Still to come**: warm pools of booted snapshots.
 
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -51,6 +53,8 @@ pub struct Machine {
     pub kernel: PathBuf,
     /// `mke2fs`, which makes the disks.
     pub mkfs: PathBuf,
+    /// Each VMM runs in a jail of its own (`jail.rs`): this machine allows the namespaces.
+    pub jail: bool,
 }
 
 impl Machine {
@@ -67,7 +71,7 @@ impl Machine {
         let firecracker = from_env("KILN_FIRECRACKER").or_else(|| Some(kiln.join("bin/firecracker")).filter(|p| p.is_file())).or_else(|| crate::os::which("firecracker"))?;
         let kernel = from_env("KILN_FIRECRACKER_KERNEL").or_else(|| Some(kiln.join("firecracker/vmlinux")).filter(|p| p.is_file()))?;
         let mkfs = crate::os::which("mke2fs").or_else(|| ["/usr/sbin/mke2fs", "/sbin/mke2fs"].into_iter().map(PathBuf::from).find(|p| p.is_file()))?;
-        Some(Machine { firecracker, kernel, mkfs })
+        Some(Machine { firecracker, kernel, mkfs, jail: super::jail::available() })
     }
 
     /// Firecracker's version (`v1.17.0`).
@@ -110,6 +114,11 @@ impl Socks {
         self.0.join("v.sock")
     }
 
+    /// Firecracker's API, for a pause, a snapshot and a restore (W13-R09).
+    pub fn api(&self) -> PathBuf {
+        self.0.join("api.sock")
+    }
+
     /// Where the guest's connections to the host's `port` come.
     pub fn port(&self, port: u32) -> PathBuf {
         self.0.join(format!("v.sock_{port}"))
@@ -130,34 +139,126 @@ pub struct Drive<'a> {
 }
 
 /// A microVM booted from kiln's disk (the first drive) into `kiln guest <mode>`, its console
-/// written to `console.log` in `dir`, its vsock in `socks`.
+/// written to `console.log` in `dir`, its vsock in `socks`. Its VMM runs in a jail of its own
+/// when this machine allows one (`jail.rs`), which has only these: there, each is where the jail
+/// puts it.
 pub fn boot(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], mode: &str, vcpus: u32, memory_mib: u64) -> anyhow::Result<Vm> {
-    let config = serde_json::json!({
-        "boot-source": {
-            "kernel_image_path": m.kernel,
-            "boot_args": format!("console=ttyS0 reboot=k panic=1 pci=off quiet root=/dev/vda ro rootfstype=ext4 init=/kiln -- guest {mode}"),
-        },
-        "drives": drives.iter().map(|d| serde_json::json!({ "drive_id": d.id, "path_on_host": d.path, "is_root_device": false, "is_read_only": d.read_only })).collect::<Vec<_>>(),
-        "machine-config": { "vcpu_count": vcpus, "mem_size_mib": memory_mib },
-        "vsock": { "guest_cid": 3, "uds_path": socks.uds() },
-        "entropy": {},
-    });
+    vmm(m, dir, socks, drives, Run::Boot { mode, vcpus, memory_mib, api: false, snapshot_to: None })
+}
+
+/// What a VMM does as it starts.
+enum Run<'a> {
+    /// Boots kiln's disk into `kiln guest <mode>`; with its API socket when `api` (for a pause and
+    /// a snapshot, written to `snapshot_to`, bound in at `/snap`).
+    Boot { mode: &'a str, vcpus: u32, memory_mib: u64, api: bool, snapshot_to: Option<&'a Path> },
+    /// Waits, with its API socket, to restore the snapshot in `from` (bound in at `/snap`, read
+    /// only): jailed, so the paths the snapshot names are this microVM's own.
+    Restore { from: &'a Path },
+}
+
+/// A VMM in `dir`, its console written to `console.log` there, its vsock in `socks`. It runs in a
+/// jail of its own when this machine allows one (`jail.rs`), which has only these: there, each is
+/// where the jail puts it.
+fn vmm(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], run: Run<'_>) -> anyhow::Result<Vm> {
+    let at = |host: &Path, jailed: String| if m.jail { jailed } else { host.to_string_lossy().into_owned() };
     let path = dir.join("vm.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    let mut args: Vec<String> = Vec::new();
+    match &run {
+        Run::Boot { mode, vcpus, memory_mib, api, .. } => {
+            let config = serde_json::json!({
+                "boot-source": {
+                    "kernel_image_path": at(&m.kernel, "/kernel".into()),
+                    "boot_args": format!("console=ttyS0 reboot=k panic=1 pci=off quiet root=/dev/vda ro rootfstype=ext4 init=/kiln -- guest {mode}"),
+                },
+                "drives": drives.iter().map(|d| serde_json::json!({ "drive_id": d.id, "path_on_host": at(d.path, format!("/drives/{}", d.id)), "is_root_device": false, "is_read_only": d.read_only })).collect::<Vec<_>>(),
+                "machine-config": { "vcpu_count": vcpus, "mem_size_mib": memory_mib },
+                "vsock": { "guest_cid": 3, "uds_path": at(&socks.uds(), "/socks/v.sock".into()) },
+                "entropy": {},
+            });
+            std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+            args.extend(["--config-file".to_owned(), at(&path, "/vm.json".into())]);
+            if *api {
+                args.extend(["--api-sock".to_owned(), at(&socks.api(), "/socks/api.sock".into())]);
+            } else {
+                args.push("--no-api".to_owned());
+            }
+        }
+        Run::Restore { .. } => {
+            anyhow::ensure!(m.jail, "a snapshot is restored only in a jail of its own: the paths it names would be another microVM's");
+            args.extend(["--api-sock".to_owned(), "/socks/api.sock".to_owned()]);
+        }
+    }
+    args.extend(["--level".to_owned(), "Warning".to_owned()]);
     let console = dir.join("console.log");
     let out = std::fs::File::create(&console)?;
-    let child = Command::new(&m.firecracker)
-        .arg("--no-api")
-        .arg("--config-file")
-        .arg(&path)
-        .args(["--level", "Warning"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(out.try_clone()?)
-        .stderr(out)
-        .spawn()
-        .with_context(|| format!("starting {}", m.firecracker.display()))?;
+    let mut cmd = if m.jail {
+        let bind = |from: &Path, to: &str, rw: bool| super::jail::Bind { from: from.to_path_buf(), to: to.to_owned(), rw };
+        let mut binds = vec![bind(&m.firecracker, "/firecracker", false), bind(&socks.0, "/socks", true)];
+        match &run {
+            Run::Boot { snapshot_to, .. } => {
+                binds.extend([bind(&m.kernel, "/kernel", false), bind(&path, "/vm.json", false)]);
+                if let Some(to) = snapshot_to {
+                    binds.push(bind(to, "/snap", true));
+                }
+            }
+            Run::Restore { from } => binds.push(bind(from, "/snap", false)),
+        }
+        binds.extend(drives.iter().map(|d| bind(d.path, &format!("/drives/{}", d.id), !d.read_only)));
+        binds.extend([bind(Path::new("/dev/kvm"), "/dev/kvm", true), bind(Path::new("/dev/urandom"), "/dev/urandom", false), bind(Path::new("/dev/null"), "/dev/null", true)]);
+        let argv = std::iter::once("/firecracker".to_owned()).chain(args).collect();
+        let root = dir.join("jail");
+        std::fs::create_dir_all(&root)?;
+        let spec = dir.join("jail.json");
+        std::fs::write(&spec, serde_json::to_vec_pretty(&super::jail::Spec { root, binds, argv })?)?;
+        let mut c = Command::new(std::env::current_exe()?);
+        c.arg("vmm-jail").arg(&spec);
+        c
+    } else {
+        let mut c = Command::new(&m.firecracker);
+        c.args(args);
+        c
+    };
+    let child = cmd.current_dir(dir).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).spawn().with_context(|| format!("starting {}", m.firecracker.display()))?;
     Ok(Vm { child: Some(child), console })
+}
+
+/// A call to a VMM's API (Firecracker's: HTTP over its Unix socket, there once the VMM is up),
+/// `method` `path` with `body`, within `within`: why not, when it refuses.
+fn api(sock: &Path, method: &str, path: &str, body: &serde_json::Value, within: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + within;
+    let mut s = loop {
+        match UnixStream::connect(sock) {
+            Ok(s) => break s,
+            Err(e) => {
+                anyhow::ensure!(Instant::now() < deadline, "the microVM's API ({}): {e}", sock.display());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    s.set_read_timeout(Some(within))?;
+    let text = body.to_string();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text}", text.len())?;
+    // Its answer: the status line, the headers, the body they size.
+    let mut r = std::io::BufReader::new(s);
+    let mut status = String::new();
+    r.read_line(&mut status)?;
+    let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).with_context(|| format!("{method} {path}: not an HTTP answer: {status}"))?;
+    let mut len = 0usize;
+    loop {
+        let mut h = String::new();
+        if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            len = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut said = vec![0u8; len.min(64 << 10)];
+    r.read_exact(&mut said)?;
+    anyhow::ensure!((200..300).contains(&code), "{method} {path}: {code} {}", String::from_utf8_lossy(&said).trim());
+    Ok(())
 }
 
 /// A running microVM's VMM: killed if it's dropped before it ended.
@@ -405,6 +506,8 @@ pub struct Booted {
     image: String,
     /// The image's environment.
     env: Vec<(String, String)>,
+    /// Restored from a snapshot (W13-R09), not booted.
+    restored: bool,
 }
 
 impl Booted {
@@ -438,33 +541,147 @@ async fn boot_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &supe
     relay(&socks, guest::PROXY_PORT, Arc::clone(&proxy_to), Arc::clone(&stop))?;
     relay(&socks, guest::SERVER_PORT, Arc::clone(&server_to), Arc::clone(&stop))?;
     let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
-    let cpus = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
-    let vcpus = u32::try_from(cpus).unwrap_or(2);
     let vm = boot(
         m,
         &dir,
         &socks,
         &[Drive { id: "kiln", path: &kiln, read_only: true }, Drive { id: "image", path: &root.path, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
         "init",
-        vcpus,
-        2048,
+        pool_vcpus(),
+        POOL_MEMORY_MIB,
     )?;
     let (vm, conn) = crate::rt::blocking(move || {
         let mut vm = vm;
-        let conn = vm.accept(&control, BOOT).and_then(|mut c| {
-            c.set_read_timeout(Some(BOOT))?;
-            match guest::recv::<FromGuest>(&mut c) {
-                Ok(Some(FromGuest::Ready)) => {
-                    c.set_read_timeout(None)?;
-                    Ok(c)
-                }
-                _ => Err(anyhow::anyhow!("the microVM's guest didn't say it was ready:\n{}", tail(&vm.console))),
-            }
-        });
+        let conn = ready(&mut vm, &control, BOOT);
         (vm, conn)
     })
     .await?;
-    Ok(Booted { vm, socks, dir, conn: conn?, stop, proxy_to, server_to, image: image.to_owned(), env: root.env })
+    Ok(Booted { vm, socks, dir, conn: conn?, stop, proxy_to, server_to, image: image.to_owned(), env: root.env, restored: false })
+}
+
+/// What a guest dialling in says first, within `within`: ready, else why not.
+fn ready(vm: &mut Vm, control: &UnixListener, within: Duration) -> anyhow::Result<UnixStream> {
+    let mut c = vm.accept(control, within)?;
+    c.set_read_timeout(Some(within))?;
+    match guest::recv::<FromGuest>(&mut c) {
+        Ok(Some(FromGuest::Ready)) => {
+            c.set_read_timeout(None)?;
+            Ok(c)
+        }
+        _ => Err(anyhow::anyhow!("the microVM's guest didn't say it was ready:\n{}", tail(&vm.console))),
+    }
+}
+
+/// A pool's image as a snapshot (W13-R09): a microVM of it booted to where its guest waits for
+/// the host, paused and snapshotted (its state, its memory, its scratch disk as it was), kept in
+/// `dir` until anything it depends on changes.
+struct Template {
+    dir: PathBuf,
+    kiln: PathBuf,
+    root: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+/// The size of a pool's microVMs, booted or restored.
+fn pool_vcpus() -> u32 {
+    u32::try_from(std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4)).unwrap_or(2)
+}
+const POOL_MEMORY_MIB: u64 = 2048;
+
+/// `image`'s template here: kept by all a snapshot depends on (kiln's disk, the image, the guest
+/// kernel, Firecracker's version, the microVM's size), made when there's none; one image's older
+/// ones go.
+async fn template(m: &Machine, cache: &Path, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Template> {
+    let kiln = kiln_disk(m, cache).await.context("kiln's disk for the microVM")?;
+    let root = super::rootfs::prepare(m, cache, &kiln, image, pull).await.with_context(|| format!("the image {image}"))?;
+    let version = {
+        let m = m.clone();
+        crate::rt::blocking(move || m.version()).await?.unwrap_or_default()
+    };
+    let image_dir = cache.join("snapshots").join(root.digest.trim_start_matches("sha256:").get(..16).unwrap_or("image"));
+    let key = crate::util::sha256_hex(format!("{}|{}|{}|{version}|{}|{POOL_MEMORY_MIB}", kiln.display(), root.digest, m.kernel.display(), pool_vcpus()).as_bytes());
+    let dir = image_dir.join(key.get(..16).unwrap_or("template"));
+    let t = Template { dir: dir.clone(), kiln, root: root.path.clone(), env: root.env.clone() };
+    let _one = super::rootfs::lock(&format!("snapshot-{}", dir.display())).await;
+    if dir.join("done").is_file() {
+        return Ok(t);
+    }
+    let (m, kiln, root) = (m.clone(), t.kiln.clone(), t.root.clone());
+    crate::rt::blocking(move || make_template(&m, &image_dir, &dir, &kiln, &root)).await??;
+    Ok(t)
+}
+
+/// The template made in `dir`, the others of its image (`image_dir`) gone: booted with its API and
+/// nothing listening for its guest, which waits for the host; paused there and snapshotted.
+fn make_template(m: &Machine, image_dir: &Path, dir: &Path, kiln: &Path, root: &Path) -> anyhow::Result<()> {
+    if let Ok(entries) = std::fs::read_dir(image_dir) {
+        for e in entries.flatten().filter(|e| e.path() != dir) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let socks = Socks::new(&format!("t{}", name.get(..11).unwrap_or(&name)))?;
+    let scratch = dir.join("scratch.ext4");
+    mkfs(m, &scratch, SCRATCH, "scratch", None)?;
+    let drives = [Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }];
+    let mut vm = vmm(m, dir, &socks, &drives, Run::Boot { mode: "init", vcpus: pool_vcpus(), memory_mib: POOL_MEMORY_MIB, api: true, snapshot_to: Some(dir) })?;
+    // Up once its guest says it waits.
+    let deadline = Instant::now() + BOOT;
+    while !std::fs::read_to_string(&vm.console).is_ok_and(|c| c.contains(guest::WAITING)) {
+        if let Some(status) = vm.ended() {
+            anyhow::bail!("the template's microVM ended ({status}) before its guest was up:\n{}", tail(&vm.console));
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the template's guest wasn't up within {BOOT:?}:\n{}", tail(&vm.console));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    api(&socks.api(), "PATCH", "/vm", &serde_json::json!({ "state": "Paused" }), BOOT)?;
+    api(&socks.api(), "PUT", "/snapshot/create", &serde_json::json!({ "snapshot_type": "Full", "snapshot_path": "/snap/vmstate", "mem_file_path": "/snap/memory" }), SHUTDOWN)?;
+    drop(vm);
+    for f in ["vm.json", "jail.json", "console.log"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    let _ = std::fs::remove_dir_all(dir.join("jail"));
+    std::fs::write(dir.join("done"), b"")?;
+    Ok(())
+}
+
+/// A pool's microVM restored from its image's template (W13-R09), as `key`: in a jail of its own,
+/// its scratch disk a copy of the template's, its guest dialling in as it runs again.
+async fn restore_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Booted> {
+    let t = template(m, cache, image, pull).await?;
+    let dir = cache.join("vms").join(key);
+    let socks = Socks::new(key)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let scratch = dir.join("scratch.ext4");
+    // A copy of the template's: shared blocks where the file system can, holes kept.
+    let copied = Command::new("cp").arg("--reflink=auto").arg(t.dir.join("scratch.ext4")).arg(&scratch).stdin(Stdio::null()).output().context("copying the template's scratch disk")?;
+    anyhow::ensure!(copied.status.success(), "copying the template's scratch disk: {}", String::from_utf8_lossy(&copied.stderr).trim());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (proxy_to, server_to) = (Arc::new(AtomicU16::new(0)), Arc::new(AtomicU16::new(0)));
+    relay(&socks, guest::PROXY_PORT, Arc::clone(&proxy_to), Arc::clone(&stop))?;
+    relay(&socks, guest::SERVER_PORT, Arc::clone(&server_to), Arc::clone(&stop))?;
+    let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
+    let drives = [Drive { id: "kiln", path: &t.kiln, read_only: true }, Drive { id: "image", path: &t.root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }];
+    let vm = vmm(m, &dir, &socks, &drives, Run::Restore { from: &t.dir })?;
+    let sock = socks.api();
+    let (vm, conn) = crate::rt::blocking(move || {
+        let mut vm = vm;
+        let conn = api(
+            &sock,
+            "PUT",
+            "/snapshot/load",
+            &serde_json::json!({ "snapshot_path": "/snap/vmstate", "mem_backend": { "backend_type": "File", "backend_path": "/snap/memory" }, "resume_vm": true }),
+            BOOT,
+        )
+        .with_context(|| format!("restoring the snapshot:\n{}", tail(&vm.console)))
+        .and_then(|()| ready(&mut vm, &control, BOOT));
+        (vm, conn)
+    })
+    .await?;
+    Ok(Booted { vm, socks, dir, conn: conn?, stop, proxy_to, server_to, image: image.to_owned(), env: t.env, restored: true })
 }
 
 /// A leg run in a microVM booted for it.
@@ -496,7 +713,11 @@ async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<Job
             }
         }
     })?;
-    let start = guest::LegStart { assignment: serde_json::to_string(a)?, runner_name: leg.runner_name.clone(), cache_max: leg.cache_max, env, ca, server_port };
+    // The time, and randomness for its kernel's: a microVM restored from a snapshot has the
+    // snapshot's (W13-R09).
+    let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let entropy = format!("{}{}", crate::util::random_token(), crate::util::random_token()).into_bytes();
+    let start = guest::LegStart { assignment: serde_json::to_string(a)?, runner_name: leg.runner_name.clone(), cache_max: leg.cache_max, env, ca, server_port, now_ns, entropy };
     to_tx.send(ToGuest::Leg(Box::new(start))).await.map_err(|_| anyhow::anyhow!("the microVM's guest hung up"))?;
     // A cancel goes in; so does what the egress proxy refuses, as it does.
     let done = crate::rt::Shutdown::new();
@@ -632,8 +853,18 @@ pub async fn start_warm(work: &Path, ask: &super::pool::Ask) -> anyhow::Result<(
     let image = ask.image.clone().filter(|i| !i.trim().is_empty()).context("the pool names no image")?;
     let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new() };
     let key = format!("p{}", crate::util::sha256_hex(ask.executor.as_bytes()).get(..11).unwrap_or("ool"));
-    let b = boot_for(&m, &work.join("_firecracker"), &key, &image, &pull).await?;
-    tracing::info!(executor = %ask.executor, pool = %ask.pool, image = %image, "pool microVM ready");
+    let cache = work.join("_firecracker");
+    // Restored from its image's snapshot where it can be (W13-R09), else booted.
+    let restored = if m.jail { Some(restore_for(&m, &cache, &key, &image, &pull).await) } else { None };
+    let b = match restored {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => {
+            tracing::warn!(executor = %ask.executor, error = %format!("{e:#}"), "a pool's microVM couldn't be restored from a snapshot: booting it");
+            boot_for(&m, &cache, &key, &image, &pull).await?
+        }
+        None => boot_for(&m, &cache, &key, &image, &pull).await?,
+    };
+    tracing::info!(executor = %ask.executor, pool = %ask.pool, image = %image, restored = b.restored, "pool microVM ready");
     WARM.lock().insert(ask.executor.clone(), b);
     Ok(())
 }
