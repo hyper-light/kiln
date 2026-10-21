@@ -103,12 +103,13 @@ async fn send_parts(b: &dyn Blobs, upload: &str, path: &Path, size: u64) -> Resu
 }
 
 /// Bytes `first` to `last` of `key`'s object as a stream of [`PIECE`]s, each got by its range, all
-/// of the version the first was: a piece of another, or a refusal, ends the stream early (the
+/// of one version: the one whose etag is `etag` when it's given (the one its reader was told of),
+/// else the one the first piece is of. A piece of another, or a refusal, ends the stream early (the
 /// reader sees fewer bytes than it was promised), with a warning.
-pub fn read_stream(b: Arc<dyn Blobs>, key: String, first: u64, last: u64) -> async_channel::Receiver<Bytes> {
+pub fn read_stream(b: Arc<dyn Blobs>, key: String, etag: Option<String>, first: u64, last: u64) -> async_channel::Receiver<Bytes> {
     let (tx, rx) = async_channel::bounded::<Bytes>(4);
     crate::rt::spawn(async move {
-        let mut etag: Option<String> = None;
+        let mut etag = etag;
         let mut at = first;
         while at <= last {
             let end = at.saturating_add(PIECE.saturating_sub(1)).min(last);
@@ -222,12 +223,18 @@ mod tests {
             let b: Arc<dyn Blobs> = Arc::new(SimBlobs::new(crate::rt::clock(), SimLimits { object: 1 << 30, ..SimLimits::default() }));
             let meta = put_file(b.as_ref(), "big", &path, Cond::Always, Some(&sha)).await?;
             assert_eq!((meta.size, meta.etag), (data.len() as u64, sha.clone()));
-            let rx = read_stream(Arc::clone(&b), "big".into(), 0, data.len() as u64 - 1);
+            let rx = read_stream(Arc::clone(&b), "big".into(), None, 0, data.len() as u64 - 1);
             let mut got = Vec::new();
             while let Ok(piece) = rx.recv().await {
                 got.extend_from_slice(&piece);
             }
             assert!(got == data, "the stream gave {} of {} bytes", got.len(), data.len());
+            // Told of one version, a stream gives nothing of another put since.
+            b.put("big", b"replaced".to_vec(), Put::default()).await?;
+            let rx = read_stream(Arc::clone(&b), "big".into(), Some(sha.clone()), 0, 7);
+            assert!(rx.recv().await.is_err(), "the version its reader was told of is gone");
+            let rx = read_stream(Arc::clone(&b), "big".into(), Some(crate::util::sha256_hex(b"replaced")), 0, 7);
+            assert_eq!(rx.recv().await.ok().as_deref(), Some(&b"replaced"[..]));
             let wrong = put_file(b.as_ref(), "wrong", &path, Cond::Always, Some(&crate::util::sha256_hex(b"other"))).await;
             assert!(matches!(wrong, Err(Refusal::BadChecksum { .. })), "{wrong:?}");
             assert!(matches!(b.head("wrong").await, Err(Refusal::NotFound(_))));

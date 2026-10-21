@@ -1086,7 +1086,7 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
             let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
             let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
             let key = crate::harness::streams::recording_key(id, rid, what);
-            let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, start, end) };
+            let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, None, start, end) };
             file_response(meta, &path, &etag, false, range, srv::channel_body(body))
         }
         None => serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?,
@@ -1109,7 +1109,7 @@ async fn archived_transcript(hub: &Arc<Hub>, id: &str, source: &str) -> R {
     }
     let key = crate::harness::archive::key(id, source);
     let meta = hub.blobs.blobs.head(&key).await.map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
-    let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, 0, meta.size.saturating_sub(1)) };
+    let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, Some(meta.etag.clone()), 0, meta.size.saturating_sub(1)) };
     let r = srv::response(StatusCode::OK, "application/x-ndjson", srv::channel_body(body));
     let r = srv::with_header(r, header::CONTENT_ENCODING, "br");
     Ok(srv::with_header(r, header::CONTENT_LENGTH, &meta.size.to_string()))
@@ -1463,7 +1463,7 @@ async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
     let Ok(range) = byte_range(&req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
     let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
     let length = if meta.size == 0 { 0 } else { end.saturating_sub(start).saturating_add(1) };
-    let body = if req.method() == Method::HEAD || meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(blobs, key, start, end) };
+    let body = if req.method() == Method::HEAD || meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(blobs, key, Some(meta.etag.clone()), start, end) };
     let mut r = srv::response(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK }, "application/octet-stream", srv::channel_body(body));
     r = srv::with_header(r, header::CONTENT_LENGTH, &length.to_string());
     r = srv::with_header(r, header::ACCEPT_RANGES, "bytes");
@@ -1521,6 +1521,9 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
             Ok(Some(c)) => c,
             Ok(None) => break,
             Err(e) => {
+                drop(sink);
+                let _ = done.await;
+                let _ = std::fs::remove_file(&tmp);
                 counted("failed", 0);
                 return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
             }

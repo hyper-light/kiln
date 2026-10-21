@@ -373,7 +373,7 @@ pub async fn take_in_from(cfg: &crate::config::Config, local: &crate::blobs::loc
 /// The binary kept for `target` as a stream, with what kiln knows of it.
 pub fn stream(hub: &Hub, target: &str) -> Option<(Binary, async_channel::Receiver<bytes::Bytes>)> {
     let b = stored(hub, target)?;
-    let rx = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(target), 0, b.size.saturating_sub(1));
+    let rx = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(target), Some(b.sha256.clone()), 0, b.size.saturating_sub(1));
     Some((b, rx))
 }
 

@@ -462,7 +462,10 @@ async fn copy_file(hub: &Hub, location: &super::registry::Location, session: &st
             break;
         }
     }
-    let meta = first.ok_or_else(|| anyhow::anyhow!("nothing was read"))?;
+    let Some(meta) = first.filter(|m| m.size == at) else {
+        writer.abort().await;
+        anyhow::bail!("{at} bytes of it were read: it ended short");
+    };
     writer.finish().await.map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(meta)
 }

@@ -202,6 +202,14 @@ impl Sync {
     /// Starts the owner of the groups kept in `dir`, the contents their steps name in `contents`.
     /// Blob tokens are signed with `key`.
     pub fn start(dir: PathBuf, key: String, contents: Arc<Contents>) -> Self {
+        // Contents half-sent when the server stopped (`<data>/sync/incoming`): none is under way
+        // before it listens.
+        let incoming = dir.join("incoming");
+        if incoming.is_dir()
+            && let Err(e) = std::fs::remove_dir_all(&incoming)
+        {
+            tracing::warn!(target: "kiln.sync", error = %e, "contents half-sent before the server stopped couldn't be removed");
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out) = async_channel::unbounded();
         let view = Arc::new(Mutex::new(View::default()));

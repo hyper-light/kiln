@@ -166,7 +166,7 @@ pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Rec
         let (_, rx) = async_channel::bounded(1);
         return rx;
     }
-    crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), start, end.saturating_sub(1))
+    crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), Some(obj.digest.clone()), start, end.saturating_sub(1))
 }
 
 /// What a collection let go.

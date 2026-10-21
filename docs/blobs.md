@@ -172,6 +172,11 @@ release after it, with nothing a key holds lost:
   that held it, and their content comes back as above (sync's runners send it again; the binary is
   fetched or uploaded again).
 
+The tests of `kiln::blobs::local` run the older kiln's upkeep word for word (main at 64b69db: its
+collection's SQL, then its sweep) on a store this release wrote, and then this release's
+reconciliation on what it left; `kiln::sync::contents` and `kiln::updates` test taking in what it
+kept as files.
+
 ## Watching it
 
 - `kiln_blobs_requests_total{store, op, outcome}`: requests by operation and outcome (`ok`,

@@ -202,7 +202,7 @@ impl Contents {
             let (_, rx) = async_channel::bounded(1);
             return Some((0, rx));
         }
-        Some((size, crate::blobs::io::read_stream(Arc::clone(&self.blobs), key(hash), 0, size.saturating_sub(1))))
+        Some((size, crate::blobs::io::read_stream(Arc::clone(&self.blobs), key(hash), Some(hash.to_ascii_lowercase()), 0, size.saturating_sub(1))))
     }
 }
 
