@@ -2713,14 +2713,22 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
 - *Done.* R11's `type=registry`, end to end (`w08_r11_buildkit_registry_cache`): the cache as an
   image in kiln's registry (W12), the job's own token its credentials (W12-R03), and the next
   run's build, on a fresh builder, takes every layer from it.
+- *Done.* AC01 and AC09 with the published clients: `@actions/cache` 6.3.0 and
+  `@actions/artifact` 6.3.1, bundled and pinned (`crates/kiln/tests/fixtures/storage-action`),
+  in `crates/kiln/tests/storage.rs`:
+  - AC01: the cache saved (a second save finds it there), restored by key and by prefix, a miss,
+    and a branch restoring its default branch's entry; artifacts of one file, of a thousand and
+    (with `KILN_TEST_BIG=1`) of 2 GiB uploaded, listed, downloaded by name and by id, one deleted.
+  - AC09: a dispatched run's jobs unset (`write`), `read`, `write-only` and `none`, each with its
+    `ACTIONS_CACHE_MODE` and the client restoring and saving as it allows, saying what it skipped;
+    a `pull_request_target` run restoring the default branch's entry and unable to save there;
+    a called workflow asking for more than its caller allows not starting, and saying why.
 - *Left.*
   - R12 and AC08 on a real 10 GbE LAN. The store's part is measured by `kiln ci bench`
     (W22-AC08): a 1 GiB entry restored at 7,962 MiB/s, against 500. R13's insights are done
     (`cache_v1.rs` and the chunked cache record every lookup and save; W19 shows them by key
     prefix, with the time hits saved).
   - A diff that only rebases reusing what it didn't touch (W14).
-  - AC01 (the toolkit harness: 1,000 files, 2 GiB) and AC09, which run the published toolkit
-    packages and `actions/cache` themselves.
 
 ### W09 Secrets and variables
 
