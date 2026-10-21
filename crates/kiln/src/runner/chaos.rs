@@ -23,7 +23,7 @@ use futures::FutureExt as _;
 use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::http::io::RtFuturesIo;
-use crate::net::{Kind, NetHandle, SERVER_PEER};
+use crate::net::Kind;
 use crate::rt::Shutdown;
 
 /// What to inject.
@@ -113,15 +113,22 @@ pub struct DelayLine {
 }
 
 impl DelayLine {
-    pub fn new(net: NetHandle, by: Duration) -> DelayLine {
+    /// The line, and where each frame comes out when it's due: back to the runner's loop, which
+    /// sends it if it's connected and welcomed then, and keeps it for the next connection if not,
+    /// as it does any frame (one sent straight on could reach a connection the server hasn't
+    /// taken the runner's Hello on yet, and be dropped there).
+    pub fn new(by: Duration) -> (DelayLine, async_channel::Receiver<(u32, Kind, Vec<u8>)>) {
         let (tx, rx) = async_channel::unbounded::<(Instant, u32, Kind, Vec<u8>)>();
+        let (due_tx, due_rx) = async_channel::unbounded::<(u32, Kind, Vec<u8>)>();
         crate::rt::spawn(async move {
             while let Ok((due, lane, kind, data)) = rx.recv().await {
                 crate::rt::sleep_until(due).await;
-                net.send(SERVER_PEER, lane, kind, data).await;
+                if due_tx.send((lane, kind, data)).await.is_err() {
+                    return;
+                }
             }
         });
-        DelayLine { tx, by }
+        (DelayLine { tx, by }, due_rx)
     }
 
     pub fn send(&self, lane: u32, kind: Kind, data: Vec<u8>) {

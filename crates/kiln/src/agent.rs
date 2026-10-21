@@ -246,6 +246,8 @@ enum Ev {
     Forwarded(Vec<u8>),
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
+    /// A test build's fault: a frame held back, due now (W22-AC04).
+    Delayed(u32, Kind, Vec<u8>),
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -632,6 +634,14 @@ async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
     }
 }
 
+/// The next of `rx`, or never when there's none.
+async fn recv_opt<T>(rx: Option<&async_channel::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(r) => r.recv().await.ok(),
+        None => futures::future::pending().await,
+    }
+}
+
 async fn sleep_until_opt(t: Option<Instant>) {
     match t {
         Some(t) => crate::rt::sleep_until(t).await,
@@ -791,7 +801,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // server late.
     let chaos = crate::runner::chaos::get();
     let mut chaos_drop: Option<Instant> = None;
-    let delay_line = chaos.and_then(|c| c.delay).map(|by| crate::runner::chaos::DelayLine::new(net.clone(), by));
+    let (delay_line, delayed) = match chaos.and_then(|c| c.delay).map(crate::runner::chaos::DelayLine::new) {
+        Some((line, due)) => (Some(line), Some(due)),
+        None => (None, None),
+    };
     let mut jobs: HashMap<String, Running> = HashMap::new();
     // Pools' executors this runner started (docs/ci.md W13-R09).
     let pool_execs = crate::runner::pool::Executors::default();
@@ -992,6 +1005,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
             () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
+            d = recv_opt(delayed.as_ref()).fuse() => match d { Some((lane, kind, data)) => Ev::Delayed(lane, kind, data), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
@@ -1011,6 +1025,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 crate::browser::driven::stop_all().await;
                 return Ok(());
+            }
+            Ev::Delayed(lane, kind, data) => {
+                // As an undelayed frame goes: sent while connected and welcomed, kept otherwise.
+                if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    net.send(SERVER_PEER, lane, kind, data).await;
+                } else if kind != Kind::Term {
+                    buffered += data.len();
+                    buffer.push_back((lane, kind, data));
+                }
             }
             Ev::ChaosDrop => {
                 chaos_drop = None;

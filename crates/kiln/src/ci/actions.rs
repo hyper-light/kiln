@@ -255,6 +255,22 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             }
             continue;
         }
+        // `./path`: an action of the workspace, read from it as the step runs (W07-R01). A
+        // composite one's own actions are pinned now, as a remote composite's are: read from this
+        // repository at the running commit, where a checkout of it puts the action.
+        if let Some(p) = uses.strip_prefix("./") {
+            let path = p.trim_matches('/').to_owned();
+            if !path.split('/').any(|s| s == ".." || s == ".git")
+                && let Some(meta) = own_metadata(hub, repo, sha, &path).await
+                && let (Some(action), _) = kiln_ci::wf::parse_action(&meta)
+                && action.runs.using == "composite"
+            {
+                let mut inner = Vec::new();
+                steps_uses(&action.runs.steps, &mut inner);
+                todo.extend(inner.into_iter().map(|x| (x, depth + 1, Some(below.clone()))));
+            }
+            continue;
+        }
         let Some(r) = Remote::parse(&uses) else { continue };
         if depth > 9 {
             return Err(format!("`{uses}`: composite actions nest at most 10 deep"));

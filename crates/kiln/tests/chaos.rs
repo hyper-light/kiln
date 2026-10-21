@@ -123,7 +123,7 @@ jobs:
     assert_eq!(state(&legs, "talk"), ("success".to_owned(), 1), "a dropped connection loses nothing\n{legs:?}\n{}", s.log());
     let said = log(&s, &legs, "talk")?;
     let missing: Vec<u32> = (1..=40).filter(|i| !said.contains(&format!("line {i} of 40"))).collect();
-    assert!(missing.is_empty(), "lines lost: {missing:?}\n{said}");
+    assert!(missing.is_empty(), "lines lost: {missing:?}\n{said}\n{}", s.log());
     assert_eq!(state(&legs, "after"), ("success".to_owned(), 1), "the output arrived\n{}\n{}", log(&s, &legs, "after")?, s.log());
     assert!(s.log().contains("chaos: dropping the connection"), "the connection was dropped\n{}", s.log());
     Ok(())

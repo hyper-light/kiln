@@ -173,3 +173,85 @@ fn w14_ac05_github_actions_on_a_native_repository() -> anyhow::Result<()> {
     assert!(threads.contains("from an action"), "{threads}");
     Ok(())
 }
+
+/// `actions/checkout` v7 (as the corpus pins it, by commit): its credentials persisted in a
+/// configuration file of their own under `RUNNER_TEMP`, which a later `git fetch` in the job uses:
+/// on the host, in a job container, and in the `docker` executor. In the job container, root over
+/// a workspace this runner's user owns, git refuses the repository until it's a safe directory, as
+/// on GitHub (checkout adds it only to a global configuration of its own while it runs).
+const CHECKOUT_V7: &str = r#"on: push
+jobs:
+  host:
+    runs-on: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: git fetch --tags && echo "fetched again"
+  container:
+    runs-on: local
+    container: docker.io/library/node:24-bookworm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --tags && echo "fetched again"
+  executor:
+    runs-on: v7exec
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: git fetch --tags && echo "fetched again"
+"#;
+
+#[test]
+fn w07_r09_checkout_v7_persists_its_credentials() -> anyhow::Result<()> {
+    if !github() {
+        eprintln!("skipped: github.com doesn't answer here, and the action comes from it");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    // The job container on this machine's network: the server listens on its loopback only. The
+    // `docker` executor's image has Node and git.
+    let rule = "[[ci.routing]]\nmatch = { labels = [\"v7exec\"] }\nexecutor = [\"docker\"]\nimage = \"docker.io/library/node:24-bookworm\"\n";
+    let s = common::start_env(dir.path(), &Options { agent: true, ci: "", extra: rule }, false, &[("KILN_CONTAINER_NETWORK", "host")])?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, dir.path(), &["clone", "-q", &url, "work"])?;
+    let work = dir.path().join("work");
+    git(&home, &work, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "README.md"])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/checkout.yml"), CHECKOUT_V7)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "checkout v7"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    let mut run = Value::Null;
+    until(&s, 900, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0").cloned().unwrap_or_default();
+        Ok(run.get("finished_at").is_none_or(Value::is_null).then_some(body))
+    })?;
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    for l in serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let leg = l.get("id").and_then(Value::as_str).unwrap_or_default();
+        let (_, about) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
+        let about: Value = serde_json::from_str(&about)?;
+        let mut log = String::new();
+        for x in about.get("steps").and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.get("idx").and_then(Value::as_u64)) {
+            log.push_str(&http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={x}"), &s.admin, None)?.1);
+        }
+        let key = about.pointer("/leg/key").and_then(Value::as_str).unwrap_or_default().to_owned();
+        assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{key}: {about}\n{log}\n{}", s.log());
+        assert!(log.contains("fetched again"), "{key}: {log}");
+    }
+    Ok(())
+}

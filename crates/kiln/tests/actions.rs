@@ -142,7 +142,9 @@ jobs:
           echo "as-runner=$(cat as-runner.txt) owner=$(stat -c %u as-runner.txt)"
 "#;
 
-const LOCAL: &str = "name: local\ninputs:\n  name:\n    description: n\n    default: nobody\noutputs:\n  echoed:\n    description: e\n    value: ${{ steps.e.outputs.echoed }}\nruns:\n  using: composite\n  steps:\n    - id: e\n      shell: bash\n      run: echo \"echoed=local ${{ inputs.name }}\" >> \"$GITHUB_OUTPUT\"\n";
+// Its own remote action (`kinds/hello`, which nothing else in the run uses) is pinned as the run
+// starts, from the repository at the running commit (W07-R02).
+const LOCAL: &str = "name: local\ninputs:\n  name:\n    description: n\n    default: nobody\noutputs:\n  echoed:\n    description: e\n    value: ${{ steps.e.outputs.echoed }}\nruns:\n  using: composite\n  steps:\n    - id: e\n      shell: bash\n      run: echo \"echoed=local ${{ inputs.name }}\" >> \"$GITHUB_OUTPUT\"\n    - uses: kinds/hello@v1\n";
 
 /// A server with its own runner whose `kinds/*` actions come from `src`, polling `repo`, once it
 /// has taken the repository as it is (the push after its first poll runs).
@@ -378,6 +380,7 @@ fn w07_ac04_kinds() -> anyhow::Result<()> {
     commit(&src.join("kinds/docker"), DOCKER, Some("v1"))?;
     commit(&src.join("kinds/stack"), STACK, Some("v1"))?;
     commit(&src.join("kinds/as-runner"), AS_RUNNER, Some("v1"))?;
+    commit(&src.join("kinds/hello"), HELLO, Some("v1"))?;
     // The machine's Node 24, when it has one, so the runner needn't fetch it.
     if let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file()))
         && Command::new(&node).arg("--version").output().is_ok_and(|v| String::from_utf8_lossy(&v.stdout).starts_with("v24."))
@@ -443,7 +446,7 @@ fn w07_ac04_kinds() -> anyhow::Result<()> {
         at(want)?;
     }
     // Outputs, of every kind, and what the Docker action wrote in the workspace.
-    for want in ["js=hello acme/kinds", "docker=hello whale file=whale wrote this", "url=from-url", "stack=deep-outer-middle-inner", "local=local here"] {
+    for want in ["js=hello acme/kinds", "docker=hello whale file=whale wrote this", "url=from-url", "stack=deep-outer-middle-inner", "local=local here", "hello from kinds/hello"] {
         at(want)?;
     }
     // An image made for GitHub's runner user writes in the workspace as this runner's user.

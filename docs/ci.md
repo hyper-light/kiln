@@ -2364,6 +2364,10 @@ Gives step execution for `uses:`.
     to that repository's legs only. No checkout is needed.
   - R02 through reusable workflows: their calls are followed when the run starts, and the
     actions of the workflows they call are pinned with the rest.
+  - R02 through the repository's own composite actions (`./path`): each is read from the
+    repository at the running commit, where a checkout of it puts it, and its remote actions are
+    pinned with the rest (`w07_ac04_kinds`'s local action uses one nothing else does). The
+    corpus found them missed: such a job failed with "was not resolved when the run started".
   - R04 (`kiln_ci::policy`, AC05's unit tests):
     - `[ci.actions] allow`, `deny`, `require_sha_pins` (`KCI4021`) and `prefetch`;
     - repositories' own narrower policies (`/api/ci/actions/policy?repo=`, `kiln actions
@@ -2460,6 +2464,13 @@ Gives step execution for `uses:`.
   itself, by a relative URL), `actions/download-artifact@v4` of an artifact another run made (its
   `run-id`, with the job's token), and `peter-evans/create-or-update-comment@v4` commenting on the
   pull request as the job. It runs when github.com answers, the actions coming from it.
+- *Done.* `actions/checkout` v7, as the corpus pins it, keeps its credentials in a configuration
+  file of their own under `RUNNER_TEMP` (`includeIf` in the repository's configuration), and a
+  later `git fetch` in the job uses them: on the host, in a job container and in the `docker`
+  executor (`w07_r09_checkout_v7_persists_its_credentials`). In a job container (root, over a
+  workspace this runner's user owns) git first wants the workspace a safe directory, as on GitHub.
+  A job that drops its credentials (`persist-credentials: false`) and fetches again needs them on
+  kiln, whose repositories aren't read anonymously as a public one on GitHub is.
 - *Left.* AC01 (with W22-AC02).
 
 ### W08 Runtime services: store, caches, artifacts, reuse
@@ -6523,7 +6534,10 @@ and AC02.
   in kiln's gate). `kiln agent --chaos <spec>`, or `KILN_CHAOS` for a server's own runner, is
   compiled only with the `chaos` feature (`crate::runner::chaos`):
   - `drop=<duration>`: the runner drops its connection that often;
-  - `delay=<duration>`: what it sends the server arrives that late;
+  - `delay=<duration>`: what it sends the server arrives that late. A frame due goes back through
+    the runner's loop, sent if it's connected and welcomed then and kept for the next connection
+    if not, as any frame is (sent straight on, one could reach a connection whose Hello the server
+    hadn't taken yet, and be dropped there: the log once lost a step's lines so);
   - `oom=<duration>`: a step on the host is killed that long after it starts, as the OOM killer
     kills, and counted where kiln counts the OOM killer's kills;
   - `disk=<MiB>`: a job container's workspace is a volume that small;

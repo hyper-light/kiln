@@ -49,6 +49,9 @@ FINISHED = {"succeeded", "failed", "cancelled", "timed_out", "skipped"}
 # Failures that aren't kiln's, by what their notes say: the reason the table gives.
 KNOWN = [
     (r"deploy-pages|Failed to create deployment \(status: 501\)", "GitHub Pages is outside kiln (docs/ci.md §1.3)"),
+    # `persist-credentials: false`, then a fetch of the repository: GitHub's public repositories
+    # answer anyone, kiln's only those signed in.
+    (r"could not read Username for", "the job drops its credentials and fetches again: kiln's repositories aren't read anonymously, as a public one on GitHub is"),
 ]
 
 
