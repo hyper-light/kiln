@@ -1,8 +1,16 @@
 //! The network, under the nemesis: frames between nodes dropped, duplicated, delayed (so arriving
 //! out of order) and cut off by partitions, while the nemesis lasts; after it, every frame
-//! arrives, soon. A model asks what becomes of each frame it sends ([`Net::send`]) and puts its
-//! arrivals in its own queue; frames that are only ever late (an announcement a real link
-//! carries again until it's heard) go by [`Net::send_late`].
+//! arrives, soon. A model asks what becomes of each frame it sends and puts its arrivals in its
+//! own queue, by how the frame travels:
+//!
+//! - [`Net::send`]: a datagram, lost, doubled or overtaken;
+//! - [`Net::send_in_order`]: on an ordered lane (a QUIC stream, a TCP connection): lost (a lane
+//!   that sheds frames or a connection that drops), never doubled, never overtaking one sent
+//!   before it on that lane;
+//! - [`Net::send_once`]: a request or its answer on a connection of its own: lost or late, never
+//!   doubled;
+//! - [`Net::send_late`]: only ever late (an announcement a real link carries again until it's
+//!   heard).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -91,6 +99,8 @@ pub struct Net {
     rng: Rng,
     /// Links cut, each until when (both directions).
     cuts: BTreeMap<(Node, Node), Duration>,
+    /// Each ordered lane's last arrival: a frame sent on it after arrives after it.
+    lanes: BTreeMap<(Node, Node, u32), Duration>,
     counts: NetCounts,
 }
 
@@ -103,7 +113,7 @@ fn link(a: Node, b: Node) -> (Node, Node) {
 
 impl Net {
     pub fn new(faults: Faults, rng: Rng) -> Self {
-        Self { faults, rng, cuts: BTreeMap::new(), counts: NetCounts::default() }
+        Self { faults, rng, cuts: BTreeMap::new(), lanes: BTreeMap::new(), counts: NetCounts::default() }
     }
 
     pub fn faults(&self) -> Faults {
@@ -161,6 +171,45 @@ impl Net {
         Fate::Once(self.delay(now))
     }
 
+    /// Whether a frame sent now from `from` to `to` is lost (cut off, or dropped), counted.
+    fn lost(&mut self, now: Duration, from: Node, to: Node) -> bool {
+        self.counts.sent = self.counts.sent.saturating_add(1);
+        if !self.faulty(now) {
+            return false;
+        }
+        if self.is_cut(now, from, to) {
+            self.counts.cut = self.counts.cut.saturating_add(1);
+            return true;
+        }
+        if self.rng.chance(self.faults.drop) {
+            self.counts.dropped = self.counts.dropped.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    /// What becomes of a frame `from` sends `to` at `now` on ordered lane `lane`: it arrives after
+    /// every frame sent before it on that lane, or not at all; never twice.
+    pub fn send_in_order(&mut self, now: Duration, from: Node, to: Node, lane: u32) -> Fate {
+        if self.lost(now, from, to) {
+            return Fate::Lost;
+        }
+        let drawn = self.delay(now);
+        let last = self.lanes.entry((from, to, lane)).or_default();
+        let at = drawn.max(last.saturating_add(Duration::from_nanos(1)));
+        *last = at;
+        Fate::Once(at)
+    }
+
+    /// What becomes of a request (or its answer) `from` sends `to` at `now`, on a connection of
+    /// its own: lost or late, never twice.
+    pub fn send_once(&mut self, now: Duration, from: Node, to: Node) -> Fate {
+        if self.lost(now, from, to) {
+            return Fate::Lost;
+        }
+        Fate::Once(self.delay(now))
+    }
+
     /// When a frame that's only ever late arrives: never lost or doubled, but delayed (past a cut,
     /// until the cut heals).
     pub fn send_late(&mut self, now: Duration, from: Node, to: Node) -> Duration {
@@ -208,6 +257,29 @@ mod tests {
             let fate = calm.send(now, Node(0), Node(1));
             assert!(matches!(fate, Fate::Once(t) if t > now && t <= now + ms(2)), "after the nemesis, a frame arrives once, soon: {fate:?}");
         }
+    }
+
+    /// CP-T6.1: on an ordered lane, frames are lost but never overtake one another or come twice;
+    /// a request is lost or late, never doubled.
+    #[test]
+    fn an_ordered_lane_loses_frames_but_never_reorders_or_doubles_them() {
+        let ms = Duration::from_millis;
+        let mut net = Net::new(Faults { drop: 200, dup: 500, slow: ms(80), fast: ms(2), until: ms(1000) }, Rng::new(11));
+        let mut last = Duration::ZERO;
+        let mut lost = 0;
+        for i in 0..1000u64 {
+            let fate = net.send_in_order(ms(i), Node(0), Node(1), 7);
+            assert!(!matches!(fate, Fate::Twice(..)), "an ordered lane doubled a frame");
+            match fate {
+                Fate::Once(t) => {
+                    assert!(t > last, "a frame overtook one sent before it");
+                    last = t;
+                }
+                _ => lost += 1,
+            }
+            assert!(!matches!(net.send_once(ms(i), Node(0), Node(1)), Fate::Twice(..)));
+        }
+        assert!(lost > 0);
     }
 
     /// CP-T6.1: a frame that's only ever late arrives once the cut it met heals.
