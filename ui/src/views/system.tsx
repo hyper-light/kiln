@@ -1,21 +1,23 @@
 import * as React from "react";
-import { RefreshCw } from "lucide-react";
+import { Download, RefreshCw } from "lucide-react";
 import { api } from "@/api/client";
 import type { AuditEntry, SystemInfo } from "@/api/types";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { CopyButton, EmptyState, FoldSection, PageIntro } from "@/components/ui/misc";
+import { CopyButton, EmptyState, FoldSection, PageIntro, SearchField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { useRes, warm, type Res } from "@/lib/data";
+import { fileStamp, saveFile, toCsv } from "@/lib/download";
 import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 
-const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 15_000 } };
+// Live while the page is open: the children, the crash log and the figures follow the server within seconds.
+const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 5_000 } };
 
 const CRASH_LEAD = "Recorded by kiln supervise when the server exits abnormally.";
 const CONFIG_LEAD = "Secrets are redacted by the server.";
@@ -204,7 +206,8 @@ function AuditSection() {
 
 function AuditTable({ win }: { win: AuditWindow }) {
   const since = win === "all" ? undefined : Math.floor(Date.now() / 1000 / 3600) * 3600 - Number(win) * 86400;
-  const rows = useSuspenseResource(`audit/${win}`, (s) => api.audit({ since, limit: 1000 }, s), { pollMs: 60_000 }).data;
+  // Live while its section is open (folded, it isn't rendered and doesn't ask).
+  const rows = useSuspenseResource(`audit/${win}`, (s) => api.audit({ since, limit: 1000 }, s), { pollMs: 10_000 }).data;
   const [chosen, setChosen] = React.useState<Chosen>({});
   const [q, setQ] = React.useState("");
   const facets: Facet[] = AUDIT_FACETS.map((f) => {
@@ -218,16 +221,21 @@ function AuditTable({ win }: { win: AuditWindow }) {
   const shown = rows.filter((a) => auditTakes(a, chosen, q));
   return (
     <>
-      <FacetBox
-        className="mb-4"
-        label="Filter the audit log"
-        placeholder="Filter by who, action, scope, result, address, or words…"
-        query={q}
-        onQuery={setQ}
-        facets={facets}
-        chosen={chosen}
-        onChosen={setChosen}
-      />
+      <div className="log-tools">
+        <FacetBox
+          className="min-w-0 flex-1"
+          label="Filter the audit log"
+          placeholder="Filter by who, action, scope, result, address, or words…"
+          query={q}
+          onQuery={setQ}
+          facets={facets}
+          chosen={chosen}
+          onChosen={setChosen}
+        />
+        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the entries shown, as CSV" onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}>
+          <Download /> Download
+        </Button>
+      </div>
       {shown.length === 0 ? (
         <EmptyState title={rows.length ? "No entries match." : "No audit entries in this window."} />
       ) : (
@@ -264,6 +272,46 @@ function AuditTable({ win }: { win: AuditWindow }) {
             </tbody>
           </table>
         </div>
+      )}
+    </>
+  );
+}
+
+/** The audit entries as CSV, a column per field. */
+function auditCsv(rows: AuditEntry[]): string {
+  return toCsv(
+    ["time", "who", "for", "action", "target", "result", "scope", "address", "token", "detail"],
+    rows.map((a) => [new Date(a.ts * 1000).toISOString(), a.principal, a.on_behalf_of, a.action, a.target, a.result, a.scope, a.ip, a.token, a.detail]),
+  );
+}
+
+/** The supervisor's crash log, newest first: filtered as you type, downloaded as what it shows. */
+function CrashLog({ lines }: { lines: string[] }) {
+  const [q, setQ] = React.useState("");
+  if (lines.length === 0) {
+    return (
+      <div className="flex items-center gap-2.5 py-2 font-mono text-[11px] text-[#a8c9bc]">
+        <i className="dot" data-status="succeeded" /> No crashes recorded.
+      </div>
+    );
+  }
+  const words = q.trim().toLowerCase();
+  const shown = words ? lines.filter((l) => l.toLowerCase().includes(words)) : lines;
+  return (
+    <>
+      <div className="log-tools">
+        <SearchField className="min-w-0 flex-1" label="Filter the crash log" placeholder="Filter by generation, signal, or words…" value={q} onChange={setQ} />
+        <span className="log-count">{words ? `${shown.length} of ${lines.length}` : lines.length} lines</span>
+        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the lines shown" onClick={() => saveFile(`kiln-crash-log-${fileStamp()}.txt`, shown.join("\n") + "\n")}>
+          <Download /> Download
+        </Button>
+      </div>
+      {shown.length === 0 ? (
+        <EmptyState title="No lines match." />
+      ) : (
+        <pre className="max-h-[420px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#d8c8b0]">
+          {shown.join("\n")}
+        </pre>
       )}
     </>
   );
@@ -310,15 +358,7 @@ function SystemBody() {
 
       <FoldSection id="system.crash" index="02" label="Process" title="Crash log">
         <p className="section-lead">{CRASH_LEAD}</p>
-        {d.crash_log.length === 0 ? (
-          <div className="flex items-center gap-2.5 py-2 font-mono text-[11px] text-[#a8c9bc]">
-            <i className="dot" data-status="succeeded" /> No crashes recorded.
-          </div>
-        ) : (
-          <pre className="max-h-[420px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#d8c8b0]">
-            {d.crash_log.join("\n")}
-          </pre>
-        )}
+        <CrashLog lines={d.crash_log} />
       </FoldSection>
 
       <FoldSection id="system.config" index="03" label="Read-only" title="Effective configuration">

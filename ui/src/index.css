@@ -1041,7 +1041,9 @@ html.fills-window body {
 .field textarea::placeholder {
   color: #6f7380;
 }
+/* Its own clear button only: Safari keeps drawing its native one under `appearance: none`. */
 .field input::-webkit-search-cancel-button {
+  display: none;
   appearance: none;
 }
 .field-label {
@@ -2918,3 +2920,27 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   background: #08090a;
 }
 
+
+/* A log's tools above it: its filter, how many lines, its download. */
+.log-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 14px;
+}
+.log-count {
+  flex: none;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+@media (max-width: 639px) {
+  .log-tools {
+    flex-wrap: wrap;
+  }
+  .log-tools > :first-child {
+    flex-basis: 100%;
+  }
+}
