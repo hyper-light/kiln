@@ -47,6 +47,10 @@ class Stream {
     this.video = media.getVideoTracks()[0];
     this.audio = media.getAudioTracks()[0];
     if (this.video) this.video.contentHint = "detail";
+    // What its pictures' times are moved by (a tab captured since a switch counts from its own
+    // start), and the last one's.
+    this.shift = 0;
+    this.lastTs = -1;
   }
 
   codecFor(w, h) {
@@ -87,32 +91,77 @@ class Stream {
   async start() {
     const s = this.video.getSettings();
     await this.configure(s.width, s.height);
-    const reader = new MediaStreamTrackProcessor({ track: this.video }).readable.getReader();
+    this.see(this.video);
+    if (this.audio) this.hear(this.audio);
+  }
+
+  // Each picture of `track`, while it's the one captured.
+  see(track) {
+    const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
     (async () => {
       for (;;) {
         const { value: frame, done } = await reader.read();
         if (done) break;
+        if (track !== this.video) {
+          frame.close();
+          reader.cancel().catch(() => {});
+          break;
+        }
         this.frame(frame);
       }
     })();
-    if (this.audio) {
+  }
+
+  // Its sound, while `track` is the one captured.
+  hear(track) {
+    if (!this.aenc) {
       this.aenc = new AudioEncoder({ output: (c) => out(this.id, "a", "k", c.timestamp, chunkData(c)), error: () => {} });
       this.aenc.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 2, bitrate: 96_000, opus: { usedtx: true, complexity: 10 } });
       out(this.id, "c", "a", 0, btoa(JSON.stringify({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 })));
-      const ar = new MediaStreamTrackProcessor({ track: this.audio }).readable.getReader();
-      (async () => {
-        for (;;) {
-          const { value, done } = await ar.read();
-          if (done) break;
-          if (!this.paused && this.aenc.state === "configured") this.aenc.encode(value);
-          value.close();
-        }
-      })();
     }
+    const ar = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    (async () => {
+      for (;;) {
+        const { value, done } = await ar.read();
+        if (done) break;
+        if (track !== this.audio) {
+          value.close();
+          ar.cancel().catch(() => {});
+          break;
+        }
+        if (!this.paused && this.aenc.state === "configured") this.aenc.encode(value);
+        value.close();
+      }
+    })();
+  }
+
+  // Another tab's picture and sound from now on (its viewer went to it): the same encoders, from
+  // a key frame, its times after the last sent.
+  switchTo(media) {
+    const before = this.media;
+    this.media = media;
+    this.video = media.getVideoTracks()[0];
+    this.audio = media.getAudioTracks()[0];
+    if (this.video) this.video.contentHint = "detail";
+    this.shift = null;
+    this.forceKey = true;
+    if (this.video) this.see(this.video);
+    if (this.audio) this.hear(this.audio);
+    for (const t of before.getTracks()) t.stop();
+  }
+
+  // A picture at its time after the last one's.
+  stamped(frame) {
+    if (this.shift === null) this.shift = Math.max(0, this.lastTs + 16_667 - frame.timestamp);
+    if (!this.shift) return frame;
+    const moved = new VideoFrame(frame, { timestamp: frame.timestamp + this.shift });
+    frame.close();
+    return moved;
   }
 
   frame(taken) {
-    const frame = this.evened(taken);
+    const frame = this.evened(this.stamped(taken));
+    this.lastTs = frame.timestamp;
     const [w, h] = this.size;
     if (frame.displayWidth !== w || frame.displayHeight !== h) {
       // The page's size changed: the encoders follow, from a key frame (what comes meanwhile waits
@@ -179,8 +228,11 @@ class Stream {
     if (this.last && !this.paused) this.still();
   }
 
-  // The page's new size (in pixels): the capture takes it (it would scale into the old one).
+  // The page's new size (in pixels): the capture takes it (it would scale into the old one), and
+  // so does a tab captured later.
   async resize(w, h) {
+    this.opts.width = w;
+    this.opts.height = h;
     await this.video.applyConstraints({ width: { max: w }, height: { max: h }, aspectRatio: { exact: w / h }, frameRate: { max: this.opts.framerate || 60 } });
   }
 
@@ -221,7 +273,27 @@ class Pushed extends Stream {
   async resize() {}
 }
 
+// A tab's picture and sound, at most a stream's size.
+const tab = (mediaId, o) =>
+  navigator.mediaDevices.getUserMedia({
+    video: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId, maxWidth: o.width || 1280, maxHeight: o.height || 800, maxFrameRate: o.framerate || 60 } },
+    audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId } },
+  });
+
 chrome.runtime.onMessage.addListener((m, _sender, reply) => {
+  if (m.kind === "switch") {
+    (async () => {
+      try {
+        const s = streams.get(m.stream);
+        if (!s || s instanceof Pushed) throw new Error("no such tab's stream");
+        s.switchTo(await tab(m.mediaId, s.opts));
+        reply({ ok: true, audio: Boolean(s.audio) });
+      } catch (e) {
+        reply({ ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
   if (m.kind === "pushed") {
     (async () => {
       try {
@@ -239,11 +311,7 @@ chrome.runtime.onMessage.addListener((m, _sender, reply) => {
   (async () => {
     try {
       const o = m.opts || {};
-      const media = await navigator.mediaDevices.getUserMedia({
-        video: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: m.mediaId, maxWidth: o.width || 1280, maxHeight: o.height || 800, maxFrameRate: o.framerate || 60 } },
-        audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: m.mediaId } },
-      });
-      const s = new Stream(m.stream, media, o);
+      const s = new Stream(m.stream, await tab(m.mediaId, o), o);
       streams.set(m.stream, s);
       await s.start();
       reply({ ok: true, size: s.size, audio: Boolean(s.audio) });

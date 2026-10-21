@@ -14,7 +14,7 @@ import { SelectField } from "@/components/ui/misc";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Live } from "./live";
-import type { LiveStream } from "./live-of";
+import { typedUrl, type LiveStream } from "./live-of";
 import "./live.css";
 
 type Profile = "conversation" | "clean" | "personal";
@@ -66,16 +66,10 @@ function programOf(command: string): string {
   return program;
 }
 
-/** A typed address, as one: a scheme when it has none (`localhost:3000` is http). */
-function urlOf(typed: string): string {
-  const t = typed.trim();
-  return /^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? t : `http://${t}`;
-}
-
 /** A typed address on the agent's machine itself (`localhost:3000/x`): its port and page. */
 function localOf(typed: string): { port: number; path: string } | undefined {
   try {
-    const u = new URL(urlOf(typed));
+    const u = new URL(typedUrl(typed));
     if (!["localhost", "127.0.0.1", "[::1]"].includes(u.hostname) || !u.port) return undefined;
     return { port: Number(u.port), path: `${u.pathname}${u.search}` };
   } catch {
@@ -164,7 +158,7 @@ function Pages({ session }: { session: string }) {
 
   const open = async () => {
     const starting = chosen === "app";
-    const url = port ? addressOf(port) : urlOf(address);
+    const url = port ? addressOf(port) : typedUrl(address);
     if (!starting && !port && !address.trim()) {
       setError("Which address? Type one, like localhost:3000.");
       return;

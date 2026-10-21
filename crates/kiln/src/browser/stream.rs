@@ -179,31 +179,103 @@ pub struct Stream {
     paused: std::sync::atomic::AtomicBool,
 }
 
-/// What a stream's page is: a Chromium tab (captured as its compositor draws it), or a page of
-/// another engine's (`super::driven`: its picture taken as it changes).
+/// What a stream's page is: a Chromium tab (captured as its compositor draws it) and the others
+/// it opened, or a page of another engine's (`super::driven`: its picture taken as it changes).
 pub(crate) enum Surface {
-    Tab(Page),
+    Tab(Tabs),
     Driven(super::driven::Driven),
+}
+
+/// A Chromium stream's tabs, as a browser's: the one shown (captured, and what its viewers do goes
+/// to it), and the rest, each opened by its page (a link to a new tab, a sign-in's popup) or by its
+/// viewers.
+pub(crate) struct Tabs {
+    list: Mutex<Vec<Tab>>,
+    /// The shown tab's target.
+    shown: Mutex<String>,
+    /// One tab shown at a time (two at once would capture both).
+    showing: futures::lock::Mutex<()>,
+}
+
+#[derive(Clone)]
+struct Tab {
+    page: Arc<Page>,
+    /// Chrome's own id for it, what the capture extension captures it by.
+    chrome: i64,
+    /// The stream's tab that opened it, if one did.
+    opener: Option<String>,
+    url: String,
+    title: String,
+}
+
+/// The most tabs a stream has open (a page opening tabs in a loop stops being heard at that).
+const TABS: usize = 30;
+
+impl Tabs {
+    fn new(page: Page, chrome: i64) -> Self {
+        let shown = page.target().to_owned();
+        Self { list: Mutex::new(vec![Tab { page: Arc::new(page), chrome, opener: None, url: String::new(), title: String::new() }]), shown: Mutex::new(shown), showing: futures::lock::Mutex::new(()) }
+    }
+
+    /// The tab shown.
+    fn page(&self) -> anyhow::Result<Arc<Page>> {
+        let shown = self.shown.lock().clone();
+        self.list.lock().iter().find(|t| t.page.target() == shown).map(|t| t.page.clone()).ok_or_else(|| anyhow::anyhow!("its tabs are all closed"))
+    }
+
+    fn get(&self, target: &str) -> Option<Tab> {
+        self.list.lock().iter().find(|t| t.page.target() == target).cloned()
+    }
+
+    fn has(&self, target: &str) -> bool {
+        self.list.lock().iter().any(|t| t.page.target() == target)
+    }
+
+    fn pages(&self) -> Vec<Arc<Page>> {
+        self.list.lock().iter().map(|t| t.page.clone()).collect()
+    }
+
+    /// As its viewers are told them: `{"list": [{id, url, title}], "shown": id}`.
+    fn said(&self) -> Value {
+        let list: Vec<Value> = self.list.lock().iter().map(|t| json!({"id": t.page.target(), "url": t.url, "title": t.title})).collect();
+        json!({"tabs": {"list": list, "shown": *self.shown.lock()}})
+    }
+
+    /// A tab's address or title, as it changed: whether it did.
+    fn changed(&self, target: &str, url: Option<&str>, title: Option<&str>) -> bool {
+        let mut l = self.list.lock();
+        let Some(t) = l.iter_mut().find(|t| t.page.target() == target) else { return false };
+        let mut changed = false;
+        if let Some(u) = url.filter(|u| *u != t.url) {
+            u.clone_into(&mut t.url);
+            changed = true;
+        }
+        if let Some(n) = title.filter(|n| *n != t.title) {
+            n.clone_into(&mut t.title);
+            changed = true;
+        }
+        changed
+    }
 }
 
 impl Surface {
     async fn eval(&self, js: &str) -> anyhow::Result<Value> {
         match self {
-            Self::Tab(p) => p.eval(js).await,
+            Self::Tab(t) => t.page()?.eval(js).await,
             Self::Driven(d) => d.eval(js).await,
         }
     }
 
     async fn navigate(&self, url: &str) -> anyhow::Result<()> {
         match self {
-            Self::Tab(p) => p.call("Page.navigate", json!({"url": url})).await.map(|_| ()),
+            Self::Tab(t) => t.page()?.call("Page.navigate", json!({"url": url})).await.map(|_| ()),
             Self::Driven(d) => d.navigate(url).await,
         }
     }
 
     async fn reload(&self) -> anyhow::Result<()> {
         match self {
-            Self::Tab(p) => p.call("Page.reload", json!({})).await.map(|_| ()),
+            Self::Tab(t) => t.page()?.call("Page.reload", json!({})).await.map(|_| ()),
             Self::Driven(d) => d.reload().await,
         }
     }
@@ -211,7 +283,8 @@ impl Surface {
     /// Back (`-1`) or forward (`1`).
     async fn history(&self, delta: i64) -> anyhow::Result<()> {
         match self {
-            Self::Tab(p) => {
+            Self::Tab(t) => {
+                let p = t.page()?;
                 let h = p.call("Page.getNavigationHistory", json!({})).await?;
                 let at = h.get("currentIndex").and_then(Value::as_i64).unwrap_or(0) + delta;
                 if let Some(entry) = h.get("entries").and_then(Value::as_array).and_then(|e| usize::try_from(at).ok().and_then(|i| e.get(i))) {
@@ -223,17 +296,27 @@ impl Surface {
         }
     }
 
+    /// Its window; every tab's (each is laid out for it before it's shown).
     async fn viewport(&self, width: u32, height: u32, scale: f64, mobile: bool) -> anyhow::Result<()> {
         match self {
-            Self::Tab(p) => p.viewport(width, height, scale, mobile).await,
+            Self::Tab(t) => {
+                let shown = t.page()?;
+                shown.viewport(width, height, scale, mobile).await?;
+                for p in t.pages().into_iter().filter(|p| !Arc::ptr_eq(p, &shown)) {
+                    let _ = p.viewport(width, height, scale, mobile).await;
+                }
+                Ok(())
+            }
             Self::Driven(d) => d.viewport(width, height, scale).await,
         }
     }
 
     async fn settle(&self) {
         match self {
-            Self::Tab(p) => {
-                let _ = p.settle().await;
+            Self::Tab(t) => {
+                if let Ok(p) = t.page() {
+                    let _ = p.settle().await;
+                }
             }
             Self::Driven(_) => crate::rt::sleep(Duration::from_millis(150)).await,
         }
@@ -242,7 +325,7 @@ impl Surface {
     /// A picture of it (PNG).
     async fn picture(&self) -> anyhow::Result<Vec<u8>> {
         match self {
-            Self::Tab(p) => p.picture(false).await,
+            Self::Tab(t) => t.page()?.picture(false).await,
             Self::Driven(d) => Ok(d.shot(true).await?.0),
         }
     }
@@ -277,6 +360,9 @@ impl Streams {
         let cdp = browser.cdp.clone();
         let worker = super::target(&cdp, |t| t.get("type").and_then(Value::as_str) == Some("service_worker") && t.get("url").and_then(Value::as_str).is_some_and(|u| u.starts_with(&format!("chrome-extension://{EXTENSION_ID}/")))).await?;
         let worker = cdp.call(None, "Target.attachToTarget", json!({"targetId": worker, "flatten": true})).await?.get("sessionId").and_then(Value::as_str).unwrap_or("").to_owned();
+        // Its pages said as they come and go: a tab a stream's page opens is the stream's.
+        crate::rt::spawn(tabs_said(cdp.listen_browser()));
+        cdp.call(None, "Target.setDiscoverTargets", json!({"discover": true})).await?;
         let s = Arc::new(Streamer { browser, alone: profile.starts_with("clean:"), worker, offscreen: futures::lock::Mutex::new(None), outs: Arc::default(), idle_since: std::sync::atomic::AtomicI64::new(crate::util::now_ms()) });
         g.insert(profile.to_owned(), s.clone());
         Ok(s)
@@ -337,7 +423,7 @@ impl Streams {
             }
             crate::rt::sleep(Duration::from_millis(50)).await;
         }
-        anyhow::ensure!(tab.is_number(), "the capture extension doesn't see the stream's tab");
+        let chrome = tab.as_i64().ok_or_else(|| anyhow::anyhow!("the capture extension doesn't see the stream's tab"))?;
         s.outs.lock().insert(id.to_owned(), out.clone());
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (pw, ph) = ((f64::from(width) * scale).round() as u32, (f64::from(height) * scale).round() as u32);
@@ -355,8 +441,9 @@ impl Streams {
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(page), device, inputs, out.clone(), dir, (width, height, scale, mobile)));
-        crate::rt::spawn(watch(stream.clone(), out.clone()));
+        let first = page.target().to_owned();
+        let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(Tabs::new(page, chrome)), device, inputs, out.clone(), dir, (width, height, scale, mobile)));
+        crate::rt::spawn(watch(stream.clone(), first));
         crate::rt::spawn(apply(Arc::downgrade(&stream), queued));
         let opened = json!({"opened": {"width": width, "height": height, "scale": scale, "audio": started.get("audio"), "platform": std::env::consts::OS, "engine": "chromium", "device": device}});
         self.went(id, stream, &spec.url, opened, out).await
@@ -453,6 +540,11 @@ impl Streams {
         self.open.lock().get(id).cloned()
     }
 
+    /// The stream whose tab `target` is.
+    fn owning(&self, target: &str) -> Option<Arc<Stream>> {
+        self.open.lock().values().find(|s| matches!(&s.page, Surface::Tab(t) if t.has(target))).cloned()
+    }
+
     /// Close a stream: its capture stops, its tab goes. A browser left with no streams stops a
     /// while later (unless one opens meanwhile); a clean profile's stops now, and its profile goes.
     pub async fn close(&self, id: &str) {
@@ -467,10 +559,12 @@ impl Streams {
         let off = s.streamer.offscreen.lock().await.clone().unwrap_or_default();
         let _ = super::evaluate(&cdp, &off, &format!("kiln.stop({})", json!(id))).await;
         s.streamer.outs.lock().remove(id);
-        // Its tab, whoever else still holds the stream (its watcher ends as the tab does).
+        // Its tabs, whoever else still holds the stream (their watchers end as they do).
         match &s.page {
-            Surface::Tab(p) => {
-                let _ = cdp.call(None, "Target.closeTarget", json!({"targetId": p.target()})).await;
+            Surface::Tab(t) => {
+                for p in t.pages() {
+                    let _ = cdp.call(None, "Target.closeTarget", json!({"targetId": p.target()})).await;
+                }
             }
             Surface::Driven(d) => d.close().await,
         }
@@ -580,8 +674,9 @@ pub async fn serve_control(id: String, json: String) {
 
 /// What an agent does in its live page (`crate::browser::ask`'s `act`): its `actions` in order
 /// (`{"click": [x, y]}`, `{"tap": [x, y]}`, `{"type": "text"}`, `{"key": "Enter"}`, `{"scroll":
-/// [dx, dy]}`, `{"go": url}`, `{"back": true}`, `{"forward": true}`, `{"reload": true}`,
-/// `{"wait_ms": n}`), then (`picture`, by default) a picture of it. Its viewers are told what it did.
+/// [dx, dy]}`, `{"go": url}`, `{"back": true}`, `{"forward": true}`, `{"reload": true}`, `{"tab":
+/// {"show": id}}`, `{"tab": {"new": url}}`, `{"tab": {"close": id}}`, `{"wait_ms": n}`), then
+/// (`picture`, by default) a picture of it, and its tabs. Its viewers are told what it did.
 #[derive(Debug, Deserialize)]
 pub struct Act {
     pub stream: String,
@@ -649,6 +744,9 @@ pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
     if let (Some(o), Some(r)) = (answer.as_object_mut(), recorded) {
         o.insert("recorded".into(), r);
     }
+    if let (Some(o), Surface::Tab(t)) = (answer.as_object_mut(), &s.page) {
+        o.insert("tabs".into(), t.said().get("tabs").cloned().unwrap_or_default());
+    }
     Ok(answer)
 }
 
@@ -686,7 +784,7 @@ async fn act_one(s: &Stream, verb: &str, arg: &Value) -> anyhow::Result<Option<V
             s.input(vec![Input::Wheel { x, y, dx, dy, mods: 0 }]).await?;
             Some(json!({"scroll": [dx, dy]}))
         }
-        "go" | "back" | "forward" | "reload" => {
+        "go" | "back" | "forward" | "reload" | "tab" => {
             s.control(&json!({verb: arg})).await?;
             crate::rt::sleep(Duration::from_millis(400)).await;
             Some(json!({verb: arg}))
@@ -727,7 +825,7 @@ pub(crate) const FOCUS_SOURCE: &str = FOCUS;
 
 const FOCUS: &str = r"(() => {
   if (window.__kilnFocus) return;
-  window.__kilnFocus = true;
+  window.__kilnFocus = {};
   const editable = (e) => e && (e.isContentEditable || (e.tagName === 'INPUT' && !['button','checkbox','color','file','hidden','image','radio','range','reset','submit'].includes(e.type)) || e.tagName === 'TEXTAREA');
   const like = (e) => ({ type: e.isContentEditable ? 'text' : (e.type || 'text'), mode: e.inputMode || '', ac: (e.getAttribute('autocomplete') || '').trim(), hint: e.enterKeyHint || '',
     label: ((e.labels && e.labels[0] && e.labels[0].textContent) || e.placeholder || e.getAttribute('aria-label') || '').trim().slice(0, 60), multi: e.tagName === 'TEXTAREA' || e.isContentEditable });
@@ -758,6 +856,8 @@ const FOCUS: &str = r"(() => {
   const selected = () => { const e = document.activeElement; tell('selected', e && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA') ? e.type !== 'password' && typeof e.selectionStart === 'number' && e.selectionEnd > e.selectionStart : !!String(getSelection() || '')); };
   document.addEventListener('selectionchange', selected, true);
   addEventListener('focusin', selected, true);
+  // All of it again (its tab is shown again: its viewers knew another's).
+  window.__kilnFocus.again = () => { for (const k of Object.keys(said)) delete said[k]; focus(); fields(); selected(); };
 })();";
 
 /// What's selected in the page, to copy: a field's selection (never a password's), else the
@@ -836,41 +936,88 @@ async fn pump(s: std::sync::Weak<Stream>) {
     }
 }
 
-/// What the tab does that its viewer's side shows: where it is (its address and title), a field
-/// taking text or not, a dialog (dismissed), its end.
-async fn watch(s: Arc<Stream>, out: async_channel::Sender<Out>) {
-    let Surface::Tab(page) = &s.page else { return };
+/// What a tab does that its viewers' side shows, while it's the one shown: where it is (its address
+/// and title), a field taking text or not, a dialog (dismissed); its end. Each tab's address and
+/// title go in the stream's list of tabs, shown or not.
+async fn watch(s: Arc<Stream>, target: String) {
+    let Surface::Tab(tabs) = &s.page else { return };
+    let Some(page) = tabs.get(&target).map(|t| t.page) else { return };
     let events = page.listen();
     while let Ok(e) = events.recv().await {
+        let shown = *tabs.shown.lock() == target;
         let ev = match e.method.as_str() {
             "Page.frameNavigated" if e.params.get("frame").and_then(|f| f.get("parentId")).is_none() => {
                 let url = e.params.get("frame").and_then(|f| f.get("url")).and_then(Value::as_str).unwrap_or("");
-                s.log(json!({"navigated": url}));
-                Some(json!({"navigated": {"url": url}}))
+                if tabs.changed(&target, Some(url), None) {
+                    s.tell_tabs().await;
+                }
+                if shown {
+                    s.log(json!({"navigated": url}));
+                }
+                shown.then(|| json!({"navigated": {"url": url}}))
             }
             "Page.loadEventFired" => {
                 let title = page.eval("document.title").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
-                Some(json!({"loaded": {"title": title}}))
+                if tabs.changed(&target, None, Some(&title)) {
+                    s.tell_tabs().await;
+                }
+                shown.then(|| json!({"loaded": {"title": title}}))
             }
             // `{"focus": ...}`, `{"fields": [...]}` or `{"selected": bool}`, as the page said it.
-            "Runtime.bindingCalled" if e.params.get("name").and_then(Value::as_str) == Some("kilnFocus") => serde_json::from_str::<Value>(e.params.get("payload").and_then(Value::as_str).unwrap_or("{}"))
+            "Runtime.bindingCalled" if shown && e.params.get("name").and_then(Value::as_str) == Some("kilnFocus") => serde_json::from_str::<Value>(e.params.get("payload").and_then(Value::as_str).unwrap_or("{}"))
                 .ok()
                 .filter(|v| v.as_object().is_some_and(|o| o.len() == 1 && ["focus", "fields", "selected"].iter().any(|k| o.contains_key(*k)))),
             // A page's alert, confirm or prompt would hold it still: answered, and said.
             "Page.javascriptDialogOpening" => {
                 let _ = page.call("Page.handleJavaScriptDialog", json!({"accept": true})).await;
-                Some(json!({"dialog": {"type": e.params.get("type"), "message": e.params.get("message")}}))
+                shown.then(|| json!({"dialog": {"type": e.params.get("type"), "message": e.params.get("message")}}))
             }
             "Inspector.detached" | "Target.detachedFromTarget" => {
-                let _ = out.send(Out::Event { stream: s.id.clone(), json: json!({"closed": {"why": "the page went away"}}).to_string() }).await;
+                s.tab_gone(&target).await;
                 return;
             }
             _ => None,
         };
         if let Some(ev) = ev
-            && out.send(Out::Event { stream: s.id.clone(), json: ev.to_string() }).await.is_err()
+            && s.out.send(Out::Event { stream: s.id.clone(), json: ev.to_string() }).await.is_err()
         {
             return;
+        }
+    }
+}
+
+/// What a profile's browser says of its pages: a tab a stream's page opened (a link to a new tab,
+/// a popup) becomes the stream's (`Stream::adopt`); one changed or gone is said to its stream's
+/// viewers. Each in a task of its own: a stream slow to take what it's told holds up no other's.
+async fn tabs_said(events: async_channel::Receiver<super::cdp::Event>) {
+    while let Ok(e) = events.recv().await {
+        let info = e.params.get("targetInfo");
+        let Some(id) = info.and_then(|i| i.get("targetId")).or_else(|| e.params.get("targetId")).and_then(Value::as_str).map(str::to_owned) else { continue };
+        let said = |k: &str| info.and_then(|i| i.get(k)).and_then(Value::as_str);
+        match e.method.as_str() {
+            "Target.targetCreated" if said("type") == Some("page") => {
+                let Some(opener) = said("openerId").filter(|o| !o.is_empty()).map(str::to_owned) else { continue };
+                let Some(s) = streams().owning(&opener) else { continue };
+                crate::rt::spawn(async move {
+                    if let Err(e) = s.adopt(id, Some(opener), false).await {
+                        tracing::debug!(stream = %s.id, error = %format!("{e:#}"), "a tab its page opened isn't the stream's");
+                    }
+                });
+            }
+            "Target.targetInfoChanged" => {
+                if let Some(s) = streams().owning(&id)
+                    && let Surface::Tab(t) = &s.page
+                    && t.changed(&id, said("url"), said("title"))
+                {
+                    crate::rt::spawn(async move { s.tell_tabs().await });
+                }
+            }
+            "Target.targetDestroyed" => {
+                if let Some(s) = streams().owning(&id) {
+                    crate::rt::spawn(async move { s.tab_gone(&id).await });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1070,6 +1217,153 @@ impl Stream {
         }
     }
 
+    /// To its viewers.
+    async fn say(&self, ev: Value) {
+        let _ = self.out.send(Out::Event { stream: self.id.clone(), json: ev.to_string() }).await;
+    }
+
+    /// Its tabs, to its viewers (`Tabs::said`).
+    async fn tell_tabs(&self) {
+        if let Surface::Tab(t) = &self.page {
+            self.say(t.said()).await;
+        }
+    }
+
+    /// Its window as last laid out: CSS pixels, pixel density, a phone's or not.
+    fn window(&self) -> (u32, u32, f64, bool) {
+        let v = self.viewport.lock().clone();
+        let n = |k: &str, or: u32| v.get(k).and_then(Value::as_u64).and_then(|x| u32::try_from(x).ok()).unwrap_or(or);
+        (n("width", 390), n("height", 640), v.get("scale").and_then(Value::as_f64).unwrap_or(2.0), v.get("mobile").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    /// A tab of its own from now on: one its page opened (`opener`; shown when Chrome shows it, as
+    /// a link to a new tab is, not one opened in the background), or one its viewer asked for
+    /// (`show`).
+    async fn adopt(self: &Arc<Self>, target: String, opener: Option<String>, show: bool) -> anyhow::Result<()> {
+        let Surface::Tab(tabs) = &self.page else { return Ok(()) };
+        if tabs.has(&target) {
+            return Ok(());
+        }
+        anyhow::ensure!(tabs.list.lock().len() < TABS, "it has {TABS} tabs open already");
+        let cdp = self.streamer.browser.cdp.clone();
+        let page = Page::attach(self.streamer.browser.clone(), None, target.clone()).await?;
+        // Laid out as its others are (a device's window and agent), saying what they say.
+        let (width, height, scale, mobile) = self.window();
+        page.viewport(width, height, scale, mobile).await?;
+        if let Some(agent) = self.device.map(|d| d.agent).filter(|a| !a.is_empty()) {
+            page.call("Emulation.setUserAgentOverride", json!({"userAgent": agent})).await?;
+        }
+        page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
+        page.before_load(FOCUS).await?;
+        let _ = page.eval(FOCUS).await;
+        // Chrome's id for it, once its extension sees it.
+        let mut found = Value::Null;
+        for _ in 0..100 {
+            if let Ok(v) = super::evaluate(&cdp, &self.streamer.worker, &format!("kiln.tabOf({})", json!(target))).await
+                && v.get("tab").is_some_and(Value::is_number)
+            {
+                found = v;
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        }
+        let chrome = found.get("tab").and_then(Value::as_i64).ok_or_else(|| anyhow::anyhow!("the capture extension doesn't see the tab"))?;
+        let info = cdp.call(None, "Target.getTargetInfo", json!({"targetId": target})).await.unwrap_or_default();
+        let said = |k: &str| info.get("targetInfo").and_then(|i| i.get(k)).and_then(Value::as_str).unwrap_or("").to_owned();
+        {
+            let mut l = tabs.list.lock();
+            if l.iter().any(|t| t.page.target() == target) {
+                return Ok(());
+            }
+            l.push(Tab { page: Arc::new(page), chrome, opener, url: said("url"), title: said("title") });
+        }
+        crate::rt::spawn(watch(self.clone(), target.clone()));
+        if show || found.get("active").and_then(Value::as_bool) == Some(true) {
+            self.show(&target).await
+        } else {
+            self.tell_tabs().await;
+            Ok(())
+        }
+    }
+
+    /// Show its tab `target`: captured from now on (the same encoders, from a key frame), what its
+    /// viewers do goes to it, and they're told where it is.
+    async fn show(&self, target: &str) -> anyhow::Result<()> {
+        let Surface::Tab(tabs) = &self.page else { anyhow::bail!("only Chromium's pages have tabs") };
+        let _one = tabs.showing.lock().await;
+        let tab = tabs.get(target).ok_or_else(|| anyhow::anyhow!("it has no such tab (it may have closed)"))?;
+        if *tabs.shown.lock() != target {
+            let cdp = &self.streamer.browser.cdp;
+            let (width, height, scale, mobile) = self.window();
+            let _ = tab.page.viewport(width, height, scale, mobile).await;
+            let moved = super::evaluate(cdp, &self.streamer.worker, &format!("kiln.switchTo({}, {})", tab.chrome, json!(self.id))).await?;
+            anyhow::ensure!(moved.get("ok").and_then(Value::as_bool) == Some(true), "its tab couldn't be captured: {}", moved.get("error").and_then(Value::as_str).unwrap_or("it said nothing"));
+            target.clone_into(&mut tabs.shown.lock());
+            // Chrome's tab too (its page sees itself in front).
+            let _ = cdp.call(None, "Target.activateTarget", json!({"targetId": target})).await;
+        }
+        // Its viewers: its tabs, where it is, its title, its fields.
+        self.tell_tabs().await;
+        let url = tab.page.eval("location.href").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or(tab.url);
+        let title = tab.page.eval("document.title").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or(tab.title);
+        self.log(json!({"navigated": url}));
+        self.say(json!({"navigated": {"url": url}})).await;
+        self.say(json!({"loaded": {"title": title}})).await;
+        let _ = tab.page.eval("window.__kilnFocus && window.__kilnFocus.again && window.__kilnFocus.again()").await;
+        Ok(())
+    }
+
+    /// Its tab `target` closed (by its page, its viewer or the browser): with it shown, the one
+    /// that opened it is in its place, else the last opened; with none left, the stream ends.
+    async fn tab_gone(&self, target: &str) {
+        let Surface::Tab(tabs) = &self.page else { return };
+        let next = {
+            let mut l = tabs.list.lock();
+            let Some(i) = l.iter().position(|t| t.page.target() == target) else { return };
+            let gone = l.remove(i);
+            gone.opener.filter(|o| l.iter().any(|t| t.page.target() == o)).or_else(|| l.last().map(|t| t.page.target().to_owned()))
+        };
+        // One closing as its stream does says nothing more.
+        if streams().get(&self.id).is_none() {
+            return;
+        }
+        let shown = *tabs.shown.lock() == target;
+        match next {
+            None => self.say(json!({"closed": {"why": "its last tab closed"}})).await,
+            Some(n) if shown => {
+                if let Err(e) = self.show(&n).await {
+                    tracing::debug!(stream = %self.id, error = %format!("{e:#}"), "no tab shown in place of one that closed");
+                }
+            }
+            Some(_) => self.tell_tabs().await,
+        }
+    }
+
+    /// What its viewer asks of its tabs: `{"show": id}`, `{"new": url}` (a blank one, with no
+    /// address) or `{"close": id}`.
+    async fn tab(&self, t: &Value) -> anyhow::Result<()> {
+        let Surface::Tab(tabs) = &self.page else { anyhow::bail!("only Chromium's pages have tabs here") };
+        let cdp = &self.streamer.browser.cdp;
+        if let Some(id) = t.get("show").and_then(Value::as_str) {
+            self.show(id).await?;
+        }
+        if let Some(url) = t.get("new") {
+            let url = url.as_str().map(str::trim).filter(|u| !u.is_empty()).unwrap_or("about:blank");
+            anyhow::ensure!(tabs.list.lock().len() < TABS, "it has {TABS} tabs open already");
+            let made = cdp.call(None, "Target.createTarget", json!({"url": url})).await?;
+            let target = made.get("targetId").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("the browser made no tab"))?.to_owned();
+            let me = streams().get(&self.id).ok_or_else(|| anyhow::anyhow!("it closed"))?;
+            let opener = tabs.shown.lock().clone();
+            me.adopt(target, Some(opener), true).await?;
+        }
+        if let Some(id) = t.get("close").and_then(Value::as_str) {
+            anyhow::ensure!(tabs.has(id), "it has no such tab");
+            cdp.call(None, "Target.closeTarget", json!({"targetId": id})).await?;
+            self.tab_gone(id).await;
+        }
+        Ok(())
+    }
+
     /// Record it from now (`super::record`): the stream goes on while it does, from a key frame.
     pub async fn record_start(&self) -> anyhow::Result<Value> {
         anyhow::ensure!(self.recording.lock().is_none(), "it's recording already");
@@ -1143,7 +1437,7 @@ impl Stream {
     pub async fn input(&self, events: Vec<Input>) -> anyhow::Result<()> {
         self.touched.store(crate::util::now_ms(), std::sync::atomic::Ordering::Relaxed);
         let page = match &self.page {
-            Surface::Tab(p) => p,
+            Surface::Tab(t) => t.page()?,
             Surface::Driven(d) => return d.input(&events).await,
         };
         for e in events {
@@ -1226,7 +1520,7 @@ impl Stream {
 
     /// What a viewer asks of the stream (`ServerMsg::StreamControl`): `{"resize": {width, height,
     /// scale, mobile}}`, `{"pause": bool}`, `{"keyframe": true}`, `{"go": url}`, `{"reload": true}`,
-    /// `{"back": true}`, `{"forward": true}`.
+    /// `{"back": true}`, `{"forward": true}`, `{"tab": {"show" | "new" | "close": ...}}` (`Self::tab`).
     pub async fn control(&self, c: &Value) -> anyhow::Result<()> {
         let off = self.streamer.offscreen.lock().await.clone().unwrap_or_default();
         let cdp = &self.streamer.browser.cdp;
@@ -1285,6 +1579,9 @@ impl Stream {
             if c.get(k).and_then(Value::as_bool) == Some(true) {
                 self.page.history(delta).await?;
             }
+        }
+        if let Some(t) = c.get("tab") {
+            self.tab(t).await?;
         }
         Ok(())
     }
@@ -1352,6 +1649,127 @@ mod tests {
             streams().close("test-stream").await;
             assert!(configs >= 1 && keys >= 1 && frames > 30, "configs {configs}, key frames {keys}, frames {frames}");
             assert_eq!(title, json!("clicked"));
+            Ok(())
+        })
+    }
+
+    /// A site on loopback for a test: each path's page.
+    fn site(pages: &'static [(&'static str, &'static str)]) -> anyhow::Result<String> {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let at = format!("http://{}", l.local_addr()?);
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut c, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let body = pages.iter().find(|(p, _)| *p == path).map_or("", |(_, b)| *b);
+                let _ = std::io::Write::write_all(&mut c, format!("HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        Ok(at)
+    }
+
+    /// What a test's stream sent: its events, and its pictures' times as they came.
+    #[derive(Default)]
+    struct Heard {
+        events: Vec<Value>,
+        times: Vec<i64>,
+    }
+
+    impl Heard {
+        /// What came until `done` says so, or `within` passed: whether it did.
+        async fn until(&mut self, rx: &async_channel::Receiver<Out>, within: Duration, done: impl Fn(&Self) -> bool) -> bool {
+            let end = std::time::Instant::now() + within;
+            while std::time::Instant::now() < end {
+                if done(self) {
+                    return true;
+                }
+                match crate::rt::timeout(Duration::from_millis(100), rx.recv()).await {
+                    Ok(Ok(Out::Event { json, .. })) => self.events.push(serde_json::from_str(&json).unwrap_or_default()),
+                    Ok(Ok(Out::Frame { data, .. })) if data.first() == Some(&b'v') => {
+                        if let Some(ts) = data.get(2..10).and_then(|b| <[u8; 8]>::try_from(b).ok()) {
+                            self.times.push(i64::from_be_bytes(ts));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            done(self)
+        }
+
+        /// The last list of tabs said: their ids, and the shown one's.
+        fn tabs(&self) -> (Vec<String>, String) {
+            let Some(t) = self.events.iter().rev().find_map(|e| e.get("tabs")) else { return (Vec::new(), String::new()) };
+            let ids = t.get("list").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_owned)).collect()).unwrap_or_default();
+            (ids, t.get("shown").and_then(Value::as_str).unwrap_or("").to_owned())
+        }
+    }
+
+    /// Tabs, as a browser has them: a link to a new tab opens one, shown (its pictures go on, their
+    /// times after the last's); the first shown again; the second closed; one its viewer opened.
+    #[test]
+    #[ignore = "downloads and starts the real browser (about 200 MB)"]
+    fn a_link_to_a_new_tab_opens_one() -> anyhow::Result<()> {
+        static PAGES: &[(&str, &str)] = &[
+            ("/", "<title>first</title><body style='margin:0'><a href='/two' target=_blank style='display:block;width:300px;height:100px;background:#123'>two</a><button onclick=\"window.open('/two', 'pop', 'width=300,height=200')\" style='display:block;width:300px;height:100px'>pop</button></body>"),
+            ("/two", "<title>second</title><body style='margin:0;background:#bab0e3'><div id=b style='width:40px;height:40px;background:#123;position:absolute'></div><script>let t=0;(function f(){t++;b.style.left=(t*3%200)+'px';requestAnimationFrame(f)})()</script></body>"),
+        ];
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        let at = site(PAGES)?;
+        crate::rt::block_on(async move {
+            let spec: Spec = serde_json::from_value(json!({"url": format!("{at}/"), "width": 320, "height": 240, "scale": 1, "profile": "clean"}))?;
+            let (tx, rx) = async_channel::bounded::<Out>(4096);
+            streams().open(&dir, "tabs-test", &spec, tx).await?;
+            let s = streams().get("tabs-test").ok_or_else(|| anyhow::anyhow!("not open"))?;
+            s.control(&json!({"pause": false, "keyframe": true})).await?;
+            let mut h = Heard::default();
+            let loaded = h.until(&rx, Duration::from_secs(10), |h| h.events.iter().any(|e| e.pointer("/loaded/title") == Some(&json!("first")))).await;
+            assert!(loaded, "the first page didn't load: {:?}", h.events);
+            let (first, _) = h.tabs();
+            let first = first.first().cloned().unwrap_or_default();
+            // Its link, clicked: a new tab, shown.
+            let click = |k: &str, buttons: i64| Input::Pointer { k: k.into(), x: 100.0, y: 50.0, button: 0, buttons, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 };
+            s.input(vec![click("down", 1), click("up", 0)]).await?;
+            let opened = h.until(&rx, Duration::from_secs(10), |h| {
+                let (ids, shown) = h.tabs();
+                ids.len() == 2 && !shown.is_empty() && shown != first
+            }).await;
+            assert!(opened, "no second tab shown: {:?}", h.events);
+            let (ids, second) = h.tabs();
+            let before = h.times.len();
+            h.until(&rx, Duration::from_secs(2), |_| false).await;
+            assert!(h.times.len() > before + 10, "its pictures stopped after the switch: {} then {}", before, h.times.len());
+            assert!(h.events.iter().any(|e| e.pointer("/loaded/title") == Some(&json!("second"))), "{:?}", h.events);
+            // The first again; its popup.
+            s.control(&json!({"tab": {"show": first}})).await?;
+            assert!(h.until(&rx, Duration::from_secs(5), |h| h.tabs().1 == first).await, "the first tab wasn't shown again");
+            let pop = |k: &str, buttons: i64| Input::Pointer { k: k.into(), x: 100.0, y: 150.0, button: 0, buttons, pt: "mouse".into(), id: 1, mods: 0, clicks: 1 };
+            s.input(vec![pop("down", 1), pop("up", 0)]).await?;
+            let popped = h.until(&rx, Duration::from_secs(10), |h| h.tabs().0.len() == 3).await;
+            assert!(popped, "no popup tab: {:?}", h.tabs());
+            let (all, popup) = h.tabs();
+            s.control(&json!({"tab": {"close": popup}})).await?;
+            assert!(h.until(&rx, Duration::from_secs(5), |h| h.tabs().0.len() == 2 && h.tabs().1 == first).await, "the popup closed, its opener not shown: {:?} of {all:?}", h.tabs());
+            // The second closed.
+            s.control(&json!({"tab": {"close": second}})).await?;
+            assert!(h.until(&rx, Duration::from_secs(5), |h| h.tabs().0.len() == 1).await, "the second tab didn't close: {:?}", h.tabs());
+            // One its viewer opened.
+            s.control(&json!({"tab": {"new": format!("{at}/two")}})).await?;
+            let third = h.until(&rx, Duration::from_secs(10), |h| {
+                let (ids, shown) = h.tabs();
+                ids.len() == 2 && shown != first
+            }).await;
+            assert!(third, "no new tab: {:?}", h.tabs());
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            let title = s.page.eval("document.title").await?;
+            h.until(&rx, Duration::from_secs(1), |_| false).await;
+            streams().close("tabs-test").await;
+            assert_eq!(title, json!("second"));
+            assert!(ids.contains(&first), "{ids:?}");
+            // Its pictures' times only went on.
+            let back: Vec<_> = h.times.windows(2).filter(|w| w.get(1) < w.first()).collect();
+            assert!(back.is_empty(), "times went back: {back:?}");
             Ok(())
         })
     }

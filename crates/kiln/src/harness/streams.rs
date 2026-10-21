@@ -197,8 +197,8 @@ impl Relay {
         let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return };
         if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
             // What a viewer joining later needs to show it as it is now (whether its window can be
-            // seen where it runs, too: Safari's on a locked Mac).
-            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected" | "hidden") {
+            // seen where it runs, too: Safari's on a locked Mac; its tabs).
+            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected" | "hidden" | "tabs") {
                 live.said.lock().insert(k.clone(), json.clone());
             }
             if matches!(k.as_str(), "closed" | "error") {
@@ -485,7 +485,10 @@ mod tests {
         assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("true")));
         r.event("m1", "v1", json!({"hidden": false}).to_string());
         assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("false")));
-        assert_eq!(rx.len(), 6);
+        // Its tabs, as they are now.
+        r.event("m1", "v1", json!({"tabs": {"list": [{"id": "t1", "url": "http://localhost:5173/a", "title": "A"}], "shown": "t1"}}).to_string());
+        assert!(l.said.lock().get("tabs").is_some_and(|t| t.contains("\"shown\":\"t1\"")));
+        assert_eq!(rx.len(), 7);
         while rx.try_recv().is_ok() {}
         assert_eq!(l.codec(), "avc1.42E01f");
         assert_eq!(live("v9", "m1").codec(), "h264");
