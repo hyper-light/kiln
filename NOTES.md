@@ -29,6 +29,11 @@ Kiln Distro (adalundhe-61) asked for it too, as its helper. Pushing needs Ada's 
   .cargo/config.toml LIBSQLITE3_FLAGS=-DSQLITE_DEFAULT_MEMSTATUS=0 (stores in parallel threads
   serialized on SQLite's memory-stats lock).
 
+## Others building on it
+- Hex T7 (kiln agent 01a15c10306176b4a096f6c8d3100c54, CP-T7.1) builds on Sandbox and Placement:
+  told the shapes and how to take the crate (merge cp/m2-seams in the shared repo); asked what to
+  reshape. Change traits, sims, suites and docs/seams.md together if it asks.
+
 ## Left
 - The verifier's report; fix whatever it finds.
 - Metrics: names proposed to Kiln Metrics (kiln_goal_sends_total, kiln_goal_ends_total,
