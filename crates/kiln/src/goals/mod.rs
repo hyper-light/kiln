@@ -205,11 +205,11 @@ fn known(hub: &Hub, agent: &str) -> R<Info> {
     hub.harness.list().into_iter().find(|i| i.id == agent).ok_or(Error::NoAgent)
 }
 
-/// Sets the goals still to go: `given`, in that order (existing ones by id, edited; new ones
-/// added). The goal under way may be among them: first, it stays under way (with other words, it
-/// goes to the agent again as they say); after others, it goes back among them (cleared in the
-/// agent) and the first goes next. Left out, it stays under way, before them. Goals done stay as
-/// they are, and one given by id isn't added again.
+/// Sets the goals still to go: `given`, in that order (existing ones by id, or by their words
+/// alone, edited; new ones added). The goal under way may be among them: first, it stays under way
+/// (with other words, it goes to the agent again as they say); after others, it goes back among
+/// them (cleared in the agent) and the first goes next. Left out, it stays under way, before them.
+/// Goals done stay as they are, and one given by id isn't added again.
 pub async fn set(hub: &Hub, agent: &str, given: Vec<Given>) -> R<Stack> {
     let info = known(hub, agent)?;
     let given = given.into_iter().map(|g| Ok((g.id, clean(&g.text)?))).collect::<R<Vec<_>>>()?;
@@ -299,6 +299,7 @@ enum Row {
 /// What `set` makes of `items`, given the goals still to go (`set` says how), and the goals to
 /// come that go (left out).
 fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, Vec<String>) {
+    let still = |i: &Item| matches!(i.status.as_str(), "pending" | "active");
     let status = |id: &str| items.iter().find(|i| i.id == id).map(|i| i.status.clone());
     // Each goal there at most once (said again, it's a new one); goals done are left where they are,
     // and one unknown (gone since) is a new one.
@@ -314,7 +315,15 @@ fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, V
             _ => to_go.push((None, text)),
         }
     }
-    let mut rows: Vec<Row> = items.iter().filter(|i| !matches!(i.status.as_str(), "pending" | "active")).map(|i| Row::Kept(i.id.clone())).collect();
+    // A goal given by its words alone is the one still to go with those words, unless that one was
+    // named: a list in another order, without ids, reorders the goals rather than copying them.
+    for (id, text) in to_go.iter_mut().filter(|(id, _)| id.is_none()) {
+        if let Some(i) = items.iter().find(|i| still(i) && !seen.contains(&i.id) && same(&i.text, text)) {
+            seen.push(i.id.clone());
+            *id = Some(i.id.clone());
+        }
+    }
+    let mut rows: Vec<Row> = items.iter().filter(|i| !still(i)).map(|i| Row::Kept(i.id.clone())).collect();
     let active = items.iter().find(|i| i.status == "active");
     let at = active.and_then(|a| to_go.iter().position(|(id, _)| id.as_deref() == Some(a.id.as_str())));
     if let Some(a) = active {
@@ -343,7 +352,10 @@ pub async fn add(hub: &Hub, agent: &str, texts: Vec<String>, start: bool) -> R<S
     let stack = {
         let _one = CHANGING.lock().await;
         let now = get(hub, agent).await?;
-        let mut given: Vec<(Option<String>, String)> = now.items.iter().filter(|i| i.status == "pending").map(|i| (Some(i.id.clone()), i.text.clone())).collect();
+        // Every goal still to go named, the one under way first (where it stays): what's added is new,
+        // whatever its words.
+        let under_way = now.items.iter().filter(|i| i.status == "active");
+        let mut given: Vec<(Option<String>, String)> = under_way.chain(now.items.iter().filter(|i| i.status == "pending")).map(|i| (Some(i.id.clone()), i.text.clone())).collect();
         given.extend(texts.into_iter().map(|t| (None, t)));
         set_locked(hub, &info, agent, given).await?
     };
@@ -1089,6 +1101,12 @@ mod tests {
         // one unknown (gone since), is a new one.
         assert_eq!(edit(&items, &[(Some("m"), "lint passes"), (Some("s"), "fly"), (Some("b"), "docs build")]), (strs(&["=m", "=s", "=a", "b:docs build"]), strs(&["c"])));
         assert_eq!(edit(&items, &[(Some("b"), "docs build"), (Some("b"), "docs build"), (Some("x"), "new one")]), (strs(&["=m", "=s", "=a", "b:docs build", "+docs build", "+new one"]), strs(&["c"])));
+        // Given by their words alone (an agent's list without ids): the goals they are, reordered,
+        // the goal under way too; words of a goal done make a new one; a goal named isn't taken
+        // by words as well.
+        assert_eq!(edit(&items, &[(None, "ship it"), (None, "tests  pass"), (None, "docs build")]), (strs(&["=m", "=s", "c:ship it", "<a:tests  pass", "b:docs build"]), vec![]));
+        assert_eq!(edit(&items, &[(None, "lint passes")]), (strs(&["=m", "=s", "=a", "+lint passes"]), strs(&["b", "c"])));
+        assert_eq!(edit(&items, &[(None, "docs build"), (Some("b"), "docs build")]), (strs(&["=m", "=s", "=a", "+docs build", "b:docs build"]), strs(&["c"])));
         // An edit begun before the goal under way was met and the next started: nothing repeats.
         let since = [goal("a", "tests pass", "met"), goal("b", "docs build", "active"), goal("c", "ship it", "pending")];
         assert_eq!(edit(&since, &[(Some("a"), "tests pass"), (Some("b"), "docs build"), (Some("c"), "ship it")]), (strs(&["=a", "=b", "c:ship it"]), vec![]));
@@ -1235,6 +1253,12 @@ mod stack_tests {
             assert_eq!(s.state, "done");
             let s = add(&hub, id, vec!["one more".into()], false).await?;
             assert_eq!((s.state.as_str(), words(&s).last().cloned()), ("paused", Some("pending:one more".into())));
+            // A goal added with the words of the goal under way is a new one: that one stays under way.
+            settled(&hub, id).await;
+            let s = control(&hub, id, Action::Start).await?;
+            assert_eq!(under_way(&s), Some(("one more".into(), true)));
+            let s = add(&hub, id, vec!["one  more".into()], false).await?;
+            assert_eq!(words(&s).get(s.items.len().saturating_sub(2)..).map(<[String]>::to_vec), Some(strs(&["active:one more", "pending:one more"])));
             Ok(())
         })
     }

@@ -98,7 +98,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.set",
-            summary: "Replace an agent's goals still to go (reordered, edited, removed, added): `goals` is the list as it should be, existing ones by `id`. The goal under way may be in it: first, it stays under way (with other words, it goes to the agent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done are left as they are.",
+            summary: "Replace an agent's goals still to go (reordered, edited, removed, added): `goals` is the list as it should be, existing ones by `id` (one given by its words alone is the goal still to go with those words). The goal under way may be in it: first, it stays under way (with other words, it goes to the agent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done are left as they are.",
             read_only: false,
             destructive: true,
             input: || {
