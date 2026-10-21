@@ -210,6 +210,9 @@ pub struct Hub {
     pub tasks: crate::sync::tasks::Tasks,
     /// Notifications to people's devices (`crate::push`).
     pub push: crate::push::Service,
+    /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
+    /// any S3.
+    pub blobs: crate::blobs::Opened,
 }
 
 impl Hub {
@@ -223,7 +226,7 @@ impl Hub {
         admin_token: String,
         join_token: String,
         shutdown: Shutdown,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_on(crate::rt::clock(), cfg, store, logs, net, pki, admin_token, join_token, shutdown)
     }
 
@@ -239,7 +242,8 @@ impl Hub {
         admin_token: String,
         join_token: String,
         shutdown: Shutdown,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
+        let blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
@@ -248,7 +252,7 @@ impl Hub {
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             cfg,
             store,
             logs,
@@ -296,7 +300,8 @@ impl Hub {
             places,
             tasks,
             push: crate::push::Service::default(),
-        })
+            blobs,
+        }))
     }
 
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
@@ -2160,7 +2165,7 @@ pub(crate) mod tests {
         let pki = Arc::new(pki);
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
-        Ok(Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
+        Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }
 
     #[test]

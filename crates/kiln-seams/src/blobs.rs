@@ -140,6 +140,40 @@ pub trait Blobs: Send + Sync + 'static {
     fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>>;
 }
 
+/// A store shared: what it answers, an `Arc` of it answers.
+impl<B: Blobs + ?Sized> Blobs for Arc<B> {
+    fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>, put: Put) -> BoxFuture<'a, Result<Meta, Refusal>> {
+        self.as_ref().put(key, bytes, put)
+    }
+    fn get<'a>(&'a self, key: &'a str, range: Option<Range>) -> BoxFuture<'a, Result<(Meta, Vec<u8>), Refusal>> {
+        self.as_ref().get(key, range)
+    }
+    fn head<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Meta, Refusal>> {
+        self.as_ref().head(key)
+    }
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
+        self.as_ref().delete(key)
+    }
+    fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFuture<'a, Result<Listing, Refusal>> {
+        self.as_ref().list(prefix, after, limit)
+    }
+    fn start_upload<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<String, Refusal>> {
+        self.as_ref().start_upload(key)
+    }
+    fn upload_part<'a>(&'a self, upload: &'a str, part: u32, bytes: Vec<u8>) -> BoxFuture<'a, Result<String, Refusal>> {
+        self.as_ref().upload_part(upload, part, bytes)
+    }
+    fn complete_upload<'a>(&'a self, upload: &'a str, parts: Vec<(u32, String)>) -> BoxFuture<'a, Result<Meta, Refusal>> {
+        self.as_ref().complete_upload(upload, parts)
+    }
+    fn abort_upload<'a>(&'a self, upload: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
+        self.as_ref().abort_upload(upload)
+    }
+    fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
+        self.as_ref().presign(key, method, expires)
+    }
+}
+
 /// Longest key, in bytes: S3's 1024, less 64 a store may put before a key (an S3 store's prefix
 /// in its bucket), so a key one store takes, every store takes.
 pub const KEY_MAX: usize = 960;
