@@ -86,6 +86,36 @@ const doingOf = (a: AgentInfo) => (a.approvals.length > 0 ? "needs you" : a.stat
 const previewOf = (roster: string): Promise<BroadcastPreview | null> =>
   roster ? harnessApi.broadcastPreview({ ids: roster.split(",").map((r) => r.slice(0, r.lastIndexOf(":"))) }).catch(() => null) : Promise.resolve(null);
 
+/** One of the settings the agents are held to: Any, or a value some or all of them have. */
+function TuneSelect({
+  label,
+  any,
+  value,
+  options,
+  total,
+  onChange,
+}: {
+  label: string;
+  any: string;
+  value: string;
+  options: { id: string; label: string; count: number }[];
+  total: number;
+  onChange: (v: string) => void;
+}) {
+  if (options.length === 0) return null;
+  return (
+    <select className="ms-tune-select" aria-label={label} value={value} data-set={value ? "" : undefined} onChange={(e) => onChange(e.target.value)}>
+      <option value="">{any}</option>
+      {options.map((o) => (
+        <option key={o.id} value={o.id}>
+          {o.label}
+          {o.count < total ? ` (${o.count} of ${total})` : ""}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 export function MessageBar(props: BarProps) {
   // What they understand (commands, modes, models, efforts, and how many have each): again as
   // the agents picked change, come or go. Meanwhile the bar keeps what it knew; before the first
@@ -103,7 +133,21 @@ function Previewed({ roster, ...bar }: BarProps & { roster: string }) {
   return <Bar {...bar} preview={data} />;
 }
 
-function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & { preview: BroadcastPreview | null }) {
+/** A setting the agents can be held to: Any, or one of their catalog's (with which agents have it). */
+type Tune = { mode: string; model: string; effort: string };
+const ANY: Tune = { mode: "", model: "", effort: "" };
+
+/** The agents that have every setting chosen (Any leaves all of them). */
+function tuned(agents: AgentInfo[], tune: Tune, preview: BroadcastPreview | null): AgentInfo[] {
+  const lists = { mode: preview?.modes ?? [], model: preview?.models ?? [], effort: preview?.efforts ?? [] };
+  const sets = (Object.keys(tune) as (keyof Tune)[]).filter((k) => tune[k]).map((k) => new Set(lists[k].find((o) => o.id === tune[k])?.agents ?? []));
+  return sets.length === 0 ? agents : agents.filter((a) => sets.every((ids) => ids.has(a.id)));
+}
+
+function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: BarProps & { preview: BroadcastPreview | null }) {
+  const [tune, setTune] = React.useState<Tune>(ANY);
+  // Who gets what's sent from here: those the selectors leave (all of them while each is Any).
+  const agents = tuned(everyone, tune, preview);
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [found, setFound] = React.useState(0);
@@ -124,17 +168,20 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
   const roomy = useMediaQuery("(min-width: 640px)");
 
   const ids = agents.map((a) => a.id);
-  const key = ids.join(",");
-  // A different set of agents: whatever was being asked is for the old one.
+  const key = everyone.map((a) => a.id).join(",");
+  // A different set of agents: whatever was being asked, and the settings held, are for the old one.
   const [askedOf, setAskedOf] = React.useState(key);
   if (askedOf !== key) {
     setAskedOf(key);
     setAsk(null);
     setChoice("");
+    setTune(ANY);
   }
 
   const n = agents.length;
-  const who = reach === "selected" ? `${n} selected` : reach === "shown" ? `${n} shown` : n === 1 ? "the one agent" : `all ${n}`;
+  const total = everyone.length;
+  const held = n < total;
+  const who = held ? `${n} of ${total}` : reach === "selected" ? `${n} selected` : reach === "shown" ? `${n} shown` : n === 1 ? "the one agent" : `all ${n}`;
   const working = agents.filter((a) => a.status === "running").length;
   const waiting = agents.reduce((s, a) => s + a.approvals.filter((p) => p.tool !== "question" && p.tool !== "plan").length, 0);
 
@@ -191,11 +238,26 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
     const go = async () => {
       setText("");
       setSending(n);
-      const ok = await send({ text: body, mode, attachments: files.length > 0 ? attachments.payload() : undefined });
+      // The settings chosen, applied to them first (each a command to every one of them).
+      const settings: Command[] = [];
+      if (tune.mode) settings.push({ type: "set_mode", mode: tune.mode });
+      if (tune.model) settings.push({ type: "set_model", model: tune.model });
+      if (tune.effort) settings.push({ type: "set_effort", effort: tune.effort });
+      let ok = true;
+      for (const c of settings) ok = ok && (await send({ command: c }));
+      ok = ok && (await send({ text: body, mode, attachments: files.length > 0 ? attachments.payload() : undefined }));
       setSending(0);
       if (!ok) setText((t) => t || body);
     };
-    if (mode === "now" && working > 0)
+    const risky = tune.mode ? modes.find((m) => m.id === tune.mode)?.dangerous : false;
+    if (risky)
+      setAsk({
+        ask: `Switch ${count(n, "agent")} to ${modes.find((m) => m.id === tune.mode)?.label ?? tune.mode} and send? It skips permission checks.`,
+        label: "Send",
+        danger: true,
+        run: go,
+      });
+    else if (mode === "now" && working > 0)
       setAsk({
         ask: `Stop the turn of ${count(working, "working agent")} and send this now?`,
         label: "Send now",
@@ -204,7 +266,6 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
     else void go();
   };
 
-  const some = (k: number) => (k < n ? ` (${k} of ${n})` : "");
   const modes = preview?.modes ?? [];
   const models = preview?.models ?? [];
   const efforts = preview?.efforts ?? [];
@@ -215,7 +276,7 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
       setAsk(null);
       return;
     }
-    const [what, id = ""] = v.split(":");
+    const [what] = v.split(":");
     const many = count(n, "agent");
     if (what === "interrupt")
       setAsk({
@@ -228,26 +289,6 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
         ask: `Restart ${many}?`,
         label: "Restart",
         run: () => command({ type: "restart" }),
-      });
-    else if (what === "mode") {
-      const m = modes.find((x) => x.id === id);
-      setAsk({
-        ask: `Switch ${many} to ${m?.label ?? id}?${m?.dangerous ? " It skips permission checks." : ""}`,
-        label: "Switch",
-        danger: m?.dangerous,
-        run: () => command({ type: "set_mode", mode: id }),
-      });
-    } else if (what === "model")
-      setAsk({
-        ask: `Switch ${many} to ${models.find((x) => x.id === id)?.label ?? id}?`,
-        label: "Switch",
-        run: () => command({ type: "set_model", model: id }),
-      });
-    else if (what === "effort")
-      setAsk({
-        ask: `Set the effort of ${many} to ${efforts.find((x) => x.id === id)?.label ?? id}?`,
-        label: "Set",
-        run: () => command({ type: "set_effort", effort: id }),
       });
     else if (what === "allow")
       setAsk({
@@ -337,7 +378,14 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
                 {picked.length > CHIPS && <span className="ms-to-more">+{picked.length - CHIPS} more</span>}
               </>
             ) : (
-              <span className="ms-to-all">{reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
+              <span className="ms-to-all">{held ? `${n} of ${total} agents` : reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
+            )}
+            {(modes.length > 0 || models.length > 0 || efforts.length > 0) && (
+              <span className="ms-tune">
+                <TuneSelect label="Permissions" any="Any permissions" value={tune.mode} options={modes} total={total} onChange={(mode) => setTune((t) => ({ ...t, mode }))} />
+                <TuneSelect label="Model" any="Any model" value={tune.model} options={models} total={total} onChange={(model) => setTune((t) => ({ ...t, model }))} />
+                <TuneSelect label="Effort" any="Any effort" value={tune.effort} options={efforts} total={total} onChange={(effort) => setTune((t) => ({ ...t, effort }))} />
+              </span>
             )}
           </div>
           {attachments.chips}
@@ -412,36 +460,6 @@ function Bar({ agents, reach, onEnded, all = [], onPick, preview }: BarProps & {
                   Interrupt{working > 0 ? ` (${working} working)` : ""}
                 </option>
                 <option value="restart">Restart</option>
-                {modes.length > 0 && (
-                  <optgroup label="Permissions">
-                    {modes.map((m) => (
-                      <option key={m.id} value={`mode:${m.id}`}>
-                        {m.label}
-                        {some(m.count)}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                {models.length > 0 && (
-                  <optgroup label="Model">
-                    {models.map((m) => (
-                      <option key={m.id} value={`model:${m.id}`}>
-                        {m.label}
-                        {some(m.count)}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                {efforts.length > 0 && (
-                  <optgroup label="Effort">
-                    {efforts.map((m) => (
-                      <option key={m.id} value={`effort:${m.id}`}>
-                        {m.label}
-                        {some(m.count)}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
                 <optgroup label="Waiting on you">
                   <option value="allow" disabled={waiting === 0}>
                     Allow {waiting > 0 ? `${waiting} ` : ""}waiting

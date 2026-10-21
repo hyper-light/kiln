@@ -509,7 +509,8 @@ export interface BroadcastReport {
   results: BroadcastOutcome[];
 }
 
-type Counted<T> = T & { count: number };
+/** An entry of the agents' merged catalogs: how many of them have it, and which. */
+type Counted<T> = T & { count: number; agents?: string[] };
 
 export interface BroadcastPreview {
   agents: { id: string; name: string; machine: string; kind: string; status: Status }[];
