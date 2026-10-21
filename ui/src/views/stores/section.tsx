@@ -1,7 +1,8 @@
 /**
- * The System page's conversation stores (docs/conversations.md, "Telemetry"): replication live, as
- * one of hyperlight's figures; every store in a table; and the dashboard of the one picked, its
- * series over an hour or a day and what happened to it lately.
+ * The System page's conversation stores (docs/conversations.md, "Telemetry"): replication live, the
+ * stores as databases with batches moving between them; the replication log, live, searchable and
+ * downloadable; every store in a table; and the dashboard of the one picked, its series over an hour
+ * or a day and what happened to it lately.
  */
 import * as React from "react";
 import { api } from "@/api/client";
@@ -15,11 +16,10 @@ import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
-import { useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
-import { StoresFigure, waitQuantile } from "./figure";
-import { agoText, countText, sizeText, stateText } from "./scene";
+import { ReplicationFigure, ReplicationLog } from "./replication";
+import { agoText, countText, sizeText, stateText, waitQuantile } from "./scene";
 import "./stores.css";
 
 export const convoStatusRes: Res<ConvoStatus> = { key: "conversations/status", fetch: (s) => api.convoStatus(s), opts: { pollMs: 2_000 } };
@@ -59,8 +59,6 @@ export function StoresSection({ index }: { index: string }) {
 function StoresBody() {
   const status = useRes(convoStatusRes).data;
   const [picked, setPicked] = React.useState<string | null>(null);
-  const dashboard = React.useRef<HTMLDivElement>(null);
-  const reduced = useMediaQuery("(prefers-reduced-motion: reduce)");
   if (!status.on) {
     return (
       <EmptyState title="This server keeps no conversation store">
@@ -69,17 +67,14 @@ function StoresBody() {
     );
   }
   const shown = status.stores.find((s) => s.key === picked) ?? status.stores[0] ?? null;
-  const pick = (key: string) => {
-    setPicked(key);
-    dashboard.current?.scrollIntoView({ block: "start", behavior: reduced ? "instant" : "smooth" });
-  };
   return (
     <>
-      <StoresFigure status={status} onPick={pick} />
+      <ReplicationFigure status={status} selected={picked} onSelect={setPicked} />
+      <Loadable label="the replication log" fallback={<LogHold />}>
+        <ReplicationLog />
+      </Loadable>
       <StoresTable status={status} selected={shown?.key ?? null} onSelect={setPicked} />
-      <div ref={dashboard} className="scroll-mt-20">
-        {shown && <StoreDashboard key={shown.key} status={status} store={shown} />}
-      </div>
+      {shown && <StoreDashboard key={shown.key} status={status} store={shown} />}
     </>
   );
 }
@@ -378,13 +373,25 @@ function StoreCharts({ store, win }: { store: ConvoStore; win: number }) {
   );
 }
 
-/** The section while it loads: the figure's frame, the table's head. */
+/** The replication log while it loads: its tools' row and its lines' box. */
+function LogHold() {
+  return (
+    <section className="rp-log">
+      <SectionHeading label="Log" title="Replication log" />
+      <Hold height={36} label="Loading the replication log" />
+      <Hold height={260} className="mt-3" />
+    </section>
+  );
+}
+
+/** The section while it loads: the figure's frame, the log, the table's head. */
 export function StoresHold() {
   return (
     <>
-      <div className="cv-figure">
+      <div className="rp-figure">
         <Hold height={520} label="Loading the conversation stores" />
       </div>
+      <LogHold />
       <div className="mt-6">
         <TableHold head={<StoresHead />} rows={5} rowHeight={41} />
       </div>

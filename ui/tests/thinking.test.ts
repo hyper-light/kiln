@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { HEvent } from "../src/api/harness.ts";
 import { turnsOf, type ToolEvent } from "../src/views/harness/derive.ts";
-import { latestThought, thinkingStarted, thinkingWords, thoughtIsLive, type ThoughtItem } from "../src/views/harness/thinking.ts";
+import { latestThought, thinkingStarted, thinkingWords, thoughtIsLive, thoughtShown, type ThoughtItem } from "../src/views/harness/thinking.ts";
 
 const prompt: HEvent = { id: "prompt", seq: 0, at: 1000, kind: "user", text: "Take a look" };
 const thought = (id: string, at: number, streaming = true): Extract<HEvent, { kind: "thinking" }> => ({ id, seq: at, at, kind: "thinking", text: id, streaming });
@@ -60,4 +60,17 @@ test("notices and steering do not reset an active harness turn", () => {
   const turns = turnsOf([prompt, thought("old", 2000, false), { ...prompt, id: "new-prompt", at: 100000 }], undefined, true);
   assert.equal(thinkingStarted(turns[1]!, 1500), 1500, "steering preserves the active turn's start");
   assert.equal(thinkingStarted(turns[1]!), 100000, "without live state the new prompt is the fallback");
+});
+
+test("a thought takes a row only once it has something to show, so an empty one never comes and goes", () => {
+  const empty = (id: string, at: number, streaming = true, redacted = false): Extract<HEvent, { kind: "thinking" }> => ({ id, seq: at, at, kind: "thinking", text: "", streaming, redacted });
+  // Under way, nothing yet: no row (the turn's live tail says it is thinking).
+  assert.equal(thoughtShown(turn(empty("t", 2000)).items[0] as ThoughtItem), false);
+  // Ended with nothing to show: still none.
+  assert.equal(thoughtShown(turn(empty("t", 2000, false, true)).items[0] as ThoughtItem), false);
+  // Its words came: a row, and it stays.
+  assert.equal(thoughtShown(turn(thought("words", 2000)).items[0] as ThoughtItem), true);
+  assert.equal(thoughtShown(turn(thought("words", 2000, false)).items[0] as ThoughtItem), true);
+  // Only whitespace so far isn't something to show.
+  assert.equal(thoughtShown(turn({ ...empty("t", 2000), text: "  \n" }).items[0] as ThoughtItem), false);
 });
