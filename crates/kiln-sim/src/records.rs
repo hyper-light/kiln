@@ -3,7 +3,8 @@
 //! just after (the caller never hears which). That commit and every call after it are refused
 //! `Unavailable` until the model has crashed what runs on the store and [`Crashing::restart`]s it
 //! on what the store kept: what a crash-at-every-write test of a journal on `Records` runs on (the
-//! session journal of CP-T3.1).
+//! session journal of CP-T3.1). A model can also have a commit refused, typed, with no crash
+//! ([`Crashing::refuse_at`]), and reads how many calls of each kind went through ([`Calls`]).
 
 use std::sync::Arc;
 
@@ -11,12 +12,27 @@ use futures::future::BoxFuture;
 use kiln_seams::records::{Changes, Consistency, Page, Records, Refusal, Rev, Row, Scan, Tx};
 use parking_lot::Mutex;
 
+/// The calls that went through a [`Crashing`] store, by kind (refused ones included).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Calls {
+    pub gets: u64,
+    pub scans: u64,
+    pub commits: u64,
+    pub changes: u64,
+    pub waits: u64,
+    pub heads: u64,
+    /// Commits refused by [`Crashing::refuse_at`], nothing committed.
+    pub refused: u64,
+}
+
 #[derive(Debug, Default)]
 struct State {
-    /// Commits made through it.
-    commits: u64,
+    /// Calls made through it.
+    calls: Calls,
     /// The crash to come: commits until it, and whether it comes after its commit took effect.
     at: Option<(u64, bool)>,
+    /// A refusal to come: commits until it, and what it says.
+    refuse: Option<(u64, Refusal)>,
     crashed: bool,
     crashes: u64,
 }
@@ -65,19 +81,53 @@ impl<R: Records> Crashing<R> {
         st.at = None;
     }
 
-    /// Commits made through it, and crashes.
+    /// The `n`th commit from now (0: the next) is refused with `refusal`, nothing committed and no
+    /// crash: the caller is to say so, never to take the write as made.
+    pub fn refuse_at(&self, n: u64, refusal: Refusal) {
+        self.state.lock().refuse = Some((n, refusal));
+    }
+
+    /// Commits made through it (refused ones included), and crashes.
     pub fn commits(&self) -> u64 {
-        self.state.lock().commits
+        self.state.lock().calls.commits
+    }
+
+    /// The calls made through it, by kind.
+    pub fn calls(&self) -> Calls {
+        self.state.lock().calls
     }
 
     pub fn crashes(&self) -> u64 {
         self.state.lock().crashes
     }
 
+    /// Counts a call; refused `Unavailable` once the crash has come.
+    fn call(&self, kind: fn(&mut Calls) -> &mut u64) -> Result<(), Refusal> {
+        let mut st = self.state.lock();
+        let n = kind(&mut st.calls);
+        *n = n.saturating_add(1);
+        if st.crashed { Err(down()) } else { Ok(()) }
+    }
+
+    /// The refusal this commit gets, if it's the one chosen.
+    fn refusal_now(&self) -> Option<Refusal> {
+        let mut st = self.state.lock();
+        match st.refuse.take() {
+            Some((0, r)) => {
+                st.calls.refused = st.calls.refused.saturating_add(1);
+                Some(r)
+            }
+            Some((n, r)) => {
+                st.refuse = Some((n.saturating_sub(1), r));
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Whether this commit is the crash's, and if so whether it takes effect first.
     fn crash_now(&self) -> Option<bool> {
         let mut st = self.state.lock();
-        st.commits = st.commits.saturating_add(1);
         match st.at {
             Some((0, after)) => {
                 st.at = None;
@@ -97,26 +147,23 @@ impl<R: Records> Crashing<R> {
 impl<R: Records> Records for Crashing<R> {
     fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: Consistency) -> BoxFuture<'a, Result<Option<Row>, Refusal>> {
         Box::pin(async move {
-            if self.crashed() {
-                return Err(down());
-            }
+            self.call(|c| &mut c.gets)?;
             self.inner.get(family, key, at).await
         })
     }
 
     fn scan<'a>(&'a self, family: &'a str, scan: Scan) -> BoxFuture<'a, Result<Page, Refusal>> {
         Box::pin(async move {
-            if self.crashed() {
-                return Err(down());
-            }
+            self.call(|c| &mut c.scans)?;
             self.inner.scan(family, scan).await
         })
     }
 
     fn commit<'a>(&'a self, tx: Tx) -> BoxFuture<'a, Result<Rev, Refusal>> {
         Box::pin(async move {
-            if self.crashed() {
-                return Err(down());
+            self.call(|c| &mut c.commits)?;
+            if let Some(r) = self.refusal_now() {
+                return Err(r);
             }
             match self.crash_now() {
                 None => self.inner.commit(tx).await,
@@ -133,27 +180,21 @@ impl<R: Records> Records for Crashing<R> {
 
     fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>> {
         Box::pin(async move {
-            if self.crashed() {
-                return Err(down());
-            }
+            self.call(|c| &mut c.changes)?;
             self.inner.changes(family, after, limit).await
         })
     }
 
     fn wait<'a>(&'a self, family: &'a str, after: Rev) -> BoxFuture<'a, Result<Rev, Refusal>> {
         Box::pin(async move {
-            if self.crashed() {
-                return Err(down());
-            }
+            self.call(|c| &mut c.waits)?;
             self.inner.wait(family, after).await
         })
     }
 
     fn head(&self) -> BoxFuture<'_, Result<Rev, Refusal>> {
         Box::pin(async move {
-            if self.crashed() {
-                return Err(down());
-            }
+            self.call(|c| &mut c.heads)?;
             self.inner.head().await
         })
     }
@@ -208,6 +249,22 @@ mod tests {
                 block_on(append(&store, 50))?;
             }
         }
+        Ok(())
+    }
+
+    /// CP-T6.1 (for CP-T3.1): a commit refused, typed, with no crash: nothing committed, the calls
+    /// after it go through, and every call is counted by its kind.
+    #[test]
+    fn a_refused_commit_commits_nothing_and_the_store_goes_on() -> Result<(), Refusal> {
+        let store = Crashing::new(SimRecords::new());
+        store.refuse_at(1, Refusal::Full { limit: 3 });
+        block_on(append(&store, 0))?;
+        assert_eq!(block_on(append(&store, 1)), Err(Refusal::Full { limit: 3 }));
+        block_on(append(&store, 2))?;
+        assert!(!store.crashed());
+        assert_eq!(block_on(kept(&store, 3))?, [0, 2], "the refused commit's write isn't there");
+        let calls = store.calls();
+        assert_eq!((calls.commits, calls.refused, calls.gets), (3, 1, 3));
         Ok(())
     }
 }
