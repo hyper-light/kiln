@@ -307,6 +307,9 @@ pub struct Subject {
     pub environments: Vec<String>,
     /// Whom it's about, for the `inbox` (a run's actor when none).
     pub people: Vec<String>,
+    /// The review thread it's about (`comment.reply`, `mention`): what a reply to it answers
+    /// (docs/ci.md W14-R05).
+    pub thread: Option<String>,
 }
 
 impl Subject {
@@ -387,6 +390,8 @@ struct Msg {
     people: Vec<String>,
     /// The issues it names (its commit's trailers): what an issue tracker comments on.
     refs: Vec<String>,
+    /// The review thread it's about: email and Slack messages take replies to it (W14-R05).
+    thread: Option<String>,
 }
 
 impl Msg {
@@ -404,7 +409,18 @@ impl Msg {
         };
         let people = if s.people.is_empty() { vec![s.actor.clone()] } else { s.people.clone() };
         let people = people.into_iter().filter(|p| !p.is_empty()).collect();
-        Msg { title, line, url: s.url.clone(), what, dedup, resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"), webhook, people, refs: super::trackers::references(&s.message) }
+        Msg {
+            title,
+            line,
+            url: s.url.clone(),
+            what,
+            dedup,
+            resolve: matches!(event, "run.fixed" | "run.succeeded" | "deploy.succeeded"),
+            webhook,
+            people,
+            refs: super::trackers::references(&s.message),
+            thread: s.thread.clone(),
+        }
     }
 
     /// An agent's event, as `crate::push` sends it: `{type, agent: {id, name, machine, …}, title, text, url}`.
@@ -420,7 +436,7 @@ impl Msg {
         };
         let line = format!("{text} · {machine} · {url}");
         let webhook = json!({ "event": event, "title": title, "text": line, "agent": ev.get("agent").cloned().unwrap_or(Value::Null), "url": url });
-        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook, people: Vec::new(), refs: Vec::new() }
+        Msg { title, line, url, what: "the agent", dedup: format!("kiln:agent:{id}"), resolve: event == "agent.finished", webhook, people: Vec::new(), refs: Vec::new(), thread: None }
     }
 }
 
@@ -459,7 +475,18 @@ impl Msg {
         let webhook = json!({ "event": event, "title": title, "text": line, "release": r, "url": url });
         // Its approvers while it waits for them; else whoever asked for it.
         let people = if event == "release.waiting_approval" { approvers.iter().map(|a| (*a).to_owned()).collect() } else { vec![by.clone()] };
-        Msg { title, line, url: url.to_owned(), what: "the release", dedup: format!("kiln:release:{app}:{env}"), resolve: event == "release.succeeded", webhook, people, refs: Vec::new() }
+        Msg {
+            title,
+            line,
+            url: url.to_owned(),
+            what: "the release",
+            dedup: format!("kiln:release:{app}:{env}"),
+            resolve: event == "release.succeeded",
+            webhook,
+            people,
+            refs: Vec::new(),
+            thread: None,
+        }
     }
 }
 
@@ -535,7 +562,7 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: 
             let s = need("webhook URL or bot token")?;
             if s.starts_with("xoxb-") || s.starts_with("xoxp-") {
                 let channel = target.map(str::to_owned).or_else(|| cfg("channel")).ok_or("a Slack bot needs a channel: `slack:#ci`")?;
-                (integrations::endpoint("slack:api", || "https://slack.com/api/chat.postMessage".into()), json!({ "channel": channel, "text": text }), Some(s))
+                (integrations::endpoint("slack:api", || format!("{}/chat.postMessage", super::replies::slack_api(i))), json!({ "channel": channel, "text": text }), Some(s))
             } else {
                 (s, json!({ "text": text }), None)
             }
@@ -571,6 +598,7 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: 
     if matches!(i.kind.as_str(), "discord" | "teams" | "webhook") || (i.kind == "slack" && bearer.is_none()) {
         req = req.reaching(&hub.cfg.ci.reach());
     }
+    let bot = bearer.is_some();
     if let Some(b) = bearer {
         // Opsgenie's scheme is its own; the rest are bearer tokens.
         req = if b.starts_with("GenieKey ") { req.header("authorization", &b) } else { req.bearer(&b) };
@@ -597,6 +625,16 @@ async fn send(hub: &Hub, i: &Integration, target: Option<&str>, event: &str, m: 
     {
         return Err(format!("Slack: {}", v.get("error").and_then(Value::as_str).unwrap_or("refused")));
     }
+    // A bot's message about a review thread: remembered, so a reply in its Slack thread finds the
+    // review thread (W14-R05).
+    if i.kind == "slack"
+        && bot
+        && let Some(thread) = &m.thread
+        && let Ok(v) = serde_json::from_slice::<Value>(&answer)
+        && let (Some(channel), Some(ts)) = (v.get("channel").and_then(Value::as_str), v.get("ts").and_then(Value::as_str))
+    {
+        super::replies::chat_posted(hub, &i.id, channel, ts, thread).await;
+    }
     Ok(Went::Sent)
 }
 
@@ -613,7 +651,24 @@ async fn send_email(hub: &Hub, i: &Integration, target: Option<&str>, password: 
     let from = cfg("from").ok_or_else(|| format!("{} has no `from`", i.name))?;
     let to: Vec<String> = target.map(str::to_owned).or_else(|| cfg("to")).ok_or("email needs an address: `email:ada@example.com`, or the integration's `to`")?.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned).collect();
     let server = super::smtp::Server { host, port, tls, user: cfg("user"), password, reach: Some(hub.cfg.ci.reach()) };
-    let message = super::smtp::Message { from, to, subject: m.title.clone(), body: format!("{}\n\n{}\n", m.line, m.url) };
+    let body = format!("{}\n\n{}\n", m.line, m.url);
+    // About a review thread, with a mailbox for replies (W14-R05): each address gets one of its
+    // own, with a reply address only it has.
+    if let (Some(thread), Some(replies)) = (&m.thread, cfg("replies")) {
+        for address in &to {
+            let token = super::replies::token_for(hub, thread, super::smtp::address(address)).await.map_err(|e| format!("{e:#}"))?;
+            let message = super::smtp::Message {
+                from: from.clone(),
+                to: vec![address.clone()],
+                subject: m.title.clone(),
+                body: format!("{body}\nReply to this email to answer in the thread.\n"),
+                reply_to: super::replies::reply_to(&replies, &token),
+            };
+            super::smtp::send(&server, &message).await.map_err(|e| format!("{e:#}"))?;
+        }
+        return Ok(());
+    }
+    let message = super::smtp::Message { from, to, subject: m.title.clone(), body, reply_to: None };
     super::smtp::send(&server, &message).await.map_err(|e| format!("{e:#}"))
 }
 
@@ -827,7 +882,26 @@ async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>
         None => Vec::new(),
     };
     let url = format!("{}/runs/{run}", hub.cfg.server.public_url.trim_end_matches('/'));
-    Ok(Some((repo.clone(), Subject { repo: repo.name, run: run.to_owned(), number, workflow, name, branch, sha, message, actor, conclusion: conclusion.unwrap_or_default(), url, github, environments: Vec::new(), people })))
+    Ok(Some((
+        repo.clone(),
+        Subject {
+            repo: repo.name,
+            run: run.to_owned(),
+            number,
+            workflow,
+            name,
+            branch,
+            sha,
+            message,
+            actor,
+            conclusion: conclusion.unwrap_or_default(),
+            url,
+            github,
+            environments: Vec::new(),
+            people,
+            thread: None,
+        },
+    )))
 }
 
 /// A run ended (W19-R06): `run.failed`, `run.cancelled`, or `run.succeeded` and, after failures
@@ -1046,7 +1120,18 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
     let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
     let title = format!("⚠ runner {name} is offline");
     let line = format!("gone {} min · {} · {url}", gone_for / 60, if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") });
-    let m = Msg { title: title.clone(), line: line.clone(), url, what: "the runner", dedup: format!("kiln:runner:{name}"), resolve: false, webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }), people: Vec::new(), refs: Vec::new() };
+    let m = Msg {
+        title: title.clone(),
+        line: line.clone(),
+        url,
+        what: "the runner",
+        dedup: format!("kiln:runner:{name}"),
+        resolve: false,
+        webhook: json!({ "event": "runner.offline", "title": title, "text": line, "runner": runner }),
+        people: Vec::new(),
+        refs: Vec::new(),
+        thread: None,
+    };
     for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
         if rule.check(true).is_err() || !takes_ctx(rule, "runner.offline", "runner", &runner) {
             continue;
@@ -1064,10 +1149,11 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
 
 /// A person-facing event about a diff or change request (W19-R06): `review.requested` (`people`:
 /// the reviewers asked), `comment.reply` (the people in the thread) or `mention` (whom it
-/// mentions), done by `actor`. The repository's rules see `run` as the diff: `name` it and its
-/// title, `workflow` its name, `branch` its trunk, `actor`, `message` (what was said), `url`.
+/// mentions), done by `actor`, about review thread `thread` when it's one's. The repository's
+/// rules see `run` as the diff: `name` it and its title, `workflow` its name, `branch` its trunk,
+/// `actor`, `message` (what was said), `url`.
 #[allow(clippy::too_many_arguments)]
-pub async fn diff_event(hub: Arc<Hub>, repo: String, event: &'static str, diff: String, title: String, trunk: String, actor: String, text: String, people: Vec<String>) {
+pub async fn diff_event(hub: Arc<Hub>, repo: String, event: &'static str, diff: String, title: String, trunk: String, actor: String, text: String, people: Vec<String>, thread: Option<String>) {
     let mut people: Vec<String> = people.into_iter().filter(|p| !p.eq_ignore_ascii_case(&actor) && super::inbox::person(p) != super::inbox::person(&actor)).collect();
     people.sort();
     people.dedup();
@@ -1087,6 +1173,7 @@ pub async fn diff_event(hub: Arc<Hub>, repo: String, event: &'static str, diff: 
         url: format!("{base}/diffs/{diff}"),
         github: json!({ "repository": repo, "ref": format!("refs/heads/{trunk}"), "ref_name": trunk, "actor": actor, "event_name": event }),
         people,
+        thread,
         ..Subject::default()
     };
     emit(&hub, &r, event, &s).await;
@@ -1264,7 +1351,23 @@ mod tests {
     use super::*;
 
     fn subject() -> Subject {
-        Subject { repo: "acme/app".into(), run: "r1".into(), number: 7, workflow: ".github/workflows/ci.yml".into(), name: "CI".into(), branch: "main".into(), sha: "0123456789abcdef".into(), message: "fix the parser\n\nlong".into(), actor: "ada".into(), conclusion: "failure".into(), url: "https://kiln.example/runs/r1".into(), github: json!({ "ref_name": "main", "event_name": "push" }), environments: Vec::new(), people: Vec::new() }
+        Subject {
+            repo: "acme/app".into(),
+            run: "r1".into(),
+            number: 7,
+            workflow: ".github/workflows/ci.yml".into(),
+            name: "CI".into(),
+            branch: "main".into(),
+            sha: "0123456789abcdef".into(),
+            message: "fix the parser\n\nlong".into(),
+            actor: "ada".into(),
+            conclusion: "failure".into(),
+            url: "https://kiln.example/runs/r1".into(),
+            github: json!({ "ref_name": "main", "event_name": "push" }),
+            environments: Vec::new(),
+            people: Vec::new(),
+            thread: None,
+        }
     }
 
     /// W19-AC05's rules, without the network: events and `where` pick rules; bad rules are refused.

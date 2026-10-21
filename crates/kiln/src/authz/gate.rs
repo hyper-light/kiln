@@ -268,6 +268,26 @@ async fn withheld_from(hub: &Hub, by: &serde_json::Value, names: Vec<String>, ta
         })
 }
 
+/// User `id` as a caller, as they are now (disabled or gone: none): who something they said
+/// elsewhere acts as (a reply to kiln's review email, or in a chat's thread: docs/ci.md W14-R05).
+pub async fn user_caller(hub: &Hub, id: &str) -> Option<Caller> {
+    let id = id.to_owned();
+    hub.store
+        .call(move |c| {
+            Ok(user_rights(c, &id)?.map(|(name, rights)| Caller {
+                kind: Kind::User,
+                name: format!("user:{name}"),
+                user: Some(id.clone()),
+                token: None,
+                agent: None,
+                rights: Some(rights),
+                limit: None,
+            }))
+        })
+        .await
+        .unwrap_or_else(store_err)
+}
+
 /// Whether user `id`, as they are now, may `capability` in `target` (disabled or gone: no): what a
 /// person's own notification rules are held to (W19-R06).
 pub async fn user_may(hub: &Hub, id: &str, capability: &str, target: &Scope) -> bool {

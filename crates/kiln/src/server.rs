@@ -159,6 +159,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
         child!("attachments", h => crate::ci::attach::run(h));
         child!("previews", h => crate::ci::previews::run(h));
+        child!("review-replies", h => crate::ci::replies::run(h));
         // Bisections and experiments this server was driving when it stopped stopped with it
         // (docs/ci.md W20).
         let h = hub.clone();

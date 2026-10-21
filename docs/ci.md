@@ -177,15 +177,15 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | done | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; the whole native table: `pull_request`'s activity types and `pull_request_target`, comments and reviews, the merge queue's `enqueued`/`dequeued`; kiln's `land`, `agent`, `webhook` (inbound hooks), `pipeline` and `deploy`; `chain-depth`; nothing started by a job's token; the App's events; AC01–AC09 |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit, and AC04 and AC06 end to end), reusable workflows local and remote, plan preview, outputs' provenance and readers (R23); fixtures F-10 to F-15 and AC07; `files:` shards in runs, `$KILN_SHARD_ITEMS`, runs' removed combinations; AC08 on the live cluster left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC10 (AC08 at 127k assignments/s; AC09 a server killed under a queue, its running legs re-adopted), reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons; resource mode from runners' facts (R03); AC11 on the live cluster left |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); AC04 (each shell, on Linux and macOS; Windows left), AC05 (pre, main and post order, `post-if`, cancellation, timeouts) and AC06 (paths in containers); a `k8s` pool's pods (W13-R07); Firecracker microVMs (W13-R05); shards' left with W13 |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); AC04 (each shell, on Linux, macOS and Windows), AC05 (pre, main and post order, `post-if`, cancellation, timeouts) and AC06 (paths in containers); a `k8s` pool's pods (W13-R07); Firecracker microVMs (W13-R05); shards' left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins and a rerun with fresh actions; musl Node for Alpine job containers |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06, a rebased diff's); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit's `type=gha` and `type=registry` caches (R11, AC03); speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault, Vault, Infisical, Doppler, 1Password), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); Vault, Infisical, Doppler and 1Password as stores (R08); AC02 (every read and read-only tool walked, none with a value); AC06 (declarations end to end, an action's undeclared reads reported); AC08 (W18-AC03's); a repository's, a workflow's and an environment's secrets on their pages |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
-| W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for every D.1 ecosystem (AC03 with the real tools for eight), vcpkg's binary cache kept by kiln; jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
+| W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for every D.1 ecosystem (AC03 with the real tools for eight), vcpkg's binary cache kept by kiln; jobs' registry credentials through `docker-credential-kiln`, federated for every D.2 registry that federates (Alibaba's and Oracle's among them); offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); each VMM in a jail of its own (namespaces, no root), pools restored from snapshots, services and job containers in microVMs; AC02 on host, docker and firecracker, AC03, AC05 (a cold start 0.64 s, a warm one 35 ms); `shards` left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare, search), GraphQL (pull requests, comments, labels, reviews, checks, search; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); GraphQL's merges left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare, search), GraphQL (pull requests, comments, labels, reviews, checks, search; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); replies by email and in Slack threads, posted as their people (R05); GraphQL's merges left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container deployments (Compose stacks, healthy, outliving their jobs) and microVM ones (long-lived Firecracker microVMs, health-checked, taking over their ports, booted again with their runner); previews of diffs, stacks and pull requests (AC04; their containers and microVMs taken down as they go); shards' microVMs, CD's preview apps and the live-cluster ACs left |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; in Firecracker microVMs terminals, keeping, extend and release, and reruns in place (W13-R05); shards' left |
@@ -2202,10 +2202,9 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
 - *Done.* AC04's run on Windows (x86-64, Windows PowerShell 5.1, MSYS2's bash and perl) found
   `shell: cmd` broken there: std's quoting escaped the quotes inside GitHub's `/S /C "CALL "{0}""`,
   which cmd doesn't take escaped, so every `cmd` step failed. Its line goes as written now
-  (`raw_arg`). PowerShell's exit codes are `-command`'s, as on GitHub: a failure is 1.
-- *Left.*
-  - AC04 again on Windows, with the `cmd` fix.
-  - AC07 (with W22-AC01).
+  (`raw_arg`). PowerShell's exit codes are `-command`'s, as on GitHub: a failure is 1. Run again
+  with the fix, AC04 passed on Windows too: every shell there, `cmd` among them.
+- *Left.* AC07 (with W22-AC01).
 
 ### W07 Actions
 
@@ -3537,6 +3536,20 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   asked; from their registry when kiln's mirror can't.
 - *Done.* More of D.2's federations through `docker-credential-kiln`: Quay's robot federation,
   JFrog's OIDC integration, Cloudsmith's OIDC, Chainguard's assumable identities.
+- *Done.* D.2's last two (`crates/kiln/src/ci/integrations/{alibaba,oracle}.rs`), an `oci`
+  integration's `federation`:
+  - `alibaba`: STS's `AssumeRoleWithOIDC` with the leg's ID token (`role_arn`,
+    `oidc_provider_arn`; audience `sts.aliyuncs.com` by default), then Container Registry's
+    temporary password: an Enterprise Edition instance's (`instance_id`, RPC style) or the
+    Personal Edition's (ROA style), each signed with the role's key and security token. The
+    region is the registry host's unless `region` says.
+  - `oracle`: the leg's ID token exchanged at an OCI identity domain (`domain`, `client_id`, the
+    client secret as the integration's token) for a session token bound to a key made for the one
+    login, then Container Registry's token for a request that key signs (OCI's HTTP signatures),
+    logged in as `BEARER_TOKEN`. Without a federation, an auth token is the stored token, its
+    `username` `<namespace>/<user>`.
+  - Unit-tested: Alibaba's own RPC signature example; each exchange against a fake that checks
+    what's sent and verifies its signature (a key other than the session's is refused).
 - *Done.* The rest of D.1 (`crates/kiln/src/ci/registry/proxy.rs`):
   - Composer: Packagist's v2 metadata, the root's `metadata-url` and each version's archive
     (`dist.url`, on GitHub's, GitLab's or Bitbucket's hosts, or one the proxy names) pointed
@@ -3554,8 +3567,8 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
     against stand-ins for Packagist and ConanCenter (`w12_r04_composer_conan_and_vcpkg`).
 - *Left.* R02's runners beyond Docker's pulls and Firecracker's (whose root file systems come
   through kiln's mirrors as Docker's images do: W13-R05): containerd's `hosts.toml` for the
-  cluster and shards' settings, with W13; D.2's Alibaba ACR and Oracle OCIR federations; AC04
-  (user-assisted, against test tenants).
+  cluster and shards' settings, with W13; AC04 (user-assisted, against test tenants), which is
+  also where D.2's federations meet the real registries.
 
 ### W13 Runners and executors
 
@@ -4526,10 +4539,31 @@ GraphQL; merging through GraphQL is left.
     - a job reading its own run, its workflow and the runs list, then uploading SARIF twice:
       the first upload opens an alert, the second fixes it, and a bad commit gets a 422
       (`w14_r11_runs_and_code_scanning`).
+- *Done.* R05's replies by email or chat (`crates/kiln/src/ci/replies.rs`, `ci/imap.rs`):
+  - Email: an `email` integration with `replies` (a mailbox kiln reads: `review@example.com`)
+    sends a message about a review thread (`comment.reply`, `mention`) to each address on its
+    own, `Reply-To: review+<token>@example.com`, the token that address's for that thread. kiln
+    reads the mailbox's unseen messages over IMAP (`imap_host`, `imap_port`, `imap_tls`,
+    `imap_user`, `imap_folder`, `imap_every`; the integration's password; a password goes in the
+    clear only to this machine). A reply to a token, from the address it went to, is posted to
+    the thread by the person with that address, without what it quotes or its signature
+    (MIME's parts and encodings read); anything else is left, saying why.
+  - Slack: a bot's message about a thread is remembered; a reply in its Slack thread, sent by
+    Slack's Events API to the integration's own address (`GET /api/ci/integrations/:name/replies`
+    says it, with the bot's scopes and events; its key derived from the server's master key), is
+    posted by the person whose Slack email it is (`users.info`). The bot's API is `api`
+    (GovSlack's, say). Discord, Teams and Telegram take no replies: their integrations post
+    through webhooks or bots kiln doesn't hear from.
+  - A reply is that person's comment: they must be able to review the diff (`diffs.review`).
+  - Checked end to end (`tests/replies.rs`, against stand-in SMTP, IMAP and Slack servers): a
+    reviewer's emailed reply and their Slack reply each posted to the thread as theirs, quoting
+    left out; the same reply address from another mailbox, and a reply in a thread kiln didn't
+    start, posted nothing.
+  - On the way: a repository kiln hosts has its trunk's files (rules, environments, settings)
+    read from its own git, not its mirror, which has a push only after the next poll.
 - *Left.* Everything else:
   - GraphQL's merge mutations (`mergePullRequest`, `enablePullRequestAutoMerge`) and the land
     queue's equivalent for jobs;
-  - replies by email or chat (R05, with W11-R06);
   - AC07, which needs a test repository on GitHub (user-assisted). AC06 is done (above), and so
     is AC05: `github-script`, the release with an asset and `actions/checkout` from the facade
     above, and a checkout at a diff's version with its submodules and `download-artifact` across

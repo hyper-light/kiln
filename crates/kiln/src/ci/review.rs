@@ -203,9 +203,21 @@ fn tell(hub: &std::sync::Arc<Hub>, d: &Diff, me: &str, said: Vec<(String, String
                 .await
                 .unwrap_or_default();
             people.push(d.author.clone());
-            super::notify::diff_event(std::sync::Arc::clone(&hub), d.repo.clone(), "comment.reply", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), body.clone(), people).await;
+            super::notify::diff_event(
+                std::sync::Arc::clone(&hub),
+                d.repo.clone(),
+                "comment.reply",
+                d.name.clone(),
+                d.title.clone(),
+                d.trunk.clone(),
+                me.clone(),
+                body.clone(),
+                people,
+                Some(thread.clone()),
+            )
+            .await;
             let named = kiln_ci::trigger::context::mentions(&body);
-            super::notify::diff_event(std::sync::Arc::clone(&hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), body, named).await;
+            super::notify::diff_event(std::sync::Arc::clone(&hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), body, named, Some(thread)).await;
         }
     });
 }
@@ -427,7 +439,7 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     tell(hub, d, &me, drafts);
     if !text.is_empty() {
         let named = kiln_ci::trigger::context::mentions(&text);
-        crate::rt::spawn(super::notify::diff_event(std::sync::Arc::clone(hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), text.clone(), named));
+        crate::rt::spawn(super::notify::diff_event(std::sync::Arc::clone(hub), d.repo.clone(), "mention", d.name.clone(), d.title.clone(), d.trunk.clone(), me.clone(), text.clone(), named, None));
     }
     // The review state the reviews give it now (a draft stays a draft, landing stays landing).
     let (_, path) = super::diffs::home(hub, d).await?;

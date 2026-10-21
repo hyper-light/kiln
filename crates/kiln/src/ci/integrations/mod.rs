@@ -10,11 +10,13 @@
 //!   that federate (AWS, Google Cloud, Azure) exchange kiln's OIDC identity for short-lived
 //!   credentials; the rest use a stored token.
 
+pub mod alibaba;
 pub mod aws;
 pub mod azure;
 pub mod cloudflare;
 pub mod gcp;
 pub mod oci;
+pub mod oracle;
 pub mod stores;
 pub mod vercel;
 
@@ -102,19 +104,26 @@ pub const KINDS: &[KindInfo] = &[
             f("registry", true, "as image references name it: docker.io, ghcr.io, quay.io, registry.example.com:5000"),
             f("username", false, "for a private registry, or Docker Hub pulls without the anonymous limit"),
             f("insecure", false, "true for a registry that speaks plain HTTP (a local network, a test)"),
-            f("federation", false, "aws (ECR), gcp (Artifact Registry) or azure (ACR): short-lived credentials from the job's ID token, no stored secret"),
-            f("role_arn", false, "federation = aws: the IAM role that may pull and push"),
-            f("region", false, "federation = aws: the registry's region (read from its host otherwise)"),
+            f(
+                "federation",
+                false,
+                "aws (ECR), gcp (Artifact Registry), azure (ACR), quay, jfrog, cloudsmith, chainguard, alibaba (Container Registry) or oracle (OCIR): short-lived credentials from the job's ID token",
+            ),
+            f("role_arn", false, "federation = aws or alibaba: the role that may pull and push"),
+            f("region", false, "federation = aws or alibaba: the registry's region (read from its host otherwise)"),
             f("audience", false, "the ID token's audience the cloud trusts"),
             f("provider", false, "federation = gcp: projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>"),
             f("service_account", false, "federation = gcp: a service account to impersonate"),
             f("tenant_id", false, "federation = azure: the Entra tenant"),
-            f("client_id", false, "federation = azure: the app registration with the federated credential"),
+            f("client_id", false, "federation = azure: the app registration with the federated credential; oracle: the identity domain's confidential application"),
             f("robot", false, "federation = quay: the robot account (org+name) that trusts kiln's ID tokens"),
             f("url", false, "federation = jfrog: the platform's URL, when not the registry's host"),
             f("org", false, "federation = cloudsmith: the organization"),
             f("service", false, "federation = cloudsmith: the service account's slug"),
             f("identity", false, "federation = chainguard: the assumable identity's id"),
+            f("oidc_provider_arn", false, "federation = alibaba: the RAM OIDC provider that trusts kiln's ID tokens (acs:ram::<account>:oidc-provider/<name>)"),
+            f("instance_id", false, "federation = alibaba: the Enterprise Edition instance (cri-…); none for the Personal Edition"),
+            f("domain", false, "federation = oracle: the OCI IAM identity domain's URL (https://idcs-….identity.oraclecloud.com); its client secret is the token"),
         ],
         secret: Some("access token or password"),
         built: true,
@@ -244,7 +253,18 @@ pub const KINDS: &[KindInfo] = &[
     },
     KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true },
     // Chat, paging and webhooks: where notifications go (docs/ci.md W11-R06, W19-R06).
-    KindInfo { kind: "slack", title: "Slack", category: "notify", mode: Mode::Token, fields: &[f("channel", false, "the channel a bot token posts to when a rule names none (#ci)")], secret: Some("incoming webhook URL, or a bot token (xoxb-…)"), built: true },
+    KindInfo {
+        kind: "slack",
+        title: "Slack",
+        category: "notify",
+        mode: Mode::Token,
+        fields: &[
+            f("channel", false, "the channel a bot token posts to when a rule names none (#ci)"),
+            f("api", false, "Slack's API for a bot token: https://slack.com/api (the default), or GovSlack's"),
+        ],
+        secret: Some("incoming webhook URL, or a bot token (xoxb-…)"),
+        built: true,
+    },
     KindInfo { kind: "discord", title: "Discord", category: "notify", mode: Mode::Token, fields: &[], secret: Some("webhook URL"), built: true },
     KindInfo { kind: "teams", title: "Microsoft Teams", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Workflows webhook URL"), built: true },
     KindInfo { kind: "telegram", title: "Telegram", category: "notify", mode: Mode::Token, fields: &[f("chat_id", false, "the chat a rule that names none posts to")], secret: Some("bot token"), built: true },
@@ -262,6 +282,13 @@ pub const KINDS: &[KindInfo] = &[
             f("tls", false, "starttls (the default), tls, or none for a relay that takes mail in the clear"),
             f("user", false, "who signs in, when the server wants it"),
             f("to", false, "where a rule that names no address sends (comma-separated)"),
+            f("replies", false, "a mailbox kiln reads replies to its review emails in (review@example.com): they're posted to their threads"),
+            f("imap_host", false, "replies: the mailbox's IMAP server (imap.example.com)"),
+            f("imap_port", false, "replies: 993 with TLS (the default), 143 with STARTTLS"),
+            f("imap_tls", false, "replies: tls (the default), starttls, or none for this machine's own server"),
+            f("imap_user", false, "replies: who signs in to the mailbox (`user` otherwise); the password is the integration's"),
+            f("imap_folder", false, "replies: the folder replies arrive in (INBOX)"),
+            f("imap_every", false, "replies: how often the mailbox is read (30s)"),
         ],
         secret: Some("the password, when the server wants one"),
         built: true,
@@ -775,6 +802,19 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
                 Err(fail(StatusCode::NOT_FOUND, format!("no integration `{name}`")))
+            }
+        }
+        // Where Slack's Events API sends a Slack integration's events: replies in its threads
+        // (docs/ci.md W14-R05).
+        (&Method::GET, ["integrations", name, "replies"]) => {
+            let i = get(hub, name).await.map_err(internal)?.ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no integration `{name}`")))?;
+            match i.kind.as_str() {
+                "slack" => Ok(srv::json(
+                    StatusCode::OK,
+                    &json!({ "events_url": crate::ci::replies::events_url(hub, &i), "scopes": ["chat:write", "users:read", "users:read.email"], "events": ["message.channels", "message.groups"] }),
+                )),
+                "email" => Ok(srv::json(StatusCode::OK, &json!({ "replies": i.config.get("replies"), "imap_host": i.config.get("imap_host") }))),
+                other => Err(fail(StatusCode::NOT_FOUND, format!("a {other} integration takes no replies"))),
             }
         }
         (&Method::POST, ["integrations", name, "verify"]) => {

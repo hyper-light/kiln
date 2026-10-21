@@ -148,7 +148,18 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
         .map_err(|e| format!("{e:#}"))?;
     let (id, number, n, kind, rebase_only, asked) = made;
     if !asked.is_empty() {
-        crate::rt::spawn(super::notify::diff_event(Arc::clone(hub), repo.name.clone(), "review.requested", format!("CR{number}"), title.clone(), trunk.to_owned(), by.author.0.clone(), String::new(), asked));
+        crate::rt::spawn(super::notify::diff_event(
+            Arc::clone(hub),
+            repo.name.clone(),
+            "review.requested",
+            format!("CR{number}"),
+            title.clone(),
+            trunk.to_owned(),
+            by.author.0.clone(),
+            String::new(),
+            asked,
+            None,
+        ));
     }
     if kind != "unchanged" {
         let _ = gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/CR{number}/v{n}"), &s.head], LS_REMOTE_TIMEOUT).await;

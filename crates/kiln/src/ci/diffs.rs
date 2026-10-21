@@ -500,7 +500,18 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
         by_diff.entry(number).or_insert_with(|| (title, Vec::new())).1.push(reviewer);
     }
     for (number, (title, reviewers)) in by_diff {
-        crate::rt::spawn(super::notify::diff_event(Arc::clone(hub), s.repo.name.clone(), "review.requested", format!("D{number}"), title, s.trunk.to_owned(), s.author.0.clone(), String::new(), reviewers));
+        crate::rt::spawn(super::notify::diff_event(
+            Arc::clone(hub),
+            s.repo.name.clone(),
+            "review.requested",
+            format!("D{number}"),
+            title,
+            s.trunk.to_owned(),
+            s.author.0.clone(),
+            String::new(),
+            reviewers,
+            None,
+        ));
     }
     // Their checks, unless a job's token pushed them (it starts no run, as on GitHub).
     if by_job(s.pushed_by) {

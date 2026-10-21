@@ -69,6 +69,8 @@ pub struct Message {
     pub to: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// Where replies go (a review thread's reply address, docs/ci.md W14-R05).
+    pub reply_to: Option<String>,
 }
 
 /// The address in `kiln <ci@example.com>` (or the whole, when it's just an address).
@@ -118,6 +120,9 @@ pub fn render(m: &Message, host: &str, now: time::OffsetDateTime) -> String {
         ("Auto-Submitted", "auto-generated".into()),
     ] {
         out.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if let Some(r) = &m.reply_to {
+        out.push_str(&format!("Reply-To: {}\r\n", header_text(r)));
     }
     out.push_str("\r\n");
     let bytes = body.as_bytes();
@@ -227,7 +232,9 @@ pub async fn send(server: &Server, m: &Message) -> anyhow::Result<()> {
     for t in &m.to {
         anyhow::ensure!(valid_address(t), "`{t}` isn't an address");
     }
-    anyhow::ensure!(server.tls != Tls::None || server.password.as_deref().is_none_or(str::is_empty), "a password never goes in the clear: use `tls: starttls` or `tls: tls`");
+    // A password is only sent to sign in as `user`.
+    let signs_in = server.user.as_deref().is_some_and(|u| !u.is_empty()) && server.password.as_deref().is_some_and(|p| !p.is_empty());
+    anyhow::ensure!(server.tls != Tls::None || !signs_in, "a password never goes in the clear: use `tls: starttls` or `tls: tls`");
     let tcp = match &server.reach {
         Some(r) => crate::http::io::connect_direct_reaching(&server.host, server.port, r).await?,
         None => crate::http::io::connect(&server.host, server.port).await?,
@@ -290,7 +297,7 @@ mod tests {
         for bad in ["ada", "ada@example", "a b@example.com", "ada@example.com\r\nRCPT TO:<x@y.z>", "<>", "@example.com"] {
             assert!(!valid_address(bad), "{bad:?}");
         }
-        let m = Message { from: "kiln <ci@example.com>".into(), to: vec!["ada@example.com".into()], subject: "✗ CI #7 failed\r\nBcc: x@y.z".into(), body: ".\r\nline two".into() };
+        let m = Message { from: "kiln <ci@example.com>".into(), to: vec!["ada@example.com".into()], subject: "✗ CI #7 failed\r\nBcc: x@y.z".into(), body: ".\r\nline two".into(), reply_to: None };
         let at = time::OffsetDateTime::from_unix_timestamp(1_792_400_000).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
         let data = render(&m, "kiln.test", at);
         assert!(data.contains("From: kiln <ci@example.com>\r\nTo: ada@example.com\r\n"), "{data}");
@@ -298,6 +305,9 @@ mod tests {
         assert!(data.contains("Subject: =?utf-8?B?") && !data.contains("\r\nBcc:"), "{data}");
         assert!(data.ends_with("\r\n.\r\n") && data.matches("\r\n.\r\n").count() == 1, "{data}");
         assert!(data.contains("Date: ") && data.contains("Auto-Submitted: auto-generated"));
+        assert!(!data.contains("Reply-To:"), "{data}");
+        let replied = render(&Message { reply_to: Some("kiln <review+t0k@example.com>".into()), ..m }, "kiln.test", at);
+        assert!(replied.contains("\r\nReply-To: kiln <review+t0k@example.com>\r\n"), "{replied}");
         assert_eq!(Tls::parse("").ok(), Some(Tls::StartTls));
         assert_eq!(Tls::parse("TLS").ok(), Some(Tls::Implicit));
         assert!(Tls::parse("maybe").is_err());

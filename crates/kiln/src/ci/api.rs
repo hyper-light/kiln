@@ -62,6 +62,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         ["_kiln", "attestation-key.pem"] => Some(super::attest::key_pem(hub).await),
         // W03-R02: an inbound webhook's call, checked by its signature.
         ["api", "ci", "hooks", id] if req.method() == Method::POST => Some(super::inbound::call(hub, id, req).await),
+        // W14-R05: Slack's Events API, at a Slack integration's own address.
+        ["api", "ci", "replies", "slack", id, key] if req.method() == Method::POST => Some(super::replies::slack_events(hub, id, key, req).await),
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -75,7 +77,22 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
 
 /// Is this path one of [`open`]'s? (So the caller can hand the request over without cloning it.)
 pub fn is_open(seg: &[&str]) -> bool {
-    git_path(seg) || matches!(seg, ["git", rest @ ..] if git_path(rest)) || super::rest::is_web(seg) || super::rest::is_download(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] | ["api", "v3", ..] | ["api", "graphql"] | ["api", "uploads", ..] | ["api", "ci", "hooks", _])
+    git_path(seg)
+        || matches!(seg, ["git", rest @ ..] if git_path(rest))
+        || super::rest::is_web(seg)
+        || super::rest::is_download(seg)
+        || matches!(
+            seg,
+            ["_kiln", ..]
+                | ["_apis", ..]
+                | ["oidc", ..]
+                | ["twirp", ..]
+                | ["api", "v3", ..]
+                | ["api", "graphql"]
+                | ["api", "uploads", ..]
+                | ["api", "ci", "hooks", _]
+                | ["api", "ci", "replies", "slack", _, _]
+        )
 }
 
 /// First segments that are kiln's own, never a repository owner.
