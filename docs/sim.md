@@ -17,12 +17,12 @@ exactly from its seed, and a bug it finds is fixed with its seed kept as the reg
 | One seed | `KILN_SIM_SEED=<seed> cargo test -p kiln --lib <model's test>`: that seed alone, with its last steps in words |
 | More seeds | `KILN_SIM_SEEDS=<n>` (and `KILN_SIM_FROM=<first>`) |
 
-A failure says its seed and how to replay it:
+A failure says its seed and how to replay it (here the third bug's, before its fix):
 
 ```
-kiln-sim sync: seeds 0..=199 (200) in 41.20 s, 291 seeds/min on one thread, 1 failed
-  seed 117: m3's folder isn't the log's repo: ...
-    replay: KILN_SIM_SEED=117
+kiln-sim moves: seeds 2000..=2000 (1) in 0.04 s, 1409 seeds/min on one thread, 1 failed
+  seed 2000: 37.637443715s: the session left m2 with its write to agent/notes.md (120 bytes, at 35.987614043s) not in the log through index 23: left behind
+    replay: KILN_SIM_SEED=2000
 ```
 
 ## What it is
