@@ -179,6 +179,8 @@ pub struct Stream {
     touched: std::sync::atomic::AtomicI64,
     touches: Mutex<HashMap<i64, (f64, f64)>>,
     inputs: async_channel::Sender<Vec<Input>>,
+    /// What its viewers ask of it, done in order (`controlled`).
+    controls: async_channel::Sender<Value>,
     /// Laid out as a phone's (touch, a phone's viewport): what its viewer is.
     mobile: std::sync::atomic::AtomicBool,
     /// In a person's own profile (their sign-ins): theirs to use, not an agent's.
@@ -450,7 +452,8 @@ impl Streams {
         s.outs.lock().insert(id.to_owned(), outs.chunks.clone());
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (pw, ph) = ((f64::from(width) * scale).round() as u32, (f64::from(height) * scale).round() as u32);
-        let opts = json!({"width": pw, "height": ph, "framerate": 60, "bitrate": spec.bitrate.unwrap_or(4_000_000), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
+        // Its bitrate as it asked, else as its size and rate want (`bitrateFor`).
+        let opts = json!({"width": pw, "height": ph, "framerate": 60, "bitrate": spec.bitrate.unwrap_or(4_000_000), "asked": spec.bitrate.is_some(), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
         let started = super::evaluate(&s.browser.cdp, &s.worker, &format!("kiln.capture({tab}, {}, {opts})", json!(id))).await?;
         if started.get("ok").and_then(Value::as_bool) != Some(true) {
             s.outs.lock().remove(id);
@@ -464,10 +467,12 @@ impl Streams {
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
+        let (controls, ordered) = async_channel::bounded::<Value>(64);
         let first = page.target().to_owned();
-        let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(Tabs::new(page, chrome)), device, inputs, out.clone(), dir, (width, height, scale, mobile)));
+        let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(Tabs::new(page, chrome)), device, (inputs, controls), out.clone(), dir, (width, height, scale, mobile)));
         crate::rt::spawn(watch(stream.clone(), first));
         crate::rt::spawn(apply(Arc::downgrade(&stream), queued));
+        crate::rt::spawn(controlled(Arc::downgrade(&stream), ordered));
         let opened = json!({"opened": {"width": width, "height": height, "scale": scale, "audio": started.get("audio"), "platform": std::env::consts::OS, "engine": "chromium", "device": device}});
         self.went(id, stream, &spec.url, opened, out).await
     }
@@ -500,7 +505,7 @@ impl Streams {
         enc.outs.lock().insert(id.to_owned(), outs.chunks.clone());
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (pw, ph) = ((f64::from(width) * scale).round() as u32, (f64::from(height) * scale).round() as u32);
-        let opts = json!({"width": pw, "height": ph, "framerate": 30, "bitrate": spec.bitrate.unwrap_or(4_000_000), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
+        let opts = json!({"width": pw, "height": ph, "framerate": 30, "bitrate": spec.bitrate.unwrap_or(4_000_000), "asked": spec.bitrate.is_some(), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
         let started = match super::evaluate(&enc.browser.cdp, &enc.worker, &format!("kiln.pushed({}, {opts})", json!(id))).await {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => v,
             other => {
@@ -512,10 +517,12 @@ impl Streams {
         drop(started);
         self.listen(&enc).await?;
         let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let stream = Arc::new(Stream::new(id, spec, enc, Surface::Driven(page), device, inputs, out.clone(), dir, window));
+        let (controls, ordered) = async_channel::bounded::<Value>(64);
+        let stream = Arc::new(Stream::new(id, spec, enc, Surface::Driven(page), device, (inputs, controls), out.clone(), dir, window));
         crate::rt::spawn(said(stream.clone(), out.clone()));
         crate::rt::spawn(pump(Arc::downgrade(&stream)));
         crate::rt::spawn(apply(Arc::downgrade(&stream), queued));
+        crate::rt::spawn(controlled(Arc::downgrade(&stream), ordered));
         let opened = json!({"opened": {"width": width, "height": height, "scale": scale, "mobile": mobile, "audio": false, "platform": std::env::consts::OS, "engine": engine.name(), "device": device}});
         self.went(id, stream, &spec.url, opened, out).await
     }
@@ -707,12 +714,36 @@ pub fn serve_input(id: &str, json: &str) {
     }
 }
 
-/// `ServerMsg::StreamControl` on a runner.
-pub async fn serve_control(id: String, json: String) {
-    let Some(s) = streams().get(&id) else { return };
-    let c: Value = serde_json::from_str(&json).unwrap_or_default();
-    if let Err(e) = s.control(&c).await {
-        tracing::debug!(stream = %id, error = %format!("{e:#}"), "a viewer's request didn't reach the stream");
+/// `ServerMsg::StreamControl` on a runner: queued for its stream, done in order (`controlled`).
+pub fn serve_control(id: &str, json: &str) {
+    let Some(s) = streams().get(id) else { return };
+    match serde_json::from_str::<Value>(json) {
+        Ok(c) => {
+            let _ = s.controls.try_send(c);
+        }
+        Err(e) => tracing::debug!(stream = id, error = %e, "a viewer's request isn't any kiln knows"),
+    }
+}
+
+/// What its viewers ask of a stream, done in the order they asked, one at a time: a new size and a
+/// tab shown at once would each capture a tab, and an older size could be laid out last. Of sizes
+/// asked one after another while it was busy, the last.
+async fn controlled(s: std::sync::Weak<Stream>, ordered: async_channel::Receiver<Value>) {
+    let only_size = |c: &Value| c.as_object().is_some_and(|o| o.len() == 1 && o.contains_key("resize"));
+    while let Ok(mut c) = ordered.recv().await {
+        while let Ok(next) = ordered.try_recv() {
+            if !(only_size(&c) && only_size(&next)) {
+                let Some(st) = s.upgrade() else { return };
+                if let Err(e) = st.control(&c).await {
+                    tracing::debug!(stream = %st.id, error = %format!("{e:#}"), "a viewer's request didn't reach the stream");
+                }
+            }
+            c = next;
+        }
+        let Some(st) = s.upgrade() else { return };
+        if let Err(e) = st.control(&c).await {
+            tracing::debug!(stream = %st.id, error = %format!("{e:#}"), "a viewer's request didn't reach the stream");
+        }
     }
 }
 
@@ -1278,7 +1309,7 @@ fn punctuation(c: char) -> Option<i64> {
 
 impl Stream {
     #[allow(clippy::too_many_arguments)]
-    fn new(id: &str, spec: &Spec, streamer: Arc<Streamer>, page: Surface, device: Option<super::devices::Device>, inputs: async_channel::Sender<Vec<Input>>, out: async_channel::Sender<Out>, dir: &Path, window: (u32, u32, f64, bool)) -> Self {
+    fn new(id: &str, spec: &Spec, streamer: Arc<Streamer>, page: Surface, device: Option<super::devices::Device>, (inputs, controls): (async_channel::Sender<Vec<Input>>, async_channel::Sender<Value>), out: async_channel::Sender<Out>, dir: &Path, window: (u32, u32, f64, bool)) -> Self {
         let (width, height, scale, mobile) = window;
         Self {
             id: id.to_owned(),
@@ -1289,6 +1320,7 @@ impl Stream {
             touched: std::sync::atomic::AtomicI64::new(0),
             touches: Mutex::default(),
             inputs,
+            controls,
             mobile: std::sync::atomic::AtomicBool::new(mobile),
             personal: spec.profile.starts_with("personal:"),
             out,

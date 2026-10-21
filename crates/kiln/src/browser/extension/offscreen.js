@@ -63,6 +63,13 @@ class Stream {
     return was;
   }
 
+  // Bits a second for pictures this size at its rate: what it asked for, else about a tenth of
+  // a bit a pixel (a page's flat colours and text take far less than video), from 2 to 25 Mb/s.
+  bitrateFor(w, h) {
+    if (this.opts.asked) return this.opts.bitrate;
+    return Math.round(Math.min(25_000_000, Math.max(2_000_000, w * h * (this.opts.framerate || 60) * 0.1)));
+  }
+
   codecFor(w, h) {
     const want = this.opts.codec || "h264";
     if (want === "vp8") return "vp8";
@@ -76,8 +83,9 @@ class Stream {
     this.size = [w, h];
     const codec = this.codecFor(w, h);
     const base = { codec, width: w, height: h, framerate: this.opts.framerate || 60, latencyMode: "realtime", hardwareAcceleration: "no-preference", ...(codec.startsWith("avc1") ? { avc: { format: "annexb" } } : {}) };
-    const live = { ...base, bitrate: this.opts.bitrate || 4_000_000, bitrateMode: "variable" };
-    const still = { ...base, bitrate: (this.opts.bitrate || 4_000_000) * 4, latencyMode: "quality" };
+    const bitrate = this.bitrateFor(w, h);
+    const live = { ...base, bitrate, bitrateMode: "variable" };
+    const still = { ...base, bitrate: bitrate * 4, latencyMode: "quality" };
     const ok = await VideoEncoder.isConfigSupported(live);
     if (!ok.supported) throw new Error(`this browser can't encode ${codec} at ${w}x${h}`);
     for (const e of [this.enc, this.stillEnc]) if (e && e.state !== "closed") e.close();
@@ -215,10 +223,17 @@ class Stream {
     if (this.last) this.last.close();
     this.last = frame.clone();
     clearTimeout(this.stillTimer);
-    if (this.paused || this.enc.state !== "configured" || this.enc.encodeQueueSize > 2) {
-      if (!this.paused) this.counts.dropped++;
+    // Paused, or its encoder not ready: what comes next starts from a key frame. Its encoder
+    // behind: this picture is let go before it's encoded, so the next is still the one after the
+    // last it encoded (a key frame then would only weigh the stream down further).
+    if (this.paused || this.enc.state !== "configured") {
       frame.close();
       this.forceKey = true;
+      return;
+    }
+    if (this.enc.encodeQueueSize > 2) {
+      this.counts.dropped++;
+      frame.close();
       return;
     }
     const key = this.forceKey;
@@ -398,7 +413,7 @@ globalThis.kiln = {
   resize: (id, w, h) => streams.get(id)?.resize(w, h),
   bitrate: (id, bps) => {
     const s = streams.get(id);
-    if (s) s.opts.bitrate = bps;
+    if (s) [s.opts.bitrate, s.opts.asked] = [bps, true];
   },
   stop: (id) => {
     streams.get(id)?.stop();
@@ -414,7 +429,7 @@ globalThis.kiln = {
     const n = s.counted();
     const secs = (performance.now() - n.since) / 1000;
     const track = s.video ? s.video.getSettings() : null;
-    return { seconds: Math.round(secs * 100) / 100, taken: n.taken, encoded: n.encoded, dropped: n.dropped, keys: n.keys, kbps: Math.round((n.bytes * 8) / 1000 / Math.max(secs, 0.001)), encodeMs: n.encoded ? Math.round((n.encodeMs / n.encoded) * 10) / 10 : null, encodeMax: Math.round(n.encodeMax), size: s.size, codec: s.enc ? s.codecFor(s.size[0], s.size[1]) : null, queue: s.enc ? s.enc.encodeQueueSize : null, track: track ? [track.width, track.height, track.frameRate] : null, bitrate: s.opts.bitrate || 4_000_000 };
+    return { seconds: Math.round(secs * 100) / 100, taken: n.taken, encoded: n.encoded, dropped: n.dropped, keys: n.keys, kbps: Math.round((n.bytes * 8) / 1000 / Math.max(secs, 0.001)), encodeMs: n.encoded ? Math.round((n.encodeMs / n.encoded) * 10) / 10 : null, encodeMax: Math.round(n.encodeMax), size: s.size, codec: s.enc ? s.codecFor(s.size[0], s.size[1]) : null, queue: s.enc ? s.enc.encodeQueueSize : null, track: track ? [track.width, track.height, track.frameRate] : null, bitrate: s.size ? s.bitrateFor(s.size[0], s.size[1]) : null };
   },
   sizes: () => Object.fromEntries([...streams].map(([id, s]) => [id, { size: s.size, frame: s.last ? [s.last.displayWidth, s.last.displayHeight, s.last.codedWidth, s.last.codedHeight] : null, track: s.video ? s.video.getSettings() : null }])),
 };
