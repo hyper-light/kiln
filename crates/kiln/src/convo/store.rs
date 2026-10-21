@@ -762,10 +762,11 @@ mod tests {
         }
         assert_eq!(store.marks("held")?.len(), 1, "a session that ended at the hold keeps its record");
         store.hold_prune(held + 1);
-        let until = Instant::now() + Duration::from_secs(15);
+        // Asked more seldom than the writer waits, idle, before it looks again.
+        let until = Instant::now() + Duration::from_secs(30);
         while !store.marks("held")?.is_empty() {
             anyhow::ensure!(Instant::now() < until, "the hold moved past it, the record was still kept");
-            std::thread::sleep(SQUEEZE_EVERY * 3);
+            std::thread::sleep(LOOK_FILE + SQUEEZE_EVERY);
         }
         Ok(())
     }

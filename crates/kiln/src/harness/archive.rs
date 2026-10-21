@@ -46,8 +46,18 @@ pub const UNPACKED_MAX: u64 = 1 << 30;
 const QUALITY: u32 = 5;
 /// The codec a piece is written in.
 const CODEC: &str = "jsonl+br";
-/// The conversation store notes a close a moment before kiln does: held back from that much earlier.
-const HOLD_SLACK_MS: i64 = 60_000;
+
+/// How large a piece may grow: its lines, and bytes of them.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    lines: u64,
+    bytes: u64,
+}
+
+const LIMITS: Limits = Limits { lines: PIECE_LINES, bytes: PIECE_BYTES };
+/// A close as the conversation store has it is its session's machine's time, not the server's: the
+/// hold starts a day before kiln's note of it, whatever the clocks say.
+const HOLD_SLACK_MS: i64 = 86_400_000;
 
 /// A name as it goes in a key: itself when it's a plain name, else its SHA-256.
 fn plain(name: &str) -> String {
@@ -167,6 +177,10 @@ async fn pass(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<(
 /// Archives what's new of a session's record since its last piece, each source on from the line
 /// after its last piece's: the pieces written.
 pub async fn archive(hub: &Hub, convo: &crate::convo::store::Store, session: &str) -> anyhow::Result<usize> {
+    archive_in(hub, convo, session, LIMITS).await
+}
+
+async fn archive_in(hub: &Hub, convo: &crate::convo::store::Store, session: &str, limits: Limits) -> anyhow::Result<usize> {
     let (c, s) = (convo.clone(), session.to_owned());
     let marks = crate::rt::blocking(move || c.marks(&s)).await??;
     let mut written = 0usize;
@@ -174,7 +188,7 @@ pub async fn archive(hub: &Hub, convo: &crate::convo::store::Store, session: &st
         let (s, src) = (session.to_owned(), mark.source.clone());
         let last: Option<i64> = hub.store.call(move |c| Ok(c.query_row("SELECT MAX(last) FROM transcript_segments WHERE session = ?1 AND source = ?2", params![s, src], |r| r.get(0))?)).await?;
         let from = last.map_or(0, |l| u64::try_from(l).unwrap_or(0).saturating_add(1));
-        written = written.saturating_add(pieces(hub, convo, session, &mark.source, from).await?);
+        written = written.saturating_add(pieces(hub, convo, session, &mark.source, from, limits).await?);
     }
     Ok(written)
 }
@@ -194,8 +208,8 @@ impl Making {
     }
 }
 
-/// Writes one source's lines from `from` on as pieces: how many.
-async fn pieces(hub: &Hub, convo: &crate::convo::store::Store, session: &str, source: &str, from: u64) -> anyhow::Result<usize> {
+/// Writes one source's lines from `from` on as pieces of at most `limits`: how many.
+async fn pieces(hub: &Hub, convo: &crate::convo::store::Store, session: &str, source: &str, from: u64, limits: Limits) -> anyhow::Result<usize> {
     let (mut from, mut written) = (from, 0usize);
     let mut making: Option<Making> = None;
     loop {
@@ -212,7 +226,7 @@ async fn pieces(hub: &Hub, convo: &crate::convo::store::Store, session: &str, so
                 let mut m = m;
                 let mut more = Vec::new();
                 for (n, line) in rest.by_ref() {
-                    if m.lines >= PIECE_LINES || m.raw >= PIECE_BYTES {
+                    if m.lines >= limits.lines || m.raw >= limits.bytes {
                         more.push((n, line));
                         more.extend(rest.by_ref());
                         break;
@@ -317,33 +331,42 @@ mod tests {
         Ok(String::from_utf8(text)?.lines().map(str::to_owned).collect())
     }
 
+    fn texts(session: &str, lines: std::ops::Range<u64>) -> Vec<String> {
+        record(session, lines).into_iter().filter_map(|r| if let crate::convo::rows::Row::Record(r) = r { Some(r.line) } else { None }).collect()
+    }
+
     /// CP-T10.1: a closed conversation's record, read from the conversation store, is in kiln's
-    /// store of bytes: every line, in order, in brotli-compressed pieces. Closed again after more
-    /// lines, only those are archived, as a piece of their own; none is ever replaced, so the
-    /// archive holds every line even once the store has let the first ones go.
+    /// store of bytes: every line, in order, in brotli-compressed pieces of at most so many lines,
+    /// and bytes of them. Closed again after more lines, only those are archived, as a piece of
+    /// their own; none is ever replaced, so the archive holds every line even once the store has
+    /// let the first ones go.
     #[test]
     fn a_closed_conversations_record_is_archived_in_pieces_never_replaced() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let (_dir, convo) = crate::convo::store::scratch()?;
+            let small = Limits { lines: 100, bytes: 1 << 20 };
             let c = convo.clone();
-            let first = PIECE_LINES + 1234;
-            assert!(crate::rt::blocking(move || c.put_wait(record("s1", 0..first))).await?);
-            assert_eq!(archive(&hub, &convo, "s1").await?, 2, "two pieces: one full, one the rest");
+            assert!(crate::rt::blocking(move || c.put_wait(record("s1", 0..2_250))).await?);
+            assert_eq!(archive_in(&hub, &convo, "s1", small).await?, 23, "22 full pieces, one the rest");
             let pieces = archived(&hub, "s1").await?;
-            assert_eq!(pieces.iter().map(|p| (p.first, p.last)).collect::<Vec<_>>(), [(0, PIECE_LINES - 1), (PIECE_LINES, first - 1)]);
-            let (packed, raw) = (pieces.iter().map(|p| p.bytes).sum::<u64>(), first * 120);
-            assert!(packed > 0 && packed < raw / 4, "{packed} bytes packed");
-            let expect: Vec<String> = record("s1", 0..first).into_iter().filter_map(|r| if let crate::convo::rows::Row::Record(r) = r { Some(r.line) } else { None }).collect();
-            assert!(read_back(&hub, "s1").await? == expect);
+            assert_eq!(pieces.first().map(|p| (p.first, p.last, p.lines)), Some((0, 99, 100)));
+            assert_eq!(pieces.last().map(|p| (p.first, p.last, p.lines)), Some((2_200, 2_249, 50)));
+            let packed: u64 = pieces.iter().map(|p| p.bytes).sum();
+            assert!(packed > 0 && packed < 2_250 * 120 / 4, "{packed} bytes packed");
+            assert!(read_back(&hub, "s1").await? == texts("s1", 0..2_250));
             // Nothing new: nothing written.
-            assert_eq!(archive(&hub, &convo, "s1").await?, 0);
+            assert_eq!(archive_in(&hub, &convo, "s1", small).await?, 0);
             // It resumed and closed again: its new lines are a piece of their own.
             let c = convo.clone();
-            assert!(crate::rt::blocking(move || c.put_wait(record("s1", first..first + 10))).await?);
-            assert_eq!(archive(&hub, &convo, "s1").await?, 1);
-            let all: Vec<String> = record("s1", 0..first + 10).into_iter().filter_map(|r| if let crate::convo::rows::Row::Record(r) = r { Some(r.line) } else { None }).collect();
-            assert!(read_back(&hub, "s1").await? == all);
+            assert!(crate::rt::blocking(move || c.put_wait(record("s1", 2_250..2_260))).await?);
+            assert_eq!(archive_in(&hub, &convo, "s1", small).await?, 1);
+            assert!(read_back(&hub, "s1").await? == texts("s1", 0..2_260));
+            // Pieces end at their bytes too: a line or so past them.
+            let c = convo.clone();
+            assert!(crate::rt::blocking(move || c.put_wait(record("s3", 0..50))).await?);
+            assert_eq!(archive_in(&hub, &convo, "s3", Limits { lines: 1_000, bytes: 1_000 }).await?, 6, "9 lines of about 118 bytes pass 1,000");
+            assert!(archived(&hub, "s3").await?.iter().all(|p| p.lines <= 9));
             // A piece a cut-short try put already is taken as it is, never replaced.
             let k = key("s2", "cc", 0, 2);
             hub.blobs.blobs.put(&k, b"kept before".to_vec(), Put::default()).await?;
