@@ -146,13 +146,13 @@ function AuditHead() {
   return (
     <thead>
       <tr>
-        <th>Time</th>
-        <th>Who</th>
-        <th>Action</th>
-        <th className="hidden md:table-cell">Result</th>
-        <th className="hidden lg:table-cell">Scope</th>
-        <th className="hidden xl:table-cell">Address</th>
-        <th>Detail</th>
+        <th className="w-[7%]">Time</th>
+        <th className="hidden w-[14%] sm:table-cell">Who</th>
+        <th className="md:w-[31%]">Action</th>
+        <th className="hidden w-[5%] md:table-cell">Result</th>
+        <th className="hidden w-[8%] lg:table-cell">Scope</th>
+        <th className="hidden w-[10%] xl:table-cell">Address</th>
+        <th className="hidden md:table-cell">Detail</th>
       </tr>
     </thead>
   );
@@ -237,19 +237,24 @@ function AuditTable({ win }: { win: AuditWindow }) {
                 <tr key={a.id}>
                   <td className="cell-mono whitespace-nowrap" title={absoluteTime(a.ts)}>
                     <RelTime ts={a.ts} />
+                    {/* On a phone who did it reads under when. */}
+                    <div className="max-w-[112px] truncate text-[10px] text-[#7b7e88] sm:hidden">{a.principal}</div>
                   </td>
-                  <td className="cell-mono max-w-[220px]">
+                  <td className="cell-mono hidden max-w-0 sm:table-cell">
                     <div className="truncate">{a.principal}</div>
                     {a.on_behalf_of && <div className="truncate text-[10px] text-[#7b7e88]">for {a.on_behalf_of}</div>}
                   </td>
-                  <td className="max-w-[320px]">
+                  <td className="max-w-0">
                     <span className="chip max-w-full truncate">{a.action}</span>
                     {a.target && !a.action.endsWith(a.target) && <div className="mt-1 truncate font-mono text-[10px] text-[#7b7e88]">{a.target}</div>}
+                    {/* Without room for its own column, its detail reads in full here. */}
+                    {a.detail && <div className="mt-1 text-[11px] whitespace-normal text-[#b9bbc2] [overflow-wrap:anywhere] md:hidden">{a.detail}</div>}
                   </td>
                   <td className={`cell-mono hidden md:table-cell ${/^[45]/.test(a.result) ? "!text-[#d1aaad]" : ""}`}>{a.result}</td>
-                  <td className="cell-mono hidden max-w-[160px] truncate lg:table-cell">{a.scope ?? "—"}</td>
-                  <td className="cell-mono hidden xl:table-cell">{a.ip ?? "—"}</td>
-                  <td className="truncate-cell text-[#b9bbc2]" title={a.detail}>
+                  <td className="cell-mono hidden max-w-0 truncate lg:table-cell">{a.scope ?? "—"}</td>
+                  <td className="cell-mono hidden whitespace-nowrap xl:table-cell">{a.ip ?? "—"}</td>
+                  {/* Cut to its share of the width, the whole of it on hover. */}
+                  <td className="hidden max-w-0 truncate text-[#b9bbc2] md:table-cell" title={a.detail}>
                     {a.detail || <span className="text-[#6d7078]">—</span>}
                   </td>
                 </tr>
