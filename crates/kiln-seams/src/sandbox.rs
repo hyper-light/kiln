@@ -18,11 +18,20 @@ use crate::conformance::{Case, Failure, ensure, fine, same};
 pub struct Limits {
     pub memory_bytes: u64,
     pub processes: u32,
+    /// Its share of the CPU against others', on cgroup v2's scale ([`WEIGHT_MIN`] to
+    /// [`WEIGHT_MAX`]; 100 is an even share): a build held below an agent.
+    pub cpu_weight: u16,
+    /// Its share of the disk, on the same scale (2026-10-19's builds starved a disk, not a CPU).
+    pub io_weight: u16,
 }
+
+/// The weights' scale (cgroup v2's `cpu.weight`, `io.weight`).
+pub const WEIGHT_MIN: u16 = 1;
+pub const WEIGHT_MAX: u16 = 10_000;
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { memory_bytes: 1 << 30, processes: 64 }
+        Self { memory_bytes: 1 << 30, processes: 64, cpu_weight: 100, io_weight: 100 }
     }
 }
 
@@ -31,6 +40,8 @@ impl Default for Limits {
 pub enum Boundary {
     /// A process on the host, as kiln runs harnesses today.
     Host,
+    /// An OCI image, run rootless (Hex's `oci` class).
+    Container { image: String },
     /// A microVM from `image`.
     MicroVm { image: String },
 }
@@ -70,7 +81,10 @@ pub enum Exit {
     Code(i32),
     /// Killed, through `Run::kill`.
     Killed,
-    /// Stopped for going over a limit.
+    /// Ended by a limit: memory when its boundary killed it for going over (cgroup v2's
+    /// `memory.events` counting an `oom_kill`); processes when it was refused one past its limit
+    /// (`pids.max`: the fork fails, the run isn't stopped) and then failed. A run refused a process
+    /// that coped and ended well ends `Code(0)`.
     OverLimit(Limit),
 }
 
@@ -236,8 +250,15 @@ impl Run for SimRun {
 impl Sandbox for SimSandbox {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
         let out = (|| {
-            if let Boundary::MicroVm { .. } = launch.boundary {
-                return Err(Refusal::Unsupported("a microVM".into()));
+            for (what, w) in [("a cpu weight", launch.limits.cpu_weight), ("an io weight", launch.limits.io_weight)] {
+                if !(WEIGHT_MIN..=WEIGHT_MAX).contains(&w) {
+                    return Err(Refusal::Invalid { what, why: format!("{w} (from {WEIGHT_MIN} to {WEIGHT_MAX})") });
+                }
+            }
+            match launch.boundary {
+                Boundary::Host => {}
+                Boundary::Container { .. } => return Err(Refusal::Unsupported("a container".into())),
+                Boundary::MicroVm { .. } => return Err(Refusal::Unsupported("a microVM".into())),
             }
             let arg = |i: usize| launch.args.get(i).cloned().unwrap_or_default();
             let mut st = RunState::default();
@@ -310,7 +331,7 @@ pub trait SandboxFixture: Send + Sync {
     fn wait(&self) -> Launch;
     /// Uses `bytes` of memory, under a limit of `limit` bytes.
     fn hog(&self, bytes: u64, limit: u64) -> Launch;
-    /// Starts `n` processes, under a limit of `limit`.
+    /// Starts `n` processes, under a limit of `limit`, and fails when one is refused it.
     fn spawn(&self, n: u32, limit: u32) -> Launch;
     /// Connects to `host`, with `granted` the hosts it may reach.
     fn connect(&self, host: &str, granted: &[&str]) -> Launch;
@@ -462,6 +483,25 @@ fn c8<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c10<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        for (cpu, io) in [(0, 100), (100, 0), (WEIGHT_MAX.saturating_add(1), 100), (100, WEIGHT_MAX.saturating_add(1))] {
+            let mut l = f.say("x");
+            l.limits.cpu_weight = cpu;
+            l.limits.io_weight = io;
+            match f.sandbox().launch(l).await {
+                Err(Refusal::Invalid { .. }) => {}
+                Err(e) => return Err(format!("weights {cpu}/{io} refused as {e:?}, not Invalid")),
+                Ok(_) => return Err(format!("weights {cpu}/{io} were taken")),
+            }
+        }
+        let mut l = f.say("weighted");
+        (l.limits.cpu_weight, l.limits.io_weight) = (WEIGHT_MIN, WEIGHT_MAX);
+        let run = fine("a launch at the weights' ends", f.sandbox().launch(l).await)?;
+        same("its end", end(&drain(run.as_ref()).await), Some(Exit::Code(0)))
+    })
+}
+
 fn c9<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let folder = f.folder();
@@ -479,10 +519,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
         Case { id: "SANDBOX-3", says: "a run's stderr and exit code are said as they are, and its end comes once, last", check: c3::<F> },
         Case { id: "SANDBOX-4", says: "a run killed ends Killed, and takes no more input", check: c4::<F> },
         Case { id: "SANDBOX-5", says: "a run over its memory limit is ended OverLimit(Memory); under it, it runs to its end", check: c5::<F> },
-        Case { id: "SANDBOX-6", says: "a run over its process limit is ended OverLimit(Processes); under it, it runs to its end", check: c6::<F> },
+        Case { id: "SANDBOX-6", says: "a run refused processes past its process limit, that then fails, ends OverLimit(Processes); under it, it runs to its end", check: c6::<F> },
         Case { id: "SANDBOX-7", says: "a run reaches only the hosts it's granted", check: c7::<F> },
         Case { id: "SANDBOX-8", says: "a launch of a program that doesn't exist is refused NoSuchProgram", check: c8::<F> },
         Case { id: "SANDBOX-9", says: "a run works in the folder it's given", check: c9::<F> },
+        Case { id: "SANDBOX-10", says: "cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead", check: c10::<F> },
     ]
 }
 
@@ -501,6 +542,8 @@ mod tests {
         let s = SimSandbox::new();
         let vm = Launch { boundary: Boundary::MicroVm { image: "x".into() }, ..Launch::of("say", &["x"]) };
         assert!(matches!(futures::executor::block_on(s.launch(vm)), Err(Refusal::Unsupported(_))));
+        let container = Launch { boundary: Boundary::Container { image: "x".into() }, ..Launch::of("say", &["x"]) };
+        assert!(matches!(futures::executor::block_on(s.launch(container)), Err(Refusal::Unsupported(_))));
         let runs: Vec<_> = (0..SIM_RUNS).filter_map(|_| futures::executor::block_on(s.launch(Launch::of("wait", &[]))).ok()).collect();
         assert_eq!(runs.len(), SIM_RUNS);
         assert!(matches!(futures::executor::block_on(s.launch(Launch::of("wait", &[]))), Err(Refusal::Full { .. })));

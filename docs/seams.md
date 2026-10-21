@@ -204,16 +204,24 @@ Methods: `push_blob`, `blob`, `push_manifest`, `manifest`, `tags`, `delete_manif
 
 ## Sandbox
 
-A harness launched in a boundary: its program, its folder, its limits (memory, processes) and the
-hosts it may reach, its stdio streamed back and its end said once, last. The suite asks its
+A harness or a CI leg launched in a boundary (the host, a rootless OCI container, a microVM): its
+program, its folder, its limits and the hosts it may reach, its stdio streamed back and its end said
+once, last. Its limits are memory and processes, and its shares of the CPU and the disk, on cgroup
+v2's weights (1 to 10,000, 100 an even share: a build held below an agent). The suite asks its
 fixture for programs by what they do (echo, exit with a code, use memory, start processes,
 connect), so each implementation supplies its own.
 
-- **Implementations:** `host` (today's launch), Shards, then Hex's classes (CP-T4.1, CP-T7.2);
-  `kiln_seams::sandbox::SimSandbox`: built-in programs that do those things, 1000 runs at once,
-  10,000 outputs unread a run (past it, the run is killed).
-- **Used by:** every harness kiln launches, once CP-T4.1 lands it.
-- **Passed by:** the simulator, every clause; `host` and Shards, when CP-T4.1 lands them.
+How a limit ends a run, as Linux's cgroup v2 has it (agreed with Hex's track, CP-T7.1): memory when
+the boundary killed it for going over (`memory.events` counts an `oom_kill`); processes when it was
+refused one past its limit (`pids.max` fails the fork, the run isn't stopped) and then failed. A run
+refused a process that copes and ends well ends with its code.
+
+- **Implementations:** `host` (today's launch), Shards, then Hex's classes: `process`, `oci`,
+  `firecracker`, `shards` (CP-T4.1, CP-T7.1, CP-T7.2); `kiln_seams::sandbox::SimSandbox`: built-in
+  programs that do those things on the host boundary (a container or a microVM is refused
+  `Unsupported`), 1000 runs at once, 10,000 outputs unread a run (past it, the run is killed).
+- **Used by:** every harness kiln launches and its CI legs, once CP-T4.1 and CP-T7.1 land them.
+- **Passed by:** the simulator, every clause; `host`, Shards and Hex's, when their tracks land them.
 
 Methods: `launch`, `boundaries`.
 
@@ -222,10 +230,11 @@ Methods: `launch`, `boundaries`.
 - **SANDBOX-3** a run's stderr and exit code are said as they are, and its end comes once, last
 - **SANDBOX-4** a run killed ends Killed, and takes no more input
 - **SANDBOX-5** a run over its memory limit is ended OverLimit(Memory); under it, it runs to its end
-- **SANDBOX-6** a run over its process limit is ended OverLimit(Processes); under it, it runs to its end
+- **SANDBOX-6** a run refused processes past its process limit, that then fails, ends OverLimit(Processes); under it, it runs to its end
 - **SANDBOX-7** a run reaches only the hosts it's granted
 - **SANDBOX-8** a launch of a program that doesn't exist is refused NoSuchProgram
 - **SANDBOX-9** a run works in the folder it's given
+- **SANDBOX-10** cpu and io weights outside cgroup v2's 1 to 10,000 are refused Invalid; at its ends a run goes ahead
 
 ## Placement
 

@@ -18,7 +18,7 @@ Kiln Distro (adalundhe-61) asked for it too, as its helper. Pushing needs Ada's 
 - Change request draft: ~/.cache/kiln-cp/cr-m2.md (goes in the landing merge commit's message).
 
 ## What's where
-- crates/kiln-seams: ten seams (trait + Sim* + conformance cases, 93 cases), tests/doc_truth.rs.
+- crates/kiln-seams: ten seams (trait + Sim* + conformance cases, 94 cases), tests/doc_truth.rs.
 - docs/seams.md: contracts, clause ids = case ids; the doc-truth test holds them together.
 - kiln: rt.rs RtClock/RtSpawn (+ suites on real time); harness/port.rs Hub as HarnessPort (passes
   HARNESS-1/2/4; 3/5 wait on CP-T3.2/3.3); goals/mod.rs Driver (store, clock, shutdown, port, hub
