@@ -314,6 +314,7 @@ the API. Nothing of it asks a store's writer for anything.
 mirrors = 1          # runners that keep a copy of the server's store; 0: none
 mirror_on = []       # runners to pick first, by name
 keep_closed_days = 30  # days an ended agent's transcript is kept (its events stay); 0: for good
+keep_archived_days = 365  # days its archive in kiln's store of bytes is kept after its last close; 0: for good
 compact = true       # make the store's file compact once a third of it is free (runners and mirrors too)
 ```
 

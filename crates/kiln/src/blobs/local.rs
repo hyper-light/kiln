@@ -270,7 +270,7 @@ impl LocalBlobs {
         self.ready
             .get_or_init(|| async {
                 match self.reconcile().await {
-                    Ok(r) if r.taken + r.dropped > 0 => {
+                    Ok(r) if r.taken > 0 || r.dropped > 0 => {
                         tracing::warn!(target: "kiln.blobs", event = "adopt", taken = r.taken, dropped = r.dropped, "an older kiln ran on the local store: what it kept is taken in, and keys whose bytes it let go are gone (sync's runners send those again; an upgrade binary is fetched or uploaded again)");
                     }
                     Ok(_) => {}
@@ -884,7 +884,7 @@ pub(crate) mod tests {
     }
 
     /// CP-T10.1, AC-T10.1.2: the local store passes every clause of the Blobs suite, each case on a
-    /// store of its own.
+    /// store of its own; T-T10.1.1 is its BLOBS-58, a conditional create racing others.
     #[test]
     fn the_local_store_passes_the_blobs_suite() -> anyhow::Result<()> {
         let report = crate::rt::block_on(crate::blobs::tests::run_suite(|| async { Fixture::new() }, Duration::from_secs(120)))?;
@@ -926,6 +926,30 @@ pub(crate) mod tests {
             }
         }
         Ok(out)
+    }
+
+    /// CP-T10.1: a whole object read as a stream is checked against its SHA-256: with a bit of one
+    /// of its chunks flipped, the stream ends short of its last piece, never served as if whole.
+    #[test]
+    fn a_damaged_object_streams_short_never_as_if_whole() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let Fixture { blobs, _dir, .. } = Fixture::new()?;
+            let data = kiln_seams::blobs::noise(10 << 20, 41);
+            blobs.put("d", data.clone(), Put::default()).await?;
+            let chunk = walk(&blobs.root.join("chunks"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no chunk"))?;
+            let mut bytes = std::fs::read(&chunk)?;
+            if let Some(b) = bytes.get_mut(100) {
+                *b ^= 1;
+            }
+            std::fs::write(&chunk, &bytes)?;
+            let rx = crate::blobs::io::read_stream(Arc::new(blobs), "d".into(), None, 0, data.len() as u64 - 1);
+            let mut got = 0usize;
+            while let Ok(p) = rx.recv().await {
+                got = got.saturating_add(p.len());
+            }
+            assert!(got < data.len(), "{got} bytes of a damaged object streamed");
+            Ok(())
+        })
     }
 
     /// The chunk files are as old as the disk says: made older than the grace by hand.

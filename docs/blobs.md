@@ -55,7 +55,7 @@ bytes) stops the server at start, saying which.
 | `sync/<sha256>` | the server's copy of the contents synced repos' steps name | `sync::contents` | a week after no repo's tree names it |
 | `binaries/kiln-<target>`, `binaries/kiln-<target>.json` | runner upgrade binaries for other platforms, and what kiln knows of each | `updates` | when it's removed (Settings → Updates) or replaced |
 | `recordings/<session>/<recording>/<file>` | live pages' recordings (video, log, test), copied from their machine when they end | `harness::streams` | when the conversation closes |
-| `transcripts/<session>/<source>/<first>-<last>.jsonl.br` | a piece of a closed conversation's own record (Claude Code's transcript, Codex's rollouts): lines `first` to `last`, brotli, written once and never replaced | `harness::archive` | kept; the conversation store lets no record go before it's archived |
+| `transcripts/<session>/<source>/<first>-<last>.jsonl.br` | a piece of a closed conversation's own record (Claude Code's transcript, Codex's rollouts): lines `first` to `last`, brotli, written once and never replaced | `harness::archive` | `[conversations] keep_archived_days` (365) after its last close; the conversation store lets no record go before it's archived, or given up 30 days past its own keeping |
 
 Keys are 1 to 960 bytes of UTF-8, in `/`-separated segments of 1 to 255 bytes, with no `.` or
 `..` segment, no control characters and no backslash: the same keys on every store.
@@ -166,6 +166,10 @@ release after it, with nothing a key holds lost:
   it removed or replaced, go, with a warning. Sync's contents it kept as files since the `.taken`
   mark are taken in where they lie, and a file whose content the store holds already is removed; a
   binary it kept newer than the store's is the platform's.
+- **Transcripts:** the older kiln doesn't archive them, nor hold its conversation store's pruning
+  back for them. A conversation that closes while it runs is never archived; one closed just before
+  the rollback is archived when this release starts again, unless the older kiln has let its record
+  go by then (`keep_closed_days` after its close).
 - **One case loses a key:** the older kiln unpins an object when it reads it or keeps the same
   content again as CI's (a release pipeline's artifact is also the runner binary kept of it). If
   nothing of CI refers to it an hour later, it lets it go; coming back, this release drops the keys
@@ -183,7 +187,8 @@ kept as files.
   `refused` for a typed refusal, `unavailable` when the store couldn't answer).
 - `kiln_blobs_request_seconds{store, op}`: how long each took.
 - `kiln_blobs_bytes_total{store, direction}`: bytes `written` and `read`.
-- `kiln_blobs_collected_total{kind}`: objects let go that nothing refers to.
+- `kiln_blobs_collected_total{kind}`: objects let go that nothing refers to any more, by what kept
+  them: `cas`, `sync`, `recordings`, `transcripts`.
 - Events on target `kiln.blobs` (`event` = `put`, `get`, `list`, `adopt`, `collect`, `refused`):
   refusals at debug, an unavailable store at warn.
 
@@ -193,7 +198,7 @@ refused or unavailable.
 
 ## The suite against MinIO
 
-Every store passes the same suite of the contract's 161 clauses (`kiln_seams::blobs::cases`): the
+Every store passes the same suite of the contract's 162 clauses (`kiln_seams::blobs::cases`): the
 simulator and the local store in every `cargo test`, the S3 store against a MinIO when one is
 named. The lab's MinIO runs in a container on fedora (`cgr.dev/chainguard/minio`, MinIO
 RELEASE.2026-09-22):
@@ -205,7 +210,7 @@ $ KILN_TEST_S3="http://127.0.0.1:19300 kiln-t10 <access key id> <file holding th
     cargo test -p kiln --lib blobs::s3 -- --ignored
 ```
 
-Recorded 2026-10-21 on fedora: 161 of 161 clauses on the simulator, the local store and the S3
+Recorded 2026-10-21 on fedora: 162 of 162 clauses on the simulator, the local store and the S3
 store against MinIO.
 
 ## The labs

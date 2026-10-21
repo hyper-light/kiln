@@ -331,7 +331,8 @@ clause!(c14, f, b, {
     let mut tampered = url.clone();
     let last = tampered.pop();
     tampered.push(if last == Some('0') { '1' } else { '0' });
-    ensure(f.redeem(&tampered, Method::Put, Some(b"x".to_vec())).await.is_err(), || "a tampered URL was taken".into())?;
+    // A body of the length declared, so the signature alone refuses it.
+    ensure(f.redeem(&tampered, Method::Put, Some(b"tampered!".to_vec())).await.is_err(), || "a tampered URL was taken".into())?;
     same("the object after", get(b, "dropped").await?, b"left here".to_vec())
 });
 
@@ -663,6 +664,8 @@ clause!(c57, f, b, {
     not_found("the object", b.head("vanished").await)
 });
 
+// T-T10.1.1: a conditional create racing others of the same key; exactly one succeeds, on every
+// store the suite runs on.
 clause!(c58, f, b, {
     let attempts = (0..8u8).map(|i| async move { (i, b.put("race", vec![i; 1000], when(Cond::IfNoneMatch)).await) });
     let outcomes = futures::future::join_all(attempts).await;
@@ -1561,6 +1564,14 @@ clause!(c161, f, b, {
     same("the object", get(b, "declared").await?, b"12345".to_vec())
 });
 
+clause!(c162, f, b, {
+    for k in ["sp", "sp ", "sp q", "spa"] {
+        put(b, k, k.as_bytes()).await?;
+    }
+    same("the keys a prefix ending in a space lists", listed_keys(b, "sp ").await?, vec!["sp ".to_owned(), "sp q".to_owned()])?;
+    same("the keys its first two bytes list", listed_keys(b, "sp").await?, vec!["sp".to_owned(), "sp ".to_owned(), "sp q".to_owned(), "spa".to_owned()])
+});
+
 /// The `Blobs` contract, clause by clause (docs/seams.md, "Blobs").
 pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
     vec![
@@ -1725,5 +1736,6 @@ pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
         Case { id: "BLOBS-159", says: "If-Match compares content, not size: an etag of same-sized, other content is refused PreconditionFailed", check: c159::<F> },
         Case { id: "BLOBS-160", says: "objects stored by a put, an upload and a presigned put each have their content's SHA-256 as their etag", check: c160::<F> },
         Case { id: "BLOBS-161", says: "a presigned put takes a body of exactly the length its URL declares: one longer or shorter is refused and stores nothing", check: c161::<F> },
+        Case { id: "BLOBS-162", says: "a listing by a prefix ending in a space gives only the keys that start with it, the space included", check: c162::<F> },
     ]
 }

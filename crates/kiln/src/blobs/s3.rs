@@ -834,7 +834,9 @@ impl Blobs for S3Blobs {
     fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFuture<'a, Result<Listing, Refusal>> {
         Box::pin(async move {
             let limit = seam::list_limit(limit)?;
-            let mut q = vec![("list-type", "2".to_owned()), ("prefix", self.objects(prefix)), ("max-keys", limit.to_string())];
+            // One more than asked: the key that is the prefix but its last space (`p` for `p `) is
+            // stored as `p `, so S3 lists it too, and it's left out below.
+            let mut q = vec![("list-type", "2".to_owned()), ("prefix", self.objects(prefix)), ("max-keys", limit.saturating_add(1).min(seam::LIST_MAX).to_string())];
             if let Some(a) = after {
                 q.push(("start-after", self.object(a)));
             }
@@ -847,15 +849,16 @@ impl Blobs for S3Blobs {
             let mut objects = Vec::new();
             for c in aws::xml_all(&text, "Contents") {
                 let Some(k) = aws::xml_text(c, "Key") else { continue };
-                let Some(key) = k.strip_prefix(&strip).and_then(|k| k.strip_suffix(' ')) else { continue };
+                let Some(key) = k.strip_prefix(&strip).and_then(|k| k.strip_suffix(' ')).filter(|k| k.starts_with(prefix)) else { continue };
                 objects.push(Listed {
                     key: key.to_owned(),
                     size: aws::xml_text(c, "Size").and_then(|v| v.parse().ok()).unwrap_or(0),
                     modified_ms: aws::xml_text(c, "LastModified").as_deref().and_then(iso_ms).unwrap_or(0),
                 });
             }
+            let more = objects.len() > limit;
             objects.truncate(limit);
-            let truncated = aws::xml_text(&text, "IsTruncated").as_deref() == Some("true");
+            let truncated = more || aws::xml_text(&text, "IsTruncated").as_deref() == Some("true");
             Ok(Listing { objects, truncated })
         })
     }
@@ -1040,7 +1043,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// CP-T10.1, AC-T10.1.2: an S3 store passes every clause of the Blobs suite, each case under a
+    /// CP-T10.1, AC-T10.1.2 (and T-T10.1.1, its BLOBS-58: a conditional create racing others):
+    /// an S3 store passes every clause of the Blobs suite, each case under a
     /// prefix of its own in one bucket. Runs where `KILN_TEST_S3` names an S3 (the S3 lab: MinIO
     /// in a container on fedora, docs/blobs.md): `cargo test -p kiln --lib blobs::s3 -- --ignored`.
     #[test]

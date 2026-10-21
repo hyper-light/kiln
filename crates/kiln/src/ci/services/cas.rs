@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kiln_seams::blobs::{Cond, Refusal};
+use kiln_seams::blobs::Refusal;
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 
@@ -135,7 +135,7 @@ pub async fn put_file(hub: &Hub, path: &Path) -> anyhow::Result<Object> {
         }
         Uploading::start(&digest)
     };
-    let kept = crate::blobs::io::put_file(blobs.as_ref(), &key(&digest), path, Cond::Always, Some(&digest)).await;
+    let kept = crate::blobs::io::put_file(blobs.as_ref(), &key(&digest), path, Some(&digest)).await;
     {
         let _held = stripe(&digest).lock().await;
         kept.map_err(refused)?;

@@ -54,12 +54,16 @@ async fn copy(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Pages a copy lists, at most: a store of more objects than that many pages of [`LIST_MAX`] is
+/// copied in more than one run.
+const PAGES_MAX: usize = 100_000;
+
 /// Copies every object of `from` into `to`, an object at a time, each checked by its SHA-256;
 /// what `to` holds already (the same SHA-256) is skipped. `say` hears of each copied.
 pub async fn copy_all(from: &dyn Blobs, to: &dyn Blobs, say: impl Fn(String)) -> Result<Copied> {
     let mut out = Copied::default();
     let mut after: Option<String> = None;
-    loop {
+    for _ in 0..PAGES_MAX {
         let page = from.list("", after.as_deref(), LIST_MAX).await.map_err(|e| anyhow::anyhow!("listing the local store: {e}"))?;
         for o in &page.objects {
             let meta = from.head(&o.key).await.map_err(|e| anyhow::anyhow!("{}: {e}", o.key))?;
@@ -76,11 +80,14 @@ pub async fn copy_all(from: &dyn Blobs, to: &dyn Blobs, say: impl Fn(String)) ->
             out.bytes = out.bytes.saturating_add(copied);
             say(format!("{} ({} bytes)", o.key, copied));
         }
-        after = page.objects.last().map(|o| o.key.clone());
+        let next = page.objects.last().map(|o| o.key.clone());
+        anyhow::ensure!(next.is_none() || next > after, "the local store listed {next:?} again after it: its listing doesn't go on");
+        after = next;
         if !page.truncated || after.is_none() {
             return Ok(out);
         }
     }
+    anyhow::bail!("{} objects copied, and more listed than {PAGES_MAX} pages: run it again to go on", out.objects)
 }
 
 async fn copy_one(from: &dyn Blobs, to: &dyn Blobs, key: &str, size: u64, etag: &str) -> Result<u64> {

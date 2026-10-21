@@ -13,7 +13,9 @@
 //! archive is due [`AFTER`] a close, so the record's last lines, still on their way from the
 //! session's machine, are in; what's due is kept in kiln's own store (`transcript_archives`), so a
 //! restart doesn't lose it. Until it's done, the conversation store lets go of no record of a
-//! session that ended since (`Store::hold_prune`): a record goes only once it's archived. A piece
+//! session that ended since (`Store::hold_prune`): a record goes only once it's archived, or once
+//! its archive has failed [`HOLD_EXTRA`] past when the store would have let it go (given up,
+//! warned). An archive goes `[conversations] keep_archived_days` after its last close. A piece
 //! holds at most [`PIECE_LINES`] lines, and [`PIECE_BYTES`] bytes of them but for its last line;
 //! one is read back unpacked to at most [`UNPACKED_MAX`].
 
@@ -37,6 +39,9 @@ const RETRY_MS: i64 = 3_600_000;
 const BATCH: i64 = 8;
 /// Lines read from the conversation store at a time.
 const PAGE: usize = 2000;
+/// Pages one archive of a source reads, at most: a record longer goes on from its last piece at
+/// the next try.
+const PAGES_MAX: usize = 50_000;
 /// The most lines, and bytes of them, a piece holds.
 pub const PIECE_LINES: u64 = 50_000;
 pub const PIECE_BYTES: u64 = 32 << 20;
@@ -55,6 +60,11 @@ struct Limits {
 }
 
 const LIMITS: Limits = Limits { lines: PIECE_LINES, bytes: PIECE_BYTES };
+/// How long past the conversation store's own keeping a record not archived yet is held: past it,
+/// its archive is given up, warned, and the store lets the record go as it would have.
+pub const HOLD_EXTRA: Duration = Duration::from_secs(30 * 86_400);
+/// Archives let go of, or given up, at most a look.
+const LET_GO_BATCH: i64 = 100;
 /// A close as the conversation store has it is its session's machine's time, not the server's: the
 /// hold starts a day before kiln's note of it, whatever the clocks say.
 const HOLD_SLACK_MS: i64 = 86_400_000;
@@ -136,6 +146,76 @@ async fn hold(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<(
     Ok(())
 }
 
+/// Gives up the archives still failing [`HOLD_EXTRA`] past when the conversation store would have
+/// let their records go (`done_ms` 0): the hold lets them go, warned of each.
+async fn give_up(hub: &Hub) -> anyhow::Result<()> {
+    let Some(keep) = hub.cfg.conversations.keep_closed() else { return Ok(()) };
+    let held_ms = i64::try_from(keep.saturating_add(HOLD_EXTRA).as_millis()).unwrap_or(i64::MAX);
+    let before = crate::util::now_ms().saturating_sub(held_ms);
+    let given: Vec<String> = hub
+        .store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let given: Vec<String> = {
+                let mut q = tx.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND closed_ms < ?1 LIMIT ?2")?;
+                q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
+            };
+            for s in &given {
+                tx.execute("UPDATE transcript_archives SET done_ms = 0 WHERE session = ?1", [s])?;
+            }
+            tx.commit()?;
+            Ok(given)
+        })
+        .await?;
+    for session in given {
+        tracing::warn!(target: "kiln.blobs", event = "refused", session = %session, days = HOLD_EXTRA.as_secs() / 86_400, "a closed conversation's record couldn't be archived in the days held past its keeping: given up, and the conversation store lets it go");
+    }
+    Ok(())
+}
+
+/// Lets go of the archives (written, or given up) of conversations last closed over
+/// `[conversations] keep_archived_days` ago: their pieces, then their records.
+async fn let_go(hub: &Hub) -> anyhow::Result<()> {
+    let days = hub.cfg.conversations.keep_archived_days;
+    if days == 0 {
+        return Ok(());
+    }
+    let before = crate::util::now_ms().saturating_sub(i64::from(days).saturating_mul(86_400_000));
+    let old: Vec<String> = hub
+        .store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NOT NULL AND due_ms < ?1 LIMIT ?2")?;
+            Ok(q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?)
+        })
+        .await?;
+    let mut gone = 0u64;
+    'sessions: for session in old {
+        for p in archived(hub, &session).await? {
+            match hub.blobs.blobs.delete(&p.key).await {
+                Ok(()) | Err(Refusal::NotFound(_)) => gone = gone.saturating_add(1),
+                Err(e) => {
+                    tracing::warn!(target: "kiln.blobs", event = "collect", key = %p.key, error = %e, "an archived piece past its keeping couldn't be deleted; tried again at the next look");
+                    continue 'sessions;
+                }
+            }
+        }
+        let s = session.clone();
+        hub.store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                tx.execute("DELETE FROM transcript_segments WHERE session = ?1", [&s])?;
+                tx.execute("DELETE FROM transcript_archives WHERE session = ?1", [&s])?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+    }
+    if gone > 0 {
+        crate::metrics::blobs().collected.add(&["transcripts"], gone);
+    }
+    Ok(())
+}
+
 /// Archives what's due, every minute, for as long as the server runs (with a conversation store).
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
@@ -146,8 +226,11 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     }
 }
 
-/// One look: what's due archived, the hold on the conversation store moved on as far as it may.
+/// One look: archives past their keeping let go, those failing too long given up, what's due
+/// archived, and the hold on the conversation store moved on as far as it may.
 async fn pass(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<()> {
+    let_go(hub).await?;
+    give_up(hub).await?;
     hold(hub, convo).await?;
     let now = crate::util::now_ms();
     let due: Vec<String> = hub
@@ -212,7 +295,16 @@ impl Making {
 async fn pieces(hub: &Hub, convo: &crate::convo::store::Store, session: &str, source: &str, from: u64, limits: Limits) -> anyhow::Result<usize> {
     let (mut from, mut written) = (from, 0usize);
     let mut making: Option<Making> = None;
+    let mut pages = 0usize;
     loop {
+        pages = pages.saturating_add(1);
+        if pages > PAGES_MAX {
+            // What's written stays: the next try goes on after it.
+            if let Some(m) = making.filter(|m| m.lines > 0) {
+                write_piece(hub, session, source, m).await?;
+            }
+            anyhow::bail!("the record of {source} is longer than {PAGES_MAX} pages: archived so far, the rest at the next try");
+        }
         let (c, s, src) = (convo.clone(), session.to_owned(), source.to_owned());
         let page = crate::rt::blocking(move || c.record(&s, &src, from, PAGE)).await??;
         let full = page.len() >= PAGE;
@@ -395,6 +487,36 @@ mod tests {
             pass(&hub, &convo).await?;
             assert_eq!(archived(&hub, "s1").await?.len(), 1);
             assert_eq!(convo.held(), None, "archived: nothing held back");
+            Ok(())
+        })
+    }
+
+    /// CP-T10.1: an archive past `[conversations] keep_archived_days` goes, its pieces and its
+    /// records; one still failing [`HOLD_EXTRA`] past when the conversation store would have let its
+    /// record go is given up, and holds nothing back any more.
+    #[test]
+    fn archives_go_past_their_keeping_and_are_given_up_past_their_hold() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let convo = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let c = convo.clone();
+            assert!(crate::rt::blocking(move || c.put_wait(record("s-old", 0..3))).await?);
+            assert_eq!(archive(&hub, &convo, "s-old").await?, 1);
+            let key = archived(&hub, "s-old").await?.first().map(|p| p.key.clone()).ok_or_else(|| anyhow::anyhow!("not archived"))?;
+            let now = crate::util::now_ms();
+            let (kept_for, held_for) = (366 * 86_400_000_i64, (30 + 31) * 86_400_000_i64);
+            hub.store
+                .call(move |c| {
+                    c.execute("INSERT INTO transcript_archives (session, closed_ms, due_ms, done_ms) VALUES ('s-old', ?1, ?1, ?1)", [now - kept_for])?;
+                    c.execute("INSERT INTO transcript_archives (session, closed_ms, due_ms, done_ms) VALUES ('s-held', ?1, ?2, NULL)", [now - held_for, now + 3_600_000])?;
+                    Ok(())
+                })
+                .await?;
+            pass(&hub, &convo).await?;
+            assert!(archived(&hub, "s-old").await?.is_empty() && matches!(hub.blobs.blobs.head(&key).await, Err(Refusal::NotFound(_))));
+            let given: Option<i64> = hub.store.call(|c| Ok(c.query_row("SELECT done_ms FROM transcript_archives WHERE session = 's-held'", [], |r| r.get(0))?)).await?;
+            assert_eq!(given, Some(0), "given up");
+            assert_eq!(convo.held(), None, "and holding nothing back");
             Ok(())
         })
     }

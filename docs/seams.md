@@ -316,6 +316,7 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 - **BLOBS-159** If-Match compares content, not size: an etag of same-sized, other content is refused PreconditionFailed
 - **BLOBS-160** objects stored by a put, an upload and a presigned put each have their content's SHA-256 as their etag
 - **BLOBS-161** a presigned put takes a body of exactly the length its URL declares: one longer or shorter is refused and stores nothing
+- **BLOBS-162** a listing by a prefix ending in a space gives only the keys that start with it, the space included
 
 ## Secrets
 

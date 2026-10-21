@@ -285,32 +285,67 @@ pub fn stored(hub: &Hub, target: &str) -> Option<Binary> {
 }
 
 /// Reads what the store keeps of each platform's binary into [`Updates`]: a binary whose bytes
-/// aren't whole there is left out.
-pub async fn load(hub: &Hub) {
+/// aren't whole there is left out. Whether every one could be read (one the store couldn't answer
+/// for is read again later: [`load_until_read`]).
+pub async fn load(hub: &Hub) -> bool {
+    use kiln_seams::blobs::Refusal;
     let blobs = &hub.blobs.blobs;
-    let mut kept = HashMap::new();
+    // Each platform the store answered for: its binary, or none; one it couldn't is left as it is.
+    let mut answered: Vec<(&str, Option<Binary>)> = Vec::new();
     let mut targets: Vec<&str> = crate::api::RELEASE_TARGETS.to_vec();
     if !targets.contains(&crate::api::TARGET) {
         targets.push(crate::api::TARGET);
     }
+    let all = targets.len();
     for t in targets {
         let meta = match crate::blobs::io::get_all(blobs.as_ref(), &meta_key(t), 1 << 20).await {
             Ok((_, bytes)) => serde_json::from_slice::<Binary>(&bytes).ok(),
-            Err(kiln_seams::blobs::Refusal::NotFound(_)) => None,
+            Err(Refusal::NotFound(_)) => None,
+            Err(e @ Refusal::Unavailable(_)) => {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %meta_key(t), error = %e, "a kept binary couldn't be read: read again later");
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(target: "kiln.blobs", event = "get", key = %meta_key(t), error = %e, "a kept binary couldn't be read");
                 None
             }
         };
-        let Some(meta) = meta else { continue };
+        let Some(meta) = meta else {
+            answered.push((t, None));
+            continue;
+        };
         match blobs.head(&binary_key(t)).await {
-            Ok(m) if m.size == meta.size && m.etag == meta.sha256 => {
-                kept.insert(t.to_owned(), meta);
+            Ok(m) if m.size == meta.size && m.etag == meta.sha256 => answered.push((t, Some(meta))),
+            Err(Refusal::Unavailable(e)) => tracing::warn!(target: "kiln.blobs", event = "get", key = %binary_key(t), error = %e, "a kept binary couldn't be read: read again later"),
+            Ok(_) | Err(_) => {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %binary_key(t), "a kept binary isn't whole: left out");
+                answered.push((t, None));
             }
-            Ok(_) | Err(_) => tracing::warn!(target: "kiln.blobs", event = "get", key = %binary_key(t), "a kept binary isn't whole: left out"),
         }
     }
-    *hub.updates.kept.lock() = kept;
+    let read = answered.len() == all;
+    let mut kept = hub.updates.kept.lock();
+    for (t, b) in answered {
+        match b {
+            Some(b) => kept.insert(t.to_owned(), b),
+            None => kept.remove(t),
+        };
+    }
+    read
+}
+
+/// [`load`] again, a while apart (a minute, doubling to a quarter of an hour), until the store
+/// answers for every binary: one unavailable when the server started isn't left out for good.
+pub async fn load_until_read(hub: Arc<Hub>) {
+    let mut wait = Duration::from_secs(60);
+    loop {
+        crate::rt::sleep(wait).await;
+        if load(&hub).await {
+            tracing::info!(target: "kiln.blobs", event = "get", "the kept binaries are all read");
+            return;
+        }
+        wait = wait.saturating_mul(2).min(Duration::from_secs(900));
+    }
 }
 
 /// Takes the binaries kept as files (`<data>/binaries`) into the local store, where they lie: each

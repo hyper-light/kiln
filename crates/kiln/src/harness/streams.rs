@@ -334,9 +334,14 @@ impl Relay {
     }
 
     /// A recording's file copied into kiln's store of bytes: served from there from now on.
-    fn kept(&self, session: &str, rid: &str, what: &str, meta: super::files::Meta) {
-        if let Some(r) = self.recordings.lock().get_mut(session).and_then(|v| v.iter_mut().find(|r| r.id == rid)) {
-            r.kept.insert(what.to_owned(), meta);
+    /// Whether the recording is known still (not, once its conversation has closed).
+    fn kept(&self, session: &str, rid: &str, what: &str, meta: super::files::Meta) -> bool {
+        match self.recordings.lock().get_mut(session).and_then(|v| v.iter_mut().find(|r| r.id == rid)) {
+            Some(r) => {
+                r.kept.insert(what.to_owned(), meta);
+                true
+            }
+            None => false,
         }
     }
 
@@ -422,8 +427,14 @@ async fn keep_recording(hub: Arc<Hub>, session: String, rec: Recording) {
         if path.is_empty() {
             continue;
         }
-        match copy_file(&hub, &location, &session, path, &recording_key(&session, &rec.id, what)).await {
-            Ok(meta) => hub.harness.streams.kept(&session, &rec.id, what, meta),
+        let key = recording_key(&session, &rec.id, what);
+        match copy_file(&hub, &location, &session, path, &key).await {
+            Ok(meta) => {
+                // Its conversation closed while it was copied: the copy goes as the rest did.
+                if !hub.harness.streams.kept(&session, &rec.id, what, meta) && hub.blobs.blobs.delete(&key).await.is_ok() {
+                    crate::metrics::blobs().collected.inc(&["recordings"]);
+                }
+            }
             Err(e) => tracing::warn!(target: "kiln.blobs", event = "put", recording = %rec.id, file = what, error = %format!("{e:#}"), "a recording's file stays on its machine alone"),
         }
     }

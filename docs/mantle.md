@@ -20,7 +20,7 @@ An object's etag is its content's SHA-256, however it was uploaded.
 
 The steps (critical path, plan 01a157fe105271769f00a90acd217bca):
 
-- **CP-T10.1** (done): `Blobs`' local store (today's content-addressed store, its data unchanged)
+- **CP-T10.1** (this change): `Blobs`' local store (today's content-addressed store, its data unchanged)
   and an any-S3 one, tested against MinIO, with kiln's stores behind them (docs/blobs.md).
 - **CP-T10.2**: Mantle vendored at `vendor/mantle`, at a named commit; kiln's bytes in Mantle's
   chunk store inside kiln's process on one machine, through Mantle's crates (no gateway), every
@@ -405,7 +405,7 @@ API, roadmap or trust model is Ada's to decide, marked **[Ada]** here and listed
 ### Agreed next
 
 - **Mantle's listener against kiln's suite:** Mantle's agent tells kiln's when its HTTP/1.1 listener
-  serves (the next goal in its stack); kiln points `KILN_TEST_S3` at it and runs the 161 clauses of
+  serves (the next goal in its stack); kiln points `KILN_TEST_S3` at it and runs the clauses of
   the `Blobs` suite; failing clauses are Mantle's to fix.
 - **kiln's workload in Mantle's tests:** large objects put once in sequential 16 MiB parts and read
   many times in ranges; many small puts and gets of source files; frequent conditional puts per

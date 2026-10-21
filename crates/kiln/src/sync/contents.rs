@@ -76,9 +76,19 @@ impl Contents {
                     tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "sync's contents from before couldn't be taken in; runners send again what's wanted");
                 }
             }
-            c.load().await;
+            c.load_until_whole().await;
         });
         me
+    }
+
+    /// [`Contents::load`] again, a while apart (a minute, doubling to a quarter of an hour), until
+    /// the store answers for all of it: contents held while it couldn't are known once it does.
+    async fn load_until_whole(&self) {
+        let mut wait = Duration::from_secs(60);
+        while !self.load().await {
+            crate::rt::sleep(wait).await;
+            wait = wait.saturating_mul(2).min(Duration::from_secs(900));
+        }
     }
 
     /// Contents with nothing held and nothing to list: a test's.
@@ -88,17 +98,18 @@ impl Contents {
         Arc::new(me)
     }
 
-    /// Lists what the store holds into the index.
-    async fn load(&self) {
+    /// Lists what the store holds into the index: whether all of it was (the store answered for
+    /// every page).
+    async fn load(&self) -> bool {
         let began = Instant::now();
         let mut after: Option<String> = None;
-        let mut seen = 0usize;
+        let (mut seen, mut whole) = (0usize, true);
         for _ in 0..PAGES_MAX {
             let page = match self.blobs.list("sync/", after.as_deref(), LIST_MAX).await {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(target: "kiln.blobs", event = "list", error = %e, "sync's contents couldn't all be listed; the rest are known as they come");
-                    self.partial.store(true, Ordering::Relaxed);
+                    tracing::warn!(target: "kiln.blobs", event = "list", error = %e, "sync's contents couldn't all be listed; the rest are known as they come, and listed again later");
+                    whole = false;
                     break;
                 }
             };
@@ -118,17 +129,20 @@ impl Contents {
                 break;
             }
         }
+        self.partial.store(!whole, Ordering::Relaxed);
         self.index.lock().loaded = true;
         self.loaded_cv.notify_all();
-        tracing::info!(target: "kiln.blobs", event = "list", contents = seen, ms = began.elapsed().as_millis(), "sync's contents listed");
+        tracing::info!(target: "kiln.blobs", event = "list", contents = seen, whole, ms = began.elapsed().as_millis(), "sync's contents listed");
+        whole
     }
 
     /// Waits (blocking: the sync thread's) until the index is made, or `d` has passed.
     pub fn wait_loaded(&self, d: Duration) -> bool {
-        let deadline = Instant::now() + d;
+        let began = Instant::now();
         let mut g = self.index.lock();
         while !g.loaded {
-            if self.loaded_cv.wait_until(&mut g, deadline).timed_out() {
+            let left = d.saturating_sub(began.elapsed());
+            if left.is_zero() || self.loaded_cv.wait_for(&mut g, left).timed_out() {
                 return g.loaded;
             }
         }
@@ -166,7 +180,7 @@ impl Contents {
         if !self.has(hash) && self.index.lock().held.len() >= INDEX_MAX {
             return Err(Refusal::Full { what: "sync's contents", limit: u64::try_from(INDEX_MAX).unwrap_or(u64::MAX) });
         }
-        let meta = crate::blobs::io::put_file(self.blobs.as_ref(), &key(hash), path, Cond::Always, Some(hash)).await?;
+        let meta = crate::blobs::io::put_file(self.blobs.as_ref(), &key(hash), path, Some(hash)).await?;
         self.note(hash, meta.size, meta.modified_ms)
     }
 
@@ -276,7 +290,7 @@ mod tests {
             take_in(&local, &dir.path().join("blobs")).await?;
             assert!(dir.path().join("blobs").join(TAKEN).exists());
             let c = Contents::empty(Arc::clone(&hub.blobs.blobs));
-            c.load().await;
+            assert!(c.load().await, "listed whole");
             assert_eq!(c.size(&hash), Some(11), "listed from the store");
             assert!(path.exists(), "where it lay");
             let (size, rx) = c.stream(&hash).ok_or_else(|| anyhow::anyhow!("not held"))?;
@@ -290,6 +304,21 @@ mod tests {
             let f = dir.path().join("wrong");
             std::fs::write(&f, b"not what it says")?;
             assert!(matches!(c.put_file(&new, &f).await, Err(Refusal::BadChecksum { .. })));
+            // Large contents, sent in parts: one sent under another's name is refused before
+            // anything is replaced, and the content held is read whole still.
+            let (right, wrong) = (kiln_seams::blobs::noise((20 << 20) + 3, 5), kiln_seams::blobs::noise((20 << 20) + 3, 6));
+            let (rp, wp) = (dir.path().join("right"), dir.path().join("wrong-big"));
+            std::fs::write(&rp, &right)?;
+            std::fs::write(&wp, &wrong)?;
+            let big = crate::util::sha256_hex(&right);
+            c.put_file(&big, &rp).await?;
+            assert!(matches!(c.put_file(&big, &wp).await, Err(Refusal::BadChecksum { .. })));
+            let (size, rx) = c.stream(&big).ok_or_else(|| anyhow::anyhow!("not held"))?;
+            let mut got = Vec::with_capacity(right.len());
+            while let Ok(b) = rx.recv().await {
+                got.extend_from_slice(&b);
+            }
+            assert!(size == right.len() as u64 && got == right, "{} of {} bytes read", got.len(), right.len());
             // An older kiln run on the store again (a rollback) kept contents as files: the next
             // start takes in the new ones where they lie, and removes those the store holds already.
             let later = old.put_bytes(b"kept while rolled back")?;

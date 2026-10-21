@@ -126,7 +126,7 @@ const UPKEEP_EVERY: Duration = Duration::from_secs(3600);
 /// local store taken in ([`local::LocalBlobs::ready`]), the upgrade binaries kept as files taken in
 /// where they lie, and what kiln knows of the kept binaries read. Sync's contents are listed by
 /// their own ([`crate::sync::contents`]).
-pub async fn start(hub: &crate::hub::Hub) {
+pub async fn start(hub: &Arc<crate::hub::Hub>) {
     if let Some(s3) = &hub.blobs.s3
         && hub.cfg.blobs.s3.create_bucket
         && let Err(e) = s3.ensure_bucket().await
@@ -139,18 +139,21 @@ pub async fn start(hub: &crate::hub::Hub) {
             tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "runner binaries kept as files couldn't be taken in");
         }
     }
-    crate::updates::load(hub).await;
+    if !crate::updates::load(hub).await {
+        crate::rt::spawn(crate::updates::load_until_read(Arc::clone(hub)));
+    }
 }
 
-/// The store's upkeep for as long as the server runs: every hour, uploads left two days and what
-/// nothing holds any more let go (`kiln_blobs_collected_total`).
+/// The store's upkeep for as long as the server runs: every hour, uploads left two days, and
+/// objects no key has held for an hour, let go with the chunks nothing uses. Each was counted as its
+/// key went (`kiln_blobs_collected_total`, by what kept it).
 pub async fn run(hub: Arc<crate::hub::Hub>) -> anyhow::Result<()> {
     loop {
         crate::rt::sleep(UPKEEP_EVERY).await;
         if let Some(local) = &hub.blobs.local {
             match local.collect().await {
                 Ok(c) => {
-                    if c.uploads + c.objects + c.chunks > 0 {
+                    if c.uploads > 0 || c.objects > 0 || c.chunks > 0 {
                         tracing::info!(target: "kiln.blobs", event = "collect", uploads = c.uploads, objects = c.objects, chunks = c.chunks, bytes = c.bytes, "the local store let go of what nothing holds");
                     }
                 }
