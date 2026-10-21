@@ -493,10 +493,11 @@ for a in "$@"; do
     /rd:true) newest=1 ;;
   esac
 done
-if [ "$newest" = 1 ]; then tail -n 1 "$file"; exit 0; fi
+# As wevtutil writes them: one event after another, no line between, none after the last.
+if [ "$newest" = 1 ]; then tail -n 1 "$file" | tr -d '\n'; exit 0; fi
 awk -v after="$after" -v count="$count" '
   { if (match($0, /<EventRecordID>[0-9]+</)) { id = substr($0, RSTART + 15, RLENGTH - 16) + 0; if (id > after && n < count) { print; n++ } } }
-' "$file"
+' "$file" | tr -d '\n'
 "#;
 
 /// Event `id` of channel `System` as `wevtutil` renders it: its level and message.

@@ -1312,9 +1312,10 @@ pub(crate) fn read_lines(cmd: &mut std::process::Command, what: &str) -> std::io
             line.clear();
             match (&mut r).take(LINE_MAX as u64).read_until(b'\n', &mut line) {
                 Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    // Too long to be read whole: the rest of it skipped.
-                    if line.last() != Some(&b'\n') {
+                Ok(n) => {
+                    // Too long to be read whole: the rest of it skipped. A last line without its
+                    // newline (the output's end: `wevtutil` writes its events so) is whole.
+                    if line.last() != Some(&b'\n') && n >= LINE_MAX {
                         let mut skip = Vec::new();
                         let _ = r.read_until(b'\n', &mut skip);
                         continue;
@@ -1578,6 +1579,21 @@ mod tests {
     /// its message, level, time, service and ids, broken JSON read as text), its stream, its being
     /// cut short, its origin's attributes and service; its text back for the next line's. With
     /// kiln's nginx pipeline on, a line it reads is its record still, and another source's a row.
+    /// A command's last line without its newline (as `wevtutil` ends its output) is read, whole;
+    /// a line past the bound is skipped and the next read.
+    #[cfg(unix)]
+    #[test]
+    fn a_last_line_without_its_newline_is_read() {
+        let (lines, status, _) = output_lines(std::process::Command::new("sh").args(["-c", "printf 'a\\nb'"]), "test", std::time::Duration::from_secs(10)).unwrap_or_default();
+        assert!(status.is_some_and(|s| s.success()));
+        assert_eq!(lines, ["a\n", "b"]);
+        let (none, _, _) = output_lines(std::process::Command::new("sh").args(["-c", "printf ''"]), "test", std::time::Duration::from_secs(10)).unwrap_or_default();
+        assert!(none.is_empty());
+        let long = format!("head -c {} /dev/zero | tr '\\0' x; printf '\\nnext'", LINE_MAX + 100);
+        let (after_long, _, _) = output_lines(std::process::Command::new("sh").args(["-c", &long]), "test", std::time::Duration::from_secs(30)).unwrap_or_default();
+        assert_eq!(after_long, ["next"]);
+    }
+
     #[test]
     fn a_line_written_as_its_row_is_its_record_s_row() -> anyhow::Result<()> {
         const NOW: i64 = 1_792_324_800_000_000_000;
