@@ -483,13 +483,17 @@ function CopyMsg({ text, label, className }: { text: string; label: string; clas
   );
 }
 
-function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
+/** When something was said, "14:05": one formatter for every message (making one for each, as each renders, is slow). */
+const SAID_AT = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+
+/** What was asked: it renders only when it changes, not as the turn under it streams. */
+const Prompt = React.memo(function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
   const system = e.origin && e.origin !== "human";
   return (
     <div className="hx-prompt" data-origin={e.origin ?? "human"} data-ev={e.id}>
       <div className="hx-prompt-meta">
         <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
-        <span className="hx-dim">{new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+        <span className="hx-dim">{SAID_AT.format(e.at)}</span>
         {delivery && <span className="hx-dim">· {DELIVERY[delivery]}</span>}
         {e.attachments?.length ? (
           <span className="hx-dim hx-trunc" title={e.attachments.join(", ")}>
@@ -506,7 +510,7 @@ function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "
       <div className="hx-prompt-text">{e.text}</div>
     </div>
   );
-}
+});
 
 /** A step that started a subagent: it shows the subagent's task as it goes. */
 function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenTask?: (t: string) => void }) {
@@ -514,7 +518,8 @@ function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenT
   return <StepRow step={step} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
 }
 
-function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; active: boolean; since: number }) {
+/** One thing in a turn: it renders again only when it changes (or starts or stops being the live one), not as the rest of the turn streams. */
+const ItemView = React.memo(function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; active: boolean; since: number }) {
   switch (item.type) {
     case "step":
       return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
@@ -544,7 +549,7 @@ function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: s
         <StepRow step={{ type: "step", key: item.key, group: "tool", calls: [item.event] }} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />
       );
   }
-}
+});
 
 /** Whether the end of a live turn shows it at work: a reply or a thought streaming, a call running. */
 function moving(items: Item[], turnStarted?: number): boolean {
