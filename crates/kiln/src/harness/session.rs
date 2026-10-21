@@ -2923,8 +2923,11 @@ mod tests {
         let codex = Kind::get("codex").ok_or_else(|| anyhow::anyhow!("no codex"))?;
         let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
         let (mode, effort, modes, efforts) = carried_choices(codex, claude, "full-access", "ultra", true, "opus");
-        assert_eq!((mode.as_deref(), effort.as_deref()), (Some("bypassPermissions"), Some("max")));
-        assert!(modes.iter().any(|m| m.id == "bypassPermissions" && m.label == "Bypass"), "{modes:?}");
+        // Claude offers asking nothing only where Claude Code allows it (not as root outside a
+        // sandbox, as CI's containers run): else the most it may.
+        let top = if modes.iter().any(|m| m.id == "bypassPermissions") { "bypassPermissions" } else { "auto" };
+        assert_eq!((mode.as_deref(), effort.as_deref()), (Some(top), Some("max")));
+        assert!(modes.iter().all(|m| m.id != "bypassPermissions" || m.label == "Bypass"), "{modes:?}");
         assert!(efforts.iter().any(|e| e.id == "max"), "{efforts:?}");
         // Without leave to ask nothing: the most it may. Codex's auto: Claude's accept-edits.
         assert_eq!(carried_choices(codex, claude, "full-access", "", false, "opus").0.as_deref(), Some("auto"));
