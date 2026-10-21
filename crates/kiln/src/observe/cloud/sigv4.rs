@@ -1,6 +1,8 @@
-//! AWS Signature Version 4: what signs every request kiln makes of AWS (CloudWatch's, STS's).
+//! AWS Signature Version 4: what signs every request kiln makes of AWS (CloudWatch's, STS's, S3's).
 //! Checked against AWS's own test suite (`aws4_testsuite`, as botocore carries it): each case's
-//! canonical request, string to sign and signature, to the byte.
+//! canonical request, string to sign and signature, to the byte; S3's ways (its path encoded once,
+//! its payload's hash a signed header) checked live against MinIO, which signs as S3 does
+//! (`tests/observe_archives.rs`).
 
 use sha2::Digest as _;
 use time::OffsetDateTime;
@@ -30,8 +32,8 @@ pub struct Request<'a> {
 }
 
 /// RFC 3986's unreserved characters left, every other byte `%XX` (AWS's `UriEncode`); `/` kept
-/// when `slash` (a path's).
-fn uri_encode(s: &str, slash: bool) -> String {
+/// when `slash` (a path's): an S3 object's path in its URL is encoded so, as it is signed.
+pub(crate) fn uri_encode(s: &str, slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -65,10 +67,14 @@ fn stamps(at: OffsetDateTime) -> (String, String) {
     (format!("{date}T{:02}{:02}{:02}Z", at.hour(), at.minute(), at.second()), date)
 }
 
-/// The canonical request (its lines joined by `\n`) and its signed headers.
-fn canonical(req: &Request<'_>) -> (String, String) {
-    // The path's segments encoded twice, as every service but S3 wants.
-    let path = if req.path.is_empty() { "/".to_owned() } else { uri_encode(&uri_encode(req.path, true), true) };
+/// The canonical request (its lines joined by `\n`) and its signed headers; `s3`'s path encoded
+/// once, as S3 wants (twice for every other service).
+fn canonical(req: &Request<'_>, s3: bool) -> (String, String) {
+    let path = match req.path {
+        "" => "/".to_owned(),
+        p if s3 => uri_encode(p, true),
+        p => uri_encode(&uri_encode(p, true), true),
+    };
     let mut query: Vec<(String, String)> = req.query.iter().map(|(k, v)| (uri_encode(k, false), uri_encode(v, false))).collect();
     query.sort();
     let query = query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
@@ -92,16 +98,22 @@ fn canonical(req: &Request<'_>) -> (String, String) {
 }
 
 /// The headers to send besides the request's own: `x-amz-date`, `x-amz-security-token` with a
-/// session's credentials (both signed), and `authorization`.
+/// session's credentials, S3's `x-amz-content-sha256` (the payload's hash, which S3 requires), each
+/// signed, and `authorization`.
 pub fn sign(keys: &Keys, region: &str, service: &str, req: &Request<'_>, at: OffsetDateTime) -> Vec<(String, String)> {
     let (amz_date, date) = stamps(at);
+    let s3 = service == "s3";
+    let payload = if s3 { sha256_hex(req.body) } else { String::new() };
     let mut headers: Vec<(&str, &str)> = req.headers.to_vec();
     headers.push(("x-amz-date", &amz_date));
     if let Some(t) = &keys.token {
         headers.push(("x-amz-security-token", t));
     }
+    if s3 {
+        headers.push(("x-amz-content-sha256", &payload));
+    }
     let signed_req = Request { headers: &headers, ..*req };
-    let (creq, signed) = canonical(&signed_req);
+    let (creq, signed) = canonical(&signed_req, s3);
     let scope = format!("{date}/{region}/{service}/aws4_request");
     let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(creq.as_bytes()));
     let k = [date.as_str(), region, service, "aws4_request"].iter().fold(format!("AWS4{}", keys.secret).into_bytes(), |k, part| hmac(&k, part.as_bytes()));
@@ -109,6 +121,9 @@ pub fn sign(keys: &Keys, region: &str, service: &str, req: &Request<'_>, at: Off
     let mut out = vec![("x-amz-date".to_owned(), amz_date.clone())];
     if let Some(t) = &keys.token {
         out.push(("x-amz-security-token".to_owned(), t.clone()));
+    }
+    if s3 {
+        out.push(("x-amz-content-sha256".to_owned(), payload));
     }
     out.push(("authorization".to_owned(), format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}", keys.access_key)));
     out
@@ -156,7 +171,7 @@ mod tests {
         for (method, query, creq, creq_hash, signature) in cases {
             let headers = [("Host", "example.amazonaws.com"), ("X-Amz-Date", "20150830T123600Z")];
             let req = Request { method, path: "/", query, headers: &headers, body: b"" };
-            let (got, _) = canonical(&req);
+            let (got, _) = canonical(&req, false);
             assert_eq!(got, creq, "{method} {query:?}");
             assert_eq!(sha256_hex(got.as_bytes()), creq_hash);
             let signed = sign(&keys(), "us-east-1", "service", &Request { headers: &[("Host", "example.amazonaws.com")], ..req }, at());
@@ -175,5 +190,26 @@ mod tests {
         assert!(signed.iter().any(|(h, v)| h == "x-amz-security-token" && v == "SESSION"));
         assert_eq!(uri_encode("a b/c=d", false), "a%20b%2Fc%3Dd");
         assert_eq!(uri_encode("/a b", true), "/a%20b");
+    }
+
+    /// S3's ways: its path encoded once (`$` as `%24`, not `%2524`), every other service's twice;
+    /// the payload's hash sent as `x-amz-content-sha256`, signed, and the canonical request's last
+    /// line.
+    #[test]
+    fn s3_s_path_is_encoded_once_and_its_payload_s_hash_is_signed() {
+        let body = b"Welcome to Amazon S3.";
+        let headers = [("Host", "examplebucket.s3.amazonaws.com")];
+        let req = Request { method: "PUT", path: "/test$file.text", query: &[], headers: &headers, body };
+        let (s3, _) = canonical(&req, true);
+        let (other, _) = canonical(&req, false);
+        assert_eq!(s3.lines().nth(1), Some("/test%24file.text"));
+        assert_eq!(other.lines().nth(1), Some("/test%2524file.text"));
+        let signed = sign(&keys(), "us-east-1", "s3", &req, at());
+        let hash = sha256_hex(body);
+        assert!(signed.iter().any(|(h, v)| h == "x-amz-content-sha256" && *v == hash), "{signed:?}");
+        let authz = signed.iter().find(|(h, _)| h == "authorization").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert!(authz.contains("/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, "), "{authz}");
+        let monitoring = sign(&keys(), "us-east-1", "monitoring", &req, at());
+        assert!(!monitoring.iter().any(|(h, _)| h == "x-amz-content-sha256"), "only S3's");
     }
 }

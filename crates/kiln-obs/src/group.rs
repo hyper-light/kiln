@@ -141,6 +141,18 @@ pub fn due<L: LogStore, M: StateMachine>(r: &Replica<L, M>) -> bool {
     r.is_stalled() || r.compactable_bytes() >= CADENCE_BYTES / 2
 }
 
+/// How long applied entries wait for a cut at the most when they come slowly (a cadence's bytes take
+/// hours): what a log archive's objects wait for (`docs/observe.md` §10.5), Datadog's own archives'
+/// 15 minutes (its writer's batches').
+pub const CUT_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Whether the group's log is due to be compacted (the store cut) for its age: entries are
+/// applied past `since` (where the store was last cut), the first of them `waited` ago, and that is
+/// `after` or more.
+pub fn due_by_age<L: LogStore, M: StateMachine>(r: &Replica<L, M>, since: u64, waited: Duration, after: Duration) -> bool {
+    r.applied().index > since && waited >= after
+}
+
 /// How many applied entries a compaction keeps for members a little behind: half a cadence's
 /// worth at the entries' mean size, so that a member away for that long takes the log, not an
 /// image and its files; none when the group is stalled for room. `since` is where the log was

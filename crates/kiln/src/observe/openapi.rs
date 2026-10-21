@@ -1137,6 +1137,79 @@ fn schemas() -> Map<String, Value> {
         ),
     );
     put("Cloud", json!({ "allOf": [schema("CloudIn"), object(&[("name", string()), ("status", schema("CloudStatus"))], &["name", "status"])] }));
+    let integration = describe(
+        object(&[("cloud", describe(string(), "the name of the kiln cloud integration whose credentials write here (`/clouds`), of the destination's cloud"))], &["cloud"]),
+        "Datadog's fields besides it (account_id, role_name, client_email, project_id, tenant_id, client_id) are kept as given",
+    );
+    let prefix = describe(string(), "where in the bucket or container its objects go: <path>/dt=<YYYYMMDD>/hour=<HH>/archive_<HHmmss.SSSS>.<uuid>.json.gz");
+    put(
+        "ArchiveDestination",
+        json!({ "oneOf": [
+            object(
+                &[
+                    ("type", one_of(&["s3"])),
+                    ("bucket", string()),
+                    ("path", prefix.clone()),
+                    ("integration", integration.clone()),
+                    ("region", describe(string(), "the bucket's; none: the cloud integration's first, else AWS_REGION, else us-east-1")),
+                    ("storage_class", describe(string(), "S3's storage class (STANDARD_IA, GLACIER_IR, …); none: the bucket's")),
+                    ("encryption", object(&[("type", one_of(&["NO_OVERRIDE", "SSE_S3", "SSE_KMS"])), ("key", describe(string(), "SSE_KMS's key, its ARN"))], &["type"])),
+                    ("endpoint", describe(string(), "an S3-compatible store's address (MinIO, R2, …): objects at <endpoint>/<bucket>/<key>; none: AWS's")),
+                ],
+                &["type", "bucket", "integration"],
+            ),
+            object(
+                &[("type", one_of(&["gcs"])), ("bucket", string()), ("path", prefix.clone()), ("integration", integration.clone()), ("endpoint", describe(string(), "Cloud Storage's address; none: Google's"))],
+                &["type", "bucket", "integration"],
+            ),
+            object(
+                &[
+                    ("type", one_of(&["azure"])),
+                    ("storage_account", string()),
+                    ("container", string()),
+                    ("path", prefix),
+                    ("integration", integration),
+                    ("endpoint", describe(string(), "the account's blob address; none: https://<account>.blob.core.windows.net")),
+                ],
+                &["type", "storage_account", "container", "integration"],
+            ),
+        ] }),
+    );
+    let archive_fields = [
+        ("name", string()),
+        (
+            "query",
+            describe(
+                string(),
+                "a log search: the records it takes, each record to the first archive in order whose search it matches (kiln's own events only if it names source:kiln.event); `*` unless said",
+            ),
+        ),
+        ("destination", schema("ArchiveDestination")),
+        ("include_tags", describe(boolean(), "events carry the record's unified service tags (service, host, source, env, version)")),
+        ("rehydration_tags", describe(array(string()), "Datadog's, kept as given")),
+        ("rehydration_max_scan_size_in_gb", describe(integer(), "Datadog's, kept as given")),
+    ];
+    put("ArchiveIn", describe(object(&archive_fields, &["name", "destination"]), "an archive, or Datadog's {\"data\": {\"type\": \"archives\", \"attributes\": …}}"));
+    let archive_state = one_of(&["UNKNOWN", "WORKING", "FAILING"]);
+    put(
+        "ArchiveStatus",
+        object(
+            &[
+                ("state", archive_state.clone()),
+                ("error", nullable(string())),
+                ("events", integer()),
+                ("objects", integer()),
+                ("bytes", describe(integer(), "written, gzip'd")),
+                ("last_written", nullable(integer())),
+                ("pending", describe(integer(), "log files held not yet archived to it")),
+            ],
+            &["state", "events", "objects", "bytes", "pending"],
+        ),
+    );
+    put(
+        "Archive",
+        json!({ "allOf": [schema("ArchiveIn"), object(&[("id", string()), ("created", ms()), ("modified", ms()), ("state", archive_state), ("status", schema("ArchiveStatus"))], &["id", "state", "status"])] }),
+    );
     put(
         "CloudTest",
         object(
@@ -1580,6 +1653,51 @@ fn ops() -> Vec<Op<'static>> {
             "observe.read",
             Some(body("LogMetricTest")),
             vec![("200", answer_of("its series", object(&[("series", array(object(&[("metric", string()), ("tags", map_of(string())), ("points", array(any()))], &["metric", "tags", "points"]))), ("records", integer()), ("rows_scanned", integer())], &["series", "records"])))],
+        ),
+        op(
+            "get",
+            "/archives",
+            "Lists the log archives in the order records are matched against them, each its status",
+            "observe.read",
+            None,
+            vec![("200", answer_of("the archives", object(&[("archives", array(schema("Archive")))], &["archives"])))],
+        ),
+        op(
+            "post",
+            "/archives",
+            "Makes a log archive, last in order: it takes the records of the log files cut from now on (checked: its search parses, its cloud integration is of its destination's cloud)",
+            "observe.manage",
+            Some(body("ArchiveIn")),
+            vec![("201", answer("made", Some("Archive"))), ("409", answer("an archive of that name already", Some("Error")))],
+        ),
+        Op { params: vec![id()], ..op("get", "/archives/{id}", "A log archive and its status", "observe.read", None, vec![ok("Archive")]) },
+        Op {
+            params: vec![id()],
+            ..op(
+                "put",
+                "/archives/{id}",
+                "Changes a log archive: its search and tags apply to the log files cut after, where it writes to its next object",
+                "observe.manage",
+                Some(body("ArchiveIn")),
+                vec![ok("Archive")],
+            )
+        },
+        Op { params: vec![id()], ..op("delete", "/archives/{id}", "Removes a log archive (what it wrote stays)", "observe.manage", None, vec![no_content()]) },
+        op(
+            "get",
+            "/archive_order",
+            "The archives' ids, in the order records are matched against them",
+            "observe.read",
+            None,
+            vec![("200", answer_of("their order", object(&[("archive_ids", array(string()))], &["archive_ids"])))],
+        ),
+        op(
+            "put",
+            "/archive_order",
+            "Puts the archives in an order (every one of them, each once), from the log files cut after; Datadog's {\"data\": {\"type\": \"archive_order\", \"attributes\": …}} too",
+            "observe.manage",
+            Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("archive_ids", array(string()))], &["archive_ids"]) } } })),
+            vec![("200", answer_of("their order", object(&[("archive_ids", array(string()))], &["archive_ids"])))],
         ),
         op("get", "/pipelines", "Lists the log pipelines in the order they apply: kiln's own, then yours", "observe.read", None, vec![("200", answer_of("the pipelines", object(&[("pipelines", array(schema("Pipeline")))], &["pipelines"])))]),
         op("post", "/pipelines", "Makes a log pipeline, last (checked: it compiles)", "observe.manage", Some(body("PipelineIn")), vec![("201", answer("made", Some("Pipeline")))]),

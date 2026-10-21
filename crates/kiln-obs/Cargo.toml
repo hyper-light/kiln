@@ -58,6 +58,10 @@ name = "logs"
 harness = false
 
 [[bench]]
+name = "archive"
+harness = false
+
+[[bench]]
 name = "logmetrics"
 harness = false
 

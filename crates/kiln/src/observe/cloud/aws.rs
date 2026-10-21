@@ -579,14 +579,17 @@ async fn ambient(api: &Api<'_>, cfg: &Config, region: &str, now: i64) -> anyhow:
     Ok(serde_json::from_str::<Issued>(creds).map_err(|e| anyhow::anyhow!("the instance's credentials: {e}"))?.keys(now))
 }
 
+/// A cloud's keys (its own, else the server's: [`ambient`]; a role assumed with them, when it
+/// names one), kept until five minutes before they end: what its pulls sign with, and an archive's
+/// objects (`crate::observe::archives`).
 #[derive(Default)]
-struct Creds {
+pub(crate) struct Creds {
     /// The keys signing calls, and until when (unix ms).
     held: Option<(Keys, i64)>,
 }
 
 impl Creds {
-    async fn get(&mut self, api: &Api<'_>, cfg: &Config, region: &str, now: i64) -> anyhow::Result<Keys> {
+    pub(crate) async fn get(&mut self, api: &Api<'_>, cfg: &Config, region: &str, now: i64) -> anyhow::Result<Keys> {
         if let Some((k, until)) = &self.held
             && until.saturating_sub(now) > REFRESH_MS
         {

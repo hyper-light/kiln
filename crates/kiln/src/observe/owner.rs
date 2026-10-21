@@ -712,9 +712,21 @@ struct Rep {
     _log: Log<DeviceFile>,
     out: Output<(u64, Answer)>,
     compacted: u64,
+    /// Where the store was last cut, and since when (ns since the owner started) an entry past it
+    /// has waited: entries that come slowly are cut within [`cut_after`] of the first of them
+    /// (`kiln_obs::group::due_by_age`).
+    cut: u64,
+    waiting: Option<u64>,
     /// The store's durable point when maintenance was last told: a cut since is new blocks to
     /// merge, however it came (a compaction, a snapshot's persisting).
     told: u64,
+}
+
+/// How long applied entries wait for a cut at the most (`kiln_obs::group::CUT_AFTER`);
+/// `KILN_OBSERVE_CUT_AFTER_MS` makes it shorter, for a test of what waits on cuts (log archives).
+fn cut_after() -> Duration {
+    static AFTER: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| std::env::var("KILN_OBSERVE_CUT_AFTER_MS").ok().and_then(|v| v.parse().ok()).map_or(group::CUT_AFTER, Duration::from_millis))
 }
 
 /// Which member each machine is, as the server keeps it (`<observe>/members.json`).
@@ -935,7 +947,8 @@ impl Owner {
             let depth = store.depth();
             let settings = group::settings(id, depth).map_err(|e| format!("the group's settings: {e:?}"))?;
             let r = Replica::open(&settings, store, machine, Unbounded).map_err(|e| format!("the replica: {e:?}"))?;
-            Ok(Rep { compacted: r.applied().index, told: 0, r, _log: log, out: Output::default() })
+            let applied = r.applied().index;
+            Ok(Rep { compacted: applied, cut: applied, waiting: None, told: 0, r, _log: log, out: Output::default() })
         })();
         match opened {
             Ok(mut rep) => {
@@ -1467,9 +1480,21 @@ impl Owner {
         }
         let asked = self.compact_asked && rep.r.in_flight() == 0;
         let keep = if asked { 0 } else { group::keep(&rep.r, rep.compacted) };
-        if (asked || group::due(&rep.r)) && rep.r.compact(keep, now, &self.waker).unwrap_or(false) {
+        if rep.waiting.is_none() && rep.r.applied().index > rep.cut {
+            rep.waiting = Some(now);
+        }
+        let due = asked || group::due(&rep.r);
+        if due && rep.r.compact(keep, now, &self.waker).unwrap_or(false) {
             self.compact_asked = false;
             rep.compacted = rep.r.applied().index;
+            (rep.cut, rep.waiting) = (rep.compacted, None);
+        } else if !due && rep.waiting.is_some_and(|since| group::due_by_age(&rep.r, rep.cut, Duration::from_nanos(now.saturating_sub(since)), cut_after())) {
+            // Entries that came slowly have waited long enough: a compaction cuts the store first,
+            // whether or not the log's start then moves (a few entries, all of them kept).
+            if rep.r.compact(keep, now, &self.waker).unwrap_or(false) {
+                rep.compacted = rep.r.applied().index;
+            }
+            (rep.cut, rep.waiting) = (rep.r.applied().index, None);
         }
         // A cut made blocks: maintenance merges them (the logarithmic method keeps a few).
         let durable = rep.r.machine().read().durable().index;

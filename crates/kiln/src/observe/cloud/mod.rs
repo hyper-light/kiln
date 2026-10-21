@@ -381,6 +381,10 @@ impl<'a> Call<'a> {
         Self { method: Method::Post, url, headers: vec![("content-type".into(), content_type.into())], body: body.into(), timeout: TIMEOUT }
     }
 
+    pub fn put(url: &'a str, content_type: &str, body: impl Into<Bytes>) -> Self {
+        Self { method: Method::Put, url, headers: vec![("content-type".into(), content_type.into())], body: body.into(), timeout: TIMEOUT }
+    }
+
     pub fn header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.to_owned(), v.to_owned()));
         self

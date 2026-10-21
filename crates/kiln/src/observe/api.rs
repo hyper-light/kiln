@@ -158,6 +158,50 @@ fn pipelines() -> Result<&'static std::sync::Arc<super::pipeline::kept::Pipeline
     PIPELINES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log pipelines are kept by the server"))
 }
 
+/// The server's log archives, once it started.
+static ARCHIVES: OnceLock<std::sync::Arc<super::archives::Archives>> = OnceLock::new();
+
+pub fn set_archives(a: std::sync::Arc<super::archives::Archives>) {
+    let _ = ARCHIVES.set(a);
+}
+
+fn archives() -> Result<&'static std::sync::Arc<super::archives::Archives>, Fail> {
+    ARCHIVES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log archives are written by the server"))
+}
+
+/// An archive as the API shows it: its definition, Datadog's `state`, and kiln's status of it.
+fn archive_json(a: &super::archives::Archive, s: &super::archives::Status) -> Value {
+    let mut v = serde_json::to_value(a).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("state".into(), Value::from(s.state));
+        o.insert("status".into(), serde_json::to_value(s).unwrap_or(Value::Null));
+    }
+    v
+}
+
+/// What a request gives, as kiln's or as Datadog's (`{"data": {"type": …, "attributes": …}}`).
+fn datadog_or_plain(v: Value) -> Value {
+    match v {
+        Value::Object(mut o) if o.get("data").and_then(|d| d.get("attributes")).is_some() => o.remove("data").and_then(|mut d| d.get_mut("attributes").map(Value::take)).unwrap_or(Value::Null),
+        v => v,
+    }
+}
+
+fn archive_in(v: Value) -> Result<super::archives::Archive, Fail> {
+    serde_json::from_value(datadog_or_plain(v)).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("an archive: {e}")))
+}
+
+/// The log files the store holds now, read on the blocking pool: what a change of the archives
+/// applies from.
+async fn log_files_held() -> Result<Vec<(u64, std::sync::Arc<kiln_obs::logs::file::LogFile>)>, Fail> {
+    let store = get().and_then(Observe::store).ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe's store is opening"))?;
+    crate::rt::blocking(move || store.read().unwrap_or_else(PoisonError::into_inner).log_files()).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+}
+
+fn refused((code, why): super::archives::Refusal) -> Fail {
+    (StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), why)
+}
+
 /// The server's metrics from logs, and from spans, once it started.
 static LOG_METRICS: OnceLock<std::sync::Arc<super::logmetrics::LogMetrics>> = OnceLock::new();
 static SPAN_METRICS: OnceLock<std::sync::Arc<super::logmetrics::LogMetrics>> = OnceLock::new();
@@ -1158,6 +1202,44 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             store.order(&o.pipeline_ids).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
             apply_pipelines(store);
             Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::GET, ["archives"]) => {
+            let list: Vec<Value> = archives()?.list().iter().map(|(a, s)| archive_json(a, s)).collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "archives": list })))
+        }
+        (&Method::POST, ["archives"]) => {
+            let a = archive_in(read_json(req.into_body(), QUERY_BODY).await?)?;
+            let files = log_files_held().await?;
+            let made = archives()?.create(a, &files).map_err(refused)?;
+            Ok(srv::json(StatusCode::CREATED, &archive_json(&made, &super::archives::Status::default())))
+        }
+        (&Method::GET, ["archives", id]) => archives()?.get(id).map(|(a, s)| srv::json(StatusCode::OK, &archive_json(&a, &s))).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such archive")),
+        (&Method::PUT, ["archives", id]) => {
+            let id = (*id).to_owned();
+            let a = archive_in(read_json(req.into_body(), QUERY_BODY).await?)?;
+            let files = log_files_held().await?;
+            let store = archives()?;
+            let changed = store.put(&id, a, &files).map_err(refused)?;
+            let status = store.get(&id).map(|(_, s)| s).unwrap_or_default();
+            Ok(srv::json(StatusCode::OK, &archive_json(&changed, &status)))
+        }
+        (&Method::DELETE, ["archives", id]) => {
+            let id = (*id).to_owned();
+            let files = log_files_held().await?;
+            archives()?.delete(&id, &files).map_err(refused)?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::GET, ["archive_order"]) => Ok(srv::json(StatusCode::OK, &json!({ "archive_ids": archives()?.order() }))),
+        (&Method::PUT, ["archive_order"]) => {
+            #[derive(Deserialize)]
+            struct Order {
+                archive_ids: Vec<String>,
+            }
+            let v: Value = read_json(req.into_body(), QUERY_BODY).await?;
+            let o: Order = serde_json::from_value(datadog_or_plain(v)).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("archive_ids: {e}")))?;
+            let files = log_files_held().await?;
+            let ids = archives()?.set_order(&o.archive_ids, &files).map_err(refused)?;
+            Ok(srv::json(StatusCode::OK, &json!({ "archive_ids": ids })))
         }
         (&Method::GET, ["log_metrics"]) => metrics_list("log_metrics"),
         (&Method::GET, ["span_metrics"]) => metrics_list("span_metrics"),

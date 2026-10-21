@@ -190,9 +190,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         match crate::http::client::Client::public() {
             Ok(http) => {
-                let clouds = crate::observe::cloud::Clouds::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key"), std::sync::Arc::new(http), shutdown.clone());
+                let http = std::sync::Arc::new(http);
+                let clouds = crate::observe::cloud::Clouds::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key"), http.clone(), shutdown.clone());
                 crate::observe::api::set_clouds(clouds.clone());
                 clouds.start();
+                // Log archives, written with the cloud integrations' credentials. Its loop holds
+                // nothing that panics (the crate's lints): run, not supervised.
+                let archives = crate::observe::archives::Archives::open(&cfg.data("observe"), clouds, http);
+                crate::observe::api::set_archives(archives.clone());
+                crate::rt::spawn(archives.run(shutdown.clone()));
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "cloud integrations did not start: no HTTPS client"),
         }

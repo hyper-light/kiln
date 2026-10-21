@@ -1,5 +1,6 @@
 //! Logs (`docs/observe.md` §3, §4.6): records, their columnar blocks, and search over them.
 
+pub mod archive;
 pub mod block;
 pub mod bloom;
 pub mod file;

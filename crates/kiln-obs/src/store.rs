@@ -591,6 +591,17 @@ impl Store {
         self.generation
     }
 
+    /// The log records' files, oldest first, each its number: a cut's records, written once (an
+    /// install numbers them anew: [`Store::epoch`] says when).
+    pub fn log_files(&self) -> Vec<(u64, Arc<crate::logs::file::LogFile>)> {
+        self.logs.files().iter().map(|f| (f.seq, Arc::clone(&f.log))).collect()
+    }
+
+    /// Installs this store took (each numbers its files anew).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Log records applied from here on are published to `feed` (live tail, [`crate::logs::tail`]).
     pub fn set_feed(&mut self, feed: Option<Arc<Feed>>) {
         self.feed = feed;

@@ -301,9 +301,10 @@ fn error(a: &Answer) -> String {
     format!("{} {}", a.status, said.unwrap_or_else(|| a.text()))
 }
 
-pub(super) struct Token {
-    pub(super) value: String,
-    until: i64,
+pub(crate) struct Token {
+    pub(crate) value: String,
+    /// Unix ms: when it ends.
+    pub(crate) until: i64,
 }
 
 /// A token's answer: `expires_in` (seconds from now) or `expires_on` (unix seconds), either a
@@ -320,8 +321,8 @@ fn token_of(a: &Answer, what: &str, now: i64) -> anyhow::Result<Token> {
     Ok(Token { value, until })
 }
 
-/// A token for `audience` (Resource Manager's root, or Log Analytics').
-pub(super) async fn token(api: &Api<'_>, cfg: &Config, audience: &str, now: i64) -> anyhow::Result<Token> {
+/// A token for `audience` (Resource Manager's root, Log Analytics', Storage's: an archive's blobs).
+pub(crate) async fn token(api: &Api<'_>, cfg: &Config, audience: &str, now: i64) -> anyhow::Result<Token> {
     let scope = format!("{audience}/.default");
     let resource = format!("{audience}/");
     let entra = |tenant: &str| format!("{}/{}/oauth2/v2.0/token", cfg.login(), encode(tenant));

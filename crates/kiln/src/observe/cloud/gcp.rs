@@ -289,6 +289,47 @@ async fn token(api: &Api<'_>, src: &Source, scope: &str, now: i64) -> anyhow::Re
     Ok(Token { value, until: now + (expires_in * 1000.0) as i64 })
 }
 
+/// A token of a cloud's credentials (its service account's key, else the server's own:
+/// `Source::ambient`) for a scope, kept until five minutes before it ends: what a pull reads with,
+/// and an archive's objects are written with (`crate::observe::archives`). The metadata server's
+/// token is of the instance's own scopes, whatever is asked.
+pub(crate) struct Bearer {
+    service_account: Option<String>,
+    scope: String,
+    source: Option<Source>,
+    token: Option<Token>,
+}
+
+impl Bearer {
+    pub(crate) fn new(cfg: &Config, scope: &str) -> Self {
+        Self { service_account: cfg.service_account.clone(), scope: scope.to_owned(), source: None, token: None }
+    }
+
+    pub(crate) async fn get(&mut self, api: &Api<'_>, now: i64) -> anyhow::Result<String> {
+        if let Some(t) = &self.token
+            && t.until.saturating_sub(now) > REFRESH_MS
+        {
+            return Ok(t.value.clone());
+        }
+        if self.source.is_none() {
+            self.source = Some(match &self.service_account {
+                Some(k) => Source::of_key(k)?,
+                None => Source::ambient()?,
+            });
+        }
+        let src = self.source.as_ref().ok_or_else(|| anyhow::anyhow!("no credentials"))?;
+        let t = token(api, src, &self.scope, now).await?;
+        let v = t.value.clone();
+        self.token = Some(t);
+        Ok(v)
+    }
+
+    /// The project its credentials name, once they are read.
+    fn project(&self) -> Option<&str> {
+        self.source.as_ref().and_then(Source::project)
+    }
+}
+
 // ----------------------------------------------------------------------------------- the API
 
 #[derive(Debug, Deserialize)]
@@ -509,8 +550,7 @@ struct Type {
 pub struct Puller {
     cfg: Config,
     tags: Vec<(String, String)>,
-    source: Option<Source>,
-    token: Option<Token>,
+    bearer: Bearer,
     projects: Vec<String>,
     types: Vec<Type>,
     discovered: Option<Instant>,
@@ -519,26 +559,12 @@ pub struct Puller {
 impl Puller {
     pub fn new(cfg: Config) -> Self {
         let tags = cfg.common.tag_pairs();
-        Self { projects: cfg.projects.clone(), cfg, tags, source: None, token: None, types: Vec::new(), discovered: None }
+        let bearer = Bearer::new(&cfg, &cfg.scope());
+        Self { projects: cfg.projects.clone(), cfg, tags, bearer, types: Vec::new(), discovered: None }
     }
 
     async fn bearer(&mut self, api: &Api<'_>, now: i64) -> anyhow::Result<String> {
-        if let Some(t) = &self.token
-            && t.until.saturating_sub(now) > REFRESH_MS
-        {
-            return Ok(t.value.clone());
-        }
-        if self.source.is_none() {
-            self.source = Some(match &self.cfg.service_account {
-                Some(k) => Source::of_key(k)?,
-                None => Source::ambient()?,
-            });
-        }
-        let src = self.source.as_ref().ok_or_else(|| anyhow::anyhow!("no credentials"))?;
-        let t = token(api, src, &self.cfg.scope(), now).await?;
-        let v = t.value.clone();
-        self.token = Some(t);
-        Ok(v)
+        self.bearer.get(api, now).await
     }
 
     async fn get(&self, api: &Api<'_>, token: &str, url: &str) -> anyhow::Result<Answer> {
@@ -645,7 +671,7 @@ impl Puller {
     }
 
     async fn home_project(&self, api: &Api<'_>) -> anyhow::Result<Vec<String>> {
-        if let Some(p) = self.source.as_ref().and_then(Source::project).map(str::to_owned).or_else(|| env("GOOGLE_CLOUD_PROJECT")).or_else(|| env("CLOUDSDK_CORE_PROJECT")) {
+        if let Some(p) = self.bearer.project().map(str::to_owned).or_else(|| env("GOOGLE_CLOUD_PROJECT")).or_else(|| env("CLOUDSDK_CORE_PROJECT")) {
             return Ok(vec![p]);
         }
         let url = metadata_url("/computeMetadata/v1/project/project-id");

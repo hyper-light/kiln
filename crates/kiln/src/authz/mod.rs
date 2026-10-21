@@ -424,6 +424,11 @@ pub static ROUTES: &[Rule] = &[
     any("/api/observe/v1/pipelines", "observe.manage", At::Server),
     any("/api/observe/v1/pipelines/**", "observe.manage", At::Server),
     any("/api/observe/v1/pipeline_order", "observe.manage", At::Server),
+    // Archives write every record they take to a store outside, with a cloud integration's
+    // credentials: a maintainer's.
+    any("/api/observe/v1/archives", "observe.manage", At::Server),
+    any("/api/observe/v1/archives/**", "observe.manage", At::Server),
+    any("/api/observe/v1/archive_order", "observe.manage", At::Server),
     // Metrics from logs write series, as monitors and dashboards are written; trying one reads.
     r("POST", "/api/observe/v1/log_metric_test", "observe.read", At::Server),
     r("POST", "/api/observe/v1/span_metric_test", "observe.read", At::Server),

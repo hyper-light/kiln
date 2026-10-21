@@ -33,6 +33,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-19 | Error Tracking (§8.8): errors grouped into issues as Datadog groups them (within a service: their type, their message's words, the application's innermost frame of their stack; a user's `error.fingerprint`), of the errors requests failed with (a service's entry span's, or a Datadog tracer's top-most error under its erring entry) and of error logs; eight languages' stacks read as their runtimes write them (recorded from them); an `issue.id` on each error as it is taken, a stack kept whole to 25,000 bytes (both its ends past it); each issue's errors counted on the server (`error_tracking.errors` by issue, service, env and version); issues kept by the server with Datadog's statuses, fourteen quiet days resolving one, a new version's error a regression; the API (OpenAPI) and its pages; checked live with OpenTelemetry's Python SDK (spans and logs) and ddtrace through a resolve and a regression (§13); 1.1 to 2.8 µs an error (§12.24); Datadog's Error Tracking monitors (new issues and regressions, impact; §9) telling integrations, an ignored issue muted, checked live and in browsers (§13); reading an error without allocating, 0.6 to 1.1 µs (§12.24) | done |
 | O-20 | Datadog's dashboards (§7, §11): their JSON imported as kiln's and any dashboard given back as Datadog's, every widget kept (drawn as Datadog draws it, drawn otherwise and said, or a note saying what it was); groups, pies; logs, spans and events as operands of formulas, as Datadog's formulas mix them (§6); Datadog's boolean filters, a search's value lists, `max` and `min`, arithmetic without spaces; Datadog's 678 integration dashboards taken and given back the same, 90.8% of their widgets drawn as Datadog draws them (with service checks', O-21), 105 µs an import (§12.25); checked in browsers (§13) | done |
 | O-21 | Service checks (§9.4): each run, the Agent's (`/api/v1/check_run`) or DogStatsD's (`_sc`), a record and a sample of its status, read from its check's series; Datadog's service check monitor (`"check".over(...).by(...).last(n).count_by_status()`, its thresholds runs in a row, `{{check_message}}`); the check status widget, `POST checks/status`, Datadog's `check_status` imported and given back; the monitor form and page; checked live (a host alerting on its second failure in a row, not its first, its notice the run's message, recovering on its first OK) and in browsers (§13) | done |
+| O-22 | Log archives (§10.5): Datadog's, to S3 (and S3-compatible stores), Cloud Storage and Azure Blob Storage with the cloud integrations' credentials (S3's requests signed with SigV4, the path once and the payload's hash), each record to the first archive whose search takes it; Datadog's objects (an hour's events a folder) and events; each record once through failures, restarts, installs and changes (each archive its place, a file kept to the archives it was begun with, a part written not written again); the store cut within 15 minutes when records come slowly; checked live against RustFS and stand-ins for Google's and Microsoft's stores and token services (§13) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -174,7 +175,10 @@ holds while an exporter's series come to one receiver, as an app's to its machin
 
 The head holds recent samples in memory: each series' open chunk and its closed chunks. The head is
 cut into an immutable **block** file when the group compacts its log (§5: the log is the
-write-ahead log, so a cut is what lets it be trimmed):
+write-ahead log, so a cut is what lets it be trimmed): once it holds half a cadence of entries
+(32 MiB), and when entries come slowly, 15 minutes after the first of them not yet cut
+(`kiln_obs::group::CUT_AFTER`; Datadog's archives' own batch): what waits on a cut, a log archive's
+objects (§10.5), waits that long at the most.
 
 ```
 block   = MAGIC | FORMAT 3 | data | index | footer
@@ -563,7 +567,8 @@ kiln's (docs/access.md): every GET, and every query, search and check asked by P
 `observe.read` (a viewer's); dashboards, monitors and data posted need `observe.write` (a
 developer's); integrations, clouds, scrape targets, synthetic tests (they reach endpoints from the
 machines), log sources (they read machines' files), log pipelines (they change every record stored
-after) and the store's operations need `observe.manage`
+after), log archives (they write every record they take to a store outside) and the store's
+operations need `observe.manage`
 (a maintainer's), but their listings, `observe.read` (their
 secrets are never in them).
 
@@ -613,6 +618,7 @@ its schema (§13). Built:
 | `PUT errors/issues/{id}` | `{"status": "for_review" \| "reviewed" \| "resolved" \| "ignored"}` |
 | `GET/POST span_metrics`, `GET/PUT/DELETE span_metrics/{name}`, `POST span_metric_test` | metrics from spans, as `log_metrics` are; the list says kiln's trace metrics too (`builtin`) |
 | `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind; a syslog source's connections and datagrams dropped; the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines, or whether it may listen where it says |
+| `GET/POST archives`, `GET/PUT/DELETE archives/{id}`, `GET/PUT archive_order` | log archives (§10.5), in the order records are matched against them, Datadog's shape (plain or in its API's envelope), each with Datadog's `state` and what it wrote, failed with and has yet to write; a change applies to the log files cut after it |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
 
@@ -1789,6 +1795,64 @@ when they change, as scrape targets are told (§8); each machine says how its ru
 - **Trying and running**: `POST synthetics/<name>/test` runs a test (the one given, or the kept one)
   once from the server and answers what it saw, its parts timed, nothing written; `POST
   synthetics/<name>/run` runs it now at every location (the runners told on observe's lane).
+
+### 10.5 Log archives
+
+`crate::observe::archives`: Datadog's Log Archives. The records kiln takes are written by the server
+to an object store as Datadog's archives hold them, so what reads Datadog's archives (its
+rehydration, Athena, a script) reads kiln's. An archive is Datadog's (its v2 API's JSON, plain or as
+`{"data": {"type": "archives", "attributes": …}}`): a name, a search (a log search, `*` unless
+said), a destination, and whether its events carry tags; 64 at the most, in an order
+(`archive_order`, `<observe>/archives.json`). A record goes to the first archive in order whose
+search it matches, once, as Datadog's; kiln's own events (`source:kiln.event`) only to one whose
+search names them.
+
+- **Destinations**: an S3 bucket (its region; a storage class; Datadog's encryption: the bucket's,
+  `SSE_S3`, or `SSE_KMS` with its key) or any S3-compatible store's at an `endpoint` (MinIO, R2,
+  RustFS: by path); a Cloud Storage bucket; an Azure Storage container; a path in it. Each written
+  with the credentials of the kiln cloud integration it names (`integration.cloud`, §10.1), of its
+  cloud (Datadog's own integration fields kept as given): S3's requests signed with SigV4 (the path
+  encoded once, the payload's hash signed, as S3 asks), Cloud Storage's with a token for
+  `devstorage.read_write`, Azure's with one for `https://storage.azure.com`; the integration's keys,
+  service account or client secret, else the server's own (its environment, its files, a workload's
+  identity, the instance's metadata service). An integration archives alone write with is `paused`:
+  it pulls nothing.
+- **Objects**: `<path>/dt=<YYYYMMDD>/hour=<HH>/archive_<HHmmss.SSSS>.<uuid>.json.gz`, gzip'd JSON
+  lines (level 6, as Datadog's writers), each of an hour's events by their own time (what reads an
+  hour's folder finds every event of it, as Vector's sink partitioned them) and 100 MB of them at
+  the most, named of its newest's time. An event: `_id` (Datadog's 18 bytes: its time in ms, eight
+  bytes of the archive and the file, its place in the file), `date` (RFC 3339 to the ms), `host`,
+  `source`, `service`, `status`, `message`, `tags` (when asked, the record's unified service tags),
+  `trace_id` and `span_id` when it has them, and every other attribute under `attributes`, a dotted
+  key a path of objects (`http.status_code`: `{"http": {"status_code": …}}`) unless it is both a
+  value and another's path.
+- **Each record once**: what is archived is the store's log files, in order. A file is a cut's
+  records (§4.5), written once, never changed, expired whole: every record is in exactly one. It is
+  read with no hold of the store and encoded on the blocking pool, its parts written as they close
+  (one waiting while one is written); its objects are named of its contents (its checksum, size,
+  first and last time), the archive, the hour and the part, so a file written again writes the same
+  objects over themselves. Each archive keeps its place (the last file all of whose objects are
+  written): one failing holds back no other. A file is begun with the archives as they are then and
+  kept to them while one of them is yet to write it: a change of searches, tags or order applies to
+  the files cut after it, and a file tried again splits into the same parts, those written (to the
+  destination as it is) not written again (`<observe>/archives.state.json`). An archive made begins
+  after the newest file held (Datadog's begins with what comes after it); one whose place was lost,
+  with the oldest. An install numbers the files anew; each place follows its file by its contents.
+- **When**: every 30 s, the files cut since: about a minute's records under load, and within 15
+  minutes of a record when they come slowly (§4.5), as Datadog's own archives come within minutes.
+- **Failing**: an upload is tried again on a 429 or 5xx (after its `Retry-After`, else 1 s
+  doubling; four tries); then the archive is `FAILING`, its error in the store's words, and is tried
+  again after a minute, doubling to 16. Its state (Datadog's `UNKNOWN`, `WORKING`, `FAILING`), what
+  it wrote and how many files it has yet to write are in the API; starting to fail, and recovering,
+  is an event once (`source:kiln.event @event.type:archive.write`). Files expire with the logs'
+  retention: an archive failing longer than that loses what expired unwritten.
+- **Counted**, by `archive`: `kiln.archives.events`, `.objects`, `.bytes` (gzip'd), `.failures`, and
+  `kiln.archives.pending` (files yet to write).
+
+Checked live (§13): three archives (Cloud Storage; Blob Storage, with tags; S3 in RustFS, which
+checks SigV4 by its own reading) each given every record it is the first to take, once, as Datadog
+writes them, and none of kiln's events; a store failing part way through a file, the server killed
+meanwhile and an archive made first in order: nothing lost, nothing written twice.
 
 ## 11. UI
 
@@ -3661,6 +3725,26 @@ Every count is waited for and then held three seconds more: one record twice wou
 found two faults since fixed: a fetch with no records was refused (a partition's least size read as
 34 bytes, not 30), and a stream that failed read again what it had offered (its offsets now outlive
 its connection). 2026-10-19: passes (128 s; the records come within 2.5 s of being sent).
+
+**Log archives** (`crates/kiln/tests/observe_archives.rs`; the first needs Docker): a kiln server
+writing to RustFS (1.0.3, an S3-compatible store in a container, which checks SigV4 by its own
+reading: the path as encoded, the payload's hash) and to Cloud Storage and Blob Storage stood in
+for, which take an object only with a token their token services gave for their scope or audience
+(a service account's assertion verified against its key; a client's secret). Archives in order:
+`status:error` to Cloud Storage (made as Datadog's API makes one, its integration's fields kept),
+`service:web` to Blob Storage with tags, the rest to S3; 600 records over three hours, and five of
+kiln's own events. Each record is in the first archive that takes it, exactly once, and none of
+kiln's events; every object is named as Datadog names them, in the folder of its events' hour, after
+its newest event's time; every event is its record's (`date`, the reserved attributes, `attributes`
+nested, tags only where asked, an `_id` of its time); each archive is `WORKING`, its events as the
+API and `kiln.archives.events` count them; nothing was compacted by hand (the store cut two seconds
+after the first record waited, `KILN_OBSERVE_CUT_AFTER_MS`). Then an S3 stood in for that lets one
+object through and fails the rest (S3's SlowDown): the second of three batches written in part, the
+archive `FAILING` with the store's 503 and an event saying so; an archive made and put first in
+order (as Datadog's API orders them); the server killed (SIGKILL), the store back, the server
+started again, a third batch: the first two batches' every record in the first archive, the
+third's in the second, each once, and no object written twice (the part written before the failure
+not written again). 2026-10-21: both pass (19 s and 29 s; macOS, arm64).
 
 **SLOs** (`observe_live.rs`): requests counted a minute for three hours ending at a five-minute
 edge, a thousandth failing but in the last 70 minutes, when half do, and a latency high then; a

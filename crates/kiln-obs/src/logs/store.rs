@@ -160,6 +160,12 @@ impl LogStore {
         self.spans
     }
 
+    /// Its files, oldest first (their numbers ascending): each a cut's, written once, never
+    /// rewritten (only expired whole).
+    pub fn files(&self) -> &[HeldFile] {
+        &self.files
+    }
+
     /// What it holds now, to read with no hold of it ([`LogSnapshot`]).
     pub fn snapshot(&self) -> LogSnapshot {
         LogSnapshot { head: self.head.clone(), sealed: self.sealed.clone(), files: self.files.iter().map(|f| Arc::clone(&f.log)).collect(), spans: self.spans }
