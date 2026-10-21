@@ -42,9 +42,18 @@ kiln-sim sync: seeds 0..=199 (200) in 41.20 s, 291 seeds/min on one thread, 1 fa
 
 | Model | What of kiln's it runs | Its nemesis | What it checks |
 | --- | --- | --- | --- |
-| sync | a synced repo's copies on two or three machines and the server's member: `sync::Copy`, `Feed` and `Index` as hyper-durable replicas, `sync::server::take_steps`, the runner's and server's shells; each copy on a simulated disk through `sync::fs` | frames lost and cut off on the sync lane (its order kept, as a QUIC stream keeps it), contents' transfers lost; runners and the server crashing; power losses; a crash at a chosen write; fsync and write errors; full disks; people editing all the while, a file's size often kept | nothing spreads that nobody wrote; every copy converges on the log's repo; no one's last write is lost |
+| sync | a synced repo's copies on two or three machines and the server's member: `sync::Copy`, `Feed` and `Index` as hyper-durable replicas, `sync::server::take_steps`, the runner's and server's shells; each copy on a simulated disk through `sync::fs` | frames lost and cut off on the sync lane (its order kept, as a QUIC stream keeps it); contents' requests lost, and in some seeds sent twice and overtaking one another (a client trying again), their answers lost; runners and the server crashing; power losses; a crash at a chosen write; fsync and write errors; full disks; people editing all the while, a file's size often kept | nothing spreads that nobody wrote; every copy converges on the log's repo; no one's last write is lost |
 | moves | the same, with an agent session moving between the machines: `sync::runner`'s `look_now_at`, `left_at` and `arrived`, as `harness::session`'s `files_out` and `files_in` use them | the sync model's | a session leaves no write of its own behind, goes on with each in its folder, and every move finishes |
 | goal driver | `goals`' `adopt` and `step` as the driver's loop runs them, on a simulated clock, through `SimHarness`, its store inline (a crash at each of its waits) | the server crashing at any wait; machines away; harnesses starting again; usage limits; people clearing goals | one goal under way, in order, ended ones never back; nothing to a paused agent; no goal again within 30 s unless the agent was cut off from it; every stack runs to its end |
+
+Not modelled yet, and where they will be:
+
+- **Sends:** Sends T3's own deterministic simulation (`harness/inbox/sim.rs`, with the network nemesis) moves
+  onto kiln-sim once both are on main.
+- **The harness host's record:** CP-T3.1 replaces the host's JSON file with a journal on `Records`; its
+  crash test (a crash at every write) runs on `kiln_sim::records::Crashing`. Today's host runs its
+  sessions' tasks on kiln's runtime and real harness processes, which a seed can't replay; the goal
+  driver's model drives the host's side of the `HarnessPort` seam (agents restarting, away, paused).
 
 ## The bugs it found
 

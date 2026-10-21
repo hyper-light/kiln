@@ -254,13 +254,17 @@ impl Counts {
     }
 }
 
-/// What the model is asked to run: a seed, and the bugs planted in a test build (none for kiln's
-/// own).
+/// What the model is asked to run besides its seed: the bugs planted in a test build (none for
+/// kiln's own), and how it runs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Plant {
     /// Copies' saved state written in place, not to a temporary file renamed over it, nor fsynced:
     /// a power loss tears it, and the write it held is lost (T-T6.1.1's planted bug).
     pub state_in_place: bool,
+    /// Each contents request sent once, never tried again by its client, as the model ran when the
+    /// first bugs were found: their seeds replay the runs that found them. Else a seed draws whether
+    /// its requests may be sent twice, and overtake one another.
+    pub requests_once: bool,
 }
 
 struct Sim {
@@ -282,6 +286,9 @@ struct Sim {
     /// What the server's member took, by log index (taken again as its log replays: the same).
     history: BTreeMap<u64, (Step, Vec<Decision>)>,
     session: Option<Session>,
+    /// Contents requests may be sent twice (a client trying again) and overtake one another: on a
+    /// network of their own, so the rest of a seed's draws are as they were without it.
+    retried: Option<Net>,
 }
 
 fn node(w: Who) -> Node {
@@ -320,6 +327,8 @@ impl Sim {
         let mut netr = rng.stream("net");
         let faults = Faults::draw(&mut netr, Duration::from_millis(5), Duration::from_millis(400), until);
         let net = Net::new(faults, netr);
+        let mut retries = rng.stream("retries");
+        let retried = (!plant.requests_once && retries.chance(500)).then(|| Net::new(faults, retries));
         let n = usize::try_from(rng.range(2, 3)).unwrap_or(2);
         let mut machines = Vec::new();
         for i in 0..n {
@@ -364,6 +373,7 @@ impl Sim {
             plant,
             history: BTreeMap::new(),
             session: (mode == Mode::Moves).then(|| Session { at: 0, leg: Leg::Working, wrote: BTreeMap::new(), edits: 0 }),
+            retried,
             rng,
         };
         // Some folders hold files before they sync; then every copy starts.
@@ -1049,9 +1059,11 @@ impl Sim {
     /// moving): lost or late, never twice.
     fn send(&mut self, from: Who, to: Who, frame: Frame) {
         let now = self.now();
-        let fate = match frame {
-            Frame::Raft(_) | Frame::Steps(_) | Frame::Want(_) => self.net.send_in_order(now, node(from), node(to), LANE_SYNC),
-            Frame::Put { .. } | Frame::Putted { .. } | Frame::Get { .. } | Frame::Got { .. } => self.net.send_once(now, node(from), node(to)),
+        let fate = match (&frame, self.retried.as_mut()) {
+            (Frame::Raft(_) | Frame::Steps(_) | Frame::Want(_), _) => self.net.send_in_order(now, node(from), node(to), LANE_SYNC),
+            // A request a client may send again, overtaking others; each copy answered once.
+            (Frame::Put { .. } | Frame::Get { .. }, Some(retried)) => retried.send(now, node(from), node(to)),
+            (Frame::Put { .. } | Frame::Putted { .. } | Frame::Get { .. } | Frame::Got { .. }, _) => self.net.send_once(now, node(from), node(to)),
         };
         for at in fate.arrivals() {
             self.queue.push(at, Ev::Arrive { to, from, frame: frame.clone() });
@@ -1229,6 +1241,9 @@ impl Sim {
 
     fn finish(&mut self) {
         self.counts.net = self.net.counts();
+        if let Some(retried) = &self.retried {
+            self.counts.net.add(&retried.counts());
+        }
         for mc in &self.machines {
             self.counts.disk.add(&mc.disk.counts());
         }
@@ -1301,6 +1316,9 @@ mod tests {
 
     use super::*;
 
+    /// The model as the bugs' seeds found them (each request sent once): they replay those runs.
+    const ONCE: Plant = Plant { state_in_place: false, requests_once: true };
+
     /// CP-T6.1, AC-T6.1.1: the sync model over the seed budget (200 seeds on every change
     /// request; nightly sets `KILN_SIM_SEEDS` and `KILN_SIM_FROM`): every copy converges, nothing
     /// spreads that nobody wrote, no one's last write is lost; and every fault happened.
@@ -1328,6 +1346,7 @@ mod tests {
                 ("contents fetched", all.fetched),
                 ("frames lost", all.net.dropped),
                 ("steps sent again", all.again),
+                ("requests doubled", all.net.duplicated),
                 ("frames cut off", all.net.cut),
                 ("files torn", all.disk.torn),
                 ("fsync errors", all.disk.fsync_errors),
@@ -1358,10 +1377,10 @@ mod tests {
     #[test]
     fn the_seeds_where_a_power_loss_tore_a_file_sync_had_written_converge() -> Result<(), String> {
         for seed in [3, 163] {
-            run(seed, 0, Plant::default(), Mode::Sync)?;
+            run(seed, 0, ONCE, Mode::Sync)?;
         }
         for seed in [57, 90] {
-            run(seed, 0, Plant::default(), Mode::Moves)?;
+            run(seed, 0, ONCE, Mode::Moves)?;
         }
         Ok(())
     }
@@ -1402,10 +1421,10 @@ mod tests {
     #[test]
     fn the_seeds_where_a_write_failed_part_way_through_a_step_converge() -> Result<(), String> {
         for seed in [184, 125] {
-            run(seed, 0, Plant::default(), Mode::Sync)?;
+            run(seed, 0, ONCE, Mode::Sync)?;
         }
         for seed in [136, 170] {
-            run(seed, 0, Plant::default(), Mode::Moves)?;
+            run(seed, 0, ONCE, Mode::Moves)?;
         }
         Ok(())
     }
@@ -1452,8 +1471,8 @@ mod tests {
     /// kept bytes the log never had, and proposed stale ones over a conflict's (sync seed 1848).
     #[test]
     fn the_seeds_where_a_change_kept_its_file_s_size_and_time_converge() -> Result<(), String> {
-        run(1848, 0, Plant::default(), Mode::Sync)?;
-        run(2000, 0, Plant::default(), Mode::Moves)?;
+        run(1848, 0, ONCE, Mode::Sync)?;
+        run(2000, 0, ONCE, Mode::Moves)?;
         Ok(())
     }
 
@@ -1466,7 +1485,7 @@ mod tests {
     #[test]
     fn the_seeds_where_a_step_went_out_before_it_was_saved_converge() -> Result<(), String> {
         for seed in [3174, 3083] {
-            run(seed, 0, Plant::default(), Mode::Moves)?;
+            run(seed, 0, ONCE, Mode::Moves)?;
         }
         Ok(())
     }
@@ -1512,7 +1531,7 @@ mod tests {
     /// log held, for good (sync seed 1331).
     #[test]
     fn the_seed_where_a_kept_back_version_never_came_converges() -> Result<(), String> {
-        run(1331, 0, Plant::default(), Mode::Sync).map(|_| ())
+        run(1331, 0, ONCE, Mode::Sync).map(|_| ())
     }
 
     /// CP-T6.1, the fifth bug's contract: a version a step brought, kept back while the file was
@@ -1566,7 +1585,7 @@ mod tests {
     #[test]
     fn the_planted_lost_write_after_a_torn_page_is_found() -> Result<(), String> {
         for seed in 0..200 {
-            if run(seed, 0, Plant { state_in_place: true }, Mode::Sync).is_err() {
+            if run(seed, 0, Plant { state_in_place: true, ..Plant::default() }, Mode::Sync).is_err() {
                 return Ok(());
             }
         }
