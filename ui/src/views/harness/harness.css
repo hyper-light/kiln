@@ -781,10 +781,6 @@ textarea.hx-input {
   border-radius: 14px 14px 14px 4px;
   background: #0f1013;
 }
-.hx-prompt[data-origin]:not([data-origin="human"]) {
-  border-style: dashed;
-  background: transparent;
-}
 .hx-prompt-meta {
   display: flex;
   align-items: center;
@@ -1768,6 +1764,49 @@ textarea.hx-input {
   align-items: center;
   gap: 6px;
   color: #b4b5ba;
+}
+/* No change request yet: what it is on one line; below it, under the words, the option and then
+   the action at the end (on a line of its own when both don't fit). With room, one line. */
+.hx-change-new {
+  display: block;
+  padding: 10px 10px 10px 12px;
+  container-type: inline-size;
+}
+.hx-change-grid {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  grid-template-areas:
+    "icon what"
+    ". do";
+  align-items: center;
+  gap: 10px;
+}
+.hx-change-icon {
+  grid-area: icon;
+}
+.hx-change-grid > .hx-change-what {
+  grid-area: what;
+  min-width: 0;
+}
+.hx-change-do {
+  display: flex;
+  flex-wrap: wrap;
+  grid-area: do;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  min-width: 0;
+}
+@container (min-width: 600px) {
+  .hx-change-grid {
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    grid-template-areas: "icon what do";
+    column-gap: 14px;
+  }
+  .hx-change-do {
+    flex-wrap: nowrap;
+    gap: 14px;
+  }
 }
 .hx-files {
   display: flex;
@@ -3157,10 +3196,6 @@ textarea.hx-input {
   border: 0;
   border-radius: 0;
   background: none;
-}
-.hx-prompt[data-origin]:not([data-origin="human"]) {
-  border: 0;
-  opacity: 0.8;
 }
 .hx-prompt-meta .hx-eyebrow {
   color: #cbc3ea;

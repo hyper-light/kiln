@@ -70,12 +70,16 @@
   justify-content: center;
   gap: 14px;
 }
-.ag-loading .sg-trace {
+.ag-loading .sg-beam {
   width: 44px;
   height: 44px;
 }
 .ag-loading .sg-trace path {
   stroke-width: 1.1;
+}
+/* Match the loader's thin outline; both layers now grow with the beam's wrapper. */
+.ag-loading .sg-trace-glow {
+  --sg-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='none' stroke='%23000' stroke-width='1.1' stroke-linecap='round'%3E%3Cpath d='M6.4 22.5C2.4 17.1 7.1 6.2 14 4.5C21.4 2.7 27.4 10.1 25.1 16.5C22.8 22.9 13.1 28.8 8.8 26.6'/%3E%3Cpath d='M8.8 26.6C6.9 25.6 5.6 23.6 5.2 21.3'/%3E%3C/svg%3E");
 }
 :root[data-motion="paused"] .ag-ready {
   animation: none;
@@ -772,9 +776,6 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   height: 1px;
   background: linear-gradient(90deg, transparent, #a7aed070, #b9a6c560, transparent);
   content: "";
-}
-.hx-turn .hx-prompt[data-origin]:not([data-origin="human"]) {
-  background: #0d0d10;
 }
 .hx-turn .hx-prompt-text {
   font-size: 15px;

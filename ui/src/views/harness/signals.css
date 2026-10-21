@@ -128,6 +128,20 @@
   letter-spacing: 0.02em;
   text-transform: none;
 }
+/* While it thinks, the prism sweeps through its words: the holographic shimmer. One line per
+   conversation, so its repaint stays cheap; other live labels only breathe. */
+.sg-thinking-line .sg-label[data-live="true"] {
+  background-size: 250% 100%;
+  animation: sg-prism-current 6s ease-in-out infinite alternate;
+}
+@keyframes sg-prism-current {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
 .sg-think-head {
   position: relative;
   margin: 0;
@@ -192,7 +206,7 @@
 
 /* ------------------------------------------------------------ trace (a tool call's state) */
 
-/* hyperlight's mark, drawn small. A fixed 14px square, so settling never shifts the row. */
+/* hyperlight's mark, drawn small. The outline and running light share the wrapper's size. */
 .sg-beam {
   position: relative;
   display: inline-grid;
@@ -203,8 +217,8 @@
 }
 .sg-trace {
   grid-area: 1 / 1;
-  width: 14px;
-  height: 14px;
+  width: 100%;
+  height: 100%;
   overflow: visible;
   fill: none;
   stroke-linecap: round;
@@ -238,8 +252,8 @@
   position: relative;
   grid-area: 1 / 1;
   overflow: hidden;
-  width: 14px;
-  height: 14px;
+  width: 100%;
+  height: 100%;
   -webkit-mask: var(--sg-mark) center / 100% 100% no-repeat;
   mask: var(--sg-mark) center / 100% 100% no-repeat;
   --sg-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='none' stroke='%23000' stroke-width='3.2' stroke-linecap='round'%3E%3Cpath d='M6.4 22.5C2.4 17.1 7.1 6.2 14 4.5C21.4 2.7 27.4 10.1 25.1 16.5C22.8 22.9 13.1 28.8 8.8 26.6'/%3E%3Cpath d='M8.8 26.6C6.9 25.6 5.6 23.6 5.2 21.3'/%3E%3C/svg%3E");
@@ -348,6 +362,8 @@
 :root[data-motion="paused"] .sg-label,
 :root[data-motion="paused"] .sg-think::before,
 :root[data-motion="paused"] .sg-trace path,
+:root[data-motion="paused"] .sg-beam,
+:root[data-motion="paused"] .sg-trace-glow > span,
 :root[data-motion="paused"] .sg-caret {
   animation-play-state: paused;
 }
