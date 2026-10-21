@@ -2182,7 +2182,10 @@ reusing the results of jobs whose inputs have not changed.
   limit). `kiln store verify` re-hashes; `kiln store gc` collects.
 - **W08-R02 Remote backend** (opt-in): `[ci.store] s3 = { endpoint, bucket, region,
   credentials }` keeps chunks in any S3-compatible store (SigV4 signing implemented in kiln's HTTP
-  client), with the local directory as a cache.
+  client), with the local directory as a cache. Built otherwise (CP-T10.1, docs/blobs.md): the
+  content-addressed store's objects are keys at `cas/<digest>` in kiln's store of bytes, the local
+  store by default (this layout) or any S3-compatible one (`[blobs] store = "s3"`, `[blobs.s3]`),
+  with no local cache.
 
 **Requirements: GitHub's services**
 

@@ -45,7 +45,10 @@ For each agent session (kiln's id):
   the agent has ended. Each store lets go by its own clock, a few thousand lines at a time while
   it has nothing else to do, and writes no drop, so no feed carries it: the server's store keeps
   them as long as `[conversations] keep_closed_days` says, runners and mirrors the 30 days.
-  Claude Code keeps its own transcripts 30 days by default too.
+  Claude Code keeps its own transcripts 30 days by default too. On the server, a transcript is also
+  archived in kiln's store of bytes once its agent ends (docs/blobs.md, `transcripts/`), and the
+  store lets no record go before that: it holds back every session that ended since the oldest
+  close not archived yet.
 - **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
