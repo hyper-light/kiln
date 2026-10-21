@@ -134,6 +134,10 @@ enum Run {
 /// and when the CLI reports a rate-limit change).
 const USAGE_EVERY_MS: i64 = 180_000;
 
+/// A background task that started this recently may not be in the list of live ones yet (the
+/// list and a task's own start come in either order).
+const LEVEL_GRACE_MS: i64 = 5_000;
+
 /// The effort levels Claude Code knows (its settings schema), offered until initialize says which
 /// the model in use has, and for a model it does not list.
 pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -2074,8 +2078,21 @@ impl Claude {
                 }
             }
             // Every live background task (replace semantics): ones kiln missed (before a restart,
-            // or a dropped line) join.
+            // or a dropped line) join, and ones it shows in the background that aren't among them
+            // have ended though their end never came ("a missed bookend cannot wedge a stale
+            // running indicator", as Claude Code describes it).
             "background_tasks_changed" => {
+                let listed: std::collections::HashSet<&str> = v.get("tasks").and_then(Value::as_array).into_iter().flatten().filter_map(|b| str_of(b, "task_id")).collect();
+                let now = Core::now();
+                // The list has every running task but a foreground one: what kiln shows left
+                // running (background work, shells, monitors) and the list doesn't have, ended.
+                for t in core.state.tasks.iter_mut().filter(|t| t.left_running() && !listed.contains(t.id.as_str()) && !t.id.starts_with(super::survivors::LEFT)) {
+                    // One just started may come before the list it joins.
+                    if now - t.started >= LEVEL_GRACE_MS {
+                        t.status = "completed".into();
+                        t.ended.get_or_insert(now);
+                    }
+                }
                 for b in v.get("tasks").and_then(Value::as_array).into_iter().flatten() {
                     let Some(id) = str_of(b, "task_id") else { continue };
                     match core.state.tasks.iter_mut().find(|t| t.id == id) {
@@ -3266,15 +3283,10 @@ fn prune_delivery(core: &mut Core) {
     }
 }
 
+/// The oldest finished tasks go beyond those a state keeps (never a paused one: it's live).
 fn prune_tasks(core: &mut Core) {
-    const KEEP: usize = 200;
-    while core.state.tasks.len() > KEEP {
-        match core.state.tasks.iter().position(|t| t.status != "running" && t.status != "pending") {
-            Some(i) => {
-                core.state.tasks.remove(i);
-            }
-            None => break,
-        }
+    for id in super::core::bound_tasks(&mut core.state.tasks) {
+        core.task_output.remove(&id);
     }
 }
 
@@ -4995,5 +5007,47 @@ mod tests {
         c.exited(&mut core, Some(0), None);
         assert!(core.state.tasks.iter().all(|t| !t.live()));
         Ok(())
+    }
+
+    /// Claude Code's `background_tasks_changed` is the level ("every live background task after the
+    /// change; REPLACE semantics"), so a missed end can't leave one shown running for ever.
+    #[test]
+    fn a_background_task_whose_end_never_came_ends_once_the_live_list_leaves_it_out() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let started = |id: &str, kind: &str, background: bool| {
+            json!({"type": "system", "subtype": "task_started", "task_id": id, "description": id, "task_type": kind, "is_backgrounded": background, "uuid": "u", "session_id": "s"}).to_string()
+        };
+        let level = |ids: &[&str]| {
+            let tasks: Vec<Value> = ids.iter().map(|id| json!({"task_id": id, "task_type": "local_bash", "description": id})).collect();
+            json!({"type": "system", "subtype": "background_tasks_changed", "tasks": tasks, "uuid": "u", "session_id": "s"}).to_string()
+        };
+        c.line(&mut core, &started("b1", "local_bash", true));
+        c.line(&mut core, &started("b2", "local_bash", true));
+        c.line(&mut core, &started("a1", "local_agent", false));
+        // A command task whose start says nothing of the background (as a monitor's doesn't) is
+        // listed while it runs all the same.
+        let monitor = json!({"type": "system", "subtype": "task_started", "task_id": "m1", "description": "errors", "task_type": "local_bash", "uuid": "u", "session_id": "s"});
+        c.line(&mut core, &monitor.to_string());
+        for t in &mut core.state.tasks {
+            t.started -= 60_000;
+        }
+        // b1's and m1's ends never reached kiln (a dropped line); a1 works in the foreground,
+        // never listed.
+        c.line(&mut core, &level(&["b2"]));
+        let status = |core: &Core, id: &str| core.state.tasks.iter().find(|t| t.id == id).map(|t| (t.status.clone(), t.ended.is_some()));
+        assert_eq!(status(&core, "b1"), Some(("completed".to_owned(), true)));
+        assert_eq!(status(&core, "m1"), Some(("completed".to_owned(), true)));
+        assert_eq!(status(&core, "b2"), Some(("running".to_owned(), false)));
+        assert_eq!(status(&core, "a1"), Some(("running".to_owned(), false)));
+        // Its end, late after all, still says how it ended.
+        let end = json!({"type": "system", "subtype": "task_notification", "task_id": "b1", "status": "failed", "summary": "b1 failed with exit code 1", "uuid": "u", "session_id": "s"});
+        c.line(&mut core, &end.to_string());
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "b1").map(|t| (t.status.as_str(), t.exit_code)), Some(("failed", Some(1))));
+        // One just started can come before the list that has it.
+        c.line(&mut core, &started("b3", "local_bash", true));
+        c.line(&mut core, &level(&["b2"]));
+        assert_eq!(status(&core, "b3"), Some(("running".to_owned(), false)));
     }
 }

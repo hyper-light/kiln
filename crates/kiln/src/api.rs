@@ -3731,7 +3731,7 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     Ok(srv::json(StatusCode::OK, &s))
 }
 
-/// Start, pause, skip or clear an agent's goal stack.
+/// Start, pause, skip, clear or restore an agent's goal stack.
 async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
     let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
     may_steer_goals(hub, caller, id)?;
@@ -3855,7 +3855,7 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
 
 /// Who a broadcast to `to` would reach (the same picking as the broadcast itself), the machines
 /// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts)
-/// merged, each entry with `count`, how many of them have it.
+/// merged, each entry with `count`, how many of them have it, and `agents`, which.
 async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     #[derive(serde::Deserialize)]
     struct Body {
@@ -3864,8 +3864,8 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let picked = crate::harness::broadcast::pick(&hub.harness.list(), &b.to);
     let mut machines: Vec<String> = Vec::new();
-    // (field in each agent's meta, the key naming an entry, the entries seen with their counts)
-    let mut merged: [(&str, &str, Vec<(serde_json::Value, usize)>); 4] =
+    // (field in each agent's meta, the key naming an entry, the entries seen with the agents that have them)
+    let mut merged: [(&str, &str, Vec<(serde_json::Value, Vec<String>)>); 4] =
         [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new())];
     for info in &picked {
         let machine = info.target.strip_prefix("agent:").unwrap_or(&info.target).to_owned();
@@ -3877,17 +3877,18 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
             for entry in meta.get(*field).and_then(serde_json::Value::as_array).into_iter().flatten() {
                 let Some(name) = entry.get(*key).and_then(serde_json::Value::as_str) else { continue };
                 match seen.iter_mut().find(|(v, _)| v.get(*key).and_then(serde_json::Value::as_str) == Some(name)) {
-                    Some((_, n)) => *n += 1,
-                    None => seen.push((entry.clone(), 1)),
+                    Some((_, ids)) => ids.push(info.id.clone()),
+                    None => seen.push((entry.clone(), vec![info.id.clone()])),
                 }
             }
         }
     }
-    let counted = |seen: Vec<(serde_json::Value, usize)>| -> Vec<serde_json::Value> {
+    let counted = |seen: Vec<(serde_json::Value, Vec<String>)>| -> Vec<serde_json::Value> {
         seen.into_iter()
-            .map(|(mut v, n)| {
+            .map(|(mut v, ids)| {
                 if let Some(o) = v.as_object_mut() {
-                    o.insert("count".into(), json!(n));
+                    o.insert("count".into(), json!(ids.len()));
+                    o.insert("agents".into(), json!(ids));
                 }
                 v
             })

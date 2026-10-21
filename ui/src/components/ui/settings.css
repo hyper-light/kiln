@@ -78,7 +78,9 @@
 .st-search > svg {
   flex: none;
 }
+/* Its own clear button only: Safari keeps drawing its native one under `appearance: none`. */
 .st-search input::-webkit-search-cancel-button {
+  display: none;
   appearance: none;
 }
 .st-search-clear {

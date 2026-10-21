@@ -1262,4 +1262,64 @@ mod tests {
             Ok(())
         })
     }
+
+    /// Ending an agent while its harness runs (and while it's down): the last state it sends
+    /// before it closes, what the ended agent shows, has nothing still running.
+    #[cfg(unix)]
+    #[test]
+    fn an_ended_agents_last_state_has_its_tasks_stopped() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        use super::super::model::Task;
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            // A harness that runs and says nothing.
+            let quiet = dir.path().join("quiet-claude");
+            std::fs::write(&quiet, "#!/bin/sh\nexec sleep 30\n")?;
+            std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755))?;
+            for (id, program) in [("running", quiet.clone()), ("down", dir.path().join("no-such-claude"))] {
+                let (tx, rx) = async_channel::unbounded();
+                let host = Host::new(tx, None, Limits::default());
+                let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+                let s = host.open(Some(id.into()), spec)?;
+                // Its harness running (and its adapter started), or down (it could not start). One
+                // lock at a time.
+                let ready = |s: &Session| {
+                    if id == "down" {
+                        return s.core.lock().state.status == Status::Exited;
+                    }
+                    let spawned = s.pid.lock().is_some();
+                    spawned && !s.core.lock().meta.features.is_empty()
+                };
+                let started = crate::rt::timeout(Duration::from_secs(10), async {
+                    while !ready(&s) {
+                        crate::rt::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await;
+                anyhow::ensure!(started.is_ok(), "{id}: the session never got going");
+                {
+                    let mut core = s.core.lock();
+                    core.state.tasks.push(Task { id: "b7".into(), class: Some("shell".into()), status: "running".into(), background: true, stoppable: true, ..Task::default() });
+                    core.touch_state();
+                }
+                assert!(host.close(id));
+                let last = crate::rt::timeout(Duration::from_secs(20), async {
+                    let mut last = None;
+                    while let Ok((_, u)) = rx.recv().await {
+                        match u {
+                            Update::State { state } => last = Some(state),
+                            Update::Closed => return Some(last),
+                            _ => {}
+                        }
+                    }
+                    None
+                })
+                .await;
+                let state = last.ok().flatten().flatten().ok_or_else(|| anyhow::anyhow!("{id}: never closed, or no state before it"))?;
+                assert!(state.tasks.iter().any(|t| t.id == "b7") && state.tasks.iter().all(|t| !t.live()), "{id}: {:?}", state.tasks);
+            }
+            Ok(())
+        })
+    }
 }

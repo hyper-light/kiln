@@ -97,6 +97,19 @@
     font: inherit;
     color: inherit;
   }
+  /* A native list draws its own menu: on Windows in its options' colours, else in the system's
+     white under the light text a select inherits here. Every one in kiln's dark. */
+  select {
+    color-scheme: dark;
+  }
+  option,
+  optgroup {
+    background-color: #131417;
+    color: #e3e4e9;
+  }
+  option:disabled {
+    color: #6f7380;
+  }
   button {
     cursor: pointer;
     background: none;
@@ -522,6 +535,60 @@ html.fills-window body {
   margin-bottom: 10px;
   color: #92959f;
   font-size: 9px;
+}
+/* A heading that folds its section: its title is the button, and the whole heading answers it. */
+.section-fold {
+  position: relative;
+}
+.section-fold:not([data-open]) {
+  margin-bottom: 0;
+}
+.section-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: inherit;
+  text-align: left;
+}
+.section-toggle::after {
+  position: absolute;
+  inset: -6px 0;
+  content: "";
+}
+.section-fold .section-aside {
+  position: relative;
+  z-index: 1;
+}
+.section-chev {
+  flex: none;
+  color: #6f7380;
+  transition:
+    transform 0.2s var(--ease),
+    color 0.2s;
+}
+.section-fold:not([data-open]) .section-chev {
+  transform: rotate(-90deg);
+}
+.section-fold:hover .section-chev,
+.section-toggle:focus-visible .section-chev {
+  color: #ededee;
+}
+.section-toggle:focus-visible {
+  outline: 2px solid rgb(165 160 191 / 35%);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+/* What a section is, in a line under its heading. */
+.section-lead {
+  margin: -6px 0 14px;
+  color: #8f939e;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+@media (prefers-reduced-motion: reduce) {
+  .section-chev {
+    transition: none;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -974,7 +1041,9 @@ html.fills-window body {
 .field textarea::placeholder {
   color: #6f7380;
 }
+/* Its own clear button only: Safari keeps drawing its native one under `appearance: none`. */
 .field input::-webkit-search-cancel-button {
+  display: none;
   appearance: none;
 }
 .field-label {
@@ -1610,7 +1679,50 @@ html.fills-window body {
   }
 }
 
-/* Command palette */
+/* Command palette: a modal over the page, near its top (on a phone, clear of the keyboard). */
+.palette-dialog {
+  width: min(720px, calc(100% - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 20vh);
+  margin: 10vh auto auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid #2a3039;
+  border-radius: 12px;
+  background: #0b0c0f;
+  color: inherit;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 55%);
+}
+.palette-dialog[open] {
+  animation: palette-in 0.14s ease-out;
+}
+.palette-dialog::backdrop {
+  background: rgb(4 5 6 / 62%);
+}
+.palette-dialog .palette-inner {
+  width: 100%;
+}
+@keyframes palette-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+@media (max-width: 640px) {
+  .palette-dialog {
+    width: calc(100% - 24px);
+    max-height: calc(100dvh - 24px);
+    margin-top: 12px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .palette-dialog[open] {
+    animation: none;
+  }
+}
+:root[data-motion="paused"] .palette-dialog[open] {
+  animation: none;
+}
 .cmdk-input {
   width: 100%;
   min-height: 52px;
@@ -2908,3 +3020,27 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   background: #08090a;
 }
 
+
+/* A log's tools above it: its filter, how many lines, its download. */
+.log-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 14px;
+}
+.log-count {
+  flex: none;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+@media (max-width: 639px) {
+  .log-tools {
+    flex-wrap: wrap;
+  }
+  .log-tools > :first-child {
+    flex-basis: 100%;
+  }
+}
