@@ -1,8 +1,18 @@
 //! `Blobs`: bytes, with S3's semantics (CP-T10.1): put; get, with byte ranges; head, list and
 //! delete; conditional writes (`If-None-Match: *`, `If-Match`); multipart; checksums; presigned
-//! URLs. Its real implementations are kiln's CAS, any S3, and Mantle (CP-T10.1 grows the suite past
-//! 150 cases); [`SimBlobs`] keeps objects in memory, its presigned URLs signed and timed by its
-//! clock. An object's etag is its content's SHA-256, however it was uploaded.
+//! URLs. Its real implementations are kiln's: the local store (kiln's content-addressed store, its
+//! data where it was), any S3, and Mantle once it's vendored (CP-T10.2); [`SimBlobs`] keeps objects
+//! in memory, its presigned URLs signed and timed by its clock. An object's etag is its content's
+//! SHA-256, however it was uploaded.
+//!
+//! What every implementation takes is checked by the functions here ([`check_key`],
+//! [`check_sha256`], [`byte_range`], [`check_parts`], [`lifetime_secs`] and the rest), so a key,
+//! a range or a lifetime one store takes, every store takes. The keys are narrower than S3's: they
+//! hold no control characters and no backslash, and their `/`-separated segments are 1 to 255
+//! bytes, none `.` or `..`, so they're the same keys on every S3 (MinIO keeps a key's segments as
+//! file names) and on every platform.
+
+mod suite;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -12,16 +22,30 @@ use futures::future::BoxFuture;
 use parking_lot::Mutex;
 
 use crate::clock::{Clock, SimClock};
-use crate::conformance::{Case, Failure, ensure, fine, refused, same};
 use crate::sha256_hex;
 
-/// An object as stored.
+pub use suite::{cases, noise};
+
+/// An object as stored: what a put answers, and head and get say.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Meta {
     pub key: String,
     pub size: u64,
-    /// Its content's SHA-256, hex: what `If-Match` compares.
+    /// Its content's SHA-256, 64 lowercase hex digits: what `If-Match` compares.
     pub etag: String,
+    /// When the store last wrote it: milliseconds since the Unix epoch, by the store's clock and to
+    /// its resolution (an S3's is a whole second). Head, get and list say the same; a put's answer
+    /// says when the store acknowledged it, as near as the store tells.
+    pub modified_ms: i64,
+}
+
+/// An object as a listing names it. A listing says no etag: an S3's listing names objects by its
+/// own ETags (MD5s, or digests of parts), which aren't the content's SHA-256; head says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub key: String,
+    pub size: u64,
+    /// As head says it.
     pub modified_ms: i64,
 }
 
@@ -40,7 +64,7 @@ pub enum Cond {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Put {
     pub cond: Cond,
-    /// The content's SHA-256 (hex), checked before anything is stored.
+    /// The content's SHA-256 (hex, either case), checked before anything is stored.
     pub sha256: Option<String>,
 }
 
@@ -54,7 +78,7 @@ pub struct Range {
 /// A page of a listing, in key order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
-    pub objects: Vec<Meta>,
+    pub objects: Vec<Listed>,
     /// More keys follow the last one.
     pub truncated: bool,
 }
@@ -111,12 +135,17 @@ pub trait Blobs: Send + Sync + 'static {
     /// Joins the parts named (ascending, each with its etag) into the object.
     fn complete_upload<'a>(&'a self, upload: &'a str, parts: Vec<(u32, String)>) -> BoxFuture<'a, Result<Meta, Refusal>>;
     fn abort_upload<'a>(&'a self, upload: &'a str) -> BoxFuture<'a, Result<(), Refusal>>;
-    /// A URL that lets its holder get or put `key` until `expires` from now (at most 7 days).
+    /// A URL that lets its holder get or put `key` until `expires` from now (rounded up to a whole
+    /// second, at most 7 days).
     fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>>;
 }
 
-/// Longest key, in bytes (S3's).
-pub const KEY_MAX: usize = 1024;
+/// Longest key, in bytes: S3's 1024, less 64 a store may put before a key (an S3 store's prefix
+/// in its bucket), so a key one store takes, every store takes.
+pub const KEY_MAX: usize = 960;
+/// Longest segment of a key between `/`s, in bytes (a file name's, where a store keeps keys as
+/// paths: MinIO does).
+pub const SEGMENT_MAX: usize = 255;
 /// Most keys a listing gives (S3's).
 pub const LIST_MAX: usize = 1000;
 /// Part numbers run 1 to this (S3's).
@@ -126,11 +155,144 @@ pub const PART_MIN: usize = 5 << 20;
 /// The longest a presigned URL lasts (S3's).
 pub const PRESIGN_MAX: Duration = Duration::from_secs(7 * 24 * 3600);
 
-fn check_key(key: &str) -> Result<(), Refusal> {
-    if key.is_empty() || key.len() > KEY_MAX || key.contains('\0') {
-        return Err(Refusal::Invalid { what: "a key", why: format!("1 to {KEY_MAX} bytes of UTF-8, no NUL ({} bytes)", key.len()) });
+/// Whether a store takes `key`: 1 to [`KEY_MAX`] bytes of UTF-8 with no control character and no
+/// backslash, its `/`-separated segments each 1 to [`SEGMENT_MAX`] bytes and none `.` or `..` (so
+/// no leading, trailing or doubled `/`).
+pub fn check_key(key: &str) -> Result<(), Refusal> {
+    let bad = |why: String| Err(Refusal::Invalid { what: "a key", why });
+    if key.is_empty() || key.len() > KEY_MAX {
+        return bad(format!("it's {} bytes: a key is 1 to {KEY_MAX}", key.len()));
+    }
+    if let Some(c) = key.chars().find(|c| c.is_control() || *c == '\\') {
+        return bad(format!("it holds {c:?}: a key holds no control characters and no backslash"));
+    }
+    for segment in key.split('/') {
+        if segment.is_empty() {
+            return bad("it has an empty segment: no leading, trailing or doubled '/'".into());
+        }
+        if segment.len() > SEGMENT_MAX {
+            return bad(format!("a segment is {} bytes: each is 1 to {SEGMENT_MAX}", segment.len()));
+        }
+        if segment == "." || segment == ".." {
+            return bad(format!("it has a {segment:?} segment"));
+        }
     }
     Ok(())
+}
+
+/// Whether `sha` is a SHA-256 as a put names its content's: 64 hex digits, either case.
+pub fn check_sha256(sha: &str) -> Result<(), Refusal> {
+    if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(Refusal::Invalid { what: "a SHA-256", why: format!("{sha:?} isn't 64 hex digits") })
+    }
+}
+
+/// Checks a put's checksum against its content: `Invalid` for one that isn't a SHA-256,
+/// `BadChecksum` for one the content doesn't have.
+pub fn check_content(put: &Put, bytes: &[u8]) -> Result<(), Refusal> {
+    let Some(want) = &put.sha256 else { return Ok(()) };
+    check_sha256(want)?;
+    let got = sha256_hex(bytes);
+    if got.eq_ignore_ascii_case(want) { Ok(()) } else { Err(Refusal::BadChecksum { want: want.clone(), got }) }
+}
+
+/// Whether a put's condition holds against what's at its key (`None`: nothing).
+pub fn holds(cond: &Cond, key: &str, current: Option<&str>) -> Result<(), Refusal> {
+    match (cond, current) {
+        (Cond::Always, _) | (Cond::IfNoneMatch, None) => Ok(()),
+        (Cond::IfMatch(want), Some(etag)) if want == etag => Ok(()),
+        _ => Err(Refusal::PreconditionFailed(key.to_owned())),
+    }
+}
+
+/// The bytes `range` names of an object of `size`, first and last, inclusive: an end past the
+/// object is its last byte; an empty object, a start at or past the end, or an end before the
+/// start is `InvalidRange`.
+pub fn byte_range(range: Range, size: u64) -> Result<(u64, u64), Refusal> {
+    let last = size.checked_sub(1).ok_or(Refusal::InvalidRange { size })?;
+    if range.start > last || range.end.is_some_and(|e| e < range.start) {
+        return Err(Refusal::InvalidRange { size });
+    }
+    Ok((range.start, range.end.map_or(last, |e| e.min(last))))
+}
+
+/// A listing's limit as a store keeps it: 0 is refused, more than [`LIST_MAX`] is [`LIST_MAX`].
+pub fn list_limit(limit: usize) -> Result<usize, Refusal> {
+    if limit == 0 {
+        return Err(Refusal::Invalid { what: "a listing's limit", why: "it's 0".into() });
+    }
+    Ok(limit.min(LIST_MAX))
+}
+
+/// Where a listing starts: past `after` when that's at or past `prefix`, else at `prefix`.
+pub fn list_from<'a>(prefix: &'a str, after: Option<&'a str>) -> std::ops::Bound<&'a str> {
+    match after {
+        Some(a) if a >= prefix => std::ops::Bound::Excluded(a),
+        _ => std::ops::Bound::Included(prefix),
+    }
+}
+
+/// Whether `part` is a part number (1 to [`PARTS_MAX`]).
+pub fn check_part(part: u32) -> Result<(), Refusal> {
+    if part == 0 || part > PARTS_MAX {
+        return Err(Refusal::Invalid { what: "a part number", why: format!("{part} (1 to {PARTS_MAX})") });
+    }
+    Ok(())
+}
+
+/// The parts a completion names: at least one, ascending with none twice, each a part number.
+pub fn check_parts(parts: &[(u32, String)]) -> Result<(), Refusal> {
+    if parts.is_empty() {
+        return Err(Refusal::BadParts("no parts named".into()));
+    }
+    if !parts.windows(2).all(|w| matches!(w, [a, b] if a.0 < b.0)) {
+        return Err(Refusal::BadParts("parts must be named in ascending order, each once".into()));
+    }
+    if let Some((n, _)) = parts.iter().find(|(n, _)| *n == 0 || *n > PARTS_MAX) {
+        return Err(Refusal::BadParts(format!("part {n} isn't a part number (1 to {PARTS_MAX})")));
+    }
+    Ok(())
+}
+
+/// A presigned URL's lifetime in whole seconds, rounded up: more than 0, at most [`PRESIGN_MAX`].
+pub fn lifetime_secs(expires: Duration) -> Result<u64, Refusal> {
+    let whole = expires.as_secs().saturating_add(u64::from(expires.subsec_nanos() > 0));
+    if whole == 0 || whole > PRESIGN_MAX.as_secs() {
+        return Err(Refusal::Invalid { what: "a presigned URL's lifetime", why: format!("{expires:?} (more than 0, at most 7 days)") });
+    }
+    Ok(whole)
+}
+
+/// A key as a URL's path carries it: RFC 3986's unreserved characters and `/` as they are, every
+/// other byte `%XX` (S3's encoding of an object's key).
+pub fn encode_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for b in key.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A key back from [`encode_key`]'s form (`None`: not one).
+pub fn decode_key(path: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = char::from(bytes.next()?).to_digit(16)?;
+            let lo = char::from(bytes.next()?).to_digit(16)?;
+            out.push(u8::try_from(hi.checked_mul(16)?.checked_add(lo)?).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn len64(n: usize) -> u64 {
@@ -167,11 +329,14 @@ pub struct SimBlobs {
     secret: String,
 }
 
+/// An upload under way: its key, and its parts by number (etag, bytes).
+type SimUpload = (String, BTreeMap<u32, (String, Vec<u8>)>);
+
 #[derive(Default)]
 struct SimState {
     objects: BTreeMap<String, (Meta, Arc<Vec<u8>>)>,
     bytes: u64,
-    uploads: HashMap<String, (String, BTreeMap<u32, (String, Vec<u8>)>)>,
+    uploads: HashMap<String, SimUpload>,
     next: u64,
 }
 
@@ -197,12 +362,7 @@ impl SimBlobs {
             return Err(Refusal::TooLarge { what: "an object", size, limit: self.limits.object });
         }
         let old = st.objects.get(key).map(|(m, _)| m.clone());
-        match (cond, &old) {
-            (Cond::IfNoneMatch, Some(_)) => return Err(Refusal::PreconditionFailed(key.to_owned())),
-            (Cond::IfMatch(want), Some(m)) if *want != m.etag => return Err(Refusal::PreconditionFailed(key.to_owned())),
-            (Cond::IfMatch(_), None) => return Err(Refusal::PreconditionFailed(key.to_owned())),
-            _ => {}
-        }
+        holds(cond, key, old.as_ref().map(|m| m.etag.as_str()))?;
         if old.is_none() && st.objects.len() >= self.limits.objects {
             return Err(Refusal::Full { what: "objects", limit: len64(self.limits.objects) });
         }
@@ -216,17 +376,13 @@ impl SimBlobs {
         Ok(meta)
     }
 
-    /// Uses a presigned URL as its holder would: a get gives the bytes, a put stores `body`.
-    pub fn redeem(&self, url: &str, body: Option<Vec<u8>>) -> Result<Option<Vec<u8>>, Refusal> {
+    /// Uses a presigned URL as its holder would, with `method`: a get gives the bytes, a put
+    /// stores `body`. A URL used with the other method, or changed after signing, is `Forbidden`.
+    pub fn redeem(&self, url: &str, method: Method, body: Option<Vec<u8>>) -> Result<Option<Vec<u8>>, Refusal> {
         let rest = url.strip_prefix("sim://blobs/").ok_or_else(|| Refusal::Forbidden("not one of this store's URLs".into()))?;
-        let (key_hex, query) = rest.split_once('?').ok_or_else(|| Refusal::Forbidden("no signature".into()))?;
+        let (path, query) = rest.split_once('?').ok_or_else(|| Refusal::Forbidden("no signature".into()))?;
         let field = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('='))).map(str::to_owned);
-        let key = hex::decode(key_hex).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(|| Refusal::Forbidden("a bad key".into()))?;
-        let method = match field("method").as_deref() {
-            Some("GET") => Method::Get,
-            Some("PUT") => Method::Put,
-            _ => return Err(Refusal::Forbidden("no method".into())),
-        };
+        let key = decode_key(path).ok_or_else(|| Refusal::Forbidden("a bad key".into()))?;
         let expires_ms: i64 = field("expires").and_then(|e| e.parse().ok()).ok_or_else(|| Refusal::Forbidden("no expiry".into()))?;
         if field("sig").as_deref() != Some(self.sign(method, &key, expires_ms).as_str()) {
             return Err(Refusal::Forbidden("the signature doesn't match".into()));
@@ -246,12 +402,7 @@ impl Blobs for SimBlobs {
     fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>, put: Put) -> BoxFuture<'a, Result<Meta, Refusal>> {
         let out = (|| {
             check_key(key)?;
-            if let Some(want) = &put.sha256 {
-                let got = sha256_hex(&bytes);
-                if !got.eq_ignore_ascii_case(want) {
-                    return Err(Refusal::BadChecksum { want: want.clone(), got });
-                }
-            }
+            check_content(&put, &bytes)?;
             self.store(&mut self.inner.lock(), key, bytes, &put.cond)
         })();
         Box::pin(async move { out })
@@ -262,13 +413,9 @@ impl Blobs for SimBlobs {
             check_key(key)?;
             let (meta, bytes) = self.inner.lock().objects.get(key).cloned().ok_or_else(|| Refusal::NotFound(key.to_owned()))?;
             let Some(r) = range else { return Ok((meta, bytes.as_ref().clone())) };
-            let size = meta.size;
-            let end = r.end.unwrap_or(size.saturating_sub(1)).min(size.saturating_sub(1));
-            if size == 0 || r.start >= size || r.end.is_some_and(|e| e < r.start) {
-                return Err(Refusal::InvalidRange { size });
-            }
-            let (s, e) = (usize::try_from(r.start).unwrap_or(usize::MAX), usize::try_from(end).unwrap_or(usize::MAX));
-            let slice = bytes.get(s..=e).map(<[u8]>::to_vec).ok_or(Refusal::InvalidRange { size })?;
+            let (first, last) = byte_range(r, meta.size)?;
+            let (s, e) = (usize::try_from(first).unwrap_or(usize::MAX), usize::try_from(last).unwrap_or(usize::MAX));
+            let slice = bytes.get(s..=e).map(<[u8]>::to_vec).ok_or(Refusal::InvalidRange { size: meta.size })?;
             Ok((meta, slice))
         })();
         Box::pin(async move { out })
@@ -291,14 +438,12 @@ impl Blobs for SimBlobs {
 
     fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFuture<'a, Result<Listing, Refusal>> {
         let out = (|| {
-            if limit == 0 {
-                return Err(Refusal::Invalid { what: "a listing's limit", why: "it's 0".into() });
-            }
-            let limit = limit.min(LIST_MAX);
+            let limit = list_limit(limit)?;
             let st = self.inner.lock();
-            let start = match after {
-                Some(a) if a >= prefix => std::ops::Bound::Excluded(a.to_owned()),
-                _ => std::ops::Bound::Included(prefix.to_owned()),
+            let start = match list_from(prefix, after) {
+                std::ops::Bound::Excluded(a) => std::ops::Bound::Excluded(a.to_owned()),
+                std::ops::Bound::Included(p) => std::ops::Bound::Included(p.to_owned()),
+                std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
             };
             let mut objects = Vec::new();
             let mut truncated = false;
@@ -310,7 +455,7 @@ impl Blobs for SimBlobs {
                     truncated = true;
                     break;
                 }
-                objects.push(m.clone());
+                objects.push(Listed { key: m.key.clone(), size: m.size, modified_ms: m.modified_ms });
             }
             Ok(Listing { objects, truncated })
         })();
@@ -334,9 +479,7 @@ impl Blobs for SimBlobs {
 
     fn upload_part<'a>(&'a self, upload: &'a str, part: u32, bytes: Vec<u8>) -> BoxFuture<'a, Result<String, Refusal>> {
         let out = (|| {
-            if part == 0 || part > PARTS_MAX {
-                return Err(Refusal::Invalid { what: "a part number", why: format!("{part} (1 to {PARTS_MAX})") });
-            }
+            check_part(part)?;
             if len64(bytes.len()) > self.limits.object {
                 return Err(Refusal::TooLarge { what: "a part", size: len64(bytes.len()), limit: self.limits.object });
             }
@@ -362,12 +505,7 @@ impl Blobs for SimBlobs {
         let out = (|| {
             let mut st = self.inner.lock();
             let (key, have) = st.uploads.get(upload).cloned().ok_or_else(|| Refusal::NoSuchUpload(upload.to_owned()))?;
-            if parts.is_empty() {
-                return Err(Refusal::BadParts("no parts named".into()));
-            }
-            if !parts.windows(2).all(|w| matches!(w, [a, b] if a.0 < b.0)) {
-                return Err(Refusal::BadParts("parts must be named in ascending order".into()));
-            }
+            check_parts(&parts)?;
             let mut bytes = Vec::new();
             let last = parts.len().saturating_sub(1);
             for (i, (n, etag)) in parts.iter().enumerate() {
@@ -377,6 +515,10 @@ impl Blobs for SimBlobs {
                 }
                 if i < last && data.len() < self.limits.part_min {
                     return Err(Refusal::BadParts(format!("part {n} is {} bytes: every part but the last is at least {}", data.len(), self.limits.part_min)));
+                }
+                if len64(bytes.len()).saturating_add(len64(data.len())) > self.limits.object {
+                    let size = parts.iter().filter_map(|(n, _)| have.get(n)).map(|(_, b)| len64(b.len())).fold(0, u64::saturating_add);
+                    return Err(Refusal::TooLarge { what: "an object", size, limit: self.limits.object });
                 }
                 bytes.extend_from_slice(data);
             }
@@ -415,15 +557,9 @@ impl Blobs for SimBlobs {
     fn presign<'a>(&'a self, key: &'a str, method: Method, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
         let out = (|| {
             check_key(key)?;
-            if expires > PRESIGN_MAX || expires.is_zero() {
-                return Err(Refusal::Invalid { what: "a presigned URL's lifetime", why: format!("{expires:?} (more than 0, at most 7 days)") });
-            }
-            let expires_ms = self.clock.unix_ms().saturating_add(i64::try_from(expires.as_millis()).unwrap_or(i64::MAX));
-            let m = match method {
-                Method::Get => "GET",
-                Method::Put => "PUT",
-            };
-            Ok(format!("sim://blobs/{}?method={m}&expires={expires_ms}&sig={}", hex::encode(key.as_bytes()), self.sign(method, key, expires_ms)))
+            let secs = lifetime_secs(expires)?;
+            let expires_ms = self.clock.unix_ms().saturating_add(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX));
+            Ok(format!("sim://blobs/{}?expires={expires_ms}&sig={}", encode_key(key), self.sign(method, key, expires_ms)))
         })();
         Box::pin(async move { out })
     }
@@ -436,22 +572,30 @@ pub trait BlobsFixture: Send + Sync {
     fn blobs(&self) -> &dyn Blobs;
     /// The smallest a part other than the last may be, in this store.
     fn part_min(&self) -> usize;
+    /// The most an object (or a part) may hold in this store, as the fixture made it: small
+    /// enough that a case can pass it.
+    fn object_max(&self) -> u64;
+    /// How finely the store keeps when it wrote an object (1 ms; an S3's is 1 s).
+    fn resolution(&self) -> Duration;
     /// Lets `d` pass by the store's clock.
     fn pass(&self, d: Duration) -> BoxFuture<'_, ()>;
-    /// Uses a presigned URL as a client would (a get's bytes; a put stores `body`).
-    fn redeem<'a>(&'a self, url: &'a str, body: Option<Vec<u8>>) -> BoxFuture<'a, Result<Option<Vec<u8>>, Refusal>>;
+    /// Uses a presigned URL as a client would, with `method` (a get's bytes; a put stores `body`).
+    fn redeem<'a>(&'a self, url: &'a str, method: Method, body: Option<Vec<u8>>) -> BoxFuture<'a, Result<Option<Vec<u8>>, Refusal>>;
 }
 
-/// The fixture for a [`SimBlobs`], parts as small as 5 bytes.
+/// The fixture for a [`SimBlobs`]: parts as small as 5 bytes, objects to 24 MiB.
 pub struct SimBlobsFixture {
     pub blobs: SimBlobs,
     pub clock: SimClock,
 }
 
+/// The largest object a [`SimBlobsFixture`]'s store takes.
+pub const SIM_FIXTURE_OBJECT: u64 = 24 << 20;
+
 impl Default for SimBlobsFixture {
     fn default() -> Self {
         let clock = SimClock::new();
-        Self { blobs: SimBlobs::new(Arc::new(clock.clone()), SimLimits { part_min: 5, ..SimLimits::default() }), clock }
+        Self { blobs: SimBlobs::new(Arc::new(clock.clone()), SimLimits { part_min: 5, object: SIM_FIXTURE_OBJECT, ..SimLimits::default() }), clock }
     }
 }
 
@@ -462,220 +606,20 @@ impl BlobsFixture for SimBlobsFixture {
     fn part_min(&self) -> usize {
         5
     }
+    fn object_max(&self) -> u64 {
+        SIM_FIXTURE_OBJECT
+    }
+    fn resolution(&self) -> Duration {
+        Duration::from_millis(1)
+    }
     fn pass(&self, d: Duration) -> BoxFuture<'_, ()> {
         self.clock.advance(d);
         Box::pin(async {})
     }
-    fn redeem<'a>(&'a self, url: &'a str, body: Option<Vec<u8>>) -> BoxFuture<'a, Result<Option<Vec<u8>>, Refusal>> {
-        let out = self.blobs.redeem(url, body);
+    fn redeem<'a>(&'a self, url: &'a str, method: Method, body: Option<Vec<u8>>) -> BoxFuture<'a, Result<Option<Vec<u8>>, Refusal>> {
+        let out = self.blobs.redeem(url, method, body);
         Box::pin(async move { out })
     }
-}
-
-async fn put_plain(b: &dyn Blobs, key: &str, bytes: &[u8]) -> Result<Meta, Failure> {
-    fine("put", b.put(key, bytes.to_vec(), Put::default()).await)
-}
-
-fn c1<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let meta = put_plain(b, "c/a.txt", b"hello").await?;
-        same("its size and etag", (meta.size, meta.etag.clone()), (5, sha256_hex(b"hello")))?;
-        let (m, bytes) = fine("get", b.get("c/a.txt", None).await)?;
-        same("what's read back", (m, bytes), (meta, b"hello".to_vec()))
-    })
-}
-
-fn c2<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        put_plain(b, "r", b"0123456789").await?;
-        let part = |start: u64, end: Option<u64>| b.get("r", Some(Range { start, end }));
-        same("bytes 2-4", fine("get", part(2, Some(4)).await)?.1, b"234".to_vec())?;
-        same("bytes 7-", fine("get", part(7, None).await)?.1, b"789".to_vec())?;
-        same("bytes 8-100", fine("get", part(8, Some(100)).await)?.1, b"89".to_vec())?;
-        same("bytes 10-", part(10, None).await.map(|x| x.1), Err(Refusal::InvalidRange { size: 10 }))?;
-        same("bytes 5-3", part(5, Some(3)).await.map(|x| x.1), Err(Refusal::InvalidRange { size: 10 }))
-    })
-}
-
-fn c3<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let meta = put_plain(b, "h", b"abc").await?;
-        same("head", fine("head", b.head("h").await)?, meta)?;
-        same("head of nothing", b.head("missing").await, Err(Refusal::NotFound("missing".into())))?;
-        same("get of nothing", b.get("missing", None).await.map(|x| x.1), Err(Refusal::NotFound("missing".into())))
-    })
-}
-
-fn c4<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let first = put_plain(b, "o", b"first").await?;
-        let second = put_plain(b, "o", b"second").await?;
-        ensure(first.etag != second.etag, || "new content kept its etag".into())?;
-        same("after the overwrite", fine("get", b.get("o", None).await)?.1, b"second".to_vec())
-    })
-}
-
-fn c5<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let only_new = Put { cond: Cond::IfNoneMatch, sha256: None };
-        fine("a create", b.put("n", b"one".to_vec(), only_new.clone()).await)?;
-        same("a second create", b.put("n", b"two".to_vec(), only_new).await.map(|m| m.size), Err(Refusal::PreconditionFailed("n".into())))?;
-        same("the object", fine("get", b.get("n", None).await)?.1, b"one".to_vec())
-    })
-}
-
-fn c6<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let first = put_plain(b, "m", b"one").await?;
-        let if_match = |etag: &str| Put { cond: Cond::IfMatch(etag.to_owned()), sha256: None };
-        fine("a replace at its etag", b.put("m", b"two".to_vec(), if_match(&first.etag)).await)?;
-        same("a replace at a stale etag", b.put("m", b"three".to_vec(), if_match(&first.etag)).await.map(|m| m.size), Err(Refusal::PreconditionFailed("m".into())))?;
-        same("a replace of nothing", b.put("none", b"x".to_vec(), if_match(&first.etag)).await.map(|m| m.size), Err(Refusal::PreconditionFailed("none".into())))?;
-        same("the object", fine("get", b.get("m", None).await)?.1, b"two".to_vec())
-    })
-}
-
-fn c7<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        put_plain(b, "d", b"x").await?;
-        fine("delete", b.delete("d").await)?;
-        same("after the delete", b.head("d").await, Err(Refusal::NotFound("d".into())))?;
-        fine("a delete of nothing", b.delete("d").await)
-    })
-}
-
-fn c8<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        for k in ["p/b", "p/a", "q/a", "p/c", "p/d"] {
-            put_plain(b, k, b"v").await?;
-        }
-        let names = |l: &Listing| l.objects.iter().map(|m| m.key.clone()).collect::<Vec<_>>();
-        let first = fine("list", b.list("p/", None, 3).await)?;
-        same("the first page", (names(&first), first.truncated), (vec!["p/a".to_owned(), "p/b".to_owned(), "p/c".to_owned()], true))?;
-        let rest = fine("list on", b.list("p/", Some("p/c"), 3).await)?;
-        same("the rest", (names(&rest), rest.truncated), (vec!["p/d".to_owned()], false))?;
-        ensure(matches!(b.list("", None, 0).await, Err(Refusal::Invalid { .. })), || "a listing of 0 wasn't refused Invalid".into())
-    })
-}
-
-fn c9<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let right = Put { cond: Cond::Always, sha256: Some(sha256_hex(b"data")) };
-        fine("a put with its checksum", b.put("s", b"data".to_vec(), right).await)?;
-        let wrong = Put { cond: Cond::Always, sha256: Some(sha256_hex(b"other")) };
-        let e = refused("a put with a wrong checksum", b.put("t", b"data".to_vec(), wrong).await)?;
-        ensure(matches!(e, Refusal::BadChecksum { .. }), || format!("refused as {e:?}"))?;
-        same("what the refused put stored", b.head("t").await, Err(Refusal::NotFound("t".into())))
-    })
-}
-
-fn c10<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let min = f.part_min();
-        let up = fine("start", b.start_upload("big").await)?;
-        let (one, two, three) = (vec![b'a'; min], vec![b'b'; min], b"end".to_vec());
-        // Uploaded out of order: joined in part order.
-        let e3 = fine("part 3", b.upload_part(&up, 3, three.clone()).await)?;
-        let e1 = fine("part 1", b.upload_part(&up, 1, one.clone()).await)?;
-        let e2 = fine("part 2", b.upload_part(&up, 2, two.clone()).await)?;
-        let meta = fine("complete", b.complete_upload(&up, vec![(1, e1), (2, e2), (3, e3)]).await)?;
-        let whole: Vec<u8> = [one, two, three].concat();
-        same("its size and etag", (meta.size, meta.etag), (len64(whole.len()), sha256_hex(&whole)))?;
-        same("the object", fine("get", b.get("big", None).await)?.1, whole)
-    })
-}
-
-fn c11<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let min = f.part_min();
-        let up = fine("start", b.start_upload("x").await)?;
-        let small = fine("a small first part", b.upload_part(&up, 1, b"tiny".to_vec()).await)?;
-        let last = fine("the last part", b.upload_part(&up, 2, vec![b'z'; min]).await)?;
-        ensure(matches!(b.complete_upload(&up, vec![(1, small.clone()), (2, last.clone())]).await, Err(Refusal::BadParts(_))), || "a part under the minimum, not last, was taken".into())?;
-        ensure(matches!(b.complete_upload(&up, vec![(2, last), (1, small)]).await, Err(Refusal::BadParts(_))), || "parts named out of order were taken".into())?;
-        ensure(matches!(b.upload_part(&up, 0, b"x".to_vec()).await, Err(Refusal::Invalid { .. })), || "part 0 was taken".into())?;
-        ensure(matches!(b.upload_part(&up, PARTS_MAX.saturating_add(1), b"x".to_vec()).await, Err(Refusal::Invalid { .. })), || "a part past 10,000 was taken".into())?;
-        same("a part for no upload", b.upload_part("no-such-upload", 1, b"x".to_vec()).await, Err(Refusal::NoSuchUpload("no-such-upload".into())))?;
-        same("what the failed completes left", b.head("x").await, Err(Refusal::NotFound("x".into())))
-    })
-}
-
-fn c12<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let up = fine("start", b.start_upload("gone").await)?;
-        let e1 = fine("part 1", b.upload_part(&up, 1, b"abc".to_vec()).await)?;
-        fine("abort", b.abort_upload(&up).await)?;
-        same("completing it after", b.complete_upload(&up, vec![(1, e1)]).await.map(|m| m.size), Err(Refusal::NoSuchUpload(up.clone())))?;
-        same("the object", b.head("gone").await, Err(Refusal::NotFound("gone".into())))
-    })
-}
-
-fn c13<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        put_plain(b, "shared", b"for you").await?;
-        let url = fine("presign", b.presign("shared", Method::Get, Duration::from_secs(60)).await)?;
-        same("a get through it", f.redeem(&url, None).await, Ok(Some(b"for you".to_vec())))?;
-        f.pass(Duration::from_secs(61)).await;
-        same("a get once it has expired", f.redeem(&url, None).await, Err(Refusal::Expired))?;
-        ensure(matches!(b.presign("shared", Method::Get, PRESIGN_MAX.saturating_add(Duration::from_secs(1))).await, Err(Refusal::Invalid { .. })), || "a URL for more than 7 days was given".into())
-    })
-}
-
-fn c14<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        let url = fine("presign", b.presign("dropped", Method::Put, Duration::from_secs(60)).await)?;
-        same("a put through it", f.redeem(&url, Some(b"left here".to_vec())).await, Ok(None))?;
-        same("the object", fine("get", b.get("dropped", None).await)?.1, b"left here".to_vec())?;
-        // Its last character changed (a presigned URL ends in its signature, S3's as this one's).
-        let mut tampered = url.clone();
-        let last = tampered.pop();
-        tampered.push(if last == Some('0') { '1' } else { '0' });
-        ensure(f.redeem(&tampered, Some(b"x".to_vec())).await.is_err(), || "a tampered URL was taken".into())
-    })
-}
-
-fn c15<F: BlobsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
-    Box::pin(async move {
-        let b = f.blobs();
-        ensure(matches!(b.put("", b"x".to_vec(), Put::default()).await, Err(Refusal::Invalid { .. })), || "an empty key was taken".into())?;
-        ensure(matches!(b.put(&"k".repeat(KEY_MAX.saturating_add(1)), b"x".to_vec(), Put::default()).await, Err(Refusal::Invalid { .. })), || "a key over 1024 bytes was taken".into())?;
-        put_plain(b, &"k".repeat(KEY_MAX), b"x").await.map(|_| ())
-    })
-}
-
-/// The `Blobs` contract, clause by clause (docs/seams.md, "Blobs").
-pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
-    vec![
-        Case { id: "BLOBS-1", says: "an object put is got back whole, with its size and its content's SHA-256 as its etag", check: c1::<F> },
-        Case { id: "BLOBS-2", says: "a get with a byte range gives those bytes (an end past the object, to its end); a range outside it is refused InvalidRange", check: c2::<F> },
-        Case { id: "BLOBS-3", says: "head gives an object's metadata; head or get of a key with no object is refused NotFound", check: c3::<F> },
-        Case { id: "BLOBS-4", says: "a put over an object replaces it, and new content has a new etag", check: c4::<F> },
-        Case { id: "BLOBS-5", says: "a put If-None-Match creates only where there's no object; else it's refused PreconditionFailed and stores nothing", check: c5::<F> },
-        Case { id: "BLOBS-6", says: "a put If-Match replaces only the object with that etag; else it's refused PreconditionFailed", check: c6::<F> },
-        Case { id: "BLOBS-7", says: "a deleted object is gone; deleting a key with no object succeeds", check: c7::<F> },
-        Case { id: "BLOBS-8", says: "a listing gives a prefix's objects in key order, after its cursor, at most its limit, saying when it's truncated; a limit of 0 is refused", check: c8::<F> },
-        Case { id: "BLOBS-9", says: "a put with a SHA-256 its content doesn't have is refused BadChecksum and stores nothing", check: c9::<F> },
-        Case { id: "BLOBS-10", says: "a multipart upload's parts, uploaded in any order, are joined in part order into one object", check: c10::<F> },
-        Case { id: "BLOBS-11", says: "a multipart upload is refused when a part but the last is under the minimum or parts are named out of order; part numbers run 1 to 10,000", check: c11::<F> },
-        Case { id: "BLOBS-12", says: "an aborted upload is gone: completing it is refused NoSuchUpload", check: c12::<F> },
-        Case { id: "BLOBS-13", says: "a presigned get works until it expires by the store's clock, then is refused Expired; none lasts more than 7 days", check: c13::<F> },
-        Case { id: "BLOBS-14", says: "a presigned put stores what its holder sends; a URL changed after signing is refused", check: c14::<F> },
-        Case { id: "BLOBS-15", says: "keys are 1 to 1024 bytes: an empty or longer one is refused Invalid", check: c15::<F> },
-    ]
 }
 
 #[cfg(test)]
@@ -683,10 +627,12 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
-    /// CP-M2, AC-M2.2: the simulator and its suite.
+    /// CP-M2, AC-M2.2; CP-T10.1, AC-T10.1.2: the simulator passes every clause.
     #[test]
     fn the_simulated_store_passes_the_blobs_suite() -> Result<(), String> {
-        futures::executor::block_on(run("Blobs", &cases::<SimBlobsFixture>(), || async { SimBlobsFixture::default() })).into_result().map(|_| ())
+        let passed = futures::executor::block_on(run("Blobs", &cases::<SimBlobsFixture>(), || async { SimBlobsFixture::default() })).into_result()?;
+        assert!(passed >= 150, "{passed} cases");
+        Ok(())
     }
 
     /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
@@ -710,5 +656,27 @@ mod tests {
         assert_eq!(put("e1", b""), Ok(0));
         assert_eq!(put("e2", b""), Ok(0));
         assert!(matches!(futures::executor::block_on(b.put("e3", Vec::new(), Put::default())), Err(Refusal::Full { what: "objects", .. })));
+    }
+
+    /// CP-T10.1: what every store takes is checked alike; a key, range or lifetime one store
+    /// takes, every store takes.
+    #[test]
+    fn keys_ranges_and_lifetimes_are_checked_alike() {
+        for good in ["a", "a/b", "ü/日本/😀.txt", "q?x=1&y=2", "a.b/..c/...", "k".repeat(255).as_str()] {
+            assert_eq!(check_key(good), Ok(()), "{good:?}");
+        }
+        for bad in ["", "/a", "a/", "a//b", ".", "a/../b", "a\\b", "a\0b", "tab\there", "del\u{7f}", "c1\u{85}", "k".repeat(256).as_str(), vec!["k".repeat(200); 5].join("/").as_str()] {
+            assert!(matches!(check_key(bad), Err(Refusal::Invalid { .. })), "{bad:?}");
+        }
+        assert_eq!(byte_range(Range { start: 2, end: Some(100) }, 10), Ok((2, 9)));
+        assert_eq!(byte_range(Range { start: 9, end: None }, 10), Ok((9, 9)));
+        assert_eq!(byte_range(Range { start: 0, end: None }, 0), Err(Refusal::InvalidRange { size: 0 }));
+        assert_eq!(byte_range(Range { start: 5, end: Some(4) }, 10), Err(Refusal::InvalidRange { size: 10 }));
+        assert_eq!(lifetime_secs(Duration::from_millis(1500)), Ok(2));
+        assert_eq!(lifetime_secs(PRESIGN_MAX), Ok(604_800));
+        assert!(lifetime_secs(PRESIGN_MAX.saturating_add(Duration::from_millis(1))).is_err());
+        assert!(lifetime_secs(Duration::ZERO).is_err());
+        assert_eq!(decode_key(&encode_key("a b+c%/ü?#")).as_deref(), Some("a b+c%/ü?#"));
+        assert_eq!(encode_key("a b+c"), "a%20b%2Bc");
     }
 }

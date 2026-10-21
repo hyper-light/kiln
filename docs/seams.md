@@ -127,17 +127,29 @@ Methods: `create`, `publish`, `read`, `wait`, `bounds`.
 
 ## Blobs
 
-Bytes, with S3's semantics. An object's etag is its content's SHA-256, however it was uploaded.
+Bytes, with S3's semantics. An object's etag is its content's SHA-256, however it was uploaded. A
+listing names each object's key, size and modified time, not its etag (an S3's listing carries its
+own ETags, MD5s or digests of parts, not the content's SHA-256): head says that. Head, get and list
+say the same modified time, the store's, to its resolution (an S3's is a whole second); a put's
+answer says when the store acknowledged it, as near as the store tells. What every implementation
+takes is checked by the same functions (`check_key`, `check_sha256`, `byte_range`, `check_parts`,
+`lifetime_secs` in `kiln_seams::blobs`), so a key, range or lifetime one store takes, every store
+takes. A put is checked in this order: its key, its size, its checksum, then its condition.
 
-- **Implementations:** kiln's CAS, any S3, then Mantle (CP-T10.1, which takes this suite past 150
-  cases); `kiln_seams::blobs::SimBlobs`: in memory, its presigned URLs signed and timed by its
+- **Implementations:** kiln's local store (`kiln::blobs::local::LocalBlobs`: kiln's
+  content-addressed store, its data where it was), any S3 (`kiln::blobs::s3::S3Blobs`), then Mantle
+  (CP-T10.2); `kiln_seams::blobs::SimBlobs`: in memory, its presigned URLs signed and timed by its
   clock, objects to 64 MiB, a million of them, a GiB in all (uploads' parts included), 1000
   uploads under way.
-- **Used by:** the CAS, sync's blobs, CD's artifacts, recordings, transcripts and upgrade binaries,
-  once CP-T10.1 moves them behind it; Reliquary's bytes (CP-T9.1).
-- **Passed by:** the simulator, every clause; the local and S3 ones, when CP-T10.1 lands them.
-- **Bounds:** keys 1 to 1024 bytes (S3's); 1000 keys a listing (S3's); part numbers 1 to 10,000,
-  every part but the last at least 5 MiB (S3's); presigned URLs for up to 7 days (S3's).
+- **Used by:** kiln's content-addressed store (caches, artifacts, registry blobs, release assets and
+  test reports, which CD reads its artifacts from), sync's blobs, recordings, transcripts and
+  runner upgrade binaries (docs/blobs.md); Reliquary's bytes (CP-T9.1).
+- **Passed by:** the simulator, every clause; the local store, every clause; the S3 store against
+  MinIO, every clause (docs/blobs.md, "The suite against MinIO").
+- **Bounds:** keys 1 to 960 bytes (S3's 1024, less 64 a store may put before them), in segments of
+  1 to 255 bytes between `/`s, none `.` or `..`, with no control characters and no backslash;
+  1000 keys a listing (S3's); part numbers 1 to 10,000, every part but the last at least 5 MiB
+  (S3's); presigned URLs for up to 7 days (S3's), their lifetimes rounded up to whole seconds.
 
 Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, `complete_upload`, `abort_upload`, `presign`.
 
@@ -153,9 +165,154 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 - **BLOBS-10** a multipart upload's parts, uploaded in any order, are joined in part order into one object
 - **BLOBS-11** a multipart upload is refused when a part but the last is under the minimum or parts are named out of order; part numbers run 1 to 10,000
 - **BLOBS-12** an aborted upload is gone: completing it is refused NoSuchUpload
-- **BLOBS-13** a presigned get works until it expires by the store's clock, then is refused Expired; none lasts more than 7 days
+- **BLOBS-13** a presigned get works until it expires by the store's clock, then is refused Expired; a URL's lifetime is more than 0 and at most 7 days
 - **BLOBS-14** a presigned put stores what its holder sends; a URL changed after signing is refused
-- **BLOBS-15** keys are 1 to 1024 bytes: an empty or longer one is refused Invalid
+- **BLOBS-15** keys are 1 to 960 bytes: an empty or longer one is refused Invalid
+- **BLOBS-16** a key of multibyte UTF-8 is kept as it is: its object is got back by it, and head names it so
+- **BLOBS-17** keys with spaces and URL-reserved characters are kept exactly, each its own object, and listed as they were put
+- **BLOBS-18** a space, a plus, a slash and an escaped slash make different keys: "a b", "a+b", "a/b" and "a%2Fb" are four objects
+- **BLOBS-19** keys that differ only in case are different objects
+- **BLOBS-20** keys that differ only in Unicode normalization (NFC and NFD) are different objects: keys are their bytes
+- **BLOBS-21** a key with a control character (NUL, tab, newline, DEL, a C1 control) is refused Invalid
+- **BLOBS-22** a key with a backslash is refused Invalid, so keys are the same on every platform's file system
+- **BLOBS-23** a key that starts or ends with '/', or holds an empty segment ('//'), is refused Invalid
+- **BLOBS-24** a key with a '.' or '..' segment is refused Invalid; dots within a segment's name ('a.b', '..c', '...') are taken
+- **BLOBS-25** a key's segments are 1 to 255 bytes: one of 255 is taken, one of 256 refused Invalid
+- **BLOBS-26** a key's bytes are counted, not its characters: 960 bytes, most of them two-byte characters, are taken, one byte more refused Invalid
+- **BLOBS-27** every request that names a key refuses a bad one Invalid: get, head, delete, start_upload and presign as put does
+- **BLOBS-28** a key refused stores nothing: nothing is listed after
+- **BLOBS-29** keys are exact: "a " and " a" aren't "a"
+- **BLOBS-30** objects are apart: a put to one key changes no other, however alike their keys ('a', 'a/b', 'ab', 'a b')
+- **BLOBS-31** an empty object is kept: its size is 0, its etag the SHA-256 of nothing, and a get gives no bytes
+- **BLOBS-32** every byte value round-trips: 0 to 255 and back down are got back exactly
+- **BLOBS-33** objects of 1 byte, 64 KiB, 1 MiB and 1 MiB and a byte are each got back exactly
+- **BLOBS-34** an object of 9 MiB of noise is got back exactly, its etag its SHA-256
+- **BLOBS-35** an object as large as the store takes is kept; one byte more is refused TooLarge and stores nothing
+- **BLOBS-36** a put's answer says the key, size and etag head then says
+- **BLOBS-37** an etag is 64 lowercase hex digits
+- **BLOBS-38** a get's answer carries the object's key, size and etag, as head says them
+- **BLOBS-39** the same content put again keeps its etag, and the object is got back unchanged
+- **BLOBS-40** a smaller object put over a larger leaves exactly the new bytes, no tail of the old
+- **BLOBS-41** an empty object put over another leaves it empty
+- **BLOBS-42** two keys may hold the same content, each its own object: deleting one leaves the other whole
+- **BLOBS-43** replacing one of two keys that held the same content leaves the other's as it was
+- **BLOBS-44** content a bit apart has etags apart
+- **BLOBS-45** the same content under two keys has one etag
+- **BLOBS-46** a put with its content's SHA-256 is taken, in lower or upper case hex
+- **BLOBS-47** a put whose SHA-256 isn't 64 hex digits is refused Invalid and stores nothing
+- **BLOBS-48** a put with a wrong SHA-256 over an object leaves the object as it was
+- **BLOBS-49** an empty object put with the SHA-256 of nothing is taken
+- **BLOBS-50** a put's checksum is checked before its condition: a wrong one is refused BadChecksum even where If-None-Match fails too
+- **BLOBS-51** a create (If-None-Match) with its content's SHA-256 is taken
+- **BLOBS-52** a replace (If-Match) with its content's SHA-256 is taken
+- **BLOBS-53** a create refused leaves the object as it was: its bytes, its etag and its time
+- **BLOBS-54** a key whose object was deleted can be created again with If-None-Match
+- **BLOBS-55** If-Match an object's etag holds after the same content is put again
+- **BLOBS-56** If-Match an etag the object hasn't (empty, garbage, another's) is refused PreconditionFailed, and the object stays
+- **BLOBS-57** If-Match the etag of an object since deleted is refused PreconditionFailed, and nothing is stored
+- **BLOBS-58** of 8 creates (If-None-Match) of one key at once, exactly one is taken, the rest refused PreconditionFailed, and the object is the one taken
+- **BLOBS-59** of 8 replaces at once, each If-Match the same etag, exactly one is taken, the rest refused PreconditionFailed, and the object is the one taken
+- **BLOBS-60** of 8 unconditional puts of one key at once, every one is taken and the object is one of them whole
+- **BLOBS-61** a create where an upload was aborted is taken: the upload left nothing
+- **BLOBS-62** after a delete, If-Match any etag is refused PreconditionFailed
+- **BLOBS-63** bytes 0-0 give the first byte; the last byte's range, closed or open, gives the last
+- **BLOBS-64** a range from 0 to the last byte, closed or open, gives the whole object
+- **BLOBS-65** a range's answer says the whole object's key, size and etag, not the range's
+- **BLOBS-66** any range of an empty object is refused InvalidRange, naming size 0
+- **BLOBS-67** a range that starts at or past the end is refused InvalidRange, naming the object's size; one on the last byte gives it
+- **BLOBS-68** a range of a key with no object is refused NotFound, not InvalidRange
+- **BLOBS-69** 40 ranges spread over 3 MiB of noise each give exactly their bytes
+- **BLOBS-70** an object read in 1 MiB ranges, put together, is the object
+- **BLOBS-71** a range across the joins of a multipart object's parts gives its bytes
+- **BLOBS-72** ranges of one byte and of three in an object's middle give exactly those
+- **BLOBS-73** head after a delete is refused NotFound
+- **BLOBS-74** an object being uploaded in parts isn't there until its upload completes: head and get are refused NotFound
+- **BLOBS-75** head, get and list say the same size and modified time of an object
+- **BLOBS-76** an object written again later has a later modified time, by the store's clock
+- **BLOBS-77** a key between two objects' ('a' and 'a/b/c' put, 'a/b' not) is refused NotFound: keys aren't folders
+- **BLOBS-78** deleting a key leaves keys that start with it ('a/b', 'ab') as they were
+- **BLOBS-79** a key put again after a delete has the new content, size and etag
+- **BLOBS-80** deleting a key with no object succeeds, again and again
+- **BLOBS-81** a deleted object leaves the listing at once
+- **BLOBS-82** content deleted under one key and put again stays whole under another that holds it too
+- **BLOBS-83** an empty store's listing is empty and not truncated
+- **BLOBS-84** a listing of the prefix "" gives every object
+- **BLOBS-85** a prefix is a string, not a folder: "p" lists "p", "p/x", "pa" and "pb", not "q"
+- **BLOBS-86** keys list in the order of their UTF-8 bytes: A, Z, a, a/b, a0, aa, z, é
+- **BLOBS-87** a prefix that names nothing lists nothing, and isn't truncated
+- **BLOBS-88** a listing's limit of 1 gives one object, truncated when more follow
+- **BLOBS-89** a listing whose limit is what's there, or more, gives it all and isn't truncated
+- **BLOBS-90** a limit over 1000 gives 1000 and says the rest follow; paged, 1001 objects are each listed
+- **BLOBS-91** a listing after a key starts past it, whether or not the key is there
+- **BLOBS-92** a listing after a key before its prefix starts at the prefix
+- **BLOBS-93** a listing after the last key, or past it, is empty and not truncated
+- **BLOBS-94** paging with a limit of 2, each page after the one before's last key, visits every object once, in order
+- **BLOBS-95** a listing says each object's size and modified time as head says them
+- **BLOBS-96** a listing after an overwrite says the new size
+- **BLOBS-97** an upload under way isn't listed; once completed, its object is
+- **BLOBS-98** an empty object is listed, with size 0
+- **BLOBS-99** multibyte and reserved keys are listed as they were put
+- **BLOBS-100** objects stored by a presigned put and by an upload are listed like any other
+- **BLOBS-101** a put refused for its condition, checksum or size lists nothing new
+- **BLOBS-102** a prefix that is a whole key lists that object and those that go on from it
+- **BLOBS-103** a prefix with reserved characters ("s/q?") matches them exactly
+- **BLOBS-104** a cursor within a prefix lists only the prefix's later keys
+- **BLOBS-105** an object put after a page was read is on a later page when its key is past the cursor
+- **BLOBS-106** a key of 960 bytes is listed and deleted like any other
+- **BLOBS-107** parts uploaded in order and completed are one object, its etag the SHA-256 of the whole
+- **BLOBS-108** an upload of one part smaller than the minimum is one object: the last part may be any size
+- **BLOBS-109** an object put in parts has the etag of the same bytes put whole
+- **BLOBS-110** a part uploaded again replaces the one before: completing with the old etag is refused BadParts, with the new it's taken
+- **BLOBS-111** completing with a part named twice is refused BadParts
+- **BLOBS-112** completing with no parts named is refused BadParts
+- **BLOBS-113** completing with a part never uploaded is refused BadParts
+- **BLOBS-114** completing with a part's etag wrong is refused BadParts
+- **BLOBS-115** parts 1 and 10,000 are taken; 0 and 10,001 are refused Invalid
+- **BLOBS-116** completing or aborting an upload that was never started is refused NoSuchUpload
+- **BLOBS-117** a completed upload is gone: completing it again, aborting it or a part for it is refused NoSuchUpload
+- **BLOBS-118** a part for an aborted upload is refused NoSuchUpload
+- **BLOBS-119** a completed upload replaces the object at its key
+- **BLOBS-120** aborting an upload leaves the object at its key as it was
+- **BLOBS-121** two uploads to one key are apart, each with its own parts; the one completed last is the object
+- **BLOBS-122** each upload started has an id of its own
+- **BLOBS-123** a part over the store's object limit is refused TooLarge
+- **BLOBS-124** completing an upload whose parts sum past the object limit is refused TooLarge and stores nothing
+- **BLOBS-125** parts of exactly the minimum, then a last of one byte, are taken
+- **BLOBS-126** parts of one upload uploaded at once are each kept and joined in order
+- **BLOBS-127** deleting a key doesn't end an upload to it: the upload completes after, and is the object
+- **BLOBS-128** a put while an upload is under way is replaced when the upload completes
+- **BLOBS-129** a part uploaded again and again is joined as its last upload
+- **BLOBS-130** an upload aborted after parts lists nothing
+- **BLOBS-131** a completed upload's object is headed and listed like any other, with one modified time
+- **BLOBS-132** parts of different content have different etags
+- **BLOBS-133** a presigned get of a key with no object is refused NotFound
+- **BLOBS-134** a presigned get gives the object as it is when used: put again since signing, the new bytes
+- **BLOBS-135** a presigned put replaces the object at its key
+- **BLOBS-136** an object stored by a presigned put has its content's SHA-256 as its etag
+- **BLOBS-137** a presigned put that has expired is refused Expired and stores nothing
+- **BLOBS-138** a get's URL can't put and a put's can't get: each is refused
+- **BLOBS-139** a URL changed to name another key is refused
+- **BLOBS-140** presigning makes nothing: a presigned put's key has no object until its URL is used
+- **BLOBS-141** a presigned get of an object deleted since signing is refused NotFound
+- **BLOBS-142** a presigned put of no bytes stores an empty object
+- **BLOBS-143** a presigned URL works for a multibyte key
+- **BLOBS-144** a presigned URL works for a key with spaces and reserved characters
+- **BLOBS-145** a presigned get gives an object of 2 MiB whole
+- **BLOBS-146** puts to 16 keys at once all land, each got back as put
+- **BLOBS-147** gets during a replacement each give one version whole, the old or the new
+- **BLOBS-148** deletes of 10 keys at once leave none listed
+- **BLOBS-149** of If-Match and If-None-Match puts racing on one object, exactly one If-Match is taken
+- **BLOBS-150** 12 uploads started at once to 12 keys each complete as their own object
+- **BLOBS-151** a put's answer and head name the object's key
+- **BLOBS-152** a multipart object got whole says its whole size and etag
+- **BLOBS-153** ranges of an object stored by a presigned put give its bytes
+- **BLOBS-154** after a large object is replaced by a small one, a range past the small one's end is refused InvalidRange naming its size
+- **BLOBS-155** an upload completes with the parts it names, in their order, gaps allowed; small parts not last are refused BadParts
+- **BLOBS-156** parts 1 and 9, with none between, complete into one object of the two
+- **BLOBS-157** parts uploaded but not named are left out of the object, and gone with the upload
+- **BLOBS-158** If-Match chains: each replace names the etag the last answered, and an older etag is refused PreconditionFailed
+- **BLOBS-159** If-Match compares content, not size: an etag of same-sized, other content is refused PreconditionFailed
+- **BLOBS-160** objects stored by a put, an upload and a presigned put each have their content's SHA-256 as their etag
 
 ## Secrets
 
