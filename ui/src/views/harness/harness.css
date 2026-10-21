@@ -764,6 +764,10 @@ textarea.hx-input {
   visibility: hidden;
 }
 .hx-turn {
+  /* Each turn is painted as one piece (a layer of its own, nothing moves): while the last one
+     streams, the browser reuses what it painted of the turns before it instead of painting the
+     whole conversation again for every word. */
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 12px;
