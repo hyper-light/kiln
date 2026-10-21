@@ -269,10 +269,10 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
-Mission Control shows kiln sessions and native subagents in a flat list, without relationship
-labels or nested disclosures. Search, status filters and sorting apply to each row independently.
-Native subagents show their own status and open their work inside
-the parent's conversation, including after they finish. The session list carries small
+Mission Control shows only standalone kiln sessions, in a flat list. Managed children and native
+subagents are excluded from its rows, counts, filters, conversation search and bulk actions.
+Subagent status and output remain available inside the agent chats, including after they finish.
+The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
 do not create kiln sessions or change the harness's isolation, permissions or execution.

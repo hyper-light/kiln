@@ -30,8 +30,7 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { NativeTask } from "./family";
-import { missionRows, type MissionRow, type MissionStand as Stand } from "./mission-rows";
+import { missionFoundSessions, missionRows, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
@@ -364,7 +363,7 @@ function Found({ all }: { all: { a: AgentInfo }[] }) {
   // Its own key: "ai-sessions" is the list alone (`aiSessionsRes`), and whichever read it first
   // would hand the other the wrong shape.
   const [found, quiet] = useSuspenseResource("ai-sessions-found", readAll, FOUND).data;
-  const elsewhere = found.filter((s) => !s.managed_by && !all.some((r) => r.a.harness_session && r.a.harness_session === s.id));
+  const elsewhere = missionFoundSessions(found, all);
   return <FoundSessions sessions={elsewhere} quiet={quiet} />;
 }
 
@@ -479,9 +478,8 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const { held, bind } = useListHold(selecting);
   const { live, ended } = useShownList(all, q, view, held);
   const glide = useGlide(live.map((r) => `${r.a.id}:${r.stand}`).join());
-  const managedLive = live.filter((r) => !r.native);
-  const managedEnded = ended.filter((r) => !r.native);
-  const selectable = [...managedLive, ...managedEnded];
+  const selectable = [...live, ...ended];
+  const searchAgents = React.useMemo(() => new Set(all.map(({ a }) => a.id)), [all]);
   const filtered = isFiltered(q, view.facets);
 
   const setMany = React.useCallback((ids: string[], on: boolean) => {
@@ -510,22 +508,20 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
     if (![...selected].every((id) => here.has(id))) setSelected(new Set([...selected].filter((id) => here.has(id))));
   }
   const checked = selectable.filter((r) => selected.has(r.a.id));
-  const liveChecked = managedLive.filter((r) => selected.has(r.a.id)).length;
-  const some = liveChecked > 0 && liveChecked < managedLive.length;
+  const liveChecked = live.filter((r) => selected.has(r.a.id)).length;
+  const some = liveChecked > 0 && liveChecked < live.length;
   const allBox = React.useCallback(
     (el: HTMLInputElement | null) => {
       if (el) el.indeterminate = some;
     },
     [some],
   );
-  // Only real sessions can receive commands; native rows are views into existing threads.
-  const targets = checked.length > 0 ? checked.map((r) => r.a) : managedLive.map((r) => r.a);
+  const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
   const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
-  const message = <MessageBar agents={targets} reach={reach} onEnded={clear} all={list} onPick={setMany} />;
+  const findable = React.useMemo(() => all.map((r) => r.a), [all]);
+  const message = <MessageBar agents={targets} reach={reach} onEnded={clear} all={findable} onPick={setMany} />;
   const folds = phone && checked.length === 0;
-  const renderRow = ({ a, stand, native }: MissionRow) => native
-    ? <NativeTask key={a.id} agent={native.agent} task={native.task} />
-    : <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />;
+  const renderRow = ({ a, stand }: MissionRow) => <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />;
 
   return (
     <>
@@ -534,7 +530,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
           <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
           {!phone && message}
           <React.Suspense fallback={null}>
-            <Recover rows={managed} />
+            <Recover rows={all} />
           </React.Suspense>
           <React.Suspense fallback={null}>
             <PushOffer />
@@ -554,15 +550,14 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
         <>
           <div className="ms-listhead" data-selecting={(touchScreen && selecting) || undefined}>
             {touchScreen ? (
-              // By touch: Select (or hold a row), then tap rows; All, and Done. Only kiln's own
-              // agents are picked (a native subagent's row is a view into its parent's thread).
+              // By touch: Select (or hold a row), then tap rows; All, and Done.
               <>
                 <span className="ms-count" aria-live="polite">
                   {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${all.length} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
                 </span>
                 {selecting ? (
                   <span className="ms-picks">
-                    <button type="button" className="ms-link" disabled={managedLive.length === 0 || liveChecked === managedLive.length} onClick={() => setMany(managedLive.map((r) => r.a.id), true)}>
+                    <button type="button" className="ms-link" disabled={live.length === 0 || liveChecked === live.length} onClick={() => setMany(live.map((r) => r.a.id), true)}>
                       Select all
                     </button>
                     <button type="button" className="ms-link ms-done" onClick={clear}>
@@ -570,7 +565,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                     </button>
                   </span>
                 ) : (
-                  managedLive.length > 0 && (
+                  live.length > 0 && (
                     <button type="button" className="ms-link ms-select" onClick={() => setPicking(true)}>
                       Select
                     </button>
@@ -584,10 +579,10 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
                     ref={allBox}
                     type="checkbox"
                     className="check"
-                    disabled={managedLive.length === 0}
-                    checked={managedLive.length > 0 && liveChecked === managedLive.length}
-                    onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...managedLive.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !managedLive.some((r) => r.a.id === id))))}
-                    aria-label={filtered ? `Select the ${managedLive.length} agents shown` : `Select all ${managedLive.length} agents`}
+                    disabled={live.length === 0}
+                    checked={live.length > 0 && liveChecked === live.length}
+                    onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
+                    aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
                   />
                   <span>
                     {checked.length > 0
@@ -638,8 +633,8 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
         </>
       )}
 
-      {/* What was said that holds the words of the filter, in every agent's conversation. */}
-      {all.length > 0 && <SaidInConversations q={q} />}
+      {/* Search the standalone agents' conversations, without their child threads. */}
+      {all.length > 0 && <SaidInConversations q={q} agents={searchAgents} />}
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
       <React.Suspense fallback={null}>
@@ -653,7 +648,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
               <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
               Ended · {ended.length}
             </button>
-            {managedEnded.length > 0 && <button type="button" className="ms-link" onClick={() => void Promise.allSettled(managedEnded.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
+            {ended.length > 0 && <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
               Clear
             </button>}
           </div>

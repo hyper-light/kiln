@@ -1,6 +1,6 @@
 /**
  * What was said, found in the server's conversation store (docs/conversations.md, "Filtering and
- * search"): across every agent from Mission Control's filter, and in one agent's history beyond
+ * search"): across Mission Control's standalone agents, and in one agent's history beyond
  * what its timeline holds from its find bar. Each match shows where its words are, marked.
  */
 import * as React from "react";
@@ -9,6 +9,7 @@ import { Link } from "@/lib/router";
 import { harnessApi, type HEvent, type SaidHit } from "@/api/harness";
 import { relativeTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
+import { missionSaid } from "./mission-rows";
 
 /** Words typed before conversations are searched. */
 export const SAID_MIN = 3;
@@ -75,8 +76,9 @@ const when = (at: number) => relativeTime(at / 1000);
 
 const searchAll = (q: string) => (): Promise<SaidHit[]> => harnessApi.said({ q, limit: 40 }).then((r) => r.hits);
 
-function Hits({ q }: { q: string }) {
-  const hits = useSuspenseResource(`conversations/said:${q}`, searchAll(q)).data;
+function Hits({ q, agents }: { q: string; agents: ReadonlySet<string> }) {
+  const found = useSuspenseResource(`conversations/said:${q}`, searchAll(q)).data;
+  const hits = missionSaid(found, agents);
   const [all, setAll] = React.useState(false);
   if (hits.length === 0) return null;
   const shown = all ? hits : hits.slice(0, SHOWN);
@@ -123,13 +125,13 @@ function Hits({ q }: { q: string }) {
   );
 }
 
-/** Mission Control: what every agent said that holds the words typed in its filter. */
-export function SaidInConversations({ q }: { q: string }) {
+/** Mission Control: matches in the standalone agents' conversations. */
+export function SaidInConversations({ q, agents }: { q: string; agents: ReadonlySet<string> }) {
   const query = React.useDeferredValue(q.trim());
   if (query.length < SAID_MIN) return null;
   return (
     <React.Suspense fallback={null}>
-      <Hits q={query} />
+      <Hits q={query} agents={agents} />
     </React.Suspense>
   );
 }
