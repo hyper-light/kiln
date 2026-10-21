@@ -26,6 +26,7 @@ import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleDoctor } from "./doctor.ts";
@@ -1287,7 +1288,7 @@ const server = http.createServer(async (req, res) => {
     // ---- goal stacks ----
     if (await handleGoals(req, res, url)) return;
     // ---- agents that run agents ----
-    if (await handleFamily(req, res, url, () => [longInfo()])) return;
+    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
@@ -1655,7 +1656,14 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleFamilySession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))) return;
+    if (
+      hm &&
+      (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
+        handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
+        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))
+    )
+      return;
     ws.close(1008, "no such socket");
   });
 });
