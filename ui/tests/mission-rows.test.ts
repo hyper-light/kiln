@@ -109,5 +109,28 @@ test("a sort chosen on purpose is followed as it is; by default what needs you c
     { a: agent({ id: "epsilon", name: "Epsilon", status: "exited" }), stand: "crashed" },
   ];
   assert.deepEqual(names(sortRows(rows, "name")), ["Alpha", "Beta", "Delta", "Epsilon", "Gamma"]);
-  assert.deepEqual(names(sortRows(rows, "priority")), ["Delta", "Gamma", "Epsilon", "Alpha", "Beta"]);
+  assert.deepEqual(names(sortRows(rows, "priority")), ["Delta", "Gamma", "Beta", "Alpha", "Epsilon"]);
+});
+
+test("needs-first puts working and ready before finished, followed by every inactive state", () => {
+  const states = ["ended", "offline", "paused", "crashed", "finished", "ready", "working", "needs"] as const;
+  const rows: MissionRow[] = states.map((stand, i) => ({
+    a: agent({ id: stand, name: stand, created_at: 9000 - i * 1000, last_activity: 9000 - i * 1000 }),
+    stand,
+  }));
+  assert.deepEqual(sortRows(rows, "priority").map((r) => r.stand), ["needs", "working", "ready", "finished", "crashed", "paused", "offline", "ended"]);
+  assert.deepEqual(rows.map((r) => r.stand), states, "sorting does not mutate the live roster");
+});
+
+test("live lifecycle changes update priority even when finished agents are newer", () => {
+  const rows: MissionRow[] = [
+    { a: agent({ id: "work", name: "Work", created_at: 1000 }), stand: "working" },
+    { a: agent({ id: "ready", name: "Ready", created_at: 2000 }), stand: "ready" },
+    { a: agent({ id: "done", name: "Done", created_at: 3000, last_activity: 10000 }), stand: "finished" },
+  ];
+  assert.deepEqual(names(sortRows(rows, "priority")), ["Work", "Ready", "Done"]);
+  const updated = rows.map((r): MissionRow => r.a.id === "done" ? { ...r, stand: "working" } : r.a.id === "work" ? { ...r, stand: "finished" } : r);
+  assert.deepEqual(names(sortRows(updated, "priority")), ["Done", "Ready", "Work"]);
+  const needs = updated.map((r): MissionRow => r.a.id === "work" ? { ...r, stand: "needs" } : r);
+  assert.deepEqual(names(sortRows(needs, "priority")), ["Work", "Done", "Ready"]);
 });

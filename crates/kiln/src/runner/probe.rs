@@ -209,17 +209,9 @@ fn kvm() -> (bool, bool) {
 
 /// The work directory's own file system (a `tmpfs` too, which `sysinfo`'s disks leave out): its
 /// size and what this user may still write.
-#[cfg(unix)]
-#[allow(clippy::useless_conversion, reason = "the block counts are u32 on some systems, u64 on others")]
 pub(crate) fn volume(dir: &Path) -> Option<Disk> {
-    let s = nix::sys::statvfs::statvfs(dir).ok()?;
-    let frag = u64::from(s.fragment_size());
-    Some(Disk { total: u64::from(s.blocks()).saturating_mul(frag), free: u64::from(s.blocks_available()).saturating_mul(frag) })
-}
-
-#[cfg(not(unix))]
-pub(crate) fn volume(_dir: &Path) -> Option<Disk> {
-    None
+    let (total, free) = crate::os::disk_space(dir)?;
+    Some(Disk { total, free })
 }
 
 /// The machine: its OS, CPU, memory, the work directory's volume, virtualization and emulation.
