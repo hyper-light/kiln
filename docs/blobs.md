@@ -55,7 +55,7 @@ bytes) stops the server at start, saying which.
 | `sync/<sha256>` | the server's copy of the contents synced repos' steps name | `sync::contents` | a week after no repo's tree names it |
 | `binaries/kiln-<target>`, `binaries/kiln-<target>.json` | runner upgrade binaries for other platforms, and what kiln knows of each | `updates` | when it's removed (Settings → Updates) or replaced |
 | `recordings/<session>/<recording>/<file>` | live pages' recordings (video, log, test), copied from their machine when they end | `harness::streams` | when the conversation closes |
-| `transcripts/<session>/<source>.jsonl.br` | a closed conversation's own record (Claude Code's transcript, Codex's rollouts), brotli | `harness::archive` | kept |
+| `transcripts/<session>/<source>/<first>-<last>.jsonl.br` | a piece of a closed conversation's own record (Claude Code's transcript, Codex's rollouts): lines `first` to `last`, brotli, written once and never replaced | `harness::archive` | kept; the conversation store lets no record go before it's archived |
 
 Keys are 1 to 960 bytes of UTF-8, in `/`-separated segments of 1 to 255 bytes, with no `.` or
 `..` segment, no control characters and no backslash: the same keys on every store.

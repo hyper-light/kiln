@@ -11,8 +11,8 @@
 //! - `binaries/kiln-<target>` and `binaries/kiln-<target>.json`: runner upgrade binaries
 //!   (`crate::updates`);
 //! - `recordings/<session>/<recording>/<file>`: live pages' recordings (`crate::harness::streams`);
-//! - `transcripts/<session>/<source>.jsonl.br`: ended agents' transcripts
-//!   (`crate::convo::archive`).
+//! - `transcripts/<session>/<source>/<first>-<last>.jsonl.br`: ended agents' transcripts, in pieces
+//!   (`crate::harness::archive`).
 
 pub mod chunks;
 pub mod cli;
@@ -436,7 +436,7 @@ pub(crate) mod tests {
             crate::sync::contents::key("<sha256>"),
             crate::updates::binary_key("<target>"),
             crate::harness::streams::recording_key("session", "recording", "file"),
-            crate::harness::archive::key("session", "source"),
+            crate::harness::archive::key("session", "source", 0, 9),
         ];
         for k in families {
             let family = k.split('/').next().unwrap_or_default();

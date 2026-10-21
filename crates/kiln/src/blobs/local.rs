@@ -982,7 +982,7 @@ pub(crate) mod tests {
             let f = Fixture::new()?;
             let b = &f.blobs;
             let noise = kiln_seams::blobs::noise;
-            let held = [("sync/a", noise(2 << 20, 21)), ("binaries/kiln-x", noise(3 << 20, 22)), ("recordings/s/r/video", noise(1 << 20, 23)), ("transcripts/s/claude.jsonl.br", noise(1 << 20, 24))];
+            let held = [("sync/a", noise(2 << 20, 21)), ("binaries/kiln-x", noise(3 << 20, 22)), ("recordings/s/r/video", noise(1 << 20, 23)), ("transcripts/s/claude/0-9.jsonl.br", noise(1 << 20, 24))];
             for (k, v) in &held {
                 b.put(k, v.clone(), Put::default()).await?;
             }

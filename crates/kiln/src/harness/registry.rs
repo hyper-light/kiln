@@ -324,6 +324,11 @@ impl Registry {
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
+        // No record goes before kiln's store of bytes has it: held back entirely until the archive
+        // of transcripts (`super::archive`) says how far it has come.
+        if let Some(c) = &convo {
+            c.hold_prune(0);
+        }
         // Runners that keep a store send it here; the server keeps their sessions from that. What
         // a mirror sends back to restore the store from isn't sent to it again.
         let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
