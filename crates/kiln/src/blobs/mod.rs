@@ -387,6 +387,7 @@ impl Following {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::future::Future;
+    use std::path::PathBuf;
 
     use kiln_seams::blobs::BlobsFixture;
     use kiln_seams::conformance::Report;
@@ -409,5 +410,36 @@ pub(crate) mod tests {
             }
         }
         Ok(report)
+    }
+
+    /// CP-T10.1: docs/blobs.md says every `[blobs]` and `[blobs.s3]` setting the code reads, and
+    /// every family of keys kiln keeps, as the code makes them.
+    #[test]
+    fn docs_blobs_md_says_every_setting_and_key_family() -> anyhow::Result<()> {
+        let doc = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/blobs.md"))?;
+        let mut s3 = super::s3::Config::default();
+        (s3.secret_access_key_file, s3.session_token_file, s3.ca_file) = (Some("f".into()), Some("f".into()), Some("f".into()));
+        let cfg = toml::Value::try_from(super::Config { s3, ..super::Config::default() })?;
+        let mut settings: Vec<String> = Vec::new();
+        for (k, v) in cfg.as_table().into_iter().flatten() {
+            match v.as_table() {
+                Some(t) => settings.extend(t.keys().cloned()),
+                None => settings.push(k.clone()),
+            }
+        }
+        let missing: Vec<&String> = settings.iter().filter(|k| !doc.contains(&format!("\n{k} =")) && !doc.contains(&format!("# {k} ="))).collect();
+        anyhow::ensure!(missing.is_empty(), "docs/blobs.md doesn't show the settings {missing:?}");
+        let families = [
+            crate::ci::services::cas::key("<sha256>"),
+            crate::sync::contents::key("<sha256>"),
+            crate::updates::binary_key("<target>"),
+            crate::harness::streams::recording_key("session", "recording", "file"),
+            crate::harness::archive::key("session", "source"),
+        ];
+        for k in families {
+            let family = k.split('/').next().unwrap_or_default();
+            anyhow::ensure!(doc.contains(&format!("`{family}/")), "docs/blobs.md doesn't name the keys {family}/ ({k})");
+        }
+        Ok(())
     }
 }
