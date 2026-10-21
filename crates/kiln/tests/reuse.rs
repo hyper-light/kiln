@@ -152,3 +152,115 @@ fn w08_ac06_a_leg_takes_a_result_for_the_same_inputs() -> anyhow::Result<()> {
     assert!(rebuilt.contains("built 1") && rebuilt != line, "it built again, at the reused commit: {rerun_log}");
     Ok(())
 }
+
+const PULL: &str = r#"on: pull_request
+jobs:
+  build:
+    runs-on: local
+    reuse: { paths: [src] }
+    steps:
+      - run: echo "built $(cat src/version) as $(date +%s%N)"
+  docs:
+    runs-on: local
+    reuse: { paths: [docs] }
+    steps:
+      - run: echo "documented $(cat docs/note) as $(date +%s%N)"
+"#;
+
+/// The newest `pull_request` run made at `since` or after, once it has finished: its legs by key,
+/// each its detail and its log.
+fn pull_run(s: &Server, since: i64) -> anyhow::Result<std::collections::BTreeMap<String, (Value, String)>> {
+    let mut run = String::new();
+    until(s, 300, "the pull request's run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/reuse&limit=20", &s.admin, None)?;
+        let runs = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        let newest = runs.into_iter().find(|r| r.get("event").and_then(Value::as_str) == Some("pull_request") && r.get("created_at").and_then(Value::as_i64).is_some_and(|c| c >= since));
+        match newest {
+            Some(r) if r.get("finished_at").is_some_and(|f| !f.is_null()) => {
+                run = r.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                Ok(None)
+            }
+            _ => Ok(Some(body)),
+        }
+    })?;
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+    let mut legs = std::collections::BTreeMap::new();
+    for l in serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let (about, log) = leg_now(s, l.get("id").and_then(Value::as_str).unwrap_or_default())?;
+        legs.insert(about.pointer("/leg/key").and_then(Value::as_str).unwrap_or_default().to_owned(), (about, log));
+    }
+    Ok(legs)
+}
+
+/// W08-R10 with W14: a diff that only rebases reuses every leg whose paths it didn't touch. Its
+/// first version builds and documents; then the trunk moves on, changing the docs; the diff rebased
+/// onto it, its own change the same, takes the build's result and documents again.
+#[test]
+fn w08_r10_a_rebased_diff_reuses_what_it_did_not_touch() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/reuse", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    for d in ["src", "docs", ".kiln"] {
+        std::fs::create_dir_all(work.join(d))?;
+    }
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/reuse.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "reuse\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::write(work.join(".kiln/pull.yaml"), PULL)?;
+    std::fs::write(work.join("src/version"), "1\n")?;
+    std::fs::write(work.join("docs/note"), "first\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "the workflow"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    // The diff's first version: both run.
+    std::fs::write(work.join("src/version"), "2\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "version 2\n\nChange-Id: I3333333333333333333333333333333333333333"])?;
+    let since = now();
+    git(&home, &work, &["push", "-q", &push, "HEAD:refs/for/main"])?;
+    let first = pull_run(&s, since)?;
+    for key in ["build", "docs"] {
+        let (about, log) = first.get(key).cloned().unwrap_or_default();
+        assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{key}: {about}\n{log}\n{}", s.log());
+        assert!(about.pointer("/leg/reused_from").is_none_or(Value::is_null), "{key} had nothing to reuse: {about}");
+    }
+    let built_first = built(&first.get("build").cloned().unwrap_or_default().1);
+    assert!(built_first.contains("built 2"), "{built_first}");
+    // The trunk moves on: its docs change.
+    git(&home, &work, &["branch", "-q", "diff"])?;
+    git(&home, &work, &["reset", "-q", "--hard", "HEAD~1"])?;
+    std::fs::write(work.join("docs/note"), "second\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "the docs again"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    // The diff rebased onto it, its own change the same: a new version.
+    git(&home, &work, &["checkout", "-q", "diff"])?;
+    git(&home, &work, &["rebase", "-q", "main"])?;
+    let since = now();
+    git(&home, &work, &["push", "-q", &push, "HEAD:refs/for/main"])?;
+    let second = pull_run(&s, since)?;
+    let (build, build_log) = second.get("build").cloned().unwrap_or_default();
+    assert_eq!(build.pointer("/leg/conclusion"), Some(&json!("success")), "{build}\n{build_log}");
+    assert!(build.pointer("/leg/reused_from").is_some_and(|r| !r.is_null()), "the build's paths are as they were: {build}");
+    assert_eq!(built(&build_log), built_first, "its log is the first version's");
+    let (docs, docs_log) = second.get("docs").cloned().unwrap_or_default();
+    assert_eq!(docs.pointer("/leg/conclusion"), Some(&json!("success")), "{docs}\n{docs_log}");
+    assert!(docs.pointer("/leg/reused_from").is_none_or(Value::is_null), "the trunk changed the docs: {docs}");
+    assert!(docs_log.contains("documented second"), "{docs_log}");
+    Ok(())
+}
+
+/// Now, in Unix seconds (a run's `created_at`).
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}

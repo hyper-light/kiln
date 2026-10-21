@@ -48,9 +48,37 @@ pub struct Server {
     pub port: u16,
     pub admin: String,
     dir: std::path::PathBuf,
+    /// Its environment beyond the test's, kept for a restart.
+    #[allow(dead_code)]
+    env: Vec<(String, String)>,
 }
 
 impl Server {
+    /// Stopped (killed, as a crash or a host's restart would), then started again on its ports and
+    /// its data: its log goes on in `server.log`.
+    #[allow(dead_code)]
+    pub fn restart(&mut self) -> anyhow::Result<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let log = std::fs::OpenOptions::new().append(true).open(self.dir.join("server.log"))?;
+            let mut cmd = server_command(&self.dir, log)?;
+            cmd.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            self.child = cmd.spawn()?;
+            // Up once it answers; its ports may take a moment to be free again.
+            while self.child.try_wait()?.is_none() {
+                if let Ok((200, _)) = http(self.port, "GET", "/healthz", "", None) {
+                    return Ok(());
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the server didn't start again");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the server didn't start again:\n{}", self.log());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// The end of the server's log.
     #[allow(dead_code)]
     pub fn log(&self) -> String {
@@ -101,6 +129,18 @@ pub fn start_env(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)])
         }
     }
     anyhow::bail!("the server didn't start: {why}")
+}
+
+/// `kiln server` with `dir`'s configuration, its home in `dir`, writing to `log`.
+fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home)?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
+    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CHAOS"] {
+        cmd.env_remove(var);
+    }
+    Ok(cmd)
 }
 
 fn start_once(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)]) -> anyhow::Result<Result<Server, String>> {
@@ -154,20 +194,13 @@ enabled = true
         // And pods (a `k8s` pool's: docs/ci.md W13-R07).
         kubernetes = if o.extra.contains("[kubernetes]") { "" } else { "[kubernetes]\nenabled = false\n" },
     );
-    let cfg = dir.join("kiln.toml");
-    std::fs::write(&cfg, config)?;
-    let home = dir.join("home");
-    std::fs::create_dir_all(&home)?;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    std::fs::write(dir.join("kiln.toml"), config)?;
     // Its log, for a test that wants to say why it failed (`Server::log`).
     let log = std::fs::File::create(dir.join("server.log"))?;
-    cmd.args(["--config", &cfg.to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CHAOS"] {
-        cmd.env_remove(var);
-    }
+    let mut cmd = server_command(dir, log)?;
     cmd.envs(env.iter().copied());
     let child = cmd.spawn()?;
-    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf() };
+    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect() };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = server.child.try_wait()? {

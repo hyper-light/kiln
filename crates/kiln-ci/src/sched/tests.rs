@@ -589,3 +589,30 @@ fn w05_r12_reserved_pool() -> Result<(), String> {
     assert_eq!(sim.started("other"), Some(3 * H), "after the window");
     Ok(())
 }
+
+/// W05-R03: a request as written. CPUs as Kubernetes writes them (`500m` is half of one, not 500
+/// minutes), memory and disk in bytes with their units, GPUs; a pool's the same way.
+#[test]
+fn w05_r03_requests_as_written() -> Result<(), String> {
+    use super::pools::{ResourceSpec, cpus};
+    assert_eq!(cpus("2"), Some(2.0));
+    assert_eq!(cpus("500m"), Some(0.5));
+    assert_eq!(cpus("0.25"), Some(0.25));
+    assert_eq!(cpus("-1"), None);
+    assert_eq!(cpus("lots"), None);
+    let r = ResourceSpec { cpu: Some("1500m".into()), memory: Some("2Gi".into()), disk: Some("10G".into()), gpu: Some(1) }.resources()?;
+    assert_eq!(r, Resources { cpu: 1.5, mem: 2 << 30, disk: 10_000_000_000, gpu: 1 });
+    assert_eq!(ResourceSpec::default().resources()?, Resources::default(), "nothing asked");
+    assert!(ResourceSpec { memory: Some("much".into()), ..ResourceSpec::default() }.resources().is_err());
+    let pool = PoolSpec {
+        name: "p".into(),
+        executor: "docker".into(),
+        image: Some("alpine:3.20".into()),
+        labels: vec!["p".into()],
+        resources: Some(ResourceSpec { cpu: Some("100m".into()), memory: Some("64Mi".into()), ..ResourceSpec::default() }),
+        ..PoolSpec::default()
+    }
+    .pool()?;
+    assert_eq!((pool.request.cpu, pool.request.mem), (0.1, 64 << 20), "a pool's executor asks a tenth of a CPU");
+    Ok(())
+}

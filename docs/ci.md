@@ -176,10 +176,10 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
 | W03 | Triggers and events | W02 | done | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; the whole native table: `pull_request`'s activity types and `pull_request_target`, comments and reviews, the merge queue's `enqueued`/`dequeued`; kiln's `land`, `agent`, `webhook` (inbound hooks), `pipeline` and `deploy`; `chain-depth`; nothing started by a job's token; the App's events; AC01–AC09 |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit, and AC04 and AC06 end to end), reusable workflows local and remote, plan preview, outputs' provenance and readers (R23); fixtures F-10 to F-15 and AC07; `files:` shards in runs, `$KILN_SHARD_ITEMS`, runs' removed combinations; AC08 on the live cluster left |
-| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); AC05 (pre, main and post order, `post-if`, cancellation, timeouts) and AC06 (paths in containers); a `k8s` pool's pods (W13-R07); Firecracker microVMs (W13-R05); shards' left with W13 |
+| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC10 (AC08 at 127k assignments/s; AC09 a server killed under a queue, its running legs re-adopted), reruns as attempts; pools' executors scaled with W13 (R27); reservations (R12); the `scaling` and `reservation` reasons; resource mode from runners' facts (R03); AC11 on the live cluster left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); AC04 (each shell, on Linux and macOS; Windows left), AC05 (pre, main and post order, `post-if`, cancellation, timeouts) and AC06 (paths in containers); a `k8s` pool's pods (W13-R07); Firecracker microVMs (W13-R05); shards' left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1`, `kiln/auth@v1`, `kiln/upload@v1`, `kiln/download@v1`, `kiln/cache@v1` and `kiln/deploy@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` actions of the owner's own repositories; tarballs in the store; the run page's pins and a rerun with fresh actions; musl Node for Alpine job containers |
-| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit's `type=gha` and `type=registry` caches (R11, AC03); speed left |
+| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06, a rebased diff's); `kiln/cache@v1` and `cache:` on chunks (only new ones move; `ref`, `repo` and `global` scopes; a runner's local tier); called workflows' cache-mode capped; v1's `artifacts:`; the store's chunks in an S3-compatible bucket (R02); BuildKit's `type=gha` and `type=registry` caches (R11, AC03); speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault, Vault, Infisical, Doppler, 1Password), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments' secrets only after approval (AC07); Settings → CI's secrets and variables by scope (W21-R11); Vault, Infisical, Doppler and 1Password as stores (R08); AC02 (every read and read-only tool walked, none with a value); AC06 (declarations end to end, an action's undeclared reads reported); AC08 (W18-AC03's); a repository's, a workflow's and an environment's secrets on their pages |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
@@ -1284,7 +1284,8 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
     `schedule` entry; `repository_dispatch`'s types; `on: [push, fork]` and a map with some
     events filtered.
   - `branches` with `branches-ignore` (and tags', and paths') is an error (KCI1015).
-- *Left.* The App's events (with W14-R10).
+- *Done.* The App's events (W14-R10): its signed webhook's events reach the workflows as GitHub's
+  do, and GitHub's Re-run and a check suite's rerun rerun kiln's run (`w14_r10_github_app`).
 
 ### W04 Planner: graph, matrices, reusable workflows, outputs
 
@@ -1902,8 +1903,33 @@ W20.
   its pool; it waits for `scaling` while executors start for it. On the simulator, a
   burst of 200 legs scales a pool to its `max` of 32 and back to `min_idle` within
   `idle_timeout` (`w13_ac04_pool_burst_on_the_simulator`).
-  - AC07 (cancel timing on the host executor), AC09 at 10,000 legs, AC11 live.
-  - Resource capacity from W13's facts.
+- *Done.* AC07, GitHub's cancel sequence timed on the host executor (in W06-AC05's
+  `w06_ac05_post_steps_cancellation_and_timeouts`): a step trapping both signals gets SIGINT as the
+  run is cancelled, SIGTERM 7.5 s on, and is killed at 10 s, each within half a second; then the
+  `always()` step and the post step run.
+- *Done.* AC09 (`tests/restart.rs`, `w05_ac09_a_restart_rebuilds_the_queue`): a run of two slow
+  legs on a runner of its own and 1,000 legs queued for runners there aren't; the server killed and
+  started again on its ports and data while the slow legs' steps run.
+  - The dispatcher rebuilt all 1,002 legs within 2 s, saying how many and how long as it started.
+  - It took the slow legs back from the runner as the runner reconnected; each finished once, on
+    its first attempt.
+  - The queued legs waited on, none assigned.
+  - A checkout that meets the server away (restarting) tries its fetch again, waiting 1 s and
+    doubling to 15 s, for two minutes, as `actions/checkout` retries its own.
+  - `kiln ci bench` measures the rebuild at 10,000 queued legs (`ci.bench.restart.rebuild_ms`,
+    §1.5's ≤ 2 s; W22-AC08).
+- *Done.* R03's resource mode end to end: `[ci.scheduler] mode = "resources"`, with `overcommit = {
+  cpu, memory, disk }` (1.5, 1 and 1 by default) and `default_request = { cpu, memory, disk, gpu
+  }`.
+  - A runner offers what its facts say it has (W13-R01): its CPUs' threads, its memory, its work
+    volume's free disk and its GPUs. Until its facts are in, it offers its slots.
+  - A leg takes what its job's `resources:` asks, else the default. CPUs are written as
+    Kubernetes writes them (`2`, `0.5`, `500m` for half of one); memory and disk with their units.
+    A pool's `resources.cpu` reads `500m` the same way now, where it was 500 minutes.
+  - Checked end to end (`tests/capacity.rs`): two legs each asking more than half of the
+    machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
+    ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
+- *Left.* AC11 on the live cluster.
 
 ### W06 Step runtime on the runner
 
@@ -2168,8 +2194,15 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
   `/__w/_temp/_runner_file_commands`, each working (an output, a variable and a path the next
   step has); a Docker action's are `/github/workspace` and `/github/file_commands`, its output
   and what it wrote in the workspace reaching the steps after it.
+- *Done.* AC04 (`w06_ac04_each_shell_here`, on whatever machine runs it): each shell the machine
+  has, as GitHub runs it. `bash` fails a step on a command failing mid-pipeline (`pipefail`) and
+  `sh` doesn't; PowerShell (`$ErrorActionPreference = 'stop'`) and `cmd` on Windows; `python`; a
+  custom template (`perl {0}`). Each failing step says its exit code as GitHub does, and
+  `working-directory` is where the step runs. Run on Linux (x86-64) and macOS (arm64).
 - *Left.*
-  - AC04 on macOS and Windows; AC07 (with W22-AC01).
+  - AC04's run on Windows: the same test on a Windows runner (`cargo test -p kiln --lib
+    w06_ac04`).
+  - AC07 (with W22-AC01).
 
 ### W07 Actions
 
@@ -2734,7 +2767,10 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
     (W22-AC08): a 1 GiB entry restored at 7,962 MiB/s, against 500. R13's insights are done
     (`cache_v1.rs` and the chunked cache record every lookup and save; W19 shows them by key
     prefix, with the time hits saved).
-  - A diff that only rebases reusing what it didn't touch (W14).
+- *Done.* R10's rebased diff (`w08_r10_a_rebased_diff_reuses_what_it_did_not_touch`): a diff's
+  first version builds and documents; the trunk moves on, changing only its docs; the diff
+  rebased onto it, its own change the same, takes the build's result (its log the first
+  version's) and documents again, the listed paths' trees deciding.
 
 ### W09 Secrets and variables
 
@@ -6506,7 +6542,9 @@ and AC02.
     - run creation: 1,000 pushes, each timed from its event to its run in the store, the
       workflow already read (git stubbed);
     - log ingest: 16 legs' output at once, and a line's way to a live viewer;
-    - the cache's store: a 1 GiB entry saved, then restored as a restore streams it.
+    - the cache's store: a 1 GiB entry saved, then restored as a restore streams it;
+    - a restart (W05-AC09): 10,000 legs queued by one hub on a store on disk, for runners there
+      aren't, rebuilt by a second hub on that store, as the server is when it starts again.
 
     The network's part (the runner's link, HTTP, the browser) is the live cluster's to confirm.
 

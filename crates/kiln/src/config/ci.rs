@@ -386,12 +386,42 @@ pub struct Scheduler {
     pub aging_per_minute: f64,
     /// Seconds a leg is expected to take when its job has no history (W19's medians).
     pub default_cost_seconds: f64,
+    /// `slots` (each runner takes its `slots` legs at once) or `resources` (W05-R03): a runner
+    /// offers what its facts say it has (CPUs, memory, the work volume's free disk, GPUs), times
+    /// `overcommit`, and a leg takes what its job's `resources:` asks, else `default_request`.
+    pub mode: String,
+    pub overcommit: Overcommit,
+    pub default_request: kiln_ci::sched::pools::ResourceSpec,
+}
+
+impl Scheduler {
+    /// Resource mode (W05-R03).
+    pub fn resources(&self) -> bool {
+        self.mode.trim().eq_ignore_ascii_case("resources")
+    }
 }
 
 impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
-        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost }
+        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost, mode: "slots".into(), overcommit: Overcommit::default(), default_request: Default::default() }
+    }
+}
+
+/// How far past what a runner has its legs may ask, in resource mode: CPUs 1.5 times, memory and
+/// disk once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Overcommit {
+    pub cpu: f64,
+    pub memory: f64,
+    pub disk: f64,
+}
+
+impl Default for Overcommit {
+    fn default() -> Self {
+        let d = kiln_ci::sched::state::Config::default();
+        Overcommit { cpu: d.overcommit_cpu, memory: d.overcommit_mem, disk: d.overcommit_disk }
     }
 }
 

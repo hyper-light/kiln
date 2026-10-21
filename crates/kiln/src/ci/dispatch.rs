@@ -279,6 +279,7 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         cost: r.costs.get(&spec.job).copied(),
         // On a `k8s` pool, a pod of its own, its containers in it (W13-R07).
         own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty()),
+        request: request_of(job, cfg),
         ..LegIn::default()
     }
 }
@@ -286,7 +287,33 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
 /// The scheduler's settings: `[ci.scheduler]`, `[ci.fairness]` and the routing rules.
 fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config {
     let (s, f) = (&hub.cfg.ci.scheduler, &hub.cfg.ci.fairness);
-    Config { rules, aging_per_minute: s.aging_per_minute, default_cost: s.default_cost_seconds, weights: f.weights.clone(), quotas: f.quotas.clone(), ..Config::default() }
+    Config {
+        rules,
+        aging_per_minute: s.aging_per_minute,
+        default_cost: s.default_cost_seconds,
+        weights: f.weights.clone(),
+        quotas: f.quotas.clone(),
+        resources: s.resources(),
+        overcommit_cpu: s.overcommit.cpu,
+        overcommit_mem: s.overcommit.memory,
+        overcommit_disk: s.overcommit.disk,
+        ..Config::default()
+    }
+}
+
+/// What a leg asks of its runner in resource mode (W05-R03): its job's `resources:` (kiln's: `{
+/// cpu, memory, disk, gpu }`), else `[ci.scheduler] default_request`.
+fn request_of(job: Option<&kiln_ci::wf::ir::Job>, cfg: &crate::config::ci::Ci) -> kiln_ci::sched::state::Resources {
+    use kiln_ci::wf::ir::YVal;
+    let asked = job.and_then(|j| j.kiln.resources.as_ref()).map(|v| {
+        let text = |k: &str| match v.get(k) {
+            Some(YVal::Str(t)) => Some(t.src.clone()),
+            Some(YVal::Num(n)) => Some(n.to_string()),
+            _ => None,
+        };
+        kiln_ci::sched::pools::ResourceSpec { cpu: text("cpu"), memory: text("memory"), disk: text("disk"), gpu: text("gpu").and_then(|g| g.trim().parse().ok()) }
+    });
+    asked.and_then(|a| a.resources().ok()).or_else(|| cfg.scheduler.default_request.resources().ok()).unwrap_or_default()
 }
 
 /// The hub's handle on the dispatcher.
@@ -299,12 +326,22 @@ pub struct Handle {
     runs: Arc<Mutex<HashSet<String>>>,
     /// Failed legs kept to look into: the runner keeping each, and until when (W17-R02).
     kept: Mutex<HashMap<String, (String, i64)>>,
+    /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09).
+    restored: Mutex<Option<Restored>>,
+}
+
+/// What the dispatcher rebuilt as it started: the unfinished runs, their legs, and how long it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restored {
+    pub runs: usize,
+    pub legs: usize,
+    pub took: Duration,
 }
 
 impl Default for Handle {
     fn default() -> Self {
         let (tx, rx) = async_channel::unbounded();
-        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), kept: Mutex::default() }
+        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), kept: Mutex::default(), restored: Mutex::default() }
     }
 }
 
@@ -318,6 +355,11 @@ impl Handle {
 
     pub fn enabled(&self) -> bool {
         self.on.load(Ordering::Relaxed)
+    }
+
+    /// What the dispatcher rebuilt as it started, once it has.
+    pub fn restored(&self) -> Option<Restored> {
+        *self.restored.lock()
     }
 
     /// Whether `job` is one of the engine's legs.
@@ -681,9 +723,15 @@ pub fn spawn(hub: Arc<Hub>) {
             in_commands: false,
             pods: std::collections::HashSet::new(),
         };
+        let started = std::time::Instant::now();
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
+        let restored = Restored { runs: d.runs.len(), legs: d.legs.len(), took: started.elapsed() };
+        if restored.runs > 0 {
+            tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), "the CI engine rebuilt its runs");
+        }
+        *hub.ci.restored.lock() = Some(restored);
         let agents: Vec<String> = hub.agents.lock().values().filter(|a| a.connected).map(|a| a.name.clone()).collect();
         for a in agents {
             d.runner_up(&a, &[]).await;
@@ -869,9 +917,21 @@ impl Dispatch {
         }
     }
 
+    /// What a runner offers in resource mode (W05-R03): what its facts say it has (its CPUs'
+    /// threads, its memory, its work volume's free disk, its GPUs); `None`, its slots, until they're
+    /// in, and in slot mode.
+    fn capacity_of(&self, a: &crate::hub::AgentLive) -> Option<kiln_ci::sched::state::Resources> {
+        if !self.hub.cfg.ci.scheduler.resources() {
+            return None;
+        }
+        let f = a.facts.as_ref()?;
+        let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
+        (cpus > 0).then(|| kiln_ci::sched::state::Resources { cpu: f64::from(cpus), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
+    }
+
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: None, executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         self.commands(cmds).await;
     }
@@ -889,7 +949,7 @@ impl Dispatch {
             self.hub.send_to_agent(agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await;
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
-        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: None, executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         for (leg, attempt) in gone {
             let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some("the runner lost it".into()), peak_rss: None, cpu_seconds: None };

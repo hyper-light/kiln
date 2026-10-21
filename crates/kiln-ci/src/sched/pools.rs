@@ -107,6 +107,34 @@ pub struct ResourceSpec {
     pub gpu: Option<u32>,
 }
 
+impl ResourceSpec {
+    /// What it asks for (W05-R03): CPUs (`2`, `0.5`, or thousandths, `500m`), memory and disk
+    /// (`512Mi`, `2G`, bytes) and GPUs; why not when one isn't a quantity.
+    pub fn resources(&self) -> Result<Resources, String> {
+        let bytes = |what: &str, v: &Option<String>| -> Result<u64, String> {
+            match v.as_deref().map(str::trim) {
+                Some(s) => routing::number(s).filter(|n| *n >= 0.0 && n.is_finite()).map(|n| n as u64).ok_or_else(|| format!("`resources.{what}` isn't a size (`512Mi`, `2G`): `{s}`")),
+                None => Ok(0),
+            }
+        };
+        let cpu = match self.cpu.as_deref().map(str::trim) {
+            Some(s) => cpus(s).ok_or_else(|| format!("`resources.cpu` isn't a number of CPUs (`2`, `0.5`, `500m`): `{s}`"))?,
+            None => 0.0,
+        };
+        Ok(Resources { cpu, mem: bytes("memory", &self.memory)?, disk: bytes("disk", &self.disk)?, gpu: self.gpu.unwrap_or(0) })
+    }
+}
+
+/// CPUs as Kubernetes writes them: `2`, `0.5`, or thousandths (`500m`).
+pub fn cpus(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let n = match s.strip_suffix('m') {
+        Some(milli) => milli.parse::<f64>().ok()? / 1000.0,
+        None => s.parse::<f64>().ok()?,
+    };
+    (n >= 0.0 && n.is_finite()).then_some(n)
+}
+
 /// The executor kinds a pool may have.
 pub const KINDS: &[&str] = &["docker", "firecracker", "shards", "k8s"];
 
@@ -153,14 +181,7 @@ impl PoolSpec {
             Some(t) => routing::number(t.trim()).filter(|s| *s >= 0.0).ok_or_else(|| format!("pool `{name}`: `idle_timeout` is a duration (`90s`, `10m`), not `{t}`"))?,
             None => 600.0,
         };
-        let size = |what: &str, v: &Option<String>| -> Result<f64, String> {
-            match v.as_deref() {
-                Some(s) => routing::number(s.trim()).filter(|n| *n >= 0.0).ok_or_else(|| format!("pool `{name}`: `resources.{what}` isn't a quantity: `{s}`")),
-                None => Ok(0.0),
-            }
-        };
-        let r = self.resources.clone().unwrap_or_default();
-        let request = Resources { cpu: size("cpu", &r.cpu)?, mem: size("memory", &r.memory)? as u64, disk: size("disk", &r.disk)? as u64, gpu: r.gpu.unwrap_or(0) };
+        let request = self.resources.clone().unwrap_or_default().resources().map_err(|e| format!("pool `{name}`: {e}"))?;
         Ok(Pool {
             name: name.to_owned(),
             executor: self.executor.clone(),

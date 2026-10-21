@@ -1412,11 +1412,26 @@ impl Leg {
                 // As typed in the workspace: without `-C <workspace>`.
                 let shown: Vec<&str> = if args.first() == Some(&"-C") { args.iter().skip(2).copied().collect() } else { args.iter().copied().filter(|x| *x != w.as_str()).collect() };
                 self.note(idx, &format!("git {}", shown.join(" "))).await;
-                let mut cmd = Command::new("git");
-                cmd.args(&args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "http.extraheader").env("GIT_CONFIG_VALUE_0", &header);
-                let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
-                if !out.status.success() {
-                    anyhow::bail!("git {}: {}", args.get(2).copied().unwrap_or_default(), String::from_utf8_lossy(&out.stderr).trim());
+                let mut again = Again::new();
+                loop {
+                    let mut cmd = Command::new("git");
+                    cmd.args(&args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "http.extraheader").env("GIT_CONFIG_VALUE_0", &header);
+                    let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
+                    if out.status.success() {
+                        break;
+                    }
+                    let said = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                    // The server away a moment (restarting): its fetch is tried again, as
+                    // `actions/checkout` tries its own.
+                    if args.get(2) == Some(&"fetch")
+                        && unreachable(&said)
+                        && let Some(wait) = again.next()
+                    {
+                        self.note(idx, &format!("The server didn't answer ({}); trying again in {}s", said.lines().last().unwrap_or_default(), wait.as_secs())).await;
+                        crate::rt::sleep(wait).await;
+                        continue;
+                    }
+                    anyhow::bail!("git {}: {said}", args.get(2).copied().unwrap_or_default());
                 }
             }
             return Ok(());
@@ -1425,10 +1440,20 @@ impl Leg {
         anyhow::ensure!(c.sparse.is_empty() && c.filter.is_none(), "sparse and partial checkouts need git, which isn't installed here");
         let url = format!("{}/api/v3/repos/{}/tarball/{sha}", st.server_url.trim_end_matches('/'), a.repo);
         self.note(idx, &format!("git isn't installed here: downloading {} at {}", a.repo, sha.get(..12).unwrap_or(&sha))).await;
-        let mut resp = self.http.get(&url).bearer(&token).timeout(Duration::from_secs(600)).send().await?;
-        if !resp.is_success() {
-            anyhow::bail!("the commit's tarball: HTTP {}", resp.status());
-        }
+        let mut again = Again::new();
+        let mut resp = loop {
+            let wait = match self.http.get(&url).bearer(&token).timeout(Duration::from_secs(600)).send().await {
+                Ok(r) if r.is_success() => break r,
+                Ok(r) if matches!(r.status(), 502..=504) => again.next().ok_or_else(|| anyhow::anyhow!("the commit's tarball: HTTP {}", r.status()))?,
+                Ok(r) => anyhow::bail!("the commit's tarball: HTTP {}", r.status()),
+                Err(e) => match again.next() {
+                    Some(w) => w,
+                    None => return Err(e.context("the commit's tarball")),
+                },
+            };
+            self.note(idx, &format!("The server didn't answer; trying again in {}s", wait.as_secs())).await;
+            crate::rt::sleep(wait).await;
+        };
         let mut bytes = Vec::new();
         while let Some(c) = resp.chunk().await? {
             bytes.extend_from_slice(&c);
@@ -4094,8 +4119,47 @@ impl Leg {
     }
 }
 
-/// Whether `path` is a report the job wrote (W16-R01's discovery): modified since `t` (less a
-/// second, for coarse clocks), and not a file git tracks (a checkout's are new too).
+/// Waits between tries at the server while it's away (a restart): 1 s, doubling to 15 s, for two
+/// minutes in all.
+struct Again {
+    wait: Duration,
+    until: Instant,
+}
+
+impl Again {
+    fn new() -> Again {
+        Again { wait: Duration::from_secs(1), until: Instant::now() + Duration::from_secs(120) }
+    }
+
+    /// How long to wait before the next try; `None` once the two minutes are up.
+    fn next(&mut self) -> Option<Duration> {
+        let wait = self.wait;
+        if Instant::now() + wait > self.until {
+            return None;
+        }
+        self.wait = wait.saturating_mul(2).min(Duration::from_secs(15));
+        Some(wait)
+    }
+}
+
+/// Whether git's `said` is of a server it couldn't reach, or one that answered it's unavailable.
+fn unreachable(said: &str) -> bool {
+    [
+        "Could not connect",
+        "Couldn't connect",
+        "Failed to connect",
+        "Connection refused",
+        "Connection reset",
+        "Empty reply from server",
+        "Recv failure",
+        "returned error: 502",
+        "returned error: 503",
+        "returned error: 504",
+    ]
+    .iter()
+    .any(|m| said.contains(m))
+}
+
 /// A deployment's name on its runner (W15-R02): `<repository>-<environment>`, as Compose takes a
 /// project's.
 fn deployment_name(repo: &str, env: &str) -> String {
@@ -4170,6 +4234,8 @@ fn deploy_memory(text: &str) -> anyhow::Result<u64> {
     Ok(mib)
 }
 
+/// Whether `path` is a report the job wrote (W16-R01's discovery): modified since `t` (less a
+/// second, for coarse clocks), and not a file git tracks (a checkout's are new too).
 fn written_since(path: &Path, t: std::time::SystemTime) -> bool {
     let recent = std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|m| m + Duration::from_secs(1) >= t);
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return recent };
@@ -4223,6 +4289,20 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The checkout tries the server again while it's away: on git's words for a server it couldn't
+    /// reach, waiting 1 s and doubling to 15 s, for two minutes in all.
+    #[test]
+    fn a_checkout_waits_out_a_restarting_server() {
+        assert!(unreachable("fatal: unable to access 'http://127.0.0.1:1/acme/app/': Failed to connect to 127.0.0.1 port 1 after 0 ms: Could not connect to server"));
+        assert!(unreachable("fatal: unable to access 'http://k/a/': The requested URL returned error: 503"));
+        assert!(!unreachable("fatal: couldn't find remote ref 0123456789abcdef"), "a commit that isn't there isn't tried again");
+        let mut again = Again::new();
+        let waits: Vec<u64> = std::iter::from_fn(|| again.next()).take(6).map(|w| w.as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 15, 15]);
+        let mut spent = Again { wait: Duration::from_secs(15), until: Instant::now() + Duration::from_secs(10) };
+        assert_eq!(spent.next(), None, "past its two minutes");
+    }
 
     /// W15-R02: a microVM deployment's inputs as the step reads them.
     #[cfg(target_os = "linux")]
@@ -4330,8 +4410,8 @@ mod tests {
         run_leg_with(workflow, secrets, dialect, prepare, &|_| {})
     }
 
-    /// [`run_leg_prepared`], the assignment changed by `tweak` first.
-    #[cfg(unix)]
+    /// [`run_leg_prepared`], the assignment changed by `tweak` first (on every platform: W06-AC04's
+    /// shells are each platform's).
     fn run_leg_with(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect, prepare: &dyn Fn(&Path) -> anyhow::Result<()>, tweak: &dyn Fn(&mut AssignmentV2)) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
         let path = if dialect == Dialect::Kiln { ".kiln/t.yaml" } else { ".github/workflows/t.yml" };
         let (w, d) = kiln_ci::wf::parse_workflow(path, workflow, dialect);
@@ -4371,12 +4451,82 @@ mod tests {
         Ok((result, logs, events))
     }
 
-    #[cfg(unix)]
     fn finished(events: &[JobEventV2], idx: u32) -> Option<(Conclusion, Conclusion, BTreeMap<String, String>)> {
         events.iter().find_map(|e| match e {
             JobEventV2::StepFinished { idx: i, outcome, conclusion, outputs, .. } if *i == idx => Some((*outcome, *conclusion, outputs.clone())),
             _ => None,
         })
+    }
+
+    /// W06-AC04: each shell this machine has, as GitHub runs it. `bash` fails a step on a command
+    /// failing mid-pipeline (`pipefail`), `sh` doesn't; PowerShell (`$ErrorActionPreference =
+    /// 'stop'`) and `cmd` on Windows; `python`; a custom template (`perl {0}`). Each failing step
+    /// says its exit code as GitHub does, and `working-directory` is where the step runs.
+    #[test]
+    fn w06_ac04_each_shell_here() -> anyhow::Result<()> {
+        let have = crate::os::have;
+        // A real Python 3 (Windows has a stand-in that offers to install one).
+        let python = std::process::Command::new("python").args(["-c", "import sys; print(sys.version_info[0])"]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "3");
+        // (shell, script, the exit code it fails with (`None`: it passes), what it says)
+        let mut cases: Vec<(String, &str, Option<i32>, &str)> = Vec::new();
+        if have("bash") {
+            cases.push(("bash".into(), "false | true\necho never", Some(1), ""));
+            cases.push(("bash".into(), "true | true && echo bash-ok", None, "bash-ok"));
+            cases.push(("bash".into(), "exit 7", Some(7), ""));
+        }
+        if cfg!(unix) {
+            cases.push(("sh".into(), "false | true && echo sh-ok", None, "sh-ok"));
+            cases.push(("sh".into(), "false\necho never", Some(1), ""));
+        }
+        if cfg!(windows) {
+            let ps = if have("pwsh") { "pwsh" } else { "powershell" };
+            cases.push((ps.into(), "Write-Output ps-ok", None, "ps-ok"));
+            cases.push((ps.into(), "exit 4", Some(4), ""));
+            cases.push((ps.into(), "Write-Error 'failing'\nWrite-Output never", Some(1), ""));
+            cases.push(("cmd".into(), "echo cmd-ok", None, "cmd-ok"));
+            cases.push(("cmd".into(), "exit /b 6", Some(6), ""));
+        }
+        if python {
+            cases.push(("python".into(), "print('py-ok')", None, "py-ok"));
+            cases.push(("python".into(), "import sys\nsys.exit(5)", Some(5), ""));
+        }
+        if have("perl") {
+            cases.push(("perl {0}".into(), "print \"custom-ok\\n\";", None, "custom-ok"));
+            cases.push(("perl {0}".into(), "exit 3;", Some(3), ""));
+        }
+        let block = |script: &str| script.lines().map(|l| format!("          {l}\n")).collect::<String>();
+        let mut wf = String::from("on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n");
+        for (shell, script, _, _) in &cases {
+            wf.push_str(&format!("      - continue-on-error: true\n        shell: {shell}\n        run: |\n{}", block(script)));
+        }
+        // `working-directory`, in the default shell.
+        let here = if cfg!(windows) { "New-Item -ItemType Directory -Force sub | Out-Null" } else { "mkdir -p sub" };
+        let print = if cfg!(windows) { "Write-Output \"in=$((Get-Location).Path)\"" } else { "echo \"in=$(pwd)\"" };
+        wf.push_str(&format!("      - run: {here}\n      - working-directory: sub\n        run: '{}'\n", print.replace('\'', "''")));
+        let (r, logs, events) = run_leg_with(&wf, &[], Dialect::Gha, &|_| Ok(()), &|_| {})?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        for (i, (shell, script, code, says)) in cases.iter().enumerate() {
+            let idx = u32::try_from(i)?;
+            let log = logs.get(&idx).cloned().unwrap_or_default();
+            let outcome = finished(&events, idx).map(|f| f.0);
+            let said = |c: i32| {
+                events
+                    .iter()
+                    .any(|e| matches!(e, JobEventV2::Annotation { idx: n, level, message, .. } if *n == idx && level == "error" && *message == format!("Process completed with exit code {c}.")))
+            };
+            match code {
+                None => assert_eq!(outcome, Some(Conclusion::Success), "`{shell}` ran `{script}`: {log}"),
+                Some(c) => {
+                    assert_eq!(outcome, Some(Conclusion::Failure), "`{shell}` ran `{script}`: {log}");
+                    assert!(said(*c), "`{shell}` ran `{script}` and exited {c}: {log} {events:?}");
+                }
+            }
+            assert!(log.contains(says) && !log.contains("never"), "`{shell}` ran `{script}`: {log}");
+        }
+        let wd = logs.get(&u32::try_from(cases.len() + 1)?).cloned().unwrap_or_default();
+        let at = wd.lines().find_map(|l| l.trim().strip_prefix("in=")).unwrap_or_default().trim_end_matches(['/', '\\']).to_owned();
+        assert!(at.ends_with("sub"), "the step ran in its working-directory: {wd}");
+        Ok(())
     }
 
     /// W06-S01, S03, S04 and the environment files, on this machine.

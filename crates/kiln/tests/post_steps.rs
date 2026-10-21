@@ -123,7 +123,12 @@ jobs:
       - uses: kinds/tell@v1
         with:
           name: four
-      - run: echo started-sleeping; sleep 300
+      - name: sleep 300
+        run: |
+          trap 'echo "got INT at $(date +%s%N)"' INT
+          trap 'echo "got TERM at $(date +%s%N)"' TERM
+          echo started-sleeping
+          for i in $(seq 1 3000); do echo "alive at $(date +%s%N)"; sleep 0.1 || true; done
       - if: always()
         run: echo "always after the cancel"
       - run: echo "never after the cancel"
@@ -276,6 +281,7 @@ fn w06_ac05_post_steps_cancellation_and_timeouts() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(300));
     }
     std::thread::sleep(Duration::from_secs(2));
+    let cancelled_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{id}/cancel"), &s.admin, Some(&json!({})))?;
     anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
     let run = run_on(&s, "cancel", 120, |r| r.get("finished_at").is_some_and(|f| !f.is_null()))?;
@@ -286,6 +292,17 @@ fn w06_ac05_post_steps_cancellation_and_timeouts() -> anyhow::Result<()> {
     assert_eq!(conclusion, "cancelled", "{log}");
     let sleeping = steps.iter().find(|(_, _, l)| l.contains("started-sleeping")).map(|(_, c, _)| c.clone());
     assert_eq!(sleeping.as_deref(), Some("cancelled"), "{log}");
+    // W05-AC07: GitHub's cancel sequence, timed. SIGINT at once, SIGTERM 7.5 s on, and killed at
+    // 10 s (its last heartbeat), each ± 0.5 s.
+    if cfg!(target_os = "linux") {
+        let times = |what: &str| -> Vec<u128> { log.lines().filter_map(|l| l.split_once(what).and_then(|(_, t)| t.trim().parse::<u128>().ok())).collect() };
+        let (int, term, alive) = (times("got INT at "), times("got TERM at "), times("alive at "));
+        let secs = |a: u128, b: u128| b.saturating_sub(a) as f64 / 1e9;
+        let (Some(&int), Some(&term), Some(&last)) = (int.first(), term.first(), alive.last()) else { anyhow::bail!("its signals and heartbeats:\n{log}") };
+        assert!(secs(cancelled_at, int) < 1.5, "SIGINT {}s after the cancel:\n{log}", secs(cancelled_at, int));
+        assert!((7.0..=8.0).contains(&secs(int, term)), "SIGTERM {}s after SIGINT:\n{log}", secs(int, term));
+        assert!((9.4..=10.5).contains(&secs(int, last)), "killed {}s after SIGINT:\n{log}", secs(int, last));
+    }
     let step = |what: &str| steps.iter().find(|(n, _, _)| n.contains(what)).cloned().unwrap_or_default();
     let (_, ran, out) = step("always after");
     assert!(ran == "success" && out.contains("always after the cancel"), "the `always()` step runs to its end:\n{log}");

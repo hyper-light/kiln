@@ -54,7 +54,7 @@ pub struct BenchArgs {
     /// The scheduler's alone (W05-AC08).
     #[arg(long)]
     scheduler: bool,
-    /// Only these: `scheduler`, `expressions`, `parsing`, `runs`, `logs`, `cache`, `list` (comma-separated).
+    /// Only these: `scheduler`, `expressions`, `parsing`, `runs`, `logs`, `cache`, `list`, `restart` (comma-separated).
     #[arg(long, value_delimiter = ',')]
     only: Vec<String>,
     /// Pushes for run creation.
@@ -69,6 +69,9 @@ pub struct BenchArgs {
     /// Runs in the store the runs list's first page is read from (W21-AC04).
     #[arg(long, default_value_t = 1_000_000)]
     list_runs: usize,
+    /// Queued legs rebuilt after a restart (W05-AC09).
+    #[arg(long, default_value_t = 10_000)]
+    queued_legs: usize,
     /// Runs of each measure; its median is the result.
     #[arg(long, default_value_t = 5)]
     runs: usize,
@@ -216,6 +219,11 @@ fn parsing(runs: usize) -> Measure {
 /// A hub of the bench's own, in `dir`: an in-memory store, the CI engine running, no runners and
 /// no HTTP.
 fn bench_hub(dir: &Path) -> Result<Arc<Hub>> {
+    bench_hub_on(dir, crate::store::Store::in_memory()?)
+}
+
+/// [`bench_hub`] on `store`.
+fn bench_hub_on(dir: &Path, store: crate::store::Store) -> Result<Arc<Hub>> {
     let mut cfg = crate::config::Config::default();
     cfg.server.data_dir = dir.to_path_buf();
     cfg.terminal.enabled = false;
@@ -223,35 +231,37 @@ fn bench_hub(dir: &Path) -> Result<Arc<Hub>> {
     let pki = Arc::new(crate::pki::Pki::open(&dir.join("pki"))?);
     let leaf = pki.server_leaf(&[])?;
     let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
-    let store = crate::store::Store::in_memory()?;
     let logs = crate::logs::Logs::new(dir.join("logs"), 1 << 20);
     let hub = Hub::new(Arc::new(cfg), store, logs, net, pki, crate::util::random_token(), crate::util::random_token(), crate::rt::Shutdown::new());
     crate::ci::dispatch::spawn(Arc::clone(&hub));
     Ok(hub)
 }
 
-/// W03-AC09: `pushes` pushes, each from its event to its run created (its id told back once the
-/// run is in the store), the workflow already read (git stubbed): the p99 (≤ 500 ms) and mean.
-async fn runs(hub: &Arc<Hub>, pushes: usize) -> Result<Vec<Measure>> {
-    use kiln_ci::trigger::Event;
-    let now = crate::util::now_unix();
-    let repo = hub
-        .store
+/// The bench's repository, `name`, native, its trunk `main`.
+async fn bench_repo(hub: &Arc<Hub>, name: &str) -> Result<crate::store::Repo> {
+    hub.store
         .upsert_repo(crate::store::Repo {
             id: crate::util::new_id(),
-            name: "bench/app".into(),
+            name: name.into(),
             clone_url: String::new(),
             branches: vec!["main".into()],
             poll_seconds: 0,
             enabled: true,
-            created_at: now,
+            created_at: crate::util::now_unix(),
             last_polled_at: None,
             last_error: None,
             mode: "native".into(),
             default_branch: Some("main".into()),
             mirror: None,
         })
-        .await?;
+        .await
+}
+
+/// W03-AC09: `pushes` pushes, each from its event to its run created (its id told back once the
+/// run is in the store), the workflow already read (git stubbed): the p99 (≤ 500 ms) and mean.
+async fn runs(hub: &Arc<Hub>, pushes: usize) -> Result<Vec<Measure>> {
+    use kiln_ci::trigger::Event;
+    let repo = bench_repo(hub, "bench/app").await?;
     let path = ".github/workflows/bench.yml";
     let text = "name: bench
 on: push
@@ -285,6 +295,69 @@ jobs:
     lat.sort_by(f64::total_cmp);
     let p99 = lat.get(lat.len() * 99 / 100).copied().unwrap_or(f64::NAN);
     Ok(vec![Measure::new("runs.created_p99", "ms", Better::Lower, 500.0, vec![p99])])
+}
+
+/// W05-AC09 (§1.5): a server's queue rebuilt after a restart. One hub, on a store on disk, queues a
+/// run of ten jobs of `legs / 10` legs each for runners there aren't; a second on that store, as
+/// the server is when it starts again, replays it. Its dispatcher's rebuild: ≤ 2 s.
+async fn restart(dir: &Path, legs: usize) -> Result<Vec<Measure>> {
+    use kiln_ci::trigger::Event;
+    let db = dir.join("restart.db");
+    let per = (legs / 10).clamp(1, 1_000);
+    let first = bench_hub_on(&dir.join("one"), crate::store::Store::open(&db)?)?;
+    let queued = async {
+        let repo = bench_repo(&first, "bench/queue").await?;
+        let axis = (0..per).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let jobs: String = (0..10).map(|j| format!("  q{j}:\n    runs-on: nowhere\n    matrix: {{ i: [{axis}] }}\n    steps:\n      - run: echo never\n")).collect();
+        let (path, text) = (".kiln/queue.yaml", format!("name: queue\non: push\njobs:\n{jobs}"));
+        let (workflow, _) = kiln_ci::wf::parse_workflow(path, &text, Dialect::Kiln);
+        anyhow::ensure!(workflow.is_some(), "the bench's queue didn't read");
+        let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new() };
+        let event = Event {
+            name: "push".into(),
+            repo: repo.name.clone(),
+            git_ref: "refs/heads/main".into(),
+            sha: format!("{:040x}", 1),
+            actor: "bench".into(),
+            trusted: true,
+            payload: serde_json::json!({}),
+            ..Event::default()
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
+        crate::ci::events::start_given(&first, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
+        let run = crate::rt::timeout(Duration::from_secs(60), rx.recv()).await.map_err(|_| anyhow::anyhow!("no run within a minute"))??;
+        // Every leg in the store, queued.
+        let want = per * 10;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let r = run.clone();
+            let n: i64 = first.store.call(move |c| Ok(c.query_row("SELECT COUNT(*) FROM jobs WHERE run_id = ?1 AND status = 'queued'", [r], |x| x.get(0))?)).await?;
+            if usize::try_from(n).is_ok_and(|n| n >= want) {
+                return anyhow::Ok(want);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{n} of {want} legs queued within five minutes");
+            crate::rt::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    .await;
+    first.shutdown.cancel();
+    let want = queued?;
+    let second = bench_hub_on(&dir.join("two"), crate::store::Store::open(&db)?)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let restored = loop {
+        if let Some(r) = second.ci.restored() {
+            break r;
+        }
+        if Instant::now() > deadline {
+            second.shutdown.cancel();
+            anyhow::bail!("the second hub didn't rebuild its runs within two minutes");
+        }
+        crate::rt::sleep(Duration::from_millis(5)).await;
+    };
+    second.shutdown.cancel();
+    anyhow::ensure!(restored.legs >= want, "{} of {want} legs rebuilt", restored.legs);
+    Ok(vec![Measure::new("restart.rebuild_ms", "ms", Better::Lower, 2_000.0, vec![restored.took.as_secs_f64() * 1000.0])])
 }
 
 /// W21-AC04: the runs list's first page with `n` runs in a store on disk (twenty repositories, a
@@ -474,7 +547,10 @@ async fn bench(a: BenchArgs) -> Result<u8> {
         only.push("scheduler".into());
     }
     for o in &only {
-        anyhow::ensure!(matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache" | "list"), "`{o}`: scheduler, expressions, parsing, runs, logs, cache or list");
+        anyhow::ensure!(
+            matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache" | "list" | "restart"),
+            "`{o}`: scheduler, expressions, parsing, runs, logs, cache, list or restart"
+        );
     }
     let want = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
     let runs = a.runs.clamp(1, 100);
@@ -513,6 +589,13 @@ async fn bench(a: BenchArgs) -> Result<u8> {
     if want("list") {
         let dir = a.data.join(crate::util::new_id());
         let measured = list(&dir, a.list_runs.max(100), runs).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        measures.extend(measured?);
+    }
+    if want("restart") {
+        let dir = a.data.join(crate::util::new_id());
+        std::fs::create_dir_all(&dir)?;
+        let measured = restart(&dir, a.queued_legs.max(10)).await;
         let _ = std::fs::remove_dir_all(&dir);
         measures.extend(measured?);
     }
