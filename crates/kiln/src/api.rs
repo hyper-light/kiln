@@ -761,6 +761,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // page; docs/conversations.md, "Telemetry").
         (&Method::GET, ["api", "conversations", "status"]) => Ok(srv::json(StatusCode::OK, &crate::harness::stores::status(&hub))),
         (&Method::GET, ["api", "conversations", "series"]) => conversation_series(&hub, &q),
+        (&Method::GET, ["api", "conversations", "log"]) => conversation_log(&hub, &q),
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
         (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => boxed(|| harness_kept_file(&hub, id, sha, &req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "file"]) => boxed(|| harness_file(&hub, id, q.get("path").cloned(), &req)).await,
@@ -2308,15 +2309,37 @@ async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
     }
     let path = artifact_path(hub, id);
-    let (sink, done) = crate::rt::file_sink(path, 8 << 30)?;
+    // Kept only once all of it came: an upload that broke off leaves nothing a release would take
+    // its binaries from (a tar cut short reads as shorter files, with no error).
+    let part = path.with_extension("part");
+    let (sink, done) = crate::rt::file_sink(part.clone(), 8 << 30)?;
     let mut body = req.into_body();
-    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
-        if sink.send(chunk).await.is_err() {
-            break; // the writer failed; its error is reported below
+    let mut broke = None;
+    loop {
+        match srv::next_chunk(&mut body).await {
+            Ok(Some(chunk)) => {
+                if sink.send(chunk).await.is_err() {
+                    break; // the writer failed; its error is reported below
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                broke = Some(e.to_string());
+                break;
+            }
         }
     }
     drop(sink);
-    done.await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let written = done.await;
+    if let Some(e) = broke {
+        let _ = std::fs::remove_file(&part);
+        return Err(err(StatusCode::BAD_REQUEST, format!("the upload broke off: {e}")));
+    }
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&part);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+    }
+    std::fs::rename(&part, &path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("keep {}: {e}", path.display())))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -3588,6 +3611,18 @@ fn conversation_series(hub: &Hub, q: &HashMap<String, String>) -> R {
     let window = q.get("window").and_then(|v| v.parse::<i64>().ok()).unwrap_or(3600).clamp(60, 86_400);
     let series = hub.harness.board.series(key, window, crate::util::now_ms()).unwrap_or_else(|| crate::convo::board::SeriesView { key: key.to_owned(), ..Default::default() });
     Ok(srv::json(StatusCode::OK, &series))
+}
+
+/// `GET /api/conversations/log?since=&q=&limit=`: the replication log, newest first: what moved
+/// between the conversation stores, sample by sample, and what happened to them; after `since`
+/// (unix ms), with `q` in the line (any case). `total`: every line it holds; `matched`: those with `q`.
+fn conversation_log(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let since = q.get("since").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1_000).clamp(1, 5_000);
+    let words = q.get("q").map_or("", String::as_str);
+    let board = &hub.harness.board;
+    let (total, matched) = board.log_len(words);
+    Ok(srv::json(StatusCode::OK, &json!({ "at": crate::util::now_ms(), "total": total, "matched": matched, "lines": board.log(since, words, limit) })))
 }
 
 fn goals_err(e: crate::goals::Error) -> ApiError {

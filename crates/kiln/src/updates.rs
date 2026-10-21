@@ -468,9 +468,35 @@ fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<
         }
         let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
         entry.read_to_end(&mut bytes)?;
+        // An archive cut short (its upload broke off) reads as a shorter file, with no error: never
+        // one runners would upgrade to. Nor what isn't its platform's program.
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != entry.size() {
+            tracing::warn!(target, run = run.number, got = bytes.len(), size = entry.size(), "a release binary cut short in its run's artifacts: not kept");
+            break;
+        }
+        if !runs_on(target, &bytes) {
+            tracing::warn!(target, run = run.number, "a release binary that isn't its platform's program: not kept");
+            continue;
+        }
         kept.push((target.to_owned(), bytes));
     }
     Ok(kept)
+}
+
+/// Whether `bytes` is a program `target` runs: an ELF on Linux, a Mach-O (or a universal one) on
+/// macOS, a PE on Windows, by its first bytes.
+fn runs_on(target: &str, bytes: &[u8]) -> bool {
+    let head = bytes.get(..4).unwrap_or_default();
+    if target.contains("linux") {
+        head == b"\x7fELF"
+    } else if target.contains("apple-darwin") {
+        // 64-bit Mach-O, either way round, or a universal (fat) one.
+        [[0xcf, 0xfa, 0xed, 0xfe], [0xfe, 0xed, 0xfa, 0xcf], [0xca, 0xfe, 0xba, 0xbe]].iter().any(|m| head == m)
+    } else if target.contains("windows") {
+        head.get(..2) == Some(b"MZ".as_slice())
+    } else {
+        true
+    }
 }
 
 // ------------------------------------------------------------------ every platform in step
@@ -2734,6 +2760,55 @@ mod tests {
             as_files(&elf(4), now - Duration::from_secs(3600))?;
             take_in(&hub, &local).await?;
             assert_eq!(hub.blobs.blobs.head(&binary_key(t)).await?.etag, newer);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_release_binary_cut_short_or_not_a_program_is_never_kept() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut cfg = crate::config::Config::default();
+        cfg.server.data_dir = dir.path().to_owned();
+        let mut mac = vec![0xcf, 0xfa, 0xed, 0xfe];
+        mac.resize(2 << 20, 7);
+        // Windows' isn't its program; the Mac's is cut short, as an upload that broke off leaves it.
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, bytes) in [("dist/kiln-x86_64-pc-windows-msvc.exe", b"not a program".to_vec()), ("dist/kiln-aarch64-apple-darwin", mac)] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, name, bytes.as_slice())?;
+        }
+        let mut archive = tar.into_inner()?;
+        archive.truncate(archive.len().saturating_sub(1 << 20));
+        let artifacts = dir.path().join("artifacts.tar");
+        std::fs::write(&artifacts, archive)?;
+        let run = crate::store::Run {
+            id: "r".into(),
+            repo_id: "k".into(),
+            repo_name: "hyper-light/kiln".into(),
+            number: 13,
+            pipeline: "release".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "0d21482abcdef".into(),
+            message: String::new(),
+            author: String::new(),
+            status: crate::store::Status::Succeeded,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.server.data_dir = cfg.server.data_dir.clone()).await?;
+            let kept = adopt_into(&hub, &artifacts, &run).await?;
+            assert!(kept.is_empty(), "{kept:?}");
+            for t in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+                assert!(matches!(hub.blobs.blobs.head(&binary_key(t)).await, Err(kiln_seams::blobs::Refusal::NotFound(_))), "{t} kept");
+            }
             Ok(())
         })
     }

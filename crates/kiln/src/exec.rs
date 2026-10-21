@@ -276,7 +276,13 @@ impl Exec {
             match self.upload_artifacts(ws).await {
                 Ok(n) if n > 0 => self.up.note(&job, last, &format!("uploaded {n} artifact files")).await,
                 Ok(_) => self.up.note(&job, last, "no files matched the artifact patterns").await,
-                Err(e) => self.up.note(&job, last, &format!("artifact upload failed: {e:#}")).await,
+                Err(e) => {
+                    let why = format!("artifact upload failed: {e:#}");
+                    self.up.note(&job, last, &why).await;
+                    // A job whose artifacts didn't arrive didn't do what it's for (a release's
+                    // binaries are its artifacts).
+                    failed = failed.or(Some((Status::Failed, None, why)));
+                }
             }
         }
 
@@ -613,11 +619,22 @@ impl Exec {
         }
         let a = &self.assign;
         let url = format!("{}/api/jobs/{}/artifacts/upload", a.server_url.trim_end_matches('/'), a.job_id);
-        let resp = self.http.put(&url).bearer(&a.job_token).body(bytes).timeout(Duration::from_secs(900)).send().await?;
-        if !resp.is_success() {
-            anyhow::bail!("HTTP {}", resp.status());
+        // Tried again when it breaks off (a connection reset on a busy network): three times in all.
+        let bytes = bytes::Bytes::from(bytes);
+        let mut last = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                crate::rt::sleep(Duration::from_secs(5 * u64::from(attempt))).await;
+            }
+            match self.http.put(&url).bearer(&a.job_token).body(bytes.clone()).timeout(Duration::from_secs(900)).send().await {
+                Ok(resp) if resp.is_success() => return Ok(count),
+                // Refused (its token, its size): no use trying again.
+                Ok(resp) if resp.status() < 500 => anyhow::bail!("HTTP {}", resp.status()),
+                Ok(resp) => last = Some(anyhow::anyhow!("HTTP {}", resp.status())),
+                Err(e) => last = Some(e),
+            }
         }
-        Ok(count)
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("it wasn't sent")))
     }
 }
 

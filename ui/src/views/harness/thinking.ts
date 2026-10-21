@@ -14,6 +14,13 @@ export function latestThought(item: ThoughtItem) {
   return item.more?.at(-1) ?? item.event;
 }
 
+/** A thought has something to show once some of its text has come. Many have none at all
+ *  (thinking a harness doesn't show): those never take a row, so none ever comes and goes; while
+ *  one is under way the turn's live tail says it is thinking. */
+export function thoughtShown(item: ThoughtItem): boolean {
+  return [item.event, ...(item.more ?? [])].some((x) => !x.redacted && x.text.trim() !== "");
+}
+
 /** A stale streaming flag in a prior turn must not keep its thinking clock alive. */
 export function thoughtIsLive(item: ThoughtItem, active: boolean, turnStarted?: number): boolean {
   const latest = latestThought(item);

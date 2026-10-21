@@ -2069,7 +2069,8 @@ impl Codex {
                 core.touch_state();
             }
             Pending::Models => {
-                for m in result.get("data").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let data = result.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                for m in &data {
                     let levels: Vec<(String, String)> = m
                         .get("supportedReasoningEfforts")
                         .and_then(Value::as_array)
@@ -2088,11 +2089,16 @@ impl Codex {
                     if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
                         self.efforts.insert(String::new(), levels.clone());
                     }
-                    if m.get("isDefault").and_then(Value::as_bool) == Some(true)
-                        && core.state.effort.is_empty()
-                        && let Some(d) = m.get("defaultReasoningEffort").and_then(Value::as_str)
-                    {
-                        core.state.effort = self.effort.clone().unwrap_or_else(|| d.to_owned());
+                }
+                // An effort to show when none was chosen: its own model's default (the default
+                // model's when its own isn't listed). Only the default model's was taken before, so
+                // a session on any other model said nothing of how hard it thinks.
+                if core.state.effort.is_empty() {
+                    let model = core.state.model.clone();
+                    let default_of = |pick: &dyn Fn(&Value) -> bool| data.iter().find(|m| pick(m)).and_then(|m| m.get("defaultReasoningEffort")).and_then(Value::as_str).map(str::to_owned);
+                    let own = default_of(&|m| [m.get("model"), m.get("id")].into_iter().flatten().filter_map(Value::as_str).any(|k| !model.is_empty() && k == model));
+                    if let Some(e) = self.effort.clone().or(own).or_else(|| default_of(&|m| m.get("isDefault").and_then(Value::as_bool) == Some(true))) {
+                        core.state.effort = e;
                     }
                 }
                 if let Some(e) = &self.effort {
@@ -5289,6 +5295,31 @@ mod tests {
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
         Ok(())
+    }
+
+    /// A session on a model other than Codex's default, no effort chosen, shows its own model's
+    /// default effort: only the default model's was taken, so its page showed none at all.
+    #[test]
+    fn an_unchosen_effort_is_its_own_model_s_default() {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(Some("th1".into()), Some("o-mini".into()), None, false);
+        c.start(&mut core);
+        core.state.model = "o-mini".into();
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+        let w = written(&mut core);
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "model/list",
+            json!({"data": [
+                {"id": "gpt-5", "model": "gpt-5", "displayName": "GPT-5", "description": "", "isDefault": true, "defaultReasoningEffort": "medium", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "medium", "description": ""}]},
+                {"id": "o-mini", "model": "o-mini", "displayName": "o mini", "description": "", "defaultReasoningEffort": "high", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "high", "description": ""}]}
+            ]}),
+        );
+        assert_eq!(core.state.effort, "high");
     }
 
     #[test]
