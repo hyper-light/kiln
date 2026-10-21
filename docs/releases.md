@@ -279,3 +279,34 @@ server's network instead (macOS 15.5 or later; restart afterwards):
 sudo defaults write com.apple.network.local-network AllowedEthernetLocalNetworkAddresses -array "192.168.1.0/24"
 sudo defaults write com.apple.network.local-network AllowedWiFiLocalNetworkAddresses -array "192.168.1.0/24"
 ```
+
+## Windows: Smart App Control and signing
+
+Where Windows 11's Smart App Control is on, Windows runs a program only if a trusted publisher
+signed it or Microsoft's cloud knows it. kiln's Windows binary is unsigned unless the release signs
+it (below), so the first time a machine runs a new build, Windows may refuse it: the upgrade fails
+with "An Application Control policy has blocked this file" (os error 4551), the runner keeps the
+build it has, and kiln tries again, which passes once Microsoft's cloud knows the build. Each
+refusal is in Event Viewer (Applications and Services Logs → Microsoft → Windows → CodeIntegrity →
+Operational: event 3077, policy `VerifiedAndReputableDesktop`). Jobs that build and run programs
+on such a machine meet the same check. Smart App Control can be turned off (Windows Security → App
+& browser control), but Windows can't turn it back on without a reset.
+
+The release signs its Windows binary once it's set up to (`ci/release/sign-windows.sh`), through
+Microsoft's Artifact Signing (formerly Trusted Signing) with [jsign](https://ebourg.github.io/jsign/),
+pinned and checked. The machine that runs the release's `windows` job needs Java. To set it up:
+
+1. In Azure, an Artifact Signing account and a certificate profile. Its endpoint is the region's
+   the account is in, e.g. `https://eus.codesigning.azure.net`.
+2. An app registration with the *Artifact Signing Certificate Profile Signer* role on the profile.
+3. The release's way to act as it, one of:
+   - kiln's own identity, nothing stored: an `azure` integration for the app registration, which
+     has a federated credential for kiln's issuer (`kiln oidc`; Azure must reach its keys), and a
+     secret brokered from it:
+     `kiln secrets set WINDOWS_SIGNING_TOKEN --scope repo:hyper-light/kiln --from 'integration:<name>?scope=https://codesigning.azure.net/.default'`
+   - a client secret of the app registration's: the secret `AZURE_CLIENT_SECRET`, and the variables
+     `AZURE_TENANT_ID` and `AZURE_CLIENT_ID`.
+4. The variables `WINDOWS_SIGNING_ENDPOINT`, `WINDOWS_SIGNING_ACCOUNT` and `WINDOWS_SIGNING_PROFILE`
+   (`kiln vars set NAME VALUE --scope repo:hyper-light/kiln`).
+
+Until then, the release says it didn't sign, and ships the binary unsigned as before.

@@ -6,7 +6,8 @@
 # On Linux, zig is the cross toolchain throughout (through cargo-zigbuild):
 # - Linux: static musl binaries.
 # - Windows: built with the GNU ABI and shipped as the `x86_64-pc-windows-msvc` download the
-#   install script asks for. It needs only DLLs that come with Windows 10 and later.
+#   install script asks for. It needs only DLLs that come with Windows 10 and later. Signed when
+#   WINDOWS_SIGNING_ENDPOINT and the rest are set (sign-windows.sh), before SHA256SUMS is written.
 # - macOS: linked against ci/release/macos-stubs. These are text stubs listing the public symbols
 #   kiln imports from CoreFoundation, IOKit and libobjc; macOS binds them to the real libraries
 #   at load time, so no Apple SDK is needed. If a dependency starts importing a new symbol,
@@ -131,6 +132,7 @@ for t in "${targets[@]}"; do
       rustup target add x86_64-pc-windows-gnu >/dev/null
       "$zigbuild" zigbuild --release --locked -p kiln --target x86_64-pc-windows-gnu
       cp "$target_dir/x86_64-pc-windows-gnu/release/kiln.exe" "$dist/kiln-$t.exe"
+      "$root/ci/release/sign-windows.sh" "$dist/kiln-$t.exe"
       ;;
     *)
       echo "don't know how to build $t" >&2
