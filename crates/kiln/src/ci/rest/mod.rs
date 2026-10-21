@@ -11,6 +11,7 @@
 //!     dependency snapshots, deployments and their statuses (and the environments they go to);
 //!   - the dependency graph's compare ([`deps`]), for `dependency-review-action`;
 //!   - `/user` and `/rate_limit`;
+//!   - search over the job's repository's pull requests ([`search`]);
 //!   - GraphQL ([`graphql`]): the queries and mutations `gh` and the actions that ask GraphQL send.
 //! - Anything else answers 501 with `{"message": "not implemented by kiln: …"}`, and the leg gets
 //!   a warning naming the route, so gaps are visible and get filled.
@@ -38,6 +39,7 @@ pub mod pulls;
 pub mod records;
 pub mod repos;
 pub mod scanning;
+pub mod search;
 
 /// The token's repository when `owner/repo` names it: a job's token reads its own only.
 async fn site<'a>(hub: &'a Arc<Hub>, claims: &Job, owner: &str, repo: &str, origin: &str) -> Result<Option<repos::Site<'a>>, Fail> {
@@ -84,7 +86,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::GET, ["repos", _, _, "deployments" | "environments", ..]) => Some(("deployments", Level::Read)),
         (&Method::POST, ["repos", _, _, "deployments", ..]) => Some(("deployments", Level::Write)),
         (&Method::GET, ["repos", _, _, "attestations", ..]) => Some(("attestations", Level::Read)),
-        (&Method::GET, ["repos", _, _, "pulls", ..]) => Some(("pull-requests", Level::Read)),
+        (&Method::GET, ["repos", _, _, "pulls", ..]) | (&Method::GET, ["search", "issues"]) => Some(("pull-requests", Level::Read)),
         (&Method::POST, ["repos", _, _, "pulls"]) | (&Method::PATCH, ["repos", _, _, "pulls", _]) => Some(("pull-requests", Level::Write)),
         (&Method::POST, ["repos", _, _, "attestations"]) => Some(("attestations", Level::Write)),
         (&Method::POST | &Method::PUT, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Write)),
@@ -193,6 +195,15 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             Ok(srv::json(StatusCode::OK, &json!({ "use_default": keys.is_none(), "include_claim_keys": keys.unwrap_or_default() })))
         }
         (&Method::GET, ["user"]) => Ok(repos::user(&origin)),
+        // Search, over the job's own repository's pull requests (W14-R11).
+        (&Method::GET, ["search", "issues"]) => {
+            let own = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == claims.repo);
+            let s = match own {
+                Some(r) => Some(repos::Site::new(hub, r, &origin).await),
+                None => None,
+            };
+            search::issues(s.as_ref(), &q).await
+        }
         // What clients ask of a GitHub they don't know (codeql-action, the toolkit): no
         // `X-GitHub-Enterprise-Version`, so they take kiln as github.com's API shape.
         (&Method::GET, ["meta"]) => Ok(srv::json(StatusCode::OK, &json!({ "verifiable_password_authentication": false, "hooks": [], "web": [], "api": [], "git": [], "packages": [], "pages": [], "importer": [], "actions": [], "dependabot": [] }))),

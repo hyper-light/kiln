@@ -466,6 +466,31 @@ async fn resolve(cx: &Cx<'_>, ty: &str, obj: &Value, f: &Field, args: &Map<Strin
             }
             Value::Array(out)
         }
+        // W14-R11: the job's repository's pull requests, as `gh pr list --search` and `gh search
+        // prs` ask for them (issue search's qualifiers: `search.rs`).
+        ("Query", "search") => {
+            let query = super::search::parse(arg(args, "query"));
+            let issues = matches!(arg(args, "type"), "ISSUE" | "ISSUE_ADVANCED" | "");
+            let hits = if issues && query.of(&cx.site.repo.name) {
+                match super::pulls::all(&cx.site).await {
+                    Ok(all) => query.select(all, None),
+                    Err((_, why)) => {
+                        cx.error(path, None, &why);
+                        return Value::Null;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let total = hits.len();
+            let mut found = connection(hits.iter().map(|p| pr_obj(&cx.repo, p)).collect(), args, "SearchResultItem");
+            if let Some(o) = found.as_object_mut() {
+                for (k, n) in [("issueCount", total), ("discussionCount", 0), ("repositoryCount", 0), ("userCount", 0), ("wikiCount", 0), ("codeCount", 0)] {
+                    o.insert(k.into(), json!(n));
+                }
+            }
+            found
+        }
         ("Query", "__type") => introspect(arg(args, "name")),
         ("Query", "__schema") => {
             json!({ "__typename": "__Schema", "queryType": { "__typename": "__Type", "name": "Query", "kind": "OBJECT" }, "mutationType": { "__typename": "__Type", "name": "Mutation", "kind": "OBJECT" }, "subscriptionType": Value::Null, "types": [], "directives": [] })

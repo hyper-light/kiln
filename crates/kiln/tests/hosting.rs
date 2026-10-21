@@ -3184,6 +3184,12 @@ jobs:
           {"query":"{ repository(owner: \"$OWNER\", name: \"$NAME\") { pullRequests(states: [OPEN], first: 5) { totalCount nodes { number } } } me: viewer { login } __type(name: \"PullRequest\") { fields(includeDeprecated: true) { name } } }"}
           JSON
           echo "q4: $(gql q4.json)"
+          cat > q6.json <<JSON
+          {"query":"query PullRequestSearch(\$q: String!) { search(query: \$q, type: ISSUE, first: 10) { issueCount nodes { ... on PullRequest { number title } } } }","variables":{"q":"repo:$GITHUB_REPOSITORY is:pr is:open author:dev"}}
+          JSON
+          echo "q6: $(gql q6.json)"
+          echo "r1: $(api "$GITHUB_API_URL/search/issues?q=repo%3A$OWNER%2F$NAME+is%3Apr+is%3Aopen+one")"
+          echo "r2: $(api "$GITHUB_API_URL/search/issues?q=repo%3A$OWNER%2F$NAME+is%3Apr+is%3Amerged")"
           echo '{"query":"{ licenses { name } }"}' > q5.json
           echo "q5: $(gql q5.json)"
           echo done
@@ -3216,6 +3222,17 @@ jobs:
     assert_eq!(four.pointer("/data/repository/pullRequests/totalCount"), Some(&json!(1)), "{four}");
     assert_eq!(four.pointer("/data/me/login"), Some(&json!("github-actions")), "{four}");
     assert!(four.pointer("/data/__type/fields").and_then(Value::as_array).is_some_and(|f| f.iter().any(|x| text(x, "name") == "statusCheckRollup")), "{four}");
+    // Search (W14-R11): GraphQL's, as `gh pr list --search` asks, and REST's.
+    let six = answer("q6");
+    assert_eq!(
+        (six.pointer("/data/search/issueCount"), six.pointer("/data/search/nodes/0/number"), six.pointer("/data/search/nodes/0/title")),
+        (Some(&json!(1)), Some(&json!(1)), Some(&json!("one: a"))),
+        "{six}"
+    );
+    let r1 = answer("r1");
+    assert_eq!((r1.get("total_count"), r1.pointer("/items/0/number")), (Some(&json!(1)), Some(&json!(1))), "{r1}");
+    assert!(r1.pointer("/items/0/pull_request/url").is_some_and(|u| !u.is_null()), "an issue that is a pull request: {r1}");
+    assert_eq!(answer("r2").get("total_count"), Some(&json!(0)), "nothing merged yet: {log}");
     let five = answer("q5");
     assert!(five.pointer("/errors/0/message").and_then(Value::as_str).is_some_and(|m| m.contains("not implemented by kiln: query field `licenses`")), "{five}");
     // What the mutations did is kiln's: the comment on the diff, as the job's.

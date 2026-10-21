@@ -208,6 +208,28 @@ pub async fn list(s: &Site<'_>, q: &std::collections::HashMap<String, String>) -
     Ok(srv::json(StatusCode::OK, &out))
 }
 
+/// Every pull request of the repository, newest first, as the facade shows one (for search).
+pub(crate) async fn all(s: &Site<'_>) -> Result<Vec<Value>, Fail> {
+    let repo = s.repo.id.clone();
+    let keys: Vec<String> = s
+        .hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT id FROM diffs WHERE repo_id = ?1 ORDER BY number DESC")?;
+            let rows = st.query_map(params![repo], |r| r.get::<_, String>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+        .map_err(internal)?;
+    let mut out = Vec::new();
+    for k in keys {
+        let Some(d) = diffs::find(s.hub, &k).await.map_err(internal)? else { continue };
+        let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+        out.push(pr_json(s, &d, &vs).await);
+    }
+    Ok(out)
+}
+
 /// `GET /pulls/{n}`.
 pub async fn get(s: &Site<'_>, n: &str) -> Result<Response, Fail> {
     let Some(d) = find(s, n).await? else { return Ok(not_found()) };
