@@ -2870,8 +2870,25 @@ rollup, weighted, a percentile across series, a distribution's percentile, mean,
 count, logs in a formula, heatmaps), on one thread and on three, to the bit; the series numbered
 anew between two parts (asked again once, the new numbering's answer); queries beside a cutoff
 passing a series at a time 299 times (every answer of one numbering, none of a series' values under
-another's name); and a write beside a query of 2,000 series read over and over, nine in ten waiting
-under a fourth of the query's time.
+another's name); and a write beside a query of 2,000 series read over and over waiting a third as
+long at the median as beside it held throughout, half as long at p90 (both measured alike, in turn).
+
+Measured in the soak (§13), its dashboard now watched by two at once (each query on a thread and a
+connection of its own, every 2 s), the build before against this one, two runs each in turn on
+fedora (others' work at a load of 3 to 12), 2026-10-20:
+
+| | one series p99 (most) | its wait for the store, most | by host p50 / p99 | a request p99 | a dashboard query p99 |
+| --- | --- | --- | --- | --- | --- |
+| held throughout | 68.3 ms (299), 1.93 (2.42) | 298 ms, 0.00 | 41.7 / 349 ms, 44.8 / 89.0 | 3.87 ms, 1.78 | 327 ms, 85.0 |
+| a round at a time | 1.20 ms (1.45), 1.25 (4.24) | 0.00 ms, 0.00 | 32.2 / 54.5 ms, 18.0 / 38.4 | 1.18 ms, 1.36 | 53.9 ms, 30.6 |
+
+The one-series query met the wide one's reading in the first run held throughout (298 ms waited
+behind a write behind it, its p99 68 ms) and not in the second (the two readers wait 2 s after each
+answer, so whether one comes while the other reads hangs on how they began): read a round at a time,
+it waited for nothing in either. The writes taken meanwhile waited less in their tail (p99 1.2–1.4 ms
+against 1.8–3.9), and the wide query itself read faster in both (its p50 18–32 ms against 42–45),
+which was not foreseen and is not yet explained. Every run stored every point once, its replicas
+agreeing, its memory level.
 
 ### 12.20 DogStatsD
 
