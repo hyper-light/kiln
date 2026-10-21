@@ -772,7 +772,7 @@ impl Sim {
             let feed = rn.r.machine_mut();
             if feed.idle() && !feed.copy.adopting()
                 && let Ok(steps) = feed.copy.propose(&blobs, at_ms)
-                && !steps.is_empty()
+                && (!steps.is_empty() || feed.unsaved())
             {
                 // As the runner does: an error is said, and the next look saves again.
                 let saved = feed.save();
@@ -816,9 +816,10 @@ impl Sim {
         if again {
             rn.resent = now;
         }
-        let sent = &rn.r.machine().copy.state.sent;
-        let ready: Vec<&Step> = sent
-            .iter()
+        let ready: Vec<&Step> = rn
+            .r
+            .machine()
+            .sendable()
             .take_while(|s| {
                 s.changes.iter().all(|c| match &c.to {
                     Some(Version::File { hash, .. }) => rn.uploads.get(hash) == Some(&Upload::Done),
@@ -1444,6 +1445,54 @@ mod tests {
     fn the_seeds_where_a_change_kept_its_file_s_size_and_time_converge() -> Result<(), String> {
         run(1848, 0, Plant::default(), Mode::Sync)?;
         run(2000, 0, Plant::default(), Mode::Moves)?;
+        Ok(())
+    }
+
+    /// CP-T6.1, the fourth bug kiln-sim found, by its seeds: a copy's save failing after it
+    /// proposed a step (a full disk, an I/O error, a crash at that write), the runner sent the step
+    /// anyway. A crash then lost the copy's record of it, and its next step took the same number:
+    /// the server, which takes a number once, let that one go as sent again, and the copy dropped it
+    /// too once the first came back through the log, its changes pending for good. A moving session
+    /// left with its last write never in the log (moves seed 3174); a copy never settled (3083).
+    #[test]
+    fn the_seeds_where_a_step_went_out_before_it_was_saved_converge() -> Result<(), String> {
+        for seed in [3174, 3083] {
+            run(seed, 0, Plant::default(), Mode::Moves)?;
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, the fourth bug's contract: a step a copy proposed goes to the server only once the
+    /// copy's saved state holds it; while a save fails, the copy says it has steps unsaved, and the
+    /// next save that works lets them go.
+    #[test]
+    fn a_step_goes_to_the_server_only_once_the_copy_s_saved_state_holds_it() -> Result<(), String> {
+        let disk = Disk::new(SimClock::new(), Rng::new(1), DiskFaults::none());
+        let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+        let root = PathBuf::from("/home/m2/repo");
+        fs.create_dir_all(&root).map_err(e)?;
+        let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
+        let mut feed = Feed::open_on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), PathBuf::from("/state/m2/copy.json")).map_err(e)?;
+        disk.write("/home/m2/repo/a.txt", b"one").map_err(e)?;
+        let steps: Vec<u64> = feed.copy.propose(&blobs, SIM_EPOCH_MS).map_err(e)?.iter().map(|s| s.seq).collect();
+        if steps.is_empty() {
+            return Err("the change wasn't proposed".into());
+        }
+        // The save fails (the disk crashes at its first write): nothing may go out.
+        disk.freeze_after(0);
+        if feed.save().is_ok() {
+            return Err("the save was to fail".into());
+        }
+        disk.thaw();
+        if feed.sendable().next().is_some() || !feed.unsaved() {
+            return Err("a step its saved state doesn't hold may go to the server".into());
+        }
+        // Saved, it goes.
+        feed.save().map_err(e)?;
+        let sendable: Vec<u64> = feed.sendable().map(|s| s.seq).collect();
+        if sendable != steps || feed.unsaved() {
+            return Err(format!("saved, the steps that may go are {sendable:?}, not {steps:?}"));
+        }
         Ok(())
     }
 

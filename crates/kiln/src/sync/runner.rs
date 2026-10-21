@@ -115,7 +115,7 @@ pub fn look_now_at(feed: &mut Feed, blobs: &Blobs, ready: bool, at_ms: i64) -> O
         return None;
     }
     Some(match feed.copy.propose(blobs, at_ms) {
-        Ok(steps) => Ok((steps.len(), if steps.is_empty() { None } else { feed.save().err().map(|e| format!("the copy's state: {e}")) })),
+        Ok(steps) => Ok((steps.len(), if steps.is_empty() && !feed.unsaved() { None } else { feed.save().err().map(|e| format!("the copy's state: {e}")) })),
         Err(e) => Err(format!("looking at the folder: {e}")),
     })
 }
@@ -1014,7 +1014,9 @@ impl Owner {
             let proposed = feed.copy.propose(&self.blobs, now_ms());
             looked(&h.spec.name, started, proposed.as_ref().map_or(0, Vec::len));
             match proposed {
-                Ok(steps) if !steps.is_empty() => {
+                // New steps, or ones a save failed to keep: saved (they go to the server once
+                // they are, `Feed::sendable`).
+                Ok(steps) if !steps.is_empty() || feed.unsaved() => {
                     h.errors[E_LOOK] = feed.save().err().map(|e| format!("the copy's state: {e}"));
                     h.looked = true;
                 }
@@ -1064,8 +1066,7 @@ impl Owner {
         let mut out = Vec::new();
         let mut resent: Vec<(String, u64)> = Vec::new();
         for h in self.held.values_mut() {
-            let sent = &h.r.machine().copy.state.sent;
-            let ready: Vec<&Step> = sent.iter().take_while(|s| hashes(s).all(|x| self.uploads.get(x) == Some(&Upload::Done))).collect();
+            let ready: Vec<&Step> = h.r.machine().sendable().take_while(|s| hashes(s).all(|x| self.uploads.get(x) == Some(&Upload::Done))).collect();
             let newest = ready.last().map_or(0, |s| s.seq);
             if ready.is_empty() || (!again && newest <= h.sent) {
                 continue;

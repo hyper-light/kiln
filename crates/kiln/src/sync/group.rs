@@ -316,6 +316,9 @@ pub struct Feed {
     pub outcomes: VecDeque<Outcome>,
     /// Steps the folder took since the runner last looked (its metrics and status).
     pub took: Vec<Took>,
+    /// The newest of this copy's steps its saved state holds: only those go to the server
+    /// ([`Feed::sendable`]).
+    saved_seq: u64,
     /// A test build's planted bug (kiln-sim's T-T6.1.1): the saved state written over itself in
     /// place and never fsynced, so a power loss tears it and the write it held is lost.
     #[cfg(test)]
@@ -361,6 +364,7 @@ impl Feed {
     /// [`Feed::open`], its folder and saved state on `fs`.
     pub fn open_on(fs: Arc<dyn Fs>, root: &Path, me: &str, member: u64, limits: CopyLimits, file: PathBuf) -> anyhow::Result<Self> {
         let saved: Saved = if fs.exists(&file) { serde_json::from_slice(&super::fs::read(fs.as_ref(), &file)?)? } else { Saved { conf: (&founded()).into(), ..Saved::default() } };
+        let saved_seq = saved.state.sent.last().map_or(0, |s| s.seq);
         let at = Point { index: saved.index, term: saved.term };
         let conf: ConfState = (&saved.conf).into();
         Ok(Self {
@@ -376,6 +380,7 @@ impl Feed {
             install: saved.install,
             outcomes: VecDeque::new(),
             took: Vec::new(),
+            saved_seq,
             #[cfg(test)]
             planted_in_place: false,
         })
@@ -464,12 +469,29 @@ impl Feed {
             self.copy.fs.create(&self.file)?.write_all(&bytes)?;
             self.durable = self.reached;
             self.durable_conf = self.reached_conf.clone();
+            self.saved_seq = self.copy.state.sent.last().map_or(self.saved_seq, |s| s.seq.max(self.saved_seq));
             return Ok(());
         }
         save_atomic_on(self.copy.fs.as_ref(), &self.file, &bytes)?;
+        self.saved_seq = self.copy.state.sent.last().map_or(self.saved_seq, |s| s.seq.max(self.saved_seq));
         self.durable = self.reached;
         self.durable_conf = self.reached_conf.clone();
         Ok(())
+    }
+
+    /// This copy's unsent steps that may go to the server: those its saved state holds. One the
+    /// state couldn't be saved with yet waits for a save that holds it: sent before, a crash could
+    /// lose the copy's record of it, and the copy would number another step the same; the server
+    /// takes each number once, and that step's changes would never reach the log.
+    pub fn sendable(&self) -> impl Iterator<Item = &Step> {
+        let saved = self.saved_seq;
+        self.copy.state.sent.iter().take_while(move |s| s.seq <= saved)
+    }
+
+    /// Whether some of this copy's steps aren't in its saved state yet (a save failed): the next
+    /// look saves again, whatever it finds.
+    pub fn unsaved(&self) -> bool {
+        self.copy.state.sent.last().is_some_and(|s| s.seq > self.saved_seq)
     }
 
     fn note(&mut self, outcomes: Vec<Outcome>) {
