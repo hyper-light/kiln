@@ -947,6 +947,7 @@ impl Registry {
             self.keeper.forget(id);
             self.visuals.forget(id);
             self.opened.forget(id);
+            super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
@@ -1007,6 +1008,7 @@ impl Registry {
         };
         self.kinds.lock().insert(format!("agent:{machine}"), inv.kinds);
         for id in gone {
+            super::archive::closed(hub, &id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }
     }
@@ -1439,6 +1441,7 @@ impl Registry {
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
+            super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }
         ok || loc.is_some()

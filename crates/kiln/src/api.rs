@@ -764,6 +764,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Recordings of its streams (`crate::browser::record`): theirs a person's own profile's.
         (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
         (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => boxed(|| recording_file(&hub, id, rid, what, &req)).await,
+        // Its record once it closed, as kiln's store of bytes keeps it (`crate::harness::archive`).
+        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => Ok(srv::json(StatusCode::OK, &json!({ "sources": boxed(|| crate::harness::archive::archived(&hub, id)).await? }))),
+        (&Method::GET, ["api", "harness", "sessions", id, "transcripts", source]) => boxed(|| archived_transcript(&hub, id, source)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match boxed(|| hub.harness.task_output(&hub, id, task, since)).await {
@@ -1093,6 +1096,20 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
         }
     }
     Ok(r)
+}
+
+/// `GET /api/harness/sessions/:id/transcripts/:source`: a closed conversation's record, as archived
+/// (JSON lines, brotli-encoded as they're kept: `Content-Encoding: br`).
+async fn archived_transcript(hub: &Arc<Hub>, id: &str, source: &str) -> R {
+    if !crate::harness::archive::archived(hub, id).await?.iter().any(|s| s == source) {
+        return Err(err(StatusCode::NOT_FOUND, "no record of that source archived for this conversation"));
+    }
+    let key = crate::harness::archive::key(id, source);
+    let meta = hub.blobs.blobs.head(&key).await.map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, 0, meta.size.saturating_sub(1)) };
+    let r = srv::response(StatusCode::OK, "application/x-ndjson", srv::channel_body(body));
+    let r = srv::with_header(r, header::CONTENT_ENCODING, "br");
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &meta.size.to_string()))
 }
 
 /// A file of session `id`'s machine (`location`), in ranges, as it reads it.

@@ -133,6 +133,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     child!("scheduler", h => h.scheduler_loop());
     child!("blobs", h => crate::blobs::run(h));
+    child!("transcripts", h => crate::harness::archive::run(h));
     // `kiln workflow run`'s own server (docs/ci.md W17-R06) runs CI and nothing else: no polling
     // or schedules, terminals, agents, sync, fleet or UI.
     if !cfg.ci.local {

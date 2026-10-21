@@ -44,3 +44,14 @@ CREATE TABLE cas_index (
 );
 INSERT OR IGNORE INTO cas_index (digest, size, created_at, last_used_at)
   SELECT digest, size, created_at, last_used_at FROM cas_objects;
+
+-- Closed conversations whose record (the harness's transcript) is archived in kiln's store of
+-- bytes (crate::harness::archive): due once its last lines are in, done once written, and the
+-- sources written (JSON).
+CREATE TABLE transcript_archives (
+  session TEXT PRIMARY KEY,
+  due_ms INTEGER NOT NULL,
+  done_ms INTEGER,
+  sources TEXT NOT NULL
+);
+CREATE INDEX transcript_archives_due ON transcript_archives (done_ms, due_ms);
