@@ -313,38 +313,59 @@ pub async fn load(hub: &Hub) {
     *hub.updates.kept.lock() = kept;
 }
 
-/// Takes the binaries kept as files before (`<data>/binaries`) into the local store, where they
-/// lie, once: a `.taken` mark says it's done.
+/// Takes the binaries kept as files (`<data>/binaries`) into the local store, where they lie: each
+/// one the store doesn't hold for its platform, or holds an older one of (an older kiln run on this
+/// store again, a rollback, kept a newer one). Each start; a file taken stays where it lies.
 pub async fn take_in(hub: &Hub, local: &crate::blobs::local::LocalBlobs) -> anyhow::Result<()> {
     take_in_from(&hub.cfg, local).await
 }
 
 /// [`take_in`] for the server `cfg` names (`kiln blobs copy`).
 pub async fn take_in_from(cfg: &crate::config::Config, local: &crate::blobs::local::LocalBlobs) -> anyhow::Result<()> {
+    use kiln_seams::blobs::{Blobs as _, Refusal};
     let dir = old_dir(cfg);
-    let mark = dir.join(".taken");
-    if mark.exists() || !dir.is_dir() {
+    if !dir.is_dir() {
         return Ok(());
     }
     let d = dir.clone();
-    let files = crate::rt::blocking(move || -> anyhow::Result<Vec<(String, PathBuf, Option<String>)>> {
+    // Each platform's binary kept as a file whole, its modification time, and what kiln knew of it.
+    let found = crate::rt::blocking(move || -> Vec<(&'static str, PathBuf, PathBuf, i64, Binary)> {
         let mut out = Vec::new();
         for t in crate::api::RELEASE_TARGETS.iter().copied().chain([crate::api::TARGET]) {
             let (bin, meta) = (d.join(format!("kiln-{t}")), d.join(format!("kiln-{t}.json")));
             let Some(m) = std::fs::read(&meta).ok().and_then(|b| serde_json::from_slice::<Binary>(&b).ok()) else { continue };
-            if std::fs::metadata(&bin).is_ok_and(|md| md.len() == m.size) && !out.iter().any(|(k, _, _): &(String, PathBuf, Option<String>)| *k == binary_key(t)) {
-                out.push((binary_key(t), bin, Some(m.sha256.clone())));
-                out.push((meta_key(t), meta, None));
+            let Ok(md) = std::fs::metadata(&bin) else { continue };
+            let at = crate::blobs::local::modified_ms(&md);
+            if md.len() == m.size && !out.iter().any(|(k, ..): &(&str, PathBuf, PathBuf, i64, Binary)| *k == t) {
+                out.push((t, bin, meta, at, m));
             }
         }
-        Ok(out)
+        out
     })
-    .await??;
-    let taken = local.adopt(files).await?;
-    let m = mark.clone();
-    crate::rt::blocking(move || std::fs::write(&m, format!("{taken} taken\n"))).await??;
+    .await?;
+    let mut files = Vec::new();
+    for (t, bin, meta, at, m) in found {
+        match local.head(&binary_key(t)).await {
+            // The file taken before, or the same binary kept another way; or a newer one kept.
+            Ok(kept) if kept.etag == m.sha256 || kept.modified_ms >= at => continue,
+            // An older kiln kept a newer one: it's the platform's.
+            Ok(_) => {
+                for k in [binary_key(t), meta_key(t)] {
+                    match local.delete(&k).await {
+                        Ok(()) | Err(Refusal::NotFound(_)) => {}
+                        Err(e) => anyhow::bail!("{k}: {e}"),
+                    }
+                }
+            }
+            Err(Refusal::NotFound(_)) => {}
+            Err(e) => anyhow::bail!("{}: {e}", binary_key(t)),
+        }
+        files.push((binary_key(t), bin, Some(m.sha256.clone())));
+        files.push((meta_key(t), meta, None));
+    }
+    let taken = local.adopt(files).await?.taken;
     if taken > 0 {
-        tracing::info!(target: "kiln.blobs", event = "adopt", taken, "runner binaries from before taken in where they lie");
+        tracing::info!(target: "kiln.blobs", event = "adopt", taken, "runner binaries kept as files taken in where they lie");
     }
     Ok(())
 }
@@ -2632,6 +2653,54 @@ mod tests {
             assert_eq!(targets, others, "this server's own platform keeps its own build");
         }
         Ok(())
+    }
+
+    /// CP-T10.1: binaries kept as files (`<data>/binaries`) are taken into the local store where
+    /// they lie; one an older kiln kept since (run on the store again: a rollback) replaces the
+    /// store's older one, and an older file leaves the store's newer one alone.
+    #[test]
+    fn binaries_kept_as_files_are_taken_in_and_the_newest_is_kept() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let local = hub.blobs.local.clone().ok_or_else(|| anyhow::anyhow!("not the local store"))?;
+            let (dir, t) = (old_dir(&hub.cfg), crate::api::TARGET);
+            std::fs::create_dir_all(&dir)?;
+            let elf = |n: u8| -> Vec<u8> {
+                let mut b = b"\x7fELF".to_vec();
+                b.resize(2 << 20, n);
+                b
+            };
+            // As an older kiln keeps one: the binary and what it knows of it, as of `at`.
+            let as_files = |bytes: &[u8], at: std::time::SystemTime| -> anyhow::Result<String> {
+                let sha256 = crate::util::sha256_hex(bytes);
+                let meta = Binary { target: t.into(), sha256: sha256.clone(), size: bytes.len() as u64, origin: "upload".into(), at: 0, build: String::new(), run: None, sha: None, by: None };
+                let bin = dir.join(format!("kiln-{t}"));
+                std::fs::write(&bin, bytes)?;
+                std::fs::write(dir.join(format!("kiln-{t}.json")), serde_json::to_vec(&meta)?)?;
+                std::fs::File::options().write(true).open(&bin)?.set_modified(at)?;
+                Ok(sha256)
+            };
+            let now = std::time::SystemTime::now();
+            let first = as_files(&elf(1), now - Duration::from_secs(60))?;
+            take_in(&hub, &local).await?;
+            load(&hub).await;
+            assert_eq!(stored(&hub, t).map(|b| b.sha256), Some(first));
+            // Replaced here: the files it was taken from go.
+            let uploaded = store(&hub, t, elf(2), "upload").await?.sha256;
+            assert!(!dir.join(format!("kiln-{t}")).exists());
+            // Rolled back, the older kiln kept a newer one; started again, it's the one.
+            let newer = as_files(&elf(3), now + Duration::from_secs(60))?;
+            take_in(&hub, &local).await?;
+            load(&hub).await;
+            assert_eq!(hub.blobs.blobs.head(&binary_key(t)).await?.etag, newer);
+            assert_eq!(stored(&hub, t).map(|b| b.sha256), Some(newer.clone()));
+            assert_ne!(uploaded, newer);
+            // A file older than what the store keeps changes nothing.
+            as_files(&elf(4), now - Duration::from_secs(3600))?;
+            take_in(&hub, &local).await?;
+            assert_eq!(hub.blobs.blobs.head(&binary_key(t)).await?.etag, newer);
+            Ok(())
+        })
     }
 
     #[test]

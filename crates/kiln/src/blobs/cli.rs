@@ -41,7 +41,8 @@ async fn copy(cfg: &Config) -> Result<()> {
     let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
     let presign = local::Presign { base: String::new(), key: [0; 32] };
     let from = local::LocalBlobs::new(store, cfg.data("cas"), crate::rt::clock(), local::Limits { object: cfg.blobs.object_max, ..local::Limits::default() }, presign);
-    // What an older kiln kept as files is the local store's first, so it's copied too.
+    // What an older kiln kept is the local store's first, so it's copied too.
+    from.ready().await;
     crate::sync::contents::take_in(&from, &cfg.data("sync").join("blobs")).await?;
     crate::updates::take_in_from(cfg, &from).await?;
     let to = s3::S3Blobs::new(&cfg.blobs.s3, crate::rt::clock(), s3::Limits { object: cfg.blobs.object_max, ..s3::Limits::default() })?;

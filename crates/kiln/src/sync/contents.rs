@@ -7,8 +7,8 @@
 //! without waiting on the store: an index in memory answers, listed from the store when the server
 //! starts ([`Contents::start`]) and kept as contents come and go. It holds at most [`INDEX_MAX`]
 //! contents; past that a content sent is refused, typed, as a full disk refuses it. Contents kept as
-//! files before (`<data>/sync/blobs/<2 hex>/<hash>`) are taken where they lie by the local store,
-//! the first time it starts.
+//! files before (`<data>/sync/blobs/<2 hex>/<hash>`) are taken where they lie by the local store
+//! the first time it starts, and those an older kiln kept as files since (a rollback) the next.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,10 +70,11 @@ impl Contents {
         let me = Arc::new(Self::new(Arc::clone(&opened.blobs)));
         let (c, local) = (Arc::clone(&me), opened.local.clone());
         crate::rt::spawn(async move {
-            if let Some(local) = local
-                && let Err(e) = take_in(&local, &legacy).await
-            {
-                tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "sync's contents from before couldn't be taken in; runners send again what's wanted");
+            if let Some(local) = local {
+                local.ready().await;
+                if let Err(e) = take_in(&local, &legacy).await {
+                    tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "sync's contents from before couldn't be taken in; runners send again what's wanted");
+                }
             }
             c.load().await;
         });
@@ -205,13 +206,15 @@ impl Contents {
     }
 }
 
-/// Takes the contents kept as files before (`<dir>/<2 hex>/<hash>`) into the local store where they
-/// lie, once: a `.taken` mark says it's done.
+/// Takes the contents kept as files (`<dir>/<2 hex>/<hash>`) into the local store where they lie:
+/// all of them the first time, then those kept since the `.taken` mark was (by an older kiln run on
+/// this store again: a rollback). A file whose content the store holds already another way goes.
 pub async fn take_in(local: &crate::blobs::local::LocalBlobs, dir: &Path) -> anyhow::Result<()> {
-    let mark = dir.join(TAKEN);
-    if mark.exists() || !dir.is_dir() {
+    if !dir.is_dir() {
         return Ok(());
     }
+    let mark = dir.join(TAKEN);
+    let since = std::fs::metadata(&mark).and_then(|m| m.modified()).ok();
     let d = dir.to_path_buf();
     let files = crate::rt::blocking(move || -> std::io::Result<Vec<(String, PathBuf, Option<String>)>> {
         let mut out = Vec::new();
@@ -223,7 +226,7 @@ pub async fn take_in(local: &crate::blobs::local::LocalBlobs, dir: &Path) -> any
             for e in std::fs::read_dir(shard.path())? {
                 let e = e?;
                 let name = e.file_name().to_string_lossy().into_owned();
-                if valid_hash(&name) {
+                if valid_hash(&name) && since.is_none_or(|s| e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t >= s)) {
                     out.push((key(&name), e.path(), Some(name)));
                 }
                 if out.len() >= INDEX_MAX {
@@ -234,11 +237,24 @@ pub async fn take_in(local: &crate::blobs::local::LocalBlobs, dir: &Path) -> any
         Ok(out)
     })
     .await??;
+    if files.is_empty() && since.is_some() {
+        return Ok(());
+    }
     let n = files.len();
-    let taken = local.adopt(files).await?;
-    let m = mark.clone();
-    crate::rt::blocking(move || std::fs::write(&m, format!("{taken} of {n} taken\n"))).await??;
-    tracing::info!(target: "kiln.blobs", event = "adopt", taken, files = n, "sync's contents from before taken in where they lie");
+    let adopted = local.adopt(files).await?;
+    let (taken, redundant) = (adopted.taken, adopted.redundant);
+    let (m, first) = (mark.clone(), since.is_none());
+    let removed = crate::rt::blocking(move || -> std::io::Result<usize> {
+        let removed = redundant.iter().filter(|p| std::fs::remove_file(p).is_ok()).count();
+        std::fs::write(&m, format!("{taken} of {n} taken\n"))?;
+        Ok(removed)
+    })
+    .await??;
+    if first {
+        tracing::info!(target: "kiln.blobs", event = "adopt", taken, files = n, "sync's contents from before taken in where they lie");
+    } else {
+        tracing::warn!(target: "kiln.blobs", event = "adopt", taken, removed, files = n, "sync's contents an older kiln kept taken in where they lie; those the store holds already removed");
+    }
     Ok(())
 }
 
@@ -274,6 +290,16 @@ mod tests {
             let f = dir.path().join("wrong");
             std::fs::write(&f, b"not what it says")?;
             assert!(matches!(c.put_file(&new, &f).await, Err(Refusal::BadChecksum { .. })));
+            // An older kiln run on the store again (a rollback) kept contents as files: the next
+            // start takes in the new ones where they lie, and removes those the store holds already.
+            let later = old.put_bytes(b"kept while rolled back")?;
+            let again = old.put_bytes(b"new")?;
+            assert_eq!(again, new);
+            let (later_path, again_path) = (old.path(&later).ok_or_else(|| anyhow::anyhow!("no path"))?, old.path(&again).ok_or_else(|| anyhow::anyhow!("no path"))?);
+            take_in(&local, &dir.path().join("blobs")).await?;
+            assert!(later_path.exists() && !again_path.exists(), "taken where it lies; a second copy removed");
+            assert_eq!(hub.blobs.blobs.get(&key(&later), None).await?.1, b"kept while rolled back".to_vec());
+            assert_eq!(hub.blobs.blobs.get(&key(&new), None).await?.1, b"new".to_vec());
             c.remove(&hash);
             assert!(!c.has(&hash));
             for _ in 0..200 {

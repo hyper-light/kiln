@@ -14,6 +14,12 @@
 //! finishes; [`LocalBlobs::collect`] then lets it go, its chunks with it once no object uses them.
 //! A part is cut into chunks as it arrives; its upload's SHA-256 is taken as parts come in order
 //! (most uploads' way), else read back once at completion.
+//!
+//! An older kiln run on this store again (a rollback) keeps its objects in the same tables, and
+//! lets go of those nothing of CI refers to. So an object a key other than `cas/<digest>` holds is
+//! pinned there ([`PINNED`]): the older kiln never lets it go. When this release starts again,
+//! [`LocalBlobs::reconcile`] takes in what the older kiln kept, and drops the keys whose bytes it
+//! let go (docs/blobs.md, "Rolling back").
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read as _, Seek as _};
@@ -67,6 +73,13 @@ pub const UPLOAD_TTL: Duration = Duration::from_secs(2 * 86_400);
 const SWEEP_BUDGET: usize = 1_000_000;
 /// Rows a taking-in of files where they lie writes a transaction.
 const ADOPT_BATCH: usize = 1000;
+/// An object's `last_used_at` while a key other than the CAS's holds it: later than any time an
+/// older kiln lets objects go before, so it never does.
+pub const PINNED: i64 = i64::MAX;
+/// Rows [`LocalBlobs::reconcile`] reads a page.
+const RECONCILE_PAGE: usize = 10_000;
+/// Pages [`LocalBlobs::reconcile`] reads of each kind, at most.
+const RECONCILE_PAGES: usize = 1000;
 
 /// A key's object, as its row says.
 struct Row {
@@ -83,6 +96,8 @@ pub struct LocalBlobs {
     limits: Limits,
     presign: Presign,
     following: super::Following,
+    /// [`LocalBlobs::reconcile`] has run this start.
+    ready: async_lock::OnceCell<()>,
 }
 
 /// What a collection let go.
@@ -92,6 +107,24 @@ pub struct Collected {
     pub objects: usize,
     pub chunks: usize,
     pub bytes: u64,
+}
+
+/// What a taking-in of files where they lie did ([`LocalBlobs::adopt`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Adopted {
+    pub taken: usize,
+    /// Files whose content their key holds already another way (in chunks, or another file): their
+    /// caller's to remove.
+    pub redundant: Vec<PathBuf>,
+}
+
+/// What an older kiln run on this store did, as [`LocalBlobs::reconcile`] found it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Objects it kept, or used after this store let them go: keys at `cas/<digest>` now.
+    pub taken: usize,
+    /// Keys whose object it let go, or whose file it removed or replaced: gone.
+    pub dropped: usize,
 }
 
 fn len64(n: usize) -> u64 {
@@ -117,6 +150,35 @@ fn meta_of(key: &str, r: &Row) -> Meta {
     Meta { key: key.to_owned(), size: r.size, etag: r.digest.clone(), modified_ms: r.modified_ms }
 }
 
+/// The key kiln's CAS keeps an object at (`crate::ci::services::cas::key`): the only objects an
+/// older kiln knows.
+fn cas_key(key: &str) -> bool {
+    key.starts_with("cas/")
+}
+
+/// A file's modification time, Unix milliseconds: a file taken where it lies is the one taken while
+/// its time and size are.
+pub(crate) fn modified_ms(md: &std::fs::Metadata) -> i64 {
+    md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Whether the file at `path` is still the one taken there.
+fn same_file(path: &str, size: u64, modified: i64) -> bool {
+    std::fs::metadata(path).is_ok_and(|md| md.is_file() && md.len() == size && modified_ms(&md) == modified)
+}
+
+/// What a key let go of. Held still by a key other than the CAS's, it stays pinned; else an older
+/// kiln may let it go as its own (used now); and once no key holds it, it's released now, for
+/// [`LocalBlobs::collect`] an hour later.
+fn released(c: &Connection, digest: &str, now_s: i64) -> rusqlite::Result<usize> {
+    c.execute(
+        "UPDATE cas_objects SET last_used_at = ?2,
+           released_at = CASE WHEN EXISTS (SELECT 1 FROM blob_keys WHERE digest = ?1) THEN NULL ELSE ?2 END
+         WHERE digest = ?1 AND NOT EXISTS (SELECT 1 FROM blob_keys WHERE digest = ?1 AND substr(key, 1, 4) <> 'cas/')",
+        params![digest, now_s],
+    )
+}
+
 /// A new object for a key.
 struct Write {
     key: String,
@@ -130,9 +192,9 @@ struct Write {
 }
 
 /// In one transaction: the upload it completes still there, the condition judged against what's
-/// at the key, the object recorded, the key pointed at it, and what the key held released (its
-/// object kept an hour for reads under way). The object's answer, and a file the key named before
-/// (to remove).
+/// at the key, the object recorded (pinned, unless the key is the CAS's), the key pointed at it,
+/// and what the key held released (its object kept an hour for reads under way). The object's
+/// answer, and a file the key named before (to remove).
 fn commit(c: &mut Connection, w: &Write) -> anyhow::Result<Result<(Meta, Option<String>), Refusal>> {
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(up) = &w.upload {
@@ -149,19 +211,20 @@ fn commit(c: &mut Connection, w: &Write) -> anyhow::Result<Result<(Meta, Option<
     for (d, n) in &w.chunks {
         tx.execute("INSERT OR IGNORE INTO cas_chunks (digest, size) VALUES (?1, ?2)", params![d, i64_of(*n)])?;
     }
+    let used = if cas_key(&w.key) { now_s } else { PINNED };
     tx.execute(
-        "INSERT INTO cas_objects (digest, size, chunks, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?4)
-         ON CONFLICT (digest) DO UPDATE SET last_used_at = excluded.last_used_at",
-        params![w.digest, i64_of(w.size), serde_json::to_string(&w.chunks)?, now_s],
+        "INSERT INTO cas_objects (digest, size, chunks, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (digest) DO UPDATE SET last_used_at = MAX(last_used_at, excluded.last_used_at), released_at = NULL",
+        params![w.digest, i64_of(w.size), serde_json::to_string(&w.chunks)?, now_s, used],
     )?;
-    if let Some(o) = old.as_ref().filter(|o| o.file.is_none()) {
-        tx.execute("UPDATE cas_objects SET last_used_at = ?2 WHERE digest = ?1", params![o.digest, now_s])?;
-    }
     tx.execute(
         "INSERT INTO blob_keys (key, digest, size, modified_ms, file) VALUES (?1, ?2, ?3, ?4, NULL)
          ON CONFLICT (key) DO UPDATE SET digest = excluded.digest, size = excluded.size, modified_ms = excluded.modified_ms, file = NULL",
         params![w.key, w.digest, i64_of(w.size), w.now_ms],
     )?;
+    if let Some(o) = old.as_ref().filter(|o| o.file.is_none() && o.digest != w.digest) {
+        released(&tx, &o.digest, now_s)?;
+    }
     if let Some(up) = &w.upload {
         tx.execute("DELETE FROM blob_parts WHERE upload = ?1", [up])?;
         tx.execute("DELETE FROM blob_uploads WHERE id = ?1", [up])?;
@@ -199,7 +262,119 @@ fn signature(key: &[u8; 32], access: Access, object: &str, expires_ms: i64) -> S
 
 impl LocalBlobs {
     pub fn new(store: Store, root: PathBuf, clock: Arc<dyn Clock>, limits: Limits, presign: Presign) -> Self {
-        Self { store, root, clock, limits, presign, following: super::Following::default() }
+        Self { store, root, clock, limits, presign, following: super::Following::default(), ready: async_lock::OnceCell::new() }
+    }
+
+    /// Waits for [`LocalBlobs::reconcile`] to have run this start; the first to ask runs it.
+    pub async fn ready(&self) {
+        self.ready
+            .get_or_init(|| async {
+                match self.reconcile().await {
+                    Ok(r) if r.taken + r.dropped > 0 => {
+                        tracing::warn!(target: "kiln.blobs", event = "adopt", taken = r.taken, dropped = r.dropped, "an older kiln ran on the local store: what it kept is taken in, and keys whose bytes it let go are gone (sync's runners send those again; an upgrade binary is fetched or uploaded again)");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "what an older kiln did to the local store couldn't all be taken in"),
+                }
+            })
+            .await;
+    }
+
+    /// Takes in what an older kiln did to this store while it ran on it again (a rollback, then
+    /// this release again): objects it kept, or used after this store let them go, become keys at
+    /// `cas/<digest>` (and records of kiln's CAS, `cas_index`, as the migration that made the
+    /// tables did); keys whose object it let go, or whose file it removed or replaced, go. Run once
+    /// a start, before anything reads the store ([`LocalBlobs::ready`]).
+    pub async fn reconcile(&self) -> anyhow::Result<Reconciled> {
+        let mut out = Reconciled::default();
+        let page = i64::try_from(RECONCILE_PAGE).unwrap_or(i64::MAX);
+        for _ in 0..RECONCILE_PAGES {
+            let (found, taken, dropped) = self
+                .store
+                .call(move |c| {
+                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let gone: Vec<(String, String)> = {
+                        let mut q = tx.prepare("SELECT key, digest FROM blob_keys WHERE file IS NULL AND digest NOT IN (SELECT digest FROM cas_objects) LIMIT ?1")?;
+                        q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+                    };
+                    for (key, digest) in &gone {
+                        tx.execute("DELETE FROM blob_keys WHERE key = ?1", [key])?;
+                        if *key == format!("cas/{digest}") {
+                            tx.execute("DELETE FROM cas_index WHERE digest = ?1", [digest])?;
+                        }
+                    }
+                    let found: Vec<(String, i64, i64, i64)> = {
+                        let mut q = tx.prepare(
+                            "SELECT digest, size, created_at, last_used_at FROM cas_objects
+                             WHERE digest NOT IN (SELECT digest FROM blob_keys) AND (released_at IS NULL OR last_used_at > released_at) LIMIT ?1",
+                        )?;
+                        q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
+                    };
+                    let mut taken = 0usize;
+                    for (digest, size, created, used) in &found {
+                        let n = tx.execute(
+                            "INSERT OR IGNORE INTO blob_keys (key, digest, size, modified_ms, file) VALUES ('cas/' || ?1, ?1, ?2, ?3, NULL)",
+                            params![digest, size, created.saturating_mul(1000)],
+                        )?;
+                        if n == 0 {
+                            continue;
+                        }
+                        taken = taken.saturating_add(n);
+                        tx.execute(
+                            "INSERT INTO cas_index (digest, size, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT (digest) DO UPDATE SET last_used_at = MAX(last_used_at, excluded.last_used_at)",
+                            params![digest, size, created, used],
+                        )?;
+                        tx.execute("UPDATE cas_objects SET released_at = NULL WHERE digest = ?1", [digest])?;
+                    }
+                    tx.commit()?;
+                    Ok((found.len(), taken, gone.len()))
+                })
+                .await?;
+            out.taken = out.taken.saturating_add(taken);
+            out.dropped = out.dropped.saturating_add(dropped);
+            if (found < RECONCILE_PAGE && dropped < RECONCILE_PAGE) || taken.saturating_add(dropped) == 0 {
+                break;
+            }
+        }
+        // Keys naming files: each file still the one taken, a page at a time.
+        let mut after = String::new();
+        for _ in 0..RECONCILE_PAGES {
+            let a = after.clone();
+            let files: Vec<(String, String, i64, i64)> = self
+                .store
+                .call(move |c| {
+                    let mut q = c.prepare("SELECT key, file, size, modified_ms FROM blob_keys WHERE file IS NOT NULL AND key > ?1 ORDER BY key LIMIT ?2")?;
+                    Ok(q.query_map(params![a, page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?)
+                })
+                .await?;
+            let Some((last, ..)) = files.last() else { break };
+            after = last.clone();
+            let full = files.len() >= RECONCILE_PAGE;
+            let changed: Vec<(String, String)> = crate::rt::blocking(move || {
+                files.into_iter().filter(|(_, file, size, modified)| !same_file(file, u64::try_from(*size).unwrap_or(0), *modified)).map(|(key, file, ..)| (key, file)).collect()
+            })
+            .await?;
+            if !changed.is_empty() {
+                let dropped = self
+                    .store
+                    .call(move |c| {
+                        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let mut n = 0usize;
+                        for (key, file) in &changed {
+                            n = n.saturating_add(tx.execute("DELETE FROM blob_keys WHERE key = ?1 AND file = ?2", params![key, file])?);
+                        }
+                        tx.commit()?;
+                        Ok(n)
+                    })
+                    .await?;
+                out.dropped = out.dropped.saturating_add(dropped);
+            }
+            if !full {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// `<data>/cas`: where the chunks are.
@@ -288,9 +463,9 @@ impl LocalBlobs {
 
     /// Takes files kept before the store had keys as its objects, where they lie: each of
     /// `files` (its key, its path, and its content's SHA-256, `None` to read it) unless its key
-    /// already names something. How many it took.
-    pub async fn adopt(&self, files: Vec<(String, PathBuf, Option<String>)>) -> anyhow::Result<usize> {
-        let mut taken = 0usize;
+    /// already names something.
+    pub async fn adopt(&self, files: Vec<(String, PathBuf, Option<String>)>) -> anyhow::Result<Adopted> {
+        let mut out = Adopted::default();
         for batch in files.chunks(ADOPT_BATCH) {
             let batch = batch.to_vec();
             let rows = crate::rt::blocking(move || -> anyhow::Result<Vec<(String, String, u64, i64, String)>> {
@@ -305,34 +480,39 @@ impl LocalBlobs {
                         Some(d) => d.to_ascii_lowercase(),
                         None => crate::sync::blobs::hash_file(&path)?,
                     };
-                    let modified = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-                    out.push((key, digest, md.len(), modified, path.to_string_lossy().into_owned()));
+                    out.push((key, digest, md.len(), modified_ms(&md), path.to_string_lossy().into_owned()));
                 }
                 Ok(out)
             })
             .await??;
-            taken = taken.saturating_add(
-                self.store
-                    .call(move |c| {
-                        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                        let mut n = 0usize;
-                        for (key, digest, size, modified, path) in &rows {
-                            n = n.saturating_add(tx.execute(
-                                "INSERT OR IGNORE INTO blob_keys (key, digest, size, modified_ms, file) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                params![key, digest, i64_of(*size), modified, path],
-                            )?);
+            let (taken, redundant) = self
+                .store
+                .call(move |c| {
+                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let (mut n, mut redundant) = (0usize, Vec::new());
+                    for (key, digest, size, modified, path) in &rows {
+                        let took = tx.execute(
+                            "INSERT OR IGNORE INTO blob_keys (key, digest, size, modified_ms, file) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![key, digest, i64_of(*size), modified, path],
+                        )?;
+                        n = n.saturating_add(took);
+                        if took == 0 && row(&tx, key)?.is_some_and(|r| r.digest == *digest && r.file.as_deref() != Some(path.as_str())) {
+                            redundant.push(PathBuf::from(path));
                         }
-                        tx.commit()?;
-                        Ok(n)
-                    })
-                    .await?,
-            );
+                    }
+                    tx.commit()?;
+                    Ok((n, redundant))
+                })
+                .await?;
+            out.taken = out.taken.saturating_add(taken);
+            out.redundant.extend(redundant);
         }
-        Ok(taken)
+        Ok(out)
     }
 
-    /// Lets go of uploads left [`UPLOAD_TTL`], objects no key has held for an hour, and chunks no
-    /// object or part uses (once an hour old: a write may be about to name them).
+    /// Lets go of uploads left [`UPLOAD_TTL`], objects this store released over an hour ago that
+    /// nothing has used since, and chunks no object or part uses (once an hour old: a write may be
+    /// about to name them). What an older kiln kept is [`LocalBlobs::reconcile`]'s.
     pub async fn collect(&self) -> anyhow::Result<Collected> {
         let now_ms = self.clock.unix_ms();
         let stale_before = now_ms.saturating_sub(i64::try_from(UPLOAD_TTL.as_millis()).unwrap_or(i64::MAX));
@@ -349,7 +529,10 @@ impl LocalBlobs {
                     tx.execute("DELETE FROM blob_parts WHERE upload = ?1", [id])?;
                     tx.execute("DELETE FROM blob_uploads WHERE id = ?1", [id])?;
                 }
-                let objects = tx.execute("DELETE FROM cas_objects WHERE last_used_at < ?1 AND digest NOT IN (SELECT digest FROM blob_keys)", [released_before])?;
+                let objects = tx.execute(
+                    "DELETE FROM cas_objects WHERE released_at < ?1 AND last_used_at <= released_at AND digest NOT IN (SELECT digest FROM blob_keys)",
+                    [released_before],
+                )?;
                 let mut used = HashSet::new();
                 for sql in ["SELECT chunks FROM cas_objects", "SELECT chunks FROM blob_parts"] {
                     let mut q = tx.prepare(sql)?;
@@ -472,7 +655,7 @@ impl Blobs for LocalBlobs {
                     let old = row(&tx, &k)?;
                     tx.execute("DELETE FROM blob_keys WHERE key = ?1", [&k])?;
                     if let Some(o) = old.as_ref().filter(|o| o.file.is_none()) {
-                        tx.execute("UPDATE cas_objects SET last_used_at = ?2 WHERE digest = ?1", params![o.digest, now_s])?;
+                        released(&tx, &o.digest, now_s)?;
                     }
                     tx.commit()?;
                     Ok(Ok(old.and_then(|o| o.file)))
@@ -724,11 +907,7 @@ pub(crate) mod tests {
             let before = b.stored_bytes().await?;
             assert_eq!(b.collect().await?.objects, 0, "released within the hour, it stays");
             f.clock.advance(chunks::GRACE + Duration::from_secs(1));
-            // The chunk files are as old as the disk says: made older than the grace by hand.
-            let old = std::time::SystemTime::now() - chunks::GRACE - Duration::from_secs(60);
-            for e in walk(&b.root.join("chunks"))? {
-                std::fs::File::options().write(true).open(&e)?.set_modified(old)?;
-            }
+            age_chunks(&b.root)?;
             let c = b.collect().await?;
             assert_eq!(c.objects, 1, "{c:?}");
             assert!(c.chunks > 0 && b.stored_bytes().await? < before, "{c:?}");
@@ -749,6 +928,142 @@ pub(crate) mod tests {
         Ok(out)
     }
 
+    /// The chunk files are as old as the disk says: made older than the grace by hand.
+    fn age_chunks(root: &Path) -> io::Result<()> {
+        let old = std::time::SystemTime::now() - chunks::GRACE - Duration::from_secs(60);
+        for e in walk(&root.join("chunks"))? {
+            std::fs::File::options().write(true).open(&e)?.set_modified(old)?;
+        }
+        Ok(())
+    }
+
+    /// What kiln's CAS upkeep did before its objects were behind Blobs, as an older kiln run on
+    /// this store again (a rollback) does it at `now`: `collect`'s SQL in ci/services/cas.rs at main
+    /// 64b69db word for word, then its sweep of every chunk file no remaining object uses (made old
+    /// enough by hand). How many objects it let go.
+    fn older_kiln_upkeep(c: &mut Connection, root: &Path, now: i64) -> anyhow::Result<usize> {
+        let grace = 3600;
+        let tx = c.transaction()?;
+        let gone = tx.execute(
+            "DELETE FROM cas_objects WHERE last_used_at < ?1
+               AND digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)
+               AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)
+               AND digest NOT IN (SELECT object FROM ci_release_assets)
+               AND digest NOT IN (SELECT object FROM test_reports)
+               AND 'sha256:' || digest NOT IN (SELECT digest FROM registry_blobs)
+               AND digest NOT IN (SELECT digest FROM proxy_cache)",
+            params![now.saturating_sub(grace)],
+        )?;
+        let mut used = HashSet::new();
+        {
+            let mut q = tx.prepare("SELECT chunks FROM cas_objects")?;
+            let rows = q.query_map([], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let list: Vec<(String, u64)> = serde_json::from_str(&row?).unwrap_or_default();
+                used.extend(list.into_iter().map(|(d, _)| d));
+            }
+        }
+        tx.commit()?;
+        for f in walk(&root.join("chunks"))? {
+            let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if !used.contains(&name) || name.ends_with(".tmp") {
+                std::fs::remove_file(&f)?;
+            }
+        }
+        Ok(gone)
+    }
+
+    /// CP-T10.1: an older kiln run on this store again (a rollback) lets go of no object a key
+    /// holds, but for the CAS's own nothing of CI refers to, as it always did; and this release,
+    /// started again, drops the keys of those.
+    #[test]
+    fn an_older_kiln_run_on_the_store_lets_go_of_nothing_a_key_holds() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let f = Fixture::new()?;
+            let b = &f.blobs;
+            let noise = kiln_seams::blobs::noise;
+            let held = [("sync/a", noise(2 << 20, 21)), ("binaries/kiln-x", noise(3 << 20, 22)), ("recordings/s/r/video", noise(1 << 20, 23)), ("transcripts/s/claude.jsonl.br", noise(1 << 20, 24))];
+            for (k, v) in &held {
+                b.put(k, v.clone(), Put::default()).await?;
+            }
+            // The CAS's own: one CI refers to, one nothing does, one a sync key holds too.
+            let (used, unused, shared) = (noise(2 << 20, 25), noise(2 << 20, 26), noise(2 << 20, 27));
+            let cas = |v: &[u8]| format!("cas/{}", crate::util::sha256_hex(v));
+            for v in [&used, &unused, &shared] {
+                b.put(&cas(v), v.clone(), Put::default()).await?;
+            }
+            b.put("sync/shared", shared.clone(), Put::default()).await?;
+            let d = crate::util::sha256_hex(&used);
+            b.store.call(move |c| Ok(c.execute("INSERT INTO proxy_cache (proxy, key, digest, size, content_type, fetched_at) VALUES ('p', 'k', ?1, 1, 'x', 0)", [d])?)).await?;
+            // Two hours on, the older kiln's upkeep.
+            age_chunks(&b.root)?;
+            let (root, now) = (b.root.clone(), f.clock.unix_ms().div_euclid(1000).saturating_add(7200));
+            assert_eq!(b.store.call(move |c| older_kiln_upkeep(c, &root, now)).await?, 1, "the CAS's object nothing refers to, alone");
+            for (k, v) in held.iter().chain([("sync/shared", shared.clone())].iter()) {
+                assert!(b.get(k, None).await?.1 == *v, "{k}");
+            }
+            assert!(b.get(&cas(&used), None).await?.1 == used && b.get(&cas(&shared), None).await?.1 == shared);
+            assert!(b.get(&cas(&unused), None).await.is_err());
+            assert_eq!(b.reconcile().await?, Reconciled { taken: 0, dropped: 1 });
+            assert!(matches!(b.head(&cas(&unused)).await, Err(Refusal::NotFound(_))));
+            Ok(())
+        })
+    }
+
+    /// CP-T10.1: started again after an older kiln ran on this store (a rollback), the store takes
+    /// in the objects it kept, and those it used after this store let them go, at `cas/<digest>`
+    /// with records of kiln's CAS; keys whose files it removed or replaced go; once. Its upkeep
+    /// then lets go of what it let go itself, and of nothing taken in.
+    #[test]
+    fn what_an_older_kiln_kept_is_taken_in_and_what_it_removed_is_dropped() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let f = Fixture::new()?;
+            let b = &f.blobs;
+            let noise = kiln_seams::blobs::noise;
+            let cas = |v: &[u8]| format!("cas/{}", crate::util::sha256_hex(v));
+            // Let go of by this store: one then used by the older kiln (a CI read, as it does),
+            // one not.
+            let (reused, dropped) = (noise(1 << 20, 31), noise(1 << 20, 32));
+            for (k, v) in [("tmp/reused", &reused), ("tmp/dropped", &dropped)] {
+                b.put(k, v.clone(), Put::default()).await?;
+                b.delete(k).await?;
+            }
+            // Kept by the older kiln as it keeps objects: its chunks, and a row.
+            let kept = noise(3 << 20, 33);
+            let (list, _) = chunks::keep_all(&b.root, &kept)?;
+            let (kd, rd, list) = (crate::util::sha256_hex(&kept), crate::util::sha256_hex(&reused), serde_json::to_string(&list)?);
+            let now = f.clock.unix_ms().div_euclid(1000);
+            b.store
+                .call(move |c| {
+                    c.execute("INSERT INTO cas_objects (digest, size, chunks, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?4)", params![kd, 3 << 20, list, now.saturating_add(60)])?;
+                    c.execute("UPDATE cas_objects SET last_used_at = ?2 WHERE digest = ?1", params![rd, now.saturating_add(120)])?;
+                    Ok(())
+                })
+                .await?;
+            // Files taken where they lay: the older kiln removed one, and replaced another.
+            let dir = tempfile::tempdir()?;
+            let (gone, replaced) = (dir.path().join("gone"), dir.path().join("replaced"));
+            std::fs::write(&gone, b"removed")?;
+            std::fs::write(&replaced, b"before")?;
+            assert_eq!(b.adopt(vec![("sync/gone".into(), gone.clone(), None), ("binaries/kiln-y".into(), replaced.clone(), None)]).await?.taken, 2);
+            std::fs::remove_file(&gone)?;
+            std::fs::write(&replaced, b"after, and longer")?;
+            assert_eq!(b.reconcile().await?, Reconciled { taken: 2, dropped: 2 });
+            assert!(b.get(&cas(&kept), None).await?.1 == kept && b.get(&cas(&reused), None).await?.1 == reused);
+            for k in ["sync/gone", "binaries/kiln-y", &cas(&dropped)] {
+                assert!(matches!(b.head(k).await, Err(Refusal::NotFound(_))), "{k}");
+            }
+            let index: i64 = b.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM cas_index", [], |r| r.get(0))?)).await?;
+            assert_eq!(index, 2, "kiln's CAS knows what was taken in");
+            assert_eq!(b.reconcile().await?, Reconciled::default(), "taken in once");
+            f.clock.advance(chunks::GRACE + Duration::from_secs(1));
+            age_chunks(&b.root)?;
+            assert_eq!(b.collect().await?.objects, 1);
+            assert!(b.get(&cas(&kept), None).await?.1 == kept && b.get(&cas(&reused), None).await?.1 == reused);
+            Ok(())
+        })
+    }
+
     /// CP-T10.1: files kept before the store had keys are its objects where they lie, read as they
     /// are; replaced, the file goes.
     #[test]
@@ -759,8 +1074,8 @@ pub(crate) mod tests {
             let file = dir.path().join("old");
             std::fs::write(&file, b"from before")?;
             let sha = crate::util::sha256_hex(b"from before");
-            assert_eq!(f.blobs.adopt(vec![("sync/x".into(), file.clone(), Some(sha.clone()))]).await?, 1);
-            assert_eq!(f.blobs.adopt(vec![("sync/x".into(), file.clone(), None)]).await?, 0, "taken once");
+            assert_eq!(f.blobs.adopt(vec![("sync/x".into(), file.clone(), Some(sha.clone()))]).await?.taken, 1);
+            assert_eq!(f.blobs.adopt(vec![("sync/x".into(), file.clone(), None)]).await?, Adopted::default(), "taken once");
             let (meta, bytes) = f.blobs.get("sync/x", None).await?;
             assert_eq!((meta.etag, bytes), (sha, b"from before".to_vec()));
             assert_eq!(f.blobs.get("sync/x", Some(Range { start: 5, end: None })).await?.1, b"before".to_vec());

@@ -28,6 +28,12 @@ CREATE TABLE blob_parts (
   PRIMARY KEY (upload, part)
 );
 
+-- When the local store let go of an object (Unix seconds; NULL while a key holds it, and for what an
+-- older kiln kept): what an older kiln run on this store again (a rollback) kept or used is told
+-- from what this one let go, and taken in when this one starts again (LocalBlobs::reconcile). An
+-- older kiln names the columns it writes, so it leaves this one alone.
+ALTER TABLE cas_objects ADD COLUMN released_at INTEGER;
+
 -- What the content-addressed store held before is the local store's, each object at
 -- `cas/<digest>`: the key kiln's CAS names it by (ci/services/cas.rs).
 INSERT OR IGNORE INTO blob_keys (key, digest, size, modified_ms, file)

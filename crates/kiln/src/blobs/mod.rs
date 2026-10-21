@@ -122,9 +122,10 @@ pub fn open(cfg: &crate::config::Config, store: &crate::store::Store, clock: Arc
 /// How often the store's upkeep lets go of what nothing holds.
 const UPKEEP_EVERY: Duration = Duration::from_secs(3600);
 
-/// The store at the server's start, before anything reads from it: what was kept as files before
-/// (the upgrade binaries) taken into the local store where it lies, once, and what kiln knows of
-/// the kept binaries read. Sync's contents are listed by their own ([`crate::sync::contents`]).
+/// The store at the server's start, before anything reads from it: what an older kiln did to the
+/// local store taken in ([`local::LocalBlobs::ready`]), the upgrade binaries kept as files taken in
+/// where they lie, and what kiln knows of the kept binaries read. Sync's contents are listed by
+/// their own ([`crate::sync::contents`]).
 pub async fn start(hub: &crate::hub::Hub) {
     if let Some(s3) = &hub.blobs.s3
         && hub.cfg.blobs.s3.create_bucket
@@ -132,10 +133,11 @@ pub async fn start(hub: &crate::hub::Hub) {
     {
         tracing::warn!(target: "kiln.blobs", event = "put", error = %e, "the S3 bucket kiln keeps its bytes in couldn't be made");
     }
-    if let Some(local) = &hub.blobs.local
-        && let Err(e) = crate::updates::take_in(hub, local).await
-    {
-        tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "runner binaries from before couldn't be taken in");
+    if let Some(local) = &hub.blobs.local {
+        local.ready().await;
+        if let Err(e) = crate::updates::take_in(hub, local).await {
+            tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "runner binaries kept as files couldn't be taken in");
+        }
     }
     crate::updates::load(hub).await;
 }

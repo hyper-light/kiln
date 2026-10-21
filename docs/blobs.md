@@ -81,10 +81,10 @@ Keys are 1 to 960 bytes of UTF-8, in `/`-separated segments of 1 to 255 bytes, w
   every hour.
 - **What kiln kept before** stays where it was. The content-addressed store's objects are the local
   store's at `cas/<digest>` (the migration that made the tables keyed them: rows, no bytes moved).
-  Sync's contents (`<data>/sync/blobs/<2 hex>/<hash>`) and runner binaries (`<data>/binaries`) are
-  taken in where they lie the first time the server starts (a `.taken` mark in each folder says it
-  was done): their keys name those files, read as they are, until they're replaced or let go.
-  New writes go to the chunks.
+  Sync's contents (`<data>/sync/blobs/<2 hex>/<hash>`) are taken in where they lie the first time
+  the server starts (a `.taken` mark says when), and runner binaries (`<data>/binaries`) each time
+  it starts: their keys name those files, read as they are, until they're replaced or let go. New
+  writes go to the chunks.
 
 ### Presigned URLs
 
@@ -145,11 +145,32 @@ object (large ones in parts), checks each copy's SHA-256, and skips what the S3 
 already, so a copy cut short is finished by running it again. The local store's files stay where
 they are until you remove them.
 
-**Going back a release** after the move to these stores: an older kiln reads the
-content-addressed store (`cas_objects`) as it always did, so caches, artifacts and registry blobs
-are there. It doesn't know the keys, so contents and binaries kept since come back from their
-machines (sync's runners send again what's wanted; a binary is uploaded again). Its own
-collection may let go of objects only keys hold after an hour.
+## Rolling back
+
+A kiln from before these stores can run on the same data directory again (a rollback), and this
+release after it, with nothing a key holds lost:
+
+- **Before going back,** take `[blobs]` out of `kiln.toml` if it's there: an older kiln refuses a
+  section it doesn't know. A server moved to the S3 store doesn't go back: an older kiln can't read
+  S3, and nothing copies its objects back.
+- **What the older kiln finds:** the content-addressed store as it always was (`cas_objects` and
+  the chunks), so caches, artifacts, registry blobs and release assets kept since are there, read
+  and let go as before. An object a key other than `cas/<digest>` holds (sync's contents, runner
+  binaries, recordings, transcripts) is pinned there (its `last_used_at` past any time), so the
+  older kiln's upkeep never lets it go, nor its chunks. It doesn't know keys: contents and binaries
+  kept since come back from their machines (sync's runners send again what's wanted; a binary is
+  fetched or uploaded again), and recordings and transcripts are where it always read them.
+- **Coming back:** before it serves, this release takes in what the older kiln did
+  (`LocalBlobs::reconcile`). Objects it kept, or used after this release let them go, become keys
+  at `cas/<digest>`, with kiln's CAS's records of them. Keys whose object it let go, or whose file
+  it removed or replaced, go, with a warning. Sync's contents it kept as files since the `.taken`
+  mark are taken in where they lie, and a file whose content the store holds already is removed; a
+  binary it kept newer than the store's is the platform's.
+- **One case loses a key:** the older kiln unpins an object when it reads it or keeps the same
+  content again as CI's (a release pipeline's artifact is also the runner binary kept of it). If
+  nothing of CI refers to it an hour later, it lets it go; coming back, this release drops the keys
+  that held it, and their content comes back as above (sync's runners send it again; the binary is
+  fetched or uploaded again).
 
 ## Watching it
 
