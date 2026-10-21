@@ -635,10 +635,14 @@ impl Host {
         if !trees.is_empty() {
             session.ran.lock().1.clone_from(&alive);
             *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
-            let mut core = session.core.lock();
-            core.state.tasks.extend(trees.iter().map(|(root, _)| super::survivors::task(root)));
+        }
+        // Shown once each, and what it showed as left running that has ended since, ended.
+        let apart = alive.iter().map(|r| r.pid).collect();
+        let mut core = session.core.lock();
+        if settle_left(&mut core.state.tasks, trees.iter().map(|(root, _)| super::survivors::task(root)).collect(), &apart, now_s) {
             core.touch_state();
         }
+        drop(core);
         if !s.queue.is_empty() || paused || cut {
             let mut core = session.core.lock();
             core.state.queue = s.queue;
@@ -716,25 +720,15 @@ impl Host {
             }
         }
         // Left running that ended.
-        let ended: Vec<u32> = left.iter().filter(|l| !now_apart.contains(&l.pid)).map(|l| l.pid).collect();
         left.retain(|l| now_apart.contains(&l.pid));
         let mut next = (if running { seen.harness } else { ran.0.clone() }, seen.under);
         next.1.extend(apart);
         let changed = *ran != next;
         *ran = next;
         drop((ran, left));
-        if !new_left.is_empty() || !ended.is_empty() {
-            let mut core = s.core.lock();
-            for root in &new_left {
-                let mut t = super::survivors::task(root);
-                t.summary = Some(format!("Left running, apart from the agent (process {})", root.pid));
-                core.state.tasks.push(t);
-            }
-            let gone: std::collections::HashSet<u32> = ended.into_iter().collect();
-            for t in core.state.tasks.iter_mut().filter(|t| t.live() && t.id.strip_prefix(super::survivors::LEFT).and_then(|p| p.parse::<u32>().ok()).is_some_and(|p| gone.contains(&p))) {
-                t.status = "completed".to_owned();
-                t.ended = Some(i64::try_from(now_s).unwrap_or(0).saturating_mul(1000));
-            }
+        let taken = new_left.iter().map(|root| super::model::Task { summary: Some(format!("Left running, apart from the agent (process {})", root.pid)), ..super::survivors::task(root) }).collect();
+        let mut core = s.core.lock();
+        if settle_left(&mut core.state.tasks, taken, &now_apart, now_s) {
             core.touch_state();
         }
         changed
@@ -771,6 +765,33 @@ impl Host {
         }
         self.changed.notify(usize::MAX);
     }
+}
+
+/// What a session shows as left running, against what runs apart from it now (`apart`, by pid):
+/// the tasks of the roots taken over now (`taken`) shown, once each (one that came back with its
+/// timeline after a restart or an upgrade is shown already), and every one shown that no longer
+/// runs ended, those it came back with included, which may have ended while no runner looked.
+/// Whether any changed.
+fn settle_left(tasks: &mut Vec<super::model::Task>, taken: Vec<super::model::Task>, apart: &std::collections::HashSet<u32>, now_s: u64) -> bool {
+    use super::survivors::LEFT;
+    // A second copy of one shown goes (older images showed it again on each restart).
+    let mut shown = std::collections::HashSet::new();
+    let before = tasks.len();
+    tasks.retain(|t| !(t.live() && t.id.starts_with(LEFT)) || shown.insert(t.id.clone()));
+    let mut changed = tasks.len() != before;
+    for t in taken {
+        if !shown.contains(&t.id) {
+            tasks.push(t);
+            changed = true;
+        }
+    }
+    let ended = i64::try_from(now_s).unwrap_or(0).saturating_mul(1000);
+    for t in tasks.iter_mut().filter(|t| t.live() && t.id.strip_prefix(LEFT).and_then(|p| p.parse::<u32>().ok()).is_some_and(|p| !apart.contains(&p))) {
+        t.status = "completed".to_owned();
+        t.ended = Some(ended);
+        changed = true;
+    }
+    changed
 }
 
 /// The turn a restart cut short goes on first: kiln's word (shown as kiln's), ahead of what was
@@ -1213,6 +1234,52 @@ mod tests {
                 g.kill();
                 g.remove();
             }
+            Ok(())
+        })
+    }
+
+    /// What a session shows as left running is set right: one that has ended is ended though no look
+    /// took it over, one shown twice is shown once, and one taken over again isn't shown again.
+    #[test]
+    fn left_running_is_shown_once_and_ended_once_it_no_longer_runs() {
+        use super::super::survivors::{self, Ran};
+        let shown = |pid: u32| survivors::task(&Ran { pid, ppid: 1, started: 1_700_000_000, command: format!("sleep {pid}") });
+        // 11 ended while no runner looked; 22 runs, shown twice by an older image; 33 is new.
+        let mut tasks = vec![shown(11), shown(22), shown(22)];
+        let apart = [22, 33].into_iter().collect();
+        assert!(settle_left(&mut tasks, vec![shown(22), shown(33)], &apart, 1_800_000_000));
+        let live: Vec<&str> = tasks.iter().filter(|t| t.live()).map(|t| t.id.as_str()).collect();
+        assert_eq!(live, ["left-22", "left-33"]);
+        let ended = tasks.iter().find(|t| t.id == "left-11").map(|t| (t.status.as_str(), t.ended));
+        assert_eq!(ended, Some(("completed", Some(1_800_000_000_000))), "kept, as ended");
+        // Nothing to set right, nothing changes.
+        assert!(!settle_left(&mut tasks, vec![shown(22)], &apart, 1_800_000_010));
+    }
+
+    /// A session an upgrade handed over comes with its timeline, whose left running the watch never
+    /// took over: its next look ends those that have ended since and shows the rest once, taken
+    /// back over.
+    #[test]
+    fn a_look_sets_right_the_left_running_a_handed_over_session_came_with() -> anyhow::Result<()> {
+        use super::super::survivors::{self, Ran, Seen};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, None, Limits::default());
+            let s = host.open(Some("handed".into()), no_harness(dir.path()))?;
+            let ran = |pid: u32| Ran { pid, ppid: 1, started: 1_700_000_000, command: format!("sleep {pid}") };
+            // Its timeline shows 11 (ended during the upgrade) and 22 (twice); its record has 22.
+            s.core.lock().state.tasks.extend([survivors::task(&ran(11)), survivors::task(&ran(22)), survivors::task(&ran(22))]);
+            *s.ran.lock() = (None, vec![ran(22)]);
+            host.note(&s, Seen::default(), &HashMap::from([(22, 1_700_000_000)]), 1_800_000_000);
+            let tasks = s.core.lock().state.tasks.clone();
+            let live: Vec<&str> = tasks.iter().filter(|t| t.live()).map(|t| t.id.as_str()).collect();
+            assert_eq!(live, ["left-22"], "{tasks:?}");
+            assert!(tasks.iter().any(|t| t.id == "left-11" && t.status == "completed"), "{tasks:?}");
+            assert_eq!(s.left.lock().iter().map(|r| r.pid).collect::<Vec<_>>(), [22], "taken back over");
+            // Once 22 ends, the next look ends it.
+            host.note(&s, Seen::default(), &HashMap::new(), 1_800_000_010);
+            assert!(s.core.lock().state.tasks.iter().all(|t| !t.live()), "nothing left running");
             Ok(())
         })
     }
