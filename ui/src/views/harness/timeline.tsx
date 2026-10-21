@@ -10,7 +10,7 @@ import { useSession, type Approval, type Command, type Delivery, type HEvent, ty
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { AccountCard, saysSignedOut } from "./account-card";
-import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, taskDot, taskDuration, taskLive, taskOfCall, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
+import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, taskDot, taskDuration, taskLive, taskOfCall, turnsFrom, type Item, type Step, type ToolEvent, type Turn, type TurnsMemo } from "./derive";
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
@@ -920,9 +920,16 @@ export const Timeline = React.memo(function Timeline({
   const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
   const going = parent ? Boolean(task && taskLive(task)) : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
-  // Turns that didn't change stay the same objects, so only what changed renders again.
+  // Turns that didn't change stay the same objects, so only what changed renders again; and only
+  // the turns from the first change on are worked out again (derive.ts), not the whole history.
   const [kept] = React.useState(() => new Map<string, Turn>());
-  const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
+  const [memo] = React.useState<{ last: TurnsMemo | null }>(() => ({ last: null }));
+  const turns = React.useMemo(() => {
+    const next = turnsFrom(memo.last, events, parent, going);
+    const shared = shareTurns(kept, next.turns);
+    memo.last = { ...next, turns: shared };
+    return shared;
+  }, [kept, memo, events, parent, going]);
   const keeper = useKeeper(placeKey(agent, parent));
   const { read, restore, atEnd, setTail, toEnd } = keeper;
   // Scrolling records the place for the next content update without rendering the conversation.
