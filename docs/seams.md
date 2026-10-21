@@ -66,7 +66,8 @@ Every record kiln keeps, by family and key, each at the revision of the commit t
 
 - **Implementations:** Amphora's typed records (CP-T1.5, which takes this suite past 200 cases);
   `kiln_seams::records::SimRecords`: linearizable, snapshot reads from each key's last 32
-  versions (older: refused `Compacted`), a change feed of the last 100,000 changes, a million rows.
+  versions and the last 100,000 deleted keys' histories (older: refused `Compacted`), a change
+  feed of the last 100,000 changes, a million rows.
 - **Used by:** goal stacks, goal items, plans, plan runs and keep-going, once CP-T1.5 moves them
   off rusqlite; the session journal (CP-T3.1).
 - **Passed by:** the simulator, every clause; Amphora's, when CP-T1.5 lands it.
@@ -121,7 +122,8 @@ Bytes, with S3's semantics. An object's etag is its content's SHA-256, however i
 
 - **Implementations:** kiln's CAS, any S3, then Mantle (CP-T10.1, which takes this suite past 150
   cases); `kiln_seams::blobs::SimBlobs`: in memory, its presigned URLs signed and timed by its
-  clock, objects to 64 MiB, a GiB in all, 1000 uploads under way.
+  clock, objects to 64 MiB, a million of them, a GiB in all (uploads' parts included), 1000
+  uploads under way.
 - **Used by:** the CAS, sync's blobs, CD's artifacts, recordings, transcripts and upgrade binaries,
   once CP-T10.1 moves them behind it; Reliquary's bytes (CP-T9.1).
 - **Passed by:** the simulator, every clause; the local and S3 ones, when CP-T10.1 lands them.
@@ -179,8 +181,8 @@ OCI repositories, as the Distribution Specification v1.1 has them: blobs by dige
 tag or digest, kept byte for byte, tags that move, and referrers.
 
 - **Implementations:** Reliquary (CP-T9.1, from kiln's `ci/registry`, passing the OCI conformance
-  suite); `kiln_seams::artifacts::SimArtifacts`: in memory, 100,000 repositories, blobs and
-  manifests.
+  suite); `kiln_seams::artifacts::SimArtifacts`: in memory, 100,000 repositories, and 100,000
+  blobs, manifests and tags in each, a GiB in all.
 - **Used by:** kiln's registry, with agents, harnesses, skills and MCP servers checked on push,
   once CP-T9.1 lands Reliquary.
 - **Passed by:** the simulator, every clause; Reliquary, when CP-T9.1 lands it.
@@ -256,7 +258,8 @@ command catalog), and commands to them. Generic over kiln's types: an agent is k
 
 - **Implementations:** kiln's harness registry (`harness/port.rs`: the hub's own sessions and every
   runner's); `kiln_seams::harness::SimHarness`, which keeps agents in memory and records each
-  command it's handed, stamped by its clock (100,000 an agent; past it, refused `Full`).
+  command it's handed, stamped by its clock: 100,000 agents, and 100,000 commands an agent (past
+  it, refused `Full`).
 - **Used by:** the goal driver and keep-going (`goals/mod.rs`, `goals/keep.rs`); the inbox and the
   dispatcher of sends (CP-T3.2, CP-T3.3).
 - **Passed by:** the simulator, every clause. kiln's registry passes HARNESS-1, HARNESS-2 and

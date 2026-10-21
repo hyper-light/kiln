@@ -806,7 +806,7 @@ mod tests {
             let (id, goal) = ("goals-backoff", "the parser takes every input");
             // Its harness has goals of its own (Claude Code's /goal); it's idle, its goal still set.
             let objective = Objective { text: goal.into(), status: "active".into(), reason: None, at: clock.unix_ms() };
-            port.open(id, Info { id: id.into(), status: Status::Idle, objective: Some(objective), ..Info::default() });
+            assert!(port.open(id, Info { id: id.into(), status: Status::Idle, objective: Some(objective), ..Info::default() }));
             port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
             let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
             let sent = || port.heard(id).iter().map(|d| d.at_ms).collect::<Vec<i64>>();

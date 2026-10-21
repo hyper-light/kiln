@@ -165,13 +165,25 @@ fn references(media_type: &str, bytes: &[u8]) -> Result<References, Refusal> {
 
 // ---------------------------------------------------------------------------------- simulator
 
-/// Most repositories, and blobs, a [`SimArtifacts`] holds.
+/// Most repositories a [`SimArtifacts`] holds, and most blobs, manifests and tags in one.
 pub const SIM_ITEMS: usize = 100_000;
+/// Most bytes it holds, blobs and manifests together.
+pub const SIM_BYTES: u64 = 1 << 30;
 
 /// Repositories in memory. Clones share them.
 #[derive(Clone, Default)]
 pub struct SimArtifacts {
-    inner: Arc<Mutex<BTreeMap<String, Repo>>>,
+    inner: Arc<Mutex<SimState>>,
+}
+
+#[derive(Default)]
+struct SimState {
+    repos: BTreeMap<String, Repo>,
+    bytes: u64,
+}
+
+fn len64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 #[derive(Default)]
@@ -201,15 +213,24 @@ impl Artifacts for SimArtifacts {
             {
                 return Err(Refusal::DigestInvalid(format!("sent as {e}, it's {digest}")));
             }
-            let mut repos = self.inner.lock();
-            if !repos.contains_key(repo) && repos.len() >= SIM_ITEMS {
+            let mut st = self.inner.lock();
+            if !st.repos.contains_key(repo) && st.repos.len() >= SIM_ITEMS {
                 return Err(Refusal::Full { what: "repositories", limit: SIM_ITEMS });
             }
-            let r = repos.entry(repo.to_owned()).or_default();
-            if !r.blobs.contains_key(&digest) && r.blobs.len() >= SIM_ITEMS {
+            let held = st.bytes;
+            let r = st.repos.entry(repo.to_owned()).or_default();
+            if r.blobs.contains_key(&digest) {
+                return Ok(digest);
+            }
+            if r.blobs.len() >= SIM_ITEMS {
                 return Err(Refusal::Full { what: "blobs", limit: SIM_ITEMS });
             }
+            let total = held.saturating_add(len64(bytes.len()));
+            if total > SIM_BYTES {
+                return Err(Refusal::Full { what: "bytes", limit: usize::try_from(SIM_BYTES).unwrap_or(usize::MAX) });
+            }
             r.blobs.insert(digest.clone(), Arc::new(bytes));
+            st.bytes = total;
             Ok(digest)
         })();
         Box::pin(async move { out })
@@ -221,7 +242,7 @@ impl Artifacts for SimArtifacts {
             if !valid_digest(digest) {
                 return Err(Refusal::DigestInvalid(digest.to_owned()));
             }
-            self.inner.lock().get(repo).and_then(|r| r.blobs.get(digest)).map(|b| b.as_ref().clone()).ok_or_else(|| Refusal::BlobUnknown(digest.to_owned()))
+            self.inner.lock().repos.get(repo).and_then(|r| r.blobs.get(digest)).map(|b| b.as_ref().clone()).ok_or_else(|| Refusal::BlobUnknown(digest.to_owned()))
         })();
         Box::pin(async move { out })
     }
@@ -241,22 +262,35 @@ impl Artifacts for SimArtifacts {
                 return Err(Refusal::TagInvalid(reference.to_owned()));
             }
             let (blobs, manifests, subject, artifact_type) = references(media_type, &bytes)?;
-            let mut repos = self.inner.lock();
-            let r = repos.entry(repo.to_owned()).or_default();
+            let mut st = self.inner.lock();
+            if !st.repos.contains_key(repo) && st.repos.len() >= SIM_ITEMS {
+                return Err(Refusal::Full { what: "repositories", limit: SIM_ITEMS });
+            }
+            let held = st.bytes;
+            let r = st.repos.entry(repo.to_owned()).or_default();
             if let Some(missing) = blobs.iter().find(|d| !r.blobs.contains_key(*d)) {
                 return Err(Refusal::ManifestBlobUnknown(missing.clone()));
             }
             if let Some(missing) = manifests.iter().find(|d| !r.manifests.contains_key(*d)) {
                 return Err(Refusal::ManifestBlobUnknown(missing.clone()));
             }
-            if r.manifests.len() >= SIM_ITEMS && !r.manifests.contains_key(&digest) {
+            let new = !r.manifests.contains_key(&digest);
+            if new && r.manifests.len() >= SIM_ITEMS {
                 return Err(Refusal::Full { what: "manifests", limit: SIM_ITEMS });
+            }
+            if !by_digest && !r.tags.contains_key(reference) && r.tags.len() >= SIM_ITEMS {
+                return Err(Refusal::Full { what: "tags", limit: SIM_ITEMS });
+            }
+            let total = if new { held.saturating_add(len64(bytes.len())) } else { held };
+            if total > SIM_BYTES {
+                return Err(Refusal::Full { what: "bytes", limit: usize::try_from(SIM_BYTES).unwrap_or(usize::MAX) });
             }
             let m = Manifest { media_type: media_type.to_owned(), digest: digest.clone(), bytes };
             r.manifests.insert(digest.clone(), (m, subject, artifact_type));
             if !by_digest {
                 r.tags.insert(reference.to_owned(), digest.clone());
             }
+            st.bytes = total;
             Ok(digest)
         })();
         Box::pin(async move { out })
@@ -265,8 +299,8 @@ impl Artifacts for SimArtifacts {
     fn manifest<'a>(&'a self, repo: &'a str, reference: &'a str) -> BoxFuture<'a, Result<Manifest, Refusal>> {
         let out = (|| {
             check_repo(repo)?;
-            let repos = self.inner.lock();
-            let r = repos.get(repo).ok_or_else(|| Refusal::ManifestUnknown(reference.to_owned()))?;
+            let st = self.inner.lock();
+            let r = st.repos.get(repo).ok_or_else(|| Refusal::ManifestUnknown(reference.to_owned()))?;
             let digest = if reference.starts_with("sha256:") { reference.to_owned() } else { r.tags.get(reference).cloned().ok_or_else(|| Refusal::ManifestUnknown(reference.to_owned()))? };
             r.manifests.get(&digest).map(|(m, ..)| m.clone()).ok_or_else(|| Refusal::ManifestUnknown(reference.to_owned()))
         })();
@@ -276,8 +310,8 @@ impl Artifacts for SimArtifacts {
     fn tags<'a>(&'a self, repo: &'a str, after: Option<&'a str>, limit: usize) -> BoxFuture<'a, Result<Vec<String>, Refusal>> {
         let out = (|| {
             check_repo(repo)?;
-            let repos = self.inner.lock();
-            let Some(r) = repos.get(repo) else { return Ok(Vec::new()) };
+            let st = self.inner.lock();
+            let Some(r) = st.repos.get(repo) else { return Ok(Vec::new()) };
             let start = after.map_or(std::ops::Bound::Unbounded, |a| std::ops::Bound::Excluded(a.to_owned()));
             Ok(r.tags.range((start, std::ops::Bound::Unbounded)).take(limit.min(TAGS_MAX)).map(|(t, _)| t.clone()).collect())
         })();
@@ -290,10 +324,11 @@ impl Artifacts for SimArtifacts {
             if !valid_digest(digest) {
                 return Err(Refusal::DigestInvalid(digest.to_owned()));
             }
-            let mut repos = self.inner.lock();
-            let r = repos.get_mut(repo).ok_or_else(|| Refusal::ManifestUnknown(digest.to_owned()))?;
-            r.manifests.remove(digest).ok_or_else(|| Refusal::ManifestUnknown(digest.to_owned()))?;
+            let mut st = self.inner.lock();
+            let r = st.repos.get_mut(repo).ok_or_else(|| Refusal::ManifestUnknown(digest.to_owned()))?;
+            let (m, ..) = r.manifests.remove(digest).ok_or_else(|| Refusal::ManifestUnknown(digest.to_owned()))?;
             r.tags.retain(|_, d| d != digest);
+            st.bytes = st.bytes.saturating_sub(len64(m.bytes.len()));
             Ok(())
         })();
         Box::pin(async move { out })
@@ -305,8 +340,8 @@ impl Artifacts for SimArtifacts {
             if !valid_digest(digest) {
                 return Err(Refusal::DigestInvalid(digest.to_owned()));
             }
-            let repos = self.inner.lock();
-            let Some(r) = repos.get(repo) else { return Ok(Vec::new()) };
+            let st = self.inner.lock();
+            let Some(r) = st.repos.get(repo) else { return Ok(Vec::new()) };
             let mut out: Vec<Referrer> = r
                 .manifests
                 .values()

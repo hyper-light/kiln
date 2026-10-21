@@ -47,6 +47,8 @@ pub trait HarnessPort: Send + Sync + 'static {
 
 /// Most commands a [`SimHarness`] keeps per agent by default; past it, a send is refused `Full`.
 pub const SIM_INBOX: usize = 100_000;
+/// Most agents a [`SimHarness`] knows at once; past it, `open` takes no more.
+pub const SIM_AGENTS: usize = 100_000;
 
 /// A command the simulator was handed, and when (its clock's wall time).
 #[derive(Debug, Clone, PartialEq)]
@@ -100,12 +102,17 @@ impl<A: Clone, C: Clone> SimHarness<A, C> {
         self
     }
 
-    /// Opens agent `id` (or sets it again, as it is now).
-    pub fn open(&self, id: &str, agent: A) {
+    /// Opens agent `id` (or sets it again, as it is now): false, and nothing changed, when it
+    /// knows [`SIM_AGENTS`] already.
+    pub fn open(&self, id: &str, agent: A) -> bool {
         let mut st = self.inner.lock();
+        if !st.agents.contains_key(id) && st.agents.len() >= SIM_AGENTS {
+            return false;
+        }
         if st.agents.insert(id.to_owned(), agent).is_none() {
             st.order.push(id.to_owned());
         }
+        true
     }
 
     /// Changes agent `id` as it is now; false when there's none.
@@ -219,8 +226,8 @@ impl HarnessFixture for SimHarnessFixture {
         &self.0
     }
     fn open<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), Failure>> {
-        self.0.open(id, SimAgent { id: id.to_owned() });
-        Box::pin(async { Ok(()) })
+        let opened = self.0.open(id, SimAgent { id: id.to_owned() });
+        Box::pin(async move { ensure(opened, || "the simulator took no more agents".into()) })
     }
     fn close<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), Failure>> {
         self.0.close(id);
@@ -313,7 +320,7 @@ mod tests {
     fn deliveries_are_stamped_by_the_clock_and_refusals_are_typed() {
         let clock = SimClock::new();
         let h: SimHarness<SimAgent, String> = SimHarness::new(Arc::new(clock.clone())).with_inbox(1);
-        h.open("a", SimAgent { id: "a".into() });
+        assert!(h.open("a", SimAgent { id: "a".into() }));
         clock.advance(std::time::Duration::from_secs(30));
         assert_eq!(futures::executor::block_on(h.send("a", "first".into())), Sent::Delivered);
         assert_eq!(h.heard("a"), vec![Delivery { at_ms: crate::clock::SIM_EPOCH_MS + 30_000, command: "first".to_owned() }]);

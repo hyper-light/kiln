@@ -139,18 +139,21 @@ fn len64(n: usize) -> u64 {
 
 // ---------------------------------------------------------------------------------- simulator
 
-/// What a [`SimBlobs`] holds.
+/// What a [`SimBlobs`] holds: the largest object, the bytes in all (objects and the parts of
+/// uploads under way), the most objects, the most uploads under way, and the smallest part but
+/// the last.
 #[derive(Debug, Clone, Copy)]
 pub struct SimLimits {
     pub object: u64,
     pub total: u64,
+    pub objects: usize,
     pub uploads: usize,
     pub part_min: usize,
 }
 
 impl Default for SimLimits {
     fn default() -> Self {
-        Self { object: 64 << 20, total: 1 << 30, uploads: 1000, part_min: PART_MIN }
+        Self { object: 64 << 20, total: 1 << 30, objects: 1_000_000, uploads: 1000, part_min: PART_MIN }
     }
 }
 
@@ -199,6 +202,9 @@ impl SimBlobs {
             (Cond::IfMatch(want), Some(m)) if *want != m.etag => return Err(Refusal::PreconditionFailed(key.to_owned())),
             (Cond::IfMatch(_), None) => return Err(Refusal::PreconditionFailed(key.to_owned())),
             _ => {}
+        }
+        if old.is_none() && st.objects.len() >= self.limits.objects {
+            return Err(Refusal::Full { what: "objects", limit: len64(self.limits.objects) });
         }
         let total = st.bytes.saturating_sub(old.as_ref().map_or(0, |m| m.size)).saturating_add(size);
         if total > self.limits.total {
@@ -335,9 +341,18 @@ impl Blobs for SimBlobs {
                 return Err(Refusal::TooLarge { what: "a part", size: len64(bytes.len()), limit: self.limits.object });
             }
             let mut st = self.inner.lock();
-            let (_, parts) = st.uploads.get_mut(upload).ok_or_else(|| Refusal::NoSuchUpload(upload.to_owned()))?;
+            // A part's bytes count toward the store's until its upload completes or is aborted.
+            let (_, parts) = st.uploads.get(upload).ok_or_else(|| Refusal::NoSuchUpload(upload.to_owned()))?;
+            let replaced = parts.get(&part).map_or(0, |(_, b)| len64(b.len()));
+            let total = st.bytes.saturating_sub(replaced).saturating_add(len64(bytes.len()));
+            if total > self.limits.total {
+                return Err(Refusal::Full { what: "bytes", limit: self.limits.total });
+            }
             let etag = sha256_hex(&bytes);
-            parts.insert(part, (etag.clone(), bytes));
+            if let Some((_, parts)) = st.uploads.get_mut(upload) {
+                parts.insert(part, (etag.clone(), bytes));
+            }
+            st.bytes = total;
             Ok(etag)
         })();
         Box::pin(async move { out })
@@ -365,15 +380,35 @@ impl Blobs for SimBlobs {
                 }
                 bytes.extend_from_slice(data);
             }
-            let meta = self.store(&mut st, &key, bytes, &Cond::Always)?;
-            st.uploads.remove(upload);
-            Ok(meta)
+            // Its parts' bytes become the object's.
+            let held: u64 = have.values().map(|(_, b)| len64(b.len())).fold(0, u64::saturating_add);
+            st.bytes = st.bytes.saturating_sub(held);
+            match self.store(&mut st, &key, bytes, &Cond::Always) {
+                Ok(meta) => {
+                    st.uploads.remove(upload);
+                    Ok(meta)
+                }
+                Err(e) => {
+                    st.bytes = st.bytes.saturating_add(held);
+                    Err(e)
+                }
+            }
         })();
         Box::pin(async move { out })
     }
 
     fn abort_upload<'a>(&'a self, upload: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
-        let out = self.inner.lock().uploads.remove(upload).map(|_| ()).ok_or_else(|| Refusal::NoSuchUpload(upload.to_owned()));
+        let out = {
+            let mut st = self.inner.lock();
+            match st.uploads.remove(upload) {
+                Some((_, parts)) => {
+                    let held: u64 = parts.values().map(|(_, b)| len64(b.len())).fold(0, u64::saturating_add);
+                    st.bytes = st.bytes.saturating_sub(held);
+                    Ok(())
+                }
+                None => Err(Refusal::NoSuchUpload(upload.to_owned())),
+            }
+        };
         Box::pin(async move { out })
     }
 
@@ -655,14 +690,23 @@ mod tests {
 
     #[test]
     fn its_bytes_and_objects_are_bounded() {
-        let b = SimBlobs::new(Arc::new(SimClock::new()), SimLimits { object: 4, total: 6, uploads: 1, part_min: 1 });
+        let b = SimBlobs::new(Arc::new(SimClock::new()), SimLimits { object: 4, total: 6, objects: 3, uploads: 1, part_min: 1 });
         let put = |k: &str, v: &[u8]| futures::executor::block_on(b.put(k, v.to_vec(), Put::default())).map(|m| m.size);
         assert_eq!(put("a", b"12345"), Err(Refusal::TooLarge { what: "an object", size: 5, limit: 4 }));
         assert_eq!(put("a", b"1234"), Ok(4));
         assert_eq!(put("b", b"123"), Err(Refusal::Full { what: "bytes", limit: 6 }));
         assert_eq!(put("a", b"12"), Ok(2), "replacing frees what it replaced");
         assert_eq!(put("b", b"1234"), Ok(4));
-        assert!(futures::executor::block_on(b.start_upload("u")).is_ok());
+        let up = futures::executor::block_on(b.start_upload("u")).unwrap_or_default();
         assert!(matches!(futures::executor::block_on(b.start_upload("v")), Err(Refusal::Full { .. })));
+        // Its parts count toward the bytes: 6 held by a and b already.
+        assert!(matches!(futures::executor::block_on(b.upload_part(&up, 1, b"x".to_vec())), Err(Refusal::Full { what: "bytes", .. })));
+        assert!(futures::executor::block_on(b.delete("b")).is_ok());
+        assert!(futures::executor::block_on(b.upload_part(&up, 1, b"xy".to_vec())).is_ok());
+        assert!(futures::executor::block_on(b.abort_upload(&up)).is_ok());
+        // Empty objects count toward the most objects.
+        assert_eq!(put("e1", b""), Ok(0));
+        assert_eq!(put("e2", b""), Ok(0));
+        assert!(matches!(futures::executor::block_on(b.put("e3", Vec::new(), Put::default())), Err(Refusal::Full { what: "objects", .. })));
     }
 }

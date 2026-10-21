@@ -5,7 +5,7 @@
 //! (CP-T1.5, which grows the suite past 200 cases); [`SimRecords`] keeps it in memory, its history
 //! bounded.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -171,11 +171,14 @@ pub struct SimLimits {
     pub versions: usize,
     /// Changes kept for the change feed.
     pub changes: usize,
+    /// Deleted keys whose history is kept, for snapshot reads; past it the oldest go, and a
+    /// snapshot before their deletion is refused `Compacted`.
+    pub deleted: usize,
 }
 
 impl Default for SimLimits {
     fn default() -> Self {
-        Self { rows: 1_000_000, versions: 32, changes: 100_000 }
+        Self { rows: 1_000_000, versions: 32, changes: 100_000, deleted: 100_000 }
     }
 }
 
@@ -204,6 +207,8 @@ struct SimState {
     /// The feed starts after this revision.
     log_horizon: Rev,
     live: usize,
+    /// Keys whose newest version is a delete, by that delete's revision.
+    deleted: BTreeSet<(Rev, String, Vec<u8>)>,
 }
 
 impl SimState {
@@ -352,6 +357,13 @@ impl Records for SimRecords {
                     Write::Put { family, key, value } => (family, key, Some(value)),
                     Write::Delete { family, key } => (family, key, None),
                 };
+                let was_deleted = st.families.get(&family).and_then(|k| k.get(&key)).and_then(|v| v.back()).and_then(|(r, v)| v.is_none().then_some(*r));
+                if let Some(r) = was_deleted {
+                    st.deleted.remove(&(r, family.clone(), key.clone()));
+                }
+                if value.is_none() {
+                    st.deleted.insert((rev, family.clone(), key.clone()));
+                }
                 let versions = st.families.entry(family.clone()).or_default().entry(key.clone()).or_default();
                 // A key written twice in one commit keeps the last.
                 if versions.back().is_some_and(|(r, _)| *r == rev) {
@@ -371,6 +383,17 @@ impl Records for SimRecords {
                         st.log_horizon = st.log_horizon.max(r);
                     }
                 }
+            }
+            // Deleted keys past what's kept go, oldest delete first: a snapshot before it is refused.
+            while st.deleted.len() > st.limits.deleted {
+                let Some((r, family, key)) = st.deleted.pop_first() else { break };
+                if let Some(keys) = st.families.get_mut(&family) {
+                    keys.remove(&key);
+                    if keys.is_empty() {
+                        st.families.remove(&family);
+                    }
+                }
+                st.horizon = st.horizon.max(r.saturating_add(1));
             }
             st.live = live;
             st.head = rev;
@@ -669,7 +692,7 @@ mod tests {
 
     #[test]
     fn its_history_and_rows_are_bounded_and_say_so() {
-        let r = SimRecords::with_limits(SimLimits { rows: 2, versions: 2, changes: 3 });
+        let r = SimRecords::with_limits(SimLimits { rows: 2, versions: 2, changes: 3, ..SimLimits::default() });
         let commit = |t: Tx| futures::executor::block_on(r.commit(t));
         let r1 = commit(tx(vec![put("a", "1")])).unwrap_or_default();
         for v in ["2", "3", "4"] {
@@ -682,5 +705,22 @@ mod tests {
         assert_eq!(commit(tx(vec![put("c", "1")])), Err(Refusal::Full { limit: 2 }));
         // A delete and a put in one commit stay within it.
         assert!(commit(tx(vec![Write::Delete { family: F.into(), key: b"b".to_vec() }, put("c", "1")])).is_ok());
+    }
+
+    #[test]
+    fn deleted_keys_past_what_s_kept_go_and_snapshots_before_them_are_refused() {
+        let r = SimRecords::with_limits(SimLimits { deleted: 2, ..SimLimits::default() });
+        let commit = |t: Tx| futures::executor::block_on(r.commit(t));
+        let del = |k: &str| Write::Delete { family: F.into(), key: k.as_bytes().to_vec() };
+        let before = commit(tx(vec![put("a", "1"), put("b", "1"), put("c", "1")])).unwrap_or_default();
+        for k in ["a", "b", "c"] {
+            assert!(commit(tx(vec![del(k)])).is_ok());
+        }
+        // Three deleted, two kept: a's went, and a snapshot from before it is refused.
+        assert!(matches!(futures::executor::block_on(r.get(F, b"b", Consistency::Snapshot(before))), Err(Refusal::Compacted { .. })));
+        assert_eq!(futures::executor::block_on(r.get(F, b"a", Consistency::Linearizable)), Ok(None));
+        // A key put again is no longer a deleted one.
+        assert!(commit(tx(vec![put("b", "2")])).is_ok());
+        assert_eq!(futures::executor::block_on(r.get(F, b"b", Consistency::Linearizable)).ok().flatten().map(|x| x.value), Some(b"2".to_vec()));
     }
 }
