@@ -170,7 +170,7 @@ impl Host {
         self.looks.load(Ordering::Acquire)
     }
 
-    /// Records of the sessions written.
+    /// Records of the sessions written (a write that failed isn't one).
     pub fn saves(&self) -> u64 {
         self.saves.load(Ordering::Acquire)
     }
@@ -763,10 +763,12 @@ impl Host {
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
         let tmp = file.with_extension("tmp");
         let wrote = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::util::write_secret(&tmp, &json, 0o600)).and_then(|()| std::fs::rename(&tmp, file));
-        if let Err(e) = wrote {
-            tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions");
+        match wrote {
+            Ok(()) => {
+                self.saves.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(e) => tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions"),
         }
-        self.saves.fetch_add(1, Ordering::AcqRel);
         self.changed.notify(usize::MAX);
     }
 }
@@ -937,50 +939,62 @@ mod tests {
         }
     }
 
-    /// The watch looks at what the harnesses run every 10 s by the host's clock: not before.
+    /// The watch looks at what the harnesses run every 10 s by the host's clock: not before
+    /// (CP-M2's AC-M2.1: the harness host's watch on the simulated clock in tests).
     #[test]
     fn the_watch_looks_every_10_s_by_the_host_s_clock() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
             let clock = SimClock::new();
+            let start = clock.now();
             let (tx, _rx) = async_channel::unbounded();
             let host = Host::with_clock(tx, None, Limits::default(), Arc::new(clock.clone()));
             // A session starts the watch; closed again, a look has nothing to scan.
             host.open(Some("watched".into()), no_harness(dir.path()))?;
             assert!(host.close("watched"));
-            clock.sleeping_since(0, 1).await;
-            clock.advance(WATCH_EVERY.saturating_sub(Duration::from_millis(1)));
-            assert_eq!(host.looks(), 0, "a look before 10 s");
-            clock.advance(Duration::from_millis(1));
-            host.until(|h| h.looks() == 1).await;
-            clock.advance_and_settle(WATCH_EVERY).await;
-            assert_eq!(host.looks(), 2);
+            let mut slept = 0;
+            for n in 1..=2u32 {
+                // The watch sleeps till its next look: 10 s on from the last, and it's the only
+                // way to a look, so one that hasn't woken is one that hasn't looked.
+                clock.sleeping_since(slept, 1).await;
+                slept = clock.registrations();
+                assert_eq!((clock.sleepers(), clock.next_deadline()), (1, Some(start + WATCH_EVERY * n)), "the watch's sleep");
+                clock.advance(WATCH_EVERY.saturating_sub(Duration::from_millis(1)));
+                assert_eq!((clock.sleepers(), host.looks()), (1, u64::from(n - 1)), "awake, or a look, before 10 s");
+                clock.advance(Duration::from_millis(1));
+                host.until(|h| h.looks() == u64::from(n)).await;
+            }
             Ok(())
         })
     }
 
-    /// Changes in a burst are written once, half a second by the host's clock after the first.
+    /// Changes in a burst are written once, half a second by the host's clock after the first
+    /// (CP-M2, AC-M2.1).
     #[test]
     fn changes_are_written_once_half_a_second_after_them_by_the_host_s_clock() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
             let file = dir.path().join("harness.json");
             let clock = SimClock::new();
+            let start = clock.now();
             let (tx, _rx) = async_channel::unbounded();
             let host = Host::with_clock(tx, Some(file.clone()), Limits::default(), Arc::new(clock.clone()));
             host.open(Some("first".into()), no_harness(dir.path()))?;
-            // The watch's sleep, and the write's.
+            // The watch's sleep, and the write's: the write sleeps half a second, and it's the
+            // only way to the write, so one that hasn't woken is one that hasn't written.
             clock.sleeping_since(0, 2).await;
+            assert_eq!((clock.sleepers(), clock.next_deadline()), (2, Some(start + SAVE_AFTER)), "the write's sleep");
             host.open(Some("second".into()), no_harness(dir.path()))?;
             clock.advance(SAVE_AFTER.saturating_sub(Duration::from_millis(1)));
-            assert_eq!(host.saves(), 0, "written before half a second");
-            assert!(!file.exists());
+            assert_eq!((clock.sleepers(), clock.next_deadline()), (2, Some(start + SAVE_AFTER)), "awake before half a second");
+            assert!(host.saves() == 0 && !file.exists());
             clock.advance(Duration::from_millis(1));
             host.until(|h| h.saves() == 1).await;
             let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&file)?)?;
             let mut ids: Vec<&str> = saved.iter().map(Saved::id).collect();
             ids.sort_unstable();
             assert_eq!(ids, ["first", "second"], "both changes in the one write");
+            // (What the sessions do next, their harnesses failing to start, is the next burst's.)
             assert_eq!(host.saves(), 1);
             Ok(())
         })
@@ -1106,6 +1120,8 @@ mod tests {
         })
     }
 
+    /// What a harness left running is taken back over; its stop is waited for on the session's
+    /// updates, each a look, not by sleeps (CP-M2, AC-M2.3).
     #[cfg(unix)]
     #[test]
     fn what_a_session_left_running_is_taken_back_over_after_a_restart() -> anyhow::Result<()> {
