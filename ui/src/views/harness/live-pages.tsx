@@ -142,6 +142,10 @@ function Pages({ session }: { session: string }) {
   // What WebKit is there: an iPhone or iPad a Mac's iOS Simulator (the real Mobile Safari), else
   // Safari's own window on that Mac, or WebKitGTK elsewhere.
   const mac = look.data.look.platform === "macos";
+  // A profile of your own is yours alone: signed in as yourself (the server says when not).
+  const personal = look.data.look.personal ?? { ok: true };
+  const profiles = PROFILES.map((p) => (p.value === "personal" && !personal.ok ? { ...p, label: "Your own (sign in as yourself)", disabled: true } : p));
+  const profileNow: Profile = profile === "personal" && !personal.ok ? "conversation" : profile;
   const ios = (look.data.look.devices ?? []).some((d) => d.name === layout && d.mobile && /iPhone|iPad/.test(d.agent ?? ""));
   const webkitSays =
     runIn !== "webkit"
@@ -168,7 +172,7 @@ function Pages({ session }: { session: string }) {
     setBusy(starting ? "start" : "open");
     setError(null);
     try {
-      const v = await harnessApi.openStream(session, { ...(starting ? { start: true } : { url }), profile, engine: runIn === "chromium" ? undefined : runIn, device: layout || undefined, title: starting ? "The app" : port ? `localhost:${port.port}` : undefined });
+      const v = await harnessApi.openStream(session, { ...(starting ? { start: true } : { url }), profile: profileNow, engine: runIn === "chromium" ? undefined : runIn, device: layout || undefined, title: starting ? "The app" : port ? `localhost:${port.port}` : undefined });
       setHere((h) => [v, ...h]);
       setOpened(v.id);
       listed.setData((l) => [v, ...l.filter((x) => x.id !== v.id)]);
@@ -289,15 +293,16 @@ function Pages({ session }: { session: string }) {
         )}
         <SelectField label="Engine" value={runIn} onChange={setEngine} options={engines} className="lp-half" />
         <SelectField label="Device" value={layout} onChange={setLayout} options={devices} className="lp-half" />
-        <SelectField label="Browser profile" value={profile} onChange={(v) => setProfile(v as Profile)} options={PROFILES} className="lp-profile" />
+        <SelectField label="Browser profile" value={profileNow} onChange={(v) => setProfile(v as Profile)} options={profiles} className="lp-profile" />
         <Button size="sm" type="submit" className="lp-go" disabled={busy !== ""}>
           {busy === "start" ? "Starting the app" : busy === "open" ? "Opening" : chosen === "app" ? "Start and open" : "Open"}
         </Button>
       </form>
       <p className="field-hint lp-says">
-        {PROFILE_SAYS[profile]} {webkitSays}
+        {PROFILE_SAYS[profileNow]} {webkitSays}
         {runIn !== "chromium" ? " It streams without sound." : ""}
       </p>
+      {!personal.ok && personal.why && <p className="field-hint lp-says">{personal.why}</p>}
       <div className="lp-device">
         <span className="lp-device-what">On your device</span>
         <Button size="sm" variant="secondary" disabled={!device || deviceBusy} onClick={() => void onDevice("here")}>

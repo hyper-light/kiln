@@ -39,11 +39,14 @@ const insecure = typeof window !== "undefined" && window.isSecureContext === fal
  *  after two, this page doesn't try it again (the socket does). */
 let rtcMisses = 0;
 
-/** Why it can't be shown here (`rtc`: what became of WebRTC, when it was the one way left). */
+/** Why it can't be shown here, and what to do (`rtc`: what became of WebRTC, when it was the one
+ *  way left). */
 function cantShow(rtc?: "off" | "missed"): string {
-  if (!rtcs) return insecure ? "This browser can't show live pages on an http:// address: open kiln over https, or on localhost." : "This browser can't show live pages (it has neither WebCodecs nor WebRTC).";
-  const no = insecure ? "On an http:// address this browser has no WebCodecs (they need https, or localhost)" : "This browser has no WebCodecs";
-  return rtc === "off" ? `${no}, and this kiln has no WebRTC to show live pages with.` : `${no}, and WebRTC couldn't get through to kiln from here.`;
+  if (!rtcs) return insecure ? "This browser can't show live pages from kiln at a plain http:// address. Open kiln over https, or at localhost on kiln's own computer." : "This browser can't show live pages. Use a current Chrome, Edge, Firefox or Safari.";
+  if (!insecure) return rtc === "off" ? "This browser is too old to show live pages without WebRTC, and this kiln's server doesn't have WebRTC turned on. Use a current browser, or turn WebRTC on for the server (webrtc_addr, docs/previews.md)." : "This browser is too old to show live pages without WebRTC, and WebRTC couldn't reach this kiln's server from here. Use a current browser.";
+  return rtc === "off"
+    ? "At a plain http:// address, browsers show live pages only over WebRTC, and this kiln's server doesn't have WebRTC turned on. Open kiln over https (or at localhost on kiln's own computer), or turn WebRTC on for the server (webrtc_addr, docs/previews.md)."
+    : "At a plain http:// address, browsers show live pages only over WebRTC, and WebRTC couldn't reach this kiln's server from here: its UDP port may be blocked between you. Open kiln over https, or let that port through (docs/previews.md, “WebRTC”).";
 }
 
 /** One viewing of a stream: its socket, its decoders, what it draws; its WebRTC peer, when the
@@ -61,9 +64,9 @@ class Viewing {
   private pc: RTCPeerConnection | null = null;
   private rtc = false;
   private rtcWait: ReturnType<typeof setTimeout> | undefined;
-  /** With WebRTC the one way: the server's word that it has it, awaited; one try again once a peer
-   *  that played goes. */
-  private canWait: ReturnType<typeof setTimeout> | undefined;
+  /** Whether anything came yet: a server with WebRTC says so first, before anything else. */
+  private heard = false;
+  /** With WebRTC the one way: one try again once a peer that played goes. */
   private retried = false;
   private soundOn = false;
   closed = false;
@@ -76,12 +79,16 @@ class Viewing {
   ) {
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
-    this.ws.onopen = () => {
-      this.on.open();
-      // The server says at once whether it has WebRTC.
-      if (rtcOnly) this.canWait = setTimeout(() => this.cant("off"), 4000);
+    this.ws.onopen = () => this.on.open();
+    this.ws.onmessage = (m) => {
+      // A server with WebRTC says so in its first word, however long its runner takes: anything
+      // else first, and it has none (all a browser with no WebCodecs could show it with).
+      const first = !this.heard;
+      this.heard = true;
+      if (first && rtcOnly && !(typeof m.data === "string" && m.data.includes('"can"'))) return this.cant("off");
+      if (typeof m.data === "string") this.event(m.data);
+      else this.chunk(m.data as ArrayBuffer);
     };
-    this.ws.onmessage = (m) => (typeof m.data === "string" ? this.event(m.data) : this.chunk(m.data as ArrayBuffer));
     this.ws.onclose = (e) => {
       if (!this.closed) this.on.status("ended", e.code === 1000 ? "" : "The connection to it was lost.");
       this.closed = true;
@@ -107,7 +114,6 @@ class Viewing {
 
   close() {
     this.closed = true;
-    clearTimeout(this.canWait);
     this.unpeer(false);
     this.ws.close(1000);
     for (const d of [this.video, this.audio]) if (d && d.state !== "closed") d.close();
@@ -123,10 +129,7 @@ class Viewing {
     }
     const w = e.webrtc as { can?: boolean; answer?: string; error?: string; gone?: string } | undefined;
     if (!w) return this.on.event(e);
-    if (w.can) {
-      clearTimeout(this.canWait);
-      void this.offer();
-    }
+    if (w.can) void this.offer();
     else if (w.answer && this.pc) this.pc.setRemoteDescription({ type: "answer", sdp: w.answer }).catch(() => this.unpeer(true));
     else if (w.error !== undefined || w.gone !== undefined) this.unpeer(false);
   }
