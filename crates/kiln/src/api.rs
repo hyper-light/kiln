@@ -738,7 +738,32 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
         (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
         (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, &caller, id, action)).await,
+        // Said met, split, one goal changed, or the stack started, paused (for a while, too) …: each
+        // its operation (`goals.*`), the body its input.
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", what]) => {
+            let (name, field) = match *what {
+                "done" => ("goals.done", None),
+                "split" => ("goals.split", None),
+                action => ("goals.control", Some(("action", (*action).to_owned()))),
+            };
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+                if let Some((k, v)) = field {
+                    o.insert(k.into(), json!(v));
+                }
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
+        }
+        (&Method::PATCH, ["api", "harness", "sessions", id, "goals", goal]) => {
+            let (id, goal) = ((*id).to_owned(), (*goal).to_owned());
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+                o.insert("id".into(), json!(goal));
+            }
+            boxed(|| own_op(&hub, &caller, "goals.update", body)).await
+        }
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -3523,15 +3548,6 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
-    Ok(srv::json(StatusCode::OK, &s))
-}
-
-/// Start, pause, skip, clear or restore an agent's goal stack.
-async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
-    let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
-    may_steer_goals(hub, caller, id)?;
-    let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
-    hub.store.audit(caller.name.clone(), "goals.control".into(), format!("{id}: {action}")).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 

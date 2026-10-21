@@ -1,9 +1,9 @@
 /**
  * A plan run as one agent per step (docs/plans.md, "One agent per step"): each step with its
- * agent, where it stands (waiting, working, needs you, met, not met), what it changed and its diff
- * in review (each met step's on the one before's: the run ends as a stack); stop the run, retry a
- * step with a new agent, take a step over (kiln stops holding its agent to the goal) and say it's
- * met. Everything in the page's flow, kept live.
+ * agent (or the agent it was given to), where it stands (waiting, and for which steps; working,
+ * needs you, met and how, not met), what it changed and its diff in review (each met step's on the
+ * one met before it: the run ends as a stack); stop the run, retry a step, take a step over (kiln
+ * stops holding its agent to the goal) and say it's met. Everything in the page's flow, kept live.
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
@@ -32,6 +32,12 @@ const WORD: Record<StepStand, string> = {
 };
 
 const STATE: Record<PlanRunView["state"], string> = { running: "running", stopped: "stopped", done: "done" };
+
+/** Steps by number, as words: "step 2", "steps 2 and 3", "steps 1, 2 and 3". */
+function stepsWords(n: number[]): string {
+  if (n.length <= 1) return n.length ? `step ${n[0]}` : "";
+  return `steps ${n.slice(0, -1).join(", ")} and ${n[n.length - 1]}`;
+}
 
 /** "gone" for a run that isn't there: trying again won't bring it. */
 const unlessGone = (e: unknown): "gone" => {
@@ -175,6 +181,7 @@ function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; b
           </Link>
           <span className="plan-dim">
             {a.machine === "local" ? "server" : a.machine} · {a.kind}
+            {s.given ? " · on its goal stack" : ""}
             {a.files_changed > 0 ? ` · ${a.files_changed} file${a.files_changed === 1 ? "" : "s"} +${a.lines_added} −${a.lines_removed}` : ""}
             {s.tries > 1 ? ` · try ${s.tries}` : ""}
           </span>
@@ -183,7 +190,12 @@ function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; b
       ) : (
         s.agent_id && <p className="plan-dim run-what">Its agent has ended{s.tries > 1 ? ` (try ${s.tries})` : ""}.</p>
       )}
-      {s.reason && (s.stand === "unmet" || s.stand === "stopped" || s.stand === "yours") && <p className="plan-dim run-what">{s.reason}</p>}
+      {s.stand === "waiting" && s.needs?.length ? (
+        <p className="plan-dim run-what">
+          Starts once {stepsWords(s.needs)} {s.needs.length === 1 ? "is" : "are"} met.
+        </p>
+      ) : null}
+      {s.reason && (s.stand === "unmet" || s.stand === "stopped" || s.stand === "yours" || s.stand === "met") && <p className="plan-dim run-what">{s.reason}</p>}
       {e && stack && (
         <Quiet>
           <React.Suspense fallback={null}>
@@ -198,7 +210,7 @@ function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; b
         <div className="plan-actions">
           {(s.stand === "unmet" || s.stand === "stopped" || live) && (
             <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => onAct("retry")}>
-              {busy === `${s.n}:retry` ? "Starting…" : "Retry with a new agent"}
+              {busy === `${s.n}:retry` ? "Starting…" : s.given ? "Try it again" : "Retry with a new agent"}
             </Button>
           )}
           {(live || s.stand === "unmet" || s.stand === "stopped") && (

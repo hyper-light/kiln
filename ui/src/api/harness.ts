@@ -452,6 +452,10 @@ export interface GoalItem {
   reminders?: number;
   /** When it was last sent (unix ms). */
   reminded_at?: number;
+  /** The goal it's a part of (split into parts: that one comes back after them). */
+  part_of?: string;
+  /** The plan step it was made from (`n` from 1). */
+  step?: { plan: string; version: number; n: number; run?: string };
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -463,6 +467,8 @@ export interface GoalStack {
   updated_at: number;
   /** How many goals the last clear kept, to bring back (`restore`). */
   cleared?: number;
+  /** Paused for a while: when it resumes by itself (unix ms). */
+  resume_at?: number;
 }
 
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */

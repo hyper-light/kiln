@@ -298,6 +298,8 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
   // A harness the machine doesn't offer gives way to the first it does; a plan without steps runs as one message.
   const kind = offered.some((k) => k.id === kindChoice) ? kindChoice : (offered[0]?.id ?? "");
   const mode: PlanMode = plan.steps.length === 0 ? "message" : modeChoice;
+  // Steps that say what they run after run as that says, side by side where they don't wait for each other.
+  const graph = plan.items.some((it) => it.needs?.length);
   // One agent per step starts agents of its own.
   const fresh = where === "new" || mode === "agents";
 
@@ -352,7 +354,7 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
               ? [
                   { value: "steps", label: `Step by step (${plan.steps.length} messages, each after the last turn ends)` },
                   { value: "goals", label: `Goals (${plan.steps.length}, each a /goal once the one before is met)` },
-                  { value: "agents", label: `One agent per step (${plan.steps.length}, each once the one before is met)` },
+                  { value: "agents", label: `One agent per step (${plan.steps.length}, each once ${graph ? "the steps it runs after are" : "the one before is"} met)` },
                 ]
               : []),
           ]}
@@ -360,8 +362,9 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
       </div>
       {mode === "agents" && (
         <p className="plan-dim plan-meta-line">
-          Each step gets an agent of its own, held to the step as a goal; the next starts once it&rsquo;s met. They work in one folder, so one at a time: side by side waits for agents to have
-          workspaces of their own.
+          {graph
+            ? "Each step gets an agent of its own, held to the step as a goal, and starts once the steps it runs after are met: steps that don’t wait for each other run side by side, in one folder, so each keeps to its own files."
+            : "Each step gets an agent of its own, held to the step as a goal; the next starts once it’s met. To run steps side by side, say what each runs after."}
         </p>
       )}
       <div className="plan-actions">
