@@ -563,6 +563,30 @@ impl Sim {
                     }
                     let st = Standing { repo: REPO.to_owned(), ..stand(feed) };
                     mark = left_at(&looked, &st);
+                    if self.trace.keeps() {
+                        let short = |v: Option<&Version>| match v {
+                            Some(Version::File { hash, .. }) => hash.get(..8).unwrap_or_default().to_owned(),
+                            Some(Version::Link { target }) => format!("->{target}"),
+                            None => "-".to_owned(),
+                        };
+                        let state = &feed.copy.state;
+                        let files: Vec<String> = SESSION_PATHS
+                            .iter()
+                            .map(|(p, _)| {
+                                let here = feed.copy.fs.meta(&feed.copy.root.join(p)).ok().and_then(|_| crate::sync::blobs::hash_file_on(feed.copy.fs.as_ref(), &feed.copy.root.join(p)).ok());
+                                let seen = state.seen.get(*p).map(|e| format!("{}{}", short(Some(&e.version)), if e.racy { " racy" } else { "" }));
+                                format!(
+                                    "{p}: here {} synced {} pending {} tree {} seen {}",
+                                    here.as_deref().and_then(|h| h.get(..8)).unwrap_or("-"),
+                                    short(state.synced.get(*p)),
+                                    state.pending.get(*p).map_or("-".to_owned(), |v| short(v.as_ref())),
+                                    short(state.tree.files.get(*p)),
+                                    seen.unwrap_or_else(|| "-".to_owned())
+                                )
+                            })
+                            .collect();
+                        self.trace.note(|| format!("{now:?} leaving m{}: looked {looked:?}, standing reached {} behind {} unsent {}; {files:?}", at.saturating_add(2), st.reached, st.behind, st.unsent));
+                    }
                 }
                 match mark {
                     Some(mark) => {
@@ -1408,6 +1432,18 @@ mod tests {
                 return Err(format!("failing at write {fail_at}: the folder holds {:?}, the step brings {:?}", have.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>()));
             }
         }
+        Ok(())
+    }
+
+    /// CP-T6.1, the third bug kiln-sim found, by its seeds: a file written again just after a
+    /// look, keeping its size, kept its time too on a filesystem that stamps times by the second
+    /// (or the tick), and no look after saw the change: it took the file for what it had seen. A
+    /// moving session left its machine with its last write not in the log (moves seed 2000); a copy
+    /// kept bytes the log never had, and proposed stale ones over a conflict's (sync seed 1848).
+    #[test]
+    fn the_seeds_where_a_change_kept_its_file_s_size_and_time_converge() -> Result<(), String> {
+        run(1848, 0, Plant::default(), Mode::Sync)?;
+        run(2000, 0, Plant::default(), Mode::Moves)?;
         Ok(())
     }
 

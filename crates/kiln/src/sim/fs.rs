@@ -25,8 +25,9 @@ impl SimFs {
     }
 }
 
+/// A path as the simulated disk names it: `/`-separated, whatever the platform joined it with.
 fn s(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+    p.to_string_lossy().replace('\\', "/")
 }
 
 fn kind(k: disk::Kind) -> Kind {
@@ -130,5 +131,9 @@ impl Fs for SimFs {
 
     fn temp_id(&self) -> String {
         format!("t{:08x}", self.temps.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn now_ns(&self) -> i128 {
+        self.disk.now_ns()
     }
 }

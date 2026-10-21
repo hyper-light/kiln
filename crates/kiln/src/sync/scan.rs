@@ -18,12 +18,22 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[".git", "node_modules", "target", ".venv"
 /// A temporary file kiln writes while applying a step: never synced.
 pub const TEMP_PREFIX: &str = ".kiln-sync-";
 
+/// How recent a file's time may be, at a look, for a later look to know the file by its size and
+/// time: a file changed again within its filesystem's time step keeps both, so one this recent is
+/// read again at the next look, as git reads its racily clean entries again. Over two seconds:
+/// FAT keeps times to two, HFS+ to one, and Linux stamps them by a clock a tick behind.
+pub const RACY_NS: i128 = 3_000_000_000;
+
 /// What a scan keeps of a path between looks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub size: u64,
     pub mtime_ns: i128,
     pub version: Version,
+    /// Changed so close to the look that saw it that a change since could have kept its size and
+    /// time: read again at the next look, never known by them ([`RACY_NS`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub racy: bool,
 }
 
 /// What a copy syncs and how much.
@@ -52,13 +62,15 @@ pub struct Skipped {
 pub fn scan(fs: &dyn Fs, root: &Path, seen: &BTreeMap<String, Entry>, limits: &Limits) -> io::Result<(BTreeMap<String, Entry>, Vec<Skipped>)> {
     let mut found = BTreeMap::new();
     let mut skipped = Vec::new();
+    // Before anything is read: a file changed after it is changed after the look.
+    let started = fs.now_ns();
     for path in list(fs, root, limits)? {
         let full = root.join(&path);
         let Ok(meta) = fs.meta(&full) else { continue };
         let mtime_ns = meta.mtime_ns;
         if meta.is_symlink() {
             let target = fs.read_link(&full)?.to_string_lossy().replace('\\', "/");
-            found.insert(path, Entry { size: 0, mtime_ns, version: Version::Link { target } });
+            found.insert(path, Entry { size: 0, mtime_ns, version: Version::Link { target }, racy: false });
             continue;
         }
         if !meta.is_file() {
@@ -70,14 +82,15 @@ pub fn scan(fs: &dyn Fs, root: &Path, seen: &BTreeMap<String, Entry>, limits: &L
         }
         let exec = meta.exec;
         let version = match seen.get(&path) {
-            Some(e) if e.size == meta.len && e.mtime_ns == mtime_ns && matches!(&e.version, Version::File { exec: x, .. } if *x == exec) => e.version.clone(),
+            Some(e) if !e.racy && e.size == meta.len && e.mtime_ns == mtime_ns && matches!(&e.version, Version::File { exec: x, .. } if *x == exec) => e.version.clone(),
             _ => match hash_file_on(fs, &full) {
                 Ok(hash) => Version::File { hash, exec },
                 // Gone or unreadable between listing and reading: next look.
                 Err(_) => continue,
             },
         };
-        found.insert(path, Entry { size: meta.len, mtime_ns, version });
+        let racy = mtime_ns.saturating_add(RACY_NS) > started;
+        found.insert(path, Entry { size: meta.len, mtime_ns, version, racy });
     }
     Ok((found, skipped))
 }
@@ -184,10 +197,18 @@ mod tests {
         Ok(())
     }
 
+    /// Sets `path`'s modification time to `secs_ago` seconds before now.
+    fn aged(path: &Path, secs_ago: u64) -> io::Result<()> {
+        let t = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(secs_ago)).unwrap_or(std::time::UNIX_EPOCH);
+        std::fs::File::options().write(true).open(path)?.set_modified(t)
+    }
+
     #[test]
     fn only_what_changed_is_hashed_again() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         write(dir.path(), "f", "one")?;
+        // Changed long before the look: it's known by its size and time after.
+        aged(&dir.path().join("f"), 3600)?;
         let (first, _) = scan(&Std, dir.path(), &BTreeMap::new(), &Limits::default())?;
         // An entry that says otherwise for the same size and time is believed: nothing was read.
         let mut seen = first.clone();
@@ -198,6 +219,30 @@ mod tests {
         assert!(matches!(again.get("f").map(|e| &e.version), Some(Version::File { hash, .. }) if hash == "cached"));
         let (big, skipped) = scan(&Std, dir.path(), &BTreeMap::new(), &Limits { max_size: 2, ..Limits::default() })?;
         assert!(big.is_empty() && skipped.first().is_some_and(|s| s.path == "f"));
+        Ok(())
+    }
+
+    /// CP-T6.1, the third bug kiln-sim found: a file changed again just after a look, keeping its
+    /// size and (within its filesystem's time step) its time, is read again at the next look, not
+    /// taken for what the look saw; once its time is long past, it's known by them.
+    #[test]
+    fn a_change_that_keeps_a_file_s_size_and_time_just_after_a_look_is_still_seen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let f = dir.path().join("f");
+        write(dir.path(), "f", "one")?;
+        let t = std::fs::metadata(&f)?.modified()?;
+        let (first, _) = scan(&Std, dir.path(), &BTreeMap::new(), &Limits::default())?;
+        assert!(first.get("f").is_some_and(|e| e.racy), "changed just now: read again next time");
+        // Changed again within the same time step: the same size and time.
+        write(dir.path(), "f", "two")?;
+        std::fs::File::options().write(true).open(&f)?.set_modified(t)?;
+        let (again, _) = scan(&Std, dir.path(), &first, &Limits::default())?;
+        let (now, before) = (Version::File { hash: hash_file_on(&Std, &f)?, exec: false }, first.get("f").map(|e| e.version.clone()));
+        assert!(again.get("f").is_some_and(|e| e.version == now) && Some(now) != before, "the second change was seen");
+        // Long since: known by its size and time.
+        aged(&f, 3600)?;
+        let (old, _) = scan(&Std, dir.path(), &again, &Limits::default())?;
+        assert!(old.get("f").is_some_and(|e| !e.racy));
         Ok(())
     }
 }

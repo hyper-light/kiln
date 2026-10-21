@@ -278,6 +278,13 @@ impl Disk {
         self.inner.lock().faults.capacity = capacity;
     }
 
+    /// The disk's clock now, in nanoseconds since the Unix epoch, as fine as the simulation's (what
+    /// files' times are stamped from, before the filesystem's step).
+    pub fn now_ns(&self) -> i128 {
+        let st = self.inner.lock();
+        i128::from(SIM_EPOCH_MS).saturating_mul(1_000_000).saturating_add(i128::try_from(st.now().as_nanos()).unwrap_or(i128::MAX))
+    }
+
     /// Bytes the files hold.
     pub fn used(&self) -> u64 {
         self.inner.lock().used

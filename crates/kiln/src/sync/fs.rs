@@ -81,6 +81,8 @@ pub trait Fs: Send + Sync + std::fmt::Debug {
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
     /// A name for a temporary file no other has.
     fn temp_id(&self) -> String;
+    /// The clock files' times are stamped by, now: nanoseconds since the Unix epoch.
+    fn now_ns(&self) -> i128;
 }
 
 /// `path`'s bytes.
@@ -224,5 +226,9 @@ impl Fs for Std {
 
     fn temp_id(&self) -> String {
         crate::util::new_id()
+    }
+
+    fn now_ns(&self) -> i128 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
     }
 }
