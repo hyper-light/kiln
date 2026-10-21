@@ -1086,6 +1086,12 @@ textarea.hx-input {
   vertical-align: -0.18em;
   background: linear-gradient(180deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa);
 }
+/* After a list, a code block, a quote or a table, the caret stands where the next line would start
+   without making that line: the reply doesn't grow a line for it, to lose it again when the block
+   or the reply is done. */
+.hx-streaming > :not(p):last-child::after {
+  position: absolute;
+}
 .hx-outcome {
   padding: 14px 16px;
   border: 1px solid #262338;
