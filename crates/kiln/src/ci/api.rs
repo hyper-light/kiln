@@ -264,6 +264,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         // W13-R11: the runner images kiln built.
         (&Method::GET, ["images"]) => boxed(|| super::images::list(hub, q)).await,
+        (&Method::GET, ["registry", "mirrors"]) => boxed(|| super::registry::mirror::mirrors(hub)).await,
         // W13-R09: pools and their executors.
         (&Method::GET, ["pools"]) => boxed(|| super::pools::list(hub, None)).await,
         (&Method::GET, ["pools", name]) => boxed(|| super::pools::list(hub, Some(name))).await,

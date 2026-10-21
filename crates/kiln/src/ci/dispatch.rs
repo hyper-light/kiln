@@ -1443,7 +1443,22 @@ impl Dispatch {
             return Ok(());
         };
         let records = self.legs.get(id).and_then(|l| l.spec.environment.as_ref()).is_none_or(|e| e.deployment);
-        let def = super::environments::ensure(&self.hub, &repo, &env).await?;
+        // A preview's leg deploys to it only while kiln keeps it (W15-R07): one that's gone isn't
+        // made again as an environment with no rules.
+        let previewed = self.legs.get(id).and_then(|l| l.spec.environment.as_ref()).is_some_and(|e| e.preview.is_some());
+        let def = if previewed {
+            match super::environments::defs(&self.hub, &repo).await?.remove(&env.to_ascii_lowercase()) {
+                Some(d) => d,
+                None => {
+                    self.held.remove(id);
+                    let m = format!("{env} is gone: its change's preview went, and it takes no more deployments");
+                    runs::annotation(&self.hub, id, None, "error", None, &m, None, None, None, None, None).await?;
+                    return Box::pin(self.settled(id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await;
+                }
+            }
+        } else {
+            super::environments::ensure(&self.hub, &repo, &env).await?
+        };
         let reviews = super::environments::reviews(&self.hub, &run, &def.name).await?;
         let now = crate::util::now_unix();
         let p = &def.protection;

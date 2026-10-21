@@ -193,7 +193,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 44 of F-21's 50 green (setup-qemu in a microVM; the rest need accounts or GitHub's Sigstore); AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 
 ---
@@ -2470,7 +2470,10 @@ Gives step execution for `uses:`.
   workspace this runner's user owns) git first wants the workspace a safe directory, as on GitHub.
   A job that drops its credentials (`persist-credentials: false`) and fetches again needs them on
   kiln, whose repositories aren't read anonymously as a public one on GitHub is.
-- *Left.* AC01 (with W22-AC02).
+- *Done.* AC01 but two (with W22-AC02): F-21's actions green, those that need an account in dry
+  configurations against stand-ins for their providers (`tests/account_actions.rs`).
+- *Left.* AC01's `azure/login` (a test tenant, W11-AC03) and `actions/attest-build-provenance`
+  (GitHub's Sigstore only).
 
 ### W08 Runtime services: store, caches, artifacts, reuse
 
@@ -3565,10 +3568,15 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   - Nimble's package list (nim-lang.org's), its packages through `http`.
   - Unit-tested (`w12_r04_immutables`, `w12_r04_composer_swift_conan_and_vcpkg`), and end to end
     against stand-ins for Packagist and ConanCenter (`w12_r04_composer_conan_and_vcpkg`).
-- *Left.* R02's runners beyond Docker's pulls and Firecracker's (whose root file systems come
-  through kiln's mirrors as Docker's images do: W13-R05): containerd's `hosts.toml` for the
-  cluster and shards' settings, with W13; AC04 (user-assisted, against test tenants), which is
-  also where D.2's federations meet the real registries.
+- *Done.* R02 for a cluster's nodes: `GET /api/ci/registry/mirrors` (`ci.registry.mirrors`)
+  says what a machine pulling through kiln is given: Docker's `registry-mirrors` (Docker Hub's
+  mirror at its own `listen`) and, for each mirror, containerd's `certs.d/<upstream>/hosts.toml`
+  (the upstream's address, then kiln's under the mirror's prefix with `override_path`). `kiln images
+  mirrors --containerd /etc/containerd/certs.d [--ca <kiln's CA, from /ca.pem>]` writes them where
+  containerd's registry `config_path` reads them; a mirror that isn't `anonymous` is said to ask
+  for a sign-in, which a node's containerd doesn't give. Unit-tested (`w12_r02_what_a_node_pulls_through`).
+- *Left.* shards' registry settings (with W13-R06); AC04 (user-assisted, against test tenants),
+  which is also where D.2's federations meet the real registries.
 
 ### W13 Runners and executors
 
@@ -4071,6 +4079,11 @@ enforcement points to W18, agent isolation to W20.
     server answers on the guest's loopback, and a request out goes through the host's egress
     proxy. Unit-tested: layers' whiteouts, frames, pulls through kiln, `ldd`'s libraries,
     private networks through the guest's proxy.
+- *Done.* AC07's Dockerfile half (`tests/image_pool.rs`): an image built from what its editor
+  holds (`POST /api/ci/images/build`, as the Images panel's Build and push) on the server's
+  runner, pushed to kiln's registry and listed with its platform; then a `docker` pool of it,
+  made as the Pools page makes one (`PUT /api/ci/pools/:name`), pulled from kiln's registry with
+  the pool's own token, ran a leg in it (the file the Dockerfile wrote, on the image's Ubuntu).
 - *Left.*
   - Firecracker's own jailer where the runner is root (kiln's jail needs no root, and confines as
     it does but for its cgroups).
@@ -4079,7 +4092,9 @@ enforcement points to W18, agent isolation to W20.
     one kiln can build against yet), kiln's shipped definitions beyond the runner image, and
     example Agentfiles. The image builder, its build route and the editor's modes are W21-R08's
     (done).
-  - The ACs.
+  - AC02's `shards` and `k8s` parts (W06-AC01 in their legs: a shards microVM, and a pod on the
+    live cluster), AC06 (shards), AC07's Agentfile half (shards), and AC08 (a fresh VM through
+    Add machines, user-assisted). AC01, AC03 to AC05 and AC07's Dockerfile half are done.
 
 ### W14 Code hosting, stacked diffs, review and landing
 
@@ -6558,6 +6573,22 @@ and AC02.
   `binfmt_misc`, the action registered its arm64 emulator, and an arm64 Alpine container ran,
   emulated (`w22_ac02_setup_qemu_in_a_microvm`). That is 44 of F-21's 50; the six left need
   accounts or GitHub's Sigstore.
+- *AC02, sixth batch* (2026-10-21): the actions that need an account, recorded so, each in a dry
+  configuration that passes on kiln unmodified, against a stand-in for its provider where the
+  action lets one take its place (`tests/account_actions.rs`, W07-AC01):
+  - `aws-actions/configure-aws-credentials@v4` and `amazon-ecr-login@v2`, the AWS SDK's own
+    `AWS_ENDPOINT_URL_STS` and `AWS_ENDPOINT_URL_ECR` naming the stand-in: kiln's ID token
+    (audience `sts.amazonaws.com`, the run's subject) assumed the role, and `docker login` signed
+    in to the registry ECR named;
+  - `google-github-actions/auth@v2`, its `universe` a stand-in for Google's STS over TLS
+    (`sts.localhost`, its CA the job's `NODE_EXTRA_CA_CERTS`): kiln's ID token, for the pool's
+    provider, exchanged, and the credentials file made;
+  - `codecov/codecov-action@v5` with `dry_run`, its `url` a stand-in for Codecov's API.
+
+  That is every one of F-21's 50 but two: `azure/login`, which has no such configuration (it
+  signs in with the Azure CLI against Microsoft Entra), waits for a test tenant (W11-AC03); and
+  `actions/attest-build-provenance`, which signs only through a Sigstore that trusts GitHub's ID
+  tokens (kiln's own `kiln/attest@v1` and the job's `attest:` are W18-R01's).
 - *AC02, first batch* (16 actions, 2026-10-18):
   - Green: `setup-node`, `setup-go`, `setup-java`, `setup-uv`, `pnpm/action-setup`,
     `setup-bun`, `dtolnay/rust-toolchain`, `setup-terraform`, `docker/metadata-action`,
@@ -6963,6 +6994,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET · POST | `/api/agents` · POST `/api/agents/:name/probe` (built: runners are kiln's agents) | `ci.runners.list`, `ci.runners.probe` (its facts probed again now) | runners.read, runners.manage | W13 |
 | GET/PUT/DELETE | `/api/ci/pools[/:name]` · GET `/:name/history` | `ci.pools.list`, `.get`, `.set`, `.delete`, `.history` | pools.manage | W13, W21 |
 | GET/POST | `/api/ci/images` · POST `/validate` · POST `/build` (built) | `ci.images.list`, `.propose`, `.validate`, `.build` | images.build | W13, W21 |
+| GET | `/api/ci/registry/mirrors` | `ci.registry.mirrors` (what a machine pulls through kiln with: Docker's `registry-mirrors`, containerd's `hosts.toml`) | runners.read | W12 |
 | GET/PUT | `/api/ci/routing/rules?scope=` · POST `/explain` | `ci.routing.rules`, `.set`, `.explain` | routing.manage, runs.read | W05 |
 | GET/POST/PATCH/DELETE | `/api/ci/environments[/:name]` · GET `/board` · POST `/starter` | `ci.environments.list`, `.get`, `.save`, `.delete`, `.board`, `.starter` | environments.manage | W15 |
 | GET | `/api/ci/environments/:name/deployments` | `ci.environments.deployments` | runs.read | W15 |

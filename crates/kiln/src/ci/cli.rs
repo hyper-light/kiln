@@ -826,6 +826,16 @@ enum ImagesCmd {
     },
     /// Check a Dockerfile (or an Agentfile) as the editor does, each finding with its line.
     Validate { file: PathBuf },
+    /// The registries kiln pulls through, and what a machine is given to pull through it:
+    /// Docker's `registry-mirrors`, and containerd's `hosts.toml` for each, written under
+    /// `--containerd` (containerd's `config_path`, `/etc/containerd/certs.d`), naming `--ca` (kiln's
+    /// CA, from `/ca.pem`) where kiln's certificate is its own.
+    Mirrors {
+        #[arg(long)]
+        containerd: Option<PathBuf>,
+        #[arg(long)]
+        ca: Option<PathBuf>,
+    },
     /// Build a definition on a runner (`--on`: a label or a runner's name), and with `--push`
     /// push it to kiln's registry and register it (the server owner's only).
     Build {
@@ -879,6 +889,49 @@ pub async fn images(args: ImagesArgs, cfg: &Config) -> Result<()> {
             }
             if found.is_empty() {
                 println!("{}: no findings", file.display());
+            }
+        }
+        ImagesCmd::Mirrors { containerd, ca } => {
+            let v = run_op(&api, "ci.registry.mirrors", json!({})).await?;
+            let list = v.get("mirrors").and_then(Value::as_array).cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("kiln pulls through no registry: [[ci.registry.mirrors]] in the server's kiln.toml names them");
+                return Ok(());
+            }
+            for m in &list {
+                let anonymous = m.get("anonymous").and_then(Value::as_bool).unwrap_or(false);
+                println!("{:<24} /v2/{}/…  {}", s(m, "upstream"), s(m, "prefix"), if anonymous { "anyone pulls" } else { "pulls signed in" });
+            }
+            if let Some(d) = v.get("docker").filter(|d| d.get("registry-mirrors").and_then(Value::as_array).is_some_and(|l| !l.is_empty())) {
+                println!("\nDocker (daemon.json):\n{}", serde_json::to_string_pretty(d)?);
+            }
+            for note in v.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                println!("note: {note}");
+            }
+            let files = v.get("containerd").and_then(Value::as_object).cloned().unwrap_or_default();
+            match containerd {
+                Some(dir) => {
+                    for (path, text) in &files {
+                        let rel = path.strip_prefix("/etc/containerd/certs.d/").unwrap_or(path).trim_start_matches('/');
+                        anyhow::ensure!(!rel.split('/').any(|p| p == ".." || p.is_empty()), "`{path}` isn't a path under the folder");
+                        let mut text = text.as_str().unwrap_or_default().to_owned();
+                        if let Some(ca) = &ca {
+                            text = text.replace("  override_path = true\n", &format!("  override_path = true\n  ca = {}\n", serde_json::to_string(&ca.to_string_lossy())?));
+                        }
+                        let to = dir.join(rel);
+                        if let Some(parent) = to.parent() {
+                            std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
+                        }
+                        std::fs::write(&to, text).with_context(|| format!("writing {}", to.display()))?;
+                        println!("wrote {}", to.display());
+                    }
+                    println!("containerd reads them when its registry `config_path` is {}", dir.display());
+                }
+                None => {
+                    for (path, text) in &files {
+                        println!("\n# {path}\n{}", text.as_str().unwrap_or_default());
+                    }
+                }
             }
         }
         ImagesCmd::Build { name, file, repo, on, platforms, push } => {

@@ -404,6 +404,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/images", "diffs.submit", At::RepoQuery),
     r("POST", "/api/ci/attestations/verify", "runs.read", At::Anywhere),
     r("GET", "/api/ci/images", "runs.read", At::RepoQuery),
+    r("GET", "/api/ci/registry/mirrors", "runners.read", At::Server),
     r("GET", "/api/ci/pools", "runners.read", At::Server),
     r("GET", "/api/ci/pools/*", "runners.read", At::Server),
     r("GET", "/api/ci/pools/*/history", "runners.read", At::Server),
