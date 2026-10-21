@@ -2196,15 +2196,37 @@ async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
     }
     let path = artifact_path(hub, id);
-    let (sink, done) = crate::rt::file_sink(path, 8 << 30)?;
+    // Kept only once all of it came: an upload that broke off leaves nothing a release would take
+    // its binaries from (a tar cut short reads as shorter files, with no error).
+    let part = path.with_extension("part");
+    let (sink, done) = crate::rt::file_sink(part.clone(), 8 << 30)?;
     let mut body = req.into_body();
-    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
-        if sink.send(chunk).await.is_err() {
-            break; // the writer failed; its error is reported below
+    let mut broke = None;
+    loop {
+        match srv::next_chunk(&mut body).await {
+            Ok(Some(chunk)) => {
+                if sink.send(chunk).await.is_err() {
+                    break; // the writer failed; its error is reported below
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                broke = Some(e.to_string());
+                break;
+            }
         }
     }
     drop(sink);
-    done.await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let written = done.await;
+    if let Some(e) = broke {
+        let _ = std::fs::remove_file(&part);
+        return Err(err(StatusCode::BAD_REQUEST, format!("the upload broke off: {e}")));
+    }
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&part);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+    }
+    std::fs::rename(&part, &path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("keep {}: {e}", path.display())))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
