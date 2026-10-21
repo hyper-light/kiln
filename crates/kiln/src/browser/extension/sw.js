@@ -27,6 +27,22 @@ globalThis.kiln = {
     const mediaId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
     return await chrome.runtime.sendMessage({ kind: "switch", stream, mediaId });
   },
+  // A stream's tab captured again at its new size, in pixels (a capture keeps the size it began
+  // at): its capture let go first (Chrome captures a tab once at a time), then taken again.
+  async recapture(tabId, stream, width, height) {
+    await chrome.runtime.sendMessage({ kind: "release", stream });
+    let mediaId = null;
+    for (let i = 0; !mediaId; i++) {
+      try {
+        mediaId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+      } catch (e) {
+        // Still let go of, a moment.
+        if (i >= 20) throw e;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+    return await chrome.runtime.sendMessage({ kind: "switch", stream, mediaId, width, height });
+  },
   // A stream whose pictures kiln brings (another engine's page, taken as it changes): encoded in
   // the offscreen document as a captured tab's are.
   async pushed(stream, opts) {

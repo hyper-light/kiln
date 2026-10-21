@@ -693,7 +693,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   );
 
   // Where in the page: the frame's own point, or (held to a device, drawn whole in it) the page's.
-  const at = (e: React.PointerEvent | React.WheelEvent) => {
+  const at = (e: { clientX: number; clientY: number; currentTarget: EventTarget | null }) => {
     const c = e.currentTarget as HTMLCanvasElement;
     const r = c.getBoundingClientRect();
     const p = { x: e.clientX - r.left, y: e.clientY - r.top };
@@ -701,6 +701,33 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     return h ? pagePoint(p, r, { width: c.width, height: c.height }, h) : { x: Math.round(p.x), y: Math.round(p.y) };
   };
   const mods = (e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; key?: string }) => modifiers(e, macViewer, live.current.macPage);
+  // The wheel (a mouse's, a trackpad's, a pinch as a ctrl-wheel) is the page's, not the
+  // conversation's around it: React's wheel listener is passive and can't keep it, so the frame
+  // has one of its own. What comes within a frame goes as one, its deltas summed (in pixels: a
+  // line is 40, a page the frame's height).
+  const wheeled = React.useRef<{ x: number; y: number; dx: number; dy: number; mods: number } | null>(null);
+  const canvasEl = React.useCallback((c: HTMLCanvasElement | null) => {
+    canvas.current = c;
+    if (!c) return;
+    const on = (e: WheelEvent) => {
+      e.preventDefault();
+      const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? c.clientHeight || 800 : 1;
+      const p = at({ clientX: e.clientX, clientY: e.clientY, currentTarget: c });
+      const w = wheeled.current;
+      if (w) {
+        Object.assign(w, p, { dx: w.dx + e.deltaX * k, dy: w.dy + e.deltaY * k, mods: mods(e) });
+        return;
+      }
+      wheeled.current = { ...p, dx: e.deltaX * k, dy: e.deltaY * k, mods: mods(e) };
+      requestAnimationFrame(() => {
+        const w = wheeled.current;
+        wheeled.current = null;
+        if (w) input([{ t: "w", ...w }]);
+      });
+    };
+    c.addEventListener("wheel", on, { passive: false });
+    return () => c.removeEventListener("wheel", on);
+  }, [input]);
   const pointer = (k: "down" | "move" | "up" | "cancel") => (e: React.PointerEvent<HTMLCanvasElement>) => {
     const p = { t: "p", k, ...at(e), button: e.button, buttons: e.buttons, pt: e.pointerType, id: e.pointerId, mods: mods(e), clicks: k === "move" ? 0 : Math.max(1, e.detail || 1) };
     if (k === "down") {
@@ -978,7 +1005,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         <video ref={sourced} className="lv-video lv-source" muted playsInline autoPlay aria-hidden="true" tabIndex={-1} />
         <video ref={player} className="lv-video lv-rtc" muted playsInline autoPlay aria-hidden="true" tabIndex={-1} />
         <canvas
-          ref={canvas}
+          ref={canvasEl}
           className="lv-canvas"
           tabIndex={0}
           aria-label={`${title}, live`}
@@ -986,7 +1013,6 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           onPointerMove={pointer("move")}
           onPointerUp={pointer("up")}
           onPointerCancel={pointer("cancel")}
-          onWheel={(e) => input([{ t: "w", ...at(e), dx: e.deltaX, dy: e.deltaY, mods: mods(e) }])}
           onKeyDown={key("down")}
           onKeyUp={key("up")}
           onPaste={(e) => {

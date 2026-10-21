@@ -860,13 +860,21 @@ const FOCUS: &str = r"(() => {
   window.__kilnFocus.again = () => { for (const k of Object.keys(said)) delete said[k]; focus(); fields(); selected(); };
 })();";
 
+/// The page's own frame rate over half a second (its animation frames, as its compositor runs them).
+const PAGE_FPS: &str = "new Promise((r) => { let n = 0; const t0 = performance.now(); const f = () => { n++; if (performance.now() - t0 < 500) requestAnimationFrame(f); else r(Math.round((n * 1000) / (performance.now() - t0))); }; requestAnimationFrame(f); })";
+
 /// What's selected in the page, to copy: a field's selection (never a password's), else the
 /// document's.
 const SELECTED: &str = r"(() => { const e = document.activeElement; if (e && typeof e.selectionStart === 'number' && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA')) return e.type === 'password' ? '' : e.value.slice(e.selectionStart, e.selectionEnd); return String(getSelection() || ''); })()";
 
-/// What viewers do, applied in the order they did it (and logged, when it's recording).
+/// What viewers do, applied in the order they did it (and logged, when it's recording). What
+/// piled up while the page was busy goes together (`merged`): it never falls behind.
 async fn apply(s: std::sync::Weak<Stream>, queued: async_channel::Receiver<Vec<Input>>) {
-    while let Ok(events) = queued.recv().await {
+    while let Ok(mut events) = queued.recv().await {
+        while let Ok(more) = queued.try_recv() {
+            events.extend(more);
+        }
+        let events = merged(events);
         let Some(s) = s.upgrade() else { return };
         for e in &events {
             s.log(json!({"by": "person", "input": e}));
@@ -874,6 +882,40 @@ async fn apply(s: std::sync::Weak<Stream>, queued: async_channel::Receiver<Vec<I
         if let Err(e) = s.input(events).await {
             tracing::debug!(stream = %s.id, error = %format!("{e:#}"), "a viewer's input didn't reach the page");
         }
+    }
+}
+
+/// Input as little as it can be and still do the same: a run of wheel turns as one (their deltas
+/// summed, at the last one's point), a run of a pointer's moves as its last.
+fn merged(events: Vec<Input>) -> Vec<Input> {
+    let mut out: Vec<Input> = Vec::with_capacity(events.len());
+    for e in events {
+        if let Some(last) = out.last_mut()
+            && merge(last, &e)
+        {
+            continue;
+        }
+        out.push(e);
+    }
+    out
+}
+
+/// `e` into `last` when it's more of the same (`merged`); whether it was.
+fn merge(last: &mut Input, e: &Input) -> bool {
+    match (last, e) {
+        (Input::Wheel { x, y, dx, dy, mods }, Input::Wheel { x: x2, y: y2, dx: dx2, dy: dy2, mods: m2 }) if mods == m2 => {
+            (*x, *y) = (*x2, *y2);
+            *dx += dx2;
+            *dy += dy2;
+            true
+        }
+        (Input::Pointer { k, x, y, buttons, pt, id, mods, .. }, Input::Pointer { k: k2, x: x2, y: y2, buttons: b2, pt: pt2, id: id2, mods: m2, .. })
+            if k == "move" && k2 == "move" && buttons == b2 && pt == pt2 && id == id2 && mods == m2 =>
+        {
+            (*x, *y) = (*x2, *y2);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1520,7 +1562,8 @@ impl Stream {
 
     /// What a viewer asks of the stream (`ServerMsg::StreamControl`): `{"resize": {width, height,
     /// scale, mobile}}`, `{"pause": bool}`, `{"keyframe": true}`, `{"go": url}`, `{"reload": true}`,
-    /// `{"back": true}`, `{"forward": true}`, `{"tab": {"show" | "new" | "close": ...}}` (`Self::tab`).
+    /// `{"back": true}`, `{"forward": true}`, `{"tab": {"show" | "new" | "close": ...}}` (`Self::tab`),
+    /// `{"stats": true}` (its counts, said as `{"stats": ...}`).
     pub async fn control(&self, c: &Value) -> anyhow::Result<()> {
         let off = self.streamer.offscreen.lock().await.clone().unwrap_or_default();
         let cdp = &self.streamer.browser.cdp;
@@ -1540,9 +1583,19 @@ impl Stream {
             let _ = self.page.eval("document.activeElement && document.activeElement !== document.body && document.activeElement.scrollIntoView({ block: 'nearest' })").await;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let (pw, ph) = ((f64::from(w) * scale).round() as u32, (f64::from(h) * scale).round() as u32);
-            // A tab's capture takes its new size; another engine's pictures come at it.
-            if matches!(self.page, Surface::Tab(_)) {
-                super::evaluate(cdp, &off, &format!("kiln.resize({id}, {pw}, {ph})")).await?;
+            // A tab's captured again at its new size, once it's laid out at it (a capture keeps
+            // the size it began at); another engine's pictures come at it.
+            let shown = match &self.page {
+                Surface::Tab(t) => {
+                    let id = t.shown.lock().clone();
+                    t.get(&id)
+                }
+                Surface::Driven(_) => None,
+            };
+            if let Some(tab) = shown {
+                let _ = tab.page.settle().await;
+                let again = super::evaluate(cdp, &self.streamer.worker, &format!("kiln.recapture({}, {id}, {pw}, {ph})", tab.chrome)).await?;
+                anyhow::ensure!(again.get("ok").and_then(Value::as_bool) == Some(true), "its tab couldn't be captured at its new size: {}", again.get("error").and_then(Value::as_str).unwrap_or("it said nothing"));
             }
         }
         if let Some(p) = c.get("pause").and_then(Value::as_bool) {
@@ -1583,6 +1636,14 @@ impl Stream {
         if let Some(t) = c.get("tab") {
             self.tab(t).await?;
         }
+        // Its counts, for whoever's measuring: what its capture took, encoded and let go since
+        // last asked, and the page's own frame rate.
+        if c.get("stats").and_then(Value::as_bool) == Some(true) {
+            let encoder = super::evaluate(cdp, &off, &format!("kiln.stats({id})")).await.unwrap_or_default();
+            let page = self.page.eval(PAGE_FPS).await.unwrap_or_default();
+            let scrolled = self.page.eval("[scrollX, scrollY]").await.unwrap_or_default();
+            self.say(json!({"stats": {"encoder": encoder, "page_fps": page, "scrolled": scrolled, "window": *self.viewport.lock()}})).await;
+        }
         Ok(())
     }
 }
@@ -1598,6 +1659,22 @@ mod tests {
         let key = base64::engine::general_purpose::STANDARD.decode(m.get("key").and_then(Value::as_str).unwrap_or(""))?;
         let id: String = hex::encode(Sha256::digest(&key)).chars().take(32).map(|c| char::from(b'a' + u8::try_from(c.to_digit(16).unwrap_or(0)).unwrap_or(0))).collect();
         assert_eq!(id, EXTENSION_ID);
+        Ok(())
+    }
+
+    #[test]
+    fn input_that_piled_up_goes_together() -> anyhow::Result<()> {
+        let wheel = |dy: f64| Input::Wheel { x: 10.0, y: dy, dx: 0.0, dy, mods: 0 };
+        let p = |k: &str, x: f64| Input::Pointer { k: k.into(), x, y: 5.0, button: 0, buttons: 0, pt: "mouse".into(), id: 1, mods: 0, clicks: 0 };
+        let out = merged(vec![wheel(10.0), wheel(20.0), wheel(30.0), p("move", 1.0), p("move", 2.0), p("down", 2.0), p("move", 3.0), Input::Text { text: "a".into() }, wheel(5.0)]);
+        let said: Vec<String> = out.iter().map(|e| serde_json::to_string(e).unwrap_or_default()).collect();
+        assert_eq!(said.len(), 6, "{said:?}");
+        // The wheel's three as one, at the last's point; the moves as their last, the press kept
+        // in its place.
+        assert!(said.first().is_some_and(|w| w.contains("\"dy\":60.0") && w.contains("\"y\":30.0")), "{said:?}");
+        assert!(said.get(1).is_some_and(|m| m.contains("\"k\":\"move\"") && m.contains("\"x\":2.0")), "{said:?}");
+        assert!(said.get(2).is_some_and(|d| d.contains("\"k\":\"down\"")), "{said:?}");
+        assert!(said.get(5).is_some_and(|w| w.contains("\"dy\":5.0")), "{said:?}");
         Ok(())
     }
 
@@ -1685,7 +1762,7 @@ mod tests {
                 if done(self) {
                     return true;
                 }
-                match crate::rt::timeout(Duration::from_millis(100), rx.recv()).await {
+                match crate::rt::timeout(end.saturating_duration_since(std::time::Instant::now()).min(Duration::from_millis(100)), rx.recv()).await {
                     Ok(Ok(Out::Event { json, .. })) => self.events.push(serde_json::from_str(&json).unwrap_or_default()),
                     Ok(Ok(Out::Frame { data, .. })) if data.first() == Some(&b'v') => {
                         if let Some(ts) = data.get(2..10).and_then(|b| <[u8; 8]>::try_from(b).ok()) {
@@ -1704,6 +1781,82 @@ mod tests {
             let ids = t.get("list").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_owned)).collect()).unwrap_or_default();
             (ids, t.get("shown").and_then(Value::as_str).unwrap_or("").to_owned())
         }
+    }
+
+    /// How a page scrolled by the wheel streams: where it is, and the pictures its capture takes.
+    #[test]
+    #[ignore = "downloads and starts the real browser (about 200 MB)"]
+    fn a_scrolled_page_streams_as_it_scrolls() -> anyhow::Result<()> {
+        static PAGES: &[(&str, &str)] = &[("/", "<title>long</title><body style='margin:0'><script>for (let i = 0; i < 3000; i++) document.write('<div style=\"height:20px;background:hsl(' + (i * 7 % 360) + ',60%,40%)\">line ' + i + '</div>')</script></body>")];
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        let at = site(PAGES)?;
+        crate::rt::block_on(async move {
+            let spec: Spec = serde_json::from_value(json!({"url": format!("{at}/"), "width": 394, "height": 538, "scale": 2, "profile": "clean"}))?;
+            let (tx, rx) = async_channel::bounded::<Out>(4096);
+            streams().open(&dir, "scroll-test", &spec, tx).await?;
+            let s = streams().get("scroll-test").ok_or_else(|| anyhow::anyhow!("not open"))?;
+            s.control(&json!({"pause": false, "keyframe": true})).await?;
+            let mut h = Heard::default();
+            h.until(&rx, Duration::from_secs(3), |_| false).await;
+            let before = h.times.len();
+            let t0 = std::time::Instant::now();
+            // A wheel's turn each sixtieth of a second, as a viewer's come, for two seconds.
+            for _ in 0..120 {
+                s.inputs.try_send(vec![Input::Wheel { x: 200.0, y: 200.0, dx: 0.0, dy: 40.0, mods: 0 }])?;
+                h.until(&rx, Duration::from_millis(16), |_| false).await;
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            h.until(&rx, Duration::from_millis(300), |_| false).await;
+            let y = s.page.eval("scrollY").await?.as_f64().unwrap_or(0.0);
+            let pictures = h.times.len() - before;
+            streams().close("scroll-test").await;
+            // All of it reached the page, and its pictures came as it moved.
+            assert!((y - 4800.0).abs() < 1.0, "scrolled to {y}");
+            #[allow(clippy::cast_precision_loss)]
+            let rate = pictures as f64 / secs;
+            assert!(rate > 40.0, "{pictures} pictures in {secs:.2} s");
+            Ok(())
+        })
+    }
+
+    /// A stream resized by its viewer, to sizes a capture would come odd at if left to choose: it's
+    /// captured again at its size exactly, even, at the page's rate, and no picture is a key frame
+    /// of its own (cut to even, each was: an H.264 stream at many times its bitrate).
+    #[test]
+    #[ignore = "downloads and starts the real browser (about 200 MB)"]
+    fn a_resized_stream_comes_at_its_size_with_few_key_frames() -> anyhow::Result<()> {
+        static PAGES: &[(&str, &str)] = &[("/", "<body style='margin:0;background:#123'><div id=b style='width:40px;height:40px;background:#bab0e3;position:absolute'></div><script>let t=0;(function f(){t++;b.style.left=(t*3%300)+'px';b.style.top=(t*2%300)+'px';requestAnimationFrame(f)})()</script></body>")];
+        let dir = std::env::var_os("KILN_BROWSER_TEST_DIR").map_or_else(|| std::env::temp_dir().join("kiln-browser-test"), PathBuf::from);
+        let at = site(PAGES)?;
+        crate::rt::block_on(async move {
+            let mut out = Vec::new();
+            for (n, (w, h, scale)) in [(394u32, 538u32, 2.0f64), (395, 539, 1.0), (390, 533, 2.0)].into_iter().enumerate() {
+                let id = format!("odd-test-{n}");
+                // Opened at a phone's size, then its viewer's own (as a viewer's frame says it).
+                let spec: Spec = serde_json::from_value(json!({"url": format!("{at}/"), "width": 390, "height": 640, "scale": 2, "profile": "clean"}))?;
+                let (tx, rx) = async_channel::bounded::<Out>(4096);
+                streams().open(&dir, &id, &spec, tx).await?;
+                let s = streams().get(&id).ok_or_else(|| anyhow::anyhow!("not open"))?;
+                s.control(&json!({"pause": false, "keyframe": true})).await?;
+                s.control(&json!({"resize": {"width": w, "height": h, "scale": scale, "mobile": false}})).await?;
+                let mut heard = Heard::default();
+                heard.until(&rx, Duration::from_secs(2), |_| false).await;
+                let off = s.streamer.offscreen.lock().await.clone().unwrap_or_default();
+                let _ = super::super::evaluate(&s.streamer.browser.cdp, &off, &format!("kiln.stats({})", json!(id))).await?;
+                heard.until(&rx, Duration::from_secs(2), |_| false).await;
+                let stats = super::super::evaluate(&s.streamer.browser.cdp, &off, &format!("kiln.stats({})", json!(id))).await?;
+                streams().close(&id).await;
+                let n = |k: &str| stats.get(k).and_then(Value::as_u64).unwrap_or(0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let want = json!([(f64::from(w) * scale).round() as u32 / 2 * 2, (f64::from(h) * scale).round() as u32 / 2 * 2]);
+                let track = stats.get("track").and_then(Value::as_array).map(|t| json!([t.first(), t.get(1)])).unwrap_or_default();
+                if track != want || n("keys") > 2 || n("taken") < 100 {
+                    out.push(format!("{w}x{h}@{scale}: want {want}, {stats}"));
+                }
+            }
+            assert!(out.is_empty(), "{out:#?}");
+            Ok(())
+        })
     }
 
     /// Tabs, as a browser has them: a link to a new tab opens one, shown (its pictures go on, their

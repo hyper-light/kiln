@@ -51,6 +51,16 @@ class Stream {
     // start), and the last one's.
     this.shift = 0;
     this.lastTs = -1;
+    this.counted();
+  }
+
+  // Its counts from now (`kiln.stats`): pictures taken, encoded and let go, key frames, bytes,
+  // how long each took to encode.
+  counted() {
+    const was = this.counts;
+    this.counts = { since: performance.now(), taken: 0, encoded: 0, dropped: 0, keys: 0, bytes: 0, encodeMs: 0, encodeMax: 0 };
+    this.encoding = new Map();
+    return was;
   }
 
   codecFor(w, h) {
@@ -80,6 +90,17 @@ class Stream {
   }
 
   sent(c, meta) {
+    const n = this.counts;
+    n.encoded++;
+    n.bytes += c.byteLength;
+    if (c.type === "key") n.keys++;
+    const at = this.encoding.get(c.timestamp);
+    if (at !== undefined) {
+      const ms = performance.now() - at;
+      this.encoding.delete(c.timestamp);
+      n.encodeMs += ms;
+      n.encodeMax = Math.max(n.encodeMax, ms);
+    }
     if (meta && meta.decoderConfig && meta.decoderConfig.description) {
       // Out-of-band configuration (VP9/AV1 may have one): sent ahead of the chunk.
       const d = meta.decoderConfig;
@@ -150,6 +171,13 @@ class Stream {
     for (const t of before.getTracks()) t.stop();
   }
 
+  // Its capture let go (to be taken again at another size): the encoders stay, its last picture too.
+  release() {
+    for (const t of this.media.getTracks()) t.stop();
+    this.video = null;
+    this.audio = null;
+  }
+
   // A picture at its time after the last one's.
   stamped(frame) {
     if (this.shift === null) this.shift = Math.max(0, this.lastTs + 16_667 - frame.timestamp);
@@ -162,6 +190,7 @@ class Stream {
   frame(taken) {
     const frame = this.evened(this.stamped(taken));
     this.lastTs = frame.timestamp;
+    this.counts.taken++;
     const [w, h] = this.size;
     if (frame.displayWidth !== w || frame.displayHeight !== h) {
       // The page's size changed: the encoders follow, from a key frame (what comes meanwhile waits
@@ -187,12 +216,14 @@ class Stream {
     this.last = frame.clone();
     clearTimeout(this.stillTimer);
     if (this.paused || this.enc.state !== "configured" || this.enc.encodeQueueSize > 2) {
+      if (!this.paused) this.counts.dropped++;
       frame.close();
       this.forceKey = true;
       return;
     }
     const key = this.forceKey;
     this.forceKey = false;
+    if (this.encoding.size < 64) this.encoding.set(frame.timestamp, performance.now());
     this.enc.encode(frame, { keyFrame: key });
     frame.close();
     // Still for a moment: the same picture again, sharp; what moves next starts from a key frame.
@@ -209,8 +240,14 @@ class Stream {
     return cut;
   }
 
-  still() {
+  async still() {
     if (this.paused || !this.last || !this.stillEnc || this.stillEnc.state !== "configured") return;
+    // After what the main encoder still has: its pictures go out first, so none of them comes
+    // after the still one (a viewer's decoder would take it on the still one's key frame).
+    const was = this.last;
+    if (this.enc && this.enc.state === "configured") await this.enc.flush().catch(() => {});
+    // The page changed meanwhile: its own pictures go on, the still one when it stops again.
+    if (this.last !== was || this.paused || this.stillEnc.state !== "configured") return;
     const f = new VideoFrame(this.last, { timestamp: this.last.timestamp + 1 });
     this.stillEnc.encode(f, { keyFrame: true });
     f.close();
@@ -228,12 +265,14 @@ class Stream {
     if (this.last && !this.paused) this.still();
   }
 
-  // The page's new size (in pixels): the capture takes it (it would scale into the old one), and
-  // so does a tab captured later.
+  // The page's new size (in pixels), where kiln can't capture it again (`kiln.recapture`): the
+  // capture's own choice within it.
   async resize(w, h) {
-    this.opts.width = w;
-    this.opts.height = h;
-    await this.video.applyConstraints({ width: { max: w }, height: { max: h }, aspectRatio: { exact: w / h }, frameRate: { max: this.opts.framerate || 60 } });
+    const [W, H] = [even(w), even(h)];
+    this.opts.width = W;
+    this.opts.height = H;
+    if (!this.video) return;
+    await this.video.applyConstraints({ width: { max: W }, height: { max: H }, aspectRatio: { exact: W / H }, frameRate: { max: this.opts.framerate || 60 } });
   }
 
   pause(p) {
@@ -273,19 +312,28 @@ class Pushed extends Stream {
   async resize() {}
 }
 
-// A tab's picture and sound, at most a stream's size.
+// A tab's picture and sound, at a stream's size: a capture comes at the size it's started at
+// (even), where one asked for another later picks its own, often odd (and each picture cut to even
+// is a key frame of its own). A new size is a new capture (`kiln.recapture`).
 const tab = (mediaId, o) =>
   navigator.mediaDevices.getUserMedia({
-    video: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId, maxWidth: o.width || 1280, maxHeight: o.height || 800, maxFrameRate: o.framerate || 60 } },
+    video: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId, maxWidth: even(o.width || 1280), maxHeight: even(o.height || 800), maxFrameRate: o.framerate || 60 } },
     audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId } },
   });
 
 chrome.runtime.onMessage.addListener((m, _sender, reply) => {
+  if (m.kind === "release") {
+    const s = streams.get(m.stream);
+    if (s && !(s instanceof Pushed)) s.release();
+    reply({ ok: true });
+    return false;
+  }
   if (m.kind === "switch") {
     (async () => {
       try {
         const s = streams.get(m.stream);
         if (!s || s instanceof Pushed) throw new Error("no such tab's stream");
+        if (m.width && m.height) [s.opts.width, s.opts.height] = [even(m.width), even(m.height)];
         s.switchTo(await tab(m.mediaId, s.opts));
         reply({ ok: true, audio: Boolean(s.audio) });
       } catch (e) {
@@ -338,5 +386,14 @@ globalThis.kiln = {
   // A picture of a pushed stream's page (base64, its type).
   push: (id, b64, mime) => streams.get(id)?.push(b64, mime),
   streams: () => [...streams.keys()],
+  // A stream's counts since they were last asked for, and how it's encoded now.
+  stats: (id) => {
+    const s = streams.get(id);
+    if (!s) return null;
+    const n = s.counted();
+    const secs = (performance.now() - n.since) / 1000;
+    const track = s.video ? s.video.getSettings() : null;
+    return { seconds: Math.round(secs * 100) / 100, taken: n.taken, encoded: n.encoded, dropped: n.dropped, keys: n.keys, kbps: Math.round((n.bytes * 8) / 1000 / Math.max(secs, 0.001)), encodeMs: n.encoded ? Math.round((n.encodeMs / n.encoded) * 10) / 10 : null, encodeMax: Math.round(n.encodeMax), size: s.size, codec: s.enc ? s.codecFor(s.size[0], s.size[1]) : null, queue: s.enc ? s.enc.encodeQueueSize : null, track: track ? [track.width, track.height, track.frameRate] : null, bitrate: s.opts.bitrate || 4_000_000 };
+  },
   sizes: () => Object.fromEntries([...streams].map(([id, s]) => [id, { size: s.size, frame: s.last ? [s.last.displayWidth, s.last.displayHeight, s.last.codedWidth, s.last.codedHeight] : null, track: s.video ? s.video.getSettings() : null }])),
 };
