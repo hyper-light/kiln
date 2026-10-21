@@ -12,6 +12,10 @@
 //! unified service tags (`service`, `host`, `source`, and `env` and `version` where its attributes
 //! say them).
 //!
+//! [`read_event`] reads an event back as its record (a rehydration's, `kiln::observe::rehydrate`),
+//! [`event`]'s and Datadog's own alike, in place: nothing allocated an event once its room has
+//! room.
+//!
 //! What an archive writes of a file of records is a function of the file (its checksum, size and
 //! records' times) and the archive's id alone: each event's `_id` (its time, eight bytes of the two
 //! hashed, its place in the file), each object's name. A file written again (a retry, a restart,
@@ -23,7 +27,8 @@ use std::io::Write as _;
 
 use sha2::{Digest, Sha256};
 
-use super::record::{RecordRef, level};
+use super::record::{Record, RecordRef, level};
+use crate::json::{Str, Val};
 
 /// Attributes a record's event holds on the stack (most records have fewer): past them, a vector.
 const FEW: usize = 32;
@@ -359,10 +364,308 @@ fn attributes(attrs: &[(&str, &str)], out: &mut Vec<u8>, scratch: &mut Scratch) 
     out.push(b'}');
 }
 
+// ------------------------------------------------------------------------------------- reading
+
+/// Attributes an event read back keeps at the most (its tags among them).
+pub const READ_ATTRS: usize = 256;
+
+/// Strings of attributes let go that [`ReadRoom`] keeps for the next ones, at the most.
+const SPARE: usize = 1_024;
+
+/// What [`read_event`] reuses from event to event: the fields of each depth's object (their room
+/// kept from line to line), the JSON reader's, a key's path, text decoded, and the strings of
+/// attributes let go (taken again before any is made).
+#[derive(Debug, Default)]
+pub struct ReadRoom {
+    levels: Vec<Vec<(Str<'static>, Val<'static>)>>,
+    json: crate::json::Scratch,
+    path: String,
+    buf: String,
+    spare: Vec<(String, String)>,
+}
+
+/// Lists of fields emptied, as lists of borrows of another lifetime, their room kept (collected in
+/// place: the same layout, nothing allocated).
+fn levels_for<'b>(v: Vec<Vec<(Str<'_>, Val<'_>)>>) -> Vec<Vec<(Str<'b>, Val<'b>)>> {
+    v.into_iter()
+        .map(|mut l| {
+            l.clear();
+            l.into_iter().map(|_| (Str { raw: "", escaped: false }, Val::Null)).collect()
+        })
+        .collect()
+}
+
+/// An archived event (a line of an object: what [`event`] writes, or Datadog's own archives' events)
+/// read back into `r`, written over what it held (its strings' room kept): `date` its time (RFC
+/// 3339, or ms since the epoch); `host`, `source`, `service` and `message` its own; `status` a
+/// level's name (none: info); every field under `attributes`, and any other at the top, an
+/// attribute, nested objects' keys joined by dots ([`DEPTH`] deep: deeper, as JSON), a string as it
+/// is, a number as written, an array as its JSON, null left out; each of its `tags` (`key:value`) an
+/// attribute where none of its key is (`service`, `host` and `source` being the record's own);
+/// `trace_id` and `span_id` hex, or a tracer's decimal 64-bit ids (Datadog's `dd.trace_id` and
+/// `dd.span_id` attributes where those are not). [`READ_ATTRS`] attributes at the most. False (`r`
+/// as it may be) for a line that is no event: not a JSON object, or no time. Nothing allocated but
+/// strings longer than those they are written over, once its room has room.
+pub fn read_event(line: &[u8], r: &mut Record, room: &mut ReadRoom) -> bool {
+    let Ok(text) = std::str::from_utf8(line) else { return false };
+    let ReadRoom { levels, json, path, buf, spare } = room;
+    let mut pool = levels_for(std::mem::take(levels));
+    if pool.len() <= DEPTH {
+        pool.resize_with(DEPTH + 1, Vec::new);
+    }
+    let read = read_fields(text, r, &mut pool, json, path, buf, spare);
+    *levels = levels_for(pool);
+    read
+}
+
+/// An attribute added to `r` (an event read back) where none of its key is (a rehydration's tags),
+/// its strings those [`read_event`] let go when there are.
+pub fn add_attr(r: &mut Record, k: &str, v: &str, room: &mut ReadRoom) {
+    if r.attrs.len() >= READ_ATTRS || r.attrs.iter().any(|(a, _)| a == k) {
+        return;
+    }
+    let (mut key, mut val) = room.spare.pop().unwrap_or_default();
+    key.clear();
+    key.push_str(k);
+    val.clear();
+    val.push_str(v);
+    r.attrs.push((key, val));
+}
+
+fn read_fields<'a>(
+    text: &'a str,
+    r: &mut Record,
+    pool: &mut [Vec<(Str<'a>, Val<'a>)>],
+    json: &mut crate::json::Scratch,
+    path: &mut String,
+    buf: &mut String,
+    spare: &mut Vec<(String, String)>,
+) -> bool {
+    let Some((top, nested)) = pool.split_first_mut() else { return false };
+    if crate::json::object(text, top, json).is_err() {
+        return false;
+    }
+    let (mut ts, mut tags) = (None, None);
+    r.severity = 9;
+    (r.trace_id, r.span_id) = (None, None);
+    for s in [&mut r.service, &mut r.host, &mut r.source, &mut r.message] {
+        s.clear();
+    }
+    let mut attrs = Attrs { v: &mut r.attrs, spare, n: 0 };
+    for &(k, v) in top.iter() {
+        // An event's own keys are plain words: an escaped key is none of them.
+        match if k.escaped { "" } else { k.raw } {
+            "date" => ts = time_of(v, buf),
+            "host" => text_into(v, &mut r.host),
+            "source" => text_into(v, &mut r.source),
+            "service" => text_into(v, &mut r.service),
+            "message" => text_into(v, &mut r.message),
+            "status" => r.severity = severity_of(v, buf),
+            "tags" => tags = Some(v),
+            "trace_id" => r.trace_id = id_of(v, buf),
+            "span_id" => r.span_id = id_of(v, buf),
+            "_id" => {}
+            "attributes" => {
+                path.clear();
+                flatten(path, v, 0, nested, json, &mut attrs);
+            }
+            _ => {
+                path.clear();
+                k.push_to(path);
+                flatten(path, v, 1, nested, json, &mut attrs);
+            }
+        }
+    }
+    if let Some(Val::Array(raw)) = tags {
+        crate::json::strings_of(raw, |t| {
+            let t = t.text(buf).trim();
+            let (k, v) = t.split_once(':').unwrap_or((t, ""));
+            if !k.is_empty() && !matches!(k, "service" | "host" | "source") && attrs.get(k).is_none() {
+                attrs.push(k, |out| out.push_str(v));
+            }
+        });
+    }
+    if r.trace_id.is_none() {
+        r.trace_id = attrs.get("dd.trace_id").and_then(|s| id_text(s.trim()));
+    }
+    if r.span_id.is_none() {
+        r.span_id = attrs.get("dd.span_id").and_then(|s| id_text(s.trim()));
+    }
+    attrs.finish();
+    match ts {
+        Some(ts) => {
+            r.ts = ts;
+            true
+        }
+        None => false,
+    }
+}
+
+/// A record's attributes written over those it had (each slot's strings' room kept); those left
+/// over let go into `spare`, which a slot past them takes from before one is made.
+struct Attrs<'r> {
+    v: &'r mut Vec<(String, String)>,
+    spare: &'r mut Vec<(String, String)>,
+    n: usize,
+}
+
+impl Attrs<'_> {
+    fn push(&mut self, k: &str, value: impl FnOnce(&mut String)) {
+        if self.n >= READ_ATTRS {
+            return;
+        }
+        if self.n == self.v.len() {
+            self.v.push(self.spare.pop().unwrap_or_default());
+        }
+        if let Some((key, val)) = self.v.get_mut(self.n) {
+            key.clear();
+            key.push_str(k);
+            val.clear();
+            value(val);
+            self.n += 1;
+        }
+    }
+
+    fn get(&self, k: &str) -> Option<&str> {
+        self.v.iter().take(self.n).find(|(a, _)| a == k).map(|(_, v)| v.as_str())
+    }
+
+    /// The attributes written kept; the rest let go.
+    fn finish(self) {
+        if self.v.len() > self.n {
+            let room = SPARE.saturating_sub(self.spare.len());
+            self.spare.extend(self.v.drain(self.n..).take(room));
+        }
+    }
+}
+
+/// `v` as attributes under `path` (nested objects' keys joined by dots, their fields read into
+/// `pool`'s lists, [`DEPTH`] deep: deeper, as JSON): a string as it is, a number as written, a
+/// literal as its word, an array as its JSON; null left out, and a value with no key.
+fn flatten<'a>(path: &mut String, v: Val<'a>, level: usize, pool: &mut [Vec<(Str<'a>, Val<'a>)>], json: &mut crate::json::Scratch, out: &mut Attrs<'_>) {
+    match v {
+        Val::Object(raw) if level < DEPTH => {
+            let Some((list, rest)) = pool.split_first_mut() else { return };
+            // Checked whole with the line already: it reads.
+            if crate::json::object_at(raw, level + 2, list, json).is_err() {
+                return;
+            }
+            let at = path.len();
+            for &(k, v) in list.iter() {
+                path.truncate(at);
+                if at > 0 {
+                    path.push('.');
+                }
+                k.push_to(path);
+                flatten(path, v, level + 1, rest, json, out);
+            }
+            path.truncate(at);
+        }
+        Val::Null => {}
+        _ if path.is_empty() => {}
+        Val::Str(s) => out.push(path, |t| s.push_to(t)),
+        Val::Num(n) => out.push(path, |t| t.push_str(n)),
+        Val::Bool(b) => out.push(path, |t| t.push_str(if b { "true" } else { "false" })),
+        Val::Array(raw) | Val::Object(raw) => out.push(path, |t| crate::json::compact(raw, t)),
+    }
+}
+
+/// A value's text into `out`: a string's, decoded; a number as written; a literal's word; an array
+/// or object as its JSON; null, none.
+fn text_into(v: Val<'_>, out: &mut String) {
+    out.clear();
+    match v {
+        Val::Str(s) => s.push_to(out),
+        Val::Num(n) => out.push_str(n),
+        Val::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        Val::Null => {}
+        Val::Array(raw) | Val::Object(raw) => crate::json::compact(raw, out),
+    }
+}
+
+/// A status as a severity: a level's name (Datadog's, syslog's, OpenTelemetry's), the first of its
+/// range; none (or empty), info; another, unspecified.
+fn severity_of(v: Val<'_>, buf: &mut String) -> u8 {
+    let s = match v {
+        Val::Str(s) => s.text(buf),
+        Val::Null => return 9,
+        _ => return 0,
+    };
+    if s.is_empty() {
+        return 9;
+    }
+    super::record::severities(s).map_or(0, |r| *r.start())
+}
+
+/// A time as ns since the epoch: RFC 3339, or a whole number of ms.
+fn time_of(v: Val<'_>, buf: &mut String) -> Option<i64> {
+    match v {
+        Val::Str(s) => rfc3339_ns(s.text(buf)),
+        Val::Num(n) => n.parse::<i64>().ok()?.checked_mul(1_000_000),
+        _ => None,
+    }
+}
+
+/// RFC 3339's time as ns since the epoch: its usual form (`2018-05-15T14:31:16.003Z`, what Datadog's
+/// archives and [`event`] write) read in place; any other (an offset, more or fewer digits of a
+/// second, a lowercase `t`) by jiff's reading.
+fn rfc3339_ns(s: &str) -> Option<i64> {
+    if let Ok(&[y0, y1, y2, y3, b'-', m0, m1, b'-', d0, d1, b'T', h0, h1, b':', i0, i1, b':', s0, s1, b'.', f0, f1, f2, b'Z']) = <&[u8; 24]>::try_from(s.as_bytes()) {
+        let num = |ds: &[u8]| ds.iter().try_fold(0i64, |n, &c| c.is_ascii_digit().then_some(n * 10 + i64::from(c.wrapping_sub(b'0'))));
+        let (y, m, d) = (num(&[y0, y1, y2, y3])?, num(&[m0, m1])?, num(&[d0, d1])?);
+        let (h, mi, sec, ms) = (num(&[h0, h1])?, num(&[i0, i1])?, num(&[s0, s1])?, num(&[f0, f1, f2])?);
+        if !(1..=12).contains(&m) || d < 1 || d > crate::query::calendar::days_in_month(y, m) || h > 23 || mi > 59 || sec > 60 {
+            return None;
+        }
+        // A leap second its minute's last, as jiff reads one.
+        let secs = crate::query::calendar::days_from_civil(y, m, d) * 86_400 + h * 3_600 + mi * 60 + sec.min(59);
+        return secs.checked_mul(1_000)?.checked_add(ms)?.checked_mul(1_000_000);
+    }
+    let t: jiff::Timestamp = s.trim().parse().ok()?;
+    i64::try_from(t.as_nanosecond()).ok()
+}
+
+/// An id of `N` bytes from a value: see [`id_text`].
+fn id_of<const N: usize>(v: Val<'_>, buf: &mut String) -> Option<[u8; N]> {
+    match v {
+        Val::Str(s) => id_text(s.text(buf).trim()),
+        Val::Num(n) => id_text(n),
+        _ => None,
+    }
+}
+
+/// An id of `N` bytes, right-aligned: hex of its width (or of a tracer's 64-bit one, 16 digits, or
+/// fewer), or digits alone a decimal 64-bit id (a Datadog tracer's). None for what is none of these.
+fn id_text<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let b = s.as_bytes();
+    let mut out = [0u8; N];
+    let hex_width = b.len() == 2 * N || b.len() == 16;
+    if !hex_width && !b.is_empty() && b.len() <= 20 && b.iter().all(u8::is_ascii_digit) {
+        let n: u64 = s.parse().ok()?;
+        for (d, x) in out.iter_mut().rev().zip(n.to_be_bytes().iter().rev()) {
+            *d = *x;
+        }
+        return Some(out);
+    }
+    if b.is_empty() || !b.len().is_multiple_of(2) || b.len() > 2 * N {
+        return None;
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    for (slot, &[hi, lo]) in out.iter_mut().skip(N - b.len() / 2).zip(b.as_chunks::<2>().0) {
+        *slot = (nibble(hi)? << 4) | nibble(lo)?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logs::record::{Record, Rows, put_row};
+    use crate::logs::record::{Rows, put_row};
 
     fn rows(records: &[Record]) -> Vec<u8> {
         let (mut raw, mut prev) = (Vec::new(), 0);
@@ -483,6 +786,130 @@ mod tests {
             want.sort();
             assert_eq!(got, want, "{}", String::from_utf8_lossy(&out));
         }
+    }
+
+    /// Records written as events read back as themselves, each into the same record and room
+    /// (its strings written over, attributes let go and taken again): every field and attribute,
+    /// nested or flat, every character; tags not doubled.
+    #[test]
+    fn an_event_reads_back_as_its_record() {
+        let mut rng = crate::testkit::Rng::new(29);
+        let parts = ["a", "b", "http", "status_code", "x-y", "été", "q\"z", "a\\b"];
+        let (mut back, mut room, mut line, mut scratch) = (Record::default(), ReadRoom::default(), Vec::new(), Scratch::default());
+        for i in 0..3_000u64 {
+            let n = rng.next_u64();
+            let mut attrs: Vec<(String, String)> = Vec::new();
+            for j in 0..rng.below(12) {
+                let m = rng.next_u64();
+                let k: Vec<&str> = (0..1 + m % 3).map(|d| parts[((m >> (8 * d)) % parts.len() as u64) as usize]).collect();
+                let k = k.join(".");
+                if !attrs.iter().any(|(a, _)| *a == k) {
+                    attrs.push((k, format!("v{j}\n\"{}\"", m % 100)));
+                }
+            }
+            let r = Record {
+                ts: 1_800_000_000_000_000_000 + (n % 1_000_000_000) as i64 * 1_000_000,
+                severity: [9, 13, 17, 21, 5, 1][(n % 6) as usize],
+                service: format!("svc-{}", n % 5),
+                host: if n.is_multiple_of(7) { String::new() } else { format!("h{}", n % 3) },
+                source: "app".into(),
+                message: format!("message {i} \u{1}\t\"quoted\" ☃"),
+                attrs,
+                trace_id: n.is_multiple_of(2).then_some([((n >> 8) % 256) as u8; 16]),
+                span_id: n.is_multiple_of(3).then_some([((n >> 16) % 256) as u8; 8]),
+            };
+            let raw = rows(std::slice::from_ref(&r));
+            let row = Rows::new(&raw, 1).next_row().unwrap().unwrap();
+            line.clear();
+            event(&row, "id", n.is_multiple_of(4), &mut line, &mut scratch);
+            assert!(read_event(line.trim_ascii_end(), &mut back, &mut room), "{}", String::from_utf8_lossy(&line));
+            let level = |s: u8| crate::logs::record::severities(level(s)).map_or(0, |r| *r.start());
+            assert_eq!((back.ts, back.severity, &back.service, &back.host, &back.source, &back.message), (r.ts, level(r.severity), &r.service, &r.host, &r.source, &r.message));
+            assert_eq!((back.trace_id, back.span_id), (r.trace_id, r.span_id));
+            // Its attributes as they were; tags (when written) are its env's and version's, there already.
+            let (mut want, mut got) = (r.attrs.clone(), back.attrs.clone());
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "{}", String::from_utf8_lossy(&line));
+        }
+    }
+
+    /// An event as Datadog's own archives hold one: tags as attributes, numbers as written, a
+    /// tracer's decimal ids (Datadog's `dd.trace_id` and `dd.span_id` among its attributes), a
+    /// status of Datadog's names; what is no event is none, and a record read after one of many
+    /// attributes holds its own alone.
+    #[test]
+    fn datadog_s_own_archived_events_read() {
+        let (mut r, mut room) = (Record::default(), ReadRoom::default());
+        let line = br#"{"_id":"AAABc2dXYZ","date":"2020-08-17T15:31:24.507Z","host":"i-0abc","source":"python","service":"web","status":"warn","message":"Request took 1.2s","tags":["env:prod","service:web","team:core","version:1.4"],"trace_id":"1232391219124912494","span_id":"18446744073709551615","attributes":{"http":{"status_code":502,"method":"GET"},"duration":1.2e9,"usr":{"id":"u-1"},"ok":false,"list":[1, "a"],"gone":null}}"#;
+        assert!(read_event(line, &mut r, &mut room));
+        assert_eq!(r.ts, 1_597_678_284_507_000_000);
+        assert_eq!((r.severity, r.service.as_str(), r.host.as_str(), r.source.as_str(), r.message.as_str()), (13, "web", "i-0abc", "python", "Request took 1.2s"));
+        let attr = |r: &Record, k: &str| r.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        assert_eq!(["http.status_code", "http.method", "duration", "usr.id", "ok", "list"].map(|k| attr(&r, k)), ["502", "GET", "1.2e9", "u-1", "false", "[1,\"a\"]"].map(|v| Some(v.to_owned())));
+        assert_eq!((attr(&r, "env"), attr(&r, "team"), attr(&r, "version"), attr(&r, "service"), attr(&r, "gone")), (Some("prod".into()), Some("core".into()), Some("1.4".into()), None, None));
+        let mut t = [0u8; 16];
+        t[8..].copy_from_slice(&1_232_391_219_124_912_494u64.to_be_bytes());
+        assert_eq!((r.trace_id, r.span_id), (Some(t), Some(u64::MAX.to_be_bytes())));
+        // Datadog's correlation attributes, its date in ms, its ids where the event says none.
+        let line = br#"{"date":1597678284507,"message":"m","attributes":{"dd":{"trace_id":"1232391219124912494","span_id":"42"}}}"#;
+        assert!(read_event(line, &mut r, &mut room));
+        assert_eq!((r.ts, r.severity, r.service.as_str(), r.attrs.len()), (1_597_678_284_507_000_000, 9, "", 2));
+        assert_eq!((r.trace_id, r.span_id), (Some(t), Some(42u64.to_be_bytes())));
+        let line = br#"{"date":"2020-08-17T17:31:24.5+02:00","message":"m","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"}"#;
+        assert!(read_event(line, &mut r, &mut room));
+        assert_eq!((r.ts, r.attrs.len()), (1_597_678_284_500_000_000, 0));
+        assert_eq!(r.trace_id, Some([0x0a, 0xf7, 0x65, 0x19, 0x16, 0xcd, 0x43, 0xdd, 0x84, 0x48, 0xeb, 0x21, 0x1c, 0x80, 0x31, 0x9c]));
+        assert_eq!(r.span_id, Some([0xb7, 0xad, 0x6b, 0x71, 0x69, 0x20, 0x33, 0x31]));
+        for bad in [&b"not json"[..], br#"[1,2]"#, br#"{"message":"no date"}"#, br#"{"date":"yesterday"}"#, br#"{"date":"2021-02-29T00:00:00.000Z"}"#, b"{\"date\":1} x", &[0xff, 0xfe]] {
+            assert!(!read_event(bad, &mut r, &mut room), "{}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    /// RFC 3339's usual form read in place is what jiff reads of it, to the nanosecond, over the
+    /// years i64's nanoseconds hold (a leap second its minute's last, as jiff has it); a date that
+    /// is no date is none.
+    #[test]
+    fn times_read_in_place_are_jiff_s() {
+        let mut rng = crate::testkit::Rng::new(5);
+        let (lo, hi) = (-9_223_372_036_854i64, 9_223_372_036_854i64);
+        for _ in 0..200_000 {
+            let ms = lo + rng.below((hi - lo) as u64) as i64;
+            let mut out = Vec::new();
+            date(ms, &mut out);
+            let s = std::str::from_utf8(&out).unwrap().trim_matches('"');
+            let jiff: jiff::Timestamp = s.parse().unwrap();
+            assert_eq!(rfc3339_ns(s), i64::try_from(jiff.as_nanosecond()).ok(), "{s}");
+            assert_eq!(rfc3339_ns(s), Some(ms * 1_000_000), "{s}");
+        }
+        assert_eq!(rfc3339_ns("2016-12-31T23:59:60.000Z"), rfc3339_ns("2016-12-31T23:59:59.000Z"));
+        assert_eq!(rfc3339_ns("2016-12-31t23:59:59.5z"), rfc3339_ns("2016-12-31T23:59:59.500Z"));
+        for bad in [
+            "2021-02-29T00:00:00.000Z",
+            "2021-13-01T00:00:00.000Z",
+            "2021-12-01T24:00:00.000Z",
+            "2021-12-01T00:60:00.000Z",
+            "2021-12-00T00:00:00.000Z",
+            "2021-1a-01T00:00:00.000Z",
+            "2021-12-01T00:00:00.000",
+        ] {
+            assert_eq!(rfc3339_ns(bad), None, "{bad}");
+        }
+    }
+
+    /// Ids as tracers write them: hex of their width, a 64-bit one's in a 128-bit id's place (right-
+    /// aligned), decimals of up to 20 digits; what is none of these, none.
+    #[test]
+    fn ids_read_as_tracers_write_them() {
+        assert_eq!(id_text::<8>("18446744073709551615"), Some([0xff; 8]));
+        assert_eq!(id_text::<8>("00000000000000ff"), Some([0, 0, 0, 0, 0, 0, 0, 0xff]));
+        assert_eq!(id_text::<16>("00000000000000ff"), Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff]));
+        assert_eq!(id_text::<16>("255"), Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff]));
+        assert_eq!(id_text::<16>("ABCDEF0123456789abcdef0123456789").map(|b| b[0]), Some(0xab));
+        for bad in ["", "18446744073709551616", "123456789012345678901", "xyz", "abc", "0af7651916cd43dd8448eb211c80319c00"] {
+            assert_eq!(id_text::<16>(bad), None, "{bad}");
+        }
+        assert_eq!(id_text::<8>("0af7651916cd43dd8448eb211c80319c"), None);
     }
 
     /// An `_id` is 18 bytes base64'd, its time and counter where Datadog's are; a seed and an

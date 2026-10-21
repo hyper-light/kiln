@@ -24,7 +24,6 @@ use kiln_obs::logs::archive;
 use kiln_obs::logs::record::Record;
 use kiln_obs::machine::Shared;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::archives::{Archive, Archives, Refusal};
 
@@ -47,10 +46,6 @@ const CHUNKS: usize = 16;
 const UNZIPPED_MAX: u64 = 1 << 30;
 /// Objects of a rehydration at the most.
 const OBJECTS_MAX: usize = 1_000_000;
-/// Attributes a record reads at the most, and the depth of the objects they are nested in
-/// (`kiln_obs::logs::archive` nests 16 deep).
-const ATTRS: usize = 256;
-const DEPTH: usize = 16;
 /// How often a rehydration's progress is written down.
 const SAVE_EVERY: Duration = Duration::from_secs(2);
 
@@ -373,7 +368,7 @@ impl Rehydrations {
         let total = objects.len() as u64;
         self.set(&r.id, true, |x| x.objects = total);
         let filter = Arc::new(Filter { search, from: r.from.saturating_mul(1_000_000), to: r.to.saturating_mul(1_000_000), tags });
-        let mut writer = ViewWriter { store, builder: kiln_obs::batch::Builder::new(), point: 0, since_cut: 0 };
+        let mut writer = ViewWriter::new(store);
         let (mut bytes, mut limited) = (0u64, false);
         let mut saved = Instant::now();
         for (key, size) in objects {
@@ -511,21 +506,45 @@ struct Counts {
     malformed: u64,
 }
 
-/// What writes a view: its store, a batch built, where its last cut was, and the bytes written
-/// since.
+/// What writes a view: its store, a batch built, where its last cut was and the bytes written
+/// since; the record each event is read into (its room kept, as the reader's), and the rows of
+/// those kept since the last write (their times chained from 0), how many.
 struct ViewWriter {
     store: Shared,
     builder: kiln_obs::batch::Builder,
     point: u64,
     since_cut: u64,
+    record: Record,
+    room: archive::ReadRoom,
+    rows: Vec<u8>,
+    n: u32,
+    prev: i64,
 }
 
 impl ViewWriter {
-    fn write(&mut self, records: &[Record]) -> Result<(), String> {
-        if records.is_empty() {
+    fn new(store: Shared) -> Self {
+        Self { store, builder: kiln_obs::batch::Builder::new(), point: 0, since_cut: 0, record: Record::default(), room: archive::ReadRoom::default(), rows: Vec::new(), n: 0, prev: 0 }
+    }
+
+    /// The record read kept: a row of the next write, written when [`BATCH`] wait.
+    fn keep(&mut self) -> Result<(), String> {
+        kiln_obs::logs::record::put_row(&mut self.rows, &self.record, self.prev);
+        self.prev = self.record.ts;
+        self.n += 1;
+        if self.n as usize >= BATCH {
+            self.write()?;
+        }
+        Ok(())
+    }
+
+    /// The rows kept written to the view.
+    fn write(&mut self) -> Result<(), String> {
+        if self.n == 0 {
             return Ok(());
         }
-        self.builder.logs(records);
+        self.builder.log_rows(&self.rows, self.n);
+        (self.n, self.prev) = (0, 0);
+        self.rows.clear();
         let batch = self.builder.finish();
         self.store.write().unwrap_or_else(PoisonError::into_inner).apply(&batch).map_err(|e| format!("its view: {e}"))?;
         self.since_cut += batch.len() as u64;
@@ -545,21 +564,21 @@ impl ViewWriter {
 }
 
 /// An object's events (gzip'd JSON lines, one an event: Datadog's archive format), those `f` keeps
-/// written to `w`; one that unzips past `max` bytes refused.
+/// written to `w`, each read into `w`'s record (`kiln_obs::logs::archive::read_event`: in place, its
+/// room kept) and kept as a row; one that unzips past `max` bytes refused.
 fn read_object(body: impl std::io::Read, f: &Filter, w: &mut ViewWriter, max: u64) -> Result<Counts, String> {
     let mut c = Counts::default();
     let gz = flate2::read::MultiGzDecoder::new(body);
     let mut lines = std::io::BufReader::with_capacity(256 << 10, gz.take(max.saturating_add(1)));
     let (mut line, mut unzipped) = (Vec::new(), 0u64);
     let mut rs = kiln_obs::logs::search::RowScratch::default();
-    let mut batch: Vec<Record> = Vec::with_capacity(BATCH);
     loop {
         line.clear();
-        let n = lines.read_until(b'\n', &mut line).map_err(|e| format!("not gzip'd JSON lines: {e}"))?;
-        if n == 0 {
+        let got = lines.read_until(b'\n', &mut line).map_err(|e| format!("not gzip'd JSON lines: {e}"))?;
+        if got == 0 {
             break;
         }
-        unzipped += n as u64;
+        unzipped += got as u64;
         if unzipped > max {
             return Err(format!("it unzips past {max} bytes"));
         }
@@ -568,127 +587,22 @@ fn read_object(body: impl std::io::Read, f: &Filter, w: &mut ViewWriter, max: u6
             continue;
         }
         c.events += 1;
-        let Some(mut r) = record_of(text) else {
+        let ViewWriter { record: r, room, .. } = &mut *w;
+        if !archive::read_event(text, r, room) {
             c.malformed += 1;
             continue;
-        };
-        if r.ts < f.from || r.ts >= f.to || !f.search.record(&r, &mut rs) {
+        }
+        if r.ts < f.from || r.ts >= f.to || !f.search.record(r, &mut rs) {
             continue;
         }
         for (k, v) in &f.tags {
-            if !r.attrs.iter().any(|(a, _)| a == k) {
-                r.attrs.push((k.clone(), v.clone()));
-            }
+            archive::add_attr(r, k, v, room);
         }
-        batch.push(r);
         c.kept += 1;
-        if batch.len() >= BATCH {
-            w.write(&batch)?;
-            batch.clear();
-        }
+        w.keep()?;
     }
-    w.write(&batch)?;
+    w.write()?;
     Ok(c)
-}
-
-/// An archived event (Datadog's: `date`, `host`, `source`, `service`, `status`, `message`, `tags`,
-/// `trace_id`, `span_id`, and the rest under `attributes`, nested) as a record: `date` RFC 3339 or
-/// milliseconds; a tag `key:value` an attribute where none of that key is (service, host and
-/// source are the record's own); ids hex, or a decimal (a Datadog tracer's 64-bit ids). None for a
-/// line that is no event.
-pub(crate) fn record_of(line: &[u8]) -> Option<Record> {
-    let Value::Object(mut o) = serde_json::from_slice::<Value>(line).ok()? else { return None };
-    let ts = match o.get("date")? {
-        Value::String(s) => super::cloud::parse_time_ns(s)?,
-        Value::Number(n) => n.as_i64()?.checked_mul(1_000_000)?,
-        _ => return None,
-    };
-    let mut take = |k: &str| match o.remove(k) {
-        Some(Value::String(s)) => s,
-        Some(Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
-    };
-    let (service, host, source, message, status) = (take("service"), take("host"), take("source"), take("message"), take("status"));
-    let severity = kiln_obs::logs::record::severities(&status).map_or(if status.is_empty() { 9 } else { 0 }, |r| *r.start());
-    let mut attrs = Vec::new();
-    if let Some(a) = o.remove("attributes") {
-        flatten(None, a, 0, &mut attrs);
-    }
-    if let Some(Value::Array(tags)) = o.remove("tags") {
-        for t in tags {
-            let Value::String(t) = t else { continue };
-            let Some((k, v)) = tag(&t) else { continue };
-            if attrs.len() < ATTRS && !matches!(k.as_str(), "service" | "host" | "source") && !attrs.iter().any(|(a, _)| *a == k) {
-                attrs.push((k, v));
-            }
-        }
-    }
-    let trace_id = o.get("trace_id").and_then(|v| id_of(v, 16)).map(|b| {
-        let mut t = [0u8; 16];
-        for (d, s) in t.iter_mut().rev().zip(b.iter().rev()) {
-            *d = *s;
-        }
-        t
-    });
-    let span_id = o.get("span_id").and_then(|v| id_of(v, 8)).map(|b| {
-        let mut s = [0u8; 8];
-        for (d, x) in s.iter_mut().rev().zip(b.iter().rev()) {
-            *d = *x;
-        }
-        s
-    });
-    Some(Record { ts, severity, service, host, source, message, attrs, trace_id, span_id })
-}
-
-/// An id's bytes (`len` at the most): hex of `len` bytes or fewer, or a decimal (a 64-bit id).
-fn id_of(v: &Value, len: usize) -> Option<Vec<u8>> {
-    let s = match v {
-        Value::String(s) => s.trim().to_owned(),
-        Value::Number(n) => n.as_u64()?.to_string(),
-        _ => return None,
-    };
-    if s.is_empty() || s.len() > 2 * len {
-        return None;
-    }
-    // Hex of a whole id's width (or a tracer's 64-bit one in 128): hex; digits alone: a decimal.
-    let hex_width = s.len() == 2 * len || s.len() == 16;
-    if !hex_width && s.bytes().all(|b| b.is_ascii_digit()) {
-        return s.parse::<u64>().ok().map(|n| n.to_be_bytes().to_vec());
-    }
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    hex::decode(&s).ok()
-}
-
-/// `v`'s values, their keys their paths joined by dots ([`DEPTH`] deep: deeper, the rest as
-/// JSON), a string as it is and any other value as JSON; [`ATTRS`] at the most.
-fn flatten(prefix: Option<&str>, v: Value, depth: usize, out: &mut Vec<(String, String)>) {
-    if out.len() >= ATTRS {
-        return;
-    }
-    match v {
-        Value::Object(o) if depth < DEPTH => {
-            for (k, v) in o {
-                let key = match prefix {
-                    Some(p) => format!("{p}.{k}"),
-                    None => k,
-                };
-                flatten(Some(&key), v, depth + 1, out);
-            }
-        }
-        Value::Null => {}
-        Value::String(s) => {
-            if let Some(p) = prefix {
-                out.push((p.to_owned(), s));
-            }
-        }
-        other => {
-            if let Some(p) = prefix {
-                out.push((p.to_owned(), other.to_string()));
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -696,92 +610,13 @@ fn flatten(prefix: Option<&str>, v: Value, depth: usize, out: &mut Vec<(String, 
 mod tests {
     use super::*;
 
-    /// Records written as archived events (kiln's writer) read back as themselves, every field and
-    /// attribute: nested, flat where they must be, every character; tags not doubled.
-    #[test]
-    fn an_archived_event_reads_back_as_its_record() {
-        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng
-        };
-        let parts = ["a", "b", "http", "status_code", "x-y", "été", "q\"z", "a\\b"];
-        for i in 0..2_000u64 {
-            let n = next();
-            let mut attrs: Vec<(String, String)> = Vec::new();
-            for j in 0..(n % 9) {
-                let m = next();
-                let k: Vec<&str> = (0..1 + m % 3).map(|d| parts[((m >> (8 * d)) % parts.len() as u64) as usize]).collect();
-                let k = k.join(".");
-                if !attrs.iter().any(|(a, _)| *a == k) {
-                    attrs.push((k, format!("v{j}\n\"{}\"", m % 100)));
-                }
-            }
-            let r = Record {
-                ts: 1_800_000_000_000_000_000 + (n % 1_000_000_000) as i64 * 1_000_000,
-                severity: [9, 13, 17, 21, 5, 1][(n % 6) as usize],
-                service: format!("svc-{}", n % 5),
-                host: if n % 7 == 0 { String::new() } else { format!("h{}", n % 3) },
-                source: "app".into(),
-                message: format!("message {i} \u{1}\t\"quoted\" ☃"),
-                attrs,
-                trace_id: (n % 2 == 0).then_some([((n >> 8) % 256) as u8; 16]),
-                span_id: (n % 3 == 0).then_some([((n >> 16) % 256) as u8; 8]),
-            };
-            let mut raw = Vec::new();
-            kiln_obs::logs::record::put_row(&mut raw, &r, 0);
-            let row = kiln_obs::logs::record::Rows::new(&raw, 1).next_row().unwrap().unwrap();
-            let mut line = Vec::new();
-            archive::event(&row, "id", n % 4 == 0, &mut line, &mut archive::Scratch::default());
-            let back = record_of(&line);
-            assert!(back.is_some(), "{}", String::from_utf8_lossy(&line));
-            let back = back.unwrap();
-            let level = |s: u8| kiln_obs::logs::record::severities(kiln_obs::logs::record::level(s)).map_or(0, |r| *r.start());
-            assert_eq!((back.ts, back.severity, &back.service, &back.host, &back.source, &back.message), (r.ts, level(r.severity), &r.service, &r.host, &r.source, &r.message));
-            assert_eq!((back.trace_id, back.span_id), (r.trace_id, r.span_id));
-            // Its attributes as they were; tags (when written) are its env's and version's, already there.
-            let mut want = r.attrs.clone();
-            let mut got = back.attrs.clone();
-            want.sort();
-            got.sort();
-            assert_eq!(got, want, "{}", String::from_utf8_lossy(&line));
-        }
-    }
-
-    /// An event as Datadog's own archives hold one: tags as attributes, numbers as text, a
-    /// tracer's decimal trace id, a status of Datadog's names; what is no event is none.
-    #[test]
-    fn datadog_s_own_archived_events_read() {
-        let line = br#"{"_id":"AAABc2dXYZ","date":"2020-08-17T15:31:24.507Z","host":"i-0abc","source":"python","service":"web","status":"warn","message":"Request took 1.2s","tags":["env:prod","service:web","team:core","version:1.4"],"trace_id":"1232391219124912494","span_id":"9876543210","attributes":{"http":{"status_code":502,"method":"GET"},"duration":1200000000,"usr":{"id":"u-1"},"ok":false}}"#;
-        let r = record_of(line).unwrap();
-        assert_eq!(r.ts, 1_597_678_284_507_000_000);
-        assert_eq!((r.severity, r.service.as_str(), r.host.as_str(), r.source.as_str()), (13, "web", "i-0abc", "python"));
-        let attr = |k: &str| r.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
-        assert_eq!((attr("http.status_code"), attr("http.method"), attr("duration"), attr("usr.id"), attr("ok")), (Some("502"), Some("GET"), Some("1200000000"), Some("u-1"), Some("false")));
-        assert_eq!((attr("env"), attr("team"), attr("version"), attr("service")), (Some("prod"), Some("core"), Some("1.4"), None));
-        let mut t = [0u8; 16];
-        t[8..].copy_from_slice(&1_232_391_219_124_912_494u64.to_be_bytes());
-        assert_eq!(r.trace_id, Some(t));
-        assert_eq!(r.span_id, Some(9_876_543_210u64.to_be_bytes()));
-        // A date in ms; a 128-bit trace id in hex; a 64-bit one in hex.
-        let r = record_of(br#"{"date":1597678284507,"message":"m","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"}"#).unwrap();
-        assert_eq!(r.ts, 1_597_678_284_507_000_000);
-        assert_eq!(r.trace_id.map(hex::encode).as_deref(), Some("0af7651916cd43dd8448eb211c80319c"));
-        assert_eq!(r.span_id.map(hex::encode).as_deref(), Some("b7ad6b7169203331"));
-        for bad in [&b"not json"[..], br#"[1,2]"#, br#"{"message":"no date"}"#, br#"{"date":"yesterday"}"#] {
-            assert!(record_of(bad).is_none(), "{}", String::from_utf8_lossy(bad));
-        }
-    }
-
     /// Objects read into a view: a search and a range keep what they say, the archive's tags added,
     /// lines that are no event counted; an object that unzips past its bound refused.
     #[test]
     fn an_object_s_events_go_to_the_view_as_the_filter_says() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_view(dir.path()).unwrap();
-        let mut w = ViewWriter { store: Arc::clone(&store), builder: kiln_obs::batch::Builder::new(), point: 0, since_cut: 0 };
+        let mut w = ViewWriter::new(Arc::clone(&store));
         let mut lines = Vec::new();
         for i in 0..100i64 {
             let r = Record { ts: 1_800_000_000_000_000_000 + i * 1_000_000_000, severity: if i % 4 == 0 { 17 } else { 9 }, service: "web".into(), message: format!("m{i}"), ..Record::default() };
@@ -816,7 +651,7 @@ mod tests {
         // As it comes, in chunks of every size (a byte, odd, past a line's end), from another
         // thread: what it holds, the same; and a reader that stops ends the read.
         let dir = tempfile::tempdir().unwrap();
-        let mut w = ViewWriter { store: open_view(dir.path()).unwrap(), builder: kiln_obs::batch::Builder::new(), point: 0, since_cut: 0 };
+        let mut w = ViewWriter::new(open_view(dir.path()).unwrap());
         let (tx, rx) = async_channel::bounded(CHUNKS);
         let sizes = [1usize, 7, 4096, 3, 65_536, 1];
         let chunks: Vec<bytes::Bytes> = {

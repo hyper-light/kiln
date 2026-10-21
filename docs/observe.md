@@ -34,7 +34,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-20 | Datadog's dashboards (§7, §11): their JSON imported as kiln's and any dashboard given back as Datadog's, every widget kept (drawn as Datadog draws it, drawn otherwise and said, or a note saying what it was); groups, pies; logs, spans and events as operands of formulas, as Datadog's formulas mix them (§6); Datadog's boolean filters, a search's value lists, `max` and `min`, arithmetic without spaces; Datadog's 678 integration dashboards taken and given back the same, 90.8% of their widgets drawn as Datadog draws them (with service checks', O-21), 105 µs an import (§12.25); checked in browsers (§13) | done |
 | O-21 | Service checks (§9.4): each run, the Agent's (`/api/v1/check_run`) or DogStatsD's (`_sc`), a record and a sample of its status, read from its check's series; Datadog's service check monitor (`"check".over(...).by(...).last(n).count_by_status()`, its thresholds runs in a row, `{{check_message}}`); the check status widget, `POST checks/status`, Datadog's `check_status` imported and given back; the monitor form and page; checked live (a host alerting on its second failure in a row, not its first, its notice the run's message, recovering on its first OK) and in browsers (§13) | done |
 | O-22 | Log archives (§10.5): Datadog's, to S3 (and S3-compatible stores), Cloud Storage and Azure Blob Storage with the cloud integrations' credentials (S3's requests signed with SigV4, the path once and the payload's hash), each record to the first archive whose search takes it; Datadog's objects (an hour's events a folder) and events; each record once through failures, restarts, installs and changes (each archive its place, a file kept to the archives it was begun with, a part written not written again); the store cut within 15 minutes when records come slowly; checked live against RustFS and stand-ins for Google's and Microsoft's stores and token services (§13) | done |
-| O-23 | Rehydration from archives (§10.6): an archive's records of a range that a search takes read back from S3, Cloud Storage or Blob Storage (Datadog's format: what Datadog wrote reads alike) into a view of their own, searched, counted, faceted and patterned as the live logs are (`view`); objects read as they come off the wire (none whole in memory), a read cut short taken up where it stopped; a scan's bound; a view kept for its retention, read again whole when the server stopped in it; checked live against RustFS and the stand-ins, every read cut short (§13) | in progress |
+| O-23 | Rehydration from archives (§10.6): an archive's records of a range that a search takes read back from S3, Cloud Storage or Blob Storage (Datadog's format: what Datadog wrote reads alike) into a view of their own, searched, counted, faceted and patterned as the live logs are (`view`); objects read as they come off the wire (none whole in memory), a read cut short taken up where it stopped; each event read into its record in place (400 ns, nothing allocated; 1.8 million events a second a core as objects come, §12.27); a scan's bound; a view kept for its retention, read again whole when the server stopped in it; checked live against RustFS and the stand-ins, every read cut short (§13) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1887,11 +1887,13 @@ format (§10.5), so an archive Datadog wrote reads alike.
   a 5xx or no answer; after 1 s doubling, `Retry-After` heeded): four tries in a row that bring
   nothing, or 16 in all, fail it. The scan's bound stops it before an object that would pass it,
   and it says so (`limited`).
-- **Kept**: each event read back as its record (§10.5's writing undone): `date` (RFC 3339, or ms),
-  `host`, `source`, `service`, `status` (Datadog's names; none, `info`), `message`, `attributes`
-  flattened to dotted keys (16 deep, 256 at the most), `tags` as attributes where none of their key
-  is (`service`, `host` and `source` being the record's own), its ids (hex, or a tracer's decimal
-  64-bit ids). The records of the range that the search takes are kept, with the archive's
+- **Kept**: each event read back as its record (§10.5's writing undone; in place, into one record
+  kept from event to event: nothing allocated, §12.27): `date` (RFC 3339, or ms), `host`, `source`,
+  `service`, `status` (Datadog's names; none, `info`), `message`, `attributes` flattened to dotted
+  keys (16 deep, 256 at the most), any other field at the top an attribute too, `tags` as attributes
+  where none of their key is (`service`, `host` and `source` being the record's own), its ids (hex,
+  or a tracer's decimal 64-bit ids; Datadog's `dd.trace_id` and `dd.span_id` attributes where the
+  event says none). The records of the range that the search takes are kept, with the archive's
   `rehydration_tags`; a line that is no event is counted (`malformed`), not kept.
 - **The view**: a store of its own on the server (`<observe>/rehydrated/<id>`), not replicated,
   written as the live store is (2,000 records a batch, cut each 32 MiB of them: the live store's
@@ -3305,6 +3307,33 @@ would take a quarter less CPU and keep 7.5% more, level 9 28% more CPU to keep 2
 written once and kept for years: level 6. At it one core writes the events of 53 MB/s of log lines
 (the corpus' lines are 154 bytes), half what the store applies at its most (106 MB/s, §12.8): so the
 archiver works on three files at once (`IN_FLIGHT`), each encoded on a thread of the blocking pool.
+
+### 12.27 Rehydration's reading
+
+The same bench, its last rows (adacachy, 2026-10-21, idle; one thread pinned to a core): the
+corpus' events as §12.26 writes them (no tags, 103 MB of JSON), read back as a rehydration reads
+them (§10.6).
+
+| | events / CPU-s | JSON MB / CPU-s | allocations an event |
+| --- | --- | --- | --- |
+| each line into `serde_json`'s tree (no record made) | 1,354,450 | 426.0 | 20.24 |
+| each line into its record (`archive::read_event`) | 2,500,523 | 786.4 | 0.0003 |
+| a rehydration's reading but its store's: gunzip'd as it comes, read, searched (`*`), written as rows, built into batches | 1,805,933 | 568.0 | 0.0010 |
+| … searched (`status:error`: a few kept) | 2,321,914 | 730.3 | 0.0005 |
+
+A rehydration first read each line into `serde_json`'s tree and then made its record: the tree
+alone takes 740 ns and 20 allocations an event. `read_event` reads the line in place
+(`kiln_obs::json::object`: each field borrowed, a string decoded only when it holds an escape),
+writes its fields over the strings of one record kept from event to event, and lets an event's
+attributes past the last one's go into a pool the next take from: 400 ns and nothing allocated. A
+first cut kept 2,000 records (a batch's) and allocated 0.24 times an event, each record's strings
+growing to what the events that came to it held; so a kept event is written as a row at once
+(`Builder::log_rows`) and one record serves them all. Its usual date (`2018-05-15T14:31:16.003Z`) is
+read in place, any other form by jiff, the two the same to the nanosecond over i64's range of
+years (a test of 200,000). One core reads, searches and builds 1.8 million events a second as
+gzip'd objects come (568 MB/s of their JSON, 278 MB/s of the lines they were); the store applies
+106 MB/s of lines at its most (§12.8), so what bounds a rehydration is its view's store and the bytes
+its store sends, not its reading.
 
 ## 13. Scenarios
 

@@ -48,6 +48,15 @@ impl<'a> Str<'a> {
         buf.as_str()
     }
 
+    /// Its text appended to `out`, decoded when it holds an escape.
+    pub fn push_to(&self, out: &mut String) {
+        if self.escaped {
+            unescape(self.raw, out);
+        } else {
+            out.push_str(self.raw);
+        }
+    }
+
     /// Its text, owned.
     pub fn owned(&self) -> String {
         let mut s = String::new();
@@ -444,6 +453,45 @@ fn unescape(raw: &str, out: &mut String) {
     }
 }
 
+/// The strings of a checked array's text (what [`object`] gives as [`Val::Array`]), in their order;
+/// its other values (numbers, literals, containers and what is in them) passed over.
+pub fn strings_of<'a>(raw: &'a str, mut f: impl FnMut(Str<'a>)) {
+    let b = raw.as_bytes();
+    let (mut i, mut depth) = (0, 0usize);
+    while let Some(&c) = b.get(i) {
+        match c {
+            b'"' => {
+                let (start, mut j, mut escaped) = (i + 1, i + 1, false);
+                while let Some(&d) = b.get(j) {
+                    match d {
+                        b'\\' => {
+                            escaped = true;
+                            j += 2;
+                        }
+                        b'"' => break,
+                        _ => j += 1,
+                    }
+                }
+                if depth == 1
+                    && let Some(s) = raw.get(start..j)
+                {
+                    f(Str { raw: s, escaped });
+                }
+                i = j + 1;
+            }
+            b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 /// A checked value's text without the whitespace between its tokens (a string's own kept), into
 /// `out`: an array's or an object's as compact JSON.
 pub fn compact(raw: &str, out: &mut String) {
@@ -663,6 +711,25 @@ mod tests {
                 _ => panic!("{text}: serde_json {:?}, here {mine:?}", theirs.map(|_| ())),
             }
         }
+    }
+
+    /// An array's strings, as `serde_json` reads them, in their order: those in containers within
+    /// it, its numbers and literals passed over; an escape decoded only when asked.
+    #[test]
+    fn an_array_s_strings_are_read_in_place() {
+        let text = r#"{"tags": [ "env:prod", 7, "a\"b\\c", ["inner"], {"k": "v"}, null, "t\u00e9am:\ud83d\ude00", "" ]}"#;
+        let (mut out, mut s) = (Vec::new(), Scratch::default());
+        object(text, &mut out, &mut s).unwrap();
+        let Some((_, Val::Array(raw))) = out.first() else { panic!("{out:?}") };
+        let mut got = Vec::new();
+        strings_of(raw, |t| got.push((t.owned(), t.escaped)));
+        let theirs: serde_json::Value = serde_json::from_str(text).unwrap();
+        let want: Vec<String> = theirs["tags"].as_array().unwrap().iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+        assert_eq!(got.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(), want);
+        assert_eq!(got.iter().map(|(_, e)| *e).collect::<Vec<_>>(), [false, true, true, false]);
+        let mut pushed = String::from(">");
+        Str { raw: "a\\nb", escaped: true }.push_to(&mut pushed);
+        assert_eq!(pushed, ">a\nb");
     }
 
     #[test]
