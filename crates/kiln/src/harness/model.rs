@@ -1207,6 +1207,17 @@ pub struct Switching {
     /// The harness ("codex").
     pub kind: String,
     pub model: String,
+    /// What it goes on with there, as the switch carries them over: the permission mode (the same
+    /// latitude, never more) and the nearest effort; with that harness's own choices of each, so
+    /// its page shows the session as it will run while the switch waits, not as the old harness ran it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<ModeOption>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<ControlOption>,
 }
 
 impl State {
