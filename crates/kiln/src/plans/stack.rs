@@ -1,22 +1,26 @@
 //! A plan run's stack (docs/agentic.md P4): as each step is met, what its agent changed becomes one
-//! commit on the step before's and goes up for review, so a run whose steps ran in order ends as a
-//! stack with one diff per step.
+//! commit on the commit of the step met before it and goes up for review, so a run ends as a stack
+//! with one diff per step, in the order its steps were met (for steps run one after another, their
+//! own order; steps run side by side go up as each is met, which a step that waits for others
+//! always is after them).
 //!
 //! - **A repository kiln hosts:** each step's commit, with a Change-Id of its own, is pushed to
 //!   `refs/for/<trunk>` with its own agent's token: kiln makes it a diff whose author is that
-//!   step's agent, on the diff of the step before (W14-R03). Comments, reviews, CI and the land
+//!   step's agent, on the diff of the step met before it (W14-R03). Comments, reviews, CI and the land
 //!   queue then find their way back to the agent that did the step (`crate::workspace::follow`).
 //! - **Elsewhere** (GitHub, GitLab, Bitbucket): a branch per step, each pull request onto the
-//!   branch of the step before (the first onto the trunk), opened when kiln has an integration
+//!   branch of the step met before it (the first onto the trunk), opened when kiln has an integration
 //!   there, else a link to open it.
 //!
 //! The commits are made beside the folder (`crate::workspace::git`): the person's branch, index
 //! and working tree stay as they were. A step's commit has the files its agent changed, as they
 //! were when the step was met. A step that changed nothing has no diff; one whose commit couldn't
-//! be made hands its files on to the next, so the stack never leaves work out.
+//! be made hands its files on to the next met, so the stack never leaves work out. A step done by
+//! an agent that does more than the step (the main agent a step was given to) has every file that
+//! agent changed; steps side by side in one folder each keep to their own files.
 //!
-//! While the run goes on, what review and CI say to a step's agent waits ([`held`]): the next
-//! step's agent works in the same folder. Once the run ends it goes to the agent, which makes a
+//! While the run goes on, what review and CI say to a step's agent waits ([`held`]): the other
+//! steps' agents work in the same folder. Once the run ends it goes to the agent, which makes a
 //! new version of its diff with `agents.change` ([`amend`]): its changes since go into its own
 //! step, and the steps above are made again on it.
 
@@ -178,9 +182,9 @@ pub async fn met(hub: &Arc<Hub>, m: Met<'_>) {
     if let Some(e) = &entry.error {
         tracing::info!(run = %m.run, step = m.n, error = %e, "a plan step's work didn't go up for review");
     }
+    // In the order they were met: its commit is on the last one's.
     st.steps.retain(|e| e.n != m.n);
     st.steps.push(entry);
-    st.steps.sort_by_key(|e| e.n);
     opened(hub, &mut st).await;
     st.updated_at = crate::util::now_unix();
     save(hub, &st).await;
@@ -568,7 +572,9 @@ pub async fn amend(hub: &Arc<Hub>, actor: &str, info: &Info, want: &Want, run: &
     if paths.is_empty() {
         return Err((StatusCode::CONFLICT, format!("{} hasn't changed any files", info.name)));
     }
-    let from: Vec<usize> = st.steps.iter().enumerate().filter(|(_, e)| e.n >= n && e.state == "made").map(|(i, _)| i).collect();
+    // Its step, and the steps made on it since (met after it).
+    let at = st.steps.iter().position(|e| e.n == n).unwrap_or(st.steps.len());
+    let from: Vec<usize> = st.steps.iter().enumerate().filter(|(i, e)| *i >= at && e.state == "made").map(|(i, _)| i).collect();
     let commits: Vec<String> = from.iter().filter_map(|&i| st.steps.get(i).and_then(|e| e.sha.clone())).collect();
     let Some(first) = from.first().and_then(|&i| st.steps.get(i)).cloned() else { return Ok(None) };
     // A new title or body for its step: the same trailers (its Change-Id) under them.

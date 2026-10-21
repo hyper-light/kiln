@@ -69,6 +69,11 @@ pub struct Item {
     /// How it's tested: scenarios, each with what it passes by.
     #[serde(deserialize_with = "criteria::test_list")]
     pub testing: Vec<Test>,
+    /// The steps it waits for, by number (from 1): run with an agent per step, it starts once each
+    /// of them is met, and steps that don't wait for each other run side by side. None in the whole
+    /// plan: each step waits for the one before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<usize>,
 }
 
 /// Criteria and tests a step has at the most.
@@ -143,6 +148,52 @@ impl Item {
             }
         }
         None
+    }
+}
+
+/// Step `n` (from 1) of plan `title` as goals of its own (`crate::goals::split`): each acceptance
+/// criterion, then each test, a goal each, one line saying which step it's of.
+pub fn part_goals(title: &str, n: usize, it: &Item) -> Vec<String> {
+    let of = format!("\"{}\" (step {n} of the plan \"{}\")", it.title.trim(), title.trim());
+    let (a, t) = (it.acceptance.len(), it.testing.len());
+    let criteria = it.acceptance.iter().enumerate().map(|(k, c)| format!("{of}, acceptance criterion {} of {a}: {}", k + 1, c.sentence()));
+    let tests = it.testing.iter().enumerate().map(|(k, x)| format!("{of}, test {} of {t}: {}", k + 1, x.sentence()));
+    criteria
+        .chain(tests)
+        .map(|g| {
+            let line = g.split_whitespace().collect::<Vec<_>>().join(" ");
+            if line.chars().count() > 1990 { format!("{}…", line.chars().take(1990).collect::<String>()) } else { line }
+        })
+        .collect()
+}
+
+/// What each step waits for (indexes from 0), as a run of one agent per step runs them: as the
+/// steps say (`Item::needs`); none saying, each step the one before (or none at all, side by side:
+/// `parallel`). `n`: the steps run.
+pub fn waits(items: &[Item], n: usize, parallel: bool) -> Vec<Vec<usize>> {
+    if items.iter().take(n).any(|it| !it.needs.is_empty()) {
+        return (0..n).map(|i| items.get(i).map(|it| it.needs.iter().filter_map(|d| d.checked_sub(1)).filter(|d| *d < n && *d != i).collect()).unwrap_or_default()).collect();
+    }
+    (0..n).map(|i| if parallel || i == 0 { Vec::new() } else { vec![i - 1] }).collect()
+}
+
+/// The steps in rounds: each round's steps wait only for steps of the rounds before, so a round's
+/// run side by side (with nothing to slow them, a run goes round by round). Steps in a loop of
+/// waiting are left out (`check` refuses a plan with one).
+pub fn rounds(needs: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut done = vec![false; needs.len()];
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    loop {
+        let round: Vec<usize> = (0..needs.len()).filter(|&i| !done.get(i).copied().unwrap_or(true) && needs.get(i).is_some_and(|d| d.iter().all(|&j| done.get(j).copied().unwrap_or(true)))).collect();
+        if round.is_empty() {
+            return out;
+        }
+        for &i in &round {
+            if let Some(d) = done.get_mut(i) {
+                *d = true;
+            }
+        }
+        out.push(round);
     }
 }
 
@@ -413,7 +464,32 @@ fn check(title: &str, body: &str, items: &[Item]) -> R<()> {
     if let Some(p) = items.iter().enumerate().find_map(|(i, it)| it.problem(i + 1)) {
         return Err(Error::Bad(p));
     }
+    if let Some(p) = needs_problem(items) {
+        return Err(Error::Bad(p));
+    }
     Ok(())
+}
+
+/// What's wrong with what the steps wait for, if anything: a step that isn't there, a step that
+/// waits for itself, or steps that wait for each other round in a loop.
+fn needs_problem(items: &[Item]) -> Option<String> {
+    let n = items.len();
+    for (i, it) in items.iter().enumerate() {
+        if let Some(d) = it.needs.iter().find(|&&d| d == 0 || d > n) {
+            return Some(format!("step {} waits for step {d}, which the plan doesn't have (steps count from 1)", i + 1));
+        }
+        if it.needs.contains(&(i + 1)) {
+            return Some(format!("step {} waits for itself", i + 1));
+        }
+    }
+    let needs = waits(items, n, false);
+    let placed: usize = rounds(&needs).iter().map(Vec::len).sum();
+    if placed < n {
+        let ran: Vec<usize> = rounds(&needs).concat();
+        let stuck: Vec<String> = (0..n).filter(|i| !ran.contains(i)).map(|i| (i + 1).to_string()).collect();
+        return Some(format!("steps {} wait for each other round in a loop, so none of them could start", stuck.join(", ")));
+    }
+    None
 }
 
 /// What a plan's title is when none is given: its text's heading or first line, else its first
@@ -688,24 +764,37 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &crate::ha
     Ok(Ran { session, sent, run })
 }
 
+/// A goal stack's failure as a plan's.
+fn goals_error(e: crate::goals::Error) -> Error {
+    match e {
+        crate::goals::Error::NoAgent => Error::Bad("no such agent".into()),
+        crate::goals::Error::Bad(m) => Error::Bad(m),
+        crate::goals::Error::Other(e) => Error::Other(e),
+    }
+}
+
 /// A plan's steps as goals, after the agent's others (a new agent is started for them), and the
 /// stack running.
 async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &crate::harness::lineage::Starter) -> R<Ran> {
-    let goals: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
-    if goals.is_empty() {
+    let texts: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
+    if texts.is_empty() {
         return Err(Error::Bad("this plan has no steps (no list in it) to make goals of".into()));
     }
     let session = match target {
         Target::Session(s) => s,
         Target::New { target, kind, cwd } => start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?,
     };
-    let sent = goals.len();
-    crate::goals::add(hub, &session, goals, true).await.map_err(|e| match e {
-        crate::goals::Error::NoAgent => Error::Bad("no such agent".into()),
-        crate::goals::Error::Bad(m) => Error::Bad(m),
-        crate::goals::Error::Other(e) => Error::Other(e),
-    })?;
-    let (run, now, by_s, version, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.actor.clone(), p.version, p.id.clone(), session.clone());
+    let sent = texts.len();
+    let run = crate::util::new_id();
+    // Each goal says the step it's made from: the agent splits one into its acceptance criteria and
+    // tests (`crate::goals::split`).
+    let goals = texts
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| crate::goals::NewGoal { text, step: Some(crate::goals::StepRef { plan: p.id.clone(), version: p.version, n: i + 1, run: Some(run.clone()) }) })
+        .collect();
+    crate::goals::add_at(hub, &session, goals, true, &crate::goals::At::End).await.map_err(goals_error)?;
+    let (now, by_s, version, plan_id, session_c) = (crate::util::now_unix(), by.actor.clone(), p.version, p.id.clone(), session.clone());
     let run_c = run.clone();
     hub.store
         .call(move |c| {
@@ -763,6 +852,7 @@ mod tests {
             examples: "0x1F, 1e9".into(),
             acceptance: vec![Criterion::Qualitative { text: "scan_number exists".into() }, le],
             testing: vec![Test { scenario: "hex literals".into(), criteria: vec![Criterion::Qualitative { text: "0x1F reads as 31".into() }] }],
+            needs: vec![],
         };
         let p = Plan { id: "p".into(), title: "Lexer".into(), body: "Why: the scanner grew.".into(), items: vec![it.clone(), Item { title: "Ship it".into(), ..Item::default() }], tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps: vec![], runs: 0 };
         let md = markdown(&p);
@@ -781,6 +871,48 @@ mod tests {
         let bad = Item { title: "a".into(), acceptance: vec![Criterion::Quantitative { target: "x".into(), op: Op::Le, value: "soon".into(), value2: String::new(), unit: String::new(), baseline: String::new(), measured: String::new() }], ..Item::default() };
         assert!(matches!(check("T", "", &[bad]), Err(Error::Bad(m)) if m.starts_with("step 1: x's threshold is a number")));
         assert_eq!(title_for("", &[Item { title: "First thing".into(), ..Item::default() }]), "First thing");
+        // Split into goals: each criterion, then each test, saying which step it's of.
+        assert_eq!(
+            part_goals("Lexer", 1, &it),
+            [
+                "\"Split the scanner\" (step 1 of the plan \"Lexer\"), acceptance criterion 1 of 2: scan_number exists",
+                "\"Split the scanner\" (step 1 of the plan \"Lexer\"), acceptance criterion 2 of 2: scan time is at most 2 ms",
+                "\"Split the scanner\" (step 1 of the plan \"Lexer\"), test 1 of 1: hex literals — passes when 0x1F reads as 31",
+            ]
+        );
+        assert!(part_goals("Lexer", 2, &Item { title: "Ship it".into(), ..Item::default() }).is_empty());
+    }
+
+    /// What each step waits for: as the steps say; none saying, each the one before, or none at all
+    /// side by side. The rounds a run goes in, and the plans that can't run: a step that isn't
+    /// there, one that waits for itself, steps that wait for each other in a loop.
+    #[test]
+    fn steps_wait_for_the_steps_they_need_and_run_in_rounds() {
+        let it = |needs: &[usize]| Item { title: "s".into(), needs: needs.to_vec(), ..Item::default() };
+        let chain = [it(&[]), it(&[]), it(&[])];
+        assert_eq!(waits(&chain, 3, false), [vec![], vec![0], vec![1]]);
+        assert_eq!(waits(&chain, 3, true), [Vec::<usize>::new(), vec![], vec![]]);
+        assert_eq!(rounds(&waits(&chain, 3, false)), [vec![0], vec![1], vec![2]]);
+        // Said by the steps: those that say none wait for none, side by side or not.
+        let graph = [it(&[]), it(&[1]), it(&[1]), it(&[]), it(&[2, 3])];
+        assert_eq!(waits(&graph, 5, false), waits(&graph, 5, true));
+        assert_eq!(rounds(&waits(&graph, 5, false)), [vec![0, 3], vec![1, 2], vec![4]]);
+        // Body steps (no items): as the run says.
+        assert_eq!(waits(&[], 2, false), [vec![], vec![0]]);
+        assert!(check("T", "", &graph).is_ok());
+        let bad = |items: &[Item]| match check("T", "", items) {
+            Err(Error::Bad(m)) => m,
+            _ => String::new(),
+        };
+        assert_eq!(bad(&[it(&[]), it(&[3])]), "step 2 waits for step 3, which the plan doesn't have (steps count from 1)");
+        assert_eq!(bad(&[it(&[]), it(&[0])]), "step 2 waits for step 0, which the plan doesn't have (steps count from 1)");
+        assert_eq!(bad(&[it(&[1])]), "step 1 waits for itself");
+        assert_eq!(bad(&[it(&[]), it(&[3]), it(&[2])]), "steps 2, 3 wait for each other round in a loop, so none of them could start");
+        // A step's needs don't change how it reads: only how it runs.
+        let saved = serde_json::to_value(&chain[0]).unwrap_or_default();
+        assert!(saved.get("needs").is_none(), "{saved}");
+        let read: Item = serde_json::from_value(serde_json::json!({"title": "x", "needs": [1, 2]})).unwrap_or_default();
+        assert_eq!(read.needs, [1, 2]);
     }
 
 }

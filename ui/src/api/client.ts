@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -220,6 +220,8 @@ export const api = {
   convoStatus: (signal?: AbortSignal) => get<ConvoStatus>("/api/conversations/status", signal),
   /** One store's series over the last `window` seconds. */
   convoSeries: (key: string, window: number, signal?: AbortSignal) => get<ConvoSeries>(`/api/conversations/series${qs({ key, window })}`, signal),
+  /** The replication log, newest first: lines with `q` in them (any case), at most `limit`. */
+  convoLog: (filters: { q?: string; limit?: number; since?: number }, signal?: AbortSignal) => get<ConvoLog>(`/api/conversations/log${qs(filters)}`, signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
   /** Reach's directory: every runner, whether it takes commands from other runners, how busy it is. */
   reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>("/api/reach/runners", signal),

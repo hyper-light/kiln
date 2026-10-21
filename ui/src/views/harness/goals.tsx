@@ -6,9 +6,11 @@
  * stops short of it, or loses it when it starts again, the goal is sent again. The server drives
  * it, so it goes on with the console closed and across restarts.
  *
- * Drawn as a chain: each goal a numbered link (met, under way, next, not met), joined to the next;
- * one field to add a goal; the stack's few actions; editing the goals not yet met (the one under way
- * first) is one text box, a goal a line. Cleared goals can be brought back.
+ * Drawn as a chain: each goal a numbered link (met, under way, next, not met), joined to the next,
+ * a goal's parts (it was split into them: they come first) as smaller links before it; one field
+ * to add a goal; the stack's few actions; editing the goals not yet met (the one under way first) is
+ * one text box, a goal a line. Cleared goals can be brought back. A stack paused for a while says
+ * when it resumes by itself.
  */
 import * as React from "react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
@@ -170,7 +172,12 @@ function GoalPanel({
         Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
       </p>
       {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
-      {stack?.state === "paused" && stack.reason && <p className="gs-reason">{stack.reason}</p>}
+      {stack?.state === "paused" && stack.reason && (
+        <p className="gs-reason">
+          {stack.reason}
+          {stack.resume_at ? ` · resumes by itself ${relativeTime(stack.resume_at / 1000)}` : ""}
+        </p>
+      )}
 
       {editing !== null ? (
         <div className="gs-edit">
@@ -212,7 +219,7 @@ function GoalPanel({
                 // The goal under way while you've paused the stack: paused, not under way.
                 const held = g.status === "active" && stack?.state === "paused";
                 return (
-                  <li key={g.id} className="gs-link" data-status={held ? "paused" : g.status}>
+                  <li key={g.id} className="gs-link" data-status={held ? "paused" : g.status} data-part={g.part_of ? "" : undefined}>
                     <span className="gs-node" aria-hidden="true">
                       {g.status === "met" ? "✓" : g.status === "unmet" ? "✕" : g.status === "skipped" ? "–" : items.indexOf(g) + 1}
                     </span>

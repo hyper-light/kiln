@@ -7,7 +7,7 @@
  * made up at start, so the charts have a past.
  */
 import type http from "node:http";
-import type { ConvoNote, ConvoSeries, ConvoShip, ConvoStatus, ConvoStore, ConvoUpkeep } from "../src/api/types.ts";
+import type { ConvoLog, ConvoLogLine, ConvoNote, ConvoSeries, ConvoShip, ConvoStatus, ConvoStore, ConvoUpkeep } from "../src/api/types.ts";
 import { hashStr, mulberry32 } from "./data.ts";
 
 interface Ctx {
@@ -35,6 +35,8 @@ interface Sim {
   busyMs: number;
   waits: number[];
   batches: number;
+  /** Rows its feed delivered (a runner's to the server, the server's to the mirror). */
+  rows: number;
   wire: number;
   lastBatch: number;
   wroteAt: number;
@@ -79,6 +81,40 @@ const idOf = (name: string) => (hashStr(`store-${name}`) >>> 0).toString(16).pad
 function note(key: string, level: ConvoNote["level"], text: string, at = Date.now()) {
   notes.push({ at, key, level, text });
   if (notes.length > 200) notes.shift();
+  logged({ at, key, kind: "note", level, text });
+}
+
+/** The replication log, as the server keeps it (`GET /api/conversations/log`): oldest first. */
+const log: ConvoLogLine[] = [];
+const counted = new Map<string, [number, number, number]>();
+function logged(line: ConvoLogLine) {
+  log.push(line);
+  if (log.length > 5_000) log.shift();
+}
+const kb = (b: number) => (b >= 1 << 20 ? `${(b / (1 << 20)).toFixed(1)} MB` : b >= 1 << 10 ? `${Math.round(b / 1024)} KB` : `${b} B`);
+
+/** What each feed moved since the last sample, as the server's board logs it every 5 s. */
+function sampleLog(now: number) {
+  for (const s of sims.values()) {
+    if (s.role === "server") continue;
+    const was = counted.get(s.key);
+    counted.set(s.key, [s.batches, s.rows, s.wire]);
+    if (!was || s.batches <= was[0]) continue;
+    const moved = { batches: s.batches - was[0], rows: s.rows - was[1], bytes: s.wire - was[2], rev: s.rev };
+    const said = `${moved.batches} ${moved.batches === 1 ? "batch" : "batches"} · ${moved.rows.toLocaleString("en-US")} rows · ${kb(moved.bytes)}`;
+    logged(
+      s.role === "mirror"
+        ? { at: now, key: s.key, kind: "ship", level: "info", text: `server → ${s.machine}: ${said} · acknowledged through ${s.rev}`, moved }
+        : { at: now, key: s.key, kind: "batch", level: "info", text: `${s.machine} → server: ${said} · through ${s.rev}`, moved },
+    );
+  }
+}
+
+function logPage(q: string, limit: number): ConvoLog {
+  const words = q.trim().toLowerCase();
+  const has = (l: ConvoLogLine) => !words || l.text.toLowerCase().includes(words) || l.key.toLowerCase().includes(words);
+  const matched = log.filter(has);
+  return { at: Date.now(), total: log.length, matched: matched.length, lines: matched.slice(-limit).reverse() };
 }
 
 function sim(key: string, machine: string, role: Sim["role"], bytes: number, free: number, top: number, sessions: number, rate: number, silent = false): Sim {
@@ -98,6 +134,7 @@ function sim(key: string, machine: string, role: Sim["role"], bytes: number, fre
     busyMs: Math.round(top / 40),
     waits: [Math.round(top / 3), Math.round(top / 30), Math.round(top / 300), Math.round(top / 3000), 40, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     batches: 0,
+    rows: 0,
     wire: 0,
     lastBatch: 0,
     wroteAt: Date.now(),
@@ -206,6 +243,7 @@ function step() {
       const n = Math.min(lag, 1_500);
       s.rev += n;
       s.batches += 1;
+      s.rows += n;
       s.wire += n * 310;
       s.lastBatch = now;
       delivered += n;
@@ -231,6 +269,7 @@ function step() {
     mirror.rev += n;
     mirror.top += n;
     mirror.batches += 1;
+    mirror.rows += n;
     mirror.wire += n * 290;
     mirror.lastBatch = now;
     mirror.wroteAt = now;
@@ -268,6 +307,7 @@ function step() {
   if (now - lastPoint >= 5_000) {
     lastPoint = now;
     for (const s of sims.values()) push(s, now);
+    sampleLog(now);
   }
 }
 const lastBehind = new Map<string, number>();
@@ -514,6 +554,10 @@ export async function handleStores(req: http.IncomingMessage, res: http.ServerRe
   ctxRunners = ctx.runners;
   if (!started) start();
   if (url.pathname === "/api/conversations/status") return (ctx.json(res, 200, status()), true);
+  if (url.pathname === "/api/conversations/log") {
+    const limit = Math.min(5_000, Math.max(1, Number(url.searchParams.get("limit") ?? 1000) || 1000));
+    return (ctx.json(res, 200, logPage(url.searchParams.get("q") ?? "", limit)), true);
+  }
   if (url.pathname === "/api/conversations/series") {
     const key = url.searchParams.get("key") ?? "server";
     const window = Math.min(86_400, Math.max(60, Number(url.searchParams.get("window") ?? 3600) || 3600));

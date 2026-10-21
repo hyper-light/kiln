@@ -19,6 +19,11 @@ any harness kiln runs (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...
   it and sent to the agent as written: "p99.9 latency is at most 200 ms, measured by the soak
   test". Its **tests** are as many as it needs too: each a scenario and the criteria it passes by
   (in words or measures, the same way).
+
+  A step **runs after** the steps it waits for (tick them under **Runs after**): run with an
+  agent per step, it starts once each of them is met, and steps that don't wait for each other run
+  side by side. Moving or removing a step keeps what the others wait for. A step can't wait for
+  itself, or for a step that waits for it.
 - **Agents → Plans → New plan**: the same, with tags, and the plan's text in markdown as well.
 - **Save plan** under a plan an agent proposes: a plan-mode plan waiting for approval, the plan an
   agent laid out, or its todo list. The plan keeps where it came from (agent, harness, machine,
@@ -50,13 +55,53 @@ From the plan: **Run it**, on an agent that runs or on a new one (machine, harne
   the turn before it ends, so the agent does one step a turn.
 - **Goals**: each step a goal in the agent's goal stack (docs/goals.md): the next goes once the one
   before is met, as its harness's own `/goal` where it has one. A step's goal is one line: its
-  title, what to do, its examples, "Done when:" its acceptance criteria and "Tested by:" its
-  testing, so `/goal` both works toward it and checks it.
+  title, what to do, its examples, "Done when:" its acceptance criteria and "Tests:" its tests, so
+  `/goal` both works toward it and checks it. Each goal says the step it was made from, so the
+  agent can split it into a goal stack of its own (`goals_split`): its acceptance criteria and
+  tests, a goal each, pursued first, then the step itself for its check.
+- **One agent per step**: below.
 
 From an agent: its **Plan** tab shows the plan it proposed (with **Save plan**), **Your plans** (write
 one, pick one, **Run here** any of the three ways) and its **Goal stack**.
 
 A run sends the saved version and is listed under the plan with the agent it went to.
+
+### One agent per step
+
+Each step is held to as a goal (as with **Goals**) by an agent of its own, started for it on the
+machine, harness and folder chosen for the run, or for the step; the run has a page of its own
+(each step with its agent, where it stands, what it waits for and what it changed) and Mission
+Control groups its agents under it.
+
+- **Which steps run when.** A step starts once each step it waits for is met (**Runs after**;
+  `needs` in the API). Steps that don't wait for each other run side by side: the run's page says
+  which. In a plan whose steps say nothing of it, each step waits for the one before, or, run
+  **side by side** (`parallel`), none waits at all. `max_parallel` caps how many are at work at
+  once; an agent that runs a plan also has at most `[agents] max_children` agents of its own at
+  once, and further steps wait for room.
+- **One folder.** Steps side by side in one folder share it, and the run says so: brief each
+  step to keep to its own files, or give steps folders or machines of their own (`steps`). Until
+  agents have workspaces of their own (docs/agentic.md, W: held with Slates), nothing keeps them
+  apart there.
+- **A step for the main agent.** A step can go to an agent that's there already rather than to
+  one started for it: `steps` `[{agent: "main"}]` gives it to the run's main agent (the agent
+  that ran the plan, or the one `session` names), and an agent's id gives it to that agent (one
+  you may steer). The step's goal goes on that agent's own goal stack, after its other goals, and
+  the run goes on once it's met there; no agent is started for it.
+- **Splitting a step.** The agent holding a step (its own, or the main agent) splits the step's
+  goal into a goal stack of its own with `goals_split`: one goal per acceptance criterion and per
+  test, pursued first, then the step's goal comes back for its check (docs/goals.md, "Agents work
+  their own stack"). An agent says a goal is met with `goals_done`, and what shows it, which the
+  step keeps as how it was met.
+- **When a step isn't met.** It holds up the steps that wait for it; the others go on. Once
+  nothing is at work and nothing more can start, the run stops, saying which steps hold it up:
+  **Retry with a new agent** (a step given to an agent: its goal on that agent's stack again) or
+  **Take it over** (kiln stops holding the agent to it; **It's met: go on** when it is).
+  **Stop the run** lets every step under way go: their own agents interrupted, and a step's goal
+  on an agent it was given to taken out of that agent's stack.
+- **What comes out.** In a git repository, each step's work goes up for review as it's met, as
+  one commit on the commit of the step met before it: the run ends as a stack with one diff per
+  step, in the order they were met (a step always after the steps it waits for).
 
 ## Sharing one
 
@@ -71,7 +116,7 @@ the plan**, for keeping it in another kiln.
 
 ## API
 
-A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing}]` (up to 100). `acceptance` is a list of criteria: `{kind: "qualitative", text}` or `{kind: "quantitative", target, op, value, value2?, unit?, baseline?, measured?}`, `op` one of `lt`, `le`, `eq`, `ne`, `ge`, `gt`, `between` (`value2` the upper bound), `within` (`value2` the tolerance), `rises_at_least`, `falls_at_least`, `rises_at_most`, `falls_at_most` (`value` a percentage against `baseline`). `testing` is a list of `{scenario, criteria}`. A threshold is a number. `steps` is what runs, one string a step, the criteria and tests as sentences.
+A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing, needs?}]` (up to 100; `needs`: the steps it waits for, by number from 1). `acceptance` is a list of criteria: `{kind: "qualitative", text}` or `{kind: "quantitative", target, op, value, value2?, unit?, baseline?, measured?}`, `op` one of `lt`, `le`, `eq`, `ne`, `ge`, `gt`, `between` (`value2` the upper bound), `within` (`value2` the tolerance), `rises_at_least`, `falls_at_least`, `rises_at_most`, `falls_at_most` (`value` a percentage against `baseline`). `testing` is a list of `{scenario, criteria}`. A threshold is a number. `steps` is what runs, one string a step, the criteria and tests as sentences.
 
 
 | Method | Path | |
@@ -81,7 +126,11 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
-| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message` or `steps` |
+| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}` |
 | GET | `/api/plans/:id/runs` | runs, newest first |
+| GET | `/api/plans/runs` | runs of one agent per step (`?active=1`: those under way) |
+| GET | `/api/plans/runs/:run` | a run: each step's `{n, title, goal, stand, needs, given, agent, agent_id, reason, tries}`, its `state`, `reason`, `note` and stack |
+| POST | `/api/plans/runs/:run/stop` | stop it |
+| POST | `/api/plans/runs/:run/steps/:n/{retry,take,met}` | retry a step, take it over, say it's met |
 | POST | `/api/plans/:id/share` | `{on}` |
 | GET | `/api/shared/plans/:token` | **open**: a shared plan's title, text and steps |
