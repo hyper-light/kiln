@@ -1266,7 +1266,10 @@ impl Codex {
         self.release(core, overdue);
         let children: Vec<String> = core.state.tasks.iter()
             .filter(|t| t.class.as_deref() == Some("agent"))
-            .filter(|t| self.children.get(&t.id).is_some_and(|c| (c.refresh || t.live()) && now - c.read_at >= CHILD_REFRESH_MS))
+            // Hot adoption skips start/replay. Older adapters kept task rows without a
+            // child reader, so reconcile each missing reader once, even for ended tasks
+            // whose persisted output has never been loaded.
+            .filter(|t| self.children.get(&t.id).is_none_or(|c| (c.refresh || t.live()) && now - c.read_at >= CHILD_REFRESH_MS))
             .map(|t| t.id.clone()).collect();
         for child in children {
             self.read_child(core, &child);
@@ -5349,6 +5352,62 @@ mod tests {
         c.item(&mut core, &json!({"type": "collabAgentToolCall", "id": "follow-up", "tool": "followupTask", "status": "completed",
             "prompt": "Also check mobile", "receiverThreadIds": ["unknown-a"], "agentsStates": {"unknown-a": {"status": "running"}}}), true);
         assert_eq!(core.state.tasks.iter().find(|t| t.id == "unknown-a").map(|t| (t.status.as_str(), t.prompt.as_deref(), t.ended)), Some(("running", Some("Also check mobile"), None)));
+        Ok(())
+    }
+
+    #[test]
+    fn hot_adopted_legacy_subagents_reconcile_completion_without_replaying_the_parent() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        // A hot upgrade of a pre-reader adapter carries its task rows, but no Child map.
+        // Both reported real-world cases had already completed in Codex's durable history.
+        let mut frozen = serde_json::to_value(c)?;
+        frozen.as_object_mut().ok_or_else(|| anyhow::anyhow!("missing adapter object"))?.remove("children");
+        let mut c: Codex = serde_json::from_value(frozen)?;
+        core.state.summary = "Parent answer".into();
+        core.state.goal = "Parent assignment".into();
+        core.state.tasks = vec![
+            Task { id: "stale".into(), tool_id: Some("spawn-stale".into()), class: Some("agent".into()), status: "running".into(), ..Task::default() },
+            Task { id: "ended".into(), tool_id: Some("spawn-ended".into()), class: Some("agent".into()), status: "completed".into(), ended: Some(100_000), ..Task::default() },
+            Task { id: "shell".into(), class: Some("shell".into()), status: "running".into(), ..Task::default() },
+        ];
+        written(&mut core);
+        c.tick(&mut core);
+        let reads = written(&mut core);
+        let requests: Vec<&Value> = reads.iter().filter(|v| v.get("method").and_then(Value::as_str) == Some("thread/read")).collect();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|v| v.pointer("/params/includeTurns").and_then(Value::as_bool) == Some(false)));
+        assert!(!requests.iter().any(|v| v.pointer("/params/threadId").and_then(Value::as_str) == Some("shell")));
+        assert!(core.state.tasks.iter().find(|t| t.id == "stale").is_some_and(Task::live), "the read request alone cannot claim completion");
+        for request in requests {
+            let thread = request.pointer("/params/threadId").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing thread"))?;
+            respond(&mut c, &mut core, std::slice::from_ref(request), "thread/read", json!({"thread": {
+                "id": thread, "status": {"type": "notLoaded"}, "createdAt": 100
+            }}));
+        }
+        let history = written(&mut core);
+        assert_eq!(history.len(), 2);
+        for request in &history {
+            let thread = request.pointer("/params/threadId").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("missing thread"))?;
+            respond(&mut c, &mut core, std::slice::from_ref(request), "thread/turns/list", json!({"data": [{
+                "id": format!("{thread}-turn"), "status": "completed", "startedAt": 100, "completedAt": 102, "durationMs": 2000,
+                "items": [{"type": "agentMessage", "id": "answer", "text": format!("{thread} finished"), "phase": "final_answer"}]
+            }], "nextCursor": null}));
+        }
+        for id in ["stale", "ended"] {
+            let task = core.state.tasks.iter().find(|t| t.id == id).ok_or_else(|| anyhow::anyhow!("missing child"))?;
+            assert_eq!((task.status.as_str(), task.ended, task.duration_ms), ("completed", Some(102_000), 2000));
+            assert!(!task.live());
+            assert_eq!(task.summary.as_deref(), Some(format!("{id} finished").as_str()));
+            assert!(core.get(&child_event_id(id, "answer")).is_some_and(|e| e.parent.as_deref() == task.tool_id.as_deref()));
+        }
+        assert_eq!((core.state.summary.as_str(), core.state.goal.as_str(), core.state.status), ("Parent answer", "Parent assignment", Status::Idle));
+        // Successful completed snapshots are not polled indefinitely; a new turn's
+        // notification (or interaction) can activate the same child again as usual.
+        for child in c.children.values_mut() { child.read_at = 0; }
+        c.tick(&mut core);
+        assert!(written(&mut core).is_empty());
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"threadId": "stale", "turn": {"id": "followup"}}})]);
+        assert!(core.state.tasks.iter().find(|t| t.id == "stale").is_some_and(|t| t.live() && t.ended.is_none()));
         Ok(())
     }
 
