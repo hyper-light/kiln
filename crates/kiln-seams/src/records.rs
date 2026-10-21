@@ -204,9 +204,10 @@ struct SimState {
     families: BTreeMap<String, BTreeMap<Vec<u8>, VecDeque<(Rev, Option<Vec<u8>>)>>>,
     /// Revisions below this may have lost versions (a snapshot there is refused).
     horizon: Rev,
+    /// The change feed, oldest first: (rev, family, key, value or deleted).
+    log: VecDeque<(Rev, String, Vec<u8>, Option<Vec<u8>>)>,
     /// The feed starts after this revision (a read of changes, or a wait, from before it is
     /// refused).
-    log: VecDeque<(Rev, String, Vec<u8>, Option<Vec<u8>>)>,
     log_horizon: Rev,
     live: usize,
     /// Keys whose newest version is a delete, by that delete's revision.

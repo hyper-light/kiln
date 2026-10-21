@@ -285,7 +285,9 @@ command catalog), and commands to them. Generic over kiln's types: an agent is k
 - **Passed by:** the simulator, every clause. kiln's registry passes HARNESS-1, HARNESS-2 and
   HARNESS-4 (`harness/port.rs`'s test). Its "delivered" means the command is on its way to the
   session's runner; HARNESS-3 and HARNESS-5 (each command reaches its agent once, in order, and
-  only it) are CP-T3.2's and CP-T3.3's: sends deduplicated, then acknowledged end to end.
+  only it) are CP-T3.2's and CP-T3.3's: sends deduplicated, then acknowledged end to end. Until
+  then what reached an agent can't be seen there (its fixture's `heard` is `None`): the test runs
+  every clause, each on a hub of its own, and checks that those two fail for that alone.
 
 Methods: `agents`, `agent`, `catalog`, `send`.
 
