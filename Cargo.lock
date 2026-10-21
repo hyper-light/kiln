@@ -2274,6 +2274,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-sim"
+version = "0.2.0"
+dependencies = [
+ "futures",
+ "kiln-seams",
+ "parking_lot",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
