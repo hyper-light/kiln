@@ -1,0 +1,7 @@
+[env]
+# SQLite (rusqlite's bundled libsqlite3-sys) without its memory statistics. With them, every
+# allocation SQLite makes takes one lock for the whole process, so connections on different
+# threads wait on each other: two in-memory stores built side by side took three to four times one
+# (fedora, 2026-10-20). SQLite's own recommended options turn it off (sqlite.org/compile.html,
+# SQLITE_DEFAULT_MEMSTATUS); nothing in kiln reads them.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
