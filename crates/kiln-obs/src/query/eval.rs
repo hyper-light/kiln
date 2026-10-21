@@ -377,9 +377,15 @@ impl<'a> From<&'a std::sync::RwLock<Store>> for Source<'a> {
 impl Source<'_> {
     /// `req`'s answer ([`eval`]'s, or [`eval_shared`]'s).
     pub fn ask(self, req: &Request<'_>) -> Result<Answer, QueryError> {
+        self.with(|lease| eval_with(lease, req))
+    }
+
+    /// `f` with a lease of the store: held throughout, or shared, `f` asked again as a query is
+    /// when the series are numbered anew as it reads ([`eval_shared`]).
+    pub(crate) fn with<T>(self, f: impl Fn(&Lease<'_>) -> Result<T, QueryError>) -> Result<T, QueryError> {
         match self {
-            Self::Held(s) => eval(s, req),
-            Self::Shared(s) => eval_shared(s, req).map(|(a, _)| a),
+            Self::Held(s) => f(&Lease::Held(s)),
+            Self::Shared(s) => shared(s, f).map(|(t, _)| t),
         }
     }
 }

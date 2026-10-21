@@ -3403,10 +3403,12 @@ test endpoint one taking for its whole range). The monitors evaluate each under 
 write waits for one at the most), a monitor of logs or spans from its records as they are, the store
 let go; Error Tracking's scan reads its metric under a hold and searches for a new issue's first
 error in the records as they are. A query of metrics (the API's, a metric monitor's, an SLO's)
-holds the store a round of series at a time (§12.19), and APM's trace and map read their spans as
-they are. What is left whole under a hold reads metrics without a query: APM's services' RED
-figures, an issue's timeline, the metrics' list and summaries. A cut writes its files under a shared
-hold too, but on the thread that applies: no write waits for it, so no reader does.
+holds the store a round of series at a time (§12.19), as do the metrics read without a query
+(APM's RED and map figures, Error Tracking's: its issues' list and timeline, its scan, its
+monitors), and APM's trace and map read their spans as they are. What is left whole under a hold:
+service checks' status series (a few series each), the metrics' list and summaries (the index,
+once). A cut writes its files under a shared hold too, but on the thread that applies: no write
+waits for it, so no reader does.
 
 The flood now runs as a server does, with its work beside it: eight log monitors over the last five
 minutes, each evaluated every ten seconds (counts by host, route and thread, a cardinality of users,

@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kiln_obs::logs::search::Search;
+use kiln_obs::query::eval::Source;
 use serde::{Deserialize, Serialize};
 
 /// Issues kept at the most.
@@ -373,14 +374,14 @@ impl Issues {
             }
             let Some(store) = o.store() else { continue };
             let me = self.clone();
-            // The metric read under a hold; each new issue's first error searched for in the records
-            // as they are then, the store let go.
+            // The metric read a round of series at a time; each new issue's first error searched for
+            // in the records as they are then, the store let go.
             let _ = crate::rt::blocking(move || {
                 let held = || store.read().unwrap_or_else(PoisonError::into_inner);
                 me.scan(
                     crate::util::now_ms(),
                     |from, to| {
-                        kiln_obs::errors::seen(&held(), &[], from, to).unwrap_or_else(|e| {
+                        kiln_obs::errors::seen(Source::Shared(&store), &[], from, to).unwrap_or_else(|e| {
                             tracing::warn!(error = %e, "Error Tracking's metric was not read");
                             Vec::new()
                         })
@@ -588,7 +589,8 @@ pub async fn list(q: &HashMap<String, String>) -> Result<crate::http::server::Re
     let query = q.get("query").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
     let all = q.get("all").is_some_and(|v| v == "true" || v == "1");
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100).min(1_000);
-    super::api::reading(move |s| {
+    // The metric read a round of series at a time (`kiln_obs::query::eval::Lease`).
+    super::api::apart(move |store| {
         let mut filter: Vec<(&str, &str)> = Vec::new();
         if let Some(sv) = service.as_deref() {
             filter.push(("service", sv));
@@ -596,7 +598,7 @@ pub async fn list(q: &HashMap<String, String>) -> Result<crate::http::server::Re
         if let Some(e) = env.as_deref() {
             filter.push(("env", e));
         }
-        let seen = kiln_obs::errors::seen(s, &filter, from, to).map_err(|e| super::api::fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let seen = kiln_obs::errors::seen(Source::Shared(store), &filter, from, to).map_err(|e| super::api::fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let mut counts: HashMap<&str, f64> = HashMap::new();
         for x in &seen {
             *counts.entry(x.issue.as_str()).or_default() += x.errors;
@@ -635,10 +637,12 @@ pub async fn detail(id: &str, q: &HashMap<String, String>) -> Result<crate::http
     let (from, to) = super::apm::range(q, 86_400_000)?;
     let step = step_of(to.saturating_sub(from));
     let start = from - from.rem_euclid(step);
-    super::api::reading(move |s| {
-        let failed = |e: kiln_obs::store::StoreError| super::api::fail(StatusCode::INTERNAL_SERVER_ERROR, e);
-        let timeline = kiln_obs::errors::timeline(s, &issue.id, start, to, step).map_err(failed)?;
-        let seen = kiln_obs::errors::seen(s, &[("issue.id", issue.id.as_str())], from, to).map_err(failed)?;
+    // The metric read a round of series at a time (`kiln_obs::query::eval::Lease`), the latest error
+    // searched for in the records as they are.
+    super::api::apart(move |store| {
+        let failed = |e: kiln_obs::query::eval::QueryError| super::api::fail(StatusCode::INTERNAL_SERVER_ERROR, e);
+        let timeline = kiln_obs::errors::timeline(Source::Shared(store), &issue.id, start, to, step).map_err(failed)?;
+        let seen = kiln_obs::errors::seen(Source::Shared(store), &[("issue.id", issue.id.as_str())], from, to).map_err(failed)?;
         let mut versions: BTreeMap<&str, f64> = BTreeMap::new();
         let mut envs: BTreeMap<&str, f64> = BTreeMap::new();
         for x in &seen {
@@ -649,11 +653,13 @@ pub async fn detail(id: &str, q: &HashMap<String, String>) -> Result<crate::http
         // Its latest error in the range, whole.
         let query = format!("@issue.id:{}", issue.id);
         let (a, b) = (from.saturating_mul(1_000_000), to.saturating_mul(1_000_000).saturating_add(999_999));
-        let latest = match issue.source.as_str() {
-            "log" => kiln_obs::logs::search::parse(&query).ok().and_then(|q| s.search_logs(&q, a, b, 1).ok()),
-            _ => kiln_obs::logs::search::parse_spans(&query).ok().and_then(|q| s.search_spans(&q, a, b, 1).ok()),
-        }
-        .and_then(|f| f.records.into_iter().next());
+        let logs = issue.source == "log";
+        let at = {
+            let s = store.read().unwrap_or_else(PoisonError::into_inner);
+            if logs { s.logs_at() } else { s.spans_at() }
+        };
+        let search = if logs { kiln_obs::logs::search::parse(&query) } else { kiln_obs::logs::search::parse_spans(&query) };
+        let latest = search.ok().and_then(|q| at.search(&q, a, b, 1).ok()).and_then(|f| f.records.into_iter().next());
         let by = |m: &BTreeMap<&str, f64>, key: &str| -> Vec<serde_json::Value> {
             let mut v: Vec<(&&str, &f64)> = m.iter().collect();
             v.sort_by(|x, y| y.1.total_cmp(x.1));

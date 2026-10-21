@@ -135,7 +135,9 @@ fn slo_values(store: &Shared, id: &str, burn: Option<(i64, i64)>, now: i64) -> R
 /// An Error Tracking monitor's values (`monitor::Kind::ErrorTracking`): its issues' errors over
 /// its window (`super::errors::Issues::monitor_values`), of the issues it watches since `since`
 /// (when it was made or last changed).
-fn error_values(store: &kiln_obs::store::Store, search: &str, new: bool, by: &[String], window_ms: i64, since: i64, now: i64) -> Result<Vec<monitor::Value>, monitor::MonitorError> {
+fn error_values(store: &Shared, search: &str, new: bool, by: &[String], window_ms: i64, since: i64, now: i64) -> Result<Vec<monitor::Value>, monitor::MonitorError> {
+    // Its metric read a round of series at a time (`kiln_obs::query::eval::Source`).
+    let store = kiln_obs::query::eval::Source::Shared(store);
     let eval = |e: String| monitor::MonitorError::Eval(e);
     let issues = super::api::issues().map_err(|_| eval("Error Tracking's issues are kept by the server".into()))?;
     let search = kiln_obs::logs::search::parse(search).map_err(|e| eval(e.to_string()))?;
@@ -543,8 +545,8 @@ impl Monitors {
 
     /// One monitor's evaluation: each group's next state, events and notifications for changes.
     /// Whether any state changed. A monitor of logs or spans reads its records as they are, the
-    /// store let go (`kiln_obs::store::LogsAt`); one of metrics, or an SLO's, a part at a time
-    /// (`kiln_obs::query::eval::Lease`); Error Tracking's under a hold of its own.
+    /// store let go (`kiln_obs::store::LogsAt`); one of metrics, an SLO's or Error Tracking's, a
+    /// round of series at a time (`kiln_obs::query::eval::Lease`).
     fn evaluate(&self, store: &Shared, m: &Monitor, now: i64) -> bool {
         let (q, t) = match m.compiled() {
             Ok(Compiled::Query(q, t)) => (q, t),
@@ -554,7 +556,7 @@ impl Monitors {
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
         let values = match &q.kind {
             monitor::Kind::Slo { id, burn } => slo_values(store, id, *burn, now - delay),
-            monitor::Kind::ErrorTracking { search, new, by, window_ms } => error_values(&held(store), search, *new, by, *window_ms, m.modified, now - delay),
+            monitor::Kind::ErrorTracking { search, new, by, window_ms } => error_values(store, search, *new, by, *window_ms, m.modified, now - delay),
             _ => monitor::evaluate_shared(store, &q, now, delay),
         };
         let values = match values {

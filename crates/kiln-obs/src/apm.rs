@@ -93,10 +93,7 @@ pub struct Red {
 /// each part's series found under one hold, then read a round at a time, each round under a hold of
 /// its own, so a write waits for one round at the most (`query::eval::Lease`).
 pub fn red<'a>(store: impl Into<Source<'a>>, outbound: bool, filter: &[(&str, &str)], by: &str, from: i64, to: i64) -> Result<Vec<Red>, QueryError> {
-    match store.into() {
-        Source::Held(s) => red_on(&Lease::Held(s), outbound, filter, by, from, to),
-        Source::Shared(s) => crate::query::eval::shared(s, |lease| red_on(lease, outbound, filter, by, from, to)).map(|(r, _)| r),
-    }
+    store.into().with(|lease| red_on(lease, outbound, filter, by, from, to))
 }
 
 fn red_on(lease: &Lease<'_>, outbound: bool, filter: &[(&str, &str)], by: &str, from: i64, to: i64) -> Result<Vec<Red>, QueryError> {

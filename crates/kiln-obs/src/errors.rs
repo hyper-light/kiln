@@ -23,6 +23,8 @@
 //! An issue's id is a hash of its parts that never changes (FNV-1a, then splitmix64's finalizer:
 //! an issue's id is kept, replicated and searched for, so changing it would split every issue).
 
+use crate::query::eval::{Lease, QueryError};
+
 /// The most of a stack read for its frame: a frame is near its top, and a stack can be megabytes.
 pub const STACK_BYTES: usize = 64 << 10;
 /// A stack's attributes (Datadog's `error.stack`, OpenTelemetry's `exception.stacktrace`): kept
@@ -207,57 +209,69 @@ pub struct Seen {
 
 /// Each series of [`METRIC`] whose tags hold `filter`, over `[from, to)` (ms), with an error in it.
 /// A long range is read from the series' rollups as [`crate::apm::red`] reads them (its first and
-/// last windows then a tier's, where the range's edges are not).
-pub fn seen(store: &crate::store::Store, filter: &[(&str, &str)], from: i64, to: i64) -> Result<Vec<Seen>, crate::store::StoreError> {
+/// last windows then a tier's, where the range's edges are not). Of a store held throughout, or of
+/// a shared one read a round of series at a time (`query::eval::Source`).
+pub fn seen<'a>(store: impl Into<crate::query::eval::Source<'a>>, filter: &[(&str, &str)], from: i64, to: i64) -> Result<Vec<Seen>, QueryError> {
     let mut sel = crate::index::Selector::metric(METRIC);
     for (k, v) in filter {
         sel = sel.tag(k, v);
     }
-    let mut ids = Vec::new();
-    store.select(&sel, &mut ids);
-    read_seen(store, &ids, from, to)
+    store.into().with(|lease| {
+        let mut ids = Vec::new();
+        lease.hold()?.select(&sel, &mut ids);
+        read_seen(lease, &ids, from, to)
+    })
 }
 
 /// [`seen`] of these issues' series alone, each issue's found in the store's index by its tag: what
 /// a monitor watching a few issues reads.
-pub fn seen_of(store: &crate::store::Store, issues: &[&str], from: i64, to: i64) -> Result<Vec<Seen>, crate::store::StoreError> {
-    let (mut ids, mut one) = (Vec::new(), Vec::new());
-    for issue in issues {
-        one.clear();
-        store.select(&crate::index::Selector::metric(METRIC).tag("issue.id", issue), &mut one);
-        ids.extend_from_slice(&one);
-    }
-    read_seen(store, &ids, from, to)
+pub fn seen_of<'a>(store: impl Into<crate::query::eval::Source<'a>>, issues: &[&str], from: i64, to: i64) -> Result<Vec<Seen>, QueryError> {
+    store.into().with(|lease| {
+        let (mut ids, mut one) = (Vec::new(), Vec::new());
+        {
+            let store = lease.hold()?;
+            for issue in issues {
+                one.clear();
+                store.select(&crate::index::Selector::metric(METRIC).tag("issue.id", issue), &mut one);
+                ids.extend_from_slice(&one);
+            }
+        }
+        read_seen(lease, &ids, from, to)
+    })
 }
 
-fn read_seen(store: &crate::store::Store, ids: &[u32], from: i64, to: i64) -> Result<Vec<Seen>, crate::store::StoreError> {
+/// `ids`' errors over `[from, to)`, a round of series a hold (`query::eval::ROUND`).
+fn read_seen(lease: &Lease<'_>, ids: &[u32], from: i64, to: i64) -> Result<Vec<Seen>, QueryError> {
     use crate::rollup::{Col, Rolled, TIERS};
     let width = TIERS.iter().rev().copied().find(|&w| w.saturating_mul(crate::apm::RED_WINDOWS) <= to.saturating_sub(from));
     let (mut ts, mut vs, mut rolled, mut scratch) = (Vec::new(), Vec::new(), Rolled::default(), crate::store::Scratch::default());
     let mut out = Vec::new();
-    for &id in ids {
-        let Some(series) = store.series(id) else { continue };
-        ts.clear();
-        vs.clear();
-        rolled.clear();
-        match width {
-            Some(width) => {
-                let roll = crate::store::Roll { width, from, to, kind: series.kind(), cols: &[Col::Sum] };
-                store.read_rolled(id, from, to.saturating_sub(1), &roll, &mut scratch, &mut ts, &mut vs, &mut rolled)?;
+    for round in ids.chunks(crate::query::eval::ROUND) {
+        let store = lease.hold()?;
+        for &id in round {
+            let Some(series) = store.series(id) else { continue };
+            ts.clear();
+            vs.clear();
+            rolled.clear();
+            match width {
+                Some(width) => {
+                    let roll = crate::store::Roll { width, from, to, kind: series.kind(), cols: &[Col::Sum] };
+                    store.read_rolled(id, from, to.saturating_sub(1), &roll, &mut scratch, &mut ts, &mut vs, &mut rolled)?;
+                }
+                None => store.read_with(id, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?,
             }
-            None => store.read_with(id, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?,
-        }
-        let (mut errors, mut first, mut last) = (0.0, i64::MAX, i64::MIN);
-        for (&t, &v) in ts.iter().zip(&vs).chain(rolled.start.iter().zip(&rolled.sum)) {
-            if v > 0.0 {
-                errors += v;
-                first = first.min(t);
-                last = last.max(t);
+            let (mut errors, mut first, mut last) = (0.0, i64::MAX, i64::MIN);
+            for (&t, &v) in ts.iter().zip(&vs).chain(rolled.start.iter().zip(&rolled.sum)) {
+                if v > 0.0 {
+                    errors += v;
+                    first = first.min(t);
+                    last = last.max(t);
+                }
             }
-        }
-        if errors > 0.0 {
-            let tag = |k: &str| series.tag(k).unwrap_or(crate::logs::metrics::NONE).to_owned();
-            out.push(Seen { issue: tag("issue.id"), service: tag("service"), env: tag("env"), version: tag("version"), errors, first, last });
+            if errors > 0.0 {
+                let tag = |k: &str| series.tag(k).unwrap_or(crate::logs::metrics::NONE).to_owned();
+                out.push(Seen { issue: tag("issue.id"), service: tag("service"), env: tag("env"), version: tag("version"), errors, first, last });
+            }
         }
     }
     Ok(out)
@@ -291,32 +305,40 @@ pub fn monitor_query(search: &str) -> Option<String> {
 
 /// Issue `id`'s errors over `[from, to)` (ms) in buckets of `step` (ms; `from` a multiple of it):
 /// each bucket's start and its errors, [`TIMELINE_BUCKETS`] at the most. A step a rollup tier
-/// divides reads the tier where the range is long enough (as [`crate::apm::red`] does).
-pub fn timeline(store: &crate::store::Store, id: &str, from: i64, to: i64, step: i64) -> Result<Vec<(i64, f64)>, crate::store::StoreError> {
+/// divides reads the tier where the range is long enough (as [`crate::apm::red`] does). Of a store
+/// held throughout, or of a shared one read a round of series at a time (`query::eval::Source`).
+pub fn timeline<'a>(store: impl Into<crate::query::eval::Source<'a>>, id: &str, from: i64, to: i64, step: i64) -> Result<Vec<(i64, f64)>, QueryError> {
+    store.into().with(|lease| timeline_on(lease, id, from, to, step))
+}
+
+fn timeline_on(lease: &Lease<'_>, id: &str, from: i64, to: i64, step: i64) -> Result<Vec<(i64, f64)>, QueryError> {
     use crate::rollup::{Col, Rolled, TIERS};
     let step = step.max(crate::logs::metrics::WINDOW / 1_000_000);
     let n = usize::try_from(to.saturating_sub(from).saturating_add(step - 1) / step).unwrap_or(0).min(TIMELINE_BUCKETS);
     let mut out: Vec<(i64, f64)> = (0..n).map(|i| (from.saturating_add(i64::try_from(i).unwrap_or(0).saturating_mul(step)), 0.0)).collect();
     let to = out.last().map_or(from, |b| b.0.saturating_add(step)).min(to);
     let mut ids = Vec::new();
-    store.select(&crate::index::Selector::metric(METRIC).tag("issue.id", id), &mut ids);
+    lease.hold()?.select(&crate::index::Selector::metric(METRIC).tag("issue.id", id), &mut ids);
     let width = TIERS.iter().rev().copied().find(|&w| step % w == 0 && w.saturating_mul(crate::apm::RED_WINDOWS) <= to.saturating_sub(from));
     let (mut ts, mut vs, mut rolled, mut scratch) = (Vec::new(), Vec::new(), Rolled::default(), crate::store::Scratch::default());
-    for &sid in &ids {
-        let Some(series) = store.series(sid) else { continue };
-        ts.clear();
-        vs.clear();
-        rolled.clear();
-        match width {
-            Some(width) => {
-                let roll = crate::store::Roll { width, from, to, kind: series.kind(), cols: &[Col::Sum] };
-                store.read_rolled(sid, from, to.saturating_sub(1), &roll, &mut scratch, &mut ts, &mut vs, &mut rolled)?;
+    for round in ids.chunks(crate::query::eval::ROUND) {
+        let store = lease.hold()?;
+        for &sid in round {
+            let Some(series) = store.series(sid) else { continue };
+            ts.clear();
+            vs.clear();
+            rolled.clear();
+            match width {
+                Some(width) => {
+                    let roll = crate::store::Roll { width, from, to, kind: series.kind(), cols: &[Col::Sum] };
+                    store.read_rolled(sid, from, to.saturating_sub(1), &roll, &mut scratch, &mut ts, &mut vs, &mut rolled)?;
+                }
+                None => store.read_with(sid, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?,
             }
-            None => store.read_with(sid, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?,
-        }
-        for (&t, &v) in ts.iter().zip(&vs).chain(rolled.start.iter().zip(&rolled.sum)) {
-            if let Some(b) = usize::try_from(t.saturating_sub(from) / step).ok().and_then(|i| out.get_mut(i)) {
-                b.1 += v;
+            for (&t, &v) in ts.iter().zip(&vs).chain(rolled.start.iter().zip(&rolled.sum)) {
+                if let Some(b) = usize::try_from(t.saturating_sub(from) / step).ok().and_then(|i| out.get_mut(i)) {
+                    b.1 += v;
+                }
             }
         }
     }
@@ -1093,6 +1115,34 @@ fn mask_to(s: &str, out: &mut impl Sink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The errors' metric of a shared store, read a round of series at a time
+    /// (`query::eval::Source`), reads as one held throughout does: every issue's series' errors and
+    /// when (past two rounds of them), a few issues' alone, an issue's timeline, over a range read
+    /// as samples and one read from rollups.
+    #[test]
+    fn the_errors_metric_read_a_round_at_a_time_reads_as_held() {
+        use crate::batch::{Builder, Kind, SeriesKey};
+        let mut st = crate::store::Store::new(crate::hash::Keyed::new());
+        let mut b = Builder::new();
+        for i in 0..150u32 {
+            let issue = hex(u64::from(i) * 7_919);
+            let k = SeriesKey::new(METRIC, [("issue.id", issue.as_str()), ("service", ["web", "api"][(i % 2) as usize]), ("env", "prod"), ("version", "1.2")], Kind::Count).unwrap();
+            b.define(&k);
+            b.run(k.fp, (0..360i64).map(|j| (j * 10_000, f64::from((i + j as u32) % 3))));
+        }
+        st.apply(&b.finish()).unwrap();
+        let some = [hex(7_919), hex(2 * 7_919)];
+        let some: Vec<&str> = some.iter().map(String::as_str).collect();
+        for (from, to) in [(0, 300_000), (0, 3_600_000)] {
+            let held = (seen(&st, &[], from, to).unwrap(), seen_of(&st, &some, from, to).unwrap(), timeline(&st, &hex(3 * 7_919), from, to, 60_000).unwrap());
+            assert!(held.0.len() > 2 * crate::query::eval::ROUND, "{} series with errors", held.0.len());
+            let shared = std::sync::RwLock::new(std::mem::take(&mut st));
+            let apart = (seen(&shared, &[], from, to).unwrap(), seen_of(&shared, &some, from, to).unwrap(), timeline(&shared, &hex(3 * 7_919), from, to, 60_000).unwrap());
+            assert_eq!(apart, held, "{from}..{to}");
+            st = shared.into_inner().unwrap();
+        }
+    }
 
     /// A fixture's cases: each `---- name` and its stack.
     fn cases(text: &str) -> Vec<(&str, &str)> {
