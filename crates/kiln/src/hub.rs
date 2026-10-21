@@ -25,7 +25,7 @@ use crate::proto::{self, AgentMsg, Assignment, Hello, JobResult, LANE_CONTROL, L
 use crate::store::{AgentRow, Job, Status, Store};
 
 /// How long a persistent agent may be gone before its jobs are requeued.
-const AGENT_GRACE: Duration = Duration::from_secs(45);
+pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
 const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 /// Host samples kept per agent for the UI charts (1 h at 5 s).
@@ -907,6 +907,12 @@ impl Hub {
         self.peers.lock().get(&peer).cloned()
     }
 
+    /// Whether `job` is one of the CI engine's legs: one it knows, or, while it rebuilds its runs
+    /// after a restart (knowing none yet), one the store has (its message waits for it then).
+    async fn ci_leg(&self, job: &str) -> bool {
+        self.ci.is_leg(job) || (self.ci.enabled() && self.ci.restored().is_none() && self.store.ci_legs(vec![job.to_owned()]).await.is_ok_and(|l| l.contains(job)))
+    }
+
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
         // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
@@ -1044,7 +1050,7 @@ impl Hub {
             AgentMsg::JobFinished(r) => {
                 let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
-                    if self.ci.is_leg(&r.job) {
+                    if self.ci_leg(&r.job).await {
                         self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
                     } else {
                         self.job_done(&agent, r).await?;
@@ -1407,13 +1413,22 @@ impl Hub {
                 self.emit_job(&j.id).await;
             }
         }
+        // Until the CI engine has rebuilt its runs after a restart it knows none of its legs: those
+        // the runner says it has are its own still, for the dispatcher to re-adopt or stop once it
+        // has (`dispatch::spawn`), never taken back as v1's jobs (which would cancel them).
+        let rebuilding = if self.ci.enabled() && self.ci.restored().is_none() {
+            let said: Vec<String> = h.running.iter().filter(|j| !keep.contains(j)).cloned().collect();
+            self.store.ci_legs(said).await.unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
         for j in &h.running {
             if keep.contains(j) {
                 continue;
             }
             // CI's legs are the dispatcher's to re-adopt, or to stop if they were given up while
             // the runner was away (`Msg::RunnerUp` below, W05-R05).
-            if self.ci.is_leg(j) {
+            if self.ci.is_leg(j) || rebuilding.contains(j) {
                 keep.push(j.clone());
                 continue;
             }

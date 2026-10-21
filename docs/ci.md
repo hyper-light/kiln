@@ -1918,6 +1918,20 @@ W20.
     doubling to 15 s, for two minutes, as `actions/checkout` retries its own.
   - `kiln ci bench` measures the rebuild at 10,000 queued legs (`ci.bench.restart.rebuild_ms`,
     §1.5's ≤ 2 s; W22-AC08).
+- *Done.* R05 across a restart, whichever comes first, a runner's hello or the dispatcher's
+  rebuild of its runs:
+  - A leg the runner says it still runs before the dispatcher knows its runs is kept for it, and
+    re-adopted once it has rebuilt them; the leg's end, if it comes first, waits for it too. Such
+    a leg used to be cancelled as a job nobody knew.
+  - A leg the runner doesn't say it has was lost with it (`runner-lost`, R16's retry) and frees its
+    slot. The rebuild used to put such a leg back on the runner, where it stayed running for good
+    and held the slot: a server's own runner, back before the rebuild with none of its legs, hit it
+    on every restart that found its legs running.
+  - A runner that doesn't come back within its reconnect grace (45 s) loses its legs the same way.
+  - Checked: `tests/chaos.rs` (`w05_r05_hellos_before_the_rebuild`, the rebuild made 10 s late by
+    the chaos fault `rebuild=`) and `tests/restart.rs`
+    (`w05_r05_a_restart_loses_what_its_runner_lost`,
+    `w05_r05_a_runner_gone_over_a_restart_loses_its_legs`).
 - *Done.* R03's resource mode end to end: `[ci.scheduler] mode = "resources"`, with `overcommit = {
   cpu, memory, disk }` (1.5, 1 and 1 by default) and `default_request = { cpu, memory, disk, gpu
   }`.
@@ -6637,7 +6651,9 @@ and AC02.
     kills, and counted where kiln counts the OOM killer's kills;
   - `disk=<MiB>`: a job container's workspace is a volume that small;
   - `corrupt`: the leg's tools reach the server through a proxy that flips a byte of each upload
-    to the blob store.
+    to the blob store;
+  - `rebuild=<duration>`, the server's own: the CI engine rebuilds its runs that long after the
+    server starts, so its runners say hello before it knows their legs (W05's R05 note).
 
   A leg's faults hit its first attempt only, so its retry shows the recovery. Under each:
   - dropped every 3 s and 200 ms late, a leg goes on: it's neither lost nor retried, its log
@@ -6659,6 +6675,9 @@ and AC02.
     it's on.
   - A full disk that the failing tool doesn't name (busybox's `dd`) was a plain `failure`: a job
     container's workspace is measured in the container now.
+  - The first of these again, before the dispatcher has rebuilt its runs after a restart (it knows
+    none of its legs then): a leg its runner said it still ran was cancelled, and one it didn't was
+    put back on it, running for good (W05's R05 note; `w05_r05_hellos_before_the_rebuild`).
 - *AC07* (`crates/kiln/tests/security.rs`, against a server of its own):
   - **Token scope.** Every route of the route table refuses a token that may do nothing. That is an
     agent's for a user without a grant: 403 for it, and 401 without a token, on 128 routes.

@@ -688,6 +688,24 @@ impl Store {
         .await
     }
 
+    /// Which of `ids` are the CI engine's legs (rows of a workflow's job), not v1's jobs.
+    pub async fn ci_legs(&self, ids: Vec<String>) -> anyhow::Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT 1 FROM jobs WHERE id = ?1 AND job_id IS NOT NULL")?;
+            let mut out = std::collections::HashSet::new();
+            for id in ids {
+                if st.exists([&id])? {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Atomically claim a queued job for an agent. Returns false if someone else got it.
     pub async fn claim_job(&self, id: String, agent: String, executor: String) -> anyhow::Result<bool> {
         self.call(move |c| {

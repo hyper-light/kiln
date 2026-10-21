@@ -229,3 +229,143 @@ jobs:
     }
     Ok(())
 }
+
+/// A runner of its own, apart from the server, so it runs on through the server's restart.
+struct Keeper(std::process::Child);
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `run`'s legs: `(key, status, attempt, id)` each.
+fn legs_of(s: &Server, run: &str) -> anyhow::Result<Vec<(String, String, i64, String)>> {
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+    let legs = serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).cloned().unwrap_or_default();
+    let text = |l: &Value, k: &str| l.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    Ok(legs.iter().map(|l| (text(l, "key"), text(l, "status"), l.get("attempt").and_then(Value::as_i64).unwrap_or(0), text(l, "id"))).collect())
+}
+
+/// Until `f` says it's done (`None`), else what it last saw.
+fn until(s: &Server, secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Result<Option<String>>) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match f()? {
+            None => return Ok(()),
+            Some(last) => anyhow::ensure!(Instant::now() < deadline, "{what}: {last}\n{}", s.log()),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The newest run of `workflow` in `acme/chaos`, once there is one.
+fn newest(s: &Server, workflow: &str) -> anyhow::Result<String> {
+    let mut run = String::new();
+    until(s, 120, "the run", || {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo=acme/chaos&workflow={workflow}&limit=1"), &s.admin, None)?;
+        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok(run.is_empty().then_some(body))
+    })?;
+    Ok(run)
+}
+
+/// W05-R05 with the CI engine's rebuild after a restart late (`rebuild=10s`), so both runners say
+/// hello before it knows their legs. A runner apart from the server ran on through the restart:
+/// its leg is re-adopted, not cancelled as a job nobody knows, and finishes on its first attempt.
+/// The server's own runner went with it: its leg was lost (`runner-lost`, the next attempt
+/// waiting for another runner, W05-R16) and holds none of its slots, so its next leg runs.
+#[test]
+fn w05_r05_hellos_before_the_rebuild() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join(".kiln"))?;
+    std::fs::write(repo.join("README.md"), "restart\n")?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "start"])?;
+    let extra = format!("[[repos]]\nname = \"acme/chaos\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
+    let mut s = start_env(dir, &Options { agent: true, ci: "kiln_workflows = true", extra: &extra }, false, &[("KILN_CHAOS", "rebuild=10s")])?;
+    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
+    std::fs::create_dir_all(dir.join("keeper-home"))?;
+    let out = std::fs::File::create(dir.join("keeper.log"))?;
+    let _keeper = Keeper(
+        Command::new(env!("CARGO_BIN_EXE_kiln"))
+            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "1", "--no-terminal"])
+            .arg("--work-dir")
+            .arg(dir.join("keeper-work"))
+            .arg("--state-dir")
+            .arg(dir.join("keeper-state"))
+            .env("HOME", dir.join("keeper-home"))
+            .env("NO_COLOR", "1")
+            .env_remove("KILN_CONFIG")
+            .env_remove("KILN_CHAOS")
+            .stdout(std::process::Stdio::from(out.try_clone()?))
+            .stderr(std::process::Stdio::from(out))
+            .spawn()?,
+    );
+    let keeper_log = || std::fs::read_to_string(dir.join("keeper.log")).unwrap_or_default();
+    until(&s, 120, "the repository polled and the keeper connected", || {
+        let (_, repos) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        let (_, agents) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
+        Ok((repos.contains("\"last_polled_at\":null") || !agents.contains("\"keeper\"")).then(|| format!("{repos}\n{agents}\n{}", keeper_log())))
+    })?;
+    std::fs::write(
+        repo.join(".kiln/both.yaml"),
+        "on: push\njobs:\n  kept:\n    runs-on: keep\n    steps:\n      - run: sleep 30; echo \"kept to its end\"\n  lost:\n    runs-on: local\n    steps:\n      - run: sleep 300\n",
+    )?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "both"])?;
+    let run = newest(&s, ".kiln/both.yaml")?;
+    // Both running, the kept one's step on the keeper.
+    until(&s, 300, "both legs running", || {
+        let all = legs_of(&s, &run)?;
+        let kept = all.iter().find(|l| l.0 == "kept").map(|l| l.3.clone()).unwrap_or_default();
+        let (_, about) = http(s.port, "GET", &format!("/api/ci/legs/{kept}"), &s.admin, None)?;
+        let stepping = serde_json::from_str::<Value>(&about)
+            .unwrap_or_default()
+            .get("steps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|x| x.get("name").and_then(Value::as_str).is_some_and(|n| n.starts_with("Run sleep")) && x.get("status").and_then(Value::as_str) == Some("running"));
+        Ok((!stepping || all.iter().filter(|l| l.1 == "running").count() < 2).then(|| format!("{all:?}")))
+    })?;
+    s.restart()?;
+    // The kept leg finishes where it ran, its first attempt.
+    until(&s, 180, "the kept leg to finish", || {
+        let all = legs_of(&s, &run)?;
+        let kept = all.iter().find(|l| l.0 == "kept").cloned().unwrap_or_default();
+        anyhow::ensure!(kept.1 == "running" || kept.1 == "succeeded", "the kept leg ended {kept:?}\n--- the keeper:\n{}\n--- the server:\n{}", keeper_log(), s.log());
+        Ok((kept.1 != "succeeded").then(|| format!("{all:?}")))
+    })?;
+    let all = legs_of(&s, &run)?;
+    let kept = all.iter().find(|l| l.0 == "kept").cloned().unwrap_or_default();
+    assert_eq!(kept.2, 1, "re-adopted, not retried: {all:?}");
+    let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{}/logs?step=0", kept.3), &s.admin, None)?;
+    assert!(text.contains("kept to its end"), "it ran to its end: {text}");
+    // The lost one: its first attempt `runner-lost`, its next not on the runner that lost it.
+    until(&s, 60, "the lost leg's next attempt", || {
+        let lost = legs_of(&s, &run)?.into_iter().find(|l| l.0 == "lost").unwrap_or_default();
+        Ok((lost.2 < 2 || lost.1 == "running").then(|| format!("{lost:?}")))
+    })?;
+    let lost = legs_of(&s, &run)?.into_iter().find(|l| l.0 == "lost").unwrap_or_default();
+    let (_, about) = http(s.port, "GET", &format!("/api/ci/legs/{}", lost.3), &s.admin, None)?;
+    let about: Value = serde_json::from_str(&about)?;
+    let first = about.get("attempts").and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("number").and_then(Value::as_i64) == Some(1))).cloned().unwrap_or_default();
+    assert_eq!((first.get("conclusion").and_then(Value::as_str), first.get("class").and_then(Value::as_str)), (Some("failure"), Some("runner-lost")), "{about}\n{}", s.log());
+    // None of the server's runner's slots held: its next leg runs.
+    std::fs::write(repo.join(".kiln/after.yaml"), "on: push\njobs:\n  after:\n    runs-on: local\n    steps:\n      - run: echo after\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-qm", "after"])?;
+    let after = newest(&s, ".kiln/after.yaml")?;
+    until(&s, 120, "the next leg on the server's runner", || {
+        let all = legs_of(&s, &after)?;
+        Ok((!all.iter().any(|l| l.1 == "succeeded")).then(|| format!("{all:?}")))
+    })?;
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run}/cancel"), &s.admin, Some(&serde_json::json!({})))?;
+    anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
+    Ok(())
+}

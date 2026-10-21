@@ -657,6 +657,9 @@ struct Dispatch {
     in_commands: bool,
     /// The `k8s` pools' executors this server started as pods (W13-R07).
     pods: std::collections::HashSet<String>,
+    /// When the runners of legs the rebuild after a restart found running have had their grace to
+    /// say hello (ms): a leg whose runner hasn't by then was lost with it ([`Dispatch::absent`]).
+    absent_after: Option<i64>,
 }
 
 fn now_ms() -> i64 {
@@ -722,7 +725,12 @@ pub fn spawn(hub: Arc<Hub>) {
             next: Vec::new(),
             in_commands: false,
             pods: std::collections::HashSet::new(),
+            absent_after: None,
         };
+        // A test build's fault: the rebuild late, so the runners say hello first (W22-AC04).
+        if let Some(late) = crate::runner::chaos::get().and_then(|c| c.rebuild_after) {
+            crate::rt::sleep(late).await;
+        }
         let started = std::time::Instant::now();
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
@@ -732,9 +740,18 @@ pub fn spawn(hub: Arc<Hub>) {
             tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), "the CI engine rebuilt its runs");
         }
         *hub.ci.restored.lock() = Some(restored);
-        let agents: Vec<String> = hub.agents.lock().values().filter(|a| a.connected).map(|a| a.name.clone()).collect();
-        for a in agents {
-            d.runner_up(&a, &[]).await;
+        // The runners that said hello while it rebuilt: what each said it runs is on its record
+        // (the hub kept it); a leg it didn't say it has, it lost.
+        let agents: Vec<(String, Vec<String>)> = hub.agents.lock().values().filter(|a| a.connected).map(|a| (a.name.clone(), a.running.clone())).collect();
+        for (a, running) in agents {
+            d.runner_up(&a, &running).await;
+        }
+        // Those yet to say it have their grace to.
+        let here: HashSet<String> = hub.agents.lock().keys().cloned().collect();
+        if d.legs.values().any(|l| l.agent.as_ref().is_some_and(|a| !here.contains(a))) {
+            let at = now_ms() + i64::try_from(crate::hub::AGENT_GRACE.as_millis()).unwrap_or(i64::MAX);
+            d.absent_after = Some(at);
+            d.timers.insert(at);
         }
         loop {
             let wait = d.timers.first().map(|at| Duration::from_millis(u64::try_from((at - now_ms()).max(0)).unwrap_or(0)));
@@ -869,6 +886,10 @@ impl Dispatch {
             self.timers.pop_first();
             woke = true;
         }
+        if self.absent_after.is_some_and(|t| t <= now) {
+            self.absent_after = None;
+            self.absent().await;
+        }
         // Wait timers that ran out (W15-R03).
         if woke && !self.held.is_empty() {
             let ids: Vec<String> = self.held.keys().cloned().collect();
@@ -951,14 +972,35 @@ impl Dispatch {
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
         let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
+        cmds.extend(self.lose(gone, "the runner lost it").await);
+        self.commands(cmds).await;
+    }
+
+    /// The legs the rebuild after a restart found running on runners that haven't said hello
+    /// within their grace: lost with them, as [`Dispatch::runner_up`]'s are.
+    async fn absent(&mut self) {
+        let here: HashSet<String> = self.hub.agents.lock().keys().cloned().collect();
+        let gone: Vec<(String, u32)> = self.legs.iter().filter(|(_, l)| l.agent.as_ref().is_some_and(|a| !here.contains(a))).map(|(id, l)| (id.clone(), l.attempt)).collect();
+        if gone.is_empty() {
+            return;
+        }
+        tracing::warn!(legs = gone.len(), "legs' runners didn't come back after the restart: the legs were lost with them");
+        let cmds = self.lose(gone, "its runner didn't come back after the server restarted").await;
+        self.commands(cmds).await;
+    }
+
+    /// `gone`'s legs (each with its attempt) lost with their runner: each attempt fails so, for the
+    /// scheduler to retry or conclude (W05-R05). The scheduler's commands.
+    async fn lose(&mut self, gone: Vec<(String, u32)>, why: &str) -> Vec<Command> {
+        let mut cmds = Vec::new();
         for (leg, attempt) in gone {
-            let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some("the runner lost it".into()), peak_rss: None, cpu_seconds: None };
+            let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.to_owned()), peak_rss: None, cpu_seconds: None };
             if let Err(e) = runs::attempt_finished(&self.hub, &leg, attempt, end).await {
                 tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the attempt could not be recorded");
             }
             cmds.extend(self.sched.handle(Input::AttemptFinished { leg, attempt, outcome: Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }) }, now_ms()));
         }
-        self.commands(cmds).await;
+        cmds
     }
 
     /// A workflow that matched an event becomes a run (W04-R01).
@@ -2548,13 +2590,13 @@ impl Dispatch {
             self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0 });
             let li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci);
             match (s, agent) {
+                // Running on `a` as the store has it; `a` says whether it still is. A runner that
+                // said hello while this rebuilt said what it runs (what it left out it lost:
+                // `spawn`'s `runner_up`), one yet to says when it does, or loses it after its
+                // grace (`absent`). Not put on `a`'s record here: a leg its hello left out would
+                // hold one of its slots for good.
                 (Status::Running, Some(a)) => {
-                    let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a.clone(), attempt: attempt.max(1) }, now_ms());
-                    let mut g = self.hub.agents.lock();
-                    if let Some(ag) = g.get_mut(&a) {
-                        ag.running.push(id.clone());
-                        ag.busy = u32::try_from(ag.running.len()).unwrap_or(u32::MAX);
-                    }
+                    let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1) }, now_ms());
                 }
                 _ => queued.push(li),
             }

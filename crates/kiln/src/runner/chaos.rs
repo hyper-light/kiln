@@ -10,7 +10,9 @@
 //! - `disk=<MiB>`: a leg's job container gets a workspace of that size, so filling it is ENOSPC;
 //! - `corrupt`: a leg's uploads to the server's blob store arrive with a byte flipped;
 //! - `platform=<os>/<arch>`: the runner reports that platform's OS and architecture (and the
-//!   labels they give), a stand-in for a runner of another platform (W04-AC07).
+//!   labels they give), a stand-in for a runner of another platform (W04-AC07);
+//! - `rebuild=<duration>`: the server's, not its runner's: the CI engine rebuilds its runs that
+//!   long after the server starts, so its runners say hello before it knows their legs (W05-R05).
 //!
 //! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
 //! recovers; `drop` and `delay` are the connection's.
@@ -35,6 +37,7 @@ pub struct Chaos {
     pub disk_mib: Option<u32>,
     pub corrupt: bool,
     pub platform: Option<String>,
+    pub rebuild_after: Option<Duration>,
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -65,7 +68,8 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 kiln_ci::plan::matrix::Platform::parse(v).map_err(|e| anyhow::anyhow!("chaos `platform`: {e}"))?;
                 c.platform = Some(v.to_owned());
             }
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, delay, oom, disk, corrupt or platform"),
+            "rebuild" => c.rebuild_after = Some(d()?),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, delay, oom, disk, corrupt, platform or rebuild"),
         }
     }
     Ok(c)
@@ -264,9 +268,18 @@ mod tests {
         let c = parse("drop=2s, delay=300ms,oom=1s,disk=8,corrupt")?;
         assert_eq!(
             c,
-            Chaos { drop_every: Some(Duration::from_secs(2)), delay: Some(Duration::from_millis(300)), oom_after: Some(Duration::from_secs(1)), disk_mib: Some(8), corrupt: true, platform: None }
+            Chaos {
+                drop_every: Some(Duration::from_secs(2)),
+                delay: Some(Duration::from_millis(300)),
+                oom_after: Some(Duration::from_secs(1)),
+                disk_mib: Some(8),
+                corrupt: true,
+                platform: None,
+                rebuild_after: None
+            }
         );
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
+        assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));
         assert!(parse("oom=soon").is_err());

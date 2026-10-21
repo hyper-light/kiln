@@ -198,3 +198,151 @@ fn w05_ac09_a_restart_rebuilds_the_queue() -> anyhow::Result<()> {
     anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
     Ok(())
 }
+
+/// A native repository's working tree, pushed to the server.
+struct Tree {
+    home: std::path::PathBuf,
+    work: std::path::PathBuf,
+    push: String,
+}
+
+impl Tree {
+    /// `acme/restart`, made on `s` with a first commit, once the server has polled it.
+    fn new(dir: &Path, s: &Server) -> anyhow::Result<Tree> {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/restart", "mode": "native" })))?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let t = Tree { home: dir.join("githome"), work: dir.join("tree"), push: format!("http://x:{}@127.0.0.1:{}/git/acme/restart.git", s.admin, s.port) };
+        std::fs::create_dir_all(&t.home)?;
+        std::fs::create_dir_all(t.work.join(".kiln"))?;
+        git(&t.home, &t.work, &["init", "-q", "-b", "main"])?;
+        t.commit("README.md", "restart\n")?;
+        until(s, 60, "the first poll", || {
+            let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+            Ok(body.contains("\"last_polled_at\":null").then_some(body))
+        })?;
+        Ok(t)
+    }
+
+    /// `path` written with `text`, committed and pushed.
+    fn commit(&self, path: &str, text: &str) -> anyhow::Result<()> {
+        std::fs::write(self.work.join(path), text)?;
+        git(&self.home, &self.work, &["add", "."])?;
+        git(&self.home, &self.work, &["commit", "-qm", path])?;
+        git(&self.home, &self.work, &["push", "-q", &self.push, "HEAD:main"])?;
+        Ok(())
+    }
+}
+
+/// The newest run of `workflow`'s id, once there is one.
+fn run_of(s: &Server, workflow: &str) -> anyhow::Result<String> {
+    let mut run = String::new();
+    until(s, 120, "the run", || {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo=acme/restart&workflow={workflow}&limit=1"), &s.admin, None)?;
+        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok(run.is_empty().then_some(body))
+    })?;
+    Ok(run)
+}
+
+/// Each of `ids`' first attempt: its conclusion and failure class.
+fn first_attempts(s: &Server, ids: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for id in ids {
+        let (_, about) = http(s.port, "GET", &format!("/api/ci/legs/{id}"), &s.admin, None)?;
+        let about: Value = serde_json::from_str(&about)?;
+        let first = about.get("attempts").and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("number").and_then(Value::as_i64) == Some(1))).cloned().unwrap_or_default();
+        let text = |k: &str| first.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        out.push((text("conclusion"), text("class")));
+    }
+    Ok(out)
+}
+
+/// W05-R05 across a restart: the server killed while its own runner runs two legs, which go with
+/// it, under a queue whose rebuild outlasts the runner's reconnecting (so it says hello first,
+/// running nothing). The legs it ran were lost with it, not held: each attempt fails `runner-lost`
+/// and the leg goes on to its next attempt (W05-R16), the runner's slots free for the next leg.
+#[test]
+fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let tree = Tree::new(dir.path(), &s)?;
+    let axis = (0..QUEUED).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    tree.commit(
+        ".kiln/queue.yaml",
+        &format!("on: push\njobs:\n  slow:\n    runs-on: local\n    matrix: {{ n: [1, 2] }}\n    steps:\n      - run: sleep 120\n  queued:\n    runs-on: nowhere\n    matrix: {{ i: [{axis}] }}\n    steps:\n      - run: echo never\n"),
+    )?;
+    let run = run_of(&s, ".kiln/queue.yaml")?;
+    let mut slow: Vec<String> = Vec::new();
+    until(&s, 300, "the slow legs running", || {
+        let all = legs(&s, &run)?;
+        slow = all.iter().filter(|(_, k, st, _)| k.starts_with("slow") && st == "running").map(|(id, _, _, _)| id.clone()).collect();
+        Ok((slow.len() < 2).then(|| format!("{:?}", all.iter().filter(|(_, k, _, _)| k.starts_with("slow")).collect::<Vec<_>>())))
+    })?;
+    // Killed and started again while they run: its runner, back with none of them, says so.
+    s.restart()?;
+    until(&s, 120, "the lost legs' next attempts", || {
+        let all = legs(&s, &run)?;
+        let on: Vec<_> = all.iter().filter(|(id, _, _, _)| slow.contains(id)).collect();
+        Ok((on.len() < 2 || on.iter().any(|(_, _, st, attempt)| *attempt < 2 || st == "running")).then(|| format!("{on:?}")))
+    })?;
+    for (conclusion, class) in first_attempts(&s, &slow)? {
+        assert_eq!((conclusion.as_str(), class.as_str()), ("failure", "runner-lost"), "lost with the runner:\n{}", s.log());
+    }
+    // Its slots free: a leg for it now runs.
+    tree.commit(".kiln/after.yaml", "on: push\njobs:\n  after:\n    runs-on: local\n    steps:\n      - run: echo after\n")?;
+    let after = run_of(&s, ".kiln/after.yaml")?;
+    until(&s, 120, "the next leg on the runner", || {
+        let all = legs(&s, &after)?;
+        Ok((!all.iter().any(|(_, _, st, _)| st == "succeeded")).then(|| format!("{all:?}")))
+    })?;
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run}/cancel"), &s.admin, Some(&json!({})))?;
+    anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
+    Ok(())
+}
+
+/// The same with a runner that doesn't come back: the restart finds its leg running, and once
+/// the runner has had its grace to reconnect (45 s), the leg was lost with it.
+#[test]
+fn w05_r05_a_runner_gone_over_a_restart_loses_its_legs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options { agent: false, ci: "kiln_workflows = true", ..Options::default() })?;
+    let join = std::fs::read_to_string(dir.path().join("data/join.token"))?.trim().to_owned();
+    let home = dir.path().join("runner-home");
+    std::fs::create_dir_all(&home)?;
+    let log = std::fs::File::create(dir.path().join("runner.log"))?;
+    let child = Command::new(env!("CARGO_BIN_EXE_kiln"))
+        .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "goner", "--labels", "gone", "--slots", "1", "--no-terminal"])
+        .arg("--work-dir")
+        .arg(dir.path().join("runner-work"))
+        .arg("--state-dir")
+        .arg(dir.path().join("runner-state"))
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .env_remove("KILN_CONFIG")
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()?;
+    let runner = Runner(child);
+    let tree = Tree::new(dir.path(), &s)?;
+    tree.commit(".kiln/gone.yaml", "on: push\njobs:\n  long:\n    runs-on: gone\n    steps:\n      - run: sleep 300\n")?;
+    let run = run_of(&s, ".kiln/gone.yaml")?;
+    let mut leg = Vec::new();
+    until(&s, 300, "the leg running", || {
+        let all = legs(&s, &run)?;
+        leg = all.iter().filter(|(_, _, st, _)| st == "running").map(|(id, _, _, _)| id.clone()).collect();
+        Ok(leg.is_empty().then(|| format!("{all:?}\n{}", std::fs::read_to_string(dir.path().join("runner.log")).unwrap_or_default())))
+    })?;
+    // The runner gone, then the server killed and started again.
+    drop(runner);
+    s.restart()?;
+    until(&s, 150, "the leg lost with its runner", || {
+        let all = legs(&s, &run)?;
+        Ok((!all.iter().any(|(id, _, st, attempt)| leg.contains(id) && *attempt >= 2 && st != "running")).then(|| format!("{all:?}")))
+    })?;
+    for (conclusion, class) in first_attempts(&s, &leg)? {
+        assert_eq!((conclusion.as_str(), class.as_str()), ("failure", "runner-lost"), "lost with the runner:\n{}", s.log());
+    }
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run}/cancel"), &s.admin, Some(&json!({})))?;
+    anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
+    Ok(())
+}
