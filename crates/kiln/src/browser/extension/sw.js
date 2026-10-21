@@ -1,5 +1,28 @@
 // kiln's capture extension, its worker (crate::browser::stream): a tab's picture and sound handed
 // to the offscreen document, which encodes them. kiln calls these over the DevTools protocol.
+
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A tab captured for a stream (`ask`: what the offscreen document's to do with it), tried again a
+// while: a capture just let go of is let go of a moment later (Chrome says the tab still has one,
+// or that its state is wrong), and each try needs an id of its own.
+async function captured(tabId, ask) {
+  let last = { ok: false, error: "it wasn't tried" };
+  const until = Date.now() + 6000;
+  for (let i = 0; i === 0 || Date.now() < until; i++) {
+    if (i) await pause(Math.min(200, 25 * i));
+    let mediaId;
+    try {
+      mediaId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+    } catch (e) {
+      last = { ok: false, error: String(e) };
+      continue;
+    }
+    last = await chrome.runtime.sendMessage({ ...ask, mediaId });
+    if (last && last.ok) return last;
+  }
+  return last;
+}
 globalThis.kiln = {
   // The tab whose address ends in `#kiln-<mark>` (kiln opens each streamed tab so), its id.
   async tab(mark) {
@@ -24,24 +47,13 @@ globalThis.kiln = {
   },
   // Another of a stream's tabs captured for it from now on (its viewer went to it).
   async switchTo(tabId, stream) {
-    const mediaId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
-    return await chrome.runtime.sendMessage({ kind: "switch", stream, mediaId });
+    return await captured(tabId, { kind: "switch", stream });
   },
   // A stream's tab captured again at its new size, in pixels (a capture keeps the size it began
   // at): its capture let go first (Chrome captures a tab once at a time), then taken again.
   async recapture(tabId, stream, width, height) {
     await chrome.runtime.sendMessage({ kind: "release", stream });
-    let mediaId = null;
-    for (let i = 0; !mediaId; i++) {
-      try {
-        mediaId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
-      } catch (e) {
-        // Still let go of, a moment.
-        if (i >= 20) throw e;
-        await new Promise((r) => setTimeout(r, 25));
-      }
-    }
-    return await chrome.runtime.sendMessage({ kind: "switch", stream, mediaId, width, height });
+    return await captured(tabId, { kind: "switch", stream, width, height });
   },
   // A stream whose pictures kiln brings (another engine's page, taken as it changes): encoded in
   // the offscreen document as a captured tab's are.

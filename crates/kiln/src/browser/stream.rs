@@ -97,6 +97,22 @@ pub enum Out {
     Event { stream: String, json: String },
 }
 
+/// Where a stream's output goes: its events (waited for, so none is lost) and its chunks (one that
+/// finds no room is lost, and the next key frame mends it), each its own way, so what a stream says
+/// never waits behind its pictures (`serve_open` sends events first).
+#[derive(Clone)]
+pub struct Outs {
+    pub events: async_channel::Sender<Out>,
+    pub chunks: async_channel::Sender<Out>,
+}
+
+impl Outs {
+    /// Both one way (a test reads them as they come).
+    pub fn one(tx: async_channel::Sender<Out>) -> Self {
+        Self { events: tx.clone(), chunks: tx }
+    }
+}
+
 /// A chunk as the server gets it: `kind` (`b'v'` video, `b'a'` audio, `b'c'` a decoder's
 /// configuration), `flags` (`b'k'` a key frame, `b'a'` the audio's configuration), the timestamp
 /// (µs, big-endian), this part's index and the count of parts (a byte each), then the bytes.
@@ -193,8 +209,11 @@ pub(crate) struct Tabs {
     list: Mutex<Vec<Tab>>,
     /// The shown tab's target.
     shown: Mutex<String>,
-    /// One tab shown at a time (two at once would capture both).
+    /// One change of its capture at a time (a tab shown, a new size): two at once would capture a
+    /// tab twice, one of them never let go.
     showing: futures::lock::Mutex<()>,
+    /// Each list said is numbered, as it was then (one said later may arrive first).
+    said: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -214,7 +233,7 @@ const TABS: usize = 30;
 impl Tabs {
     fn new(page: Page, chrome: i64) -> Self {
         let shown = page.target().to_owned();
-        Self { list: Mutex::new(vec![Tab { page: Arc::new(page), chrome, opener: None, url: String::new(), title: String::new() }]), shown: Mutex::new(shown), showing: futures::lock::Mutex::new(()) }
+        Self { list: Mutex::new(vec![Tab { page: Arc::new(page), chrome, opener: None, url: String::new(), title: String::new() }]), shown: Mutex::new(shown), showing: futures::lock::Mutex::new(()), said: std::sync::atomic::AtomicU64::new(0) }
     }
 
     /// The tab shown.
@@ -235,10 +254,13 @@ impl Tabs {
         self.list.lock().iter().map(|t| t.page.clone()).collect()
     }
 
-    /// As its viewers are told them: `{"list": [{id, url, title}], "shown": id}`.
+    /// As its viewers are told them: `{"list": [{id, url, title}], "shown": id, "seq": n}`, `seq`
+    /// numbering it as it was then (the server and its viewers keep the newest).
     fn said(&self) -> Value {
-        let list: Vec<Value> = self.list.lock().iter().map(|t| json!({"id": t.page.target(), "url": t.url, "title": t.title})).collect();
-        json!({"tabs": {"list": list, "shown": *self.shown.lock()}})
+        let l = self.list.lock();
+        let seq = self.said.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let list: Vec<Value> = l.iter().map(|t| json!({"id": t.page.target(), "url": t.url, "title": t.title})).collect();
+        json!({"tabs": {"list": list, "shown": *self.shown.lock(), "seq": seq}})
     }
 
     /// A tab's address or title, as it changed: whether it did.
@@ -388,8 +410,9 @@ impl Streams {
         });
     }
 
-    /// Open a stream of `spec` as `id`; its chunks and events go to `out`.
-    pub async fn open(&self, dir: &Path, id: &str, spec: &Spec, out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
+    /// Open a stream of `spec` as `id`; its chunks and events go to `outs`.
+    pub async fn open(&self, dir: &Path, id: &str, spec: &Spec, outs: Outs) -> anyhow::Result<Value> {
+        let out = outs.events.clone();
         let engine = super::driven::Engine::parse(spec.engine.as_deref().unwrap_or(""))?;
         let device = match spec.device.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
             Some(n) => Some(super::devices::device(n).ok_or_else(|| anyhow::anyhow!("kiln knows no device {n:?}: {}", super::devices::DEVICES.iter().map(|d| d.name).collect::<Vec<_>>().join(", ")))?),
@@ -398,7 +421,7 @@ impl Streams {
         // Its window: a device's, else its viewer's.
         let (width, height, scale, mobile) = device.map_or((spec.width, spec.height, spec.scale.clamp(1.0, 3.0), spec.mobile), |d| (d.width, d.height, d.scale, d.mobile));
         if engine != super::driven::Engine::Chromium {
-            return self.open_driven(dir, id, spec, engine, device, (width, height, scale, mobile), out).await;
+            return self.open_driven(dir, id, spec, engine, device, (width, height, scale, mobile), outs).await;
         }
         // A clean profile is new each time: a browser of the stream's own.
         let profile = if spec.profile == "clean" { format!("clean:{id}") } else { spec.profile.clone() };
@@ -424,7 +447,7 @@ impl Streams {
             crate::rt::sleep(Duration::from_millis(50)).await;
         }
         let chrome = tab.as_i64().ok_or_else(|| anyhow::anyhow!("the capture extension doesn't see the stream's tab"))?;
-        s.outs.lock().insert(id.to_owned(), out.clone());
+        s.outs.lock().insert(id.to_owned(), outs.chunks.clone());
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (pw, ph) = ((f64::from(width) * scale).round() as u32, (f64::from(height) * scale).round() as u32);
         let opts = json!({"width": pw, "height": ph, "framerate": 60, "bitrate": spec.bitrate.unwrap_or(4_000_000), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
@@ -466,14 +489,15 @@ impl Streams {
     /// A stream of another engine's page (`super::driven`): its pictures, taken as it changes,
     /// encoded by a Chromium of kiln's own (`kiln.pushed`).
     #[allow(clippy::too_many_arguments)]
-    async fn open_driven(&self, dir: &Path, id: &str, spec: &Spec, engine: super::driven::Engine, device: Option<super::devices::Device>, window: (u32, u32, f64, bool), out: async_channel::Sender<Out>) -> anyhow::Result<Value> {
+    async fn open_driven(&self, dir: &Path, id: &str, spec: &Spec, engine: super::driven::Engine, device: Option<super::devices::Device>, window: (u32, u32, f64, bool), outs: Outs) -> anyhow::Result<Value> {
+        let out = outs.events.clone();
         let (width, height, scale, mobile) = window;
         let enc = self.streamer(dir, "encode").await?;
         let page = super::driven::Driven::open(dir, engine, &spec.profile, width, height, scale, device.as_ref()).await?;
         if let Some(agent) = device.map(|d| d.agent).filter(|a| !a.is_empty()) {
             page.agent(agent).await;
         }
-        enc.outs.lock().insert(id.to_owned(), out.clone());
+        enc.outs.lock().insert(id.to_owned(), outs.chunks.clone());
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (pw, ph) = ((f64::from(width) * scale).round() as u32, (f64::from(height) * scale).round() as u32);
         let opts = json!({"width": pw, "height": ph, "framerate": 30, "bitrate": spec.bitrate.unwrap_or(4_000_000), "codec": spec.codec.clone().unwrap_or_else(|| "h264".to_owned())});
@@ -623,16 +647,28 @@ impl Streams {
 /// lane; whether it opened, said.
 pub async fn serve_open(dir: PathBuf, id: String, session: String, json: String, up: async_channel::Sender<crate::exec::Up>) {
     use crate::exec::Up;
-    use crate::proto::AgentMsg;
+    use futures::FutureExt as _;
     let (tx, rx) = async_channel::bounded::<Out>(512);
+    let (chunks, chunked) = async_channel::bounded::<Out>(512);
     let fwd = up.clone();
     crate::rt::spawn(async move {
-        while let Ok(o) = rx.recv().await {
-            let m = match o {
-                Out::Frame { stream, data } => AgentMsg::StreamFrame { stream, data },
-                Out::Event { stream, json } => AgentMsg::StreamEvent { stream, json },
+        loop {
+            // What the stream says first, then its pictures: none of it waits behind them.
+            let o = futures::select_biased! {
+                o = rx.recv().fuse() => o,
+                o = chunked.recv().fuse() => o,
             };
-            if fwd.send(Up::Stream(m)).await.is_err() {
+            let Ok(o) = o else {
+                // One way ended: the other's rest, then done.
+                let rest = if rx.is_closed() { &chunked } else { &rx };
+                while let Ok(o) = rest.recv().await {
+                    if fwd.send(Up::Stream(agent_msg(o))).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            };
+            if fwd.send(Up::Stream(agent_msg(o))).await.is_err() {
                 return;
             }
         }
@@ -642,13 +678,21 @@ pub async fn serve_open(dir: PathBuf, id: String, session: String, json: String,
         s
     });
     let said = match spec {
-        Ok(spec) => match streams().open(&dir, &id, &spec, tx.clone()).await {
+        Ok(spec) => match streams().open(&dir, &id, &spec, Outs { events: tx.clone(), chunks }).await {
             Ok(v) => v,
             Err(e) => json!({"error": format!("{e:#}")}),
         },
         Err(e) => json!({"error": format!("not a stream's spec: {e}")}),
     };
     let _ = tx.send(Out::Event { stream: id, json: said.to_string() }).await;
+}
+
+/// What a stream sent, as its runner sends it to the server.
+fn agent_msg(o: Out) -> crate::proto::AgentMsg {
+    match o {
+        Out::Frame { stream, data } => crate::proto::AgentMsg::StreamFrame { stream, data },
+        Out::Event { stream, json } => crate::proto::AgentMsg::StreamEvent { stream, json },
+    }
 }
 
 /// `ServerMsg::StreamInput` on a runner: queued for its stream, in order.
@@ -1039,7 +1083,10 @@ async fn tabs_said(events: async_channel::Receiver<super::cdp::Event>) {
         match e.method.as_str() {
             "Target.targetCreated" if said("type") == Some("page") => {
                 let Some(opener) = said("openerId").filter(|o| !o.is_empty()).map(str::to_owned) else { continue };
-                let Some(s) = streams().owning(&opener) else { continue };
+                let Some(s) = streams().owning(&opener) else {
+                    tracing::debug!(tab = %id, opener = %opener, "a tab opened by none of the streams' tabs");
+                    continue;
+                };
                 crate::rt::spawn(async move {
                     if let Err(e) = s.adopt(id, Some(opener), false).await {
                         tracing::debug!(stream = %s.id, error = %format!("{e:#}"), "a tab its page opened isn't the stream's");
@@ -1286,6 +1333,7 @@ impl Stream {
         if tabs.has(&target) {
             return Ok(());
         }
+        tracing::debug!(stream = %self.id, tab = %target, opener = ?opener, "a tab of its own");
         anyhow::ensure!(tabs.list.lock().len() < TABS, "it has {TABS} tabs open already");
         let cdp = self.streamer.browser.cdp.clone();
         let page = Page::attach(self.streamer.browser.clone(), None, target.clone()).await?;
@@ -1332,7 +1380,9 @@ impl Stream {
     /// viewers do goes to it, and they're told where it is.
     async fn show(&self, target: &str) -> anyhow::Result<()> {
         let Surface::Tab(tabs) = &self.page else { anyhow::bail!("only Chromium's pages have tabs") };
+        let asked = std::time::Instant::now();
         let _one = tabs.showing.lock().await;
+        tracing::debug!(stream = %self.id, tab = target, waited_ms = asked.elapsed().as_millis(), "showing a tab");
         let tab = tabs.get(target).ok_or_else(|| anyhow::anyhow!("it has no such tab (it may have closed)"))?;
         if *tabs.shown.lock() != target {
             let cdp = &self.streamer.browser.cdp;
@@ -1344,6 +1394,7 @@ impl Stream {
             // Chrome's tab too (its page sees itself in front).
             let _ = cdp.call(None, "Target.activateTarget", json!({"targetId": target})).await;
         }
+        tracing::debug!(stream = %self.id, tab = target, ms = asked.elapsed().as_millis(), "a tab shown");
         // Its viewers: its tabs, where it is, its title, its fields.
         self.tell_tabs().await;
         let url = tab.page.eval("location.href").await.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or(tab.url);
@@ -1385,6 +1436,7 @@ impl Stream {
     /// address) or `{"close": id}`.
     async fn tab(&self, t: &Value) -> anyhow::Result<()> {
         let Surface::Tab(tabs) = &self.page else { anyhow::bail!("only Chromium's pages have tabs here") };
+        tracing::debug!(stream = %self.id, asked = %t, "its viewer asked of its tabs");
         let cdp = &self.streamer.browser.cdp;
         if let Some(id) = t.get("show").and_then(Value::as_str) {
             self.show(id).await?;
@@ -1585,17 +1637,16 @@ impl Stream {
             let (pw, ph) = ((f64::from(w) * scale).round() as u32, (f64::from(h) * scale).round() as u32);
             // A tab's captured again at its new size, once it's laid out at it (a capture keeps
             // the size it began at); another engine's pictures come at it.
-            let shown = match &self.page {
-                Surface::Tab(t) => {
-                    let id = t.shown.lock().clone();
-                    t.get(&id)
+            if let Surface::Tab(t) = &self.page {
+                // One change of its capture at a time: a tab shown meanwhile would be captured
+                // twice, one of them never let go.
+                let _one = t.showing.lock().await;
+                let shown = t.shown.lock().clone();
+                if let Some(tab) = t.get(&shown) {
+                    let _ = tab.page.settle().await;
+                    let again = super::evaluate(cdp, &self.streamer.worker, &format!("kiln.recapture({}, {id}, {pw}, {ph})", tab.chrome)).await?;
+                    anyhow::ensure!(again.get("ok").and_then(Value::as_bool) == Some(true), "its tab couldn't be captured at its new size: {}", again.get("error").and_then(Value::as_str).unwrap_or("it said nothing"));
                 }
-                Surface::Driven(_) => None,
-            };
-            if let Some(tab) = shown {
-                let _ = tab.page.settle().await;
-                let again = super::evaluate(cdp, &self.streamer.worker, &format!("kiln.recapture({}, {id}, {pw}, {ph})", tab.chrome)).await?;
-                anyhow::ensure!(again.get("ok").and_then(Value::as_bool) == Some(true), "its tab couldn't be captured at its new size: {}", again.get("error").and_then(Value::as_str).unwrap_or("it said nothing"));
             }
         }
         if let Some(p) = c.get("pause").and_then(Value::as_bool) {
@@ -1704,7 +1755,7 @@ mod tests {
             let page = "data:text/html,<body style='margin:0;background:%23123'><div id=b style='width:40px;height:40px;background:%23bab0e3;position:absolute'></div><script>let t=0;addEventListener('pointerdown',()=>document.title='clicked');(function f(){t++;b.style.left=(t*3%25200)+'px';requestAnimationFrame(f)})()</script></body>";
             let spec: Spec = serde_json::from_value(json!({"url": page, "width": 320, "height": 240, "scale": 1, "profile": "clean"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
-            let opened = streams().open(&dir, "test-stream", &spec, tx).await?;
+            let opened = streams().open(&dir, "test-stream", &spec, Outs::one(tx)).await?;
             assert!(opened.get("opened").is_some(), "{opened}");
             let s = streams().get("test-stream").ok_or_else(|| anyhow::anyhow!("not open"))?;
             s.control(&json!({"pause": false, "keyframe": true})).await?;
@@ -1793,7 +1844,7 @@ mod tests {
         crate::rt::block_on(async move {
             let spec: Spec = serde_json::from_value(json!({"url": format!("{at}/"), "width": 394, "height": 538, "scale": 2, "profile": "clean"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
-            streams().open(&dir, "scroll-test", &spec, tx).await?;
+            streams().open(&dir, "scroll-test", &spec, Outs::one(tx)).await?;
             let s = streams().get("scroll-test").ok_or_else(|| anyhow::anyhow!("not open"))?;
             s.control(&json!({"pause": false, "keyframe": true})).await?;
             let mut h = Heard::default();
@@ -1835,7 +1886,7 @@ mod tests {
                 // Opened at a phone's size, then its viewer's own (as a viewer's frame says it).
                 let spec: Spec = serde_json::from_value(json!({"url": format!("{at}/"), "width": 390, "height": 640, "scale": 2, "profile": "clean"}))?;
                 let (tx, rx) = async_channel::bounded::<Out>(4096);
-                streams().open(&dir, &id, &spec, tx).await?;
+                streams().open(&dir, &id, &spec, Outs::one(tx)).await?;
                 let s = streams().get(&id).ok_or_else(|| anyhow::anyhow!("not open"))?;
                 s.control(&json!({"pause": false, "keyframe": true})).await?;
                 s.control(&json!({"resize": {"width": w, "height": h, "scale": scale, "mobile": false}})).await?;
@@ -1873,7 +1924,7 @@ mod tests {
         crate::rt::block_on(async move {
             let spec: Spec = serde_json::from_value(json!({"url": format!("{at}/"), "width": 320, "height": 240, "scale": 1, "profile": "clean"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
-            streams().open(&dir, "tabs-test", &spec, tx).await?;
+            streams().open(&dir, "tabs-test", &spec, Outs::one(tx)).await?;
             let s = streams().get("tabs-test").ok_or_else(|| anyhow::anyhow!("not open"))?;
             s.control(&json!({"pause": false, "keyframe": true})).await?;
             let mut h = Heard::default();
@@ -1938,7 +1989,7 @@ mod tests {
             // A conversation's profile (kept), as the Tools tab opens one.
             let spec: Spec = serde_json::from_value(json!({"url": page, "profile": std::env::var("KILN_TEST_PROFILE").unwrap_or_else(|_| "clean".into()), "engine": "firefox", "device": "iPhone SE"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
-            let opened = streams().open(&dir, "test-firefox", &spec, tx).await?;
+            let opened = streams().open(&dir, "test-firefox", &spec, Outs::one(tx)).await?;
             assert_eq!(opened.pointer("/opened/engine"), Some(&json!("firefox")), "{opened}");
             assert_eq!(opened.pointer("/opened/device/name"), Some(&json!("iPhone SE")), "{opened}");
             let s = streams().get("test-firefox").ok_or_else(|| anyhow::anyhow!("not open"))?;
@@ -1988,7 +2039,7 @@ mod tests {
             let page = "data:text/html,<title>still</title><body style='margin:0;background:%23246'><p style='color:white'>still</p></body>";
             let spec: Spec = serde_json::from_value(json!({"url": page, "profile": "clean", "engine": "firefox", "device": "iPhone SE"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
-            streams().open(&dir, "test-late", &spec, tx).await?;
+            streams().open(&dir, "test-late", &spec, Outs::one(tx)).await?;
             let s = streams().get("test-late").ok_or_else(|| anyhow::anyhow!("not open"))?;
             // Nobody looks for a while: the page goes still.
             crate::rt::sleep(Duration::from_secs(3)).await;
@@ -2039,7 +2090,7 @@ mod tests {
         crate::rt::block_on(async move {
             let spec: Spec = serde_json::from_value(json!({"url": format!("http://127.0.0.1:{port}/"), "width": 393, "height": 852, "scale": 3, "profile": "clean", "engine": "webkit", "device": "iPhone 15"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
-            let opened = streams().open(&dir, "test-iphone", &spec, tx).await?;
+            let opened = streams().open(&dir, "test-iphone", &spec, Outs::one(tx)).await?;
             assert_eq!((opened.pointer("/opened/engine"), opened.pointer("/opened/device/name")), (Some(&json!("webkit")), Some(&json!("iPhone 15"))), "{opened}");
             let s = streams().get("test-iphone").ok_or_else(|| anyhow::anyhow!("not open"))?;
             s.control(&json!({"pause": false, "keyframe": true})).await?;
@@ -2082,7 +2133,7 @@ mod tests {
             let page = "data:text/html,<title>driven</title><body style='margin:0;background:%23123'><div id=b style='width:40px;height:40px;background:%23bab0e3;position:absolute'></div><script>let t=0;addEventListener('pointerdown',e=>document.title='clicked '+e.clientX+','+e.clientY);setInterval(()=>{t++;b.style.left=(t*7%25200)+'px'},80)</script></body>";
             let spec: Spec = serde_json::from_value(json!({"url": page, "width": 400, "height": 300, "scale": 1, "profile": "clean", "engine": "webkit"}))?;
             let (tx, rx) = async_channel::bounded::<Out>(4096);
-            let opened = streams().open(&dir, "test-webdriver", &spec, tx).await?;
+            let opened = streams().open(&dir, "test-webdriver", &spec, Outs::one(tx)).await?;
             assert_eq!(opened.pointer("/opened/engine"), Some(&json!("webkit")), "{opened}");
             let s = streams().get("test-webdriver").ok_or_else(|| anyhow::anyhow!("not open"))?;
             s.control(&json!({"pause": false, "keyframe": true})).await?;

@@ -316,9 +316,30 @@ class Pushed extends Stream {
 // (even), where one asked for another later picks its own, often odd (and each picture cut to even
 // is a key frame of its own). A new size is a new capture (`kiln.recapture`).
 const tab = (mediaId, o) =>
-  navigator.mediaDevices.getUserMedia({
-    video: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId, maxWidth: even(o.width || 1280), maxHeight: even(o.height || 800), maxFrameRate: o.framerate || 60 } },
-    audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId } },
+  new Promise((ok, no) => {
+    // One that doesn't start soon is tried again (`captured`, in the worker), and let go of if it
+    // starts after all.
+    let late = false;
+    const wait = setTimeout(() => {
+      late = true;
+      no(new Error("the tab's capture didn't start"));
+    }, 3000);
+    navigator.mediaDevices
+      .getUserMedia({
+        video: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId, maxWidth: even(o.width || 1280), maxHeight: even(o.height || 800), maxFrameRate: o.framerate || 60 } },
+        audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: mediaId } },
+      })
+      .then(
+        (media) => {
+          clearTimeout(wait);
+          if (late) for (const t of media.getTracks()) t.stop();
+          else ok(media);
+        },
+        (e) => {
+          clearTimeout(wait);
+          no(e);
+        },
+      );
   });
 
 chrome.runtime.onMessage.addListener((m, _sender, reply) => {

@@ -200,6 +200,13 @@ impl Relay {
             json = v.to_string();
         }
         let live = self.get(id).filter(|l| l.machine == machine)?;
+        // Its tabs as they were before the ones it said last (said later, arrived first): no news.
+        let seq = |v: &Value| v.pointer("/tabs/seq").and_then(Value::as_u64);
+        if let Some(new) = seq(&v)
+            && live.said.lock().get("tabs").and_then(|kept| serde_json::from_str::<Value>(kept).ok()).and_then(|kept| seq(&kept)).is_some_and(|kept| kept > new)
+        {
+            return None;
+        }
         let mut again = None;
         if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
             if k == "opened"
@@ -506,8 +513,9 @@ mod tests {
         let again = r.event("m1", "v1", json!({"opened": {"width": 390}}).to_string());
         assert_eq!(again.map(|(_, c)| c), Some(json!({"resize": {"width": 400, "height": 300, "scale": 2}})));
         while rx.try_recv().is_ok() {}
-        // Its tabs, as they are now.
-        r.event("m1", "v1", json!({"tabs": {"list": [{"id": "t1", "url": "http://localhost:5173/a", "title": "A"}], "shown": "t1"}}).to_string());
+        // Its tabs, as they are now; a list said before (arriving after) is no news.
+        r.event("m1", "v1", json!({"tabs": {"list": [{"id": "t1", "url": "http://localhost:5173/a", "title": "A"}], "shown": "t1", "seq": 2}}).to_string());
+        r.event("m1", "v1", json!({"tabs": {"list": [], "shown": "", "seq": 1}}).to_string());
         assert!(l.said.lock().get("tabs").is_some_and(|t| t.contains("\"shown\":\"t1\"")));
         assert_eq!(rx.len(), 1);
         while rx.try_recv().is_ok() {}

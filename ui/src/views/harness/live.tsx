@@ -512,6 +512,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const addressEl = React.useRef<HTMLInputElement | null>(null);
   /** Its tabs and the shown one's, once its runner says them (a Chromium page's). */
   const [tabs, setTabs] = React.useState<{ list: PageTab[]; shown: string } | null>(null);
+  const tabsSeq = React.useRef(0);
   const [title, setTitle] = React.useState(first.title);
   const [fps, setFps] = React.useState(0);
   const [sound, setSound] = React.useState(false);
@@ -591,8 +592,12 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         }
         const nav = e.navigated as { url?: string } | undefined;
         if (nav?.url) setAddress(nav.url === "about:blank" ? "" : nav.url);
-        const t = e.tabs as { list?: PageTab[]; shown?: string } | undefined;
-        if (t && Array.isArray(t.list)) setTabs({ list: t.list, shown: t.shown ?? "" });
+        // Its tabs, unless these are older than the last (said first, come later).
+        const t = e.tabs as { list?: PageTab[]; shown?: string; seq?: number } | undefined;
+        if (t && Array.isArray(t.list) && (t.seq ?? 0) >= tabsSeq.current) {
+          tabsSeq.current = t.seq ?? 0;
+          setTabs({ list: t.list, shown: t.shown ?? "" });
+        }
         if (typeof e.hidden === "boolean") setHidden(e.hidden);
         const loaded = e.loaded as { title?: string } | undefined;
         if (loaded?.title) setTitle(loaded.title);
