@@ -35,21 +35,15 @@ const SORTS: { value: SortId; label: string }[] = [
 /** Where an agent stands, in Mission control's words (the State filter lists them so). */
 export const STANDS = [
   { id: "needs", label: "Needs you" },
+  { id: "working", label: "Working" },
+  { id: "ready", label: "Ready" },
+  { id: "finished", label: "Finished" },
   { id: "crashed", label: "Stopped" },
   { id: "paused", label: "Paused" },
-  { id: "working", label: "Working" },
-  { id: "finished", label: "Finished" },
-  { id: "ready", label: "Ready" },
   { id: "offline", label: "Offline" },
   { id: "ended", label: "Ended" },
 ];
 const RANK = new Map(STANDS.map((s, i) => [s.id, i]));
-
-/**
- * Who needs you most, first: waiting on you, stopped, paused, then what finished since you last
- * looked (its next step is yours), then the rest.
- */
-const PRIORITY = new Map(["needs", "crashed", "paused", "finished", "working", "ready", "offline", "ended"].map((s, i) => [s, i]));
 
 /** Since when it has waited on you: its oldest request (or, without one, its last word). */
 const waitingSince = (a: AgentInfo) => a.approvals.reduce((at, p) => Math.min(at, p.at || at), a.approvals.length > 0 ? Infinity : a.last_activity);
@@ -125,7 +119,8 @@ function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
   switch (sort) {
     case "priority":
       return (x, y) => {
-        const by = (PRIORITY.get(x.stand) ?? PRIORITY.size) - (PRIORITY.get(y.stand) ?? PRIORITY.size);
+        // Needs you, working, ready, finished, then inactive states — also the filter's order.
+        const by = (RANK.get(x.stand) ?? RANK.size) - (RANK.get(y.stand) ?? RANK.size);
         if (by !== 0) return by;
         // Waiting on you the longest first; the latest news first; otherwise the newest.
         if (x.stand === "needs") return waitingSince(x.a) - waitingSince(y.a);

@@ -1,21 +1,26 @@
 import * as React from "react";
-import { RefreshCw } from "lucide-react";
+import { Download, RefreshCw } from "lucide-react";
 import { api } from "@/api/client";
 import type { AuditEntry, SystemInfo } from "@/api/types";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { CopyButton, EmptyState, PageIntro, Panel, SectionHeading } from "@/components/ui/misc";
+import { CopyButton, EmptyState, FoldSection, PageIntro, SearchField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { useRes, warm, type Res } from "@/lib/data";
+import { fileStamp, saveFile, toCsv } from "@/lib/download";
 import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 
-const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 15_000 } };
+// Live while the page is open: the children, the crash log and the figures follow the server within seconds.
+const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 5_000 } };
+
+const CRASH_LEAD = "Recorded by kiln supervise when the server exits abnormally.";
+const CONFIG_LEAD = "Secrets are redacted by the server.";
 
 /** Lightweight JSON syntax colouring using the site's prose palette. */
 function JsonView({ value }: { value: unknown }) {
@@ -131,12 +136,12 @@ function ChildrenHead() {
   return (
     <thead>
       <tr>
-        <th className="w-6" aria-label="Health" />
-        <th>Child</th>
-        <th>State</th>
-        <th className="num">Restarts</th>
-        <th className="hidden sm:table-cell">Since</th>
-        <th>Last error</th>
+        <th className="w-7" aria-label="Health" />
+        <th className="sm:w-[26%]">Child</th>
+        <th className="w-px sm:w-[14%]">State</th>
+        <th className="num w-px sm:w-[10%]">Restarts</th>
+        <th className="hidden w-[14%] sm:table-cell">Since</th>
+        <th className="hidden sm:table-cell">Last error</th>
       </tr>
     </thead>
   );
@@ -146,13 +151,13 @@ function AuditHead() {
   return (
     <thead>
       <tr>
-        <th>Time</th>
-        <th>Who</th>
-        <th>Action</th>
-        <th className="hidden md:table-cell">Result</th>
-        <th className="hidden lg:table-cell">Scope</th>
-        <th className="hidden xl:table-cell">Address</th>
-        <th>Detail</th>
+        <th className="w-[7%]">Time</th>
+        <th className="hidden w-[14%] sm:table-cell">Who</th>
+        <th className="md:w-[31%]">Action</th>
+        <th className="hidden w-[5%] md:table-cell">Result</th>
+        <th className="hidden w-[8%] lg:table-cell">Scope</th>
+        <th className="hidden w-[10%] xl:table-cell">Address</th>
+        <th className="hidden md:table-cell">Detail</th>
       </tr>
     </thead>
   );
@@ -191,18 +196,18 @@ function auditTakes(a: AuditEntry, chosen: Chosen, q: string, skip?: string) {
 function AuditSection() {
   const [win, setWin] = React.useState<AuditWindow>("7");
   return (
-    <section className="mt-12">
-      <SectionHeading index="03" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />} />
+    <FoldSection id="system.audit" index="05" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
       <Loadable label="the audit log" fallback={<TableHold head={<AuditHead />} rows={8} rowHeight={39} />}>
         <AuditTable win={win} />
       </Loadable>
-    </section>
+    </FoldSection>
   );
 }
 
 function AuditTable({ win }: { win: AuditWindow }) {
   const since = win === "all" ? undefined : Math.floor(Date.now() / 1000 / 3600) * 3600 - Number(win) * 86400;
-  const rows = useSuspenseResource(`audit/${win}`, (s) => api.audit({ since, limit: 1000 }, s), { pollMs: 60_000 }).data;
+  // Live while its section is open (folded, it isn't rendered and doesn't ask).
+  const rows = useSuspenseResource(`audit/${win}`, (s) => api.audit({ since, limit: 1000 }, s), { pollMs: 10_000 }).data;
   const [chosen, setChosen] = React.useState<Chosen>({});
   const [q, setQ] = React.useState("");
   const facets: Facet[] = AUDIT_FACETS.map((f) => {
@@ -216,16 +221,21 @@ function AuditTable({ win }: { win: AuditWindow }) {
   const shown = rows.filter((a) => auditTakes(a, chosen, q));
   return (
     <>
-      <FacetBox
-        className="mb-4"
-        label="Filter the audit log"
-        placeholder="Filter by who, action, scope, result, address, or words…"
-        query={q}
-        onQuery={setQ}
-        facets={facets}
-        chosen={chosen}
-        onChosen={setChosen}
-      />
+      <div className="log-tools">
+        <FacetBox
+          className="min-w-0 flex-1"
+          label="Filter the audit log"
+          placeholder="Filter by who, action, scope, result, address, or words…"
+          query={q}
+          onQuery={setQ}
+          facets={facets}
+          chosen={chosen}
+          onChosen={setChosen}
+        />
+        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the entries shown, as CSV" onClick={() => saveFile(`kiln-audit-${fileStamp()}.csv`, auditCsv(shown), "text/csv;charset=utf-8")}>
+          <Download /> Download
+        </Button>
+      </div>
       {shown.length === 0 ? (
         <EmptyState title={rows.length ? "No entries match." : "No audit entries in this window."} />
       ) : (
@@ -237,19 +247,24 @@ function AuditTable({ win }: { win: AuditWindow }) {
                 <tr key={a.id}>
                   <td className="cell-mono whitespace-nowrap" title={absoluteTime(a.ts)}>
                     <RelTime ts={a.ts} />
+                    {/* On a phone who did it reads under when. */}
+                    <div className="max-w-[112px] truncate text-[10px] text-[#7b7e88] sm:hidden">{a.principal}</div>
                   </td>
-                  <td className="cell-mono max-w-[220px]">
+                  <td className="cell-mono hidden max-w-0 sm:table-cell">
                     <div className="truncate">{a.principal}</div>
                     {a.on_behalf_of && <div className="truncate text-[10px] text-[#7b7e88]">for {a.on_behalf_of}</div>}
                   </td>
-                  <td className="max-w-[320px]">
+                  <td className="max-w-0">
                     <span className="chip max-w-full truncate">{a.action}</span>
                     {a.target && !a.action.endsWith(a.target) && <div className="mt-1 truncate font-mono text-[10px] text-[#7b7e88]">{a.target}</div>}
+                    {/* Without room for its own column, its detail reads in full here. */}
+                    {a.detail && <div className="mt-1 text-[11px] whitespace-normal text-[#b9bbc2] [overflow-wrap:anywhere] md:hidden">{a.detail}</div>}
                   </td>
                   <td className={`cell-mono hidden md:table-cell ${/^[45]/.test(a.result) ? "!text-[#d1aaad]" : ""}`}>{a.result}</td>
-                  <td className="cell-mono hidden max-w-[160px] truncate lg:table-cell">{a.scope ?? "—"}</td>
-                  <td className="cell-mono hidden xl:table-cell">{a.ip ?? "—"}</td>
-                  <td className="truncate-cell text-[#b9bbc2]" title={a.detail}>
+                  <td className="cell-mono hidden max-w-0 truncate lg:table-cell">{a.scope ?? "—"}</td>
+                  <td className="cell-mono hidden whitespace-nowrap xl:table-cell">{a.ip ?? "—"}</td>
+                  {/* Cut to its share of the width, the whole of it on hover. */}
+                  <td className="hidden max-w-0 truncate text-[#b9bbc2] md:table-cell" title={a.detail}>
                     {a.detail || <span className="text-[#6d7078]">—</span>}
                   </td>
                 </tr>
@@ -257,6 +272,46 @@ function AuditTable({ win }: { win: AuditWindow }) {
             </tbody>
           </table>
         </div>
+      )}
+    </>
+  );
+}
+
+/** The audit entries as CSV, a column per field. */
+function auditCsv(rows: AuditEntry[]): string {
+  return toCsv(
+    ["time", "who", "for", "action", "target", "result", "scope", "address", "token", "detail"],
+    rows.map((a) => [new Date(a.ts * 1000).toISOString(), a.principal, a.on_behalf_of, a.action, a.target, a.result, a.scope, a.ip, a.token, a.detail]),
+  );
+}
+
+/** The supervisor's crash log, newest first: filtered as you type, downloaded as what it shows. */
+function CrashLog({ lines }: { lines: string[] }) {
+  const [q, setQ] = React.useState("");
+  if (lines.length === 0) {
+    return (
+      <div className="flex items-center gap-2.5 py-2 font-mono text-[11px] text-[#a8c9bc]">
+        <i className="dot" data-status="succeeded" /> No crashes recorded.
+      </div>
+    );
+  }
+  const words = q.trim().toLowerCase();
+  const shown = words ? lines.filter((l) => l.toLowerCase().includes(words)) : lines;
+  return (
+    <>
+      <div className="log-tools">
+        <SearchField className="min-w-0 flex-1" label="Filter the crash log" placeholder="Filter by generation, signal, or words…" value={q} onChange={setQ} />
+        <span className="log-count">{words ? `${shown.length} of ${lines.length}` : lines.length} lines</span>
+        <Button variant="ghost" size="sm" disabled={shown.length === 0} title="Download the lines shown" onClick={() => saveFile(`kiln-crash-log-${fileStamp()}.txt`, shown.join("\n") + "\n")}>
+          <Download /> Download
+        </Button>
+      </div>
+      {shown.length === 0 ? (
+        <EmptyState title="No lines match." />
+      ) : (
+        <pre className="max-h-[420px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#d8c8b0]">
+          {shown.join("\n")}
+        </pre>
       )}
     </>
   );
@@ -270,8 +325,7 @@ function SystemBody() {
     <>
       <Kpis d={d} />
 
-      <section className="mt-12">
-        <SectionHeading index="01" label="Supervisor" title="Children" />
+      <FoldSection id="system.children" index="01" label="Supervisor" title="Children">
         <div className="table-wrap">
           <table className="data-table">
             <ChildrenHead />
@@ -281,13 +335,18 @@ function SystemBody() {
                   <td>
                     <StatusDot status={childStatus(c)} title={c.state} />
                   </td>
-                  <td className="text-[#e4e5e7]">{c.name}</td>
-                  <td className="cell-mono">{c.state}</td>
+                  <td className="whitespace-nowrap text-[#e4e5e7]">
+                    {c.name}
+                    {/* On a phone its error reads in full under its name: a column that narrow shows nothing of it. */}
+                    {c.last_error && <div className="mt-0.5 font-mono text-[10.5px] whitespace-normal text-[#cbb69a] [overflow-wrap:anywhere] sm:hidden">{c.last_error}</div>}
+                  </td>
+                  <td className="cell-mono whitespace-nowrap">{c.state}</td>
                   <td className={`num cell-mono ${c.restarts > 0 ? "!text-[#cbb69a]" : ""}`}>{c.restarts}</td>
                   <td className="cell-mono hidden whitespace-nowrap sm:table-cell" title={absoluteTime(c.since_unix)}>
                     <RelTime ts={c.since_unix} />
                   </td>
-                  <td className="truncate-cell font-mono text-[11px] text-[#cbb69a]" title={c.last_error ?? undefined}>
+                  {/* Cut to its share of the width: the columns before it keep theirs. */}
+                  <td className="hidden max-w-0 truncate font-mono text-[11px] text-[#cbb69a] sm:table-cell" title={c.last_error ?? undefined}>
                     {c.last_error ?? <span className="text-[#6d7078]">—</span>}
                   </td>
                 </tr>
@@ -295,26 +354,19 @@ function SystemBody() {
             </tbody>
           </table>
         </div>
-      </section>
+      </FoldSection>
 
-      <section className="mt-12 grid gap-4 lg:grid-cols-2">
-        <Panel eyebrow="Process" title="Crash log" description="Recorded by kiln supervise when the server exits abnormally.">
-          {d.crash_log.length === 0 ? (
-            <div className="flex items-center gap-2.5 py-6 font-mono text-[11px] text-[#a8c9bc]">
-              <i className="dot" data-status="succeeded" /> No crashes recorded.
-            </div>
-          ) : (
-            <pre className="max-h-[420px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#d8c8b0]">
-              {d.crash_log.join("\n")}
-            </pre>
-          )}
-        </Panel>
-        <Panel eyebrow="Read-only" title="Effective configuration" description="Secrets are redacted by the server.">
-          <JsonView value={d.config} />
-        </Panel>
-      </section>
+      <FoldSection id="system.crash" index="02" label="Process" title="Crash log">
+        <p className="section-lead">{CRASH_LEAD}</p>
+        <CrashLog lines={d.crash_log} />
+      </FoldSection>
 
-      <StoresSection index="02" />
+      <FoldSection id="system.config" index="03" label="Read-only" title="Effective configuration">
+        <p className="section-lead">{CONFIG_LEAD}</p>
+        <JsonView value={d.config} />
+      </FoldSection>
+
+      <StoresSection index="04" />
 
       <AuditSection />
     </>
@@ -326,26 +378,23 @@ function SystemHold() {
   return (
     <>
       <Kpis d={null} />
-      <section className="mt-12">
-        <SectionHeading index="01" label="Supervisor" title="Children" />
+      <FoldSection id="system.children" index="01" label="Supervisor" title="Children">
         <TableHold head={<ChildrenHead />} rows={8} rowHeight={39} label="Loading the system" />
-      </section>
-      <section className="mt-12 grid gap-4 lg:grid-cols-2">
-        <Panel eyebrow="Process" title="Crash log" description="Recorded by kiln supervise when the server exits abnormally.">
-          <Hold height={160} />
-        </Panel>
-        <Panel eyebrow="Read-only" title="Effective configuration" description="Secrets are redacted by the server.">
-          <Hold height={160} />
-        </Panel>
-      </section>
-      <section className="mt-12">
-        <SectionHeading index="02" label="Conversations" title="Conversation stores" />
+      </FoldSection>
+      <FoldSection id="system.crash" index="02" label="Process" title="Crash log">
+        <p className="section-lead">{CRASH_LEAD}</p>
+        <Hold height={160} />
+      </FoldSection>
+      <FoldSection id="system.config" index="03" label="Read-only" title="Effective configuration">
+        <p className="section-lead">{CONFIG_LEAD}</p>
+        <Hold height={160} />
+      </FoldSection>
+      <FoldSection id="system.stores" index="04" label="Conversations" title="Conversation stores">
         <StoresHold />
-      </section>
-      <section className="mt-12">
-        <SectionHeading index="03" label="Audit" title="Audit log" />
+      </FoldSection>
+      <FoldSection id="system.audit" index="05" label="Audit" title="Audit log">
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
-      </section>
+      </FoldSection>
     </>
   );
 }

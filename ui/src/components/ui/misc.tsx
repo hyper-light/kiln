@@ -4,6 +4,7 @@ import { AlertTriangle, ChevronDown, RotateCcw, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";
 import { pad2 } from "@/lib/format";
+import { useLocalStorage } from "@/lib/hooks";
 
 /* ---------------------------- page scaffolding ---------------------------- */
 
@@ -72,24 +73,67 @@ export function SectionHeading({
   title,
   aside,
   className,
+  fold,
 }: {
   index?: string;
   label: string;
   title?: React.ReactNode;
   aside?: React.ReactNode;
   className?: string;
+  /** The heading folds its section: the whole of it is the toggle. */
+  fold?: { open: boolean; onToggle: () => void; controls: string };
 }) {
   return (
-    <div className={cn("section-heading", className)}>
+    <div className={cn("section-heading", fold && "section-fold", className)} data-open={fold?.open || undefined}>
       <div className="min-w-0">
         <div className="section-number eyebrow">
           {index ? `${index} / ` : ""}
           {label}
         </div>
-        {title && <h2>{title}</h2>}
+        {title &&
+          (fold ? (
+            <h2>
+              <button type="button" className="section-toggle" aria-expanded={fold.open} aria-controls={fold.controls} onClick={fold.onToggle}>
+                {title}
+                <ChevronDown size={16} className="section-chev" aria-hidden="true" />
+              </button>
+            </h2>
+          ) : (
+            <h2>{title}</h2>
+          ))}
       </div>
-      {aside && <div className="flex shrink-0 items-center gap-2">{aside}</div>}
+      {aside && <div className="section-aside flex shrink-0 items-center gap-2">{aside}</div>}
     </div>
+  );
+}
+
+/** A page section its heading folds away: open at first, then as you left it (kept in this browser). */
+export function FoldSection({
+  id,
+  index,
+  label,
+  title,
+  aside,
+  className,
+  children,
+}: {
+  /** Where its state is kept: `kiln.fold.<id>`. */
+  id: string;
+  index?: string;
+  label: string;
+  title: React.ReactNode;
+  aside?: React.ReactNode;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useLocalStorage(`kiln.fold.${id}`, true);
+  const body = React.useId();
+  return (
+    <section className={cn("mt-12", className)}>
+      <SectionHeading index={index} label={label} title={title} aside={open ? aside : undefined} fold={{ open, onToggle: () => setOpen(!open), controls: body }} />
+      {/* Folded, it isn't there at all: nothing in it polls or moves. */}
+      <div id={body}>{open && children}</div>
+    </section>
   );
 }
 

@@ -38,6 +38,8 @@ RUN apk add --no-cache musl-dev gcc g++ make cmake perl clang clang-dev linux-he
 ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# Cargo's config for every build of the workspace (SQLite's compile-time options: .cargo/config.toml).
+COPY .cargo/ .cargo/
 COPY crates/ crates/
 # Turso, vendored for the conversation store (vendor/turso/UPSTREAM.md); kiln depends on it by path.
 COPY vendor/turso/ vendor/turso/

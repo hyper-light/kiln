@@ -24,7 +24,7 @@ import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
-import { latestThought, quietThinkingPhase, thoughtIsLive, type ThoughtItem } from "./thinking";
+import { latestThought, thinkingStarted, thoughtIsLive, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 
@@ -396,7 +396,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
 
 /* ------------------------------------------------------------------ items & turns */
 
-function Thought({ item, live }: { item: ThoughtItem; live: boolean }) {
+function Thought({ item, live, since }: { item: ThoughtItem; live: boolean; since: number }) {
   const { event: e, more = [] } = item;
   const [open, setOpen] = React.useState(false);
   useRevealed(
@@ -405,10 +405,9 @@ function Thought({ item, live }: { item: ThoughtItem; live: boolean }) {
   );
   if (e.redacted) return null;
   const all = [e, ...more].filter((x) => !x.redacted);
-  const latest = latestThought(item);
   return (
     <div className="hx-thought" data-ev={all.map((x) => x.id).join(" ")}>
-      <ThinkingHead live={live} since={latest.at} open={open} onToggle={() => setOpen(!open)} />
+      <ThinkingHead live={live} since={since} open={open} onToggle={() => setOpen(!open)} />
       {all.length > 1 && !open && <span className="hx-thought-n">{all.length} thoughts</span>}
       {open && (
         <ThinkingBody live={live}>
@@ -493,7 +492,7 @@ function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "
         {e.text && <CopyMsg text={e.text} label={system ? "Copy the message" : "Copy your message"} className="hx-prompt-copy" />}
         {!system && onCommand && <TurnMenu meta={meta ?? null} eventId={e.id} send={onCommand} />}
       </div>
-      <div className={cn("hx-prompt-text", system && "hx-dim")}>{e.text}</div>
+      <div className="hx-prompt-text">{e.text}</div>
     </div>
   );
 }
@@ -504,7 +503,7 @@ function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenT
   return <StepRow step={step} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
 }
 
-function ItemView({ item, cwd, onOpenTask, active }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; active: boolean }) {
+function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; active: boolean; since: number }) {
   switch (item.type) {
     case "step":
       return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
@@ -517,7 +516,7 @@ function ItemView({ item, cwd, onOpenTask, active }: { item: Item; cwd: string; 
         </div>
       );
     case "thought":
-      return <Thought item={item} live={active && Boolean(latestThought(item).streaming)} />;
+      return <Thought item={item} live={active && Boolean(latestThought(item).streaming)} since={since} />;
     case "notice":
       return <Notice e={item.event} repeats={item.repeats} />;
     case "page":
@@ -548,7 +547,7 @@ function moving(items: Item[], turnStarted?: number): boolean {
 }
 
 /** The end of a turn under way while nothing at its end moves: what it's doing (a model thinking
- *  after a call shows nothing for minutes) and for how long since the last thing it did, so it
+ *  after a call shows nothing for minutes) and the elapsed time across the whole turn, so it
  *  never looks stopped while it's at work. */
 function LiveTail({ doing, since }: { doing?: string; since?: number }) {
   return (
@@ -602,7 +601,7 @@ const TurnView = React.memo(function TurnView({
   const sought = findNow !== null && turn.items.some((it, i) => (i < hidden || i >= end) && itemHolds(it, findNow.id));
   const items = sought ? turn.items : turn.items.slice(hidden, end);
   const currentItem = turn.items.findLast((item) => item.type !== "notice");
-  const phase = quietThinkingPhase(turn, turnStarted);
+  const since = thinkingStarted(turn, turnStarted);
   if (turn.divider) {
     return (
       <section className="hx-turn hx-turn-switch">
@@ -623,9 +622,9 @@ const TurnView = React.memo(function TurnView({
           </button>
         )}
         {items.map((it) => (
-          <ItemView key={it.key} item={it} cwd={cwd} onOpenTask={onOpenTask} active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))} />
+          <ItemView key={it.key} since={since} item={it} cwd={cwd} onOpenTask={onOpenTask} active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))} />
         ))}
-        {live && !turn.outcome && !moving(turn.items, turnStarted) && <LiveTail key={phase.key} doing={doing} since={phase.since} />}
+        {live && !turn.outcome && !moving(turn.items, turnStarted) && <LiveTail doing={doing} since={since} />}
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>

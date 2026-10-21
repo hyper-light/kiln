@@ -60,7 +60,7 @@ async fn set(cx: Cx, v: Value) -> Out {
 async fn control(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
-    let action: Action = serde_json::from_value(v.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| (StatusCode::BAD_REQUEST, "`action` is start, pause, skip or clear".into()))?;
+    let action: Action = serde_json::from_value(v.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| (StatusCode::BAD_REQUEST, "`action` is start, pause, skip, clear or restore".into()))?;
     let s = super::control(&cx.hub, &agent, action).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.control".into(), format!("{agent}: {action:?}")).await;
     json_of(&s)
@@ -71,7 +71,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "goals.get",
-            summary: "An agent's goal stack (yours, without `agent`): its goals in order (pending, active, met, unmet, skipped), and whether it runs, is paused (and why) or is done. The goal under way is sent again whenever the agent stops short of it, until it's met; an agent without goals of its own says it's met by ending its reply with the line GOAL MET.",
+            summary: "An agent's goal stack (yours, without `agent`): its goals in order (pending, active, met, unmet, skipped), and whether it runs, is paused (and why) or is done; `cleared`: how many goals were cleared from it last (goals_control restore brings them back). The goal under way is sent again whenever the agent stops short of it, until it's met; an agent without goals of its own says it's met by ending its reply with the line GOAL MET.",
             read_only: true,
             destructive: false,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &[]),
@@ -98,7 +98,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.set",
-            summary: "Replace an agent's goals not yet started (reordered, edited, removed, added): `goals` is the list as it should be, existing ones by `id`.",
+            summary: "Replace an agent's goals still to go (reordered, edited, removed, added): `goals` is the list as it should be, existing ones by `id` (one given by its words alone is the goal still to go with those words). The goal under way may be in it: first, it stays under way (with other words, it goes to the agent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done are left as they are.",
             read_only: false,
             destructive: true,
             input: || {
@@ -115,10 +115,10 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.control",
-            summary: "Start (or resume), pause, skip the goal under way, or clear an agent's goal stack.",
+            summary: "Start (or resume), pause, skip the goal under way, or clear an agent's goal stack; restore brings back the goals cleared last, as they were, and runs it. Starting, resuming or skipping sends what's next to the agent at once.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "action": {"type": "string", "enum": ["start", "pause", "skip", "clear"]}}), &["action"]),
+            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "action": {"type": "string", "enum": ["start", "pause", "skip", "clear", "restore"]}}), &["action"]),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", v.get("action").and_then(Value::as_str).unwrap_or("start")]))),
             run: |cx, v| Box::pin(control(cx, v)),
         },
@@ -150,10 +150,17 @@ mod tests {
         }
     }
 
+    /// On a hub with a simulated clock: goals' times are its (CP-M2, AC-M2.1).
     #[test]
     fn an_agent_steers_the_goals_and_plans_of_itself_and_its_own_only() -> anyhow::Result<()> {
         within(async {
-            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            // On a simulated clock (goals' times are its), with no conversation store: what's
+            // steered is goals and plans, not conversations.
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;

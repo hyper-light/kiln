@@ -7,8 +7,8 @@
  * it, so it goes on with the console closed and across restarts.
  *
  * Drawn as a chain: each goal a numbered link (met, under way, next, not met), joined to the next;
- * one field to add a goal; the stack's few actions; editing the goals not yet started is one text
- * box, a goal a line.
+ * one field to add a goal; the stack's few actions; editing the goals not yet met (the one under way
+ * first) is one text box, a goal a line. Cleared goals can be brought back.
  */
 import * as React from "react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
@@ -17,6 +17,7 @@ import { Loadable } from "@/components/ui/loading";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { fromLines, stackReads, startWords, stoppedBy, toGo } from "./goal-stack";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
@@ -28,16 +29,17 @@ function sentWords(g: GoalItem): string {
   return g.reminders ? ` · sent again ${g.reminders}×, last ${when}` : ` · sent ${when}`;
 }
 
-/** Each agent's last goal stack: a read that fails keeps showing it (with none yet, the panel says why). */
-const lastStack = new Map<string, GoalStack>();
+/**
+ * Each agent's last goal stack: a read that fails keeps showing it (with none yet, the panel says
+ * why), and one asked for before a change made here came back doesn't undo the change.
+ */
+const reads = stackReads(() => performance.now());
 
 function readGoals(agent: string): Promise<{ stack: GoalStack | null; error: unknown }> {
+  const took = reads.ask(agent);
   return harnessApi.goals(agent).then(
-    (stack) => {
-      lastStack.set(agent, stack);
-      return { stack, error: null };
-    },
-    (error: unknown) => ({ stack: lastStack.get(agent) ?? null, error }),
+    (stack) => ({ stack: took(stack), error: null }),
+    (error: unknown) => ({ stack: reads.last(agent), error }),
   );
 }
 
@@ -46,7 +48,8 @@ export function Goals({ agent, harness }: { agent: string; harness?: string }) {
   const shown = React.useDeferredValue(agent);
   return (
     <Loadable label="Loading the goal stack" fallback={<GoalPanel agent={agent} harness={harness} stack={null} />}>
-      <AgentGoals agent={shown} harness={harness} />
+      {/* Its own: an edit or a goal half typed for one agent never goes to another. */}
+      <AgentGoals key={shown} agent={shown} harness={harness} />
     </Loadable>
   );
 }
@@ -61,7 +64,7 @@ function AgentGoals({ agent, harness }: { agent: string; harness?: string }) {
       stack={res.data.stack}
       error={res.data.error}
       onStack={(s) => {
-        lastStack.set(agent, s);
+        reads.changed(agent, s);
         res.setData(() => ({ stack: s, error: null }));
       }}
     />
@@ -84,7 +87,8 @@ function GoalPanel({
   onStack?: (s: GoalStack) => void;
 }) {
   const [adding, setAdding] = React.useState("");
-  const [editing, setEditing] = React.useState<string | null>(null);
+  // The edit box's words, and the goals it began with (what its lines go back to).
+  const [editing, setEditing] = React.useState<{ text: string; goals: GoalItem[] } | null>(null);
   const [asking, setAsking] = React.useState(false);
   const [earlier, setEarlier] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -93,12 +97,14 @@ function GoalPanel({
   const pending = items.filter((i) => i.status === "pending");
   const active = items.find((i) => i.status === "active");
   const met = items.filter((i) => i.status === "met").length;
+  const cleared = stack?.cleared ?? 0;
   // Finished ones beyond the last few fold away.
   const done = items.filter((i) => i.status !== "pending" && i.status !== "active");
   const folded = earlier ? 0 : Math.max(0, done.length - 3);
   const shown = items.filter((i) => !done.slice(0, folded).includes(i));
-  // The goal that stopped the stack, to try again first.
-  const unmet = stack?.state === "paused" ? [...items].reverse().find((i) => i.status === "unmet" || i.status === "skipped") : undefined;
+  // The goal that stopped the stack, to try again first (none while a goal is under way: that one resumes).
+  const unmet = stoppedBy(stack);
+  const startWord = startWords(stack);
   const who = harness ?? "the agent";
   const asMessage = (active ?? items.filter((i) => i.how).at(-1))?.how === "message";
 
@@ -118,22 +124,18 @@ function GoalPanel({
   };
   const add = async () => {
     const text = adding.trim();
-    if (text && (await act(() => harnessApi.addGoals(agent, [text])))) setAdding("");
+    // A stack that was done goes on with it.
+    if (text && (await act(() => harnessApi.addGoals(agent, [text], stack?.state === "done")))) setAdding("");
   };
   const saveEdit = async () => {
     if (editing === null) return;
-    const lines = editing
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
-    // Lines keep the goal that was on them; the rest are new.
+    const { goals, dropped } = fromLines(editing.text, editing.goals);
     if (
-      await act(() =>
-        harnessApi.setGoals(
-          agent,
-          lines.map((text, i) => ({ id: pending[i]?.id, text })),
-        ),
-      )
+      await act(async () => {
+        const s = await harnessApi.setGoals(agent, goals);
+        // The goal under way, its line taken out: skipped, if it's still the one under way.
+        return dropped && s.items.some((i) => i.id === dropped.id && i.status === "active") ? harnessApi.goalAction(agent, "skip") : s;
+      })
     )
       setEditing(null);
   };
@@ -173,10 +175,18 @@ function GoalPanel({
       {editing !== null ? (
         <div className="gs-edit">
           <label className="field-label" htmlFor={`gs-edit-${agent}`}>
-            Goals not yet started, one a line
+            Goals not yet met, one a line
           </label>
           <div className="field">
-            <textarea id={`gs-edit-${agent}`} value={editing} onChange={(e) => setEditing(e.target.value)} rows={Math.max(3, editing.split("\n").length + 1)} />
+            <textarea
+              id={`gs-edit-${agent}`}
+              value={editing.text}
+              onChange={(e) => {
+                const text = e.target.value;
+                setEditing((cur) => cur && { ...cur, text });
+              }}
+              rows={Math.max(3, editing.text.split("\n").length + 1)}
+            />
           </div>
           <div className="gs-actions">
             <Button size="sm" disabled={busy} onClick={() => void saveEdit()}>
@@ -239,14 +249,14 @@ function GoalPanel({
             </Button>
           </form>
           <p className="field-hint gs-hint">A condition it can meet, like &ldquo;the parser tests pass&rdquo;. A plan&rsquo;s steps go here too: run it as Goals.</p>
-          {items.length > 0 && (
+          {(items.length > 0 || cleared > 0) && (
             <div className="gs-actions">
-              {stack?.state !== "running" && (pending.length > 0 || active) && (
+              {startWord && (
                 <Button size="sm" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "start"))}>
-                  {unmet ? "Go on to the next" : met > 0 || active ? "Resume" : "Start"}
+                  {startWord}
                 </Button>
               )}
-              {unmet && !active && (
+              {unmet && (
                 <Button
                   size="sm"
                   variant="secondary"
@@ -271,12 +281,25 @@ function GoalPanel({
                   Skip this one
                 </Button>
               )}
-              {pending.length > 0 && (
-                <Button size="sm" variant="ghost" disabled={busy} onClick={() => setEditing(pending.map((p) => p.text).join("\n"))}>
+              {(pending.length > 0 || active) && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => {
+                    const goals = toGo(items);
+                    setEditing({ text: goals.map((g) => g.text).join("\n"), goals });
+                  }}
+                >
                   Edit
                 </Button>
               )}
-              {asking ? (
+              {cleared > 0 && (
+                <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "restore"))}>
+                  Bring back {cleared} cleared {cleared === 1 ? "goal" : "goals"}
+                </Button>
+              )}
+              {items.length === 0 ? null : asking ? (
                 <span className="gs-confirm" role="group" aria-label="Clear the goal stack">
                   Clear every goal here?
                   <Button

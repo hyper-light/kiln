@@ -2,6 +2,8 @@
 //! (`GetTokenInformation(TokenElevation)`), the user's `Path` (`HKCU\Environment`) and the
 //! broadcast that tells the desktop it changed (`WM_SETTINGCHANGE`), and running a program as an
 //! administrator (`ShellExecuteExW` with the `runas` verb: Windows asks the person at the desktop).
+//! And one every kiln makes: how big a volume is and how much of it this user may still write
+//! (`GetDiskFreeSpaceExW`), what `statvfs` tells elsewhere.
 //!
 //! user32 and shell32 are looked up at run time (`LoadLibraryExW` + `GetProcAddress`), so a kiln
 //! that never installs anything (an agent, a supervisor) doesn't load them.
@@ -14,6 +16,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::io;
+use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -85,6 +88,7 @@ unsafe extern "system" {
     fn GetConsoleWindow() -> *mut c_void;
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn GetDiskFreeSpaceExW(directory: *const u16, available: *mut u64, total: *mut u64, free: *mut u64) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -261,4 +265,18 @@ pub fn run_elevated(program: &Path, parameters: &str, timeout: Duration) -> io::
         (waited == WAIT_OBJECT_0 && got, code)
     };
     if waited { Ok(code) } else { Err(io::Error::new(io::ErrorKind::TimedOut, format!("{} did not finish", program.display()))) }
+}
+
+/// The size of the volume holding `dir` and the bytes this user may still write on it (disk
+/// quotas count), as `statvfs` says elsewhere. Any directory on the volume does, a `\\?\` one
+/// (what `canonicalize` gives) too.
+pub fn disk_space(dir: &Path) -> io::Result<(u64, u64)> {
+    let path: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let (mut available, mut total) = (0u64, 0u64);
+    // SAFETY: a NUL-terminated path, and places for two of the counts (a ULARGE_INTEGER is a
+    // u64); the third is optional.
+    if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, std::ptr::null_mut()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((total, available))
 }

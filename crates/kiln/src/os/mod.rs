@@ -22,7 +22,8 @@ pub use unix::*;
 mod windows;
 #[cfg(windows)]
 pub use windows::*;
-/// The Win32 calls installing needs (elevation, the user's `Path`, UAC), declared by hand.
+/// The Win32 calls installing needs (elevation, the user's `Path`, UAC) and a volume's room,
+/// declared by hand.
 #[cfg(windows)]
 mod win32;
 
@@ -149,20 +150,28 @@ fn expand_percent_vars(s: &str, var: &impl Fn(&str) -> Option<String>) -> String
     out
 }
 
-/// Bytes this user may still write on the volume holding `path` (None: unknown).
+/// The size of the volume holding `path` and the bytes this user may still write on it (None:
+/// unknown).
 // The statvfs fields' types differ by platform: a conversion that is one elsewhere is none here.
 #[allow(clippy::useless_conversion)]
-pub fn disk_available(path: &std::path::Path) -> Option<u64> {
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         let s = nix::sys::statvfs::statvfs(path).ok()?;
-        Some(u64::from(s.blocks_available()).saturating_mul(u64::from(s.fragment_size())))
+        let frag = u64::from(s.fragment_size());
+        Some((u64::from(s.blocks()).saturating_mul(frag), u64::from(s.blocks_available()).saturating_mul(frag)))
     }
-    #[cfg(not(unix))]
+    // Asked of the volume itself: `sysinfo`'s mount points (`C:\`) don't prefix the `\\?\` path
+    // `canonicalize` gives.
+    #[cfg(windows)]
     {
-        let disks = sysinfo::Disks::new_with_refreshed_list();
-        disks.iter().filter(|d| path.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).map(sysinfo::Disk::available_space)
+        win32::disk_space(path).ok()
     }
+}
+
+/// Bytes this user may still write on the volume holding `path` (None: unknown).
+pub fn disk_available(path: &Path) -> Option<u64> {
+    disk_space(path).map(|(_, available)| available)
 }
 
 /// Keep git from ever prompting (terminal, askpass helper, or Git Credential Manager's window):

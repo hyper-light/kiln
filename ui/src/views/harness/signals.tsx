@@ -136,6 +136,32 @@ export function Beam({ status, className }: { status: BeamStatus; className?: st
   );
 }
 
+const PRISM = ["#b8d9d2", "#a6c4ed", "#b8a6d5", "#d6a2aa", "#d8cbb0"];
+
+/**
+ * A conversation loading: hyperlight's mark, a short spectral light travelling the loop, changing
+ * hue as it goes, and leaving through the refraction. Only one is ever on the page, so its moving
+ * dash costs little (a tool call's Beam turns a gradient instead: there are many of those).
+ */
+export function LoadingMark({ className }: { className?: string }) {
+  // useId's punctuation isn't safe inside url(#…).
+  const gradient = `sg-load-${React.useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  return (
+    <svg className={cn("sg-load", className)} viewBox="0 0 32 32" aria-hidden="true">
+      <defs>
+        <linearGradient id={gradient} x1="5" y1="27" x2="27" y2="5" gradientUnits="userSpaceOnUse">
+          {PRISM.map((c, i) => (
+            <stop key={c} offset={i / (PRISM.length - 1)} stopColor={c} />
+          ))}
+        </linearGradient>
+      </defs>
+      <path className="sg-load-loop" d={LOOP} pathLength={100} />
+      <path className="sg-load-light" d={LOOP} pathLength={100} stroke={`url(#${gradient})`} />
+      <path className="sg-load-tail" d={TAIL} />
+    </svg>
+  );
+}
+
 /** The streaming-text caret: a thin prism bar that breathes rather than blinks. */
 export function Caret({ className }: { className?: string }) {
   return <span className={cn("sg-caret", className)} aria-hidden="true" />;

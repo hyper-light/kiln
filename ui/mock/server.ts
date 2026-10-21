@@ -20,6 +20,7 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
+import { handleGoals } from "./goals.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
@@ -1283,6 +1284,8 @@ const server = http.createServer(async (req, res) => {
     const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
     if (opened && m === "GET") return json(res, 200, []);
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
+    // ---- goal stacks ----
+    if (await handleGoals(req, res, url)) return;
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

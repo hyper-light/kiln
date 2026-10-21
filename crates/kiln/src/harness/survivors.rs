@@ -33,6 +33,14 @@ const MAX_RAN: usize = 64;
 const COMMAND_MAX: usize = 400;
 /// How long a stopped process gets to end before it's killed.
 const GRACE: Duration = Duration::from_secs(3);
+/// The longest pause between looks at whether stopped processes have ended (the first is 1 ms,
+/// each twice the last: one that ends at once is seen ending at once).
+const LOOK_MAX: Duration = Duration::from_millis(100);
+
+/// The pause after `pause`, between looks at whether processes have ended.
+pub(crate) fn next_look(pause: Duration) -> Duration {
+    pause.saturating_mul(2).min(LOOK_MAX)
+}
 /// A survivor's task id: `left-<pid>`.
 pub const LEFT: &str = "left-";
 
@@ -274,6 +282,7 @@ pub fn stop(pids: &[u32]) {
         }
     }
     let end = std::time::Instant::now() + GRACE;
+    let mut pause = Duration::from_millis(1);
     loop {
         let left: Vec<u32> = alive_pids(pids);
         if left.is_empty() {
@@ -288,12 +297,15 @@ pub fn stop(pids: &[u32]) {
             }
             // Gone once each is next given the CPU: on a busy machine, not at once.
             let end = std::time::Instant::now() + GRACE;
+            let mut pause = Duration::from_millis(1);
             while !alive_pids(&left).is_empty() && std::time::Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(pause);
+                pause = next_look(pause);
             }
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(pause);
+        pause = next_look(pause);
     }
 }
 
