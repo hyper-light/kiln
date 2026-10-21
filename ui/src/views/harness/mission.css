@@ -808,11 +808,6 @@ a.ms-why:hover {
   font-size: 12.5px;
   cursor: pointer;
 }
-.ms-refresh {
-  margin-left: auto;
-  font-size: 12.5px;
-}
-
 /* A row's name, renamed in place: the field keeps the name's size. */
 .name-field.ms-name-field {
   margin-left: -9px;
@@ -891,4 +886,207 @@ a.ms-why:hover {
 }
 .ms-listhead + .ms-msg {
   margin: 4px 0 14px;
+}
+
+/* ---------------------------------------------------------------- by touch (touch-select.ts): no checkbox column;
+   hold a row (or Select) to pick, a mark beside each name while picking, the count and Done held in view */
+@media (pointer: coarse) {
+  /* The checkbox stays for a screen reader; the eye goes by the mark. */
+  .ms-row .ms-check {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .ms-row:not(.ms-found-row) {
+    grid-template-columns: minmax(0, 1fr) 168px 300px;
+    grid-template-areas: "main meta actions";
+    -webkit-touch-callout: none;
+    touch-action: pan-y;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  @container (max-width: 760px) {
+    .ms-row:not(.ms-found-row) {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        "main main"
+        "meta actions";
+      padding-left: 12px;
+    }
+  }
+  .ms-listhead[data-selecting] {
+    position: sticky;
+    z-index: 3;
+    top: var(--header-h);
+    background: #08090a;
+  }
+}
+.ms-count {
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.ms-listhead[data-selecting] .ms-count {
+  color: #eceef2;
+}
+.ms-picks {
+  display: inline-flex;
+  gap: 18px;
+  margin-left: auto;
+}
+.ms-select {
+  margin-left: auto;
+}
+.ms-done {
+  color: #eceef2;
+  font-weight: 450;
+}
+/* Picking: an open ring beside each name, filled and ticked when it's picked. */
+.ms-pick {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  margin: 0 10px -3px 0;
+  border: 1.5px solid rgb(255 255 255 / 34%);
+  border-radius: 50%;
+  vertical-align: baseline;
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease;
+}
+.ms-row[data-selected] .ms-pick {
+  border-color: #e7e9ee;
+  background: #e7e9ee
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.4l3 3 6-6.4' fill='none' stroke='%2308090a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 12px no-repeat;
+}
+/* Swiped far enough: let go and it's picked (or put back). */
+.ms-row[data-swipe="ready"] {
+  box-shadow: inset 3px 0 0 #e7e9ee;
+}
+html[data-motion="paused"] .ms-pick {
+  transition: none;
+}
+.ms-select + .ms-msg-open {
+  margin-left: 0;
+}
+
+/* ---------------------------------------------------------------- the message box's To line: those picked
+   (each with its ×; @ in the field finds more), or everyone the list shows */
+.ms-to {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 8px 12px 0;
+  font-size: 12px;
+}
+.ms-to-label {
+  margin-right: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #6d7078;
+}
+.ms-to-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  height: 24px;
+  padding: 0 4px 0 9px;
+  border: 1px solid #303239;
+  border-radius: 999px;
+  background: #121318;
+  color: #dfe1e6;
+}
+.ms-to-chip > button {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  color: #8b8e97;
+}
+.ms-to-chip > button:hover {
+  background: rgb(255 255 255 / 8%);
+  color: #eceef2;
+}
+.ms-to-all,
+.ms-to-more {
+  color: #a1a4ad;
+}
+.ms-msg-note {
+  margin-top: 6px;
+}
+@media (pointer: coarse) {
+  .ms-to-chip {
+    height: 30px;
+  }
+  .ms-to-chip > button {
+    width: 24px;
+    height: 24px;
+  }
+}
+/* The command select: as it is where there's room; on a phone an icon, the select over it unseen. */
+.ms-cmd {
+  display: contents;
+}
+.ms-cmd-icon {
+  display: none;
+}
+@container (max-width: 520px) {
+  .ms-cmd {
+    position: relative;
+    display: inline-grid;
+    flex: none;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border: 1px solid #303239;
+    border-radius: 999px;
+    color: #a1a4ad;
+  }
+  .ms-cmd-icon {
+    display: block;
+  }
+  .ms-cmd .ms-msg-select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    opacity: 0;
+  }
+}
+
+/* Before the agents are known (RowsLoading): the bar and a few rows, in their own sizes. */
+.ms-loading-bar {
+  height: 40px;
+  margin-bottom: 18px;
+  border-radius: 7px;
+}
+.ms-row.ms-loading-row {
+  min-height: 86px;
+}
+.ms-loading-row .ms-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ms-loading-name {
+  height: 16px;
+}
+.ms-loading-line {
+  height: 11px;
+}
+.ms-loading-meta {
+  width: 120px;
+  height: 10px;
 }
