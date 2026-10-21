@@ -710,6 +710,45 @@ export interface ArchiveStatus {
 /** An archive as the API shows it. */
 export type Archive = ArchiveIn & { id: string; created: number; modified: number; state: ArchiveState; status: ArchiveStatus };
 
+/** A rehydration as it is asked (docs/observe.md §10.6): an archive's records of a range (ms) that a search takes, read back into a view of their own, kept `retention_days`; its scan bounded in GB (10^9 bytes). */
+export interface RehydrationIn {
+  name: string;
+  archive_id: string;
+  query?: string;
+  from: number;
+  to: number;
+  retention_days?: number;
+  max_scan_size_in_gb?: number;
+}
+
+export type RehydrationState = "queued" | "reading" | "done" | "failed";
+
+/** A rehydration as the API shows it: what it was asked (its archive's name then), how its reading goes, whether its bound stopped it, when its view goes. */
+export interface Rehydration {
+  id: string;
+  name: string;
+  archive_id: string;
+  archive: string;
+  query: string;
+  from: number;
+  to: number;
+  retention_days: number;
+  max_scan_bytes?: number;
+  created: number;
+  expires: number;
+  state: RehydrationState;
+  error: string | null;
+  objects: number;
+  objects_read: number;
+  bytes_read: number;
+  events_read: number;
+  records: number;
+  malformed: number;
+  limited: boolean;
+  started: number | null;
+  finished: number | null;
+}
+
 /** A metric from logs as it is sent (Datadog's definition): what it computes, of which records, grouped by what. */
 export interface LogMetricIn {
   name: string;
@@ -1100,11 +1139,13 @@ export const observeApi = {
   metrics: (match: string | undefined, signal?: AbortSignal) =>
     request<{ metrics: string[] }>("GET", `${BASE}/metrics${match ? `?match=${enc(match)}&limit=200` : "?limit=200"}`, undefined, { signal }),
   tagValues: (key: string, signal?: AbortSignal) => request<{ key: string; values: string[] }>("GET", `${BASE}/tags?key=${enc(key)}&limit=500`, undefined, { signal }),
-  logs: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<LogSearch>("POST", `${BASE}/logs/search`, body, { signal }),
-  histogram: (body: { query: string; from: number; to: number; step: number; by?: string[] }, signal?: AbortSignal) => request<LogHistogram>("POST", `${BASE}/logs/aggregate`, body, { signal }),
-  facets: (body: { query: string; from: number; to: number; facets: string[]; top?: number }, signal?: AbortSignal) => request<LogFacets>("POST", `${BASE}/logs/facets`, body, { signal }),
+  logs: (body: { query: string; from: number; to: number; limit?: number; view?: string }, signal?: AbortSignal) => request<LogSearch>("POST", `${BASE}/logs/search`, body, { signal }),
+  histogram: (body: { query: string; from: number; to: number; step: number; by?: string[]; view?: string }, signal?: AbortSignal) =>
+    request<LogHistogram>("POST", `${BASE}/logs/aggregate`, body, { signal }),
+  facets: (body: { query: string; from: number; to: number; facets: string[]; top?: number; view?: string }, signal?: AbortSignal) =>
+    request<LogFacets>("POST", `${BASE}/logs/facets`, body, { signal }),
   events: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<LogSearch>("POST", `${BASE}/events/search`, body, { signal }),
-  patterns: (body: { query: string; from: number; to: number }, signal?: AbortSignal) => request<LogPatterns>("POST", `${BASE}/logs/patterns`, body, { signal }),
+  patterns: (body: { query: string; from: number; to: number; view?: string }, signal?: AbortSignal) => request<LogPatterns>("POST", `${BASE}/logs/patterns`, body, { signal }),
   /** The live tail's WebSocket path: the search's records as they are applied. */
   tailPath: (query: string) => `${BASE}/logs/tail?query=${enc(query)}`,
   status: (signal?: AbortSignal) => request<ObserveStatus>("GET", `${BASE}/status`, undefined, { signal }),
@@ -1161,6 +1202,10 @@ export const observeApi = {
   updateArchive: (id: string, a: ArchiveIn) => request<Archive>("PUT", `${BASE}/archives/${enc(id)}`, a),
   deleteArchive: (id: string) => request<void>("DELETE", `${BASE}/archives/${enc(id)}`),
   orderArchives: (ids: string[]) => request<{ archive_ids: string[] }>("PUT", `${BASE}/archive_order`, { archive_ids: ids }),
+  rehydrations: (signal?: AbortSignal) => request<{ rehydrations: Rehydration[] }>("GET", `${BASE}/rehydrations`, undefined, { signal }).then((r) => r.rehydrations),
+  rehydration: (id: string, signal?: AbortSignal) => request<Rehydration>("GET", `${BASE}/rehydrations/${enc(id)}`, undefined, { signal }),
+  createRehydration: (r: RehydrationIn) => request<Rehydration>("POST", `${BASE}/rehydrations`, r),
+  deleteRehydration: (id: string) => request<void>("DELETE", `${BASE}/rehydrations/${enc(id)}`),
   tryPipeline: (pipeline: PipelineIn | null, records: PipelineSample[]) =>
     request<{ records: PipelineResult[] }>("POST", `${BASE}/pipeline_test`, { ...(pipeline ? { pipeline } : {}), records }).then((r) => r.records),
   logMetrics: (signal?: AbortSignal) => request<{ log_metrics: LogMetric[]; counting: LogMetricCounting }>("GET", `${BASE}/log_metrics`, undefined, { signal }),

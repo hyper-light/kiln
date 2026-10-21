@@ -116,6 +116,20 @@ pub fn key(prefix: &str, at_ms: i64, uuid: &str) -> String {
     format!("{lead}dt={y:04}{m:02}{d:02}/hour={h:02}/archive_{h:02}{min:02}{s:02}.{milli:03}0.{uuid}.json.gz")
 }
 
+/// The folder an hour's objects lie in (hours since the epoch, UTC):
+/// `<prefix>/dt=<YYYYMMDD>/hour=<HH>/`, what [`key`] begins with for a time of that hour.
+pub fn folder(prefix: &str, hour: i64) -> String {
+    format!("{}hour={:02}/", day_folder(prefix, hour.div_euclid(24)), hour.rem_euclid(24))
+}
+
+/// The folder a day's hours' folders lie in (days since the epoch, UTC): `<prefix>/dt=<YYYYMMDD>/`.
+pub fn day_folder(prefix: &str, day: i64) -> String {
+    let (y, m, d) = crate::query::calendar::civil_from_days(day);
+    let prefix = prefix.trim_matches('/');
+    let lead = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+    format!("{lead}dt={y:04}{m:02}{d:02}/")
+}
+
 /// The hour (since the epoch, UTC) a record of `ts` (ns) is archived under.
 pub fn hour_of(ts: i64) -> i64 {
     ts.div_euclid(3_600_000_000_000)
@@ -499,5 +513,12 @@ mod tests {
         assert!(matches!(u.as_bytes()[19], b'8' | b'9' | b'a' | b'b'), "RFC 9562's variant: {u}");
         assert_eq!(key("/my/prefix/", 1_526_394_676_003, &u), format!("my/prefix/dt=20180515/hour=14/archive_143116.0030.{u}.json.gz"));
         assert_eq!(key("", 0, "u"), "dt=19700101/hour=00/archive_000000.0000.u.json.gz");
+        // A key lies in its time's hour's folder, whatever the prefix's slashes.
+        for (prefix, at) in [("/my/prefix/", 1_526_394_676_003i64), ("", 0), ("x", 86_400_000 * 365 + 3_599_999), ("a/b", -1)] {
+            let hour = hour_of(at * 1_000_000);
+            assert!(key(prefix, at, "u").starts_with(&folder(prefix, hour)), "{prefix} {at}");
+        }
+        assert_eq!(folder("/p/", 17_666 * 24 + 14), "p/dt=20180515/hour=14/");
+        assert_eq!((day_folder("", 17_666), day_folder("a/b", -1)), ("dt=20180515/".to_owned(), "a/b/dt=19691231/".to_owned()));
     }
 }

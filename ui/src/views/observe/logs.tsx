@@ -3,16 +3,17 @@
  * a search (docs/observe.md §4.6), how its records fall over the range by status, each facet's
  * most common values (a click narrows the search to one, again widens it), and the newest
  * records, each opened to its attributes; or their patterns (Drain, §12.13), each a click from
- * its records; or, live, its records as they come (§6).
+ * its records; or, live, its records as they come (§6). The logs read are the live ones, or a
+ * rehydration's view (§10.6) over its own range.
  */
 import * as React from "react";
 import { wsUrl } from "@/api/client";
-import { observeApi, type LogFacets, type LogPatterns, type LogRecord, type LogTailMessage } from "@/api/observe";
+import { observeApi, type LogFacets, type LogHistogram, type LogPatterns, type LogRecord, type LogSearch, type LogTailMessage, type Rehydration } from "@/api/observe";
 import { SERIES } from "@/components/charts/types";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { PageIntro } from "@/components/ui/misc";
+import { PageIntro, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
 import { Link } from "@/lib/router";
@@ -25,10 +26,12 @@ import {
   STATUS_COLOR,
   STATUS_ORDER,
   firstLine,
-  histogramRes,
   logsOnly,
+  niceStep,
   pollFor,
-  recordsRes,
+  rangeSaid,
+  rehydrationSaid,
+  rehydrationsRes,
   useParam,
   useParams,
   useRange,
@@ -59,22 +62,43 @@ const KINDS = {
   },
 } as const;
 
-const facetsRes = (query: string, range: Range, facets: readonly string[]): Res<LogFacets> => ({
-  key: `observe/facets/${range}/${facets.join(",")}/${query}`,
-  fetch: (signal) => {
-    const to = Date.now();
-    return observeApi.facets({ query, from: to - RANGES[range], to, facets: [...facets], top: 8 }, signal);
-  },
-  opts: { pollMs: pollFor(range) },
+/** What the explorer reads: the live logs over the last `range`, or a rehydration's view over its range. */
+type Source = { range: Range; view?: undefined } | { view: Rehydration; range?: undefined };
+
+/** A source's bounds now (ms), and its view's id when it is one: what each of its queries sends. */
+function bounds(s: Source): { from: number; to: number; view?: string } {
+  if (s.view) return { from: s.view.from, to: s.view.to, view: s.view.id };
+  const to = Date.now();
+  return { from: to - RANGES[s.range], to };
+}
+
+/** A source in its queries' keys (a view's again once it is read), its span, and how often its answers are read again (a view's while it fills). */
+const keyOf = (s: Source) => (s.view ? `view:${s.view.id}:${s.view.state}` : s.range);
+const spanOf = (s: Source) => (s.view ? s.view.to - s.view.from : RANGES[s.range]);
+const pollOf = (s: Source) => (s.view ? (s.view.state === "done" || s.view.state === "failed" ? undefined : 5_000) : pollFor(s.range));
+
+const histogramRes = (query: string, s: Source): Res<LogHistogram> => ({
+  key: `observe/histogram/${keyOf(s)}/${query}`,
+  fetch: (signal) => observeApi.histogram({ query, ...bounds(s), step: niceStep(spanOf(s) / 60), by: ["status"] }, signal),
+  opts: { pollMs: pollOf(s) },
 });
 
-const patternsRes = (query: string, range: Range): Res<LogPatterns> => ({
-  key: `observe/patterns/${range}/${query}`,
-  fetch: (signal) => {
-    const to = Date.now();
-    return observeApi.patterns({ query, from: to - RANGES[range], to }, signal);
-  },
-  opts: { pollMs: pollFor(range) },
+const recordsRes = (query: string, s: Source, limit: number): Res<LogSearch> => ({
+  key: `observe/logs/${keyOf(s)}/${limit}/${query}`,
+  fetch: (signal) => observeApi.logs({ query, ...bounds(s), limit }, signal),
+  opts: { pollMs: pollOf(s) },
+});
+
+const facetsRes = (query: string, s: Source, facets: readonly string[]): Res<LogFacets> => ({
+  key: `observe/facets/${keyOf(s)}/${facets.join(",")}/${query}`,
+  fetch: (signal) => observeApi.facets({ query, ...bounds(s), facets: [...facets], top: 8 }, signal),
+  opts: { pollMs: pollOf(s) },
+});
+
+const patternsRes = (query: string, s: Source): Res<LogPatterns> => ({
+  key: `observe/patterns/${keyOf(s)}/${query}`,
+  fetch: (signal) => observeApi.patterns({ query, ...bounds(s) }, signal),
+  opts: { pollMs: pollOf(s) },
 });
 
 /** A template's fixed text, as search phrases: each token's pieces between its variables (eight at
@@ -106,9 +130,44 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
   const k = KINDS[kind];
   const [q, setQ] = useParam("q");
   const [view, setView] = useParam("view", "records");
+  // The rehydration whose view is read; none, the live logs.
+  const [rehydration] = useParam("rehydration");
   const setParams = useParams();
   const [range, setRange] = useRange();
   const query = kind === "events" ? within(k.base, q) : logsOnly(q);
+  const pick = (id: string) => setParams({ rehydration: id || null, view: id && view === "live" ? null : view === "records" ? null : view });
+  const body = (source: Source) => (
+    <>
+      <Loadable key={`h/${query}`} label="the histogram" fallback={<Hold height={146} />}>
+        <HistogramOf query={query} source={source} />
+      </Loadable>
+      <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[240px_minmax(0,1fr)]">
+        <Loadable key={`f/${query}`} label="the facets" fallback={<RowsHold rows={8} rowHeight={32} />}>
+          <Facets query={query} source={source} facets={k.facets} q={q} onToggle={(t) => setQ(toggle(q, t))} />
+        </Loadable>
+        <div className="min-w-0">
+          <Segmented
+            label="Show"
+            className="mb-3"
+            value={view === "patterns" || (view === "live" && !source.view) ? view : "records"}
+            onChange={(v) => setView(v)}
+            options={[{ value: "records", label: "Records" }, { value: "patterns", label: "Patterns" }, ...(source.view ? [] : [{ value: "live", label: "Live tail" }])]}
+          />
+          {view === "live" && !source.view ? (
+            <Live key={query} query={query} onFilter={(t) => setQ(toggle(q, t))} />
+          ) : view === "patterns" ? (
+            <Loadable key={`p/${query}`} label="the patterns" fallback={<RowsHold rows={10} rowHeight={36} />}>
+              <Patterns query={query} source={source} onPick={(terms) => setParams({ q: terms.reduce((acc, t) => (acc.split(/\s+/).includes(t) ? acc : toggle(acc, t)), q), view: null })} />
+            </Loadable>
+          ) : (
+            <Loadable key={`r/${query}`} label="the records" fallback={<RowsHold rows={10} rowHeight={36} />}>
+              <Records query={query} source={source} onFilter={(t) => setQ(toggle(q, t))} />
+            </Loadable>
+          )}
+        </div>
+      </div>
+    </>
+  );
   return (
     <div className="container-console page">
       <title>{`${k.title} · Observe · kiln`}</title>
@@ -135,42 +194,67 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
       />
       <ObserveNav />
       <SearchForm key={q} initial={q} onSearch={setQ} placeholder={kind === "events" ? "service:kiln.ci status:error" : 'service:api status:error "connection refused"'} />
-      <div className="mb-5">
-        <RangePicker value={range} onChange={setRange} />
-      </div>
-      <Loadable key={`h/${query}`} label="the histogram" fallback={<Hold height={146} />}>
-        <HistogramOf query={query} range={range} />
-      </Loadable>
-      <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[240px_minmax(0,1fr)]">
-        <Loadable key={`f/${query}`} label="the facets" fallback={<RowsHold rows={8} rowHeight={32} />}>
-          <Facets query={query} range={range} facets={k.facets} q={q} onToggle={(t) => setQ(toggle(q, t))} />
+      {kind === "logs" && rehydration ? (
+        <Loadable key={`v/${rehydration}`} label="the rehydration" fallback={<Hold height={146} />}>
+          <Historical id={rehydration} onPick={pick} body={body} />
         </Loadable>
-        <div className="min-w-0">
-          <Segmented
-            label="Show"
-            className="mb-3"
-            value={view === "patterns" || view === "live" ? view : "records"}
-            onChange={(v) => setView(v)}
-            options={[
-              { value: "records", label: "Records" },
-              { value: "patterns", label: "Patterns" },
-              { value: "live", label: "Live tail" },
-            ]}
-          />
-          {view === "live" ? (
-            <Live key={query} query={query} onFilter={(t) => setQ(toggle(q, t))} />
-          ) : view === "patterns" ? (
-            <Loadable key={`p/${query}`} label="the patterns" fallback={<RowsHold rows={10} rowHeight={36} />}>
-              <Patterns query={query} range={range} onPick={(terms) => setParams({ q: terms.reduce((acc, t) => (acc.split(/\s+/).includes(t) ? acc : toggle(acc, t)), q), view: null })} />
-            </Loadable>
-          ) : (
-            <Loadable key={`r/${query}`} label="the records" fallback={<RowsHold rows={10} rowHeight={36} />}>
-              <Records query={query} range={range} onFilter={(t) => setQ(toggle(q, t))} />
-            </Loadable>
-          )}
-        </div>
-      </div>
+      ) : (
+        <>
+          <div className="mb-5 flex flex-wrap items-center gap-3">
+            <RangePicker value={range} onChange={setRange} />
+            {kind === "logs" && (
+              <Loadable label="the rehydrations" fallback={null}>
+                <ViewPicker value="" onPick={pick} />
+              </Loadable>
+            )}
+          </div>
+          {body({ range })}
+        </>
+      )}
     </div>
+  );
+}
+
+/** Which logs are read: the live ones, or a rehydration's view (Datadog's historical views); not
+ * shown while there are none to read. */
+function ViewPicker({ value, onPick }: { value: string; onPick: (id: string) => void }) {
+  const views = useRes(rehydrationsRes).data.filter((r) => r.state === "done" || r.state === "reading" || r.id === value);
+  if (views.length === 0) return null;
+  return (
+    <SelectField
+      label="Logs read"
+      hideLabel
+      className="w-full sm:w-auto sm:min-w-[14rem]"
+      value={value}
+      onChange={onPick}
+      options={[{ value: "", label: "Live logs" }, ...views.map((r) => ({ value: r.id, label: `${r.name} · rehydrated` }))]}
+    />
+  );
+}
+
+/** A rehydration's view read over its own range: what it is said, the explorer's body over it. */
+function Historical({ id, onPick, body }: { id: string; onPick: (id: string) => void; body: (s: Source) => React.ReactNode }) {
+  const r = useRes(rehydrationsRes).data.find((x) => x.id === id);
+  if (!r)
+    return (
+      <p className="empty-line py-12 text-center">
+        That rehydration is gone, and its view with it.{" "}
+        <button type="button" className="text-link" onClick={() => onPick("")}>
+          Read the live logs
+        </button>
+      </p>
+    );
+  return (
+    <>
+      <div className="mb-5 flex flex-wrap items-center gap-x-4 gap-y-2">
+        <ViewPicker value={id} onPick={onPick} />
+        <p className="min-w-0 text-[12.5px] text-[#8c8f98]">
+          <span className="text-[#c8cad0]">{rangeSaid(r.from, r.to)}</span> · from {r.archive}
+          {r.query !== "*" && <span className="font-mono"> · {r.query}</span>} · {rehydrationSaid(r)}
+        </p>
+      </div>
+      {r.state === "failed" ? <p className="empty-line py-12 text-center">It failed, so there is no view to read: rehydrate it again from its archive.</p> : body({ view: r })}
+    </>
   );
 }
 
@@ -207,13 +291,13 @@ export function SearchForm({ initial, onSearch, placeholder }: { initial: string
   );
 }
 
-function HistogramOf({ query, range }: { query: string; range: Range }) {
-  const h = useRes(histogramRes(query, range)).data;
-  return <Histogram h={h} range={range} height={120} />;
+function HistogramOf({ query, source }: { query: string; source: Source }) {
+  const h = useRes(histogramRes(query, source)).data;
+  return <Histogram h={h} range={source.view ? spanOf(source) : source.range} height={120} />;
 }
 
-function Facets({ query, range, facets, q, onToggle }: { query: string; range: Range; facets: readonly string[]; q: string; onToggle: (t: string) => void }) {
-  const f = useRes(facetsRes(query, range, facets)).data;
+function Facets({ query, source, facets, q, onToggle }: { query: string; source: Source; facets: readonly string[]; q: string; onToggle: (t: string) => void }) {
+  const f = useRes(facetsRes(query, source, facets)).data;
   return <FacetList f={f} q={q} onToggle={onToggle} noun={["record", "records"]} />;
 }
 
@@ -267,9 +351,9 @@ export function FacetList({ f, q, onToggle, noun }: { f: LogFacets; q: string; o
   );
 }
 
-function Records({ query, range, onFilter }: { query: string; range: Range; onFilter: (t: string) => void }) {
+function Records({ query, source, onFilter }: { query: string; source: Source; onFilter: (t: string) => void }) {
   const [limit, setLimit] = React.useState(LIMIT);
-  const found = useRes(recordsRes(query, range, limit)).data;
+  const found = useRes(recordsRes(query, source, limit)).data;
   const [open, setOpen] = React.useState<number | null>(null);
   if (found.records.length === 0) return <p className="empty-line py-16 text-center">Nothing matches in this range.</p>;
   return (
@@ -456,8 +540,8 @@ function Template({ text }: { text: string }) {
 
 /** A search's patterns, the most common first: each its count, its worst status, its template, when
  * last seen; a click shows its records. */
-function Patterns({ query, range, onPick }: { query: string; range: Range; onPick: (terms: string[]) => void }) {
-  const p = useRes(patternsRes(query, range)).data;
+function Patterns({ query, source, onPick }: { query: string; source: Source; onPick: (terms: string[]) => void }) {
+  const p = useRes(patternsRes(query, source)).data;
   if (p.patterns.length === 0) return <p className="empty-line py-16 text-center">Nothing matches in this range.</p>;
   return (
     <section aria-label="Patterns">

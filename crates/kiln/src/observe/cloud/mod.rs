@@ -441,7 +441,7 @@ impl<'a> Api<'a> {
             if !c.body.is_empty() || matches!(c.method, Method::Post | Method::Put) {
                 req = req.body(c.body.clone());
             }
-            let pause = match send(req).await {
+            let pause = match send(req, c.timeout).await {
                 Ok(a) => {
                     let again = a.status == 429 || a.status >= 500 || (a.status >= 400 && throttled(&a));
                     if !again || attempt >= tries {
@@ -458,12 +458,14 @@ impl<'a> Api<'a> {
     }
 }
 
-async fn send(req: crate::http::client::RequestBuilder<'_>) -> anyhow::Result<Answer> {
+/// The request sent and its answer read, its body within `within` too (the request's own time is
+/// to its answer's head): a service that answers and stalls fails the call, to be tried again.
+async fn send(req: crate::http::client::RequestBuilder<'_>, within: Duration) -> anyhow::Result<Answer> {
     let r = req.send().await?;
     let status = r.status();
     let retry_after = r.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).map(Duration::from_secs);
     let error_type = r.header("x-amzn-query-error").or_else(|| r.header("x-amzn-errortype")).map(str::to_owned);
-    let body = r.bytes(BODY_MAX).await?;
+    let body = crate::rt::timeout(within, r.bytes(BODY_MAX)).await.map_err(|_| anyhow::anyhow!("its answer's body did not come within {within:?}"))??;
     Ok(Answer { status, body, retry_after, error_type })
 }
 

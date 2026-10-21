@@ -34,6 +34,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-20 | Datadog's dashboards (§7, §11): their JSON imported as kiln's and any dashboard given back as Datadog's, every widget kept (drawn as Datadog draws it, drawn otherwise and said, or a note saying what it was); groups, pies; logs, spans and events as operands of formulas, as Datadog's formulas mix them (§6); Datadog's boolean filters, a search's value lists, `max` and `min`, arithmetic without spaces; Datadog's 678 integration dashboards taken and given back the same, 90.8% of their widgets drawn as Datadog draws them (with service checks', O-21), 105 µs an import (§12.25); checked in browsers (§13) | done |
 | O-21 | Service checks (§9.4): each run, the Agent's (`/api/v1/check_run`) or DogStatsD's (`_sc`), a record and a sample of its status, read from its check's series; Datadog's service check monitor (`"check".over(...).by(...).last(n).count_by_status()`, its thresholds runs in a row, `{{check_message}}`); the check status widget, `POST checks/status`, Datadog's `check_status` imported and given back; the monitor form and page; checked live (a host alerting on its second failure in a row, not its first, its notice the run's message, recovering on its first OK) and in browsers (§13) | done |
 | O-22 | Log archives (§10.5): Datadog's, to S3 (and S3-compatible stores), Cloud Storage and Azure Blob Storage with the cloud integrations' credentials (S3's requests signed with SigV4, the path once and the payload's hash), each record to the first archive whose search takes it; Datadog's objects (an hour's events a folder) and events; each record once through failures, restarts, installs and changes (each archive its place, a file kept to the archives it was begun with, a part written not written again); the store cut within 15 minutes when records come slowly; checked live against RustFS and stand-ins for Google's and Microsoft's stores and token services (§13) | done |
+| O-23 | Rehydration from archives (§10.6): an archive's records of a range that a search takes read back from S3, Cloud Storage or Blob Storage (Datadog's format: what Datadog wrote reads alike) into a view of their own, searched, counted, faceted and patterned as the live logs are (`view`); objects read as they come off the wire (none whole in memory), a read cut short taken up where it stopped; a scan's bound; a view kept for its retention, read again whole when the server stopped in it; checked live against RustFS and the stand-ins, every read cut short (§13) | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -587,7 +588,7 @@ its schema (§13). Built:
 | `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at; a series with a band (`anomalies()`, `forecast()`) has `bounds` (`lower`, `upper`, `score`, `k`, `algorithm`, and a forecast's `forecast_from`, its first bucket forecast; `to` past now draws it). With `heatmap: <rows>`, a heatmap instead: `rows` (each `[lo, hi]`) and `counts` (each bucket of time, each row's): a distribution's merged buckets (made coarser until they fit), or another query's series' values in equal rows |
 | `GET metrics?match=` , `GET tags?key=&match=` | metric names and tag values, sorted (autocomplete) |
 | `GET metrics/summary?match=&limit=`, `GET metrics/summary/{name}` | what each metric is and costs, Datadog's Metrics Summary: its series (its cardinality) by kind, each tag's values and the series carrying it (the tag of most values first; a metric's own with each tag's ten values of most series), the samples applied since the server started and of late a second, its newest sample's time; the metrics of most series first (100 unless said, 1,000 at the most), and how many matched. From the index and the counts kept as samples are applied: nothing read from disk |
-| `POST logs/search` | `{query, from, to, limit}` → records newest first, with the blocks pruned |
+| `POST logs/search` | `{query, from, to, limit}` → records newest first, with the blocks pruned; with `view` (a rehydration's id, §10.6) its view's, as each logs query here |
 | `POST series` | ingest points as Datadog's v1 series API takes them (`metric`, `type`, `tags`, `points` of `[seconds, value]`) |
 | `POST distribution_points` | ingest a distribution's values as Datadog's v1 API takes them (`metric`, `tags`, `host`, `points` of `[seconds, [values]]`): their buckets, count, sum, least and most (§4.4) |
 | `POST logs` | ingest records as Datadog's log intake takes them (`message`, `timestamp`, `status`, `service`, `hostname`, `ddsource`, `attributes`) |
@@ -619,6 +620,7 @@ its schema (§13). Built:
 | `GET/POST span_metrics`, `GET/PUT/DELETE span_metrics/{name}`, `POST span_metric_test` | metrics from spans, as `log_metrics` are; the list says kiln's trace metrics too (`builtin`) |
 | `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind; a syslog source's connections and datagrams dropped; the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines, or whether it may listen where it says |
 | `GET/POST archives`, `GET/PUT/DELETE archives/{id}`, `GET/PUT archive_order` | log archives (§10.5), in the order records are matched against them, Datadog's shape (plain or in its API's envelope), each with Datadog's `state` and what it wrote, failed with and has yet to write; a change applies to the log files cut after it |
+| `GET/POST rehydrations`, `GET/DELETE rehydrations/{id}` | rehydrations from archives (§10.6): `{name, archive_id, query, from, to, retention_days, max_scan_size_in_gb}`, each with its state, what it read and kept, whether its bound stopped it, and when its view goes; removed, its view goes with it (one being read stops) |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
 
@@ -1859,6 +1861,52 @@ checks SigV4 by its own reading) each given every record it is the first to take
 writes them, and none of kiln's events; a store failing part way through a file, the server killed
 meanwhile and an archive made first in order: nothing lost, nothing written twice.
 
+### 10.6 Rehydration
+
+`crate::observe::rehydrate`: Datadog's rehydration from archives. An archive's records of a time
+range that a search takes are read back from its store into a view of their own (Datadog's
+historical view), searched, counted, faceted and patterned as the live logs are by naming it
+(`view` in a logs query, §7), kept for its retention, then dropped. What is read is the archives'
+format (§10.5), so an archive Datadog wrote reads alike.
+
+- **Asked**: a name, the archive (`archive_id`), a search (`*` unless said), a range (`from`, `to`,
+  in ms; 400 days at the most), a retention (15 days unless said, 180 at the most) and a scan's
+  bound (`max_scan_size_in_gb`; the archive's `rehydration_max_scan_size_in_gb` bounds it too, the
+  smaller). 32 at once at the most; one read at a time, in the order asked.
+- **Listed**: the range's folders, a day's (`dt=…/`) where the range holds all of it and an hour's
+  otherwise (a month in 30 listings, not 720), page by page as each store continues one (S3's
+  `continuation-token`, Cloud Storage's `pageToken`, Azure's `marker`), with the archive's cloud
+  integration's credentials as it writes (§10.5). Their objects are read in their names' order: an
+  hour's, by their newest event's time.
+- **Read as it comes**: an object's bytes go from the wire to its reader on the blocking pool, 16
+  chunks waiting at the most, gunzip'd and read a line at a time: no object is ever whole in memory
+  (an archive's are up to 100 MB of events; another writer's may be more), and reading overlaps
+  the download. One that unzips past 1 GiB is refused. A read cut short (an error, or no bytes for
+  60 s) asks for its rest (`Range: bytes=<n>-`) and is taken up where it stopped; a store that
+  sends the whole again has its start skipped. It is tried again as a cloud's calls are (on a 429,
+  a 5xx or no answer; after 1 s doubling, `Retry-After` heeded): four tries in a row that bring
+  nothing, or 16 in all, fail it. The scan's bound stops it before an object that would pass it,
+  and it says so (`limited`).
+- **Kept**: each event read back as its record (§10.5's writing undone): `date` (RFC 3339, or ms),
+  `host`, `source`, `service`, `status` (Datadog's names; none, `info`), `message`, `attributes`
+  flattened to dotted keys (16 deep, 256 at the most), `tags` as attributes where none of their key
+  is (`service`, `host` and `source` being the record's own), its ids (hex, or a tracer's decimal
+  64-bit ids). The records of the range that the search takes are kept, with the archive's
+  `rehydration_tags`; a line that is no event is counted (`malformed`), not kept.
+- **The view**: a store of its own on the server (`<observe>/rehydrated/<id>`), not replicated,
+  written as the live store is (2,000 records a batch, cut each 32 MiB of them: the live store's
+  head, §4.5) and searched as it fills. It goes whole when its retention ends (from when it was
+  read) or its rehydration is removed. One the server stopped in is begun again when it is back, its
+  view made anew; one that failed keeps none (a view is its whole range, or nothing).
+- **Said**: its state (`queued`, `reading`, `done`, or `failed` and why), the objects of its range
+  and those read, bytes read, events read, records kept, lines that were no event, whether its bound
+  stopped it, when it began and finished, when its view goes.
+
+Checked live (§13): S3's (RustFS), Cloud Storage's and Blob Storage's archives rehydrated, every
+read cut short half way by the stand-ins (Google's giving the rest when asked; Microsoft's the
+whole again): each view holds exactly its records, once, as they were sent; the server killed as
+one reads, it is read again whole; a bound stops one after its first object.
+
 ## 11. UI
 
 Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
@@ -1974,6 +2022,15 @@ time range and the search in the address (a page is a link).
   integration of its cloud that writes there (the only one taken unless chosen), a bucket or account
   and container, a path (its objects' keys shown as it is typed), an S3's region, storage class and
   encryption, another store's endpoint, and whether its events carry tags.
+- **Rehydrations** (the Archives page's second part, §10.6): each rehydration, its search and its
+  archive, its range, how its reading goes (waiting, listing, objects read of its range's), what it
+  kept of what it read (records, objects, bytes; whether its bound stopped it) or why it failed, and
+  until when its view is kept; its view a click from the logs explorer (Search), removed from its
+  row. Asked from an archive's row (that archive chosen) or the part's own button: a name, the
+  archive, a search, a range (the last day unless changed), its days and a bound of GB read. The
+  logs explorer reads a view picked beside its range (shown while there are views): over the view's
+  own range, said above it with how its reading goes (read again as it fills), its histogram, facets,
+  records and patterns as the live logs'; no live tail.
 - **Logs kiln collects** (Integrations' fourth part): each source's state over the machines that
   read it (reading, failing, no files), what it reads, its records and how far behind it is;
   added and edited in a form that tests the source on the server (the files it matches, how the
@@ -3791,6 +3848,27 @@ come after to an S3 stood in for, as Datadog's archives hold them, its row sayin
 store failing (S3's SlowDown), the row says so, its reason first; another put ahead of it from its
 row, it edited, both removed; the page within a phone's width. 2026-10-21: passes in all four
 (24 s each).
+
+**Rehydration** (`observe_archives.rs`, the first test's second part): what the three archives
+wrote, read back. S3's (RustFS) `service:api` records over the whole range: the view holds exactly
+the archive's api records, once each, every one as it was sent (its time to the millisecond, its
+fields, its nested attributes flat), searched (`status:warn`) and counted by status as the live
+logs are; it read every object of the archive and every event in them. Cloud Storage's errors of
+the last half hour: exactly those, each with the archive's rehydration tag, read from the objects
+of those hours' folders alone; kept three days. Blob Storage's bounded to its first object: that
+object's records, and it says its bound stopped it. The stand-ins cut every read half way
+(Google's giving the rest when asked with `Range`, Microsoft's sending the whole again), so every
+object of the last two is read in two tries; nothing is doubled. The live logs hold none of the
+views' records. Then every error rehydrated and the server killed (SIGKILL) once it has read an
+object: back, it reads the whole again, its view exactly every error once, and the views read
+before are as they were. One removed: its view is gone (404). What is refused, saying why: an
+archive not there, a range backwards or past 400 days, a search that does not parse, a bound of
+0 GB, a name taken. 2026-10-21: passes (both tests 115 s; fedora, x86-64). In a browser
+(`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): an archive's errors of
+the last day rehydrated from its row (that archive chosen, the last day the range), its row saying
+it kept 2 of the 4 records it read; its view searched in the logs explorer (picked there, over its
+own range, no live tail) holding those two, a search within it finding one; the live logs picked
+again; removed from its row, and from the server. 2026-10-21: passes in all four (9 s each).
 
 **SLOs** (`observe_live.rs`): requests counted a minute for three hours ending at a five-minute
 edge, a thousandth failing but in the last 70 minutes, when half do, and a latency high then; a

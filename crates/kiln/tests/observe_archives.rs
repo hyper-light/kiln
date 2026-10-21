@@ -61,18 +61,23 @@ impl Req {
     }
 }
 
+#[derive(Default)]
 struct Resp {
     status: u16,
     content_type: &'static str,
     body: Vec<u8>,
+    /// Headers besides its type and length.
+    headers: Vec<(&'static str, String)>,
+    /// The length it says, when not its body's: a body cut short (the connection closed after it).
+    length: Option<usize>,
 }
 
 fn reply(status: u16, v: &Value) -> Resp {
-    Resp { status, content_type: "application/json", body: serde_json::to_vec(v).unwrap() }
+    Resp { status, content_type: "application/json", body: serde_json::to_vec(v).unwrap(), ..Resp::default() }
 }
 
 fn xml(status: u16, s: &str) -> Resp {
-    Resp { status, content_type: "application/xml", body: s.as_bytes().to_vec() }
+    Resp { status, content_type: "application/xml", body: s.as_bytes().to_vec(), ..Resp::default() }
 }
 
 /// `%XX` decoded; `+` a space when `plus` (a form's).
@@ -172,14 +177,22 @@ impl Service {
                     let reason = match resp.status {
                         200 => "OK",
                         201 => "Created",
+                        206 => "Partial Content",
                         400 => "Bad Request",
                         401 => "Unauthorized",
                         403 => "Forbidden",
                         404 => "Not Found",
+                        416 => "Range Not Satisfiable",
                         503 => "Service Unavailable",
                         _ => "Status",
                     };
-                    let head = format!("HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", resp.status, resp.content_type, resp.body.len());
+                    let extra: String = resp.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+                    let head = format!(
+                        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                        resp.status,
+                        resp.content_type,
+                        resp.length.unwrap_or(resp.body.len())
+                    );
                     let _ = s.write_all(head.as_bytes()).and_then(|()| s.write_all(&resp.body));
                 });
             }
@@ -203,12 +216,33 @@ const ACCOUNT: &str = "kilnacct";
 const SERVICE_ACCOUNT: &str = "kiln-archives@proj-e2e.iam.gserviceaccount.com";
 
 /// What Google's and Microsoft's stand-ins hold: objects by store and name (`gcs/<bucket>/<name>`,
-/// `azure/<account>/<container>/<name>`), each one's writes, and what they refused.
+/// `azure/<account>/<container>/<name>`), each one's writes, and what they refused; and the reads
+/// that asked for an object's rest.
 #[derive(Default)]
 struct Stores {
     objects: BTreeMap<String, Vec<u8>>,
     writes: BTreeMap<String, usize>,
     refused: Vec<String>,
+    ranged: usize,
+}
+
+/// Object `key` read: cut short half way (the connection closed after it) unless its rest is asked
+/// for (`Range: bytes=<n>-`), that given (206) when `ranges`, else (as a store that takes no
+/// ranges) the whole of it.
+fn object_read(st: &mut Stores, key: &str, r: &Req, ranges: bool, content_type: &'static str) -> Option<Resp> {
+    let b = st.objects.get(key)?.clone();
+    let from = r.header("range").and_then(|v| v.strip_prefix("bytes=")?.strip_suffix('-')?.parse::<usize>().ok());
+    if from.is_some() {
+        st.ranged += 1;
+    }
+    Some(match from {
+        Some(from) if ranges && from < b.len() => {
+            Resp { status: 206, content_type, body: b[from..].to_vec(), headers: vec![("Content-Range", format!("bytes {from}-{}/{}", b.len() - 1, b.len()))], ..Resp::default() }
+        }
+        Some(_) if ranges => Resp { status: 416, content_type, ..Resp::default() },
+        None if b.len() > 1 => Resp { status: 200, content_type, body: b[..b.len() / 2].to_vec(), length: Some(b.len()), ..Resp::default() },
+        _ => Resp { status: 200, content_type, body: b, ..Resp::default() },
+    })
 }
 
 /// Google's token service (a service account's assertion, RFC 7523, signed by its key, for Cloud
@@ -275,7 +309,60 @@ fn stores(state: Arc<Mutex<Stores>>, public_key: Vec<u8>, token_uri: String) -> 
             let key = format!("azure/{}", decode(r.path.trim_start_matches('/'), false));
             st.objects.insert(key.clone(), r.body.clone());
             *st.writes.entry(key).or_default() += 1;
-            return Resp { status: 201, content_type: "application/xml", body: Vec::new() };
+            return Resp { status: 201, content_type: "application/xml", ..Resp::default() };
+        }
+        // Read back (a rehydration's): Cloud Storage's listing (two a page) and media.
+        if r.method == "GET"
+            && let Some(rest) = r.path.strip_prefix("/storage/v1/b/")
+        {
+            if r.bearer() != GCS_TOKEN {
+                st.refused.push(format!("a Cloud Storage read: {}", r.path));
+                return reply(401, &json!({ "error": { "code": 401, "message": "Invalid Credentials" } }));
+            }
+            if let Some(bucket) = rest.strip_suffix("/o") {
+                let prefix = format!("gcs/{}/{}", decode(bucket, false), r.query.get("prefix").cloned().unwrap_or_default());
+                let names: Vec<(&String, &Vec<u8>)> = st.objects.iter().filter(|(k, _)| k.starts_with(&prefix)).collect();
+                let from: usize = r.query.get("pageToken").and_then(|t| t.parse().ok()).unwrap_or(0);
+                let page: Vec<Value> = names
+                    .iter()
+                    .skip(from)
+                    .take(2)
+                    .map(|(k, b)| json!({ "name": k.split_once('/').and_then(|(_, k)| k.split_once('/')).map_or("", |(_, k)| k), "size": b.len().to_string() }))
+                    .collect();
+                let mut out = json!({ "kind": "storage#objects", "items": page });
+                if from + 2 < names.len() {
+                    out["nextPageToken"] = json!((from + 2).to_string());
+                }
+                return reply(200, &out);
+            }
+            if let Some((bucket, name)) = rest.split_once("/o/")
+                && r.query.get("alt").map(String::as_str) == Some("media")
+            {
+                let key = format!("gcs/{}/{}", decode(bucket, false), decode(name, false));
+                return object_read(&mut st, &key, r, true, "application/gzip").unwrap_or_else(|| reply(404, &json!({ "error": { "code": 404, "message": "No such object" } })));
+            }
+        }
+        // Blob Storage's listing (two a page) and blobs.
+        if r.method == "GET" && r.path.starts_with(&format!("/{ACCOUNT}/")) {
+            if r.bearer() != AZURE_TOKEN || r.header("x-ms-version").is_none() {
+                st.refused.push(format!("a blob read: {}", r.path));
+                return xml(403, "<Error><Code>AuthenticationFailed</Code></Error>");
+            }
+            let path = decode(r.path.trim_start_matches('/'), false);
+            if r.query.get("comp").map(String::as_str) == Some("list") && r.query.get("restype").map(String::as_str) == Some("container") {
+                let prefix = format!("azure/{path}/{}", r.query.get("prefix").cloned().unwrap_or_default());
+                let names: Vec<(&String, &Vec<u8>)> = st.objects.iter().filter(|(k, _)| k.starts_with(&prefix)).collect();
+                let from: usize = r.query.get("marker").and_then(|t| t.parse().ok()).unwrap_or(0);
+                let blobs: String = names
+                    .iter()
+                    .skip(from)
+                    .take(2)
+                    .map(|(k, b)| format!("<Blob><Name>{}</Name><Properties><Content-Length>{}</Content-Length></Properties></Blob>", k.splitn(4, '/').nth(3).unwrap_or(""), b.len()))
+                    .collect();
+                let next = if from + 2 < names.len() { (from + 2).to_string() } else { String::new() };
+                return xml(200, &format!("<?xml version=\"1.0\" encoding=\"utf-8\"?><EnumerationResults><Blobs>{blobs}</Blobs><NextMarker>{next}</NextMarker></EnumerationResults>"));
+            }
+            return object_read(&mut st, &format!("azure/{path}"), r, false, "application/octet-stream").unwrap_or_else(|| xml(404, "<Error><Code>BlobNotFound</Code></Error>"));
         }
         st.refused.push(format!("{} {}", r.method, r.path));
         reply(404, &json!({ "error": "not here" }))
@@ -585,7 +672,7 @@ fn every_record_goes_once_to_the_first_archive_that_takes_it_written_as_datadog_
     let (key, public) = service_account(&token_uri)?;
     let held = Arc::new(Mutex::new(Stores::default()));
     let svc = Service::start_on(port, stores(held.clone(), public, token_uri))?;
-    let f = Fleet::with_env(|_| String::new(), &FAST)?;
+    let mut f = Fleet::with_env(|_| String::new(), &FAST)?;
     let started = now_ms();
 
     // Cloud integrations that only write: paused, they read nothing.
@@ -744,6 +831,132 @@ fn every_record_goes_once_to_the_first_archive_that_takes_it_written_as_datadog_
     for (name, w) in ["errors", "web", "rest"].iter().zip(&want) {
         anyhow::ensure!(counted.get(*name).copied() == Some(w.len() as f64), "kiln.archives.events of {name}: {counted:?}");
     }
+    rehydrate(&mut f, &held, &sent, &want, &objects, &ids, t0)
+}
+
+/// What the archives wrote, rehydrated (§10.6): S3's `service:api` records over the whole range;
+/// Cloud Storage's errors of the last half hour, its archive's rehydration tag on each; Blob
+/// Storage's bounded to its first object. The stand-ins cut every read short half way, Google's
+/// giving the rest when asked (`Range`), Microsoft's the whole again. Each view holds exactly what
+/// its rehydration says (every record once, as it was sent), searched and counted as the live logs
+/// are; the server killed as one reads, it is read again whole; the views are there when the
+/// server is back, and one goes when its rehydration does.
+fn rehydrate(f: &mut Fleet, held: &Mutex<Stores>, sent: &BTreeMap<i64, Sent>, want: &[BTreeSet<i64>], objects: &[BTreeMap<String, Vec<u8>>], ids: &[String], t0: i64) -> anyhow::Result<()> {
+    use kiln_obs::logs::archive::{folder, hour_of};
+    let (from, to) = (t0 - 4 * 3_600_000, now_ms() + 60_000);
+    for (body, says) in [
+        (json!({ "name": "x", "archive_id": "nope", "from": from, "to": to }), "no archive"),
+        (json!({ "name": "x", "archive_id": ids[2], "from": to, "to": from }), "from before to"),
+        (json!({ "name": "x", "archive_id": ids[2], "from": 0, "to": 401 * 86_400_000i64 }), "400 days"),
+        (json!({ "name": "x", "archive_id": ids[2], "query": "(", "from": from, "to": to }), "its query"),
+        (json!({ "name": "x", "archive_id": ids[2], "from": from, "to": to, "max_scan_size_in_gb": 0 }), "more than 0 GB"),
+    ] {
+        let (code, text) = refused(f, "POST", "/api/observe/v1/rehydrations", &body)?;
+        anyhow::ensure!(code == 400 && text.contains(says), "{body}: {code} {text}");
+    }
+    let made = |f: &Fleet, body: Value| -> anyhow::Result<String> { Ok(ok(f, "POST", "/api/observe/v1/rehydrations", Some(&body))?["id"].as_str().unwrap_or("").to_owned()) };
+    // Web's first object, and a bound that takes it and no more.
+    let (_, first) = objects[1].iter().next().ok_or_else(|| anyhow::anyhow!("web wrote nothing"))?;
+    anyhow::ensure!(objects[1].len() > 1, "web wrote one object: nothing for a bound to stop");
+    let api = made(f, json!({ "name": "api", "archive_id": ids[2], "query": "service:api", "from": from, "to": to }))?;
+    let errors = made(f, json!({ "name": "recent errors", "archive_id": ids[0], "from": t0 - 1_800_000, "to": t0 + 60_000, "retention_days": 3 }))?;
+    let web = made(f, json!({ "name": "web's first", "archive_id": ids[1], "from": from, "to": to, "max_scan_size_in_gb": (first.len() + 100) as f64 / 1e9 }))?;
+    let (code, text) = refused(f, "POST", "/api/observe/v1/rehydrations", &json!({ "name": "api", "archive_id": ids[2], "from": from, "to": to }))?;
+    anyhow::ensure!(code == 409, "a name taken: {code} {text}");
+
+    let get = |f: &Fleet, id: &str| ok(f, "GET", &format!("/api/observe/v1/rehydrations/{id}"), None);
+    let done = |f: &Fleet, id: &str| -> anyhow::Result<Value> {
+        until(f, "a rehydration read", Duration::from_secs(180), &|| get(f, id).is_ok_and(|r| r["state"] == "done" || r["state"] == "failed"))?;
+        let r = get(f, id)?;
+        anyhow::ensure!(r["state"] == "done" && r["error"].is_null(), "{r}");
+        Ok(r)
+    };
+    // A view's records, each as it was sent (its time to the millisecond, its fields, its
+    // attributes): their seqs.
+    let view = |f: &Fleet, id: &str, query: &str| -> anyhow::Result<Vec<Value>> {
+        let found = ok(f, "POST", "/api/observe/v1/logs/search", Some(&json!({ "view": id, "query": query, "from": from, "to": to, "limit": 1000 })))?;
+        Ok(found["records"].as_array().cloned().unwrap_or_default())
+    };
+    let seqs = |records: &[Value]| -> anyhow::Result<BTreeSet<i64>> {
+        let mut out = BTreeSet::new();
+        for r in records {
+            let seq: i64 = r["attributes"]["seq"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("no seq: {r}"))?;
+            let s = sent.get(&seq).ok_or_else(|| anyhow::anyhow!("seq {seq} was not sent"))?;
+            anyhow::ensure!(r["ts_ns"].as_i64() == Some(s.ts * 1_000_000), "seq {seq}'s time: {r}");
+            anyhow::ensure!(r["message"] == s.message.as_str() && r["service"] == s.service && r["host"] == s.host.as_str() && r["source"] == "app" && r["status"] == s.status, "seq {seq}: {r}");
+            let a = &r["attributes"];
+            anyhow::ensure!(a["env"] == s.env && a["http.status_code"] == s.code.to_string().as_str() && a["http.method"] == "GET", "seq {seq}'s attributes: {r}");
+            anyhow::ensure!(out.insert(seq), "seq {seq} twice in a view");
+        }
+        Ok(out)
+    };
+
+    // S3's api records, every one, and nothing else of its objects.
+    let r = done(f, &api)?;
+    let want_api: BTreeSet<i64> = want[2].iter().copied().filter(|s| sent[s].service == "api").collect();
+    anyhow::ensure!(seqs(&view(f, &api, "*")?)? == want_api, "the api view: not every api record of its archive, once");
+    let n = objects[2].len();
+    anyhow::ensure!(
+        r["records"] == want_api.len() && r["events_read"] == want[2].len() && r["objects"] == n && r["objects_read"] == n && r["limited"] == false && r["malformed"] == 0,
+        "the api rehydration: {r}"
+    );
+    // Searched and counted as the live logs are.
+    let warn: BTreeSet<i64> = want_api.iter().copied().filter(|s| sent[s].status == "warn").collect();
+    anyhow::ensure!(!warn.is_empty() && seqs(&view(f, &api, "status:warn")?)? == warn, "the api view's warnings");
+    let agg = ok(f, "POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "view": api, "query": "*", "from": from, "to": to, "by": ["status"] })))?;
+    let counted: BTreeMap<String, u64> =
+        agg["groups"].as_array().into_iter().flatten().map(|g| (g["group"]["status"].as_str().unwrap_or("").to_owned(), g["value"].as_f64().unwrap_or(0.0) as u64)).collect();
+    let mut by_status: BTreeMap<String, u64> = BTreeMap::new();
+    for s in &want_api {
+        *by_status.entry(sent[s].status.to_owned()).or_default() += 1;
+    }
+    anyhow::ensure!(counted == by_status, "the api view by status: {counted:?}, wanted {by_status:?}");
+
+    // Cloud Storage's errors of the last half hour, read in its hours' objects alone, each with its
+    // archive's rehydration tag; kept three days.
+    let r = done(f, &errors)?;
+    let want_errors: BTreeSet<i64> = want[0].iter().copied().filter(|s| sent[s].ts >= t0 - 1_800_000).collect();
+    let records = view(f, &errors, "*")?;
+    anyhow::ensure!(records.iter().all(|r| r["attributes"]["team"] == "obs"), "its archive's rehydration tag on each");
+    anyhow::ensure!(!want_errors.is_empty() && seqs(&records)? == want_errors, "the errors view: not every error of the half hour, once");
+    let hours = hour_of((t0 - 1_800_000) * 1_000_000)..=hour_of((t0 + 60_000) * 1_000_000 - 1);
+    let read: Vec<&Vec<u8>> = objects[0].iter().filter(|(k, _)| hours.clone().any(|h| k.starts_with(&folder("errors", h)))).map(|(_, b)| b).collect();
+    let events: usize = read.iter().map(|b| events_of(b).len()).sum();
+    anyhow::ensure!(r["objects_read"] == read.len() && r["events_read"] == events && r["records"] == want_errors.len(), "the errors rehydration read its hours' objects alone: {r}");
+    anyhow::ensure!(r["expires"].as_i64().zip(r["finished"].as_i64()).is_some_and(|(e, d)| e - d == 3 * 86_400_000), "kept three days: {r}");
+
+    // Blob Storage's bounded: its first object read, and it says it stopped.
+    let r = done(f, &web)?;
+    let want_web: BTreeSet<i64> = events_of(first).iter().filter_map(|e| e["attributes"]["seq"].as_str()?.parse().ok()).collect();
+    anyhow::ensure!(r["limited"] == true && r["objects_read"] == 1 && r["objects"] == objects[1].len(), "the bounded rehydration: {r}");
+    anyhow::ensure!(seqs(&view(f, &web, "*")?)? == want_web, "the bounded view: its first object's records");
+    {
+        let st = lock(held);
+        anyhow::ensure!(st.ranged > read.len() && st.refused.is_empty(), "every read cut short and taken up: {} asked again for {} objects; refused {:?}", st.ranged, read.len() + 1, st.refused);
+    }
+    // The live logs hold none of it.
+    let live = ok(f, "POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "team:obs", "from": from, "to": to, "limit": 10 })))?;
+    anyhow::ensure!(live["records"].as_array().is_some_and(Vec::is_empty), "a view's records in the live logs: {live}");
+
+    // Every error rehydrated, the server killed as it reads: begun again when it is back, its view
+    // whole and every record in it once. The views read before are there as they were.
+    let all_errors = made(f, json!({ "name": "every error", "archive_id": ids[0], "from": from, "to": to }))?;
+    until(f, "the rehydration reading", Duration::from_secs(60), &|| get(f, &all_errors).is_ok_and(|r| r["state"] == "reading" && r["objects_read"].as_u64().is_some_and(|n| n >= 1)))?;
+    f.kill_server();
+    f.start_server()?;
+    done(f, &all_errors)?;
+    anyhow::ensure!(seqs(&view(f, &all_errors, "*")?)? == want[0], "the view read again: not every error, once");
+    anyhow::ensure!(seqs(&view(f, &api, "*")?)? == want_api && seqs(&view(f, &errors, "*")?)? == want_errors, "the views read before the server went");
+
+    // One removed: its view gone with it.
+    ok(f, "DELETE", &format!("/api/observe/v1/rehydrations/{web}"), None)?;
+    let (code, _) = f.request("GET", &format!("/api/observe/v1/rehydrations/{web}"), None)?;
+    anyhow::ensure!(code == 404, "a rehydration removed: {code}");
+    let (code, text) = refused(f, "POST", "/api/observe/v1/logs/search", &json!({ "view": web, "query": "*", "from": from, "to": to }))?;
+    anyhow::ensure!(code == 404 && text.contains("no view"), "a view removed: {code} {text}");
+    let list = ok(f, "GET", "/api/observe/v1/rehydrations", None)?;
+    let names: BTreeSet<&str> = list["rehydrations"].as_array().into_iter().flatten().filter_map(|r| r["name"].as_str()).collect();
+    anyhow::ensure!(names == BTreeSet::from(["api", "recent errors", "every error"]), "the rehydrations: {list}");
     Ok(())
 }
 

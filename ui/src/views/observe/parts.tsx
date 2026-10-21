@@ -24,6 +24,7 @@ import {
   type LogSource,
   type Pipeline,
   type Archive,
+  type Rehydration,
   type LogMetric,
   type Downtime,
   type LogMetricCounting,
@@ -269,8 +270,8 @@ export function aggregate(values: (number | null)[], how: string = "avg"): numbe
   }
 }
 
-/** The time axis a range reads best in. */
-const timeFormat = (r: Range) => (RANGES[r] > 2 * 86_400_000 ? "day" : "time");
+/** The time axis a range (or a span of ms) reads best in. */
+const timeFormat = (r: Range | number) => ((typeof r === "number" ? r : RANGES[r]) > 2 * 86_400_000 ? "day" : "time");
 
 /** Answers drawn as uPlot takes them: the first answer's buckets, and every series on them. */
 /** Whether an `anomalies()` score is past its band, on the side it watches. */
@@ -420,7 +421,7 @@ export const STATUS_COLOR: Record<string, string> = {
  * worse than it, the mildest first, so each one shows as its own segment; the legend says each
  * one's own count.
  */
-export function Histogram({ h, range, height = 120 }: { h: LogHistogram; range: Range; height?: number }) {
+export function Histogram({ h, range, height = 120 }: { h: LogHistogram; range: Range | number; height?: number }) {
   const { data, series } = React.useMemo(() => {
     const xs = Array.from({ length: h.grid.n }, (_, i) => (h.grid.from + i * h.grid.step) / 1000);
     const groups = [...h.series].sort((a, b) => STATUS_ORDER.indexOf(a.group.status ?? "") - STATUS_ORDER.indexOf(b.group.status ?? ""));
@@ -462,6 +463,7 @@ export const syntheticsRes: Res<Synthetic[]> = { key: "observe/synthetics", fetc
 export const logSourcesRes: Res<LogSource[]> = { key: "observe/log_sources", fetch: (s) => observeApi.logSources(s), opts: { pollMs: 10_000 } };
 export const pipelinesRes: Res<Pipeline[]> = { key: "observe/pipelines", fetch: (s) => observeApi.pipelines(s) };
 export const archivesRes: Res<Archive[]> = { key: "observe/archives", fetch: (s) => observeApi.archives(s), opts: { pollMs: 10_000 } };
+export const rehydrationsRes: Res<Rehydration[]> = { key: "observe/rehydrations", fetch: (s) => observeApi.rehydrations(s), opts: { pollMs: 5_000 } };
 export const logMetricsRes: Res<{ log_metrics: LogMetric[]; counting: LogMetricCounting }> = { key: "observe/log_metrics", fetch: (s) => observeApi.logMetrics(s), opts: { pollMs: 10_000 } };
 export const pipelineRes = (id: string): Res<Pipeline> => ({ key: `observe/pipeline/${id}`, fetch: (s) => observeApi.pipeline(id, s) });
 export const dashboardsRes: Res<DashboardSummary[]> = { key: "observe/dashboards", fetch: (s) => observeApi.dashboards(s) };
@@ -534,6 +536,28 @@ export function when(ns: number) {
   const d = new Date(ns / 1e6);
   const t = `${d.toLocaleTimeString(undefined, { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
   return d.toDateString() === new Date().toDateString() ? t : `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${t}`;
+}
+
+/** A range of times (ms) as read: its day once when both ends share it. */
+export function rangeSaid(from: number, to: number): string {
+  const day = (ms: number) => new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const time = (ms: number) => new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  return day(from) === day(to) ? `${day(from)}, ${time(from)} – ${time(to)}` : `${day(from)}, ${time(from)} – ${day(to)}, ${time(to)}`;
+}
+
+/** How a rehydration goes, in a few words. */
+export function rehydrationSaid(r: Rehydration): string {
+  const n = (x: number) => x.toLocaleString();
+  switch (r.state) {
+    case "queued":
+      return "Waiting to be read";
+    case "reading":
+      return r.objects > 0 ? `Reading: ${n(r.objects_read)} of ${n(r.objects)} ${r.objects === 1 ? "object" : "objects"}` : "Listing its objects";
+    case "failed":
+      return `Failed: ${r.error ?? "no reason given"}`;
+    default:
+      return `${n(r.records)} ${r.records === 1 ? "record" : "records"}${r.limited ? ", stopped at its scan's bound" : ""}`;
+  }
 }
 
 export const firstLine = (s: string) => {

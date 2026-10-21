@@ -165,6 +165,25 @@ pub fn set_archives(a: std::sync::Arc<super::archives::Archives>) {
     let _ = ARCHIVES.set(a);
 }
 
+/// The server's rehydrations from archives, once it started.
+static REHYDRATIONS: OnceLock<std::sync::Arc<super::rehydrate::Rehydrations>> = OnceLock::new();
+
+pub fn set_rehydrations(r: std::sync::Arc<super::rehydrate::Rehydrations>) {
+    let _ = REHYDRATIONS.set(r);
+}
+
+fn rehydrations() -> Result<&'static std::sync::Arc<super::rehydrate::Rehydrations>, Fail> {
+    REHYDRATIONS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "rehydrations are read by the server"))
+}
+
+/// The store a logs query reads: the replicated one, or a rehydration's view (`view`).
+fn store_of(view: Option<&str>) -> Result<kiln_obs::machine::Shared, Fail> {
+    match view.map(str::trim).filter(|v| !v.is_empty()) {
+        None => shared(),
+        Some(id) => rehydrations()?.view(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no view {id:?} (a rehydration's id)"))),
+    }
+}
+
 fn archives() -> Result<&'static std::sync::Arc<super::archives::Archives>, Fail> {
     ARCHIVES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log archives are written by the server"))
 }
@@ -555,8 +574,16 @@ pub(super) async fn read_apart<T: Send + 'static, R: Send + 'static>(
     take: impl FnOnce(&kiln_obs::store::Store) -> T + Send + 'static,
     then: impl FnOnce(T, Waited) -> Result<R, Fail> + Send + 'static,
 ) -> Result<R, Fail> {
+    read_apart_in(shared()?, take, then).await
+}
+
+/// [`read_apart`] of `store` (a rehydration's view, or the replicated one).
+async fn read_apart_in<T: Send + 'static, R: Send + 'static>(
+    store: kiln_obs::machine::Shared,
+    take: impl FnOnce(&kiln_obs::store::Store) -> T + Send + 'static,
+    then: impl FnOnce(T, Waited) -> Result<R, Fail> + Send + 'static,
+) -> Result<R, Fail> {
     let asked = std::time::Instant::now();
-    let store = shared()?;
     crate::rt::blocking(move || {
         let queued = asked.elapsed();
         let taken = take(&store.read().unwrap_or_else(PoisonError::into_inner));
@@ -1229,6 +1256,18 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             archives()?.delete(&id, &files).map_err(refused)?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
+        (&Method::GET, ["rehydrations"]) => Ok(srv::json(StatusCode::OK, &json!({ "rehydrations": rehydrations()?.list() }))),
+        (&Method::POST, ["rehydrations"]) => {
+            let r: super::rehydrate::RehydrationIn =
+                serde_json::from_value(datadog_or_plain(read_json(req.into_body(), QUERY_BODY).await?)).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("a rehydration: {e}")))?;
+            let made = rehydrations()?.create(r).map_err(refused)?;
+            Ok(srv::json(StatusCode::CREATED, &made))
+        }
+        (&Method::GET, ["rehydrations", id]) => rehydrations()?.get(id).map(|r| srv::json(StatusCode::OK, &r)).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such rehydration")),
+        (&Method::DELETE, ["rehydrations", id]) => {
+            rehydrations()?.delete(id).map_err(refused)?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
         (&Method::GET, ["archive_order"]) => Ok(srv::json(StatusCode::OK, &json!({ "archive_ids": archives()?.order() }))),
         (&Method::PUT, ["archive_order"]) => {
             #[derive(Deserialize)]
@@ -1577,6 +1616,9 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
 struct SearchBody {
     #[serde(default)]
     query: String,
+    /// A rehydration's view to read (its id); none, the live logs.
+    #[serde(default)]
+    view: Option<String>,
     /// Milliseconds since the epoch.
     from: i64,
     to: i64,
@@ -1589,7 +1631,7 @@ struct SearchBody {
 /// seen, its newest message, and its records by status; the most common first.
 async fn patterns(body: SearchBody) -> Result<Response, Fail> {
     use kiln_obs::logs::patterns::{Drain, Params, tokens};
-    read_apart(kiln_obs::store::Store::logs_at, move |at, _| {
+    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, _| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1668,7 +1710,7 @@ async fn patterns(body: SearchBody) -> Result<Response, Fail> {
 }
 
 async fn search(body: SearchBody) -> Result<Response, Fail> {
-    read_apart(kiln_obs::store::Store::logs_at, move |at, w| {
+    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1690,6 +1732,8 @@ async fn search(body: SearchBody) -> Result<Response, Fail> {
 struct AggregateBody {
     #[serde(default)]
     query: String,
+    #[serde(default)]
+    view: Option<String>,
     from: i64,
     to: i64,
     /// Facets: `service`, `host`, `source`, `status`, `@attribute`.
@@ -1721,7 +1765,7 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
         other => return Err(fail(StatusCode::BAD_REQUEST, format!("a measure: {other} (count, cardinality, sum, avg, min, max)"))),
     };
     let by: Vec<Facet> = body.by.iter().map(|f| Facet::parse(f)).collect();
-    read_apart(kiln_obs::store::Store::logs_at, move |at, w| {
+    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1749,6 +1793,8 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
 struct FacetsBody {
     #[serde(default)]
     query: String,
+    #[serde(default)]
+    view: Option<String>,
     from: i64,
     to: i64,
     /// `service`, `host`, `source`, `status`, `@attribute`.
@@ -1767,7 +1813,7 @@ async fn facets(body: FacetsBody) -> Result<Response, Fail> {
         return Err(fail(StatusCode::BAD_REQUEST, "at most 32 facets"));
     }
     let top = body.top.unwrap_or(10).clamp(1, 1000);
-    read_apart(kiln_obs::store::Store::logs_at, move |at, w| {
+    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);

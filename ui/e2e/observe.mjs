@@ -1476,6 +1476,158 @@ const scenarios = {
     }
   },
 
+  /**
+   * An archive's records read back (docs/observe.md §10.6): a rehydration asked from the archive's
+   * row (its errors of the last day), its row saying what it kept of what it read; its view searched
+   * in the logs explorer (picked there, over its own range, no live tail), a search within it; the
+   * live logs picked again; removed from its row. On a phone, both pages fit across.
+   */
+  async "an archive's records are rehydrated and searched as the live logs are"() {
+    const http = await import("node:http");
+    const zlib = await import("node:zlib");
+    // S3 as far as an archive and a rehydration ask it, each request signed: objects written,
+    // listed (ListObjectsV2) and read.
+    const objects = new Map();
+    const s3 = http.createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const signed = (req.headers.authorization ?? "").startsWith("AWS4-HMAC-SHA256 Credential=AKIDE2E/") && /^[0-9a-f]{64}$/.test(req.headers["x-amz-content-sha256"] ?? "");
+        const url = new URL(req.url ?? "/", "http://s3");
+        const path = decodeURIComponent(url.pathname);
+        if (!signed) {
+          res.writeHead(403, { "content-type": "application/xml" });
+          res.end("<Error><Code>AccessDenied</Code></Error>");
+        } else if (req.method === "PUT") {
+          objects.set(path, Buffer.concat(chunks));
+          res.writeHead(200);
+          res.end();
+        } else if (req.method === "GET" && url.searchParams.get("list-type") === "2") {
+          const bucket = path.replace(/^\/+|\/+$/g, "");
+          const under = `/${bucket}/${url.searchParams.get("prefix") ?? ""}`;
+          const listed = [...objects.keys()].filter((k) => k.startsWith(under)).sort();
+          const contents = listed.map((k) => `<Contents><Key>${k.slice(bucket.length + 2)}</Key><Size>${objects.get(k).length}</Size></Contents>`).join("");
+          res.writeHead(200, { "content-type": "application/xml" });
+          res.end(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>${bucket}</Name><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`);
+        } else if (req.method === "GET" && objects.has(path)) {
+          res.writeHead(200, { "content-type": "application/gzip" });
+          res.end(objects.get(path));
+        } else {
+          res.writeHead(404, { "content-type": "application/xml" });
+          res.end("<Error><Code>NoSuchKey</Code></Error>");
+        }
+      });
+    });
+    await new Promise((r) => s3.listen(0, "127.0.0.1", r));
+    const endpoint = `http://127.0.0.1:${s3.address().port}`;
+    const cloud = `e2e-rehydrate-${run}`;
+    const archive = `E2E kept ${run}`;
+    const name = `E2E errors back ${run}`;
+    const service = `e2e-rehydrate-${run}`;
+    const rowOf = (n) => page.locator("table.data-table tbody tr").filter({ has: page.getByText(n, { exact: true }) });
+    const archived = () =>
+      [...objects.values()].flatMap((b) =>
+        zlib
+          .gunzipSync(b)
+          .toString("utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l)),
+      );
+    let archiveId = null;
+    let made = null;
+    try {
+      expect((await api("PUT", `/api/observe/v1/clouds/${cloud}`, { kind: "aws", access_key_id: "AKIDE2E", secret_access_key: "e2e-secret", paused: true })).status === 204, "a cloud to read with");
+      const a = await api("POST", "/api/observe/v1/archives", {
+        name: archive,
+        query: `service:${service}`,
+        destination: { type: "s3", bucket: "e2e-rehydrate", path: "/kiln", integration: { cloud }, endpoint },
+      });
+      expect(a.status === 201, `an archive: ${JSON.stringify(a.body)}`);
+      archiveId = a.body.id;
+      // Four records archived, two of them errors.
+      expect(
+        (
+          await api(
+            "POST",
+            "/api/observe/v1/logs",
+            [0, 1, 2, 3].map((i) => ({ message: `rehydrated ${i}`, service, hostname: "e2e", source: "app", status: i % 2 === 0 ? "error" : "info" })),
+          )
+        ).status === 202,
+        "posting records",
+      );
+      await until(
+        "the records stored",
+        async () => (await api("POST", "/api/observe/v1/logs/search", { query: `service:${service}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 10 })).body?.records?.length === 4,
+      );
+      await api("POST", "/api/observe/v1/compact", {});
+      await until("the archive writing them", async () => archived().filter((e) => e.service === service).length === 4, 90_000);
+
+      // Asked from the archive's row: its errors of the last day.
+      await page.goto(`${BASE}/observe/archives`);
+      await rowOf(archive)
+        .getByRole("button", { name: `Rehydrate from ${archive}`, exact: true })
+        .click();
+      const d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Name", { exact: true }), name);
+      expect((await d.getByLabel("From the archive", { exact: true }).inputValue()) === archiveId, "the archive of its row chosen");
+      await fillIn(d.getByLabel("Of the records", { exact: true }), "status:error");
+      await d.getByRole("button", { name: "Rehydrate", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      made = (await api("GET", "/api/observe/v1/rehydrations")).body.rehydrations.find((r) => r.name === name);
+      expect(
+        made && made.archive_id === archiveId && made.query === "status:error" && made.retention_days === 15 && made.to - made.from === 86_400_000 + 60_000,
+        `asked as said: ${JSON.stringify(made)}`,
+      );
+      const row = rowOf(name);
+      let said = "";
+      await until(
+        "its row says what it kept of what it read",
+        async () => {
+          said = (await row.textContent()) ?? "";
+          return /Read/.test(said) && /2 of 4 records/.test(said);
+        },
+        60_000,
+      ).catch((e) => {
+        throw new Error(`${e.message}; it says: ${said}`);
+      });
+
+      // Its view in the explorer: its errors alone, over its own range; no live tail.
+      await row.getByRole("link", { name: `Search ${name}`, exact: true }).click();
+      await page.waitForURL(/\/observe\/logs\?rehydration=/);
+      expect((await page.getByLabel("Logs read", { exact: true }).inputValue()) === made.id, "its view picked");
+      const records = page.getByRole("region", { name: "Records" }).locator("li");
+      await until("its records", async () => (await records.count()) === 2);
+      const shown = (await records.allTextContents()).join(" ");
+      expect(/rehydrated 0/.test(shown) && /rehydrated 2/.test(shown) && !/rehydrated 1/.test(shown), `its errors alone: ${shown}`);
+      expect((await page.getByRole("group", { name: "Show" }).getByRole("button", { name: "Live tail", exact: true }).count()) === 0, "no live tail of a view");
+      await fitsAcross("the explorer over a view");
+      // A search within it.
+      await fillIn(page.locator("#observe-search"), '"rehydrated 2"');
+      await page.getByRole("button", { name: "Search", exact: true }).click();
+      await until("the search within the view", async () => (await records.count()) === 1 && /rehydrated 2/.test((await records.first().textContent()) ?? ""));
+      // The live logs again.
+      await page.getByLabel("Logs read", { exact: true }).selectOption("");
+      await until("the live logs", async () => !page.url().includes("rehydration=") && (await page.getByRole("group", { name: "Time range" }).count()) === 1);
+
+      // Removed from its row: its view gone.
+      await page.goto(`${BASE}/observe/archives`);
+      await fitsAcross("the archives' page with a rehydration");
+      await rowOf(name)
+        .getByRole("button", { name: `Remove ${name}`, exact: true })
+        .click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await until(`${name} gone`, async () => (await rowOf(name).count()) === 0);
+      expect((await api("GET", `/api/observe/v1/rehydrations/${made.id}`)).status === 404, "removed on the server");
+      made = null;
+    } finally {
+      if (made) await api("DELETE", `/api/observe/v1/rehydrations/${made.id}`);
+      if (archiveId) await api("DELETE", `/api/observe/v1/archives/${archiveId}`);
+      await api("DELETE", `/api/observe/v1/clouds/${cloud}`);
+      s3.close();
+    }
+  },
+
   /** A metric from logs tried on the records of the last fifteen minutes, made, counting the
    * records that come after (as the API's query says), charted, and removed. */
   async "a metric from logs is tried, made, counts what comes after, and is removed"() {

@@ -2,24 +2,25 @@
  * Log archives (docs/observe.md §10.5), Datadog's: the records kiln takes written to a bucket as
  * Datadog's Log Archives hold them (gzip'd JSON lines, a folder an hour), each record to the first
  * archive in order whose search takes it, every one once; each archive written with a cloud
- * integration's credentials.
+ * integration's credentials. And their rehydrations (§10.6): an archive's records of a range read
+ * back into a view of their own, searched in the logs explorer as the live logs are.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, Pencil, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, History, Pencil, Plus, Trash2 } from "lucide-react";
 import { Link } from "@/lib/router";
-import { observeApi, type Archive, type ArchiveDestination, type ArchiveIn, type ArchiveState, type CloudKind } from "@/api/observe";
+import { observeApi, type Archive, type ArchiveDestination, type ArchiveIn, type ArchiveState, type CloudKind, type Rehydration, type RehydrationState } from "@/api/observe";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { PageIntro, SelectField, TextField } from "@/components/ui/misc";
+import { PageIntro, SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
-import { formatBytes, relativeTime } from "@/lib/format";
+import { absoluteDate, formatBytes, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { swapped } from "@/lib/utils";
-import { archivesRes, cloudsRes, ObserveNav } from "./parts";
+import { archivesRes, cloudsRes, ObserveNav, rangeSaid, rehydrationSaid, rehydrationsRes } from "./parts";
 
 const count = (n: number) => n.toLocaleString();
 const TONE: Record<ArchiveState, string> = { WORKING: "succeeded", FAILING: "failed", UNKNOWN: "skipped" };
@@ -43,6 +44,8 @@ function where(d: ArchiveDestination): string {
 
 export default function Archives() {
   const [editing, setEditing] = React.useState<Archive | "new" | null>(null);
+  // The archive a rehydration is asked of: its id, or "" for one chosen in the dialog.
+  const [rehydrating, setRehydrating] = React.useState<string | null>(null);
   return (
     <div className="container-console page">
       <title>Archives · Observe · kiln</title>
@@ -59,11 +62,30 @@ export default function Archives() {
       />
       <ObserveNav />
       <Loadable label="the archives" fallback={<TableHold head={<Head />} rows={2} />}>
-        <List onAdd={() => setEditing("new")} onEdit={setEditing} />
+        <List onAdd={() => setEditing("new")} onEdit={setEditing} onRehydrate={(a) => setRehydrating(a.id)} />
       </Loadable>
+      <section className="mt-12">
+        <SectionHeading
+          label="Rehydrations"
+          title="Archived logs read back"
+          aside={
+            <Button variant="ghost" onClick={() => setRehydrating("")}>
+              <History /> Rehydrate
+            </Button>
+          }
+        />
+        <Loadable label="the rehydrations" fallback={<TableHold head={<RehydrationsHead />} rows={1} />}>
+          <Rehydrations onAdd={() => setRehydrating("")} />
+        </Loadable>
+      </section>
       {editing && (
         <Loadable label="the cloud integrations" fallback={null}>
           <ArchiveDialog archive={editing === "new" ? null : editing} onClose={() => setEditing(null)} />
+        </Loadable>
+      )}
+      {rehydrating !== null && (
+        <Loadable label="the archives" fallback={null}>
+          <RehydrateDialog archiveId={rehydrating} onClose={() => setRehydrating(null)} />
         </Loadable>
       )}
     </div>
@@ -83,7 +105,7 @@ function Head() {
   );
 }
 
-function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (a: Archive) => void }) {
+function List({ onAdd, onEdit, onRehydrate }: { onAdd: () => void; onEdit: (a: Archive) => void; onRehydrate: (a: Archive) => void }) {
   const all = useRes(archivesRes).data;
   const [removing, setRemoving] = React.useState<Archive | null>(null);
   const act = async (what: string, f: () => Promise<unknown>) => {
@@ -175,6 +197,9 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (a: Archive) => vo
                   </Button>
                   <Button variant="ghost" size="xs" aria-label={`Move ${a.name} down`} disabled={i === all.length - 1} onClick={() => move(i, 1)}>
                     <ArrowDown />
+                  </Button>
+                  <Button variant="ghost" size="xs" aria-label={`Rehydrate from ${a.name}`} title="Rehydrate: read a range of it back" onClick={() => onRehydrate(a)}>
+                    <History />
                   </Button>
                   <Button variant="ghost" size="xs" aria-label={`Edit ${a.name}`} onClick={() => onEdit(a)}>
                     <Pencil />
@@ -404,6 +429,231 @@ function ArchiveDialog({ archive, onClose }: { archive: Archive | null; onClose:
             </Button>
           </div>
         </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+const R_TONE: Record<RehydrationState, string> = { queued: "queued", reading: "running", done: "succeeded", failed: "failed" };
+const R_STATE: Record<RehydrationState, string> = { queued: "Waiting", reading: "Reading", done: "Read", failed: "Failed" };
+
+/** What a rehydration read, for its row: the records it kept once read (on wider screens, of how many read, from how much), else how its reading goes. */
+function ReadSaid({ r }: { r: Rehydration }) {
+  if (r.state !== "done") return <>{rehydrationSaid(r)}</>;
+  const n = (x: number) => x.toLocaleString();
+  const records = r.records === 1 ? "record" : "records";
+  return (
+    <>
+      <span className="whitespace-nowrap sm:hidden">
+        {n(r.records)} {records}
+      </span>
+      <span className="hidden sm:inline">
+        {n(r.records)} of {n(r.events_read)} {r.events_read === 1 ? "record" : "records"} ·{" "}
+        <span className="whitespace-nowrap">
+          {n(r.objects_read)} {r.objects_read === 1 ? "object" : "objects"}, {formatBytes(r.bytes_read)}
+        </span>
+      </span>
+      {r.limited && " · stopped at its bound"}
+    </>
+  );
+}
+
+function RehydrationsHead() {
+  return (
+    <tr>
+      <th>Rehydration</th>
+      <th className="hidden md:table-cell">Range</th>
+      <th>State</th>
+      <th className="hidden sm:table-cell">Kept</th>
+      <th />
+    </tr>
+  );
+}
+
+/** Each rehydration: what it reads, how its reading goes, until when its view is kept; its view a click from the logs explorer. */
+function Rehydrations({ onAdd }: { onAdd: () => void }) {
+  const all = useRes(rehydrationsRes).data;
+  const [removing, setRemoving] = React.useState<Rehydration | null>(null);
+  if (all.length === 0)
+    return (
+      <p className="empty-line py-10 text-center">
+        None yet.{" "}
+        <button type="button" className="text-link" onClick={onAdd}>
+          Rehydrate
+        </button>{" "}
+        an archive's records of a time range to search them as the live logs are, for as long as you keep them.
+      </p>
+    );
+  return (
+    <>
+      <div className="table-wrap">
+        <table className="data-table">
+          <thead>
+            <RehydrationsHead />
+          </thead>
+          <tbody>
+            {all.map((r) => (
+              <tr key={r.id}>
+                <td className="truncate-cell">
+                  <div className="truncate text-[13px] text-[#e4e5e7]">{r.name}</div>
+                  <p className="truncate font-mono text-[11px] text-[#8c8f98]">
+                    {r.query.trim() && r.query.trim() !== "*" ? r.query : "every record"} · {r.archive}
+                  </p>
+                  <p className="truncate text-[11px] text-[#8c8f98] md:hidden">{rangeSaid(r.from, r.to)}</p>
+                </td>
+                <td className="hidden text-[12.5px] whitespace-nowrap md:table-cell">{rangeSaid(r.from, r.to)}</td>
+                <td className="max-w-[22rem] sm:min-w-[13rem] md:min-w-[17rem]">
+                  <span className="status">
+                    <i className="dot" data-status={R_TONE[r.state]} aria-hidden="true" />
+                    <span className="status-text" data-status={R_TONE[r.state]}>
+                      {R_STATE[r.state]}
+                    </span>
+                  </span>
+                  {r.state === "failed" ? (
+                    <p className="line-clamp-2 text-[12px] text-[#e2c4c6] [overflow-wrap:anywhere]">{r.error ?? ""}</p>
+                  ) : (
+                    <p className="text-[12px] text-[#8c8f98]">
+                      <ReadSaid r={r} />
+                    </p>
+                  )}
+                </td>
+                <td className="hidden text-[12.5px] whitespace-nowrap text-[#8c8f98] sm:table-cell">
+                  {r.state === "done" || r.state === "failed" ? `until ${absoluteDate(r.expires / 1000)}` : `${r.retention_days} days once read`}
+                </td>
+                <td className="w-1 whitespace-nowrap text-right">
+                  {(r.state === "done" || r.state === "reading") && (
+                    <Button variant="ghost" size="xs" asChild>
+                      <Link to={`/observe/logs?rehydration=${encodeURIComponent(r.id)}`} aria-label={`Search ${r.name}`}>
+                        Search
+                      </Link>
+                    </Button>
+                  )}
+                  <Button variant="ghost-danger" size="xs" aria-label={`Remove ${r.name}`} onClick={() => setRemoving(r)}>
+                    <Trash2 />
+                  </Button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <ConfirmDialog
+        open={removing !== null}
+        onOpenChange={(o) => !o && setRemoving(null)}
+        title={`Remove ${removing?.name ?? ""}?`}
+        description="Its view goes with it (its reading stops, if it is read); the archive keeps every record."
+        confirmLabel="Remove"
+        danger
+        onConfirm={async () => {
+          if (!removing) return;
+          try {
+            await observeApi.deleteRehydration(removing.id);
+            invalidate("observe/rehydrations");
+          } catch (e) {
+            toast({ title: "Couldn't remove it", description: errorMessage(e), tone: "failed" });
+          }
+        }}
+      />
+    </>
+  );
+}
+
+/** `ms` as a datetime-local input's value, in this browser's timezone. */
+const localInput = (ms: number) => new Date(ms - new Date(ms).getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+
+/** A rehydration asked of an archive: which records (a search), of which range, kept how long, read how far at the most. */
+function RehydrateDialog({ archiveId, onClose }: { archiveId: string; onClose: () => void }) {
+  const archives = useRes(archivesRes).data;
+  const [f, setF] = React.useState(() => {
+    const now = Date.now();
+    return { name: "", archive: archiveId || (archives[0]?.id ?? ""), query: "", from: localInput(now - 86_400_000), to: localInput(now), days: "15", gb: "" };
+  });
+  const [busy, setBusy] = React.useState(false);
+  const set = (patch: Partial<typeof f>) => setF((old) => ({ ...old, ...patch }));
+  // A time picked to the minute: "to 15:54" holds 15:54's records too.
+  const from = new Date(f.from).getTime();
+  const to = new Date(f.to).getTime() + 60_000;
+  const days = Number(f.days);
+  const gb = f.gb.trim() ? Number(f.gb) : undefined;
+  // The archive's own bound, which bounds what is asked too.
+  const bound = archives.find((a) => a.id === f.archive)?.rehydration_max_scan_size_in_gb;
+  const ranged = Number.isFinite(from) && Number.isFinite(to) && to > from;
+  const ok = f.name.trim() !== "" && f.archive !== "" && ranged && Number.isInteger(days) && days >= 1 && days <= 180 && (gb === undefined || (Number.isFinite(gb) && gb > 0));
+  const save = async () => {
+    setBusy(true);
+    try {
+      const made = await observeApi.createRehydration({
+        name: f.name.trim(),
+        archive_id: f.archive,
+        query: f.query.trim() || "*",
+        from,
+        to,
+        retention_days: days,
+        ...(gb !== undefined ? { max_scan_size_in_gb: gb } : {}),
+      });
+      invalidate("observe/rehydrations");
+      toast({ title: "Asked", description: `${made.name}: its records are read from ${made.archive}, and searched in the logs explorer as they come.`, tone: "succeeded" });
+      onClose();
+    } catch (err) {
+      toast({ title: "Couldn't rehydrate", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent
+        title="Rehydrate"
+        description="An archive's records of a time range, read back into a view of their own: searched, counted and faceted as the live logs are, until it is removed or its days are up."
+      >
+        {archives.length === 0 ? (
+          <p className="field-hint">No archive yet: make one first, and its records can be read back once it has written them.</p>
+        ) : (
+          <form
+            className="space-y-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (ok) void save();
+            }}
+          >
+            <TextField label="Name" value={f.name} onChange={(e) => set({ name: e.target.value })} placeholder="checkout errors, last March" required />
+            <SelectField label="From the archive" value={f.archive} onChange={(v) => set({ archive: v })} options={archives.map((a) => ({ value: a.id, label: a.name }))} />
+            <TextField
+              label="Of the records"
+              value={f.query}
+              onChange={(e) => set({ query: e.target.value })}
+              placeholder="service:checkout status:error"
+              className="font-mono"
+              spellCheck={false}
+              hint="A log search; empty, every record of the range."
+            />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField label="From" type="datetime-local" value={f.from} onChange={(e) => set({ from: e.target.value })} />
+              <TextField label="To" type="datetime-local" value={f.to} onChange={(e) => set({ to: e.target.value })} hint={ranged ? undefined : "After it starts"} />
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField label="Kept for (days)" type="number" min={1} max={180} value={f.days} onChange={(e) => set({ days: e.target.value })} hint="1 to 180." />
+              <TextField
+                label="Read at most (GB)"
+                type="number"
+                min={0}
+                step="any"
+                value={f.gb}
+                onChange={(e) => set({ gb: e.target.value })}
+                placeholder={bound === undefined ? "no bound" : `${bound} (the archive's)`}
+                hint="Of its objects, gzip'd: past it, it stops."
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!ok || busy}>
+                Rehydrate
+              </Button>
+            </div>
+          </form>
+        )}
       </DialogContent>
     </Dialog>
   );

@@ -43,8 +43,8 @@ use kiln_obs::logs::record::Record;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::cloud::{Api, Call, Cloud, Clouds, aws, azure, gcp, sigv4};
-use crate::http::client::Client;
+use super::cloud::{Answer, Api, Call, Cloud, Clouds, aws, azure, gcp, sigv4};
+use crate::http::client::{Client, Method};
 
 /// Archives at the most: each record is matched against them in order until one takes it.
 const ARCHIVES: usize = 64;
@@ -66,6 +66,9 @@ const OPEN_PARTS: usize = 8;
 const IN_FLIGHT: usize = 3;
 /// A failing archive is tried again after two rounds (a minute), doubling to this.
 const BACKOFF_MAX: Duration = Duration::from_secs(16 * 60);
+/// Objects an hour's folder is listed to at the most (each its key and size kept): a busy archive
+/// writes a few a minute.
+const LISTED: usize = 100_000;
 /// Azure Storage's REST version blobs are written with (a bearer token needs 2017-11-09 or later; a
 /// block blob of up to 5,000 MiB in one PUT, 2019-12-12).
 const AZURE_VERSION: &str = "2023-11-03";
@@ -73,6 +76,12 @@ const AZURE_VERSION: &str = "2023-11-03";
 const AZURE_STORAGE: &str = "https://storage.azure.com";
 const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const GZIP: &str = "application/gzip";
+/// How long an object's read waits for its next bytes; tries of it in a row that bring none, and
+/// tries in all; the longest wait between tries (a cloud's calls').
+const STALL: Duration = Duration::from_secs(60);
+const READ_TRIES: u32 = 4;
+const READ_TRIES_MAX: u32 = 16;
+const READ_WAIT_MAX: Duration = Duration::from_secs(60);
 
 type Counted<'a> = &'a (dyn Fn(Vec<(SeriesKey, Vec<(i64, f64)>)>) + Sync);
 type Said<'a> = &'a (dyn Fn(Record) + Sync);
@@ -164,7 +173,7 @@ impl Destination {
         }
     }
 
-    fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         match self {
             Self::S3 { path, .. } | Self::Gcs { path, .. } | Self::Azure { path, .. } => path,
         }
@@ -553,7 +562,7 @@ struct Saved {
 
 /// `path` read as JSON; one that does not read is moved aside (`<name>.broken-<ms>`) and said, so
 /// what is saved next does not write over it.
-fn read_or_aside<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+pub(super) fn read_or_aside<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     let Ok(bytes) = std::fs::read(path) else { return T::default() };
     match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -903,18 +912,69 @@ impl Archives {
         Ok(true)
     }
 
+    /// The writer of `a`'s objects: its cloud integration's credentials as they were last got, while
+    /// the integration is the same.
+    fn writer_of(&self, a: &Archive) -> Result<Writer, String> {
+        let cloud = self.cloud_of(a)?;
+        let held = lock(&self.writers).remove(&a.id);
+        Ok(match held {
+            Some(w) if w.is(&cloud) => w,
+            _ => Writer::of(cloud),
+        })
+    }
+
+    fn keep_writer(&self, id: &str, w: Writer) {
+        lock(&self.writers).insert(id.to_owned(), w);
+    }
+
     /// One object written to `a`'s destination with its cloud integration's credentials (kept from
     /// one object to the next while the integration is the same).
     async fn upload(&self, a: &Archive, key: &str, body: Bytes) -> Result<(), String> {
-        let cloud = self.cloud_of(a)?;
-        let held = lock(&self.writers).remove(&a.id);
-        let mut writer = match held {
-            Some(w) if w.is(&cloud) => w,
-            _ => Writer::of(cloud),
-        };
+        let mut writer = self.writer_of(a)?;
         let api = Api::new(&self.http);
         let result = put_object(&api, &a.destination, &mut writer, key, body, crate::util::now_ms()).await;
-        lock(&self.writers).insert(a.id.clone(), writer);
+        self.keep_writer(&a.id, writer);
+        result
+    }
+
+    /// Every object of `a`'s destination under `prefix` (an hour's folder), each its key and size,
+    /// page after page; [`LISTED`] at the most.
+    pub(crate) async fn list_objects(&self, a: &Archive, prefix: &str) -> Result<Vec<(String, u64)>, String> {
+        let mut writer = self.writer_of(a)?;
+        let api = Api::new(&self.http);
+        let mut out = Vec::new();
+        let mut from: Option<String> = None;
+        let result = loop {
+            let answer = match store_call(&api, &a.destination, &mut writer, Op::List { prefix, from: from.as_deref() }, crate::util::now_ms()).await {
+                Ok(answer) if answer.ok() => answer,
+                Ok(answer) => break Err(refused(&answer)),
+                Err(e) => break Err(e),
+            };
+            match page_of(&a.destination, &answer.body) {
+                Ok((objects, next)) => {
+                    out.extend(objects);
+                    if out.len() > LISTED {
+                        break Err(format!("more than {LISTED} objects under {prefix}"));
+                    }
+                    match next {
+                        Some(n) if from.as_ref() != Some(&n) => from = Some(n),
+                        _ => break Ok(()),
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        self.keep_writer(&a.id, writer);
+        result.map(|()| out)
+    }
+
+    /// Object `key` of `a`'s destination read ([`stream`]), its bytes sent to `to` as they come:
+    /// how many.
+    pub(crate) async fn stream_object(&self, a: &Archive, key: &str, to: &async_channel::Sender<Bytes>) -> Result<u64, String> {
+        let mut writer = self.writer_of(a)?;
+        let api = Api::new(&self.http);
+        let result = stream(&api, &self.http, &a.destination, &mut writer, key, to).await;
+        self.keep_writer(&a.id, writer);
         result
     }
 
@@ -988,10 +1048,42 @@ fn archive_event(name: &str, severity: u8, result: &str, message: String) -> Rec
 
 // ------------------------------------------------------------------------------------ writing
 
-/// An object written: S3's PUT (signed, its payload's hash with it), Cloud Storage's media upload,
-/// Azure's block blob; an answer not 2xx an error saying it.
-async fn put_object(api: &Api<'_>, dest: &Destination, writer: &mut Writer, key: &str, body: Bytes, now: i64) -> Result<(), String> {
-    let answer = match (dest, writer) {
+/// What a store is asked: an object written, a page of a folder's objects (from where the last
+/// page left off), an object read.
+enum Op<'a> {
+    Put { key: &'a str, body: Bytes },
+    List { prefix: &'a str, from: Option<&'a str> },
+    Get { key: &'a str },
+}
+
+/// A store's request, made and signed: sent whole ([`store_call`]) or its answer streamed
+/// ([`stream`]).
+struct Prepared {
+    method: Method,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+    timeout: Duration,
+}
+
+impl Prepared {
+    fn call(&self) -> Call<'_> {
+        Call { method: self.method, url: &self.url, headers: self.headers.clone(), body: self.body.clone(), timeout: self.timeout }
+    }
+}
+
+/// `op` sent to `dest`'s store ([`prepare`]): its answer, of whatever status.
+async fn store_call(api: &Api<'_>, dest: &Destination, writer: &mut Writer, op: Op<'_>, now: i64) -> Result<Answer, String> {
+    let p = prepare(api, dest, writer, op, now).await?;
+    api.call(&p.call(), |_| false).await.map_err(|e| format!("{e:#}"))
+}
+
+/// `op` as `dest`'s store takes it with `writer`'s credentials: S3's requests signed with SigV4 (the
+/// path encoded once, the payload's hash signed), Cloud Storage's and Azure's with a bearer token of
+/// their scope or audience.
+async fn prepare(api: &Api<'_>, dest: &Destination, writer: &mut Writer, op: Op<'_>, now: i64) -> Result<Prepared, String> {
+    let timeout = if matches!(op, Op::List { .. }) { super::cloud::TIMEOUT } else { UPLOAD_TIMEOUT };
+    match (dest, writer) {
         (Destination::S3 { bucket, region, storage_class, encryption, endpoint, .. }, Writer::Aws { cfg, creds }) => {
             let region = region
                 .clone()
@@ -1000,52 +1092,80 @@ async fn put_object(api: &Api<'_>, dest: &Destination, writer: &mut Writer, key:
                 .or_else(|| super::cloud::env("AWS_DEFAULT_REGION"))
                 .unwrap_or_else(|| "us-east-1".into());
             let keys = creds.get(api, cfg, &region, now).await.map_err(|e| format!("its credentials: {e:#}"))?;
-            // The path signed is the path sent, encoded once (S3's way).
-            let (url, path) = match endpoint {
-                Some(e) => {
-                    let path = format!("/{bucket}/{key}");
-                    (format!("{}{}", url_of(e)?, sigv4::uri_encode(&path, true)), path)
-                }
-                None => {
-                    let domain = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
-                    // A bucket named with dots is no host TLS names: its objects by path.
-                    if bucket.contains('.') {
-                        let path = format!("/{bucket}/{key}");
-                        (format!("https://s3.{region}.{domain}{}", sigv4::uri_encode(&path, true)), path)
-                    } else {
-                        let path = format!("/{key}");
-                        (format!("https://{bucket}.s3.{region}.{domain}{}", sigv4::uri_encode(&path, true)), path)
-                    }
-                }
+            // A bucket named with dots is no host TLS names, and another store's is its endpoint's:
+            // their objects by path; AWS's otherwise at the bucket's own host.
+            let domain = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+            let (base, by_path) = match endpoint {
+                Some(e) => (url_of(e)?.to_owned(), true),
+                None if bucket.contains('.') => (format!("https://s3.{region}.{domain}"), true),
+                None => (format!("https://{bucket}.s3.{region}.{domain}"), false),
             };
+            let key = match &op {
+                Op::Put { key, .. } | Op::Get { key } => Some(*key),
+                Op::List { .. } => None,
+            };
+            // The path signed is the path sent, encoded once (S3's way).
+            let path = match (by_path, key) {
+                (true, Some(k)) => format!("/{bucket}/{k}"),
+                (true, None) => format!("/{bucket}"),
+                (false, Some(k)) => format!("/{k}"),
+                (false, None) => "/".to_owned(),
+            };
+            let query: Vec<(&str, &str)> = match &op {
+                Op::List { prefix, from } => [("list-type", "2"), ("prefix", *prefix)].into_iter().chain(from.map(|f| ("continuation-token", f))).collect(),
+                _ => Vec::new(),
+            };
+            let qs = query.iter().map(|(k, v)| format!("{}={}", sigv4::uri_encode(k, false), sigv4::uri_encode(v, false))).collect::<Vec<_>>().join("&");
+            let url = format!("{base}{}{}{qs}", sigv4::uri_encode(&path, true), if qs.is_empty() { "" } else { "?" });
             let (authority, _) = super::cloud::authority_and_path(&url).map_err(|e| format!("{e:#}"))?;
-            let mut headers: Vec<(String, String)> = vec![("host".into(), authority), ("content-type".into(), GZIP.into())];
-            if let Some(c) = storage_class {
-                headers.push(("x-amz-storage-class".into(), c.clone()));
-            }
-            match encryption.as_ref().map(|e| (e.kind.as_str(), e.key.as_deref())) {
-                Some(("SSE_S3", _)) => headers.push(("x-amz-server-side-encryption".into(), "AES256".into())),
-                Some(("SSE_KMS", key)) => {
-                    headers.push(("x-amz-server-side-encryption".into(), "aws:kms".into()));
-                    headers.push(("x-amz-server-side-encryption-aws-kms-key-id".into(), key.unwrap_or_default().trim().to_owned()));
+            let mut headers: Vec<(String, String)> = vec![("host".into(), authority)];
+            let (method, body) = match op {
+                Op::Put { body, .. } => {
+                    headers.push(("content-type".into(), GZIP.into()));
+                    if let Some(c) = storage_class {
+                        headers.push(("x-amz-storage-class".into(), c.clone()));
+                    }
+                    match encryption.as_ref().map(|e| (e.kind.as_str(), e.key.as_deref())) {
+                        Some(("SSE_S3", _)) => headers.push(("x-amz-server-side-encryption".into(), "AES256".into())),
+                        Some(("SSE_KMS", key)) => {
+                            headers.push(("x-amz-server-side-encryption".into(), "aws:kms".into()));
+                            headers.push(("x-amz-server-side-encryption-aws-kms-key-id".into(), key.unwrap_or_default().trim().to_owned()));
+                        }
+                        _ => {}
+                    }
+                    ("PUT", body)
                 }
-                _ => {}
-            }
+                Op::List { .. } | Op::Get { .. } => ("GET", Bytes::new()),
+            };
             let signed_with: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             let at = time::OffsetDateTime::from_unix_timestamp(now.div_euclid(1_000)).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-            let signed = sigv4::sign(&keys, &region, "s3", &sigv4::Request { method: "PUT", path: &path, query: &[], headers: &signed_with, body: &body }, at);
-            // `host` is the URL's to send, and `content-type` the call's own.
-            let mut call = Call::put(&url, GZIP, body).timeout(UPLOAD_TIMEOUT);
-            for (k, v) in headers.iter().skip(2).chain(signed.iter()) {
-                call = call.header(k, v);
-            }
-            api.call(&call, |_| false).await.map_err(|e| format!("{e:#}"))?
+            let signed = sigv4::sign(&keys, &region, "s3", &sigv4::Request { method, path: &path, query: &query, headers: &signed_with, body: &body }, at);
+            // `host` is the URL's to send.
+            headers.retain(|(k, _)| k != "host");
+            headers.extend(signed);
+            Ok(Prepared { method: if method == "PUT" { Method::Put } else { Method::Get }, url, headers, body, timeout })
         }
         (Destination::Gcs { bucket, endpoint, .. }, Writer::Gcp { bearer, .. }) => {
             let token = bearer.get(api, now).await.map_err(|e| format!("its credentials: {e:#}"))?;
             let base = endpoint.as_deref().map_or(Ok("https://storage.googleapis.com"), url_of)?;
-            let url = format!("{base}/upload/storage/v1/b/{}/o?uploadType=media&name={}", super::cloud::encode(bucket), super::cloud::encode(key));
-            api.call(&Call::post(&url, GZIP, body).bearer(&token).timeout(UPLOAD_TIMEOUT), |_| false).await.map_err(|e| format!("{e:#}"))?
+            let b = super::cloud::encode(bucket);
+            let url = match &op {
+                Op::Put { key, .. } => format!("{base}/upload/storage/v1/b/{b}/o?uploadType=media&name={}", super::cloud::encode(key)),
+                Op::List { prefix, from } => {
+                    let next = from.map(|f| format!("&pageToken={}", super::cloud::encode(f))).unwrap_or_default();
+                    format!("{base}/storage/v1/b/{b}/o?prefix={}&fields=items(name,size),nextPageToken{next}", super::cloud::encode(prefix))
+                }
+                Op::Get { key } => format!("{base}/storage/v1/b/{b}/o/{}?alt=media", super::cloud::encode(key)),
+            };
+            let mut headers = vec![("authorization".to_owned(), format!("Bearer {token}"))];
+            let (method, body) = match op {
+                Op::Put { body, .. } => {
+                    headers.push(("content-type".into(), GZIP.into()));
+                    (Method::Post, body)
+                }
+                Op::List { .. } | Op::Get { .. } => (Method::Get, Bytes::new()),
+            };
+            Ok(Prepared { method, url, headers, body, timeout })
         }
         (Destination::Azure { storage_account, container, endpoint, .. }, Writer::Azure { cfg, token }) => {
             let value = match token {
@@ -1061,14 +1181,161 @@ async fn put_object(api: &Api<'_>, dest: &Destination, writer: &mut Writer, key:
                 Some(e) => url_of(e)?.to_owned(),
                 None => format!("https://{storage_account}.blob.core.windows.net"),
             };
-            let url = format!("{base}/{container}{}", sigv4::uri_encode(&format!("/{key}"), true));
             let date = httpdate(now);
-            let call = Call::put(&url, GZIP, body).bearer(&value).header("x-ms-version", AZURE_VERSION).header("x-ms-blob-type", "BlockBlob").header("x-ms-date", &date).timeout(UPLOAD_TIMEOUT);
-            api.call(&call, |_| false).await.map_err(|e| format!("{e:#}"))?
+            let url = match &op {
+                Op::Put { key, .. } | Op::Get { key } => format!("{base}/{container}{}", sigv4::uri_encode(&format!("/{key}"), true)),
+                Op::List { prefix, from } => {
+                    let next = from.map(|f| format!("&marker={}", super::cloud::encode(f))).unwrap_or_default();
+                    format!("{base}/{container}?restype=container&comp=list&prefix={}{next}", super::cloud::encode(prefix))
+                }
+            };
+            let mut headers = vec![("authorization".to_owned(), format!("Bearer {value}")), ("x-ms-version".into(), AZURE_VERSION.into()), ("x-ms-date".into(), date)];
+            let (method, body) = match op {
+                Op::Put { body, .. } => {
+                    headers.push(("content-type".into(), GZIP.into()));
+                    headers.push(("x-ms-blob-type".into(), "BlockBlob".into()));
+                    (Method::Put, body)
+                }
+                Op::List { .. } | Op::Get { .. } => (Method::Get, Bytes::new()),
+            };
+            Ok(Prepared { method, url, headers, body, timeout })
         }
-        _ => return Err("its destination and its cloud integration are of different clouds".into()),
-    };
-    if answer.ok() { Ok(()) } else { Err(format!("{} {}", answer.status, answer.text())) }
+        _ => Err("its destination and its cloud integration are of different clouds".into()),
+    }
+}
+
+/// An answer not 2xx as an error, in the store's words.
+fn refused(answer: &Answer) -> String {
+    format!("{} {}", answer.status, answer.text())
+}
+
+/// An object written; an answer not 2xx an error saying it.
+async fn put_object(api: &Api<'_>, dest: &Destination, writer: &mut Writer, key: &str, body: Bytes, now: i64) -> Result<(), String> {
+    let answer = store_call(api, dest, writer, Op::Put { key, body }, now).await?;
+    if answer.ok() { Ok(()) } else { Err(refused(&answer)) }
+}
+
+/// Object `key` read, its bytes sent to `to` as they come (as fast as its reader takes them, the
+/// channel's room all that waits in memory): a read cut short (the store's error, no bytes for
+/// [`STALL`]) is taken up where it stopped (its rest asked for, `Range`; a store that sends it
+/// whole again has its start skipped), and tried again as a cloud's call is (429 and 5xx, after a
+/// second, doubling; `Retry-After` heeded) until [`READ_TRIES`] tries in a row bring nothing, or
+/// [`READ_TRIES_MAX`] in all. Its bytes; at once, if `to`'s reader stops.
+async fn stream(api: &Api<'_>, http: &Client, dest: &Destination, writer: &mut Writer, key: &str, to: &async_channel::Sender<Bytes>) -> Result<u64, String> {
+    let (mut sent, mut idle, mut tries, mut wait) = (0u64, 0u32, 0u32, Duration::from_secs(1));
+    loop {
+        tries += 1;
+        idle += 1;
+        let before = sent;
+        let p = prepare(api, dest, writer, Op::Get { key }, crate::util::now_ms()).await?;
+        let mut req = http.request(p.method, &p.url).timeout(p.timeout);
+        for (k, v) in &p.headers {
+            req = req.header(k, v);
+        }
+        if sent > 0 {
+            req = req.header("range", &format!("bytes={sent}-"));
+        }
+        let mut retry_after = None;
+        let failed = match req.send().await {
+            Ok(mut r) => match r.status() {
+                status @ (200 | 206) => {
+                    let from = r.header("content-range").and_then(|c| c.trim().strip_prefix("bytes ")?.split('-').next()?.trim().parse::<u64>().ok());
+                    if status == 206 && from != Some(sent) {
+                        return Err(format!("its rest was asked for from byte {sent}, and another part came"));
+                    }
+                    let mut skip = if status == 200 { sent } else { 0 };
+                    loop {
+                        match crate::rt::timeout(STALL, r.chunk()).await {
+                            Ok(Ok(Some(mut c))) => {
+                                if skip > 0 {
+                                    let n = c.len().min(usize::try_from(skip).unwrap_or(usize::MAX));
+                                    c = c.slice(n..);
+                                    skip -= n as u64;
+                                }
+                                if c.is_empty() {
+                                    continue;
+                                }
+                                sent += c.len() as u64;
+                                if to.send(c).await.is_err() {
+                                    return Ok(sent);
+                                }
+                            }
+                            Ok(Ok(None)) if skip == 0 => return Ok(sent),
+                            Ok(Ok(None)) => return Err(format!("it is shorter than the {sent} bytes read of it before")),
+                            Ok(Err(e)) => break format!("{e:#}"),
+                            Err(_) => break format!("no bytes came for {} s", STALL.as_secs()),
+                        }
+                    }
+                }
+                // Its end came as the read before failed: nothing more of it.
+                416 if sent > 0 => return Ok(sent),
+                status => {
+                    retry_after = r.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).map(Duration::from_secs);
+                    let text = match crate::rt::timeout(STALL, r.bytes(64 << 10)).await {
+                        Ok(Ok(b)) => crate::util::truncate(&String::from_utf8_lossy(&b), 500).trim().to_owned(),
+                        _ => String::new(),
+                    };
+                    if status != 429 && status < 500 {
+                        return Err(format!("{status} {text}"));
+                    }
+                    format!("{status} {text}")
+                }
+            },
+            Err(e) => format!("{e:#}"),
+        };
+        if sent > before {
+            (idle, wait) = (0, Duration::from_secs(1));
+        }
+        if idle >= READ_TRIES || tries >= READ_TRIES_MAX {
+            return Err(failed);
+        }
+        crate::rt::sleep(retry_after.map_or(wait, |r| r.min(READ_WAIT_MAX))).await;
+        wait = wait.saturating_mul(2).min(READ_WAIT_MAX);
+    }
+}
+
+/// `&amp;` and its four kin read back (what a listing's XML escapes).
+fn xml_text(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+/// The text of each `<tag>…</tag>` in `s`, in order.
+fn each<'a>(s: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    s.split(open.as_str()).skip(1).filter_map(|p| p.split(close.as_str()).next()).collect()
+}
+
+/// A page of a listing: its objects (each its key and size) and where the next begins, if one does.
+fn page_of(dest: &Destination, body: &[u8]) -> Result<(Vec<(String, u64)>, Option<String>), String> {
+    let text = String::from_utf8_lossy(body);
+    match dest {
+        Destination::S3 { .. } => {
+            let objects = each(&text, "Contents").iter().filter_map(|c| Some((xml_text(each(c, "Key").first()?), each(c, "Size").first()?.trim().parse().ok()?))).collect();
+            let more = text.contains("<IsTruncated>true</IsTruncated>");
+            Ok((objects, if more { each(&text, "NextContinuationToken").first().map(|t| xml_text(t)) } else { None }))
+        }
+        Destination::Azure { .. } => {
+            let objects = each(&text, "Blob").iter().filter_map(|b| Some((xml_text(each(b, "Name").first()?), each(b, "Content-Length").first()?.trim().parse().ok()?))).collect();
+            Ok((objects, each(&text, "NextMarker").first().map(|m| xml_text(m)).filter(|m| !m.is_empty())))
+        }
+        Destination::Gcs { .. } => {
+            #[derive(Deserialize)]
+            struct Item {
+                name: String,
+                #[serde(default)]
+                size: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Page {
+                #[serde(default)]
+                items: Vec<Item>,
+                #[serde(default, rename = "nextPageToken")]
+                next: Option<String>,
+            }
+            let page: Page = serde_json::from_slice(body).map_err(|e| format!("a listing that is not Cloud Storage's: {e}"))?;
+            Ok((page.items.into_iter().map(|i| (i.name, i.size.and_then(|s| s.parse().ok()).unwrap_or(0))).collect(), page.next.filter(|n| !n.is_empty())))
+        }
+    }
 }
 
 /// RFC 7231's IMF-fixdate of `ms` (Azure's `x-ms-date`).

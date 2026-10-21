@@ -199,7 +199,20 @@ fn schemas() -> Map<String, Value> {
             &["grid", "heatmap", "applied", "took_ms"],
         ),
     );
-    put("SearchRequest", object(&[("query", describe(string(), "a log search (Datadog's syntax; empty, every record)")), ("from", ms()), ("to", ms()), ("limit", describe(integer(), "records at the most (100; 1,000)"))], &["from", "to"]));
+    let view = describe(string(), "a rehydration's view to read (its id): the logs it read back from an archive; none, the live logs (logs only)");
+    put(
+        "SearchRequest",
+        object(
+            &[
+                ("query", describe(string(), "a log search (Datadog's syntax; empty, every record)")),
+                ("from", ms()),
+                ("to", ms()),
+                ("limit", describe(integer(), "records at the most (100; 1,000)")),
+                ("view", view.clone()),
+            ],
+            &["from", "to"],
+        ),
+    );
     put(
         "Record",
         object(
@@ -243,6 +256,7 @@ fn schemas() -> Map<String, Value> {
                 ("measure", one_of(&["count", "cardinality", "sum", "avg", "min", "max"])),
                 ("of", describe(string(), "the facet or attribute measured (@duration)")),
                 ("step", describe(integer(), "buckets of so many ms: each group's value a bucket")),
+                ("view", view.clone()),
             ],
             &["from", "to"],
         ),
@@ -263,7 +277,13 @@ fn schemas() -> Map<String, Value> {
             &["rows_scanned", "took_ms"],
         ),
     );
-    put("FacetsRequest", object(&[("query", string()), ("from", ms()), ("to", ms()), ("facets", array(string())), ("top", describe(integer(), "values a facet shows at the most (10)"))], &["from", "to", "facets"]));
+    put(
+        "FacetsRequest",
+        object(
+            &[("query", string()), ("from", ms()), ("to", ms()), ("facets", array(string())), ("top", describe(integer(), "values a facet shows at the most (10)")), ("view", view)],
+            &["from", "to", "facets"],
+        ),
+    );
     put(
         "FacetsAnswer",
         object(
@@ -1211,6 +1231,51 @@ fn schemas() -> Map<String, Value> {
         json!({ "allOf": [schema("ArchiveIn"), object(&[("id", string()), ("created", ms()), ("modified", ms()), ("state", archive_state), ("status", schema("ArchiveStatus"))], &["id", "state", "status"])] }),
     );
     put(
+        "RehydrationIn",
+        object(
+            &[
+                ("name", string()),
+                ("archive_id", string()),
+                ("query", describe(string(), "a log search: the records kept; every record unless said")),
+                ("from", ms()),
+                ("to", describe(integer(), "milliseconds since the epoch: the records' times kept are [from, to)")),
+                ("retention_days", describe(integer(), "how long its view is kept once read (15 unless said; 180 at the most)")),
+                ("max_scan_size_in_gb", describe(number(), "bytes of objects read at the most, in GB; the archive's rehydration_max_scan_size_in_gb bounds it too")),
+            ],
+            &["name", "archive_id", "from", "to"],
+        ),
+    );
+    put(
+        "Rehydration",
+        object(
+            &[
+                ("id", describe(string(), "its view's: what a logs query names as its view")),
+                ("name", string()),
+                ("archive_id", string()),
+                ("archive", describe(string(), "the archive's name when it was asked")),
+                ("query", string()),
+                ("from", ms()),
+                ("to", ms()),
+                ("retention_days", integer()),
+                ("max_scan_bytes", nullable(integer())),
+                ("created", ms()),
+                ("expires", describe(integer(), "when its view goes (ms)")),
+                ("state", one_of(&["queued", "reading", "done", "failed"])),
+                ("error", nullable(string())),
+                ("objects", describe(integer(), "objects of its range")),
+                ("objects_read", integer()),
+                ("bytes_read", integer()),
+                ("events_read", integer()),
+                ("records", describe(integer(), "records kept in its view")),
+                ("malformed", describe(integer(), "lines that were no event")),
+                ("limited", describe(boolean(), "its scan's bound stopped it before its range's last object")),
+                ("started", nullable(integer())),
+                ("finished", nullable(integer())),
+            ],
+            &["id", "name", "archive_id", "query", "from", "to", "state", "records"],
+        ),
+    );
+    put(
         "CloudTest",
         object(
             &[
@@ -1683,6 +1748,24 @@ fn ops() -> Vec<Op<'static>> {
             )
         },
         Op { params: vec![id()], ..op("delete", "/archives/{id}", "Removes a log archive (what it wrote stays)", "observe.manage", None, vec![no_content()]) },
+        op(
+            "get",
+            "/rehydrations",
+            "Lists the rehydrations from archives (Datadog's historical views), each how its reading goes",
+            "observe.read",
+            None,
+            vec![("200", answer_of("the rehydrations", object(&[("rehydrations", array(schema("Rehydration")))], &["rehydrations"])))],
+        ),
+        op(
+            "post",
+            "/rehydrations",
+            "Rehydrates an archive's records of a range that a search takes into a view of their own, searched by naming it (`view`); queued, read one at a time",
+            "observe.manage",
+            Some(body("RehydrationIn")),
+            vec![("201", answer("queued", Some("Rehydration"))), ("409", answer("a rehydration of that name already", Some("Error")))],
+        ),
+        Op { params: vec![id()], ..op("get", "/rehydrations/{id}", "A rehydration and how its reading goes", "observe.read", None, vec![ok("Rehydration")]) },
+        Op { params: vec![id()], ..op("delete", "/rehydrations/{id}", "Removes a rehydration and its view (its reading stopped)", "observe.manage", None, vec![no_content()]) },
         op(
             "get",
             "/archive_order",

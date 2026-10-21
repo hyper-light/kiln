@@ -198,7 +198,11 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 // nothing that panics (the crate's lints): run, not supervised.
                 let archives = crate::observe::archives::Archives::open(&cfg.data("observe"), clouds, http);
                 crate::observe::api::set_archives(archives.clone());
-                crate::rt::spawn(archives.run(shutdown.clone()));
+                crate::rt::spawn(archives.clone().run(shutdown.clone()));
+                // Rehydrations from the archives, each read into a view of its own.
+                let rehydrations = crate::observe::rehydrate::Rehydrations::open(&cfg.data("observe"), archives);
+                crate::observe::api::set_rehydrations(rehydrations.clone());
+                crate::rt::spawn(rehydrations.run(shutdown.clone()));
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "cloud integrations did not start: no HTTPS client"),
         }
