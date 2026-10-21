@@ -1020,6 +1020,11 @@ impl Leg {
         set("KILN_TOKEN", rt.github_token.clone());
         set("KILN_JOB", a.job_id.clone());
         set("KILN_RUN", a.run_id.clone());
+        // A preview's job (W15-R07): the environment it deploys to, and what it's for (`D12`).
+        if let Some((b, p)) = a.environment.as_ref().and_then(|b| b.preview.as_ref().map(|p| (b, p))) {
+            set("KILN_PREVIEW", b.name.clone());
+            set("KILN_PREVIEW_ID", p.id.clone());
+        }
         if shard_items(a).is_some() {
             set("KILN_SHARD_ITEMS", l.temp.join("_kiln").join("shard-items").to_string_lossy().into_owned());
         }
@@ -3371,6 +3376,16 @@ impl Leg {
         Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })
     }
 
+    /// The environment `kiln/deploy@v1` deploys to, as its `environment` input names it: only the
+    /// job's own, whose protection passed before it started, or the preview the job was bound to
+    /// when it names the preview's `previews:` entry (W15-R07).
+    fn deploying_to(&self, env: &str) -> anyhow::Result<String> {
+        match self.a.environment.as_ref() {
+            Some(b) if b.name.eq_ignore_ascii_case(env) || b.preview.as_ref().is_some_and(|p| p.template.eq_ignore_ascii_case(env)) => Ok(b.name.clone()),
+            _ => anyhow::bail!("this job deploys only to the environment it's bound to (`environment:` on the job), and `{env}` isn't it"),
+        }
+    }
+
     /// `kiln/deploy@v1` for a `container` environment (W15-R02): the job deploys it itself, on the
     /// runner its environment's routing chose. A Compose file (`compose`), or images (`images`, one
     /// a line, each a service), goes up as a Compose project named for the repository and the
@@ -3378,12 +3393,7 @@ impl Leg {
     /// the step waits for them to run and, where they have health checks, to be healthy.
     async fn deploy_containers(&self, st: &State, idx: u32, with: &BTreeMap<String, String>, wd: &Path, outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
         let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
-        let env = get("environment").ok_or_else(|| anyhow::anyhow!("`environment`: where it deploys"))?;
-        // Only to the job's own environment, whose protection passed before it started.
-        anyhow::ensure!(
-            self.a.environment.as_ref().is_some_and(|b| b.name.eq_ignore_ascii_case(&env)),
-            "this job deploys only to the environment it's bound to (`environment:` on the job), and `{env}` isn't it"
-        );
+        let env = self.deploying_to(&get("environment").ok_or_else(|| anyhow::anyhow!("`environment`: where it deploys"))?)?;
         let timeout = get("timeout").map_or(Some(1800), |t| kiln_ci::trigger::cron::seconds(&t)).ok_or_else(|| anyhow::anyhow!("`timeout` is a duration (`30m`, `1h`)"))?;
         let project = deployment_name(&self.a.repo, &env);
         let file = match (get("compose"), get("images")) {
@@ -3458,12 +3468,7 @@ impl Leg {
     async fn deploy_microvm(&self, st: &State, idx: u32, with: &BTreeMap<String, String>, outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
         use super::firecracker::{Deployment, Said};
         let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
-        let env = get("environment").ok_or_else(|| anyhow::anyhow!("`environment`: where it deploys"))?;
-        // Only to the job's own environment, whose protection passed before it started.
-        anyhow::ensure!(
-            self.a.environment.as_ref().is_some_and(|b| b.name.eq_ignore_ascii_case(&env)),
-            "this job deploys only to the environment it's bound to (`environment:` on the job), and `{env}` isn't it"
-        );
+        let env = self.deploying_to(&get("environment").ok_or_else(|| anyhow::anyhow!("`environment`: where it deploys"))?)?;
         let image = get("image").ok_or_else(|| anyhow::anyhow!("`image`: what it deploys"))?;
         let timeout = get("timeout").map_or(Some(1800), |t| kiln_ci::trigger::cron::seconds(&t)).ok_or_else(|| anyhow::anyhow!("`timeout` is a duration (`30m`, `1h`)"))?;
         let project = deployment_name(&self.a.repo, &env);
@@ -4201,6 +4206,27 @@ fn unreachable(said: &str) -> bool {
 fn deployment_name(repo: &str, env: &str) -> String {
     let name = repo.rsplit('/').next().unwrap_or("app");
     format!("{name}-{env}").to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
+}
+
+/// Takes down a deployment this runner made, as its environment (a preview) went (W15-R07): a
+/// `container` one's Compose project, with its volumes, or a `microvm` one's microVM and disks.
+/// One that's gone already is gone.
+pub async fn undeploy(ask: &kiln_ci::wire::Undeploy) -> anyhow::Result<()> {
+    let project = deployment_name(&ask.repo, &ask.environment);
+    match ask.kind.as_str() {
+        "container" => {
+            let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("taking {project} down needs Docker or Podman, and this runner has neither working"))?;
+            let config = std::env::temp_dir().join(format!("kiln-undeploy-{}", std::process::id()));
+            let c = config.clone();
+            crate::rt::blocking(move || std::fs::create_dir_all(c)).await??;
+            let cli = super::docker::Cli::new(&bin, config);
+            let args: Vec<String> = ["compose", "-p", &project, "down", "--remove-orphans", "--volumes", "--timeout", "10"].into_iter().map(str::to_owned).collect();
+            cli.run(&args, &BTreeMap::new(), Duration::from_secs(180)).await.map(|_| ())
+        }
+        #[cfg(target_os = "linux")]
+        "microvm" => super::firecracker::undeploy(&project).await,
+        other => anyhow::bail!("a {other} deployment isn't one this runner takes down"),
+    }
 }
 
 /// A microVM deployment's `ports` (`8080:80`, `127.0.0.1:8080:80`, one a line or comma-separated):

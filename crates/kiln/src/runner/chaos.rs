@@ -108,22 +108,34 @@ pub fn oom_kills() -> u64 {
 /// What the runner sends the server, each frame `by` after it was handed in, in order: a slow
 /// network's latency (`delay`), which holds nothing else up.
 pub struct DelayLine {
-    tx: async_channel::Sender<(Instant, u32, Kind, Vec<u8>)>,
+    tx: async_channel::Sender<(Instant, Due)>,
     by: Duration,
+}
+
+/// A frame out of the [`DelayLine`], due: its lane, kind and bytes, and whether the next
+/// connection sends it again anyway.
+pub struct Due {
+    pub lane: u32,
+    pub kind: Kind,
+    pub data: Vec<u8>,
+    pub again: bool,
 }
 
 impl DelayLine {
     /// The line, and where each frame comes out when it's due: back to the runner's loop, which
     /// sends it if it's connected and welcomed then, and keeps it for the next connection if not,
     /// as it does any frame (one sent straight on could reach a connection the server hasn't
-    /// taken the runner's Hello on yet, and be dropped there).
-    pub fn new(by: Duration) -> (DelayLine, async_channel::Receiver<(u32, Kind, Vec<u8>)>) {
-        let (tx, rx) = async_channel::unbounded::<(Instant, u32, Kind, Vec<u8>)>();
-        let (due_tx, due_rx) = async_channel::unbounded::<(u32, Kind, Vec<u8>)>();
+    /// taken the runner's Hello on yet, and be dropped there). A frame marked `again` (a leg's
+    /// event or result, which the next connection sends again from the runner's journal, in
+    /// order) isn't kept: sent ahead of the journal, it would make the server skip what's before
+    /// it.
+    pub fn new(by: Duration) -> (DelayLine, async_channel::Receiver<Due>) {
+        let (tx, rx) = async_channel::unbounded::<(Instant, Due)>();
+        let (due_tx, due_rx) = async_channel::unbounded::<Due>();
         crate::rt::spawn(async move {
-            while let Ok((due, lane, kind, data)) = rx.recv().await {
+            while let Ok((due, frame)) = rx.recv().await {
                 crate::rt::sleep_until(due).await;
-                if due_tx.send((lane, kind, data)).await.is_err() {
+                if due_tx.send(frame).await.is_err() {
                     return;
                 }
             }
@@ -131,8 +143,8 @@ impl DelayLine {
         (DelayLine { tx, by }, due_rx)
     }
 
-    pub fn send(&self, lane: u32, kind: Kind, data: Vec<u8>) {
-        let _ = self.tx.try_send((Instant::now() + self.by, lane, kind, data));
+    pub fn send(&self, lane: u32, kind: Kind, data: Vec<u8>, again: bool) {
+        let _ = self.tx.try_send((Instant::now() + self.by, Due { lane, kind, data, again }));
     }
 }
 

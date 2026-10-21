@@ -22,6 +22,14 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     if !hub.ci.enabled() {
         return Ok(false);
     }
+    // A host's pull request closed: its preview goes (W15-R07), whichever CI runs its workflows.
+    if t.event == "pull_request"
+        && let Some(p) = t.payload.as_deref().filter(|p| p.get("action").and_then(serde_json::Value::as_str) == Some("closed"))
+        && let Some(n) = p.pointer("/pull_request/number").and_then(serde_json::Value::as_u64)
+    {
+        let merged = p.pointer("/pull_request/merged").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        super::previews::pull_request_closed(hub, repo, n, merged).await;
+    }
     // A repository whose CI runs elsewhere (W23-R07): KilnCI stands aside.
     if !super::providers::kiln_runs(hub, repo).await {
         return Ok(true);

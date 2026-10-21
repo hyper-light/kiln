@@ -1317,6 +1317,34 @@ pub async fn restore(cache: PathBuf) {
     }
 }
 
+/// `project`'s deployment taken down (docs/ci.md W15-R07: its environment, a preview, went): its
+/// microVM ended with its disks, its ports here closed, and its record gone, so it isn't booted
+/// again. One that's gone already is gone.
+pub async fn undeploy(project: &str) -> anyhow::Result<()> {
+    let _one = super::rootfs::lock(&format!("deploy-{project}")).await;
+    let live = DEPLOYED.lock().remove(project);
+    PORTS.lock().retain(|_, d| {
+        let keep = d.project != project;
+        if !keep {
+            d.stop.store(true, Ordering::Relaxed);
+        }
+        keep
+    });
+    if let Some(live) = live {
+        let said = live.end().await;
+        tracing::info!(deployment = %project, console = %said, "a deployment was taken down");
+    }
+    if let Some(cache) = CACHE.get() {
+        let file = kept_dir(cache).join(format!("{project}.json"));
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("forgetting {}", file.display()))),
+        }
+    }
+    Ok(())
+}
+
 /// A kept deployment booted again, from its image's root file system as it was deployed.
 async fn relaunch(cache: &Path, kept: Kept) -> anyhow::Result<()> {
     let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now")?;

@@ -354,7 +354,7 @@ fn runs_on_timeouts_environment_concurrency_and_permissions() {
     let d = r.spec("d");
     assert_eq!(d.runs_on.labels, vec!["self-hosted", "staging"]);
     assert_eq!(d.timeout_minutes, 30);
-    assert_eq!(d.environment, Some(EnvironmentSpec { name: "staging".into(), url: Some("https://${{ inputs.env }}.example".into()), deployment: true }));
+    assert_eq!(d.environment, Some(EnvironmentSpec { name: "staging".into(), url: Some("https://${{ inputs.env }}.example".into()), deployment: true, preview: None }));
     assert!(d.concurrency.as_ref().is_some_and(|c| c.group == "d-staging" && c.queue_max));
     assert_eq!(d.container.as_deref(), Some("node:20"));
     assert_eq!(d.services, vec![("db".to_owned(), "postgres".to_owned())]);

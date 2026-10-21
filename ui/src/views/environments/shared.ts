@@ -1,5 +1,5 @@
 /** What the environments board and an environment's page both say (docs/ci.md W15, W21-R10). */
-import type { CiDeployment, CiEnvironment, CiEnvKind, CiProtection } from "@/api/ci";
+import type { CiDeployment, CiEnvironment, CiEnvKind, CiPreview, CiProtection } from "@/api/ci";
 import type { Status } from "@/api/types";
 
 const enc = encodeURIComponent;
@@ -52,7 +52,15 @@ export function protectionWords(p: CiProtection, concurrency: number | null): st
   return out;
 }
 
-export const SOURCE_WORDS: Record<string, string> = { file: "from .kiln/environments.yaml", kiln: "made in kiln", run: "named by a job" };
+export const SOURCE_WORDS: Record<string, string> = {
+  file: "from .kiln/environments.yaml",
+  kiln: "made in kiln",
+  run: "named by a job",
+  preview: "a preview, from .kiln/environments.yaml's previews",
+};
+
+/** Where what a preview is for is reviewed (W15-R07): a diff's, a stack's or a change request's page; none for a host's pull request. */
+export const previewOfHref = (p: CiPreview) => (p.kind === "pull_request" ? null : `/review/${enc(p.of)}`);
 
 /** A deployment's state as a status dot shows it. */
 export function deploymentStatus(state: string | null): Status {

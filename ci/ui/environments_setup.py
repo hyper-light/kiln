@@ -2,9 +2,10 @@
 # hosts with the starter set (dev, staging, production), a host environment made in kiln (web, on
 # runners labelled deploy-web), one its trunk's .kiln/environments.yaml defines (cluster: kiln
 # CD's in-cluster, namespace web), and a run whose job deploying to production waits for its
-# review (the server has no runner: a deployment waits for its environment first). And a fresh
-# repository each for the check's four browsers and sizes to make a starter set in.
-# Prints {"base", "admin", "repo", "run", "fresh": {"chromium-wide": name, …}}.
+# review (the server has no runner: a deployment waits for its environment first). A diff's
+# preview (W15-R07), made from the file's `previews:` as its pull request's job binds to it. And a
+# fresh repository each for the check's four browsers and sizes to make a starter set in.
+# Prints {"base", "admin", "repo", "run", "preview", "diff", "fresh": {"chromium-wide": name, …}}.
 #
 #     SIGNIN="$(cat <signin_setup.py's output>)" python3 -I ci/ui/environments_setup.py
 import json
@@ -60,7 +61,8 @@ call("POST", f"/api/ci/environments/starter?repo={REPO}", {})
 call("PUT", f"/api/ci/environments/web?repo={REPO}", {"kind": "host", "targets": {"runners": "label deploy-web"}, "protection": {}})
 os.makedirs(os.path.join(src, ".kiln"))
 os.makedirs(os.path.join(src, ".github", "workflows"))
-open(os.path.join(src, ".kiln", "environments.yaml"), "w").write("cluster:\n  clusters: [in-cluster]\n  namespace: web\n")
+open(os.path.join(src, ".kiln", "environments.yaml"), "w").write("cluster:\n  clusters: [in-cluster]\n  namespace: web\npreviews:\n  preview:\n    per: diff\n    url: http://preview.test/${{ preview.id }}\n")
+open(os.path.join(src, ".github", "workflows", "preview.yml"), "w").write("on: pull_request\njobs:\n  show:\n    runs-on: local\n    environment: preview\n    steps:\n      - run: echo showing\n")
 open(os.path.join(src, ".github", "workflows", "deploys.yml"), "w").write("on: push\njobs:\n  toprod:\n    runs-on: local\n    environment: production\n    steps:\n      - run: echo shipping\n")
 git(src, "add", ".")
 git(src, "commit", "-qm", "deploys")
@@ -84,4 +86,17 @@ while "cluster" not in [e.get("name") for e in call("GET", f"/api/ci/environment
     if time.time() > deadline:
         sys.exit(f"{REPO}: its file's environment never showed")
     time.sleep(1)
-print(json.dumps({"base": base, "admin": admin, "repo": REPO, "run": run, "fresh": fresh}))
+# A diff, whose pull request's job binds to its preview as it's queued.
+git(src, "checkout", "-q", "-b", "change")
+open(os.path.join(src, "README.md"), "w").write("stages, changed\n")
+git(src, "commit", "-qam", "change the stages\n\nChange-Id: I5151515151515151515151515151515151515151")
+git(src, "push", "-q", url, "HEAD:refs/for/main")
+deadline = time.time() + 120
+preview = None
+while preview is None:
+    preview = next((e for e in call("GET", f"/api/ci/environments?repo={REPO}").get("environments") or [] if e.get("preview")), None)
+    if preview is None:
+        if time.time() > deadline:
+            sys.exit(f"{REPO}: the diff's preview never showed")
+        time.sleep(1)
+print(json.dumps({"base": base, "admin": admin, "repo": REPO, "run": run, "preview": preview["name"], "diff": preview["preview"]["of"], "fresh": fresh}))

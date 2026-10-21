@@ -177,6 +177,10 @@ pub enum AgentMsg {
     /// `crate::runner::pool::Said`, docs/ci.md W13-R09). Only from runners announcing
     /// [`CAP_POOLS`]. Appended last: postcard encodes variants by index.
     Executor { json: String },
+    /// CI: a deployment it was asked to take down ([`ServerMsg::Undeploy`]) is gone, or why it
+    /// couldn't be (JSON `kiln_ci::wire::Undeployed`). Appended last: postcard encodes variants
+    /// by index.
+    Undeployed { json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -271,6 +275,9 @@ pub const CAP_POOLS: u32 = 1 << 28;
 /// `seq`) until the server says it has the result ([`ServerMsg::Received`]), and sends them again
 /// after a reconnect, so what was in flight as the connection dropped isn't lost.
 pub const CAP_RECEIVED: u32 = 1 << 29;
+/// The runner takes down a deployment it made when its environment goes ([`ServerMsg::Undeploy`],
+/// docs/ci.md W15-R07), and says so ([`AgentMsg::Undeployed`]).
+pub const CAP_UNDEPLOY: u32 = 1 << 30;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -489,6 +496,10 @@ pub enum ServerMsg {
     /// Only to runners announcing [`CAP_RECEIVED`]. Appended last: postcard encodes variants by
     /// index.
     Received { job: String },
+    /// CI: take down a deployment this runner made (JSON `kiln_ci::wire::Undeploy`, docs/ci.md
+    /// W15-R07): its environment, a preview, went. Only to runners announcing [`CAP_UNDEPLOY`].
+    /// Appended last: postcard encodes variants by index.
+    Undeploy { json: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -814,6 +825,22 @@ mod tests {
         assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "ServerMsg::Received comes right after Executor");
         assert_eq!(decode::<ServerMsg>(&b)?, got);
         assert!(CAP_RECEIVED.is_power_of_two() && CAP_RECEIVED > CAP_POOLS);
+        Ok(())
+    }
+
+    #[test]
+    fn undeploys_are_appended_after_receipts_and_executors() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Received { job: "j".into() })?;
+        let ask = ServerMsg::Undeploy { json: "{}".into() };
+        let b = encode(&ask)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Undeploy comes right after Received");
+        assert_eq!(decode::<ServerMsg>(&b)?, ask);
+        let last_agent = encode(&AgentMsg::Executor { json: "{}".into() })?;
+        let said = AgentMsg::Undeployed { json: "{}".into() };
+        let b = encode(&said)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Undeployed comes right after Executor");
+        assert_eq!(decode::<AgentMsg>(&b)?, said);
+        assert!(CAP_UNDEPLOY.is_power_of_two() && CAP_UNDEPLOY > CAP_RECEIVED);
         Ok(())
     }
 

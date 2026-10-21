@@ -247,7 +247,7 @@ enum Ev {
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
     /// A test build's fault: a frame held back, due now (W22-AC04).
-    Delayed(u32, Kind, Vec<u8>),
+    Delayed(crate::runner::chaos::Due),
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -1005,7 +1005,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
             () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
-            d = recv_opt(delayed.as_ref()).fuse() => match d { Some((lane, kind, data)) => Ev::Delayed(lane, kind, data), None => Ev::Watchdog },
+            d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
@@ -1026,11 +1026,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 crate::browser::driven::stop_all().await;
                 return Ok(());
             }
-            Ev::Delayed(lane, kind, data) => {
-                // As an undelayed frame goes: sent while connected and welcomed, kept otherwise.
+            Ev::Delayed(crate::runner::chaos::Due { lane, kind, data, again }) => {
+                // As an undelayed frame goes: sent while connected and welcomed, kept otherwise,
+                // unless the next connection sends it again in its place (a leg's event or result).
                 if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term {
+                } else if kind != Kind::Term && !again {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                 }
@@ -2354,6 +2355,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         });
                     }
+                    // A deployment this runner made, taken down: its environment, a preview, went
+                    // (docs/ci.md W15-R07).
+                    ServerMsg::Undeploy { json } => {
+                        let ask: kiln_ci::wire::Undeploy = match serde_json::from_str(&json) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "a request to take a deployment down this runner can't read");
+                                continue;
+                            }
+                        };
+                        let up = uplink.clone();
+                        crate::rt::spawn(async move {
+                            let error = crate::runner::runtime::undeploy(&ask).await.err().map(|e| format!("{e:#}"));
+                            if let Ok(json) = serde_json::to_string(&kiln_ci::wire::Undeployed { asked: ask, error }) {
+                                up.msg(AgentMsg::Undeployed { json }).await;
+                            }
+                        });
+                    }
                     // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
                     // there (W17-R05): its workspace and environment, or its container; the leg's
                     // secrets masked in what it shows.
@@ -2490,15 +2509,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some((_, _, events)) = journaled.as_ref().and_then(|j| journal.get_mut(j)) {
                     events.push(data.clone());
                 }
+                // What the next connection sends again (a leg's result not yet received, its
+                // events once the server takes them again) needn't be kept for it.
+                let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some());
                 // Logs and jobs' messages wait for the Welcome too, and come after what waited.
                 if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
                     match &delay_line {
-                        Some(d) => d.send(lane, kind, data),
+                        Some(d) => d.send(lane, kind, data, again),
                         None => {
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
                     }
-                } else if matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some()) {
+                } else if again {
                     // Sent from `unreceived` and `journal` once connected again.
                 } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();

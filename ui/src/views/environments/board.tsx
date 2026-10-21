@@ -9,7 +9,7 @@ import * as React from "react";
 import { Link } from "@/lib/router";
 
 import { appHref, cdApi } from "@/api/cd";
-import { ci, waitSentence, type CiDeployment, type CiEnvironment } from "@/api/ci";
+import { ci, waitSentence, type CiDeployment, type CiEnvironment, type CiPreview } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel, SelectField } from "@/components/ui/misc";
@@ -21,7 +21,7 @@ import { shortSha } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
-import { deploymentStatus, ENV_EVENTS, environmentHref, kindLabel, protectionWords, refName, whereWords } from "./shared";
+import { deploymentStatus, ENV_EVENTS, environmentHref, kindLabel, previewOfHref, protectionWords, refName, whereWords } from "./shared";
 import "@/views/deployments/deployments.css";
 import "./environments.css";
 
@@ -46,6 +46,32 @@ export function Deployed({ d }: { d: CiDeployment }) {
         <a href={d.url} target="_blank" rel="noreferrer" className="env-link-quiet">
           {d.url.replace(/^https?:\/\//, "")}
         </a>
+      )}
+    </span>
+  );
+}
+
+/** What a preview is for (W15-R07), and when it goes unless it's deployed again, or why it went. */
+export function PreviewOf({ p }: { p: CiPreview }) {
+  const href = previewOfHref(p);
+  const of = href ? (
+    <Link to={href} className="env-link-quiet">
+      {p.of}
+    </Link>
+  ) : (
+    p.of
+  );
+  return (
+    <span className="env-meta">
+      Preview of {of}
+      {p.kind === "stack" ? "'s stack" : ""}
+      {p.removed ? (
+        ` · removed: ${p.removed}`
+      ) : (
+        <>
+          {" "}
+          · goes <RelTime ts={p.expires_at} /> unless deployed again
+        </>
       )}
     </span>
   );
@@ -122,6 +148,7 @@ function Row({ e }: { e: CiEnvironment }) {
             {where ? ` · ${where}` : ""}
           </span>
         )}
+        {e.preview && <PreviewOf p={e.preview} />}
         <span className="env-meta">{rules.length ? rules.join(" · ") : "anyone may deploy, any ref"}</span>
       </div>
       <div className="env-cell">

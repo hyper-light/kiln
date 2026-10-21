@@ -1447,7 +1447,12 @@ impl Dispatch {
         let reviews = super::environments::reviews(&self.hub, &run, &def.name).await?;
         let now = crate::util::now_unix();
         let p = &def.protection;
-        let verdict = if !records && !p.gates.is_empty() {
+        // A preview that went with its change takes only its change's closing runs (W15-R07).
+        let closing = self.runs.get(&run).is_some_and(|r| r.event.action == "closed");
+        let gone = def.preview.as_ref().and_then(|p| p.removed.clone()).filter(|_| !closing);
+        let verdict = if let Some(why) = gone {
+            kiln_ci::env::Gate::Refused(format!("{} went ({why}): it takes no more deployments", def.name))
+        } else if !records && !p.gates.is_empty() {
             // As GitHub's custom protection rules can't be.
             kiln_ci::env::Gate::Refused(format!("{} has custom gates, which a job with `deployment: false` can't use", def.name))
         } else if p.gates.iter().any(|g| g.workflow.as_deref() == Some(path.as_str())) {
@@ -1546,7 +1551,7 @@ impl Dispatch {
     }
 
     /// A leg the plan queued: its row, then the scheduler.
-    async fn queue(&mut self, run: &str, spec: LegSpec) -> anyhow::Result<()> {
+    async fn queue(&mut self, run: &str, mut spec: LegSpec) -> anyhow::Result<()> {
         // W08-R10: a job that opted in takes an earlier leg's result for the same inputs.
         let reuse = self.reuse_hash(run, &spec).await;
         if let Some((hash, max_age)) = &reuse {
@@ -1554,6 +1559,23 @@ impl Dispatch {
                 Ok(Some((source, report))) => return Box::pin(self.take_over(run, spec, &source, hash, report_from_json(&report))).await,
                 Ok(None) => {}
                 Err(e) => tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "reuse couldn't be looked up; the leg runs"),
+            }
+        }
+        // One of `previews:` named: the leg deploys to its change's preview, that environment from
+        // here on (W15-R07); or to none, skipped or failed, saying why.
+        let mut unbound: Option<(bool, String)> = None;
+        if let Some(r) = self.runs.get(run)
+            && let Some(e) = spec.environment.as_mut().filter(|e| !e.name.is_empty() && e.preview.is_none())
+        {
+            match super::previews::bind(&self.hub, &r.repo, &e.name, &r.event.payload).await {
+                Ok(super::previews::Bind::Not) => {}
+                Ok(super::previews::Bind::To(p)) => {
+                    e.name = format!("{}-{}", p.template, p.id);
+                    e.preview = Some(p);
+                }
+                Ok(super::previews::Bind::Skip(why)) => unbound = Some((true, why)),
+                Ok(super::previews::Bind::Refuse(why)) => unbound = Some((false, why)),
+                Err(err) => unbound = Some((false, format!("its preview couldn't be made: {err:#}"))),
             }
         }
         let id = crate::util::new_id();
@@ -1571,6 +1593,17 @@ impl Dispatch {
         if let Some(m) = dockerless {
             runs::annotation(&self.hub, &id, None, "error", Some("executor".into()), &m, None, None, None, None, None).await?;
             return Box::pin(self.settled(&id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await;
+        }
+        match unbound {
+            Some((true, why)) => {
+                runs::annotation(&self.hub, &id, None, "notice", Some("environment".into()), &why, None, None, None, None, None).await?;
+                return Box::pin(self.concluded(&id, PlanC::Skipped, Some(why))).await;
+            }
+            Some((false, why)) => {
+                runs::annotation(&self.hub, &id, None, "error", Some("environment".into()), &why, None, None, None, None, None).await?;
+                return Box::pin(self.settled(&id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(why))).await;
+            }
+            None => {}
         }
         // A leg bound to an environment starts when its protection lets it (W15-R04).
         if let Some(env) = self.legs.get(&id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
@@ -2084,7 +2117,7 @@ impl Dispatch {
             job_defaults: job.map(|j| j.defaults.clone()).unwrap_or_default(),
             outputs: job.map(|j| j.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect()).unwrap_or_default(),
             environment_url: job.and_then(|j| j.environment.as_ref()).and_then(|e| e.url.clone()),
-            environment: l.spec.environment.as_ref().map(|e| e.name.clone()).filter(|n| !n.is_empty()).map(|name| wire::Bound { name, kind: None }),
+            environment: l.spec.environment.as_ref().filter(|e| !e.name.is_empty()).map(|e| wire::Bound { name: e.name.clone(), kind: None, preview: e.preview.clone() }),
             contexts: wire::Contexts {
                 github: r.github.clone(),
                 vars,
@@ -2291,17 +2324,27 @@ impl Dispatch {
 
     /// The leg is done for good: its row, then its plan (W04-R02).
     async fn settled(&mut self, leg: &str, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
-        let Some(l) = self.legs.remove(leg) else { return Ok(()) };
-        // A deployment ends here: the next its environment holds may go (W15-R01).
-        if let Some((env, repo)) = l.spec.environment.as_ref().map(|e| e.name.clone()).zip(self.runs.get(&l.run).map(|r| r.repo.id.clone())) {
-            Box::pin(self.next_deployments(&repo, &env)).await?;
-        }
         let c = match &outcome {
             Outcome::Success => PlanC::Success,
             Outcome::Cancelled => PlanC::Cancelled,
             Outcome::Failed(f) if f.class == FailureClass::Timeout => PlanC::TimedOut,
             Outcome::Failed(_) => PlanC::Failure,
         };
+        self.concluded(leg, c, reason).await
+    }
+
+    /// A leg's end, concluded `c` (a skip too: a stack's lower diff deploys nothing to its
+    /// preview, W15-R07): its deployment's last status, its row, and the plan told.
+    async fn concluded(&mut self, leg: &str, c: PlanC, reason: Option<String>) -> anyhow::Result<()> {
+        let Some(l) = self.legs.remove(leg) else { return Ok(()) };
+        // A deployment ends here: the next its environment holds may go (W15-R01).
+        if let Some((env, repo)) = l.spec.environment.as_ref().map(|e| e.name.clone()).zip(self.runs.get(&l.run).map(|r| r.repo.id.clone())) {
+            Box::pin(self.next_deployments(&repo, &env)).await?;
+        }
+        // A preview that went while this leg deployed to it: what it made there goes too (W15-R07).
+        if let (Some(e), Some(runner), Some(repo)) = (l.spec.environment.as_ref().filter(|e| e.preview.is_some()), l.agent.as_deref(), self.runs.get(&l.run).map(|r| r.repo.clone())) {
+            super::previews::leg_ended(&self.hub, &repo, &e.name, runner).await;
+        }
         let outputs = serde_json::to_string(&l.report.outputs.iter().cloned().collect::<std::collections::BTreeMap<_, _>>()).ok();
         // Its deployment's last status (W15-R04).
         if let Some(d) = l.deployment {

@@ -1146,6 +1146,11 @@ impl Hub {
                 }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
+                // Previews' deployments it's left to take down (docs/ci.md W15-R07).
+                if caps & proto::CAP_UNDEPLOY != 0 {
+                    let (hub, agent) = (Arc::clone(self), agent.clone());
+                    crate::rt::spawn(async move { crate::ci::previews::runner_up(&hub, &agent).await });
+                }
             }
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
@@ -1186,6 +1191,8 @@ impl Hub {
             }
             // A pool's executor it was asked to start (docs/ci.md W13-R09).
             AgentMsg::Executor { json } => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.clone(), json }),
+            // A preview's deployment it was asked to take down (docs/ci.md W15-R07).
+            AgentMsg::Undeployed { json } => crate::ci::previews::undeployed(self, &agent, &json).await,
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {

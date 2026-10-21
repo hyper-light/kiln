@@ -104,6 +104,39 @@ pub struct Bound {
     /// targets of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// A preview's (W15-R07): the `previews:` entry it was made from and what it's for, `name`
+    /// being both (`preview-D12`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewOf>,
+}
+
+/// What a preview environment (W15-R07) was made from: its template (the name jobs give their
+/// `environment:`) and what it's for (`D12`, `CR7`, `PR42`, or a stack's lowest diff).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreviewOf {
+    pub template: String,
+    pub id: String,
+}
+
+/// A deployment a runner made (W15-R02) that it's asked to take down, as its environment went (a
+/// preview, W15-R07): `ServerMsg::Undeploy`. `kind` is `container` (its Compose project) or
+/// `microvm`; `repo` and `environment` name it as the runner named it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Undeploy {
+    pub kind: String,
+    pub repo: String,
+    pub environment: String,
+}
+
+/// What the runner says once it's done (`AgentMsg::Undeployed`): it, gone, or why it couldn't be.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Undeployed {
+    pub asked: Undeploy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A leg's egress (W18-R08): the hosts it may reach (`*.example.com`, `host:port`) besides kiln's

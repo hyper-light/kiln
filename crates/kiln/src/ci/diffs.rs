@@ -736,6 +736,8 @@ pub(crate) struct NewVersion {
 
 /// `pull_request` `closed` for a diff that landed (`merged`) or was abandoned (W03-R09's table).
 pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool, by: &str) -> anyhow::Result<()> {
+    // Its preview goes, and its stack's once the stack has no open diff (W15-R07).
+    super::previews::closed(hub, repo, d, merged).await;
     activity(hub, repo, d, "closed", by, |p| {
         if let Some(pr) = p.get_mut("pull_request").and_then(Value::as_object_mut) {
             pr.insert("state".into(), json!("closed"));

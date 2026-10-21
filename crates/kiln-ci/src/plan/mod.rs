@@ -148,6 +148,10 @@ pub struct EnvironmentSpec {
     pub url: Option<String>,
     /// `deployment: false`: the environment's rules and secrets, no deployment record.
     pub deployment: bool,
+    /// Where `name` is one of `previews:`, the preview it was bound to as the leg was queued
+    /// (W15-R07): `name` is that preview's then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::wire::PreviewOf>,
 }
 
 /// A concurrency group, evaluated (W05-R06, W05-R07).
@@ -1361,7 +1365,7 @@ impl RunPlan {
                 Some(d) => truthy(&yval(d, dialect, cx, "environment.deployment").map_err(|e| fail(&spec, e))?),
                 None => true,
             };
-            spec.environment = Some(EnvironmentSpec { name, url: e.url.as_ref().map(|u| u.src.clone()), deployment });
+            spec.environment = Some(EnvironmentSpec { name, url: e.url.as_ref().map(|u| u.src.clone()), deployment, preview: None });
         }
         if let Some(c) = &job.concurrency {
             spec.concurrency = Some(group(c, dialect, cx, "concurrency").map_err(|e| fail(&spec, e))?);

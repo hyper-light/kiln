@@ -21,7 +21,7 @@ import { agentsRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { ScopeSecrets } from "@/views/settings-ci";
-import { Deployed, EnvApps, Waits } from "./board";
+import { Deployed, EnvApps, PreviewOf, Waits } from "./board";
 import { ENV_EVENTS, environmentsHref, KINDS, kindLabel, protectionWords, SOURCE_WORDS, whereWords } from "./shared";
 import "@/views/deployments/deployments.css";
 import "./environments.css";
@@ -92,7 +92,8 @@ function IntegrationPicker({ value, onChange, disabled }: { value: string; onCha
 }
 
 function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: string[] }) {
-  const file = e.source === "file";
+  // A preview's are its `previews:` entry's, in the file too (W15-R07).
+  const file = e.source === "file" || e.source === "preview";
   const p = e.protection;
   const [kind, setKind] = React.useState<CiEnvKind | "none">(e.kind ?? "none");
   const [clusters, setClusters] = React.useState<string[]>(e.targets.clusters ?? []);
@@ -152,7 +153,11 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
         if (!file) void save();
       }}
     >
-      {file && <p className="env-note">Defined in .kiln/environments.yaml on the trunk: change it there.</p>}
+      {file && (
+        <p className="env-note">
+          {e.preview ? `Made from ${e.preview.template} in .kiln/environments.yaml's previews on the trunk: change it there.` : "Defined in .kiln/environments.yaml on the trunk: change it there."}
+        </p>
+      )}
       <fieldset className="env-group" disabled={file || busy}>
         <legend className="env-legend">Where it deploys</legend>
         <Segmented<CiEnvKind | "none">
@@ -271,7 +276,7 @@ function Remove({ e, repo }: { e: CiEnvironment; repo: string }) {
   const navigate = useNavigate();
   const [asked, setAsked] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
-  if (e.source === "file") return null;
+  if (e.source === "file" || e.preview?.removed) return null;
   const remove = async () => {
     setBusy(true);
     try {
@@ -309,7 +314,9 @@ function Remove({ e, repo }: { e: CiEnvironment; repo: string }) {
         </>
       }
     >
-      Its rules go; its deployments stay in its history. A job that names it again makes it again, with no rules.
+      {e.preview
+        ? "Its deployments are marked inactive, and kiln takes down what it deployed on its runners. Its change's next run makes it again."
+        : "Its rules go; its deployments stay in its history. A job that names it again makes it again, with no rules."}
     </Confirm>
   );
 }
@@ -329,6 +336,7 @@ function EnvBody({ repo, name }: { repo: string; name: string }) {
           { label: "Where", value: where ?? "—" },
           { label: "Rules", value: protectionWords(e.protection, e.concurrency).join(" · ") || "anyone may deploy, any ref" },
           { label: "Defined", value: SOURCE_WORDS[e.source] ?? e.source },
+          ...(e.preview ? [{ label: "For", value: <PreviewOf p={e.preview} /> }] : []),
         ]}
       />
       <Panel eyebrow="Waiting" title="What waits to deploy here" description="Approve or reject on each run's page.">

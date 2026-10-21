@@ -186,7 +186,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for every D.1 ecosystem (AC03 with the real tools for eight), vcpkg's binary cache kept by kiln; jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); each VMM in a jail of its own (namespaces, no root), pools restored from snapshots, services and job containers in microVMs; AC02 on host, docker and firecracker, AC03, AC05 (a cold start 0.64 s, a warm one 35 ms); `shards` left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare, search), GraphQL (pull requests, comments, labels, reviews, checks, search; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); GraphQL's merges left |
-| W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container deployments (Compose stacks, healthy, outliving their jobs) and microVM ones (long-lived Firecracker microVMs, health-checked, taking over their ports, booted again with their runner); shards' microVMs, previews and the live-cluster ACs left (with CD) |
+| W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container deployments (Compose stacks, healthy, outliving their jobs) and microVM ones (long-lived Firecracker microVMs, health-checked, taking over their ports, booted again with their runner); previews of diffs, stacks and pull requests (AC04; their containers and microVMs taken down as they go); shards' microVMs, CD's preview apps and the live-cluster ACs left |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; in Firecracker microVMs terminals, keeping, extend and release, and reruns in place (W13-R05); shards' left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; the dependency changes a diff makes, on its review page (R03); attestations as referrers in other registries too; Firecracker microVMs contained (no network device: out only through the egress proxy, W13-R05); shards' left |
@@ -4608,8 +4608,9 @@ environment model both use.
   Chromium and WebKit. *UI check.*
 
 **Progress.** In progress: R01, R03, R04, R05, R06, R08 and R09 are done, with R02's kinds on
-CI's side and its `container` and `microvm` deployments (Firecracker's; shards' left with W13);
-previews and the ACs that need the live cluster are left (with CD).
+CI's side and its `container` and `microvm` deployments (Firecracker's; shards' left with W13),
+and R07's previews on CI's side; CD's preview apps and the ACs that need the live cluster are left
+(with CD).
 
 - *Done.*
   - `kiln_ci::env`: GitHub's protection rules (required reviewers, `prevent-self-review`, a wait
@@ -4779,9 +4780,38 @@ previews and the ACs that need the live cluster are left (with CD).
   repository seeing none of them) and in Chromium and WebKit, desktop and phone
   (`ci/ui/environments_check.mjs`: the board, a starter set made there, a kind changed in place
   and read again, the file's environment read only, production's wait, history and secrets).
-- *Left.* A `microvm` environment's deployments on shards (W13's shards), R07 (previews, with
-  CD), and AC02 to AC05, which need the live cluster (W22-AC05); AC03's `container` and `microvm`
-  parts are checked here.
+- *Done.* R07, CI's half (`crates/kiln/src/ci/previews.rs`):
+  - `previews:` in `.kiln/environments.yaml`, a key of its own (never an environment's name):
+    each entry an environment's keys (its kind and targets, protection, `url`, `concurrency`), and
+    `per: stack | diff` (one for each stack, at its top diff, by default), `on: [diff,
+    pull_request]` (both by default) and `ttl` (72 h by default).
+  - A leg naming one, in a run for a diff, a change request or a pull request, is bound to that
+    change's preview as it's queued: `preview-D12` (`preview-CR7`, `preview-PR42`; a stack's is
+    named for its lowest diff), made then with the entry's rules. `${{ preview.id }}` (and
+    `.name` and `.number`) fill its `url`. The job gets `KILN_PREVIEW` and `KILN_PREVIEW_ID`, and
+    its `kiln/deploy@v1` takes the entry's name for the preview, deploying as that environment
+    (a Compose project or microVM of its own). A stack's lower diffs' legs are skipped, saying
+    whose preview it is; a run for no change fails the leg, saying why.
+  - A new version's run deploys to the same preview, and each deployment pushes its `ttl` out.
+  - It goes when its diff lands or is abandoned (a stack's once none of its diffs is open), when
+    its change request or a host's pull request closes, when its `ttl` passes without a
+    deployment, or with Remove on its page (`DELETE /api/ci/environments/:name`). Its deployments
+    are marked inactive. A `container` or `microvm` one's are taken down on the runners that made
+    them (`ServerMsg::Undeploy`, `CAP_UNDEPLOY`), now or when each next connects, until it says it
+    has; other kinds' are their jobs' to take down, on the change's closing event. It's kept an
+    hour for those closing runs, which bind to it; no other run deploys to it any more, and one
+    that was deploying as it went is taken down again after it.
+  - The board and the preview's page say what it's for (linked to its review) and when it goes,
+    or why it went; its settings are its entry's, changed in the file.
+  - Checked end to end (`tests/previews.rs`, AC04 for a `container` preview): D1's job deployed
+    `preview-D1`, a Compose project of its own, with its URL; D1 v2 updated it in place; landing
+    D1 marked its deployment inactive, and its runner took the containers down. A push's job
+    naming the preview failed, saying why. The board and the preview's page in Chromium and
+    WebKit, desktop and phone (`ci/ui/environments_check.mjs`).
+- *Left.* A `microvm` environment's deployments on shards (W13's shards); cd.md's previews, an
+  app of each change in a `kubernetes` preview (CD's); AC02, AC03's other parts and AC05, which
+  need the live cluster (W22-AC05). AC03's `container` and `microvm` parts and AC04 are checked
+  here.
 
 ### W16 Test results, flaky tests and benchmarks
 
@@ -5083,7 +5113,7 @@ Firecracker microVMs, R01 in `k8s` pods, and R06. R03 is W06-R13's debug reruns.
   goes on). With its input piped, what was sent runs until the shell exits. Checked end to end
   (`w17_r01_kiln_debug_terminal`): a command piped into a running leg's terminal read its job's
   environment, and the terminal ended with the shell.
-- *Left*: terminals in microVMs and on k8s (with W13's executors).
+- *Left*: R01, R02 and R04 in shards' sandboxes, with the `shards` executor (W13-R06).
 
 ### W18 Supply chain and untrusted code
 

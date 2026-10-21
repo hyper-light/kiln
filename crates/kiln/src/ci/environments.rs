@@ -110,6 +110,99 @@ pub struct EnvDef {
     pub agents_approve: bool,
     /// At most this many of its deployments at once (W15-R01); the rest wait their turn.
     pub concurrency: Option<u32>,
+    /// A preview's (W15-R07): what it was made from and for, and until when it lasts.
+    pub preview: Option<Preview>,
+}
+
+/// A preview environment (W15-R07), as the board and the API show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Preview {
+    /// Its `previews:` entry: the name its jobs give `environment:`.
+    pub template: String,
+    /// What it's for, as people read it: `D12`, `CR7`, `#42`, or a stack's lowest diff.
+    pub of: String,
+    /// `diff`, `stack`, `change_request` or `pull_request`.
+    pub kind: &'static str,
+    pub created_at: i64,
+    /// Removed then, unless it's deployed again first.
+    pub expires_at: i64,
+    /// When it was removed, and why (`D12 landed`): it's kept an hour for its change's closing
+    /// runs.
+    pub removed_at: Option<i64>,
+    pub removed: Option<String>,
+}
+
+/// One of `.kiln/environments.yaml`'s `previews:` (W15-R07): the environment each preview it makes
+/// is (`def`: its kind and targets, protection, URL and concurrency), and which changes get one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Template {
+    /// What jobs give `environment:` to deploy to their change's preview.
+    pub name: String,
+    pub def: EnvDef,
+    /// One for each diff, rather than one for each stack, at its top diff.
+    pub per_diff: bool,
+    /// Kiln's diffs (and stacks) get one.
+    pub diffs: bool,
+    /// Pull requests get one: change requests and a host's.
+    pub pull_requests: bool,
+    /// How long one lasts after it was last deployed, in seconds.
+    pub ttl: i64,
+}
+
+/// A preview's default life after its last deployment: three days.
+pub const PREVIEW_TTL: i64 = 72 * 3600;
+
+/// One of `previews:` in `.kiln/environments.yaml`: an environment's keys, and what previews it
+/// makes.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileTemplate {
+    #[serde(flatten)]
+    env: FileEnv,
+    /// `stack` (the default) or `diff`.
+    per: Option<String>,
+    /// `diff`, `pull_request`, or both (the default).
+    on: Option<serde_yaml::Value>,
+    /// `72h` (the default), `7d`.
+    ttl: Option<String>,
+}
+
+impl FileTemplate {
+    /// The template, or why it can't be used.
+    fn template(self, repo: &str, name: &str) -> Result<Template, String> {
+        let per_diff = match self.per.as_deref().map(str::trim) {
+            None | Some("stack") => false,
+            Some("diff") => true,
+            Some(other) => return Err(format!("`per: {other}`: a preview is made per `stack` (the default) or per `diff`")),
+        };
+        let on: Vec<String> = match &self.on {
+            None => vec!["diff".into(), "pull_request".into()],
+            Some(serde_yaml::Value::String(s)) => vec![s.trim().to_owned()],
+            Some(serde_yaml::Value::Sequence(l)) => l.iter().map(|v| v.as_str().map(|s| s.trim().to_owned()).ok_or("`on` lists `diff` and `pull_request`")).collect::<Result<_, _>>()?,
+            Some(_) => return Err("`on` is `diff`, `pull_request`, or both".into()),
+        };
+        if let Some(bad) = on.iter().find(|o| !matches!(o.as_str(), "diff" | "pull_request")) {
+            return Err(format!("`on: {bad}`: previews are made for a `diff` (and its stack) or a `pull_request`"));
+        }
+        let ttl = match self.ttl.as_deref() {
+            None => PREVIEW_TTL,
+            Some(t) => kiln_ci::trigger::cron::seconds(t).and_then(|s| i64::try_from(s).ok()).filter(|s| *s > 0).ok_or_else(|| format!("`ttl: {t}` is a duration (`72h`, `7d`)"))?,
+        };
+        self.env.protection.check()?;
+        let (kind, targets) = self.env.kind(repo, name);
+        let def = EnvDef {
+            name: name.to_owned(),
+            protection: self.env.protection,
+            url: self.env.url,
+            kind,
+            targets,
+            source: "file".into(),
+            agents_approve: self.env.agents.approve,
+            concurrency: self.env.concurrency.filter(|n| *n > 0),
+            preview: None,
+        };
+        Ok(Template { name: name.to_owned(), def, per_diff, diffs: on.iter().any(|o| o == "diff"), pull_requests: on.iter().any(|o| o == "pull_request"), ttl })
+    }
 }
 
 /// One environment's CI keys in `.kiln/environments.yaml`; the rest are CD's (`clusters` is
@@ -164,7 +257,13 @@ struct FileAgents {
 }
 
 const FRESH: Duration = Duration::from_secs(20);
-type Cached = HashMap<String, (Instant, BTreeMap<String, EnvDef>)>;
+/// Trunk's file, read: its environments and its `previews:`, by lower-cased name.
+#[derive(Clone, Default)]
+struct FromFile {
+    envs: BTreeMap<String, EnvDef>,
+    previews: BTreeMap<String, Template>,
+}
+type Cached = HashMap<String, (Instant, FromFile)>;
 static FILES: Mutex<Option<Cached>> = Mutex::new(None);
 
 fn internal(e: anyhow::Error) -> Fail {
@@ -175,25 +274,51 @@ fn bad(m: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, m.into())
 }
 
-/// Trunk's environments (cached for a few seconds); none when there is no file or it can't be
-/// read (which is logged).
-async fn from_file(hub: &Hub, repo: &Repo) -> BTreeMap<String, EnvDef> {
+/// Trunk's environments and `previews:` (cached for a few seconds); none when there is no file or
+/// it can't be read (which is logged). `previews` is that key's, never an environment's name.
+async fn from_file(hub: &Hub, repo: &Repo) -> FromFile {
     if let Some((at, m)) = FILES.lock().get_or_insert_with(HashMap::new).get(&repo.id)
         && at.elapsed() < FRESH
     {
         return m.clone();
     }
-    let mut out = BTreeMap::new();
+    let mut out = FromFile::default();
     if let Some((name, text)) = super::repo_config::trunk_file(hub, repo, &[".kiln/environments.yaml", ".kiln/environments.yml"]).await {
-        match serde_yaml::from_slice::<BTreeMap<String, FileEnv>>(&text) {
-            Ok(m) => {
+        let read = serde_yaml::from_slice::<serde_yaml::Mapping>(&text).and_then(|mut m| {
+            let previews = m.remove("previews");
+            Ok((serde_yaml::from_value::<BTreeMap<String, FileEnv>>(serde_yaml::Value::Mapping(m))?, previews.map(serde_yaml::from_value::<BTreeMap<String, FileTemplate>>).transpose()?))
+        });
+        match read {
+            Ok((m, previews)) => {
                 for (env, f) in m {
                     if let Err(e) = f.protection.check() {
                         tracing::warn!(repo = %repo.name, file = name, environment = env, error = e, "an environment's protection can't be used; it has none");
                     }
                     let (kind, targets) = f.kind(&repo.name, &env);
                     let protection = if f.protection.check().is_ok() { f.protection } else { Protection::default() };
-                    out.insert(env.to_ascii_lowercase(), EnvDef { name: env, protection, url: f.url, kind, targets, source: "file".into(), agents_approve: f.agents.approve, concurrency: f.concurrency.filter(|n| *n > 0) });
+                    out.envs.insert(
+                        env.to_ascii_lowercase(),
+                        EnvDef {
+                            name: env,
+                            protection,
+                            url: f.url,
+                            kind,
+                            targets,
+                            source: "file".into(),
+                            agents_approve: f.agents.approve,
+                            concurrency: f.concurrency.filter(|n| *n > 0),
+                            preview: None,
+                        },
+                    );
+                }
+                for (t, f) in previews.unwrap_or_default() {
+                    match f.template(&repo.name, &t) {
+                        Ok(p) if !t.contains('/') && t.trim() == t && !t.is_empty() => {
+                            out.previews.insert(t.to_ascii_lowercase(), p);
+                        }
+                        Ok(_) => tracing::warn!(repo = %repo.name, file = name, preview = t, "a preview's name is an environment's: without slashes or surrounding spaces"),
+                        Err(e) => tracing::warn!(repo = %repo.name, file = name, preview = t, error = e, "a preview can't be used"),
+                    }
                 }
             }
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's environments can't be read"),
@@ -203,9 +328,18 @@ async fn from_file(hub: &Hub, repo: &Repo) -> BTreeMap<String, EnvDef> {
     out
 }
 
+/// Trunk's `previews:` (W15-R07), by lower-cased name.
+pub async fn templates(hub: &Hub, repo: &Repo) -> BTreeMap<String, Template> {
+    from_file(hub, repo).await.previews
+}
+
 /// Every environment of a repository, by lower-cased name: trunk's file, then kiln's own.
 pub async fn defs(hub: &Hub, repo: &Repo) -> anyhow::Result<BTreeMap<String, EnvDef>> {
-    let mut out = from_file(hub, repo).await;
+    let FromFile { envs: mut out, previews } = from_file(hub, repo).await;
+    // Its previews (W15-R07), each as its template says.
+    for (key, d) in super::previews::defs(hub, repo, &previews).await? {
+        out.entry(key).or_insert(d);
+    }
     let id = repo.id.clone();
     type Row = (String, String, Option<String>, String, Option<i64>, Option<String>, String);
     let rows: Vec<Row> = hub
@@ -220,7 +354,7 @@ pub async fn defs(hub: &Hub, repo: &Repo) -> anyhow::Result<BTreeMap<String, Env
         let protection: Protection = serde_json::from_str(&protection).unwrap_or_default();
         let concurrency = concurrency.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
         let targets: Targets = serde_json::from_str(&targets).unwrap_or_default();
-        out.entry(name.to_ascii_lowercase()).or_insert(EnvDef { name, protection, url, kind, targets, source, agents_approve: false, concurrency });
+        out.entry(name.to_ascii_lowercase()).or_insert(EnvDef { name, protection, url, kind, targets, source, agents_approve: false, concurrency, preview: None });
     }
     Ok(out)
 }
@@ -240,7 +374,17 @@ pub async fn ensure(hub: &Hub, repo: &Repo, name: &str) -> anyhow::Result<EnvDef
             Ok(())
         })
         .await?;
-    Ok(EnvDef { name: name.to_owned(), protection: Protection::default(), url: None, kind: None, targets: Targets::default(), source: "run".into(), agents_approve: false, concurrency: None })
+    Ok(EnvDef {
+        name: name.to_owned(),
+        protection: Protection::default(),
+        url: None,
+        kind: None,
+        targets: Targets::default(),
+        source: "run".into(),
+        agents_approve: false,
+        concurrency: None,
+        preview: None,
+    })
 }
 
 /// The reviews of a run's deployments to `env`.
@@ -303,7 +447,7 @@ async fn repo_of(hub: &Hub, q: &HashMap<String, String>) -> Result<Repo, Fail> {
 }
 
 fn env_json(d: &EnvDef, latest: Option<Value>) -> Value {
-    json!({ "name": d.name, "source": d.source, "kind": d.kind, "targets": d.targets, "protection": d.protection, "url": d.url, "agents_can_approve": d.agents_approve, "concurrency": d.concurrency, "latest_deployment": latest })
+    json!({ "name": d.name, "source": d.source, "kind": d.kind, "targets": d.targets, "protection": d.protection, "url": d.url, "agents_can_approve": d.agents_approve, "concurrency": d.concurrency, "preview": d.preview, "latest_deployment": latest })
 }
 
 /// The latest deployment of each environment of a repository, by lower-cased name.
@@ -383,7 +527,7 @@ async fn starter(hub: &Hub, repo: &Repo, caller: Option<&Caller>, by: &str) -> R
             kept.push(d.name.clone());
             continue;
         }
-        let d = EnvDef { name: name.to_owned(), protection, url: None, kind: None, targets: Targets::default(), source: "kiln".into(), agents_approve: false, concurrency: None };
+        let d = EnvDef { name: name.to_owned(), protection, url: None, kind: None, targets: Targets::default(), source: "kiln".into(), agents_approve: false, concurrency: None, preview: None };
         save(hub, repo, &d, by).await.map_err(internal)?;
         made.push(name.to_owned());
     }
@@ -498,7 +642,7 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
             let kind = b.kind.map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty());
             let targets = b.targets.unwrap_or_default().of(kind.as_deref());
             check_kind(kind.as_deref(), &targets).map_err(bad)?;
-            let d = EnvDef { name, protection, url: b.url, kind, targets, source: "kiln".into(), agents_approve: false, concurrency: b.concurrency };
+            let d = EnvDef { name, protection, url: b.url, kind, targets, source: "kiln".into(), agents_approve: false, concurrency: b.concurrency, preview: None };
             save(hub, &repo, &d, &by).await.map_err(internal)?;
             let mut v = env_json(&d, None);
             let (diagnostics, preview) = effect(hub, &repo, &d).await;
@@ -509,6 +653,11 @@ pub async fn route(hub: &Hub, method: &Method, tail: &[&str], q: &HashMap<String
             Ok(srv::json(if *method == Method::POST { StatusCode::CREATED } else { StatusCode::OK }, &v))
         }
         (&Method::DELETE, [name]) => {
+            // A preview goes as it would when its change closes (W15-R07): its deployments too.
+            if super::previews::end(hub, &repo, name, &format!("{by} removed it")).await.map_err(internal)? {
+                hub.store.audit(by, "ci.environments.delete".into(), format!("{} {name}", repo.name)).await;
+                return Ok(srv::status(StatusCode::NO_CONTENT));
+            }
             let (id, n) = (repo.id.clone(), (*name).to_owned());
             let gone = hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_environments WHERE repo_id = ?1 AND name = ?2 COLLATE NOCASE", params![id, n])?)).await.map_err(internal)?;
             if gone == 0 {
@@ -820,6 +969,7 @@ mod tests {
             source: "file".into(),
             agents_approve: agents,
             concurrency: None,
+            preview: None,
         }
     }
 

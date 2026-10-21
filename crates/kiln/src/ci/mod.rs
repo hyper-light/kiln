@@ -37,6 +37,7 @@ pub mod oidc;
 pub mod ops;
 pub mod otel;
 pub mod preview;
+pub mod previews;
 pub mod providers;
 pub mod registry;
 pub mod signing;

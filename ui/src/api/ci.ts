@@ -163,11 +163,25 @@ export interface CiEnvWait {
   queued_at: number | null;
 }
 
+/** A preview environment (W15-R07): what it was made from and for, and until when it lasts or why it went. */
+export interface CiPreview {
+  /** Its `previews:` entry in `.kiln/environments.yaml`: the name its jobs deploy to. */
+  template: string;
+  /** What it's for: `D12`, `CR7`, `#42`, or a stack's lowest diff. */
+  of: string;
+  kind: "diff" | "stack" | "change_request" | "pull_request" | string;
+  created_at: number;
+  expires_at: number;
+  /** Removed (kept an hour for its change's closing runs), and why: `D12 landed`. */
+  removed_at: number | null;
+  removed: string | null;
+}
+
 /** A repository's environment (W15). */
 export interface CiEnvironment {
   name: string;
-  /** `file` (trunk's `.kiln/environments.yaml`), `kiln` (made here), `run` (named by a job). */
-  source: "file" | "kiln" | "run" | string;
+  /** `file` (trunk's `.kiln/environments.yaml`), `kiln` (made here), `run` (named by a job), `preview` (one of the file's `previews:`, W15-R07). */
+  source: "file" | "kiln" | "run" | "preview" | string;
   kind: CiEnvKind | null;
   targets: CiEnvTargets;
   protection: CiProtection;
@@ -175,6 +189,7 @@ export interface CiEnvironment {
   agents_can_approve: boolean;
   concurrency: number | null;
   latest_deployment: CiDeployment | null;
+  preview?: CiPreview | null;
   /** On the board and one environment's page. */
   repo?: string;
   waiting?: CiEnvWait[];

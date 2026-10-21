@@ -6,6 +6,8 @@
 // - an environment's page: its kind changed in place (host to container, and back), saved and
 //   read again; the file's environment read-only; production's wait, its empty history and its
 //   secrets;
+// - a diff's preview (W15-R07): its row on the board, saying what it's for and when it goes, and
+//   its page, its settings its template's, with Remove;
 // each page with W21-AC01's two asserts (layout.mjs) and a screenshot.
 //
 //     docker run --rm --network host -e ENVS="$(cat /tmp/envs.json)" \
@@ -109,6 +111,21 @@ for (const [name, type, phone] of [
         check(who, "the file's environment is changed in the file", await until(async () => /Defined in .kiln\/environments.yaml on the trunk/.test(await text(page.locator("main")))));
         check(who, "and isn't saved here", (await page.getByRole("button", { name: "Save cluster" }).count()) === 0);
         await checkLayout(check, `${who}: the file's environment`, page);
+      });
+
+      await flow(`${who}: a preview`, async () => {
+        await page.goto(`${cfg.base}/deployments/environments`);
+        const rows = page.getByRole("list", { name: `${cfg.repo}'s environments` });
+        const row = rows.getByRole("listitem").filter({ has: page.getByRole("link", { name: cfg.preview, exact: true }) });
+        check(who, "the diff's preview, a row of its own", await until(async () => new RegExp(`Preview of ${cfg.diff} · goes in`).test(await text(row))), await text(row));
+        check(who, "what it's for, linked to its review", (await row.getByRole("link", { name: cfg.diff, exact: true }).getAttribute("href")) === `/review/${cfg.diff}`);
+        await page.goto(envUrl(cfg.preview));
+        const main = page.locator("main");
+        check(who, "its page: what it's for", await until(async () => new RegExp(`For Preview of ${cfg.diff}`).test(await text(page.locator("dl.facts")))), await text(page.locator("dl.facts")));
+        check(who, "its settings its template's, in the file", await until(async () => /Made from preview in .kiln\/environments.yaml's previews on the trunk/.test(await text(main))));
+        check(who, "and it's removed here", (await page.getByRole("button", { name: `Remove ${cfg.preview}` }).count()) === 1);
+        await checkLayout(check, `${who}: a preview`, page);
+        await shot("environment-preview");
       });
 
       await flow(`${who}: production`, async () => {
