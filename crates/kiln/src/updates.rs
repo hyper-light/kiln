@@ -20,7 +20,7 @@
 //! Jobs live in memory (the latest few) and reach the UI as `update_job` events; `updates`
 //! events say the overview changed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -168,6 +168,9 @@ pub struct Updates {
     waits: Mutex<Option<Waits>>,
     /// Every runner on the newest kiln.
     pub fleet: crate::fleet::Fleet,
+    /// The binaries kept for other platforms, by target, as kiln's store of bytes holds them
+    /// ([`load`]).
+    kept: Mutex<HashMap<String, Binary>>,
 }
 
 impl Updates {
@@ -259,28 +262,93 @@ pub fn known_target(target: &str) -> bool {
 
 // ------------------------------------------------------------------ binaries kept here
 
-/// Binaries uploaded here or fetched from a release live in `<data>/binaries`.
-fn store_dir(hub: &Hub) -> PathBuf {
-    hub.cfg.server.data_dir.join("binaries")
+/// Binaries uploaded here, fetched from a release or built are kept in kiln's store of bytes
+/// (docs/blobs.md): the binary at `binaries/kiln-<target>`, what kiln knows of it at
+/// `binaries/kiln-<target>.json`. They were `<data>/binaries/kiln-<target>` and its `.json`; the
+/// local store takes those where they lie ([`take_in`]).
+pub fn binary_key(target: &str) -> String {
+    format!("binaries/kiln-{target}")
 }
 
-fn stored_path(hub: &Hub, target: &str) -> PathBuf {
-    store_dir(hub).join(format!("kiln-{target}"))
+fn meta_key(target: &str) -> String {
+    format!("binaries/kiln-{target}.json")
 }
 
-fn meta_path(hub: &Hub, target: &str) -> PathBuf {
-    store_dir(hub).join(format!("kiln-{target}.json"))
+/// Where binaries were kept before they were in kiln's store of bytes.
+fn old_dir(cfg: &crate::config::Config) -> PathBuf {
+    cfg.server.data_dir.join("binaries")
 }
 
-/// The binary kept here for `target`, if any (and still whole).
-pub fn stored(hub: &Hub, target: &str) -> Option<(PathBuf, Binary)> {
-    if !known_target(target) {
-        return None;
+/// The binary kept here for `target`, if any.
+pub fn stored(hub: &Hub, target: &str) -> Option<Binary> {
+    known_target(target).then(|| hub.updates.kept.lock().get(target).cloned()).flatten()
+}
+
+/// Reads what the store keeps of each platform's binary into [`Updates`]: a binary whose bytes
+/// aren't whole there is left out.
+pub async fn load(hub: &Hub) {
+    let blobs = &hub.blobs.blobs;
+    let mut kept = HashMap::new();
+    let mut targets: Vec<&str> = crate::api::RELEASE_TARGETS.to_vec();
+    if !targets.contains(&crate::api::TARGET) {
+        targets.push(crate::api::TARGET);
     }
-    let p = stored_path(hub, target);
-    let meta: Binary = serde_json::from_slice(&std::fs::read(meta_path(hub, target)).ok()?).ok()?;
-    let len = std::fs::metadata(&p).ok()?.len();
-    (len == meta.size).then_some((p, meta))
+    for t in targets {
+        let meta = match crate::blobs::io::get_all(blobs.as_ref(), &meta_key(t), 1 << 20).await {
+            Ok((_, bytes)) => serde_json::from_slice::<Binary>(&bytes).ok(),
+            Err(kiln_seams::blobs::Refusal::NotFound(_)) => None,
+            Err(e) => {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %meta_key(t), error = %e, "a kept binary couldn't be read");
+                None
+            }
+        };
+        let Some(meta) = meta else { continue };
+        match blobs.head(&binary_key(t)).await {
+            Ok(m) if m.size == meta.size && m.etag == meta.sha256 => {
+                kept.insert(t.to_owned(), meta);
+            }
+            Ok(_) | Err(_) => tracing::warn!(target: "kiln.blobs", event = "get", key = %binary_key(t), "a kept binary isn't whole: left out"),
+        }
+    }
+    *hub.updates.kept.lock() = kept;
+}
+
+/// Takes the binaries kept as files before (`<data>/binaries`) into the local store, where they
+/// lie, once: a `.taken` mark says it's done.
+pub async fn take_in(hub: &Hub, local: &crate::blobs::local::LocalBlobs) -> anyhow::Result<()> {
+    let dir = old_dir(&hub.cfg);
+    let mark = dir.join(".taken");
+    if mark.exists() || !dir.is_dir() {
+        return Ok(());
+    }
+    let d = dir.clone();
+    let files = crate::rt::blocking(move || -> anyhow::Result<Vec<(String, PathBuf, Option<String>)>> {
+        let mut out = Vec::new();
+        for t in crate::api::RELEASE_TARGETS.iter().copied().chain([crate::api::TARGET]) {
+            let (bin, meta) = (d.join(format!("kiln-{t}")), d.join(format!("kiln-{t}.json")));
+            let Some(m) = std::fs::read(&meta).ok().and_then(|b| serde_json::from_slice::<Binary>(&b).ok()) else { continue };
+            if std::fs::metadata(&bin).is_ok_and(|md| md.len() == m.size) && !out.iter().any(|(k, _, _): &(String, PathBuf, Option<String>)| *k == binary_key(t)) {
+                out.push((binary_key(t), bin, Some(m.sha256.clone())));
+                out.push((meta_key(t), meta, None));
+            }
+        }
+        Ok(out)
+    })
+    .await??;
+    let taken = local.adopt(files).await?;
+    let m = mark.clone();
+    crate::rt::blocking(move || std::fs::write(&m, format!("{taken} taken\n"))).await??;
+    if taken > 0 {
+        tracing::info!(target: "kiln.blobs", event = "adopt", taken, "runner binaries from before taken in where they lie");
+    }
+    Ok(())
+}
+
+/// The binary kept for `target` as a stream, with what kiln knows of it.
+pub fn stream(hub: &Hub, target: &str) -> Option<(Binary, async_channel::Receiver<bytes::Bytes>)> {
+    let b = stored(hub, target)?;
+    let rx = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(target), 0, b.size.saturating_sub(1));
+    Some((b, rx))
 }
 
 /// It looks like an executable kiln could hand out (ELF, Mach-O or PE).
@@ -289,18 +357,14 @@ fn executable(bytes: &[u8]) -> bool {
 }
 
 /// Keep `bytes` as the binary for `target` (an upload, or a release download).
-pub fn store(hub: &Hub, target: &str, bytes: &[u8], origin: &str) -> anyhow::Result<Binary> {
-    keep(&store_dir(hub), target, bytes, origin, None)
+pub async fn store(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, bytes, origin, None, None).await
 }
 
 /// Keep the binary `machine` built of `commit` for its own platform (`crate::fleet`): what the
 /// other machines of the platform download.
-pub fn keep_built(hub: &Hub, target: &str, bytes: &[u8], machine: &str, commit: &str) -> anyhow::Result<Binary> {
-    let mut b = keep(&store_dir(hub), target, bytes, "machine", None)?;
-    b.sha = Some(commit.to_ascii_lowercase());
-    b.by = Some(machine.to_owned());
-    std::fs::write(meta_path(hub, target), serde_json::to_vec(&b)?)?;
-    Ok(b)
+pub async fn keep_built(hub: &Hub, target: &str, bytes: Vec<u8>, machine: &str, commit: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, bytes, "machine", None, Some((machine.to_owned(), commit.to_ascii_lowercase()))).await
 }
 
 /// Whether a run's binaries become what runners upgrade to: kiln's own release pipeline, built
@@ -318,8 +382,18 @@ pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run, own: &str) ->
 /// binaries each other platform's runners upgrade to. This server's own platform keeps its own
 /// build from a run of the server's commit; a run of a newer one (`crate::fleet`) brings that
 /// platform's too.
-pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
-    let dir = cfg.server.data_dir.join("binaries");
+pub async fn adopt_into(hub: &Hub, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
+    let (a, r) = (artifacts.to_path_buf(), run.clone());
+    let found = crate::rt::blocking(move || binaries_in(&a, &r)).await??;
+    let mut kept = Vec::new();
+    for (target, bytes) in found {
+        kept.push(keep(hub, &target, bytes, "built", Some((run.number, run.sha.clone())), None).await?);
+    }
+    Ok(kept)
+}
+
+/// The binaries in a release run's artifacts, by target, as [`adopt_into`] takes them.
+fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     use std::io::Read as _;
     let mut archive = tar::Archive::new(std::fs::File::open(artifacts).with_context(|| format!("open {}", artifacts.display()))?);
     let mut kept = Vec::new();
@@ -333,8 +407,7 @@ pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::st
         }
         let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
         entry.read_to_end(&mut bytes)?;
-        let target = target.to_owned();
-        kept.push(keep(&dir, &target, &bytes, "built", Some((run.number, run.sha.clone())))?);
+        kept.push((target.to_owned(), bytes));
     }
     Ok(kept)
 }
@@ -368,7 +441,7 @@ pub struct InStep {
 pub fn in_step(hub: &Hub, commit: &str) -> InStep {
     let own = commit.eq_ignore_ascii_case(crate::api::COMMIT);
     let others: Vec<&str> = crate::api::RELEASE_TARGETS.iter().copied().filter(|t| !(own && *t == crate::api::TARGET)).collect();
-    let kept: Vec<Binary> = others.iter().filter_map(|t| stored(hub, t).map(|(_, b)| b)).collect();
+    let kept: Vec<Binary> = others.iter().filter_map(|t| stored(hub, t)).collect();
     let mut s = in_step_of(&others, &kept, commit);
     if !own && !kept.iter().any(|b| b.target == crate::api::TARGET) && !s.behind.iter().any(|t| t == crate::api::TARGET) {
         s.behind.push(crate::api::TARGET.to_owned());
@@ -504,30 +577,37 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
     }
 }
 
-/// Keeps `bytes` as the binary for `target` in `dir` (`<data>/binaries`).
-fn keep(dir: &Path, target: &str, bytes: &[u8], origin: &str, built: Option<(i64, String)>) -> anyhow::Result<Binary> {
+/// Keeps `bytes` as the binary for `target` in kiln's store of bytes: the binary, then what kiln
+/// knows of it; a release run's (`built`), or a machine's own build (`by`: the machine and commit).
+async fn keep(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str, built: Option<(i64, String)>, by: Option<(String, String)>) -> anyhow::Result<Binary> {
     anyhow::ensure!(known_target(target), "kiln has no platform called {target}");
     anyhow::ensure!(bytes.len() > 1 << 20, "that file is too small to be a kiln binary");
-    anyhow::ensure!(executable(bytes), "that file is not an executable (ELF, Mach-O or PE)");
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let tmp = dir.join(format!(".kiln-{target}.part"));
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    crate::os::make_executable(&tmp)?;
-    std::fs::rename(&tmp, dir.join(format!("kiln-{target}")))?;
-    let sha256 = hex::encode(Sha256::digest(bytes));
+    anyhow::ensure!(executable(&bytes), "that file is not an executable (ELF, Mach-O or PE)");
+    let size = bytes.len() as u64;
+    let blobs = &hub.blobs.blobs;
+    let kept = blobs.put(&binary_key(target), bytes, kiln_seams::blobs::Put::default()).await.map_err(|e| anyhow::anyhow!("keeping the binary for {target}: {e}"))?;
     let (run, sha) = built.map_or((None, None), |(n, s)| (Some(n), Some(s)));
-    let meta = Binary { target: target.to_owned(), build: build_id(&sha256), sha256, size: bytes.len() as u64, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
-    std::fs::write(dir.join(format!("kiln-{target}.json")), serde_json::to_vec(&meta)?)?;
+    let mut meta = Binary { target: target.to_owned(), build: build_id(&kept.etag), sha256: kept.etag, size, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
+    if let Some((machine, commit)) = by {
+        meta.sha = Some(commit);
+        meta.by = Some(machine);
+    }
+    blobs.put(&meta_key(target), serde_json::to_vec(&meta)?, kiln_seams::blobs::Put::default()).await.map_err(|e| anyhow::anyhow!("keeping what kiln knows of the binary for {target}: {e}"))?;
+    hub.updates.kept.lock().insert(target.to_owned(), meta.clone());
     Ok(meta)
 }
 
 /// Forget the binary kept for `target`.
-pub fn unstore(hub: &Hub, target: &str) -> bool {
+pub async fn unstore(hub: &Hub, target: &str) -> bool {
     if !known_target(target) {
         return false;
     }
-    let had = std::fs::remove_file(meta_path(hub, target)).is_ok();
-    let _ = std::fs::remove_file(stored_path(hub, target));
+    let had = hub.updates.kept.lock().remove(target).is_some();
+    for k in [meta_key(target), binary_key(target)] {
+        if let Err(e) = hub.blobs.blobs.delete(&k).await {
+            tracing::warn!(target: "kiln.blobs", event = "collect", key = %k, error = %e, "a binary let go couldn't be deleted");
+        }
+    }
     had
 }
 
@@ -544,7 +624,7 @@ pub fn binaries(hub: &Hub) -> Vec<Binary> {
     }
     for t in targets {
         // An upload already installed here is the server's own binary: listed once.
-        if let Some((_, b)) = stored(hub, t)
+        if let Some(b) = stored(hub, t)
             && !v.iter().any(|x| x.target == b.target && x.sha256 == b.sha256)
         {
             v.push(b);
@@ -587,7 +667,7 @@ pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u
     if target == crate::api::TARGET {
         return own_binary().map_err(|e| anyhow::anyhow!("can't read this server's own binary: {e}"));
     }
-    if let Some((_, b)) = stored(hub, target) {
+    if let Some(b) = stored(hub, target) {
         return Ok((b.sha256, b.size));
     }
     let version = env!("CARGO_PKG_VERSION");
@@ -597,7 +677,7 @@ pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u
             crate::api::TARGET
         );
     };
-    let b = store(hub, target, &bytes, "release")?;
+    let b = store(hub, target, bytes, "release").await?;
     Ok((b.sha256, b.size))
 }
 
@@ -1293,7 +1373,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
             let newest = instances.iter().find(|i| i.newest);
             let build = newest.and_then(|i| i.build.clone());
             let target = target_for(&a.os, &a.arch);
-            let target_build = target.as_deref().and_then(|t| if t == crate::api::TARGET { Some(mine.clone()) } else { stored(hub, t).map(|(_, b)| b.build) });
+            let target_build = target.as_deref().and_then(|t| if t == crate::api::TARGET { Some(mine.clone()) } else { stored(hub, t).map(|b| b.build) });
             RunnerInfo {
                 up_to_date: build.is_some() && build == target_build,
                 method: if newest.is_some_and(|i| i.can_upgrade) { "native" } else { "terminal" },
@@ -1856,7 +1936,7 @@ pub fn server(hub: &Arc<Hub>, force: bool) -> ServerInfo {
         return s;
     }
     let mine = own_binary().ok();
-    let upload = stored(hub, crate::api::TARGET).map(|(_, b)| b).filter(|b| mine.as_ref().is_none_or(|(h, _)| *h != b.sha256));
+    let upload = stored(hub, crate::api::TARGET).filter(|b| mine.as_ref().is_none_or(|(h, _)| *h != b.sha256));
     let replacement = match (&upload, &release) {
         (Some(b), _) => Some(Replacement { origin: "upload", build: Some(b.build.clone()), version: None }),
         (None, r) if r.newer && own_release_target().is_some() => Some(Replacement { origin: "release", build: None, version: r.latest.clone() }),
@@ -1954,8 +2034,8 @@ pub async fn upgrade_server(hub: &Arc<Hub>, action: &str) -> anyhow::Result<Job>
 async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf) -> anyhow::Result<()> {
     let u = &hub.updates;
     let bytes = if r.origin == "upload" {
-        let (src, _) = stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
-        std::fs::read(&src).with_context(|| format!("read {}", src.display()))?
+        stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
+        crate::blobs::io::get_all(hub.blobs.blobs.as_ref(), &binary_key(crate::api::TARGET), MAX_BINARY as u64).await.map_err(|e| anyhow::anyhow!("reading the uploaded binary: {e}"))?.1
     } else {
         let version = r.version.clone().ok_or_else(|| anyhow::anyhow!("no release version"))?;
         let target = own_release_target().ok_or_else(|| anyhow::anyhow!("releases have no build for this platform"))?;
@@ -2474,9 +2554,12 @@ mod tests {
 
     #[test]
     fn the_release_pipelines_binaries_are_kept_for_the_other_platforms() -> anyhow::Result<()> {
+        crate::rt::block_on(async { release_binaries_are_kept().await })
+    }
+
+    async fn release_binaries_are_kept() -> anyhow::Result<()> {
+        let hub = crate::hub::tests::scratch_hub().await?;
         let dir = tempfile::tempdir()?;
-        let mut cfg = crate::config::Config::default();
-        cfg.server.data_dir = dir.path().to_owned();
         let fake = |magic: &[u8]| -> Vec<u8> {
             let mut b = magic.to_vec();
             b.resize(2 << 20, 7);
@@ -2520,7 +2603,7 @@ mod tests {
         };
         // A run of a newer commit than the server's (`crate::fleet`): every platform's, the
         // server's own included.
-        let kept = adopt_into(&cfg, &artifacts, &run)?;
+        let kept = adopt_into(&hub, &artifacts, &run).await?;
         let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
         targets.sort_unstable();
         let mut all = vec!["aarch64-apple-darwin", "x86_64-pc-windows-msvc", crate::api::TARGET];
@@ -2528,11 +2611,16 @@ mod tests {
         all.dedup();
         assert_eq!(targets, all);
         assert!(kept.iter().all(|b| b.origin == "built" && b.run == Some(12) && b.sha.as_deref() == Some("0d21482abcdef")));
-        assert!(dir.path().join("binaries/kiln-aarch64-apple-darwin").exists());
+        // Kept in kiln's store of bytes, and read back as kept when the server starts again.
+        let mac = hub.blobs.blobs.head(&binary_key("aarch64-apple-darwin")).await?;
+        assert_eq!((mac.size, Some(mac.etag)), (2 << 20, stored(&hub, "aarch64-apple-darwin").map(|b| b.sha256)));
+        hub.updates.kept.lock().clear();
+        load(&hub).await;
+        assert_eq!(stored(&hub, "aarch64-apple-darwin").map(|b| b.run), Some(Some(12)));
         // A run of the server's own commit: its platform keeps the server's own build.
         if !crate::api::COMMIT.is_empty() {
             let own = crate::store::Run { sha: crate::api::COMMIT.to_owned(), ..run };
-            let kept = adopt_into(&cfg, &artifacts, &own)?;
+            let kept = adopt_into(&hub, &artifacts, &own).await?;
             let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
             targets.sort_unstable();
             let others: Vec<&str> = OTHERS.into_iter().filter(|t| *t != crate::api::TARGET).collect();

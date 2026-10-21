@@ -11,6 +11,7 @@
 
 pub mod activity;
 pub mod blobs;
+pub mod contents;
 pub mod disk;
 pub mod git;
 pub mod group;

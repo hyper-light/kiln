@@ -249,7 +249,8 @@ impl Hub {
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock));
-        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
+        let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
+        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
         Ok(Arc::new(Self {
@@ -316,18 +317,16 @@ impl Hub {
         if !path.exists() {
             return;
         }
-        let (cfg, run_c) = (self.cfg.clone(), run.clone());
-        let adopted = crate::rt::blocking(move || crate::updates::adopt_into(&cfg, &path, &run_c)).await;
-        match adopted {
-            Ok(Ok(kept)) if !kept.is_empty() => {
+        match crate::updates::adopt_into(self, &path, run).await {
+            Ok(kept) if !kept.is_empty() => {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
                 self.emit(&serde_json::json!({ "type": "updates" }));
                 self.updates.fleet.wake();
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) | Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
         }
     }
 

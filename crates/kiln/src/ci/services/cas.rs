@@ -1,32 +1,33 @@
-//! The content-addressed store (docs/ci.md W08-R01). Objects are cut into content-defined
-//! chunks (`kiln_ci::store::cdc`). Each chunk is stored once, under its SHA-256, at
-//! `<data>/cas/chunks/<2 hex>/<2 hex>/<digest>`, and an object is its chunk list
-//! (`cas_objects`). Two versions of a large object share every chunk the change didn't touch,
-//! and the same content saved twice (one cache under two keys, an artifact uploaded again) is
-//! stored once.
+//! The content-addressed store (docs/ci.md W08-R01), behind kiln's `Blobs` (docs/blobs.md,
+//! CP-T10.1): an object is named by its content's SHA-256 and kept at `cas/<digest>` in the store
+//! `[blobs]` names, so the same content saved twice (one cache under two keys, an artifact uploaded
+//! again) is kept once. In the local store it's cut into content-defined chunks
+//! (`crate::blobs::chunks`): two versions of a large object share every chunk the change didn't
+//! touch.
 //!
-//! Content arrives in a file, assembled from an upload's parts, and is chunked from there. Reads
-//! stream any byte range. [`collect`] removes objects nothing refers to, and chunks no object
-//! uses.
+//! `cas_index` records the objects kept, whichever store holds them, so a lookup asks the store
+//! nothing and [`collect`] finds what nothing refers to without listing the store. Content arrives in
+//! a file, assembled from an upload's parts in [`staging`], and goes up from there; reads stream any
+//! byte range, a piece at a time.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use bytes::Bytes;
-use kiln_ci::store::cdc::{self, Cdc};
-use rusqlite::{OptionalExtension, params};
-use sha2::{Digest as _, Sha256};
+use kiln_seams::blobs::{Cond, Refusal};
+use parking_lot::Mutex;
+use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 
 use crate::hub::Hub;
 
-/// Bytes a read sends at a time.
-const READ_PIECE: usize = 1 << 20;
-/// Chunks and objects younger than this are never collected: an upload may be about to use them.
+/// An object put or found is never collected sooner than this: an upload may be about to refer to it.
 const GRACE: Duration = Duration::from_secs(3600);
+/// Objects one collection lets go, at most.
+const COLLECT_MAX: usize = 100_000;
+/// Locks objects are taken and let go under, by digest.
+const STRIPES: usize = 64;
 
 /// A stored object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,327 +35,267 @@ pub struct Object {
     /// SHA-256 of the content, hex.
     pub digest: String,
     pub size: u64,
-    /// Chunk digests and sizes, in order.
-    pub chunks: Vec<(String, u64)>,
 }
 
-/// `<data>/cas`.
+/// `<data>/cas`: where uploads are assembled, and the local store keeps its chunks.
 pub fn root(hub: &Hub) -> PathBuf {
     hub.cfg.data("cas")
 }
 
-/// Where uploads are assembled before they are chunked in.
+/// Where uploads are assembled before they go into the store.
 pub fn staging(hub: &Hub) -> PathBuf {
     root(hub).join("staging")
 }
 
-fn chunk_path(root: &Path, digest: &str) -> PathBuf {
-    root.join("chunks").join(digest.get(0..2).unwrap_or("00")).join(digest.get(2..4).unwrap_or("00")).join(digest)
+/// The key an object is kept at.
+pub fn key(digest: &str) -> String {
+    format!("cas/{digest}")
 }
 
-fn hex(d: &[u8]) -> String {
-    hex::encode(d)
+/// What taking an object in and letting one go are serialized by, a digest at a time: a collection
+/// never lets go of an object a put has just found, nor one whose upload is under way.
+struct Guard {
+    stripes: Vec<async_lock::Mutex<()>>,
+    /// Objects being uploaded now, by digest (as many as uploads under way).
+    uploading: Mutex<HashSet<String>>,
 }
 
-/// Writes a chunk unless it is stored; returns the bytes newly written. A stored chunk is
-/// touched, so collection leaves it alone while this upload records its object.
-fn keep_chunk(root: &Path, digest: &str, data: &[u8]) -> std::io::Result<u64> {
-    let p = chunk_path(root, digest);
-    if p.is_file() {
-        if let Ok(f) = File::options().write(true).open(&p) {
-            let _ = f.set_modified(SystemTime::now());
-        }
-        return Ok(0);
+static GUARD: LazyLock<Guard> = LazyLock::new(|| Guard { stripes: (0..STRIPES).map(|_| async_lock::Mutex::new(())).collect(), uploading: Mutex::default() });
+
+fn stripe(digest: &str) -> &'static async_lock::Mutex<()> {
+    let n = digest.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b))) % STRIPES;
+    // `n` is below STRIPES, the length.
+    GUARD.stripes.get(n).unwrap_or_else(|| first_stripe())
+}
+
+fn first_stripe() -> &'static async_lock::Mutex<()> {
+    static ONE: LazyLock<async_lock::Mutex<()>> = LazyLock::new(|| async_lock::Mutex::new(()));
+    GUARD.stripes.first().unwrap_or(&ONE)
+}
+
+/// An upload under way, so a collection leaves its object alone; gone with it.
+struct Uploading(String);
+
+impl Uploading {
+    fn start(digest: &str) -> Self {
+        GUARD.uploading.lock().insert(digest.to_owned());
+        Self(digest.to_owned())
     }
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = p.with_extension(format!("{}.tmp", crate::util::new_id()));
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, &p)?;
-    Ok(u64::try_from(data.len()).unwrap_or(u64::MAX))
 }
 
-/// Chunks a file into the store, on this thread: returns the object and the bytes of chunks
-/// that were new.
-pub fn put_file_blocking(root: &Path, path: &Path) -> std::io::Result<(Object, u64)> {
-    let mut f = File::open(path)?;
-    let mut whole = Sha256::new();
-    let mut cdc = Cdc::new();
-    let mut pending: Vec<u8> = Vec::with_capacity(cdc::MAX * 2);
-    let mut start = 0usize;
-    let mut buf = vec![0u8; 4 << 20];
-    let (mut chunks, mut fresh, mut size) = (Vec::new(), 0u64, 0u64);
-    let mut eof = false;
-    loop {
-        // Keep at least a maximal chunk ahead of the scan, unless the file has ended.
-        while !eof && pending.len() - start < cdc::MAX {
-            if start > 0 {
-                pending.drain(..start);
-                start = 0;
-            }
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                eof = true;
-            } else {
-                let got = buf.get(..n).unwrap_or_default();
-                whole.update(got);
-                pending.extend_from_slice(got);
-                size += u64::try_from(n).unwrap_or(0);
-            }
-        }
-        let rest = pending.get(start..).unwrap_or_default();
-        match cdc.next(rest, eof) {
-            Some(cut) if cut > 0 => {
-                let chunk = rest.get(..cut).unwrap_or_default();
-                let digest = hex(&Sha256::digest(chunk));
-                fresh += keep_chunk(root, &digest, chunk)?;
-                chunks.push((digest, u64::try_from(cut).unwrap_or(0)));
-                start += cut;
-            }
-            _ => break,
-        }
+impl Drop for Uploading {
+    fn drop(&mut self) {
+        GUARD.uploading.lock().remove(&self.0);
     }
-    Ok((Object { digest: hex(&whole.finalize()), size, chunks }, fresh))
 }
 
-/// Chunks a file into the store and records the object; the file is left as it is.
-pub async fn put_file(hub: &Hub, path: &Path) -> anyhow::Result<Object> {
-    let (r, p) = (root(hub), path.to_path_buf());
-    let (obj, fresh) = crate::rt::blocking(move || put_file_blocking(&r, &p)).await??;
-    let o = obj.clone();
+fn refused(e: Refusal) -> anyhow::Error {
+    anyhow::anyhow!("kiln's store of bytes: {e}")
+}
+
+/// The SHA-256 and size of a file.
+fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+    let size = std::fs::metadata(path)?.len();
+    Ok((crate::sync::blobs::hash_file(path)?, size))
+}
+
+/// Records that `digest` is kept, as of now; whether it was recorded before.
+async fn record(hub: &Hub, digest: &str, size: u64) -> anyhow::Result<bool> {
+    let (d, now) = (digest.to_owned(), crate::util::now_unix());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
-            let now = crate::util::now_unix();
-            for (d, n) in &o.chunks {
-                tx.execute("INSERT OR IGNORE INTO cas_chunks (digest, size) VALUES (?1, ?2)", params![d, i64::try_from(*n).unwrap_or(i64::MAX)])?;
-            }
-            let chunks = serde_json::to_string(&o.chunks)?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let was: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM cas_index WHERE digest = ?1)", [&d], |r| r.get(0))?;
             tx.execute(
-                "INSERT INTO cas_objects (digest, size, chunks, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?4)
+                "INSERT INTO cas_index (digest, size, created_at, last_used_at) VALUES (?1, ?2, ?3, ?3)
                  ON CONFLICT (digest) DO UPDATE SET last_used_at = excluded.last_used_at",
-                params![o.digest, i64::try_from(o.size).unwrap_or(i64::MAX), chunks, now],
+                params![d, i64::try_from(size).unwrap_or(i64::MAX), now],
             )?;
             tx.commit()?;
-            Ok(())
-        })
-        .await?;
-    tracing::debug!(object = %obj.digest, size = obj.size, chunks = obj.chunks.len(), new_bytes = fresh, "stored");
-    Ok(obj)
-}
-
-/// An object's chunk list, and a touch of its last use.
-pub async fn object(hub: &Hub, digest: &str) -> anyhow::Result<Option<Object>> {
-    let d = digest.to_owned();
-    hub.store
-        .call(move |c| {
-            let row: Option<(i64, String)> = c.query_row("SELECT size, chunks FROM cas_objects WHERE digest = ?1", [&d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            let Some((size, chunks)) = row else { return Ok(None) };
-            c.execute("UPDATE cas_objects SET last_used_at = ?2 WHERE digest = ?1", params![d, crate::util::now_unix()])?;
-            Ok(Some(Object { digest: d, size: u64::try_from(size).unwrap_or(0), chunks: serde_json::from_str(&chunks)? }))
+            Ok(was)
         })
         .await
 }
 
-/// Streams bytes `[start, end)` of an object. A chunk that can't be read ends the stream early
-/// (the reader sees fewer bytes than it was promised), with a warning.
-pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Receiver<Bytes> {
-    let (tx, rx) = async_channel::bounded::<Bytes>(4);
-    let root = root(hub);
-    let chunks = obj.chunks.clone();
-    let digest = obj.digest.clone();
-    crate::rt::spawn(async move {
-        let mut at = 0u64;
-        for (d, n) in chunks {
-            let (lo, hi) = (at, at.saturating_add(n));
-            at = hi;
-            if hi <= start {
-                continue;
-            }
-            if lo >= end {
-                break;
-            }
-            let path = chunk_path(&root, &d);
-            let file = match File::open(&path) {
-                Ok(f) => Arc::new(f),
-                Err(e) => {
-                    tracing::warn!(object = %digest, chunk = %d, error = %e, "a chunk is missing; the read ends short");
-                    return;
-                }
-            };
-            let (mut off, to) = (start.saturating_sub(lo), end.min(hi) - lo);
-            while off < to {
-                let len = usize::try_from((to - off).min(READ_PIECE as u64)).unwrap_or(READ_PIECE);
-                let f = Arc::clone(&file);
-                let piece = crate::rt::blocking(move || {
-                    let mut buf = vec![0u8; len];
-                    let mut got = 0usize;
-                    while got < len {
-                        let n = crate::os::read_at(&f, buf.get_mut(got..).unwrap_or_default(), off + got as u64)?;
-                        if n == 0 {
-                            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "chunk shorter than recorded"));
-                        }
-                        got += n;
-                    }
-                    Ok::<_, std::io::Error>(buf)
-                })
-                .await;
-                match piece {
-                    Ok(Ok(buf)) => {
-                        if tx.send(Bytes::from(buf)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(object = %digest, chunk = %d, error = %e, "a chunk can't be read; the read ends short");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(object = %digest, error = %format!("{e:#}"), "read stopped");
-                        return;
-                    }
-                }
-                off += len as u64;
+/// Puts a file's content into the store and records it; the file is left as it is. Content kept
+/// already is found and touched, not sent again.
+pub async fn put_file(hub: &Hub, path: &Path) -> anyhow::Result<Object> {
+    let p = path.to_path_buf();
+    let (digest, size) = crate::rt::blocking(move || hash_file(&p)).await??;
+    let object = Object { digest: digest.clone(), size };
+    let blobs = Arc::clone(&hub.blobs.blobs);
+    let uploading = {
+        let _held = stripe(&digest).lock().await;
+        if record(hub, &digest, size).await? {
+            match blobs.head(&key(&digest)).await {
+                Ok(m) if m.size == size => return Ok(object),
+                Ok(_) | Err(Refusal::NotFound(_)) => {}
+                Err(e) => return Err(refused(e)),
             }
         }
-    });
-    rx
+        Uploading::start(&digest)
+    };
+    let kept = crate::blobs::io::put_file(blobs.as_ref(), &key(&digest), path, Cond::Always, Some(&digest)).await;
+    {
+        let _held = stripe(&digest).lock().await;
+        kept.map_err(refused)?;
+        record(hub, &digest, size).await?;
+        drop(uploading);
+    }
+    tracing::debug!(target: "kiln.blobs", event = "put", object = %digest, size, "kept");
+    Ok(object)
 }
 
-/// What a collection removed.
+/// An object, and a touch of its last use.
+pub async fn object(hub: &Hub, digest: &str) -> anyhow::Result<Option<Object>> {
+    let (d, now) = (digest.to_owned(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            let Some(size) = c.query_row("SELECT size FROM cas_index WHERE digest = ?1", [&d], |r| r.get::<_, i64>(0)).optional()? else { return Ok(None) };
+            c.execute("UPDATE cas_index SET last_used_at = ?2 WHERE digest = ?1", params![d, now])?;
+            Ok(Some(Object { digest: d, size: u64::try_from(size).unwrap_or(0) }))
+        })
+        .await
+}
+
+/// Streams bytes `[start, end)` of an object. A piece that can't be read ends the stream early (the
+/// reader sees fewer bytes than it was promised), with a warning.
+pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Receiver<Bytes> {
+    let end = end.min(obj.size);
+    if start >= end {
+        let (_, rx) = async_channel::bounded(1);
+        return rx;
+    }
+    crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), start, end.saturating_sub(1))
+}
+
+/// What a collection let go.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Collected {
     pub objects: usize,
-    pub chunks: usize,
     pub bytes: u64,
 }
 
-/// Removes objects nothing refers to (no cache entry, artifact or release asset), and then chunks that
-/// no remaining object uses. Anything younger than an hour stays, since an upload in progress
-/// may be about to refer to it.
+/// What refers to an object: a cache entry, an artifact, a release asset, a test report, a registry
+/// blob or a proxied one.
+const UNREFERENCED: &str = "digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)
+   AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)
+   AND digest NOT IN (SELECT object FROM ci_release_assets)
+   AND digest NOT IN (SELECT object FROM test_reports)
+   AND 'sha256:' || digest NOT IN (SELECT digest FROM registry_blobs)
+   AND digest NOT IN (SELECT digest FROM proxy_cache)";
+
+/// Lets go of objects nothing refers to, unused for an hour (an upload in progress may be about to
+/// refer to one): each one's record, then its bytes, under its digest's lock.
 pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
-    let now = crate::util::now_unix();
-    let grace = i64::try_from(GRACE.as_secs()).unwrap_or(3600);
-    let (objects, used): (usize, HashSet<String>) = hub
+    let cutoff = crate::util::now_unix().saturating_sub(i64::try_from(GRACE.as_secs()).unwrap_or(3600));
+    let candidates: Vec<String> = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
-            let gone = tx.execute(
-                "DELETE FROM cas_objects WHERE last_used_at < ?1
-                   AND digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)
-                   AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)
-                   AND digest NOT IN (SELECT object FROM ci_release_assets)
-                   AND digest NOT IN (SELECT object FROM test_reports)
-                   AND 'sha256:' || digest NOT IN (SELECT digest FROM registry_blobs)
-                   AND digest NOT IN (SELECT digest FROM proxy_cache)",
-                params![now - grace],
-            )?;
-            let mut used = HashSet::new();
-            {
-                let mut q = tx.prepare("SELECT chunks FROM cas_objects")?;
-                let rows = q.query_map([], |r| r.get::<_, String>(0))?;
-                for row in rows {
-                    let list: Vec<(String, u64)> = serde_json::from_str(&row?).unwrap_or_default();
-                    used.extend(list.into_iter().map(|(d, _)| d));
-                }
-            }
-            tx.commit()?;
-            Ok((gone, used))
+            let mut q = c.prepare(&format!("SELECT digest FROM cas_index WHERE last_used_at < ?1 AND {UNREFERENCED} LIMIT ?2"))?;
+            let rows = q.query_map(params![cutoff, i64::try_from(COLLECT_MAX).unwrap_or(i64::MAX)], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
         .await?;
-    let r = root(hub);
-    let used = Arc::new(used);
-    let u = Arc::clone(&used);
-    let (chunks, bytes, removed) = crate::rt::blocking(move || sweep(&r, &u)).await?;
-    hub.store
-        .call(move |c| {
-            let tx = c.transaction()?;
-            for d in &removed {
-                tx.execute("DELETE FROM cas_chunks WHERE digest = ?1", [d])?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await?;
-    Ok(Collected { objects, chunks, bytes })
-}
-
-/// Deletes chunk files not in `used` and older than [`GRACE`]; returns their count, bytes and
-/// digests.
-fn sweep(root: &Path, used: &HashSet<String>) -> (usize, u64, Vec<String>) {
-    let mut out = (0usize, 0u64, Vec::new());
-    let Ok(level1) = std::fs::read_dir(root.join("chunks")) else { return out };
-    for a in level1.flatten() {
-        let Ok(level2) = std::fs::read_dir(a.path()) else { continue };
-        for b in level2.flatten() {
-            let Ok(files) = std::fs::read_dir(b.path()) else { continue };
-            for f in files.flatten() {
-                let name = f.file_name().to_string_lossy().to_string();
-                let Ok(meta) = f.metadata() else { continue };
-                let old = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age > GRACE);
-                // Leftover temporary files of a crashed write go too.
-                if !old || (used.contains(&name) && !name.ends_with(".tmp")) {
-                    continue;
-                }
-                if std::fs::remove_file(f.path()).is_ok() {
-                    out.0 += 1;
-                    out.1 += meta.len();
-                    out.2.push(name);
-                }
-            }
+    let mut out = Collected::default();
+    for digest in candidates {
+        let _held = stripe(&digest).lock().await;
+        if GUARD.uploading.lock().contains(&digest) {
+            continue;
         }
+        let d = digest.clone();
+        let gone: Option<i64> = hub
+            .store
+            .call(move |c| {
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let size = tx.query_row(&format!("SELECT size FROM cas_index WHERE digest = ?1 AND last_used_at < ?2 AND {UNREFERENCED}"), params![d, cutoff], |r| r.get::<_, i64>(0)).optional()?;
+                if size.is_some() {
+                    tx.execute("DELETE FROM cas_index WHERE digest = ?1", [&d])?;
+                }
+                tx.commit()?;
+                Ok(size)
+            })
+            .await?;
+        let Some(size) = gone else { continue };
+        if let Err(e) = hub.blobs.blobs.delete(&key(&digest)).await {
+            tracing::warn!(target: "kiln.blobs", event = "collect", object = %digest, error = %e, "an object nothing refers to couldn't be deleted");
+            continue;
+        }
+        out.objects = out.objects.saturating_add(1);
+        out.bytes = out.bytes.saturating_add(u64::try_from(size).unwrap_or(0));
     }
-    out
-}
-
-/// The store's size on disk: every chunk once.
-pub async fn stored_bytes(hub: &Hub) -> anyhow::Result<u64> {
-    hub.store.call(|c| Ok(c.query_row("SELECT COALESCE(SUM(size), 0) FROM cas_chunks", [], |r| r.get::<_, i64>(0)).map(|n| u64::try_from(n).unwrap_or(0))?)).await
+    if out.objects > 0 {
+        crate::metrics::blobs().collected.add(&["cas"], u64::try_from(out.objects).unwrap_or(u64::MAX));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn noise(n: usize, seed: u64) -> Vec<u8> {
-        let mut s = seed.max(1);
-        let mut out = Vec::with_capacity(n + 8);
-        while out.len() < n {
-            s ^= s >> 12;
-            s ^= s << 25;
-            s ^= s >> 27;
-            out.extend_from_slice(&s.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes());
-        }
-        out.truncate(n);
-        out
+    /// CP-T10.1: content goes into the store once, at `cas/<digest>`, reads back in any range, and
+    /// goes only once nothing refers to it and it's been unused an hour.
+    #[test]
+    fn content_is_kept_once_read_in_ranges_and_collected_when_nothing_refers_to_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let data = kiln_seams::blobs::noise(20 << 20, 11);
+            let path = dir.path().join("f");
+            std::fs::write(&path, &data)?;
+            let a = put_file(&hub, &path).await?;
+            let again = put_file(&hub, &path).await?;
+            assert_eq!((a.digest.clone(), a.size), (crate::util::sha256_hex(&data), data.len() as u64));
+            assert_eq!(again, a, "the same content is the same object");
+            assert_eq!(hub.blobs.blobs.head(&key(&a.digest)).await?.etag, a.digest);
+            let obj = object(&hub, &a.digest).await?.ok_or_else(|| anyhow::anyhow!("not found"))?;
+            let rx = read(&hub, &obj, 1_000_000, 9_000_000);
+            let mut got = Vec::new();
+            while let Ok(b) = rx.recv().await {
+                got.extend_from_slice(&b);
+            }
+            assert!(got.as_slice() == data.get(1_000_000..9_000_000).unwrap_or_default(), "{} bytes", got.len());
+            assert_eq!(collect(&hub).await?.objects, 0, "used this hour, it stays");
+            let d = a.digest.clone();
+            hub.store.call(move |c| Ok(c.execute("UPDATE cas_index SET last_used_at = 0 WHERE digest = ?1", [&d])?)).await?;
+            assert_eq!(collect(&hub).await?, Collected { objects: 1, bytes: data.len() as u64 });
+            assert!(matches!(hub.blobs.blobs.head(&key(&a.digest)).await, Err(Refusal::NotFound(_))));
+            assert_eq!(object(&hub, &a.digest).await?, None);
+            Ok(())
+        })
     }
 
+    /// CP-T10.1: what the content-addressed store held before (its objects in `cas_objects`, its
+    /// chunks on disk) is the local store's at `cas/<digest>`, read as it was.
     #[test]
-    fn w08_ac05_a_changed_object_stores_only_its_new_chunks() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let root = dir.path().join("cas");
-        let data = noise(48 << 20, 5);
-        let one = dir.path().join("one");
-        std::fs::write(&one, &data)?;
-        let (a, fresh_a) = put_file_blocking(&root, &one)?;
-        assert_eq!(a.size, data.len() as u64);
-        assert_eq!(fresh_a, a.size, "everything is new the first time");
-        assert_eq!(a.digest, hex(&Sha256::digest(&data)));
-        // The same content again: nothing new.
-        let (again, fresh) = put_file_blocking(&root, &one)?;
-        assert_eq!((again.digest.clone(), fresh), (a.digest.clone(), 0));
-        // 1 % of the bytes changed in place, in one place, and an insertion elsewhere.
-        let mut edited = data.clone();
-        for b in edited.iter_mut().skip(20 << 20).take(data.len() / 100) {
-            *b ^= 0x5a;
-        }
-        edited.splice(40 << 20..40 << 20, b"inserted".iter().copied());
-        let two = dir.path().join("two");
-        std::fs::write(&two, &edited)?;
-        let (b, fresh_b) = put_file_blocking(&root, &two)?;
-        assert_eq!(b.size, edited.len() as u64);
-        assert!(fresh_b * 100 <= b.size * 30, "{fresh_b} new bytes of {}", b.size);
-        Ok(())
+    fn objects_from_before_are_read_where_they_lie() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let data = kiln_seams::blobs::noise(3 << 20, 12);
+            let digest = crate::util::sha256_hex(&data);
+            // As the store kept it before: chunks on disk, an object row, nothing else.
+            let (chunks, _) = crate::blobs::chunks::keep_all(&root(&hub), &data)?;
+            let (d, list) = (digest.clone(), serde_json::to_string(&chunks)?);
+            hub.store
+                .call(move |c| {
+                    c.execute("INSERT INTO cas_objects (digest, size, chunks, created_at, last_used_at) VALUES (?1, ?2, ?3, 1, 1)", params![d, 3 << 20, list])?;
+                    // What the migration does for what was there when it ran.
+                    c.execute_batch(
+                        "INSERT OR IGNORE INTO blob_keys (key, digest, size, modified_ms, file) SELECT 'cas/' || digest, digest, size, created_at * 1000, NULL FROM cas_objects;
+                         INSERT OR IGNORE INTO cas_index (digest, size, created_at, last_used_at) SELECT digest, size, created_at, last_used_at FROM cas_objects;",
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            let obj = object(&hub, &digest).await?.ok_or_else(|| anyhow::anyhow!("not found"))?;
+            let rx = read(&hub, &obj, 0, obj.size);
+            let mut got = Vec::new();
+            while let Ok(b) = rx.recv().await {
+                got.extend_from_slice(&b);
+            }
+            assert!(got == data, "{} bytes", got.len());
+            Ok(())
+        })
     }
 }

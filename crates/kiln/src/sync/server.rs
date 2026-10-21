@@ -17,7 +17,7 @@ use hyper_raft::wire::Record as _;
 use serde::{Deserialize, Serialize};
 
 use super::activity::{self, Activity, Event, Kind, Tone};
-use super::blobs::Blobs;
+use super::contents::Contents;
 use super::disk::{self, Store, SyncLog};
 use super::group::{self, Index, SERVER, TICK, Taken};
 use super::wire::{self, CopySpec, CopyStatus, Joiner, MoveNews, Msg};
@@ -194,41 +194,38 @@ pub struct Sync {
     out: async_channel::Receiver<Out>,
     /// What others send a machine's syncing runner process on the sync lane (`crate::sync::tasks`).
     say: async_channel::Sender<Out>,
-    blobs: Option<Arc<Blobs>>,
+    contents: Arc<Contents>,
     key: String,
 }
 
 impl Sync {
-    /// Starts the owner of the groups kept in `dir`. Blob tokens are signed with `key`.
-    pub fn start(dir: PathBuf, key: String) -> Self {
+    /// Starts the owner of the groups kept in `dir`, the contents their steps name in `contents`.
+    /// Blob tokens are signed with `key`.
+    pub fn start(dir: PathBuf, key: String, contents: Arc<Contents>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out) = async_channel::unbounded();
         let view = Arc::new(Mutex::new(View::default()));
         let activity = Arc::new(Mutex::new(Activity::default()));
-        let blobs = Blobs::new(&dir.join("blobs")).map(Arc::new);
-        let blobs = match blobs {
-            Ok(b) => Some(b),
-            Err(e) => {
-                lock(&view).error = Some(format!("sync is off: its contents folder: {e}"));
-                None
-            }
-        };
         let say = out_tx.clone();
-        if let Some(b) = blobs.clone() {
-            let (v, a, wake_tx) = (view.clone(), activity.clone(), tx.clone());
-            let k = key.clone();
-            let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || match Owner::open(&dir, b, out_tx, v.clone(), a, wake_tx, k) {
+        let (v, a, wake_tx) = (view.clone(), activity.clone(), tx.clone());
+        let (k, c) = (key.clone(), Arc::clone(&contents));
+        let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || {
+            // What's held is judged from the store's listing: the thread waits for it.
+            if !c.wait_loaded(super::contents::LOAD_WAIT) {
+                tracing::warn!(target: "kiln.blobs", event = "list", "sync's contents weren't listed in time: what's held is known as it comes");
+            }
+            match Owner::open(&dir, c, out_tx, v.clone(), a, wake_tx, k) {
                 Ok(owner) => owner.run(&rx),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "repo sync is off");
                     lock(&v).error = Some(format!("sync is off: {e:#}"));
                 }
-            });
-            if let Err(e) = spawned {
-                lock(&view).error = Some(format!("sync is off: {e}"));
             }
+        });
+        if let Err(e) = spawned {
+            lock(&view).error = Some(format!("sync is off: {e}"));
         }
-        Self { tx, view, activity, out, say, blobs, key }
+        Self { tx, view, activity, out, say, contents, key }
     }
 
     pub fn view(&self) -> View {
@@ -251,8 +248,8 @@ impl Sync {
     }
 
     /// The server's contents.
-    pub fn blobs(&self) -> Option<&Blobs> {
-        self.blobs.as_deref()
+    pub fn contents(&self) -> &Arc<Contents> {
+        &self.contents
     }
 
     /// What a machine's runner said of its copies (`AgentMsg::Sync`, decoded).
@@ -353,7 +350,7 @@ pub struct Owner {
     view: Arc<Mutex<View>>,
     viewed: Instant,
     changed: bool,
-    blobs: Arc<Blobs>,
+    contents: Arc<Contents>,
     key: String,
     start: Instant,
     swept: Instant,
@@ -382,7 +379,7 @@ pub struct Owner {
 }
 
 impl Owner {
-    fn open(dir: &Path, blobs: Arc<Blobs>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
+    fn open(dir: &Path, contents: Arc<Contents>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let repos: Vec<Repo> = match std::fs::read(dir.join("repos.json")) {
             Ok(b) => serde_json::from_slice(&b)?,
@@ -411,7 +408,7 @@ impl Owner {
             view,
             viewed: Instant::now(),
             changed: true,
-            blobs,
+            contents,
             key,
             start: Instant::now(),
             swept: Instant::now(),
@@ -613,7 +610,7 @@ impl Owner {
                 .changes
                 .iter()
                 .filter_map(|c| match &c.to {
-                    Some(Version::File { hash, .. }) if !self.blobs.has(hash) => Some(hash.clone()),
+                    Some(Version::File { hash, .. }) if !self.contents.has(hash) => Some(hash.clone()),
                     _ => None,
                 })
                 .collect();
@@ -781,10 +778,8 @@ impl Owner {
             if let Some(d) = commit {
                 m.commit_seconds.observe(&[name], d.as_secs_f64());
             }
-            let blobs = self.blobs.clone();
-            let step = activity::step_event(t.index, &t.step, &t.decisions, commit.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)), |hash| {
-                blobs.path(hash).and_then(|p| std::fs::metadata(p).ok()).map(|md| md.len())
-            });
+            let contents = Arc::clone(&self.contents);
+            let step = activity::step_event(t.index, &t.step, &t.decisions, commit.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)), |hash| contents.size(hash));
             m.steps_committed.inc(&[name]);
             for (kind, n) in [("added", step.added), ("changed", step.changed), ("deleted", step.deleted)] {
                 if n > 0 {
@@ -1068,10 +1063,10 @@ impl Owner {
                 Version::Link { .. } => None,
             })
             .collect();
-        let Ok(all) = self.blobs.all() else { return };
-        for (hash, modified) in all {
-            if !named.contains(hash.as_str()) && modified.elapsed().unwrap_or_default() >= SWEEP_AGE {
-                let _ = self.blobs.remove(&hash);
+        let old = crate::util::now_ms().saturating_sub(i64::try_from(SWEEP_AGE.as_millis()).unwrap_or(i64::MAX));
+        for (hash, kept) in self.contents.all() {
+            if !named.contains(hash.as_str()) && kept <= old {
+                self.contents.remove(&hash);
             }
         }
     }
@@ -1205,11 +1200,12 @@ mod tests {
     #[test]
     fn a_committed_step_shows_with_its_files_and_a_stray_one_as_let_go() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let sync = Sync::start(dir.path().join("sync"), "key".into());
+        let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
+        let sync = Sync::start(dir.path().join("sync"), "key".into(), contents);
         let name = "activity-test";
         let create = Ask::Create { name: name.into(), copies: vec![("mac".into(), "/src/kiln".into()), ("box".into(), "/src/kiln".into())], exclude: Vec::new(), transient: None };
         let id = futures::executor::block_on(sync.ask(create)).map_err(anyhow::Error::msg)?;
-        let hash = sync.blobs().ok_or_else(|| anyhow::anyhow!("sync is off"))?.put_bytes(b"hello")?;
+        let hash = futures::executor::block_on(sync.contents().put_bytes(b"hello".to_vec()))?;
         let step = Step { by: String::new(), member: 2, seq: 1, at: now_ms(), changes: vec![Change { path: "src/a.txt".into(), to: Some(Version::File { hash, exec: false }), base: None }] };
         // From a machine with no copy of it: let go.
         sync.from_runner("elsewhere", Msg::Steps { repo: id.clone(), steps: vec![step.clone()] }, Vec::new());

@@ -118,6 +118,46 @@ pub fn open(cfg: &crate::config::Config, store: &crate::store::Store, clock: Arc
     }
 }
 
+/// How often the store's upkeep lets go of what nothing holds.
+const UPKEEP_EVERY: Duration = Duration::from_secs(3600);
+
+/// The store at the server's start, before anything reads from it: what was kept as files before
+/// (the upgrade binaries) taken into the local store where it lies, once, and what kiln knows of
+/// the kept binaries read. Sync's contents are listed by their own ([`crate::sync::contents`]).
+pub async fn start(hub: &crate::hub::Hub) {
+    if let Some(local) = &hub.blobs.local
+        && let Err(e) = crate::updates::take_in(hub, local).await
+    {
+        tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "runner binaries from before couldn't be taken in");
+    }
+    crate::updates::load(hub).await;
+}
+
+/// The store's upkeep for as long as the server runs: every hour, uploads left two days and what
+/// nothing holds any more let go (`kiln_blobs_collected_total`).
+pub async fn run(hub: Arc<crate::hub::Hub>) -> anyhow::Result<()> {
+    loop {
+        crate::rt::sleep(UPKEEP_EVERY).await;
+        if let Some(local) = &hub.blobs.local {
+            match local.collect().await {
+                Ok(c) => {
+                    if c.uploads + c.objects + c.chunks > 0 {
+                        tracing::info!(target: "kiln.blobs", event = "collect", uploads = c.uploads, objects = c.objects, chunks = c.chunks, bytes = c.bytes, "the local store let go of what nothing holds");
+                    }
+                }
+                Err(e) => tracing::warn!(target: "kiln.blobs", event = "collect", error = %format!("{e:#}"), "the local store's upkeep failed"),
+            }
+        }
+        if let Some(s3) = &hub.blobs.s3 {
+            match s3.collect().await {
+                Ok(n) if n > 0 => tracing::info!(target: "kiln.blobs", event = "collect", uploads = n, "uploads left in S3 let go"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(target: "kiln.blobs", event = "collect", error = %format!("{e:#}"), "the S3 store's upkeep failed"),
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------- metering
 
 /// A store, its requests counted and timed (`kiln_blobs_*`), its refusals logged on `kiln.blobs`.

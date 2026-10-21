@@ -1346,22 +1346,19 @@ fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
     let machine = sync_machine(req);
-    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
-    let Some(path) = blobs.path(hash).filter(|p| p.is_file()) else {
-        sync_blob_counted(&machine, direction, "missing", 0);
-        return Err(err(StatusCode::NOT_FOUND, "no such blob"));
-    };
+    let contents = hub.sync.contents();
     if req.method() == Method::HEAD {
-        sync_blob_counted(&machine, direction, "present", 0);
-        return Ok(srv::status(StatusCode::OK));
+        let held = contents.has(hash);
+        sync_blob_counted(&machine, direction, if held { "present" } else { "missing" }, 0);
+        return if held { Ok(srv::status(StatusCode::OK)) } else { Err(err(StatusCode::NOT_FOUND, "no such blob")) };
     }
-    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
-    let Ok(body) = crate::rt::file_source(path) else {
+    let Some((bytes, body)) = contents.stream(hash) else {
         sync_blob_counted(&machine, direction, "missing", 0);
         return Err(err(StatusCode::NOT_FOUND, "no such blob"));
     };
     sync_blob_counted(&machine, direction, "ok", bytes);
-    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &bytes.to_string()))
 }
 
 /// The largest contents a machine sends (a copy leaves out files over 256 MiB unless told otherwise).
@@ -1369,7 +1366,8 @@ const SYNC_BLOB_MAX: u64 = 1 << 30;
 /// Room the server keeps free on its data volume: contents are refused below it.
 const SYNC_DISK_FLOOR: u64 = 2 << 30;
 
-/// Contents a machine's steps name: kept once they hash to their name. Refused past
+/// Contents a machine's steps name: kept in kiln's store of bytes once they hash to their name
+/// (`crate::sync::contents`), arriving first in `<data>/sync/incoming`. Refused past
 /// [`SYNC_BLOB_MAX`], or while the server's disk has less than [`SYNC_DISK_FLOOR`] free.
 async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     if !sync_token_ok(hub, &req) {
@@ -1378,12 +1376,12 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     }
     let machine = sync_machine(&req);
     let counted = |result: &str, bytes: u64| sync_blob_counted(&machine, "up", result, bytes);
-    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
+    let contents = hub.sync.contents();
     if !crate::sync::blobs::valid_hash(hash) {
         counted("refused", 0);
         return Err(err(StatusCode::BAD_REQUEST, "not a SHA-256"));
     }
-    if blobs.has(hash) {
+    if contents.has(hash) {
         counted("present", 0);
         return Ok(srv::status(StatusCode::OK));
     }
@@ -1392,12 +1390,17 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
         counted("refused", 0);
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("contents are synced up to {} MiB", SYNC_BLOB_MAX >> 20)));
     }
-    if blobs.free_bytes().is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+    let incoming = hub.cfg.data("sync").join("incoming");
+    if let Err(e) = std::fs::create_dir_all(&incoming) {
+        counted("failed", 0);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", incoming.display())));
+    }
+    if crate::os::disk_available(&incoming).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
         counted("refused", 0);
         tracing::warn!(target: "kiln.sync", event = "sync.blob_refused", machine = %machine, reason = "disk_full", "the server's disk is nearly full: sync takes no more contents");
         return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full: sync takes no more contents until there is room"));
     }
-    let tmp = blobs.incoming();
+    let tmp = incoming.join(crate::util::new_id());
     let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX).inspect_err(|_| counted("failed", 0))?;
     let mut body = req.into_body();
     let mut bytes = 0u64;
@@ -1421,20 +1424,21 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
         counted("failed", 0);
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
     }
-    let store = blobs.clone();
-    let name = hash.to_owned();
-    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| {
-        counted("failed", 0);
-        err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
-    })?;
+    let kept = contents.put_file(hash, &tmp).await;
+    let t = tmp.clone();
+    let _ = crate::rt::blocking(move || std::fs::remove_file(&t)).await;
     match kept {
-        Ok(true) => {
+        Ok(()) => {
             counted("ok", bytes);
             Ok(srv::status(StatusCode::CREATED))
         }
-        Ok(false) => {
+        Err(kiln_seams::blobs::Refusal::BadChecksum { .. }) => {
             counted("refused", 0);
             Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name"))
+        }
+        Err(e @ kiln_seams::blobs::Refusal::Full { .. }) => {
+            counted("refused", 0);
+            Err(err(StatusCode::INSUFFICIENT_STORAGE, e.to_string()))
         }
         Err(e) => {
             counted("failed", 0);
@@ -1541,7 +1545,7 @@ async fn sync_bundle_put(hub: &Hub, batch: &str, req: Request) -> R {
     if length.is_some_and(|n| n > SYNC_BUNDLE_MAX) {
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("bundles go up to {} GiB", SYNC_BUNDLE_MAX >> 30)));
     }
-    if hub.sync.blobs().and_then(crate::sync::Blobs::free_bytes).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+    if crate::os::disk_available(&hub.cfg.data("sync")).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
         return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full"));
     }
     let tmp = file.with_extension("part");
@@ -2761,9 +2765,9 @@ async fn download_for(hub: &Hub, target: &str) -> R {
     if target == TARGET {
         return download_binary().await;
     }
-    if let Some((path, _)) = crate::updates::stored(hub, target) {
-        let body = crate::rt::file_source(path)?;
-        return Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)));
+    if let Some((b, body)) = crate::updates::stream(hub, target) {
+        let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
+        return Ok(srv::with_header(r, header::CONTENT_LENGTH, &b.size.to_string()));
     }
     if !RELEASE_TARGETS.contains(&target) {
         return Err(err(
@@ -2784,9 +2788,9 @@ async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
     if b.origin == "server" {
         return download_binary().await;
     }
-    let (path, _) = crate::updates::stored(hub, target).filter(|(_, m)| m.build == build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
-    let body = crate::rt::file_source(path)?;
-    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+    let (kept, body) = crate::updates::stream(hub, target).filter(|(m, _)| m.build == build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &kept.size.to_string()))
 }
 
 fn build_token_ok(hub: &Hub, headers: &HeaderMap, job: &str) -> bool {
@@ -3012,11 +3016,7 @@ async fn upload_binary(hub: &Arc<Hub>, q: &HashMap<String, String>, req: Request
         return Err(err(StatusCode::BAD_REQUEST, format!("unknown platform {target:?}: one of {TARGET}, {}", RELEASE_TARGETS.join(", "))));
     }
     let bytes = srv::body_bytes(req.into_body(), crate::updates::MAX_BINARY).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
-    let (h, t) = (Arc::clone(hub), target.clone());
-    let b = crate::rt::blocking(move || crate::updates::store(&h, &t, &bytes, "upload"))
-        .await
-        .and_then(|r| r)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let b = crate::updates::store(hub, &target, bytes.to_vec(), "upload").await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     hub.store.audit("admin".into(), "upgrade.binary".into(), format!("uploaded build {} for {target}", b.build)).await;
     hub.emit(&json!({ "type": "updates" }));
     Ok(srv::json(StatusCode::OK, &b))
@@ -3024,7 +3024,7 @@ async fn upload_binary(hub: &Arc<Hub>, q: &HashMap<String, String>, req: Request
 
 /// `DELETE /api/updates/binaries/{target}`.
 async fn delete_binary(hub: &Hub, target: &str) -> R {
-    if !crate::updates::unstore(hub, target) {
+    if !crate::updates::unstore(hub, target).await {
         return Err(err(StatusCode::NOT_FOUND, format!("no binary is kept for {target}")));
     }
     hub.store.audit("admin".into(), "upgrade.binary".into(), format!("removed the binary for {target}")).await;
