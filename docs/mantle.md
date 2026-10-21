@@ -233,6 +233,17 @@ API, roadmap or trust model is Ada's to decide, marked **[Ada]** here and listed
   names hyper's server, but Ada decided on 2026-10-05: Mantle's own HTTP/1.1 codec on the shared
   hyper-rt runtime, no hyper or tokio. A delete of an absent key answers 204, as S3's; the code
   that writes statuses comes with the listener.
+- **kiln's presigned URLs** (an hour at most, a put signing its length), answered in an addendum
+  from mantle-s3's verifier (`crates/s3/src/sigv4.rs` at 47834826): `X-Amz-Expires` up to 3600 is
+  taken as it is (it takes 1–604800 seconds, S3's range). A URL is expired once now ≥ `X-Amz-Date` +
+  `X-Amz-Expires`, and one dated ahead is held to the same 15 minutes' skew as a signed header.
+  Mantle caps nothing below S3's seven days: kiln signs, so kiln's hour holds without a setting on
+  Mantle's side. `content-length` among a presigned PUT's `X-Amz-SignedHeaders` binds the body: the
+  canonical request is built from each signed header as sent, so a PUT of another length, or with
+  no Content-Length (`Transfer-Encoding: chunked`), fails the signature (403 SignatureDoesNotMatch,
+  as S3's). A presigned request's payload is `UNSIGNED-PAYLOAD`, so the signed length is what binds
+  it, and the gateway holds every body to its declared length too. The library; its listener is
+  phase B.
 - **ETags are S3's** (MD5, and MD5 of the parts' MD5s with `-N` for multipart): kiln's SHA-256 etag
   is mapped at the seam, as its S3 store does now (docs/blobs.md, "The S3 store").
 - **A full-object SHA-256 for multipart:** S3's parts come in any order and at once, and SHA-256
