@@ -157,6 +157,10 @@ pub struct State {
     /// through this index ([`Copy::adopt`]); none once it has, or for a copy that joined as it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopt: Option<u64>,
+    /// Paths whose version a step brought was kept back, changed here then (`Outcome::Kept`): the
+    /// log's version comes once the change here is proposed, or gone ([`Copy::catch_up`]).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub behind: BTreeSet<String>,
 }
 
 /// What applying a change did here.
@@ -319,8 +323,13 @@ impl Copy {
         if self.adopting() {
             return Ok(Vec::new());
         }
-        let (found, skipped) = scan::scan(self.fs.as_ref(), &self.root, &self.state.seen, &self.limits)?;
+        let (mut found, skipped) = scan::scan(self.fs.as_ref(), &self.root, &self.state.seen, &self.limits)?;
         self.skipped = skipped;
+        // What the log holds of paths the folder fell behind on, brought now that nothing here
+        // stands in its way; read again at the next look.
+        for path in self.catch_up(&found, blobs)? {
+            found.remove(&path);
+        }
         let mut paths: BTreeSet<String> = found.keys().cloned().collect();
         paths.extend(self.state.synced.keys().cloned());
         paths.extend(self.state.pending.keys().cloned());
@@ -399,6 +408,61 @@ impl Copy {
         }
         self.state.adopt = None;
         Ok(out)
+    }
+
+    /// Brings the log's version of each path a step's version was kept back from (changed here then)
+    /// once the change here is gone (undone, or a file made here deleted) without being proposed:
+    /// the folder is then as this copy last synced it, so no look would ever propose it, and the
+    /// step that changed it was taken, so none would bring it either. `found` is what the look found
+    /// here. The paths brought; one whose contents aren't here yet waits for them
+    /// ([`Copy::behind_needs`]).
+    fn catch_up(&mut self, found: &BTreeMap<String, Entry>, blobs: &Blobs) -> io::Result<Vec<String>> {
+        let mut brought = Vec::new();
+        let behind: Vec<String> = self.state.behind.iter().cloned().collect();
+        for path in behind {
+            // Proposed: its step meets the log's version, and the rule decides.
+            if self.state.pending.contains_key(&path) {
+                continue;
+            }
+            let log = self.state.tree.files.get(&path).cloned();
+            let synced = self.state.synced.get(&path).cloned();
+            let here = found.get(&path).map(|e| e.version.clone());
+            if log == synced || here == log {
+                set(&mut self.state.synced, &path, log);
+                self.state.behind.remove(&path);
+                continue;
+            }
+            // Still changed here: the look proposes it.
+            if here != synced || !self.parents_real(&path) {
+                continue;
+            }
+            if let Some(Version::File { hash, .. }) = &log
+                && (!blobs.has(hash) || self.gone.contains(hash))
+            {
+                continue;
+            }
+            self.write(&path, log.as_ref(), blobs)?;
+            set(&mut self.state.synced, &path, log);
+            self.state.behind.remove(&path);
+            brought.push(path);
+        }
+        Ok(brought)
+    }
+
+    /// The contents the paths the folder fell behind on wait for ([`Copy::catch_up`]).
+    pub fn behind_needs(&self, blobs: &Blobs) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .state
+            .behind
+            .iter()
+            .filter_map(|p| match self.state.tree.files.get(p) {
+                Some(Version::File { hash, .. }) if !blobs.has(hash) && !self.gone.contains(hash) => Some(hash.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The number of this member's next step: one past what it sent, or past what the log took
@@ -498,8 +562,9 @@ impl Copy {
                             }
                         } else {
                             // Changed again since: kept, and proposed as a change of what lost, so it can't
-                            // silently undo what won.
+                            // silently undo what won; undone instead, the log's version comes after all.
                             set(&mut self.state.synced, &c.path, c.to.clone());
+                            self.state.behind.insert(c.path.clone());
                         }
                     }
                     out.push(Outcome::Conflict { path: c.path.clone(), copy });
@@ -526,6 +591,8 @@ impl Copy {
             return Ok(Outcome::Applied { path: path.to_owned() });
         }
         if self.state.pending.contains_key(path) || here != self.state.synced.get(path).cloned() {
+            // Its version comes once the change here is proposed (it meets it in the log), or gone.
+            self.state.behind.insert(path.to_owned());
             return Ok(Outcome::Kept { path: path.to_owned() });
         }
         self.write(path, to, blobs)?;
@@ -600,6 +667,7 @@ struct Undo {
     files: Vec<(String, Option<Version>)>,
     synced: Vec<(String, Option<Version>)>,
     pending: Vec<(String, Option<Option<Version>>)>,
+    behind: Vec<(String, bool)>,
     sent: Option<Vec<Step>>,
 }
 
@@ -619,6 +687,7 @@ impl Undo {
             files: paths.iter().map(|p| (p.clone(), st.tree.files.get(p).cloned())).collect(),
             synced: paths.iter().map(|p| (p.clone(), st.synced.get(p).cloned())).collect(),
             pending: paths.iter().map(|p| (p.clone(), st.pending.get(p).cloned())).collect(),
+            behind: paths.iter().map(|p| (p.clone(), st.behind.contains(p))).collect(),
             sent: ours.then(|| st.sent.clone()),
         }
     }
@@ -648,6 +717,13 @@ impl Undo {
                 None => {
                     st.pending.remove(&p);
                 }
+            }
+        }
+        for (p, was) in self.behind {
+            if was {
+                st.behind.insert(p);
+            } else {
+                st.behind.remove(&p);
             }
         }
         if let Some(sent) = self.sent {

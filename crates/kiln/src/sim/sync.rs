@@ -752,6 +752,15 @@ impl Sim {
                 Vec::new()
             }
         };
+        if self.trace.keeps() {
+            // What the folder did, as the runner's status reads it (and clears it).
+            let feed = rn.r.machine_mut();
+            let (took, outcomes): (Vec<_>, Vec<_>) = (std::mem::take(&mut feed.took), feed.outcomes.drain(..).collect());
+            if !took.is_empty() || !outcomes.is_empty() {
+                let reached = feed.progress().0;
+                self.trace.note(|| format!("{now:?} {}'s folder took {:?} through log index {reached}: {outcomes:?}", mc.name, took.iter().map(|t| format!("{}{}", t.by, if t.ours { " (ours)" } else { "" })).collect::<Vec<_>>()));
+            }
+        }
         // Its contents, fetched a few at a time.
         rn.retry.retain(|_, t| *t > now);
         for hash in wanted {
@@ -1492,6 +1501,62 @@ mod tests {
         let sendable: Vec<u64> = feed.sendable().map(|s| s.seq).collect();
         if sendable != steps || feed.unsaved() {
             return Err(format!("saved, the steps that may go are {sendable:?}, not {steps:?}"));
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, the fifth bug kiln-sim found, by its seed: a step's version of a file was kept back
+    /// from a copy whose file was changed there, unproposed; the change was then deleted (or undone)
+    /// before a look proposed it. The folder was as the copy last synced it, so no look proposed a
+    /// thing, and the step was taken, so nothing brought its version: that copy lacked the file the
+    /// log held, for good (sync seed 1331).
+    #[test]
+    fn the_seed_where_a_kept_back_version_never_came_converges() -> Result<(), String> {
+        run(1331, 0, Plant::default(), Mode::Sync).map(|_| ())
+    }
+
+    /// CP-T6.1, the fifth bug's contract: a version a step brought, kept back while the file was
+    /// changed here, comes at the next look once the change here is undone, or a file made here is
+    /// deleted, without being proposed; and nothing is proposed for it.
+    #[test]
+    fn a_kept_back_version_comes_once_the_change_here_is_undone_or_deleted() -> Result<(), String> {
+        use crate::sync::{Change, Copy, Outcome, State};
+        for undone in [true, false] {
+            let disk = Disk::new(SimClock::new(), Rng::new(7), DiskFaults::none());
+            let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+            let root = PathBuf::from("/home/m2/repo");
+            fs.create_dir_all(&root).map_err(e)?;
+            let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
+            let file = "/home/m2/repo/a.txt";
+            let version = |hash: &String| Some(Version::File { hash: hash.clone(), exec: false });
+            let (zero, one) = (blobs.put_bytes(b"zero").map_err(e)?, blobs.put_bytes(b"one!").map_err(e)?);
+            let step = |seq: u64, change: Change| Step { by: "m3".into(), member: 3, seq, at: SIM_EPOCH_MS, changes: vec![change] };
+            let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
+            let base = if undone {
+                // a.txt as the log has it, then changed here.
+                copy.apply(&step(1, Change { path: "a.txt".into(), to: version(&zero), base: None }), &blobs).map_err(e)?;
+                version(&zero)
+            } else {
+                // A file made here.
+                None
+            };
+            disk.write(file, b"mine").map_err(e)?;
+            // Another machine's version: kept back, the file changed here.
+            let kept = copy.apply(&step(2, Change { path: "a.txt".into(), to: version(&one), base }), &blobs).map_err(e)?;
+            if !matches!(kept.as_slice(), [Outcome::Kept { .. }]) {
+                return Err(format!("the version wasn't kept back: {kept:?}"));
+            }
+            // The change here goes before any look proposed it.
+            if undone {
+                disk.write(file, b"zero").map_err(e)?;
+            } else {
+                disk.remove_file(file).map_err(e)?;
+            }
+            let proposed = copy.propose(&blobs, SIM_EPOCH_MS).map_err(e)?;
+            let got = disk.read(file).ok();
+            if !proposed.is_empty() || got.as_deref() != Some(&b"one!"[..]) {
+                return Err(format!("undone: {undone}: the look proposed {proposed:?} and a.txt holds {got:?}, not the log's version"));
+            }
         }
         Ok(())
     }

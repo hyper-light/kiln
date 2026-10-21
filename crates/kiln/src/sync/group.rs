@@ -447,7 +447,8 @@ impl Feed {
         if moved {
             self.save()?;
         }
-        Ok(Vec::new())
+        // The contents of what the folder fell behind on, brought at the next look.
+        Ok(self.copy.behind_needs(blobs))
     }
 
     /// Saves the copy's state as the folder has it; then that point is durable. The folders'
@@ -515,6 +516,7 @@ impl Feed {
             _ => None,
         });
         let mut out: std::collections::HashSet<String> = queued.chain(self.copy.state.sent.iter()).flat_map(|s| s.changes.iter()).filter_map(|c| file(&c.to)).collect();
+        out.extend(self.copy.state.behind.iter().filter_map(|p| file(&self.copy.state.tree.files.get(p).cloned())));
         if let Some(t) = &self.install {
             out.extend(t.files.values().filter_map(|v| file(&Some(v.clone()))));
         }
