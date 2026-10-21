@@ -321,7 +321,9 @@ impl Observe {
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out_rx) = async_channel::bounded(16_384);
         let store = Arc::new(Mutex::new(None));
-        let view = Arc::new(Mutex::new(View::default()));
+        // Its role said from the start: a status asked before the group opens says what it is.
+        let role = if matches!(settings.role, Role::Server { .. }) { "server" } else { "runner" };
+        let view = Arc::new(Mutex::new(View { role, ..View::default() }));
         let snaps = settings.dir.join("store").join(kiln_obs::machine::SNAPSHOTS);
         let key = match &settings.role {
             Role::Server { key } => Some(key.clone()),

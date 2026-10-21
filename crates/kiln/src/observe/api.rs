@@ -502,6 +502,25 @@ pub(super) struct Waited {
     pub store_ms: f64,
 }
 
+/// What `take` takes of the store under a brief hold (its logs or spans as they are:
+/// `Store::logs_at`), read by `then` once the hold is let go: a scan however long keeps no write
+/// waiting, and no reader behind that write. `then` told what the taking waited for.
+pub(super) async fn read_apart<T: Send + 'static, R: Send + 'static>(
+    take: impl FnOnce(&kiln_obs::store::Store) -> T + Send + 'static,
+    then: impl FnOnce(T, Waited) -> Result<R, Fail> + Send + 'static,
+) -> Result<R, Fail> {
+    let asked = std::time::Instant::now();
+    let store = shared()?;
+    crate::rt::blocking(move || {
+        let queued = asked.elapsed();
+        let taken = take(&store.read().unwrap_or_else(PoisonError::into_inner));
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        then(taken, Waited { queued_ms: ms(queued), store_ms: ms(asked.elapsed().saturating_sub(queued)) })
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+}
+
 /// [`reading`], `f` told what it waited for.
 pub(super) async fn reading_waited<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store, Waited) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
     let asked = std::time::Instant::now();
@@ -1479,11 +1498,11 @@ struct SearchBody {
 /// seen, its newest message, and its records by status; the most common first.
 async fn patterns(body: SearchBody) -> Result<Response, Fail> {
     use kiln_obs::logs::patterns::{Drain, Params, tokens};
-    reading(move |s| {
+    read_apart(kiln_obs::store::Store::logs_at, move |at, _| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
-        let found = s.search_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), body.limit.unwrap_or(PATTERN_RECORDS).clamp(1, PATTERN_RECORDS)).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let found = at.search(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), body.limit.unwrap_or(PATTERN_RECORDS).clamp(1, PATTERN_RECORDS)).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         #[derive(Default)]
         struct Seen<'a> {
             count: u64,
@@ -1558,11 +1577,11 @@ async fn patterns(body: SearchBody) -> Result<Response, Fail> {
 }
 
 async fn search(body: SearchBody) -> Result<Response, Fail> {
-    reading_waited(move |s, w| {
+    read_apart(kiln_obs::store::Store::logs_at, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
-        let found = s.search_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), body.limit.unwrap_or(100).clamp(1, LOGS_MAX)).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let found = at.search(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), body.limit.unwrap_or(100).clamp(1, LOGS_MAX)).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let out = SearchOut {
             records: RecordsOut(&found.records),
             blocks: BlocksOut { total: found.blocks_total, pruned: found.blocks_pruned },
@@ -1611,7 +1630,7 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
         other => return Err(fail(StatusCode::BAD_REQUEST, format!("a measure: {other} (count, cardinality, sum, avg, min, max)"))),
     };
     let by: Vec<Facet> = body.by.iter().map(|f| Facet::parse(f)).collect();
-    reading_waited(move |s, w| {
+    read_apart(kiln_obs::store::Store::logs_at, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1621,14 +1640,14 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
             if step <= 0 {
                 return Err(fail(StatusCode::BAD_REQUEST, "a step: more than 0 ms"));
             }
-            let b = s.aggregate_logs_buckets(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), ns(step), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let b = at.aggregate_buckets(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), ns(step), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
             let series: Vec<Value> = b.groups.iter().map(|(vals, v)| json!({ "group": group(vals), "values": v })).collect();
             return Ok(srv::json(
                 StatusCode::OK,
                 &json!({ "grid": { "from": b.buckets.start / 1_000_000, "step": step, "n": b.buckets.n }, "series": series, "rows_scanned": b.rows_scanned, "blocks_pruned": b.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0, "queued_ms": w.queued_ms, "waited_ms": w.store_ms }),
             ));
         }
-        let agg = s.aggregate_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let agg = at.aggregate(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let groups: Vec<Value> = agg.groups.iter().map(|(vals, v)| json!({ "group": group(vals), "value": v })).collect();
         Ok(srv::json(StatusCode::OK, &json!({ "groups": groups, "rows_scanned": agg.rows_scanned, "blocks_pruned": agg.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0, "queued_ms": w.queued_ms, "waited_ms": w.store_ms })))
     })
@@ -1657,11 +1676,11 @@ async fn facets(body: FacetsBody) -> Result<Response, Fail> {
         return Err(fail(StatusCode::BAD_REQUEST, "at most 32 facets"));
     }
     let top = body.top.unwrap_or(10).clamp(1, 1000);
-    reading_waited(move |s, w| {
+    read_apart(kiln_obs::store::Store::logs_at, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
-        let fc = s.log_facets(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &facets, top).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let fc = at.facets(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &facets, top).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let out: Vec<Value> = facets.iter().zip(&fc.facets).map(|(f, (values, distinct))| json!({ "facet": f.name(), "distinct": distinct, "values": values.iter().map(|(v, n)| json!({ "value": v, "count": n })).collect::<Vec<_>>() })).collect();
         Ok(srv::json(StatusCode::OK, &json!({ "facets": out, "matched": fc.matched, "rows_scanned": fc.rows_scanned, "blocks_pruned": fc.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0, "queued_ms": w.queued_ms, "waited_ms": w.store_ms })))
     })

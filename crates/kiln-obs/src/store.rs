@@ -603,11 +603,11 @@ impl Store {
         store.blocks.sort_by_key(|b| b.seq);
         for e in &manifest.logs {
             let log = LogFile::open(&dir.join(&e.file))?;
-            store.logs.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log });
+            store.logs.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log: Arc::new(log) });
         }
         for e in &manifest.spans {
             let log = LogFile::open(&dir.join(&e.file))?;
-            store.spans.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log });
+            store.spans.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log: Arc::new(log) });
         }
         store.cutoff = manifest.cutoff;
         store.logs_cutoff = manifest.logs_cutoff;
@@ -1060,7 +1060,7 @@ impl Store {
                     w.done.bytes_written += log.bytes;
                     w.manifest.next_seq = seq + 1;
                     w.manifest.logs.push(BlockEntry { seq, file: file.clone() });
-                    w.logs = Some(HeldFile { seq, file, log });
+                    w.logs = Some(HeldFile { seq, file, log: Arc::new(log) });
                 }
             }
             if self.spans.unwritten_rows() > 0 {
@@ -1071,7 +1071,7 @@ impl Store {
                     w.done.bytes_written += log.bytes;
                     w.manifest.next_seq = seq + 1;
                     w.manifest.spans.push(BlockEntry { seq, file: file.clone() });
-                    w.spans = Some(HeldFile { seq, file, log });
+                    w.spans = Some(HeldFile { seq, file, log: Arc::new(log) });
                 }
             }
             let mut borrowed: Vec<(u32, &[Chunk])> = Vec::new();
@@ -1604,23 +1604,33 @@ impl Store {
         Ok(())
     }
 
+    /// The logs as they are now, to read with no hold of the store ([`LogsAt`]): what an API's
+    /// reading takes under a brief hold, and reads after.
+    pub fn logs_at(&self) -> LogsAt {
+        LogsAt { snap: self.logs.snapshot(), cutoff_ns: self.logs_cutoff.saturating_mul(1_000_000) }
+    }
+
+    /// The spans as they are now ([`LogsAt`]).
+    pub fn spans_at(&self) -> LogsAt {
+        LogsAt { snap: self.spans.snapshot(), cutoff_ns: self.spans_cutoff.saturating_mul(1_000_000) }
+    }
+
     /// The newest `limit` log records in `[from, to]` (ns, none older than the logs' cutoff) that
     /// `search` matches.
     pub fn search_logs(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
-        Ok(self.logs.search(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, limit)?)
+        self.logs_at().search(search, from, to, limit)
     }
 
     /// Log records in `[from, to]` (ns, none older than the logs' cutoff) that `search` matches,
     /// grouped by `by` and measured (log analytics).
     pub fn aggregate_logs(&self, search: &Search, from: i64, to: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Aggregated, crate::logs::store::AggregateError> {
-        self.logs.aggregate(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, by, measure)
+        self.logs_at().aggregate(search, from, to, by, measure)
     }
 
     /// As [`aggregate_logs`](Self::aggregate_logs), in buckets of `step` ns aligned to it (the
     /// buckets follow `from` as asked; what the cutoff has dropped is in none).
     pub fn aggregate_logs_buckets(&self, search: &Search, from: i64, to: i64, step: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Bucketed, crate::logs::store::AggregateError> {
-        let buckets = crate::logs::store::Buckets::over(from, to, step)?;
-        self.logs.aggregate_buckets(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, buckets, by, measure)
+        self.logs_at().aggregate_buckets(search, from, to, step, by, measure)
     }
 
     /// Every metric from logs' points for the window that begins at `window` (ns): none when the
@@ -1635,7 +1645,7 @@ impl Store {
     /// Each facet's most common values over the logs a search matches, in one pass
     /// ([`LogStore::facet_counts`]).
     pub fn log_facets(&self, search: &Search, from: i64, to: i64, facets: &[crate::logs::store::Facet], top: usize) -> Result<crate::logs::store::FacetCounts, crate::logs::store::AggregateError> {
-        self.logs.facet_counts(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, facets, top)
+        self.logs_at().facets(search, from, to, facets, top)
     }
 
     /// Bytes of logs on disk.
@@ -1646,23 +1656,22 @@ impl Store {
     /// The newest `limit` spans in `[from, to]` (ns, none older than the spans' cutoff) that
     /// `search` matches (a search of spans: `crate::logs::search::parse_spans`).
     pub fn search_spans(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
-        Ok(self.spans.search(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, limit)?)
+        self.spans_at().search(search, from, to, limit)
     }
 
     /// Spans in `[from, to]` that `search` matches, grouped by `by` and measured (trace analytics).
     pub fn aggregate_spans(&self, search: &Search, from: i64, to: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Aggregated, crate::logs::store::AggregateError> {
-        self.spans.aggregate(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, by, measure)
+        self.spans_at().aggregate(search, from, to, by, measure)
     }
 
     /// As [`aggregate_spans`](Self::aggregate_spans), in buckets of `step` ns aligned to it.
     pub fn aggregate_spans_buckets(&self, search: &Search, from: i64, to: i64, step: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Bucketed, crate::logs::store::AggregateError> {
-        let buckets = crate::logs::store::Buckets::over(from, to, step)?;
-        self.spans.aggregate_buckets(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, buckets, by, measure)
+        self.spans_at().aggregate_buckets(search, from, to, step, by, measure)
     }
 
     /// Each facet's most common values over the spans a search matches, in one pass.
     pub fn span_facets(&self, search: &Search, from: i64, to: i64, facets: &[crate::logs::store::Facet], top: usize) -> Result<crate::logs::store::FacetCounts, crate::logs::store::AggregateError> {
-        self.spans.facet_counts(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, facets, top)
+        self.spans_at().facets(search, from, to, facets, top)
     }
 
     /// Every metric from spans' points for the window that begins at `window` (ns): none when the
@@ -1677,7 +1686,7 @@ impl Store {
     /// Every span in `[from, to]` (ns) that `search` matches, to `f`, one at a time, none kept (a
     /// trace's spans, a service map's).
     pub fn each_span(&self, search: &Search, from: i64, to: i64, f: impl FnMut(&crate::logs::record::RecordRef<'_>)) -> Result<(), StoreError> {
-        Ok(self.spans.each_matching(search, from.max(self.spans_cutoff.saturating_mul(1_000_000)), to, f)?)
+        self.spans_at().each(search, from, to, f)
     }
 
     /// Spans a scan of `[from, to]` (ns) reads at the most, from the blocks' summaries.
@@ -2018,6 +2027,59 @@ pub fn cut_shared(store: &RwLock<Store>, at: Point) -> Result<Maintained, StoreE
         // Something applied meanwhile (not as the group's thread cuts): cut under the hold.
         Err(StoreError::Moved) => write_store(store).cut(at),
         done => done,
+    }
+}
+
+/// A log store's records as they were at a moment ([`Store::logs_at`], [`Store::spans_at`]): read
+/// with no hold of the store, so a scan however long never keeps a write waiting, nor a reader
+/// behind that write; none older than the store's cutoff then.
+#[derive(Debug, Clone)]
+pub struct LogsAt {
+    snap: crate::logs::store::LogSnapshot,
+    cutoff_ns: i64,
+}
+
+impl LogsAt {
+    /// The newest `limit` records in `[from, to]` (ns) that `search` matches.
+    pub fn search(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
+        Ok(self.snap.search(search, from.max(self.cutoff_ns), to, limit)?)
+    }
+
+    /// Records in `[from, to]` that `search` matches, grouped by `by` and measured.
+    pub fn aggregate(
+        &self,
+        search: &Search,
+        from: i64,
+        to: i64,
+        by: &[crate::logs::store::Facet],
+        measure: &crate::logs::store::Measure,
+    ) -> Result<crate::logs::store::Aggregated, crate::logs::store::AggregateError> {
+        self.snap.aggregate(search, from.max(self.cutoff_ns), to, by, measure)
+    }
+
+    /// As [`LogsAt::aggregate`], in buckets of `step` ns aligned to it (the buckets follow `from`
+    /// as asked; what the cutoff dropped is in none).
+    pub fn aggregate_buckets(
+        &self,
+        search: &Search,
+        from: i64,
+        to: i64,
+        step: i64,
+        by: &[crate::logs::store::Facet],
+        measure: &crate::logs::store::Measure,
+    ) -> Result<crate::logs::store::Bucketed, crate::logs::store::AggregateError> {
+        let buckets = crate::logs::store::Buckets::over(from, to, step)?;
+        self.snap.aggregate_buckets(search, from.max(self.cutoff_ns), to, buckets, by, measure)
+    }
+
+    /// Each facet's most common values over the records a search matches, in one pass.
+    pub fn facets(&self, search: &Search, from: i64, to: i64, facets: &[crate::logs::store::Facet], top: usize) -> Result<crate::logs::store::FacetCounts, crate::logs::store::AggregateError> {
+        self.snap.facet_counts(search, from.max(self.cutoff_ns), to, facets, top)
+    }
+
+    /// Every record in `[from, to]` that `search` matches, to `f`, one at a time, none kept.
+    pub fn each(&self, search: &Search, from: i64, to: i64, f: impl FnMut(&crate::logs::record::RecordRef<'_>)) -> Result<(), StoreError> {
+        Ok(self.snap.each_matching(search, from.max(self.cutoff_ns), to, f)?)
     }
 }
 

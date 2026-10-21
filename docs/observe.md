@@ -3304,7 +3304,19 @@ refused): a search's wait grew, 2.3 to 12 ms at the median, 12 to 111 at p99, an
 status's to 1.2 s at p99. A reader holds the store for its whole scan, a writer waits behind a long
 one, and every reader after waits behind the writer (the lock writes first): a second writer is a
 second convoy. Left out; what removes the wait is a reader that does not hold the store while it
-reads (its blocks and files taken as they are, read with no hold of it): next.
+reads (its blocks and files taken as they are, read with no hold of it).
+
+Done so (2026-10-20): a log store's head segments, sealed blocks and files are shared, and a reading
+of logs or spans (the explorers' search, analytics, facets and patterns) takes them as they are under
+a brief hold (`Store::logs_at`, `spans_at`: a few dozen shared pointers copied, with the cutoff then)
+and reads with the hold let go (`api::read_apart`); a file let go meanwhile stays readable (its open
+handle keeps it, on Windows too: Rust opens files sharing their deletion). A test reads a snapshot
+taken before rows came, a cut was written and taken in, and the oldest file was deleted: what it held,
+to the record. Measured on adacachy loaded by others' work (half the server's CPU of the run before),
+the count by status's wait for the store 28 ms at p99 (12 before, 1.2 s with sealing apart); what is
+left of the waits is the store's other long holds (a cut writes its files under a shared one; the
+monitors evaluate under one; metrics from logs count under one), each a writer's wait and so every
+reader's after it.
 
 **Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is
