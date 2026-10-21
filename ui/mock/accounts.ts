@@ -20,6 +20,7 @@ import type { Account, AccountFlow, AccountMethod, AgentInfo, HEvent, Meta, Slas
 import { longInfo } from "./conversation.ts";
 import { fleetCommand, fleetInfos } from "./push.ts";
 import { familyInfos } from "./agents.ts";
+import { fastInfos } from "./fast.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -402,7 +403,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {
-    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fleetInfos(), ...familyInfos()]);
+    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos()]);
     return true;
   }
 
