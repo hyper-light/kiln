@@ -1307,6 +1307,52 @@ mod tests {
         Ok(())
     }
 
+    /// CP-T6.1, the first bug kiln-sim found, by its seeds: sync wrote another machine's change into
+    /// a folder through a temporary file renamed over its name unsynced, and saved state saying the
+    /// folder held it. A power loss then left the name holding nothing, zeroes or a torn page. The
+    /// next look took that for an edit made here and the log spread it to every copy (sync seeds 3
+    /// and 163); a moving session went on with its file empty (moves seed 57); or, its size and time
+    /// unchanged, no look saw it, and the copy kept it for good while the log held another version
+    /// (moves seed 90).
+    #[test]
+    fn the_seeds_where_a_power_loss_tore_a_file_sync_had_written_converge() -> Result<(), String> {
+        for seed in [3, 163] {
+            run(seed, 0, Plant::default(), Mode::Sync)?;
+        }
+        for seed in [57, 90] {
+            run(seed, 0, Plant::default(), Mode::Moves)?;
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, the first bug's contract: once a copy's folders are synced (as `Feed::save` does
+    /// before it writes the state that says what the folder holds), a file sync wrote holds what it
+    /// wrote, whatever a power loss does after; on either way of journaling names.
+    #[test]
+    fn a_file_sync_wrote_holds_it_after_a_power_loss_once_its_folders_are_synced() -> Result<(), String> {
+        use crate::sync::{Change, Copy, State};
+        for seed in 0..200u64 {
+            let disk = Disk::new(SimClock::new(), Rng::new(seed), DiskFaults { fsync_commits_names: seed % 2 == 0, ..DiskFaults::none() });
+            let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+            let root = PathBuf::from("/home/m2/repo");
+            fs.create_dir_all(&root).map_err(e)?;
+            disk.make_durable("/home/m2/repo");
+            let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
+            let bytes = filled("another machine's change\n", 6000);
+            let hash = blobs.put_bytes(&bytes).map_err(e)?;
+            let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
+            let change = Change { path: "docs/a.txt".into(), to: Some(Version::File { hash, exec: false }), base: None };
+            copy.apply(&Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] }, &blobs).map_err(e)?;
+            copy.sync_dirs().map_err(e)?;
+            disk.power_loss();
+            let got = disk.read("/home/m2/repo/docs/a.txt").map_err(e)?;
+            if got != bytes {
+                return Err(format!("seed {seed}: after a power loss docs/a.txt holds {} bytes, not the {} sync wrote there", got.len(), bytes.len()));
+            }
+        }
+        Ok(())
+    }
+
     /// CP-T6.1, T-T6.1.1: a planted bug (a copy's state written in place, unsynced: a lost write
     /// after a torn page) is found within the CI seed budget.
     #[test]

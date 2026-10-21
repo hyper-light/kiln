@@ -75,6 +75,8 @@ pub trait Fs: Send + Sync + std::fmt::Debug {
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn remove_dir(&self, path: &Path) -> io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    /// A file's bytes durable (`File::sync_all` on it).
+    fn sync_file(&self, path: &Path) -> io::Result<()>;
     /// A folder's changes of names durable (`File::open(dir)?.sync_all()`).
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
     /// A name for a temporary file no other has.
@@ -203,6 +205,11 @@ impl Fs for Std {
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
+    }
+
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        // Opened to write (Windows flushes only what it may write), never cut short.
+        std::fs::OpenOptions::new().write(true).open(path)?.sync_all()
     }
 
     #[cfg(unix)]

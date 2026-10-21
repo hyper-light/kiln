@@ -120,6 +120,10 @@ impl Fs for SimFs {
         self.disk.create_dir_all(&s(path))
     }
 
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        self.disk.fsync(&s(path))
+    }
+
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         self.disk.fsync_dir(&s(dir))
     }

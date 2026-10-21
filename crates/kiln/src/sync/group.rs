@@ -445,8 +445,11 @@ impl Feed {
         Ok(Vec::new())
     }
 
-    /// Saves the copy's state as the folder has it; then that point is durable.
+    /// Saves the copy's state as the folder has it; then that point is durable. The folders'
+    /// changes of names go first: the state never says the folder holds what a power loss could
+    /// still take back.
     pub fn save(&mut self) -> io::Result<()> {
+        self.copy.sync_dirs()?;
         let saved = Saved {
             state: self.copy.state.clone(),
             index: self.reached.index,

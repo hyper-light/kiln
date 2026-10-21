@@ -188,6 +188,10 @@ pub struct Copy {
     pub gone: HashSet<String>,
     /// The filesystem its folder is on (the machine's own; a simulated one in kiln-sim's models).
     pub fs: Arc<dyn Fs>,
+    /// Folders whose names this copy changed (a file renamed in or removed, a folder made or
+    /// removed) since its state was last saved: synced before it is ([`Copy::sync_dirs`]), so a
+    /// power loss can't undo what the saved state says the folder holds. One entry a folder.
+    pub touched: BTreeSet<PathBuf>,
 }
 
 /// Whether a path from a step may be written here: relative, `/`-separated, without `.`, `..` or
@@ -238,7 +242,40 @@ impl Copy {
 
     /// A copy whose folder is on `fs`.
     pub fn on(fs: Arc<dyn Fs>, root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
-        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new(), fs }
+        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new(), fs, touched: BTreeSet::new() }
+    }
+
+    /// Makes the changes of names in the folders this copy changed durable: what the copy's state
+    /// may then say the folder holds survives a power loss. A folder gone since needs nothing (the
+    /// one it was in is among them); one that failed is tried again next time.
+    pub fn sync_dirs(&mut self) -> io::Result<()> {
+        let dirs = std::mem::take(&mut self.touched);
+        let mut rest = dirs.into_iter();
+        while let Some(dir) = rest.next() {
+            match self.fs.sync_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.touched.insert(dir);
+                    self.touched.extend(rest);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes that the names in the folder holding `path` changed (and, for a folder made just now,
+    /// in each folder above it, up to the copy's root).
+    fn touch(&mut self, path: &Path, made: bool) {
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| d.starts_with(&self.root)) {
+            self.touched.insert(d.to_owned());
+            if !made || *d == self.root {
+                break;
+            }
+            dir = d.parent();
+        }
     }
 
     /// What this copy's file at `path` holds now (none: no file).
@@ -484,8 +521,18 @@ impl Copy {
         Ok(Outcome::Applied { path: path.to_owned() })
     }
 
-    /// Makes this copy's `path` hold `v` (none: removes it), atomically for a file.
-    fn write(&self, path: &str, v: Option<&Version>, blobs: &Blobs) -> io::Result<()> {
+    /// Makes the folders `full` goes in: whether any was missing.
+    fn make_parents(&self, full: &Path) -> io::Result<bool> {
+        let Some(parent) = full.parent() else { return Ok(false) };
+        let missing = self.fs.meta(parent).is_err();
+        self.fs.create_dir_all(parent)?;
+        Ok(missing)
+    }
+
+    /// Makes this copy's `path` hold `v` (none: removes it), atomically for a file: its bytes
+    /// durable before its name, and the folders whose names changed noted to be synced before the
+    /// copy's state says the folder holds it ([`Copy::sync_dirs`]).
+    fn write(&mut self, path: &str, v: Option<&Version>, blobs: &Blobs) -> io::Result<()> {
         let full = self.root.join(path);
         let gone = |r: io::Result<()>| match r {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -494,35 +541,40 @@ impl Copy {
         match v {
             None => {
                 gone(self.fs.remove_file(&full))?;
+                self.touch(&full, false);
                 // Folders left empty go too, as git leaves none behind.
-                let mut dir = full.parent();
+                let mut dir = full.parent().map(Path::to_path_buf);
                 while let Some(d) = dir.filter(|d| *d != self.root && d.starts_with(&self.root)) {
-                    if self.fs.remove_dir(d).is_err() {
+                    if self.fs.remove_dir(&d).is_err() {
                         break;
                     }
-                    dir = d.parent();
+                    self.touch(&d, false);
+                    dir = d.parent().map(Path::to_path_buf);
                 }
                 Ok(())
             }
             Some(Version::File { hash, exec }) => {
                 let src = blobs.path(hash).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a SHA-256"))?;
-                if let Some(parent) = full.parent() {
-                    self.fs.create_dir_all(parent)?;
-                }
+                let made_dirs = self.make_parents(&full)?;
                 let tmp = full.with_file_name(format!("{}{}.tmp", scan::TEMP_PREFIX, self.fs.temp_id()));
                 self.fs.copy(&src, &tmp)?;
-                let made = self.fs.set_exec(&tmp, *exec).and_then(|()| self.fs.rename(&tmp, &full));
+                // Its bytes durable before its name: renamed in unsynced, a power loss can leave the
+                // name holding nothing, or a torn page, which the next look would take for an edit
+                // made here and spread to every copy.
+                let made = self.fs.set_exec(&tmp, *exec).and_then(|()| self.fs.sync_file(&tmp)).and_then(|()| self.fs.rename(&tmp, &full));
                 if made.is_err() {
                     let _ = self.fs.remove_file(&tmp);
+                } else {
+                    self.touch(&full, made_dirs);
                 }
                 made
             }
             Some(Version::Link { target }) => {
-                if let Some(parent) = full.parent() {
-                    self.fs.create_dir_all(parent)?;
-                }
+                let made_dirs = self.make_parents(&full)?;
                 gone(self.fs.remove_file(&full))?;
-                self.fs.symlink(target, &full)
+                self.fs.symlink(target, &full)?;
+                self.touch(&full, made_dirs);
+                Ok(())
             }
         }
     }
