@@ -217,11 +217,13 @@ async fn log_metric_test(t: LogMetricTest, spans: bool) -> Result<Response, Fail
         let mut series: std::collections::BTreeMap<Vec<u8>, Vec<(i64, f64)>> = std::collections::BTreeMap::new();
         let (mut records, mut rows) = (0u64, 0u64);
         let mut w = window_of(from.saturating_mul(1_000_000));
-        while w <= to.saturating_mul(1_000_000) {
-            // A hold of the store a window: writes go on between.
+        // The records as they are, counted with the store let go: writes go on throughout.
+        let at = {
             let s = store.read().unwrap_or_else(PoisonError::into_inner);
-            let counted = if spans { s.count_span_metrics(&metrics, w) } else { s.count_log_metrics(&metrics, w) }.map_err(|e| e.to_string())?;
-            drop(s);
+            if spans { s.spans_at() } else { s.logs_at() }
+        };
+        while w <= to.saturating_mul(1_000_000) {
+            let counted = at.count_metrics(&metrics, w).map_err(|e| e.to_string())?;
             if let Some(c) = counted {
                 rows += c.rows_scanned;
                 records += c.tallies.first().map_or(0, |t| t.records);

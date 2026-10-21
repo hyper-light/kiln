@@ -1639,7 +1639,7 @@ impl Store {
         if window < self.logs_cutoff.saturating_mul(1_000_000) {
             return Ok(None);
         }
-        Ok(Some(crate::logs::metrics::count(&self.logs, metrics, window)?))
+        self.logs_at().count_metrics(metrics, window)
     }
 
     /// Each facet's most common values over the logs a search matches, in one pass
@@ -1680,7 +1680,7 @@ impl Store {
         if window < self.spans_cutoff.saturating_mul(1_000_000) {
             return Ok(None);
         }
-        Ok(Some(crate::logs::metrics::count(&self.spans, metrics, window)?))
+        self.spans_at().count_metrics(metrics, window)
     }
 
     /// Every span in `[from, to]` (ns) that `search` matches, to `f`, one at a time, none kept (a
@@ -2080,6 +2080,15 @@ impl LogsAt {
     /// Every record in `[from, to]` that `search` matches, to `f`, one at a time, none kept.
     pub fn each(&self, search: &Search, from: i64, to: i64, f: impl FnMut(&crate::logs::record::RecordRef<'_>)) -> Result<(), StoreError> {
         Ok(self.snap.each_matching(search, from.max(self.cutoff_ns), to, f)?)
+    }
+
+    /// Every metric from these records' points for the window that begins at `window` (ns): none
+    /// when the cutoff reaches into it (not all its records are held).
+    pub fn count_metrics(&self, metrics: &[crate::logs::metrics::LogMetric], window: i64) -> Result<Option<crate::logs::metrics::Counted>, StoreError> {
+        if window < self.cutoff_ns {
+            return Ok(None);
+        }
+        Ok(Some(crate::logs::metrics::count(&self.snap, metrics, window)?))
     }
 }
 

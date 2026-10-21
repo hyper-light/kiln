@@ -806,7 +806,7 @@ mod tests {
         let (raw, n) = rows_of(&traces);
         logs.append(raw, n as u32).unwrap();
         let window = crate::logs::metrics::window_of(base);
-        let counted = crate::logs::metrics::count(&logs, &trace_metrics(), window).unwrap();
+        let counted = crate::logs::metrics::count(&logs.snapshot(), &trace_metrics(), window).unwrap();
         let mut st = crate::store::Store::new(crate::hash::Keyed::new());
         let mut b = crate::batch::Builder::new();
         for (k, points) in &counted.series {
@@ -931,7 +931,7 @@ mod tests {
         }
         store.append(raw, spans.len() as u32).unwrap();
         let window = crate::logs::metrics::window_of(1_700_000_000_000_000_000);
-        let counted = crate::logs::metrics::count(&store, &defs, window).unwrap();
+        let counted = crate::logs::metrics::count(&store.snapshot(), &defs, window).unwrap();
         let value = |metric: &str, tags: &[(&str, &str)]| -> f64 {
             counted
                 .series

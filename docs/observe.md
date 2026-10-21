@@ -918,8 +918,9 @@ counts the window again, whole, and writes its points over the ones before (at a
 write wins, §4.5; a window a rollup holds is read from its samples while a later write overlaps it,
 §4.7). So a record is never counted twice, and a restart loses none: the server counts every window
 of the last twenty minutes again as it starts. The replica notes, as it applies a batch, the windows
-its records fall in (`Touched`), taken under the same hold of the store as the count that follows,
-so every record noted is in what that count reads. Records that come more than twenty minutes after
+its records fall in (`Touched`), taken under the same brief hold of the store as the records the
+count reads (as they are, `Store::logs_at`, counted with the hold let go: no write waits on a
+count), so every record noted is in what that count reads. Records that come more than twenty minutes after
 their window are not counted, as Datadog's ("aggregation only considers logs ingested with a
 timestamp within the past 20 minutes"); they are stored and searched as any.
 
@@ -3314,9 +3315,12 @@ handle keeps it, on Windows too: Rust opens files sharing their deletion). A tes
 taken before rows came, a cut was written and taken in, and the oldest file was deleted: what it held,
 to the record. Measured on adacachy loaded by others' work (half the server's CPU of the run before),
 the count by status's wait for the store 28 ms at p99 (12 before, 1.2 s with sealing apart); what is
-left of the waits is the store's other long holds (a cut writes its files under a shared one; the
-monitors evaluate under one; metrics from logs count under one), each a writer's wait and so every
-reader's after it.
+left of the waits is the store's other long holds (the monitors evaluate under one; a query of
+metrics reads under one), each a writer's wait and so every reader's after it. Metrics from logs and
+from spans count as the explorers read: each window's records taken with the windows touched under a
+brief hold, counted with it let go (`LogsAt::count_metrics`; the log-metric test endpoint one
+taking for its whole range). A cut writes its files under a shared hold too, but on the thread that
+applies: no write waits for it, so no reader does.
 
 **Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is

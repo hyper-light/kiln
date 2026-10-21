@@ -518,9 +518,11 @@ impl LogMetrics {
         lock(&self.state).counting.clone()
     }
 
-    /// Counts what is due, for a quarter of a second at the most: one window a hold of the store,
-    /// what came taken under it (so a window counted holds every record noted for it), its points
-    /// offered after. Points not taken (the server is behind) leave the window to count again.
+    /// Counts what is due, for a quarter of a second at the most: one window a brief hold of the
+    /// store, what came taken under it with the records as they are (so a window counted holds
+    /// every record noted for it), counted once the hold is let go (`kiln_obs::store::LogsAt`: no
+    /// write waits on a count), its points offered after. Points not taken (the server is behind)
+    /// leave the window to count again.
     pub fn tick(&self, store: &kiln_obs::machine::Shared, touched: &Touched, offer: &dyn Fn(Vec<(kiln_obs::batch::SeriesKey, Vec<(i64, f64)>)>) -> bool) {
         let metrics = lock(&self.compiled).clone();
         let started = Instant::now();
@@ -536,9 +538,10 @@ impl LogMetrics {
             st.mark(&spans, now);
             let Some(w) = st.due(now) else { return };
             drop(st);
-            let counting = Instant::now();
-            let counted = if self.spans { s.count_span_metrics(&metrics, w) } else { s.count_log_metrics(&metrics, w) };
+            let at = if self.spans { s.spans_at() } else { s.logs_at() };
             drop(s);
+            let counting = Instant::now();
+            let counted = at.count_metrics(&metrics, w);
             let took = u64::try_from(counting.elapsed().as_millis()).unwrap_or(u64::MAX);
             let mut st = lock(&self.state);
             st.counting.count_ms += took;

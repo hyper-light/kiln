@@ -15,7 +15,7 @@ use std::sync::{Mutex, PoisonError};
 use hashbrown::HashTable;
 
 use super::search::{RowScratch, Search};
-use super::store::{Facet, LogStore, LogStoreError};
+use super::store::{Facet, LogSnapshot, LogStoreError};
 use crate::batch::{Kind, SeriesKey};
 use crate::dist::{self, Bucket};
 use crate::hash::Keyed;
@@ -222,7 +222,7 @@ fn number(v: Option<&str>) -> Option<f64> {
 
 /// Every metric's points for the window that starts at `window` (ns, a multiple of [`WINDOW`]):
 /// the records `logs` holds in it, read once.
-pub fn count(logs: &LogStore, metrics: &[LogMetric], window: i64) -> Result<Counted, LogStoreError> {
+pub fn count(logs: &LogSnapshot, metrics: &[LogMetric], window: i64) -> Result<Counted, LogStoreError> {
     let mut out = Counted { tallies: vec![Tally::default(); metrics.len()], ..Counted::default() };
     let live: Vec<usize> = metrics.iter().enumerate().filter(|(_, m)| m.since <= window).map(|(i, _)| i).collect();
     if live.is_empty() {
@@ -490,6 +490,7 @@ fn merge(spans: &mut Vec<(i64, i64)>) {
 mod tests {
     use super::*;
     use crate::logs::record::{Record, put_row};
+    use crate::logs::store::LogStore;
     use crate::testkit::Rng;
 
     const T0: i64 = 1_792_324_800_000_000_000;
@@ -556,7 +557,7 @@ mod tests {
         let mut later = metrics[2].clone();
         later.since = T0 + WINDOW;
         let metrics = [metrics[0].clone(), metrics[1].clone(), later];
-        let c = count(&s, &metrics, T0).unwrap();
+        let c = count(&s.snapshot(), &metrics, T0).unwrap();
         for ((service, status), n) in &want_count {
             assert_eq!(value(&c, "hits", &[("service", service), ("http.status_code", status)]), Some(*n as f64), "{service} {status}");
         }
@@ -588,7 +589,7 @@ mod tests {
     fn groups_past_the_limit_are_counted_in_the_overflow() {
         let records: Vec<Record> = (0..(GROUPS as i64 + 500)).map(|i| Record { ts: T0 + i, service: format!("s{i}"), ..Record::default() }).collect();
         let s = store(&records);
-        let c = count(&s, &[metric("by_service", "*", &["service"], Compute::Count)], T0).unwrap();
+        let c = count(&s.snapshot(), &[metric("by_service", "*", &["service"], Compute::Count)], T0).unwrap();
         assert_eq!(c.tallies[0], Tally { records: GROUPS as u64 + 500, groups: GROUPS + 1, overflowed: 500 });
         assert_eq!(value(&c, "by_service", &[(OVERFLOW_TAG, "true")]), Some(500.0));
         assert_eq!(value(&c, "by_service", &[("service", "s0")]), Some(1.0));
@@ -598,7 +599,7 @@ mod tests {
     fn missing_and_long_values_are_tagged_as_a_metric_keeps_them() {
         let long = "é".repeat(TAG_CHARS + 10);
         let records = vec![Record { ts: T0, service: String::new(), ..Record::default() }, Record { ts: T0 + 1, service: long.clone(), ..Record::default() }];
-        let c = count(&store(&records), &[metric("m", "*", &["service", "@missing"], Compute::Count)], T0).unwrap();
+        let c = count(&store(&records).snapshot(), &[metric("m", "*", &["service", "@missing"], Compute::Count)], T0).unwrap();
         assert_eq!(value(&c, "m", &[("service", NONE), ("missing", NONE)]), Some(1.0));
         let cut: String = long.chars().take(TAG_CHARS).collect();
         assert_eq!(value(&c, "m", &[("service", cut.as_str()), ("missing", NONE)]), Some(1.0));
