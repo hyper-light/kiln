@@ -919,17 +919,25 @@ export const Timeline = React.memo(function Timeline({
   const keptFiles = useSession(store, (s) => s.files);
   const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
+  // A Codex child's own work is keyed by its thread: opened from any of its calls, or with its row
+  // gone, it still shows (its row's id, else the thread the opened call names).
+  const thread = React.useMemo(() => {
+    if (!parent) return undefined;
+    if (task) return task.id;
+    const call = events.find((e) => e.id === parent);
+    return call?.kind === "tool" ? call.task : undefined;
+  }, [parent, task, events]);
   const going = parent ? Boolean(task && taskLive(task)) : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
   // Turns that didn't change stay the same objects, so only what changed renders again; and only
   // the turns from the first change on are worked out again (derive.ts), not the whole history.
   const [kept] = React.useState(() => new Map<string, Turn>());
   const [memo] = React.useState<{ last: TurnsMemo | null }>(() => ({ last: null }));
   const turns = React.useMemo(() => {
-    const next = turnsFrom(memo.last, events, parent, going);
+    const next = turnsFrom(memo.last, events, parent, going, thread);
     const shared = shareTurns(kept, next.turns);
     memo.last = { ...next, turns: shared };
     return shared;
-  }, [kept, memo, events, parent, going]);
+  }, [kept, memo, events, parent, going, thread]);
   const keeper = useKeeper(placeKey(agent, parent));
   const { read, restore, atEnd, setTail, toEnd } = keeper;
   // Scrolling records the place for the next content update without rendering the conversation.

@@ -87,3 +87,23 @@ test("shared turns from the last ones render as the turns worked out afresh", ()
     assert.deepEqual(shared, turnsOf(events, undefined, true), `step ${step}`);
   }
 });
+
+test("a Codex child's thread shows its own work whichever of its calls opened it, and with its row gone", () => {
+  const at = (n: number) => 1_000 + n;
+  const ev: HEvent[] = [
+    { id: "u1", seq: 1, at: at(1), kind: "user", text: "go" },
+    { id: "spawn-1", seq: 2, at: at(2), kind: "tool", tool_id: "spawn-1", name: "spawn_agent", tool: "agent", title: "Spawn", input: {}, status: "done", started: at(2), task: "T1" },
+    { id: "child:T1:p", seq: 3, at: at(3), parent: "spawn-1", kind: "user", text: "audit the columns" },
+    { id: "child:T1:a", seq: 4, at: at(4), parent: "spawn-1", kind: "assistant", text: "Done: the columns hold." },
+    { id: "send-2", seq: 5, at: at(5), kind: "tool", tool_id: "send-2", name: "send_message", tool: "agent", title: "Send", input: {}, status: "done", started: at(5), task: "T1" },
+    { id: "other", seq: 6, at: at(6), parent: "spawn-9", kind: "assistant", text: "someone else's" },
+  ];
+  const words = (turns: ReturnType<typeof turnsOf>) => turns.flatMap((t) => [t.prompt?.text, t.outcome?.text, ...t.items.map((i) => ("event" in i && "text" in i.event ? i.event.text : undefined))]).filter(Boolean);
+  // From its spawn, as before.
+  assert.deepEqual(words(turnsOf(ev, "spawn-1")), ["audit the columns", "Done: the columns hold."]);
+  // From a later call that addresses it (its row gone, the thread from the call): the same work.
+  assert.deepEqual(words(turnsOf(ev, "send-2", false, "T1")), ["audit the columns", "Done: the columns hold."]);
+  // Nothing of another child's, nor of the main thread.
+  assert(!words(turnsOf(ev, "send-2", false, "T1")).includes("someone else's"));
+  assert.deepEqual(words(turnsOf(ev)), ["go"]);
+});

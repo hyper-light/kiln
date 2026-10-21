@@ -71,14 +71,15 @@ const MERGES: Partial<Record<StepGroup, boolean>> = { explore: true, edit: true,
  * `openLast`: the last turn is still going, so it has no answer yet (its latest note stays where it
  * is instead of jumping to the answer slot and back as the turn goes on).
  */
-export function turnsOf(events: HEvent[], parent?: string, openLast = false): Turn[] {
-  return turnsFrom(null, events, parent, openLast).turns;
+export function turnsOf(events: HEvent[], parent?: string, openLast = false, thread?: string): Turn[] {
+  return turnsFrom(null, events, parent, openLast, thread).turns;
 }
 
 /** Turns worked out from `events` (for `parent`, `openLast`), and where in `events` each began. */
 export interface TurnsMemo {
   events: HEvent[];
   parent: string | undefined;
+  thread: string | undefined;
   openLast: boolean;
   turns: Turn[];
   starts: number[];
@@ -90,9 +91,9 @@ export interface TurnsMemo {
  * were, and only the rest is read again. A conversation streaming into its last turn costs that
  * turn, not the thousands of events before it.
  */
-export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: string, openLast = false): TurnsMemo {
+export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: string, openLast = false, thread?: string): TurnsMemo {
   let from = 0;
-  if (was && was.parent === parent) {
+  if (was && was.parent === parent && was.thread === thread) {
     let k = 0;
     const n = Math.min(events.length, was.events.length);
     while (k < n && events[k] === was.events[k]) k++;
@@ -108,7 +109,7 @@ export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: stri
   }
   const turns = was && from > 0 ? was.turns.slice(0, from) : [];
   const starts = was && from > 0 ? was.starts.slice(0, from) : [];
-  readTurns(events, was && from > 0 ? (was.starts[from] ?? events.length) : 0, parent, turns, starts);
+  readTurns(events, was && from > 0 ? (was.starts[from] ?? events.length) : 0, parent, thread, turns, starts);
   // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
   for (let ti = from; ti < turns.length; ti++) {
     const t = turns[ti]!;
@@ -124,11 +125,15 @@ export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: stri
       break;
     }
   }
-  return { events, parent, openLast, turns, starts };
+  return { events, parent, thread, openLast, turns, starts };
 }
 
-/** The turns of `events` from index `at` (where a turn begins) on, onto `turns`, with where each begins onto `starts`. */
-function readTurns(events: HEvent[], at: number, parent: string | undefined, turns: Turn[], starts: number[]) {
+/**
+ * The turns of `events` from index `at` (where a turn begins) on, onto `turns`, with where each begins onto `starts`.
+ * `thread`: a Codex child's thread, whose own events (`child:<thread>:…`) are its whatever call they hang from.
+ */
+function readTurns(events: HEvent[], at: number, parent: string | undefined, thread: string | undefined, turns: Turn[], starts: number[]) {
+  const own = thread ? `child:${thread}:` : null;
   let cur: Turn | null = null;
   let i = at;
   const open = (prompt: Turn["prompt"], at: number, key: string) => {
@@ -139,7 +144,7 @@ function readTurns(events: HEvent[], at: number, parent: string | undefined, tur
   };
   for (; i < events.length; i++) {
     const e = events[i]!;
-    if ((e.parent ?? undefined) !== parent) continue;
+    if ((e.parent ?? undefined) !== parent && !(own && e.id.startsWith(own))) continue;
     if (e.kind === "user") {
       if (cur) (cur as Turn).ended = e.at;
       open(e, e.at, e.id);
