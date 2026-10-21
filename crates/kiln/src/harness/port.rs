@@ -50,6 +50,7 @@ impl kiln_seams::HarnessPort for Hub {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use futures::future::BoxFuture;
     use kiln_seams::HarnessPort;
@@ -152,6 +153,8 @@ mod tests {
             // A hub of its own for each case.
             let hubs = futures::future::join_all(cases.iter().map(|_| crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true))).await;
             let mut hubs: std::collections::VecDeque<Arc<Hub>> = hubs.into_iter().collect::<anyhow::Result<_>>()?;
+            // Their folders, removed once it's done (a scratch hub leaves its own behind).
+            let folders: Vec<std::path::PathBuf> = hubs.iter().map(|h| h.cfg.server.data_dir.clone()).collect();
             let last = hubs.back().cloned().ok_or_else(|| anyhow::anyhow!("no cases"))?;
             let dir = tempfile::tempdir()?;
             let make = || {
@@ -160,7 +163,14 @@ mod tests {
                 let cwd = dir.path().to_path_buf();
                 async move { RegistryFixture { port: Named { hub, ids: Mutex::new(HashMap::new()) }, cwd } }
             };
-            let report = kiln_seams::conformance::run("HarnessPort (kiln's registry)", &cases, make).await;
+            // Each case fails, named, if the registry hasn't answered it in 30 s (by kiln's runtime).
+            let clock = crate::rt::clock();
+            let report = kiln_seams::conformance::run_within("HarnessPort (kiln's registry)", &cases, make, || clock.sleep(Duration::from_secs(30))).await;
+            drop(last);
+            let tmp = std::env::temp_dir();
+            for f in folders.iter().filter(|f| f.starts_with(&tmp) && *f != &tmp) {
+                let _ = std::fs::remove_dir_all(f);
+            }
             anyhow::ensure!(report.passed == HOLDS_TODAY, "held: {:?}, failed: {:?}", report.passed, report.failed);
             let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
             anyhow::ensure!(failed == WAIT_FOR_T3, "failed: {:?}", report.failed);

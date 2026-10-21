@@ -48,7 +48,7 @@ pub trait HarnessPort: Send + Sync + 'static {
 /// Most commands a [`SimHarness`] keeps per agent by default; past it, a send is refused `Full`.
 pub const SIM_INBOX: usize = 100_000;
 /// Most agents a [`SimHarness`] knows at once; past it, `open` takes no more. It keeps what as many
-/// closed agents were sent, the oldest closed going first.
+/// closed agents were sent: past them, the oldest closed one's goes (`forgotten()` counts them).
 pub const SIM_AGENTS: usize = 100_000;
 
 /// A command the simulator was handed, and when (its clock's wall time).
@@ -78,12 +78,14 @@ struct SimState<A, C> {
     heard: HashMap<String, Vec<Delivery<C>>>,
     /// Closed agents whose deliveries are kept, oldest closed first.
     closed: VecDeque<String>,
+    /// Closed agents whose deliveries went, past [`SIM_AGENTS`] closed after them.
+    forgotten: u64,
     away: HashSet<String>,
 }
 
 impl<A, C> Default for SimState<A, C> {
     fn default() -> Self {
-        Self { order: Vec::new(), agents: HashMap::new(), catalogs: HashMap::new(), heard: HashMap::new(), closed: VecDeque::new(), away: HashSet::new() }
+        Self { order: Vec::new(), agents: HashMap::new(), catalogs: HashMap::new(), heard: HashMap::new(), closed: VecDeque::new(), forgotten: 0, away: HashSet::new() }
     }
 }
 
@@ -128,7 +130,7 @@ impl<A: Clone, C: Clone> SimHarness<A, C> {
     }
 
     /// Closes agent `id`: no longer known. What it was sent stays readable, for the
-    /// [`SIM_AGENTS`] agents closed last.
+    /// [`SIM_AGENTS`] agents closed last; an older one's goes, counted by `forgotten()`.
     pub fn close(&self, id: &str) {
         let mut st = self.inner.lock();
         if st.agents.remove(id).is_none() {
@@ -143,8 +145,15 @@ impl<A: Clone, C: Clone> SimHarness<A, C> {
         while st.closed.len() > SIM_AGENTS {
             if let Some(oldest) = st.closed.pop_front() {
                 st.heard.remove(&oldest);
+                st.forgotten = st.forgotten.saturating_add(1);
             }
         }
+    }
+
+    /// Closed agents whose deliveries went, past [`SIM_AGENTS`] closed after them: `heard` of one
+    /// is empty, as of an agent never sent anything, and this says so.
+    pub fn forgotten(&self) -> u64 {
+        self.inner.lock().forgotten
     }
 
     /// Agent `id`'s machine goes away (`true`) or comes back: false when there's no agent `id`.
@@ -391,6 +400,7 @@ mod tests {
             h.close(&id);
         }
         assert!(h.heard("a").is_empty() && h.heard("x0").len() == 1);
+        assert_eq!(h.forgotten(), 1, "a's went, and that's said");
         let st = h.inner.lock();
         assert_eq!((st.heard.len(), st.closed.len(), st.agents.len()), (SIM_AGENTS, SIM_AGENTS, 0));
     }

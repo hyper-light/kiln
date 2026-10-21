@@ -929,7 +929,8 @@ mod tests {
     fn the_runtime_passes_the_clock_suite() -> anyhow::Result<()> {
         block_on(async {
             let cases = kiln_seams::clock::cases::<RtClockFixture>();
-            let n = kiln_seams::conformance::run("Clock (kiln's runtime)", &cases, || async { RtClockFixture }).await.into_result().map_err(anyhow::Error::msg)?;
+            // Each case fails, named, if it hasn't ended in 30 s.
+            let n = kiln_seams::conformance::run_within("Clock (kiln's runtime)", &cases, || async { RtClockFixture }, || sleep(Duration::from_secs(30))).await.into_result().map_err(anyhow::Error::msg)?;
             anyhow::ensure!(n == cases.len());
             Ok(())
         })
@@ -951,7 +952,7 @@ mod tests {
     fn the_runtime_passes_the_spawn_suite() -> anyhow::Result<()> {
         block_on(async {
             let cases = kiln_seams::spawn::cases::<RtSpawnFixture>();
-            let n = kiln_seams::conformance::run("Spawn (kiln's runtime)", &cases, || async { RtSpawnFixture }).await.into_result().map_err(anyhow::Error::msg)?;
+            let n = kiln_seams::conformance::run_within("Spawn (kiln's runtime)", &cases, || async { RtSpawnFixture }, || sleep(Duration::from_secs(30))).await.into_result().map_err(anyhow::Error::msg)?;
             anyhow::ensure!(n == cases.len());
             Ok(())
         })

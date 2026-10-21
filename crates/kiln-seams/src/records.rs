@@ -184,7 +184,8 @@ impl Default for SimLimits {
 }
 
 /// Records in memory: linearizable (one lock), snapshot reads from each key's bounded history.
-/// Clones share one store.
+/// Its horizon is the store's: once any key has lost a version, a snapshot from before the oldest
+/// one kept is refused for every key (coarse, never wrong). Clones share one store.
 #[derive(Clone, Default)]
 pub struct SimRecords {
     inner: Arc<SimInner>,

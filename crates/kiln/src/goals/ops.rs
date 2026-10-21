@@ -150,6 +150,7 @@ mod tests {
         }
     }
 
+    /// On a hub with a simulated clock: goals' times are its (CP-M2, AC-M2.1).
     #[test]
     fn an_agent_steers_the_goals_and_plans_of_itself_and_its_own_only() -> anyhow::Result<()> {
         within(async {

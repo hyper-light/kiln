@@ -930,6 +930,12 @@ mod tests {
         Host::with_clock(tx, file, limits, Arc::new(SimClock::new()))
     }
 
+    /// `Host::until`, failing the test rather than waiting forever when what it waits for never
+    /// comes (a write that failed): 30 s, which no passing run comes near.
+    async fn until(host: &Host, holds: impl Fn(&Host) -> bool) -> anyhow::Result<()> {
+        crate::rt::timeout(Duration::from_secs(30), host.until(holds)).await.map_err(|_| anyhow::anyhow!("what the test waited for didn't come in 30 s"))
+    }
+
     fn no_harness(dir: &std::path::Path) -> Spec {
         Spec {
             kind: "claude".into(),
@@ -962,7 +968,7 @@ mod tests {
                 clock.advance(WATCH_EVERY.saturating_sub(Duration::from_millis(1)));
                 assert_eq!((clock.sleepers(), host.looks()), (1, u64::from(n - 1)), "awake, or a look, before 10 s");
                 clock.advance(Duration::from_millis(1));
-                host.until(|h| h.looks() == u64::from(n)).await;
+                until(&host, |h| h.looks() == u64::from(n)).await?;
             }
             Ok(())
         })
@@ -989,7 +995,7 @@ mod tests {
             assert_eq!((clock.sleepers(), clock.next_deadline()), (2, Some(start + SAVE_AFTER)), "awake before half a second");
             assert!(host.saves() == 0 && !file.exists());
             clock.advance(Duration::from_millis(1));
-            host.until(|h| h.saves() == 1).await;
+            until(&host, |h| h.saves() == 1).await?;
             let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&file)?)?;
             let mut ids: Vec<&str> = saved.iter().map(Saved::id).collect();
             ids.sort_unstable();
@@ -1000,7 +1006,7 @@ mod tests {
         })
     }
 
-
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn limits_and_unknown_kinds_are_refused() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -1027,6 +1033,7 @@ mod tests {
         })
     }
 
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_restarted_session_takes_its_timeline_from_the_conversation_store() -> anyhow::Result<()> {
         use super::super::core::Update;
@@ -1066,6 +1073,7 @@ mod tests {
         })
     }
 
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_turn_a_restart_cut_short_goes_on_first_thing() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -1120,8 +1128,9 @@ mod tests {
         })
     }
 
-    /// What a harness left running is taken back over; its stop is waited for on the session's
-    /// updates, each a look, not by sleeps (CP-M2, AC-M2.3).
+    /// What a harness left running is taken back over. The test waits for its stop on the
+    /// session's updates, each a look; it doesn't sleep (CP-M2, AC-M2.3; the stop it asks for
+    /// polls the process, as stopping one does).
     #[cfg(unix)]
     #[test]
     fn what_a_session_left_running_is_taken_back_over_after_a_restart() -> anyhow::Result<()> {
@@ -1208,6 +1217,7 @@ mod tests {
         })
     }
 
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_session_is_saved_and_restored_with_its_pause_without_deadlocking() -> anyhow::Result<()> {
         crate::rt::block_on(async move {

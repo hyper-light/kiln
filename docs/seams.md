@@ -12,8 +12,11 @@ code part (a method or a clause added, removed or reworded on one side only).
 
 How a suite runs: `kiln_seams::conformance::run(seam, &cases, make)` runs each case against a
 fresh fixture from `make`, an implementation and what the case needs of it (a simulated clock to
-move, a real one to wait out). Every simulator is deterministic, in memory and bounded: past its
-bound it refuses, typed, and says so, never dropping silently.
+move, a real one to wait out). `run_within(seam, &cases, make, deadline)` gives each case a
+deadline too, a sleep on the implementation's runtime: a case it never answers fails, named, and
+the suite goes on (kiln's runs give each 30 s). Every simulator is deterministic, in memory and
+bounded: past a bound it refuses, typed, or lets its oldest go and says so (a read from before
+them refused, typed, or a count of what went), never dropping silently.
 
 ## Clock
 
@@ -69,8 +72,10 @@ Every record kiln keeps, by family and key, each at the revision of the commit t
   `kiln_seams::records::SimRecords`: linearizable, snapshot reads from each key's last 32
   versions and the last 100,000 deleted keys' histories (older: refused `Compacted`), a change
   feed of the last 100,000 changes (a read of changes or a wait from before it: refused
-  `Compacted`), a million rows. Its `compact` forgets the history before a revision at once,
-  as a compaction does; a suite's fixture makes its store do that for RECORDS-14.
+  `Compacted`), a million rows. Its horizon is the store's, not each key's: once any key has
+  lost a version, a snapshot from before the oldest kept is refused for every key (coarse,
+  never wrong). Its `compact` forgets the history before a revision at once, as a compaction
+  does; a suite's fixture makes its store do that for RECORDS-14.
 - **Used by:** goal stacks, goal items, plans, plan runs and keep-going, once CP-T1.5 moves them
   off rusqlite; the session journal (CP-T3.1).
 - **Passed by:** the simulator, every clause; Amphora's, when CP-T1.5 lands it.
@@ -278,8 +283,9 @@ command catalog), and commands to them. Generic over kiln's types: an agent is k
 - **Implementations:** kiln's harness registry (`harness/port.rs`: the hub's own sessions and every
   runner's); `kiln_seams::harness::SimHarness`, which keeps agents in memory and records each
   command it's handed, stamped by its clock: 100,000 agents, what the 100,000 closed last were
-  sent, and 100,000 commands an agent (past it, refused `Full`). It keeps nothing for an agent
-  it doesn't know (a catalog, a machine away).
+  sent, and 100,000 commands an agent (past it, refused `Full`). An older closed agent's
+  deliveries go, and `forgotten()` counts them; it keeps nothing for an agent it doesn't know (a
+  catalog, a machine away).
 - **Used by:** the goal driver and keep-going (`goals/mod.rs`, `goals/keep.rs`); the inbox and the
   dispatcher of sends (CP-T3.2, CP-T3.3).
 - **Passed by:** the simulator, every clause. kiln's registry passes HARNESS-1, HARNESS-2 and
