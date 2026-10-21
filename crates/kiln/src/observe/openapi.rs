@@ -221,7 +221,14 @@ fn schemas() -> Map<String, Value> {
     put(
         "SearchAnswer",
         object(
-            &[("records", describe(array(schema("Record")), "newest first")), ("blocks", object(&[("total", integer()), ("pruned", integer())], &["total", "pruned"])), ("rows_scanned", integer()), ("took_ms", number())],
+            &[
+                ("records", describe(array(schema("Record")), "newest first")),
+                ("blocks", object(&[("total", integer()), ("pruned", integer())], &["total", "pruned"])),
+                ("rows_scanned", integer()),
+                ("took_ms", number()),
+                ("queued_ms", describe(number(), "waited for a thread to read on")),
+                ("waited_ms", describe(number(), "waited for the store (a write, a cut)")),
+            ],
             &["records", "blocks", "rows_scanned", "took_ms"],
         ),
     );
@@ -250,6 +257,8 @@ fn schemas() -> Map<String, Value> {
                 ("rows_scanned", integer()),
                 ("blocks_pruned", integer()),
                 ("took_ms", number()),
+                ("queued_ms", describe(number(), "waited for a thread to read on")),
+                ("waited_ms", describe(number(), "waited for the store (a write, a cut)")),
             ],
             &["rows_scanned", "took_ms"],
         ),
@@ -264,6 +273,8 @@ fn schemas() -> Map<String, Value> {
                 ("rows_scanned", integer()),
                 ("blocks_pruned", integer()),
                 ("took_ms", number()),
+                ("queued_ms", describe(number(), "waited for a thread to read on")),
+                ("waited_ms", describe(number(), "waited for the store (a write, a cut)")),
             ],
             &["facets", "matched", "rows_scanned", "took_ms"],
         ),

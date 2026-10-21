@@ -3282,6 +3282,30 @@ trace by its id 44 ms p50, 184 ms p99 meanwhile; the newest trace readable 131 m
 the trace metrics counted 18 s after (their windows' settling, §8.3); the server 1.7 cores and 390
 MiB at its peak, the runner 0.75 cores and 340 MiB; 0.013 page faults a span.
 
+**Logs under load** (`observe_load.rs`, `an_otlp_log_flood_…`): eight senders flood OTLP/HTTP logs
+requests (500 records each, an SDK's resource and four attributes a record, an error in fifty, gzip,
+kept alive) as fast as they are answered, half to the server and half to a runner's receiver, while
+a reader asks what the logs explorer asks: the last minute's newest 50 errors, and its records
+counted by status, each answer saying what it waited for the store and what it took reading
+(`queued_ms`, `waited_ms`, `took_ms`). Every record answered 200 is stored once (each sender's,
+counted by its host: what it was answered for, no more, no less), none dropped for room; the
+replicas agree. 2026-10-20, adacachy (32 threads others share, a load of 25 to 30), 20 s: 3.9 M
+records taken, 196 k a second, 1.9% of requests refused (503, sent again when told); an answer 0.52
+ms p50, 3.4 ms p99; the errors' search 5.3 ms p50 (2.3 of it waiting for the store), 19 ms p99 (12);
+the minute counted by status 118 ms p50, 226 ms p99, nearly all of it reading; every record stored
+0.66 s after the flood; the server 2.85 cores and 402 MiB at its peak, the runner 0.74 cores and 306
+MiB.
+
+A search waits for the store while a write holds it, and a write's apply seals the log head's blocks
+there (§4.6: sorted, re-encoded, its words hashed into a filter, compressed), some milliseconds a
+block. Sealing them apart was tried (the head's segments copied under a shared hold, sealed under
+none, taken in under a brief exclusive one, each segment numbered so a seal a cut overtook is
+refused): a search's wait grew, 2.3 to 12 ms at the median, 12 to 111 at p99, and the count by
+status's to 1.2 s at p99. A reader holds the store for its whole scan, a writer waits behind a long
+one, and every reader after waits behind the writer (the lock writes first): a second writer is a
+second convoy. Left out; what removes the wait is a reader that does not hold the store while it
+reads (its blocks and files taken as they are, read with no hold of it): next.
+
 **Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is
 measured an hour ahead from its writes and said so once; its own figures, an hour ahead, are dropped

@@ -677,7 +677,9 @@ fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyh
     // What the logs explorer asks meanwhile: the last minute's errors, and its records by status.
     let reader = {
         let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
-        std::thread::spawn(move || -> (Vec<u64>, Vec<u64>, Vec<String>) {
+        // Each read: what it took the reader, and what the server says it waited for the store and
+        // took reading (µs).
+        std::thread::spawn(move || -> (Vec<[u64; 3]>, Vec<[u64; 3]>, Vec<String>) {
             let (mut search, mut facets, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             let mut conn = Conn::new(port);
             let headers = format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n");
@@ -689,7 +691,11 @@ fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyh
                 ] {
                     let t = Instant::now();
                     match conn.send(path, &headers, &serde_json::to_vec(&body).unwrap_or_default()) {
-                        Ok(a) if a.code == 200 => into.push(t.elapsed().as_micros() as u64),
+                        Ok(a) if a.code == 200 => {
+                            let v: serde_json::Value = serde_json::from_slice(&a.body).unwrap_or(serde_json::Value::Null);
+                            let us = |k: &str| (at(&v, &[k]).as_f64().unwrap_or(0.0) * 1000.0) as u64;
+                            into.push([t.elapsed().as_micros() as u64, us("waited_ms"), us("took_ms")]);
+                        }
                         Ok(a) => errors.push(format!("{path}: {}", a.code)),
                         Err(e) => errors.push(format!("{path}: {e}")),
                     }
@@ -746,22 +752,24 @@ fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyh
     let (s_threads1, r_threads1) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
     let (index, digest) = f.verify(2)?;
     all.latencies_us.sort_unstable();
-    search.sort_unstable();
-    facets.sort_unstable();
     let ms = |us: u64| us as f64 / 1000.0;
+    // Each kind of read's whole time, its wait for the store and its reading, p50 and p99 of each.
+    let parts = |reads: &mut Vec<[u64; 3]>| -> String {
+        let mut out = Vec::new();
+        for (i, what) in ["all", "waited", "reading"].iter().enumerate() {
+            let mut xs: Vec<u64> = reads.iter().filter_map(|r| r.get(i).copied()).collect();
+            xs.sort_unstable();
+            out.push(format!("{what} p50 {:.2} ms, p99 {:.2} ms", ms(pct(&xs, 0.5)), ms(pct(&xs, 0.99))));
+        }
+        format!("{} ({} reads)", out.join("; "), reads.len())
+    };
     eprintln!("\nan OTLP logs flood: {senders} senders × {records} records a request, gzip, {:.1} s", flood.as_secs_f64());
     eprintln!("  taken      {:>12} records, {:>10.0} records/s, {} requests", all.taken, all.taken as f64 / flood.as_secs_f64(), all.requests);
     eprintln!("  refused    {:>12} records (503, sent again when told), {:.2}% of requests", all.refused, 100.0 * (all.refused / records.max(1)) as f64 / all.requests.max(1) as f64);
     eprintln!("  a request  p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms", ms(pct(&all.latencies_us, 0.5)), ms(pct(&all.latencies_us, 0.99)), ms(pct(&all.latencies_us, 1.0)));
     eprintln!("  stored     every sender's records counted {:.0} ms after the flood", lag.as_secs_f64() * 1000.0);
-    eprintln!(
-        "  search     errors p50 {:.2} ms, p99 {:.2} ms ({} reads); by status p50 {:.2} ms, p99 {:.2} ms",
-        ms(pct(&search, 0.5)),
-        ms(pct(&search, 0.99)),
-        search.len(),
-        ms(pct(&facets, 0.5)),
-        ms(pct(&facets, 0.99))
-    );
+    eprintln!("  errors     the last minute's newest 50: {}", parts(&mut search));
+    eprintln!("  by status  the last minute counted: {}", parts(&mut facets));
     eprintln!(
         "  server     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.4} minor faults a record",
         s_cpu1 - s_cpu0,

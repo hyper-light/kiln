@@ -491,10 +491,26 @@ pub(super) async fn read_json<T: serde::de::DeserializeOwned>(body: Incoming, li
 
 /// Runs `f` on the store under its read lock, on the blocking pool.
 pub(super) async fn reading<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
+    reading_waited(move |s, _| f(s)).await
+}
+
+/// What a reading waited for before it read, in ms: a thread to read on, then the store (held by
+/// a write, or a cut).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Waited {
+    pub queued_ms: f64,
+    pub store_ms: f64,
+}
+
+/// [`reading`], `f` told what it waited for.
+pub(super) async fn reading_waited<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store, Waited) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
+    let asked = std::time::Instant::now();
     let store = shared()?;
     crate::rt::blocking(move || {
+        let queued = asked.elapsed();
         let s = store.read().unwrap_or_else(PoisonError::into_inner);
-        f(&s)
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        f(&s, Waited { queued_ms: ms(queued), store_ms: ms(asked.elapsed().saturating_sub(queued)) })
     })
     .await
     .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
@@ -1542,7 +1558,7 @@ async fn patterns(body: SearchBody) -> Result<Response, Fail> {
 }
 
 async fn search(body: SearchBody) -> Result<Response, Fail> {
-    reading(move |s| {
+    reading_waited(move |s, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1552,6 +1568,8 @@ async fn search(body: SearchBody) -> Result<Response, Fail> {
             blocks: BlocksOut { total: found.blocks_total, pruned: found.blocks_pruned },
             rows_scanned: found.rows_scanned,
             took_ms: started.elapsed().as_secs_f64() * 1000.0,
+            queued_ms: Some(w.queued_ms),
+            waited_ms: Some(w.store_ms),
         };
         Ok(srv::json(StatusCode::OK, &out))
     })
@@ -1593,7 +1611,7 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
         other => return Err(fail(StatusCode::BAD_REQUEST, format!("a measure: {other} (count, cardinality, sum, avg, min, max)"))),
     };
     let by: Vec<Facet> = body.by.iter().map(|f| Facet::parse(f)).collect();
-    reading(move |s| {
+    reading_waited(move |s, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1607,12 +1625,12 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
             let series: Vec<Value> = b.groups.iter().map(|(vals, v)| json!({ "group": group(vals), "values": v })).collect();
             return Ok(srv::json(
                 StatusCode::OK,
-                &json!({ "grid": { "from": b.buckets.start / 1_000_000, "step": step, "n": b.buckets.n }, "series": series, "rows_scanned": b.rows_scanned, "blocks_pruned": b.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 }),
+                &json!({ "grid": { "from": b.buckets.start / 1_000_000, "step": step, "n": b.buckets.n }, "series": series, "rows_scanned": b.rows_scanned, "blocks_pruned": b.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0, "queued_ms": w.queued_ms, "waited_ms": w.store_ms }),
             ));
         }
         let agg = s.aggregate_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let groups: Vec<Value> = agg.groups.iter().map(|(vals, v)| json!({ "group": group(vals), "value": v })).collect();
-        Ok(srv::json(StatusCode::OK, &json!({ "groups": groups, "rows_scanned": agg.rows_scanned, "blocks_pruned": agg.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 })))
+        Ok(srv::json(StatusCode::OK, &json!({ "groups": groups, "rows_scanned": agg.rows_scanned, "blocks_pruned": agg.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0, "queued_ms": w.queued_ms, "waited_ms": w.store_ms })))
     })
     .await
 }
@@ -1639,13 +1657,13 @@ async fn facets(body: FacetsBody) -> Result<Response, Fail> {
         return Err(fail(StatusCode::BAD_REQUEST, "at most 32 facets"));
     }
     let top = body.top.unwrap_or(10).clamp(1, 1000);
-    reading(move |s| {
+    reading_waited(move |s, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
         let fc = s.log_facets(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &facets, top).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let out: Vec<Value> = facets.iter().zip(&fc.facets).map(|(f, (values, distinct))| json!({ "facet": f.name(), "distinct": distinct, "values": values.iter().map(|(v, n)| json!({ "value": v, "count": n })).collect::<Vec<_>>() })).collect();
-        Ok(srv::json(StatusCode::OK, &json!({ "facets": out, "matched": fc.matched, "rows_scanned": fc.rows_scanned, "blocks_pruned": fc.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 })))
+        Ok(srv::json(StatusCode::OK, &json!({ "facets": out, "matched": fc.matched, "rows_scanned": fc.rows_scanned, "blocks_pruned": fc.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0, "queued_ms": w.queued_ms, "waited_ms": w.store_ms })))
     })
     .await
 }
@@ -1809,6 +1827,11 @@ struct SearchOut<'a> {
     blocks: BlocksOut,
     rows_scanned: u64,
     took_ms: f64,
+    /// What it waited for before it read (`Waited`), where it says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waited_ms: Option<f64>,
 }
 
 #[derive(serde::Serialize)]
@@ -2162,7 +2185,7 @@ mod tests {
             assert_eq!(serde_json::to_string(&RecordOut(r))?, serde_json::to_string(&as_value(r))?);
         }
         let (blocks_pruned, blocks_total, rows_scanned) = (3u64, 9u64, 1234u64);
-        let out = SearchOut { records: RecordsOut(&records), blocks: BlocksOut { total: blocks_total, pruned: blocks_pruned }, rows_scanned, took_ms: 1.5 };
+        let out = SearchOut { records: RecordsOut(&records), blocks: BlocksOut { total: blocks_total, pruned: blocks_pruned }, rows_scanned, took_ms: 1.5, queued_ms: None, waited_ms: None };
         let before = json!({
             "records": records.iter().map(as_value).collect::<Vec<_>>(),
             "blocks": { "total": blocks_total, "pruned": blocks_pruned },
