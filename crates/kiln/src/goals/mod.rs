@@ -799,7 +799,8 @@ mod tests {
         use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
             let clock = SimClock::new();
-            let store = crate::store::Store::in_memory()?;
+            // Its migrations on the blocking pool, not on a runtime thread the tests beside it share.
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
             let shutdown = crate::rt::Shutdown::new();
             let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
             let (id, goal) = ("goals-backoff", "the parser takes every input");
