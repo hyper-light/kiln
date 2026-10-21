@@ -11,14 +11,6 @@
   --sg-ease: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-@keyframes sg-prism-current {
-  from {
-    background-position: 0% 50%;
-  }
-  to {
-    background-position: 100% 50%;
-  }
-}
 
 /* ------------------------------------------------------------ optic */
 
@@ -47,25 +39,18 @@
   transform: rotate(-35deg) scaleX(0.55) rotate(calc(var(--i) * 5deg));
   opacity: calc(0.6 + var(--i) * 0.13);
 }
-.sg-optic[data-state="idle"] > span {
-  animation:
-    sg-optic-breathe 14s ease-in-out infinite,
-    sg-optic-chroma 18s linear infinite;
-  animation-delay: calc(var(--i) * -0.55s), calc(var(--i) * -0.9s);
-}
-/* Thinking: the idle motion, quickened. */
+/* Idle, the rings hold still in the settled prism. They move only while it works: the shape, which
+   the GPU moves (a colour change in a border is painted again every frame, the whole page with
+   it, so the colours hold still). */
+/* Thinking: the rings breathe. */
 .sg-optic[data-state="thinking"] > span {
-  animation:
-    sg-optic-breathe 3.5s ease-in-out infinite,
-    sg-optic-chroma 4.5s linear infinite;
-  animation-delay: calc(var(--i) * -0.14s), calc(var(--i) * -0.22s);
+  animation: sg-optic-breathe 3.5s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.14s);
 }
-/* Tool: colour runs fast through the rings while the shape barely moves. */
+/* Tool: the shape barely sways. */
 .sg-optic[data-state="tool"] > span {
-  animation:
-    sg-optic-sway 2.4s ease-in-out infinite,
-    sg-optic-chroma 1.6s linear infinite;
-  animation-delay: calc(var(--i) * -0.1s), calc(var(--i) * -0.4s);
+  animation: sg-optic-sway 2.4s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.1s);
 }
 /* Waiting on you: held still in amber, the outer ring lit. */
 .sg-optic[data-state="waiting"] {
@@ -103,18 +88,6 @@
     transform: rotate(-32deg) scaleX(0.6) rotate(calc(var(--i) * 5deg + 2deg));
   }
 }
-@keyframes sg-optic-chroma {
-  0%,
-  100% {
-    border-color: #b8d9d2 #b8a6d5 #a6c4ed #d6a2aa;
-  }
-  33.333% {
-    border-color: #d8cbb0 #a6c4ed #b8d9d2 #b8a6d5;
-  }
-  66.667% {
-    border-color: #b8a6d5 #b8d9d2 #d6a2aa #a6c4ed;
-  }
-}
 
 /* ------------------------------------------------------------ prism label */
 
@@ -130,10 +103,9 @@
 .sg-label[data-live="true"] {
   color: transparent;
   background: var(--sg-prism);
-  background-size: 250% 100%;
   -webkit-background-clip: text;
   background-clip: text;
-  animation: sg-prism-current 6s ease-in-out infinite alternate;
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
 }
 .sg-num {
   font-variant-numeric: tabular-nums;
@@ -221,12 +193,19 @@
 /* ------------------------------------------------------------ trace (a tool call's state) */
 
 /* hyperlight's mark, drawn small. A fixed 14px square, so settling never shifts the row. */
-.sg-trace {
+.sg-beam {
+  position: relative;
+  display: inline-grid;
   flex: none;
   width: 14px;
   height: 14px;
-  overflow: visible;
   vertical-align: middle;
+}
+.sg-trace {
+  grid-area: 1 / 1;
+  width: 14px;
+  height: 14px;
+  overflow: visible;
   fill: none;
   stroke-linecap: round;
   --sg-tone: #97999f;
@@ -243,24 +222,38 @@
     opacity 0.25s var(--sg-ease),
     stroke 0.25s ease;
 }
-/* The light: a quarter of the loop, travelling it end to end and out through the refraction. */
-.sg-trace-light {
-  stroke-dasharray: 26 74;
-  stroke-dashoffset: 100;
-  opacity: 0;
-}
 .sg-trace-tail {
   stroke: var(--sg-tone);
   opacity: 0;
   transition: opacity 0.25s ease;
 }
-.sg-trace[data-status="running"] .sg-trace-light {
-  opacity: 1;
-  animation: sg-trace-run 1.8s linear infinite;
-}
+/* The running light: a sector of the prism turning behind the mark's own shape (the loop and the
+   refraction), clockwise as the loop is drawn. Only a transform moves, so the GPU turns it and
+   nothing is painted again (a stroke's moving dash would be restyled and repainted every frame). */
 .sg-trace[data-status="running"] .sg-trace-tail {
   stroke: #bcb1d8;
-  animation: sg-trace-refract 1.8s linear infinite;
+  opacity: 0.35;
+}
+.sg-trace-glow {
+  position: relative;
+  grid-area: 1 / 1;
+  overflow: hidden;
+  width: 14px;
+  height: 14px;
+  -webkit-mask: var(--sg-mark) center / 100% 100% no-repeat;
+  mask: var(--sg-mark) center / 100% 100% no-repeat;
+  --sg-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='none' stroke='%23000' stroke-width='3.2' stroke-linecap='round'%3E%3Cpath d='M6.4 22.5C2.4 17.1 7.1 6.2 14 4.5C21.4 2.7 27.4 10.1 25.1 16.5C22.8 22.9 13.1 28.8 8.8 26.6'/%3E%3Cpath d='M8.8 26.6C6.9 25.6 5.6 23.6 5.2 21.3'/%3E%3C/svg%3E");
+}
+.sg-trace-glow > span {
+  position: absolute;
+  inset: -30%;
+  background: conic-gradient(transparent 0turn 0.66turn, #b8d9d2 0.72turn, #a6c4ed 0.8turn, #b8a6d5 0.87turn, #d6a2aa 0.93turn, #d8cbb0 0.985turn, transparent 1turn);
+  animation: sg-trace-turn 1.8s linear infinite;
+}
+@keyframes sg-trace-turn {
+  to {
+    transform: rotate(1turn);
+  }
 }
 /* Settled: the loop draws itself closed in the outcome's tone. */
 .sg-trace:not([data-status="running"]) .sg-trace-loop {
@@ -293,10 +286,13 @@
 .sg-trace[data-status="pending"] {
   --sg-tone: #aab8d2;
 }
-/* …and a pending call is only sketched, breathing. */
+/* …and a pending call is only sketched, breathing (the whole mark: the GPU fades it). */
 .sg-trace[data-status="pending"] .sg-trace-loop {
   opacity: 0.6;
   stroke-dasharray: 2 6;
+  animation: none;
+}
+.sg-beam[data-status="pending"] {
   animation: sg-soft-pulse 2.4s ease-in-out infinite alternate;
 }
 .sg-trace[data-status="pending"] .sg-trace-tail,
@@ -307,27 +303,6 @@
   opacity: 0.35;
   stroke-dasharray: none;
   animation: none;
-}
-@keyframes sg-trace-run {
-  from {
-    stroke-dashoffset: 100;
-  }
-  to {
-    stroke-dashoffset: 0;
-  }
-}
-/* The refraction lights as the light reaches the loop's end. */
-@keyframes sg-trace-refract {
-  0%,
-  62% {
-    opacity: 0.15;
-  }
-  82% {
-    opacity: 0.85;
-  }
-  100% {
-    opacity: 0.15;
-  }
 }
 @keyframes sg-trace-close {
   from {
@@ -383,14 +358,16 @@
   .sg-label,
   .sg-think::before,
   .sg-trace path,
+  .sg-beam,
+  .sg-trace-glow > span,
   .sg-caret,
   .sg-chev {
     animation: none !important;
     transition: none !important;
   }
   /* Running shows the whole loop in the prism, still. */
-  .sg-trace[data-status="running"] .sg-trace-light {
-    stroke-dasharray: none;
+  .sg-trace-glow > span {
+    background: linear-gradient(45deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0);
   }
 }
 
@@ -402,5 +379,8 @@
   }
   .sg-trace path {
     stroke: CanvasText;
+  }
+  .sg-trace-glow {
+    display: none;
   }
 }

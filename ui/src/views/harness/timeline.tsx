@@ -26,6 +26,7 @@ import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, quietThinkingPhase, thoughtIsLive, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
+import { stillAsked, useAnswered } from "./answered";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -891,6 +892,7 @@ export const Timeline = React.memo(function Timeline({
   const events = useSession(store, (s) => s.events);
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
+  const done = useAnswered();
   // The files its messages mention, as the server kept them: shown where they're mentioned.
   const keptFiles = useSession(store, (s) => s.files);
   const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
@@ -1021,7 +1023,8 @@ export const Timeline = React.memo(function Timeline({
   );
   const running = parent ? task?.status === "running" : state?.status === "running";
   const tasks = state?.tasks ?? NO_TASKS;
-  const approvals = state?.approvals ?? NO_APPROVALS;
+  // What you answered here goes from sight at once (answered.ts).
+  const approvals = stillAsked(state?.approvals ?? NO_APPROVALS, done);
   const askingKey = approvals.map((a) => a.tool_id ?? "").join(" ");
   const asking = React.useMemo(() => new Set(askingKey.split(" ").filter(Boolean)), [askingKey]);
   // What waits on you sits where it was asked: the latest thing the agent did, the conversation's

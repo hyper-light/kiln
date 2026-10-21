@@ -211,12 +211,14 @@
   background: var(--prism);
   flex: 0 0 auto;
 }
-@keyframes prism-current {
+/* What works now breathes: opacity only, so the GPU runs it and nothing is painted again (a
+   gradient sliding through is painted afresh every frame, for as long as it runs). */
+@keyframes prism-breathe {
   from {
-    background-position: 0% 50%;
+    opacity: 0.45;
   }
   to {
-    background-position: 100% 50%;
+    opacity: 1;
   }
 }
 .spectral-dot {
@@ -544,9 +546,6 @@ html.fills-window body {
   z-index: 2;
   height: 1px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 4.8s ease-in-out infinite alternate;
-  animation-play-state: paused;
   opacity: 0;
   transition: opacity 0.4s;
 }
@@ -558,10 +557,11 @@ html.fills-window body {
 }
 .card[data-interactive="true"]:hover::before,
 .card[data-interactive="true"]:focus-within::before,
-.card[data-selected="true"]::before,
-.card[data-live="true"]::before {
+.card[data-selected="true"]::before {
   opacity: 0.7;
-  animation-play-state: running;
+}
+.card[data-live="true"]::before {
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
 }
 .card-footer {
   min-height: 44px;
@@ -800,10 +800,6 @@ html.fills-window body {
 }
 .dot[data-status="running"] {
   background: var(--prism);
-  background-size: 300% 100%;
-  animation:
-    prism-current 2.4s ease-in-out infinite alternate,
-    dot-pulse 1.8s ease-in-out infinite;
 }
 .dot[data-status="running"]::after {
   content: "";
@@ -813,11 +809,6 @@ html.fills-window body {
   border: 1px solid #bab0e3;
   opacity: 0;
   animation: dot-ring 1.8s var(--ease) infinite;
-}
-@keyframes dot-pulse {
-  50% {
-    box-shadow: 0 0 8px rgb(186 176 227 / 40%);
-  }
 }
 @keyframes dot-ring {
   0% {
@@ -1566,11 +1557,12 @@ html.fills-window body {
 .menu-item[data-danger] {
   color: #d1aaad;
 }
-.toast-viewport {
+.toast-viewport,
+.rq-viewport {
   position: fixed;
   z-index: 120;
   right: 16px;
-  bottom: 16px;
+  bottom: max(16px, env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1707,9 +1699,10 @@ html.fills-window body {
   inset: 0 12% auto;
   height: 1px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 4.8s ease-in-out infinite alternate;
   opacity: 0.8;
+}
+.dag-node[data-status="running"]::before {
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
 }
 .dag-edge {
   fill: none;

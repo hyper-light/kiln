@@ -1216,6 +1216,30 @@ impl Registry {
         Ok(id)
     }
 
+    /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
+    /// message to many agents carries to each (an upload is taken by the first message that sends
+    /// it). One whose upload is gone (or expired) is left out.
+    pub fn inline_uploads(&self, attachments: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        attachments
+            .into_iter()
+            .filter_map(|mut a| {
+                a.path = None;
+                let Some(fid) = a.file_id.take() else { return (!a.data_base64.is_empty()).then_some(a) };
+                let u = self.uploads.lock().remove(&fid)?;
+                if a.name.is_empty() {
+                    a.name = u.name;
+                }
+                if a.mime.is_empty() {
+                    a.mime = u.mime;
+                }
+                a.data_base64 = b64.encode(&u.data);
+                Some(a)
+            })
+            .collect()
+    }
+
     /// A message's attachments, made ready for where the session runs: uploads resolved, and
     /// for a machine, every file sent ahead in pieces (the message then refers to them by id).
     async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {

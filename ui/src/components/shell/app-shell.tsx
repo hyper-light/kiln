@@ -19,6 +19,8 @@ import { Tip } from "@/components/ui/tooltip";
 import { pad2, shortSha } from "@/lib/format";
 
 const TerminalWorkspace = React.lazy(() => import("@/views/terminal/workspace"));
+/** What waits on you, answered from any page (Mission control and the asking agent's page show it themselves). */
+const RequestToasts = React.lazy(() => import("@/views/harness/approval-toasts"));
 
 export const NAV = [
   { to: "/", label: "Overview", end: true },
@@ -263,6 +265,11 @@ export function AppShell({ me }: { me: Me | null }) {
         </div>
         <ClusterFrames />
       </main>
+      <ErrorBoundary label="Requests waiting on you couldn't show">
+        <React.Suspense fallback={null}>
+          <RequestToasts />
+        </React.Suspense>
+      </ErrorBoundary>
 
       {!fullHeight && !away && (
         <footer className="site-footer">

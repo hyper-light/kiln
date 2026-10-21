@@ -702,9 +702,6 @@ button.cd-gnode:hover {
   background-size: 250% 100%;
   opacity: 0.8;
 }
-.cd-gnode[data-selected]::before {
-  animation: prism-current 4.8s ease-in-out infinite alternate;
-}
 .cd-gnode[data-tone="fail"] {
   box-shadow: inset 2px 0 0 #d1aaad;
 }
