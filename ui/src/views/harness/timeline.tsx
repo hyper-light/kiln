@@ -27,6 +27,7 @@ import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, typ
 import { latestThought, thinkingStarted, thoughtIsLive, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
+import { useHeld, useRecent } from "./dom";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -326,19 +327,29 @@ function AgentBody({ calls, tasks, onOpenTask }: { calls: ToolEvent[]; tasks: Ta
 
 /* ------------------------------------------------------------------ step */
 
+/**
+ * A step opens by itself while it runs once it has run this long: calls that come and go faster (an
+ * agent reading, searching and running at full speed) don't open and close it on each one.
+ */
+const OPEN_AFTER_MS = 500;
+/** A call that had been running this long when the page saw it first (by this device's clock, with room for another's) opens at once. */
+const RUNNING_BEFORE_MS = 2000;
+
 const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { step: Step; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
   const status = stepStatus(step.calls);
   const failures = step.calls.filter((c) => c.status === "error" || (c.tool === "shell" && c.exit_code !== undefined && c.exit_code !== 0)).length;
   const asking = React.useContext(Asking);
   const asked = step.calls.some((c) => asking.has(c.tool_id));
-  // Open by default: what needs attention, and what is happening right now.
+  // Open by default: what needs attention, and what is happening right now (once it has gone on a moment).
   const [open, setOpen] = React.useState<boolean | null>(null);
   // A match found in it opens it.
   useRevealed(
     (id) => step.calls.some((c) => c.id === id),
     () => setOpen(true),
   );
-  const isOpen = open ?? (status === "running" || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
+  const runningFrom = step.calls.reduce((t, c) => (c.status === "running" ? Math.max(t, c.started) : t), -Infinity);
+  const runs = useHeld(status === "running", OPEN_AFTER_MS, Date.now() - runningFrom > RUNNING_BEFORE_MS);
+  const isOpen = open ?? (runs || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
   const last = step.calls.at(-1);
@@ -546,6 +557,9 @@ function moving(items: Item[], turnStarted?: number): boolean {
   return false;
 }
 
+/** How long the end of a turn holds still before it shows the turn at work: not in the moment between one quick call and the next. */
+const TAIL_AFTER_MS = 600;
+
 /** The end of a turn under way while nothing at its end moves: what it's doing (a model thinking
  *  after a call shows nothing for minutes) and the elapsed time across the whole turn, so it
  *  never looks stopped while it's at work. */
@@ -602,6 +616,10 @@ const TurnView = React.memo(function TurnView({
   const items = sought ? turn.items : turn.items.slice(hidden, end);
   const currentItem = turn.items.findLast((item) => item.type !== "notice");
   const since = thinkingStarted(turn, turnStarted);
+  // At work with nothing moving at its end: said once the end has held still a moment (from the
+  // start, before anything has moved, at once).
+  const moves = live && moving(turn.items, turnStarted);
+  const movedLately = useRecent(moves, TAIL_AFTER_MS);
   if (turn.divider) {
     return (
       <section className="hx-turn hx-turn-switch">
@@ -624,7 +642,7 @@ const TurnView = React.memo(function TurnView({
         {items.map((it) => (
           <ItemView key={it.key} since={since} item={it} cwd={cwd} onOpenTask={onOpenTask} active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))} />
         ))}
-        {live && !turn.outcome && !moving(turn.items, turnStarted) && <LiveTail doing={doing} since={since} />}
+        {live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>

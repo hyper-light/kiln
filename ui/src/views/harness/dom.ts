@@ -1,10 +1,11 @@
 /**
  * The agent views' ways of reaching outside React without effects: a listener on the window or the
  * document for as long as a component shows (React subscribes and unsubscribes it as it would a
- * store), and clocks that tick for whoever reads them. DOM objects that belong to one element
- * (observers, focus, scrolling) are wired with a ref callback that returns its cleanup instead.
+ * store), clocks that tick for whoever reads them, and conditions held for a while (what turns on
+ * and off faster than that never shows). DOM objects that belong to one element (observers, focus,
+ * scrolling) are wired with a ref callback that returns its cleanup instead.
  */
-import { useSyncExternalStore } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 
 const nothing = () => 0;
 
@@ -75,4 +76,44 @@ export function useClock(ms: number): number {
     () => c.now,
     () => c.now,
   );
+}
+
+/** Whether moment `at` (performance.now's clock) has come: the component renders again once it does. */
+function useCome(at: number): boolean {
+  const subscribe = useCallback(
+    (notify: () => void) => {
+      const wait = at - performance.now();
+      if (!Number.isFinite(at) || wait <= 0) return () => undefined;
+      const timer = window.setTimeout(notify, wait + 1);
+      return () => window.clearTimeout(timer);
+    },
+    [at],
+  );
+  return useSyncExternalStore(
+    subscribe,
+    () => performance.now() >= at,
+    () => at === -Infinity,
+  );
+}
+
+/**
+ * Whether `on` has held for `ms`: true once it has, false again as soon as it stops, so what turns
+ * on and off faster than that never shows. `already`: it held before this could see it start (a
+ * call running for a while when the page opened), so it counts as held at once.
+ */
+export function useHeld(on: boolean, ms: number, already = false): boolean {
+  const [held] = useState(() => ({ since: on ? (already ? -Infinity : performance.now()) : Infinity }));
+  if (!on) held.since = Infinity;
+  else if (held.since === Infinity) held.since = already ? -Infinity : performance.now();
+  const come = useCome(held.since + ms);
+  return on && come;
+}
+
+/** Whether `on` holds, or held less than `ms` ago. */
+export function useRecent(on: boolean, ms: number): boolean {
+  const [was] = useState(() => ({ last: on ? Infinity : -Infinity }));
+  if (on) was.last = Infinity;
+  else if (was.last === Infinity) was.last = performance.now();
+  const come = useCome(was.last + ms);
+  return on || !come;
 }
