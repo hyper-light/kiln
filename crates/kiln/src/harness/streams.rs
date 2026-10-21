@@ -196,7 +196,9 @@ impl Relay {
         }
         let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return };
         if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
-            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected") {
+            // What a viewer joining later needs to show it as it is now (whether its window can be
+            // seen where it runs, too: Safari's on a locked Mac).
+            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected" | "hidden") {
                 live.said.lock().insert(k.clone(), json.clone());
             }
             if matches!(k.as_str(), "closed" | "error") {
@@ -477,12 +479,20 @@ mod tests {
         assert!(l.video.lock().as_ref().is_some_and(|c| c.ends_with(b"avc1.42E01f\"}")));
         assert!(l.audio.lock().as_ref().is_some_and(|c| c.ends_with(b"opus\"}")));
         assert!(l.said.lock().contains_key("navigated"));
+        // Its window out of sight where it runs (Safari's, its Mac locked): a viewer joining later
+        // is told so, as it is now.
+        r.event("m1", "v1", json!({"hidden": true}).to_string());
+        assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("true")));
+        r.event("m1", "v1", json!({"hidden": false}).to_string());
+        assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("false")));
+        assert_eq!(rx.len(), 6);
+        while rx.try_recv().is_ok() {}
         assert_eq!(l.codec(), "avc1.42E01f");
         assert_eq!(live("v9", "m1").codec(), "h264");
         // It closed on its machine: it's gone, and its viewers are told.
         r.event("m1", "v1", json!({"closed": {"why": "the page went away"}}).to_string());
         assert!(r.get("v1").is_none());
-        assert_eq!(rx.len(), 5);
+        assert_eq!(rx.len(), 1);
         Ok(())
     }
 
