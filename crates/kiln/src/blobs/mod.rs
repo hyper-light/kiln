@@ -125,6 +125,12 @@ const UPKEEP_EVERY: Duration = Duration::from_secs(3600);
 /// (the upgrade binaries) taken into the local store where it lies, once, and what kiln knows of
 /// the kept binaries read. Sync's contents are listed by their own ([`crate::sync::contents`]).
 pub async fn start(hub: &crate::hub::Hub) {
+    if let Some(s3) = &hub.blobs.s3
+        && hub.cfg.blobs.s3.create_bucket
+        && let Err(e) = s3.ensure_bucket().await
+    {
+        tracing::warn!(target: "kiln.blobs", event = "put", error = %e, "the S3 bucket kiln keeps its bytes in couldn't be made");
+    }
     if let Some(local) = &hub.blobs.local
         && let Err(e) = crate::updates::take_in(hub, local).await
     {
