@@ -1293,3 +1293,41 @@ fn spans_are_a_store_of_their_own_and_a_trace_is_found_by_its_blocks_filters() {
     assert_eq!(s.spans_cutoff(), 100_000);
     assert_eq!(s.search_spans(&all, 0, i64::MAX, usize::MAX).unwrap().records.len(), 10_000);
 }
+
+/// A batch whose row holds text that is not UTF-8 (in an attribute's value, its key, or its
+/// message: a writer gone wrong) is refused whole as it is applied, past the horizon or not: the
+/// head never takes a row its seals and cuts could not read. The same batch whole is taken.
+#[test]
+fn a_batch_with_a_row_that_is_not_utf_8_is_refused_as_it_is_applied() {
+    use crate::logs::record::put_row;
+    let records: Vec<Record> = (0..3)
+        .map(|i| Record {
+            ts: 1_700_000_000_000_000_000 + i * 1_000_000,
+            severity: 9,
+            service: "api".into(),
+            host: "h1".into(),
+            source: "kiln".into(),
+            message: format!("request {i} took {} ms", i * 7),
+            attrs: vec![("http.status_code".into(), "200".into()), ("route".into(), "/api/runs".into())],
+            trace_id: None,
+            span_id: None,
+        })
+        .collect();
+    let mut raw = Vec::new();
+    let mut prev = 0;
+    for r in &records {
+        put_row(&mut raw, r, prev);
+        prev = r.ts;
+    }
+    let (kept, n, ahead) = within_logs(raw.clone(), 3, i64::MAX, None).unwrap();
+    assert_eq!((kept.as_slice(), n, ahead), (raw.as_slice(), 3, 0));
+    let last = records.last().unwrap();
+    for (what, needle) in [("a value", last.attrs[1].1.as_bytes()), ("a key", last.attrs[0].0.as_bytes()), ("the message", last.message.as_bytes())] {
+        let at = raw.windows(needle.len()).rposition(|w| w == needle).unwrap();
+        let mut bad = raw.clone();
+        bad[at] = 0xff;
+        assert!(within_logs(bad.clone(), 3, i64::MAX, None).is_err(), "{what}: taken");
+        // A row before it past the horizon (the rows written again without it): refused too.
+        assert!(within_logs(bad, 3, records[0].ts, None).is_err(), "{what}: taken past the horizon");
+    }
+}

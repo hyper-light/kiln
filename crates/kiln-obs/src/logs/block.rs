@@ -64,6 +64,103 @@ fn insert_sorted(v: &mut Vec<String>, s: &str) {
     }
 }
 
+/// The tokens a block holds, each by its two hashes (`token_hashes`, mixed already), kept once
+/// to size its filter. The table hashes them folded with a key this process draws, mixed once
+/// (SplitMix64's finalizer): not SipHash's rounds, and still no sender can write tokens that
+/// collide in it, as with the hashes taken as they are (they are fixed by the format: anyone may
+/// compute them). Sorting them instead was measured slower: a log's words repeat.
+type Seen = std::collections::HashSet<(u64, u64), Keyed>;
+
+#[derive(Debug, Clone, Copy)]
+struct Keyed(u64);
+
+impl Keyed {
+    fn drawn() -> Self {
+        static KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        Self(*KEY.get_or_init(|| std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), 0x6b69_6c6e_u64)))
+    }
+}
+
+impl std::hash::BuildHasher for Keyed {
+    type Hasher = Folded;
+    fn build_hasher(&self) -> Folded {
+        Folded(self.0)
+    }
+}
+
+struct Folded(u64);
+
+impl std::hash::Hasher for Folded {
+    fn finish(&self) -> u64 {
+        super::bloom::mix(self.0)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = self.0.rotate_left(32) ^ x;
+    }
+}
+
+/// What a seal works in, kept by the thread for its next (the text alone is past the allocator's
+/// threshold for memory of its own, each new one faulted in a page at a time).
+struct Scratch {
+    order: Vec<usize>,
+    raw: Vec<u8>,
+    seen: Seen,
+    buf: String,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self { order: Vec::new(), raw: Vec::with_capacity(BLOCK_TEXT + BLOCK_TEXT / 8), seen: Seen::with_hasher(Keyed::drawn()), buf: String::new() }
+    }
+
+    /// What a seal left past what a block of logs takes let go, for the next to begin from: a
+    /// wider block's (a merge's, a cut's whole head) is not kept for the thread's life.
+    fn trim(&mut self) {
+        if self.raw.capacity() > 4 * (BLOCK_TEXT + BLOCK_TEXT / 8) {
+            self.raw = Vec::with_capacity(BLOCK_TEXT + BLOCK_TEXT / 8);
+        }
+        if self.seen.capacity() > SEEN_KEPT {
+            self.seen = Seen::with_hasher(*self.seen.hasher());
+        }
+        if self.order.capacity() > SEEN_KEPT {
+            self.order = Vec::new();
+        }
+    }
+}
+
+/// Tokens (and records, of the order) the scratch keeps room for between seals: a block of
+/// logs' few thousand.
+const SEEN_KEPT: usize = 1 << 16;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::new());
+}
+
+/// The block's distinct values of a field (its services, hosts, sources), sorted; the last one
+/// taken remembered, as records of a block mostly repeat it.
+struct Distinct<'a> {
+    sorted: Vec<String>,
+    last: Option<&'a str>,
+}
+
+impl<'a> Distinct<'a> {
+    fn new() -> Self {
+        Self { sorted: Vec::new(), last: None }
+    }
+
+    fn take(&mut self, s: &'a str) {
+        if self.last != Some(s) {
+            insert_sorted(&mut self.sorted, s);
+            self.last = Some(s);
+        }
+    }
+}
+
 impl LogBlock {
     /// Seals records (in any order: sorted by time here, stably).
     pub fn seal(records: &[RecordRef<'_>]) -> Self {
@@ -74,34 +171,58 @@ impl LogBlock {
     /// bytes' hashes, `super::bloom::id_hashes`) and not [`UNTOKENIZED`]'s values, every place
     /// salted by the block ([`LogBlock::salt`]).
     pub fn seal_in(records: &[RecordRef<'_>], spans: bool) -> Self {
-        let mut order: Vec<usize> = (0..records.len()).collect();
+        SCRATCH.with(|s| match s.try_borrow_mut() {
+            Ok(mut scratch) => {
+                let block = Self::seal_with(records, spans, &mut scratch);
+                scratch.trim();
+                block
+            }
+            Err(_) => Self::seal_with(records, spans, &mut Scratch::new()),
+        })
+    }
+
+    fn seal_with(records: &[RecordRef<'_>], spans: bool, scratch: &mut Scratch) -> Self {
+        let Scratch { order, raw, seen, buf } = scratch;
+        order.clear();
+        order.extend(0..records.len());
         order.sort_by_key(|&i| records.get(i).map_or(0, |r| r.ts));
-        let mut raw = Vec::with_capacity(BLOCK_TEXT + BLOCK_TEXT / 8);
+        raw.clear();
+        seen.clear();
         let mut prev = 0i64;
-        let (mut services, mut hosts, mut sources, mut keys) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut services, mut hosts, mut sources, mut keys) = (Distinct::new(), Distinct::new(), Distinct::new(), Vec::new());
+        // The last record's attribute keys, in its order: a record of the same kind names the same.
+        let mut last_keys: Vec<&str> = Vec::new();
         let mut severities = 0u32;
-        let mut seen = std::collections::HashSet::new();
-        let mut buf = String::new();
         let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
-        for &i in &order {
+        for &i in order.iter() {
             let Some(r) = records.get(i) else { continue };
-            put_row_ref(&mut raw, r, prev);
+            put_row_ref(raw, r, prev);
             prev = r.ts;
             min_ts = min_ts.min(r.ts);
             max_ts = max_ts.max(r.ts);
-            insert_sorted(&mut services, r.service);
-            insert_sorted(&mut hosts, r.host);
-            insert_sorted(&mut sources, r.source);
+            services.take(r.service);
+            hosts.take(r.host);
+            sources.take(r.source);
             severities |= 1 << u32::from(r.severity.min(24));
-            tokens(r.message, &mut buf, |t| {
+            tokens(r.message, buf, |t| {
                 seen.insert(token_hashes(t));
             });
-            for (k, v) in r.attrs() {
-                insert_sorted(&mut keys, k);
+            for (j, (k, v)) in r.attrs().enumerate() {
+                match last_keys.get_mut(j) {
+                    Some(last) if *last == k => {}
+                    Some(last) => {
+                        insert_sorted(&mut keys, k);
+                        *last = k;
+                    }
+                    None => {
+                        insert_sorted(&mut keys, k);
+                        last_keys.push(k);
+                    }
+                }
                 if spans && UNTOKENIZED.contains(&k) {
                     continue;
                 }
-                tokens(v, &mut buf, |t| {
+                tokens(v, buf, |t| {
                     seen.insert(token_hashes(t));
                 });
             }
@@ -113,18 +234,18 @@ impl LogBlock {
         // A block of spans' filter salted by the block (`super::bloom::salted`); a block of logs'
         // as logs' have always been.
         let salt = spans.then(|| super::bloom::block_salt(if records.is_empty() { 0 } else { min_ts }, records.len() as u32));
-        for h in seen {
+        for &h in seen.iter() {
             bloom.insert(salt.map_or(h, |s| super::bloom::salted(h, s)));
         }
         let mut text = Vec::with_capacity(raw.len() / 4);
-        lz4::compress(&raw, &mut text);
+        lz4::compress(raw, &mut text);
         Self {
             min_ts: if records.is_empty() { 0 } else { min_ts },
             max_ts: if records.is_empty() { 0 } else { max_ts },
             rows: records.len() as u32,
-            services,
-            hosts,
-            sources,
+            services: services.sorted,
+            hosts: hosts.sorted,
+            sources: sources.sorted,
             attr_keys: keys,
             severities,
             bloom,
@@ -281,6 +402,132 @@ mod tests {
                 span_id: None,
             })
             .collect()
+    }
+
+    /// A seal as the format was first written: a character at a time, every value searched for
+    /// in its list, the tokens' hashes in std's set.
+    fn sealed_by_the_book(records: &[RecordRef<'_>], spans: bool) -> LogBlock {
+        let mut order: Vec<usize> = (0..records.len()).collect();
+        order.sort_by_key(|&i| records[i].ts);
+        let mut raw = Vec::new();
+        let mut prev = 0i64;
+        let (mut services, mut hosts, mut sources, mut keys) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut severities = 0u32;
+        let mut seen = std::collections::HashSet::new();
+        let words = |text: &str, seen: &mut std::collections::HashSet<(u64, u64)>| {
+            let mut buf = String::new();
+            for c in text.chars().chain([' ']) {
+                if c.is_alphanumeric() {
+                    buf.extend(c.to_lowercase());
+                } else if !buf.is_empty() {
+                    seen.insert(token_hashes(&buf));
+                    buf.clear();
+                }
+            }
+        };
+        let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
+        for &i in &order {
+            let r = &records[i];
+            crate::logs::record::put_fields(&mut raw, r.ts, r.severity, [r.service, r.host, r.source], r.message, r.attrs(), r.attr_count, r.trace_id, r.span_id, prev, usize::MAX);
+            prev = r.ts;
+            min_ts = min_ts.min(r.ts);
+            max_ts = max_ts.max(r.ts);
+            insert_sorted(&mut services, r.service);
+            insert_sorted(&mut hosts, r.host);
+            insert_sorted(&mut sources, r.source);
+            severities |= 1 << u32::from(r.severity.min(24));
+            words(r.message, &mut seen);
+            for (k, v) in r.attrs() {
+                insert_sorted(&mut keys, k);
+                if !(spans && UNTOKENIZED.contains(&k)) {
+                    words(v, &mut seen);
+                }
+            }
+            if spans && let Some(t) = r.trace_id {
+                seen.insert(crate::logs::bloom::id_hashes(&t));
+            }
+        }
+        let mut bloom = Bloom::with_rate(seen.len(), BLOOM_RATE);
+        let salt = spans.then(|| crate::logs::bloom::block_salt(if records.is_empty() { 0 } else { min_ts }, records.len() as u32));
+        for h in seen {
+            bloom.insert(salt.map_or(h, |s| crate::logs::bloom::salted(h, s)));
+        }
+        let mut text = Vec::new();
+        lz4::compress(&raw, &mut text);
+        LogBlock {
+            min_ts: if records.is_empty() { 0 } else { min_ts },
+            max_ts: if records.is_empty() { 0 } else { max_ts },
+            rows: records.len() as u32,
+            services,
+            hosts,
+            sources,
+            attr_keys: keys,
+            severities,
+            bloom,
+            codec: Codec::Lz4,
+            raw_len: raw.len() as u32,
+            text,
+        }
+    }
+
+    /// Blocks of records of every shape (fields repeated and changing, attributes in any order
+    /// and number, text past ASCII; logs and spans, trace ids and the keys spans leave out of the
+    /// filter; one record, and none) seal to the same block as the format was first written, to the
+    /// byte, through one thread's scratch from block to block.
+    #[test]
+    fn a_seal_writes_the_block_the_format_first_wrote() {
+        let mut rng = crate::testkit::Rng::new(11);
+        let pick = |rng: &mut crate::testkit::Rng, of: &[&'static str]| of[rng.below(of.len() as u64) as usize];
+        let words = ["GET", "/api/v1/orders/", "42", "paid", "in", "ms", "Straße", "İstanbul", "ΣΊΣΥΦΟΣ", "東京", "😀", "e\u{301}", "-", " ", "=", "x1Y2", "ﬃ"];
+        for case in 0..60 {
+            let n = match case {
+                0 => 0,
+                1 => 1,
+                _ => 1 + rng.below(1500) as usize,
+            };
+            let spans = case % 3 == 2;
+            let records: Vec<Record> = (0..n)
+                .map(|i| {
+                    let mut attrs: Vec<(String, String)> = Vec::new();
+                    let keys = ["http.route", "user.id", "duration", "parent_id", "thread.name", "events", "status_code"];
+                    for _ in 0..rng.below(6) {
+                        let k = pick(&mut rng, &keys);
+                        if attrs.iter().all(|(a, _)| a != k) {
+                            let v: String = (0..1 + rng.below(4)).map(|_| pick(&mut rng, &words)).collect();
+                            attrs.push((k.to_owned(), v));
+                        }
+                    }
+                    if rng.below(4) != 0 {
+                        // Most records of a kind name their keys alike, in one order.
+                        attrs.sort();
+                    }
+                    let message: String = (0..1 + rng.below(10)).map(|_| pick(&mut rng, &words)).collect();
+                    let services: &[&'static str] = if rng.below(8) == 0 { &["shop", "web", "api"] } else { &["shop"] };
+                    Record {
+                        ts: 1_700_000_000_000_000_000 + rng.below(60_000_000_000) as i64,
+                        severity: [9u8, 13, 17][rng.below(3) as usize],
+                        service: pick(&mut rng, services).into(),
+                        host: format!("host-{}", if rng.below(16) == 0 { rng.below(5) } else { i as u64 / 300 }),
+                        source: pick(&mut rng, &["otlp", "otlp", "otlp", "kiln.event"]).into(),
+                        message,
+                        attrs,
+                        trace_id: (spans || rng.below(2) == 0).then(|| std::array::from_fn(|b| (rng.next_u64() >> (b % 8)) as u8)),
+                        span_id: None,
+                    }
+                })
+                .collect();
+            let (mut raw, mut prev) = (Vec::new(), 0);
+            for r in &records {
+                put_row(&mut raw, r, prev);
+                prev = r.ts;
+            }
+            let mut rows = Rows::new(&raw, records.len());
+            let mut refs = Vec::new();
+            while let Some(r) = rows.next_row().unwrap() {
+                refs.push(r);
+            }
+            assert_eq!(LogBlock::seal_in(&refs, spans), sealed_by_the_book(&refs, spans), "case {case}: {n} records, spans {spans}");
+        }
     }
 
     #[test]

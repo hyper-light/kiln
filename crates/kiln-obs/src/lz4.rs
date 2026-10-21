@@ -40,6 +40,31 @@ fn read_u32(src: &[u8], at: usize) -> Option<u32> {
     src.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes)
 }
 
+#[inline]
+fn read_u64(src: &[u8], at: usize) -> Option<u64> {
+    src.get(at..at + 8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes)
+}
+
+/// How many bytes on from `a` are those on from `b` (`a` before `b`), not reaching `end`: eight
+/// compared at once (their first difference the lowest byte of the two words' that differs, read
+/// little-endian), the rest one by one. A match's length, as a byte at a time finds it.
+#[inline]
+fn common(src: &[u8], a: usize, b: usize, end: usize) -> usize {
+    let mut k = 0;
+    while b + k + 8 <= end {
+        let (Some(x), Some(y)) = (read_u64(src, a + k), read_u64(src, b + k)) else { break };
+        let d = x ^ y;
+        if d != 0 {
+            return k + (d.trailing_zeros() / 8) as usize;
+        }
+        k += 8;
+    }
+    while b + k < end && src.get(a + k) == src.get(b + k) {
+        k += 1;
+    }
+    k
+}
+
 fn push_length(out: &mut Vec<u8>, mut n: usize) {
     while n >= 255 {
         out.push(255);
@@ -76,9 +101,7 @@ pub fn compress(src: &[u8], out: &mut Vec<u8>) {
                 m -= 1;
             }
             let mut len = MIN_MATCH + (i - start);
-            while start + len < n - LAST_LITERALS && src.get(start + len) == src.get(m + len) {
-                len += 1;
-            }
+            len += common(src, m + len, start + len, n - LAST_LITERALS);
             let lit = start - anchor;
             let token_pos = out.len();
             out.push(0);
@@ -207,6 +230,83 @@ mod tests {
             round_trip(&noise);
             let mixed: Vec<u8> = (0..len).map(|i| if (i / 37) % 3 == 0 { b"abcdefgh"[i % 8] } else { rng.below(4) as u8 }).collect();
             round_trip(&mixed);
+        }
+    }
+
+    /// The compressor as first written, a match extended a byte at a time: what blocks on disk hold.
+    fn compressed_by_byte(src: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut table = [0u32; 1 << HASH_LOG];
+        let n = src.len();
+        let (mut anchor, mut i) = (0usize, 0usize);
+        if n >= MF_LIMIT {
+            let limit = n - MF_LIMIT;
+            while i <= limit {
+                let w = read_u32(src, i).unwrap();
+                let h = hash(w);
+                let cand = table[h] as usize;
+                table[h] = (i + 1) as u32;
+                if cand == 0 || i - (cand - 1) > MAX_OFFSET || read_u32(src, cand - 1) != Some(w) {
+                    i += 1;
+                    continue;
+                }
+                let mut m = cand - 1;
+                let mut start = i;
+                while start > anchor && m > 0 && src[start - 1] == src[m - 1] {
+                    start -= 1;
+                    m -= 1;
+                }
+                let mut len = MIN_MATCH + (i - start);
+                while start + len < n - LAST_LITERALS && src[start + len] == src[m + len] {
+                    len += 1;
+                }
+                let lit = start - anchor;
+                let token_pos = out.len();
+                out.push(0);
+                if lit >= 15 {
+                    push_length(&mut out, lit - 15);
+                }
+                out.extend_from_slice(&src[anchor..start]);
+                out.extend_from_slice(&((start - m) as u16).to_le_bytes());
+                let ml = len - MIN_MATCH;
+                if ml >= 15 {
+                    push_length(&mut out, ml - 15);
+                }
+                out[token_pos] = ((lit.min(15) as u8) << 4) | ml.min(15) as u8;
+                i = start + len;
+                anchor = i;
+                if i >= 2 && i - 2 <= limit {
+                    table[hash(read_u32(src, i - 2).unwrap())] = (i - 2 + 1) as u32;
+                }
+            }
+        }
+        let lit = n - anchor;
+        out.push((lit.min(15) as u8) << 4);
+        if lit >= 15 {
+            push_length(&mut out, lit - 15);
+        }
+        out.extend_from_slice(&src[anchor..]);
+        out
+    }
+
+    /// Text, runs (long matches, short ones, matches running to the end), noise and mixtures of
+    /// them, of every length to 64 and lengths past: compressed as a byte at a time compressed
+    /// them, to the byte.
+    #[test]
+    fn matches_extended_a_word_at_a_time_compress_as_a_byte_at_a_time_did() {
+        let mut rng = Rng::new(3);
+        let log = "2026-10-20T19:01:35Z INFO kiln::observe: order 4242 paid in 37 ms by a card ending 4242 route=/api/v1/orders/17\n".repeat(300);
+        let mut cases: Vec<Vec<u8>> = vec![log.into_bytes(), vec![0u8; 100_000], b"ab".repeat(5_000)];
+        for len in (0..64).chain([65, 100, 1000, 4096, 70_000, 200_000]) {
+            cases.push((0..len).map(|_| rng.next_u64() as u8).collect());
+            cases.push((0..len).map(|i| if (i / 37) % 3 == 0 { b"abcdefgh"[i % 8] } else { rng.below(4) as u8 }).collect());
+            let period = 1 + rng.below(40) as usize;
+            cases.push((0..len).map(|i| if rng.below(50) == 0 { rng.next_u64() as u8 } else { (i % period) as u8 }).collect());
+        }
+        for (i, c) in cases.iter().enumerate() {
+            let mut out = Vec::new();
+            compress(c, &mut out);
+            assert_eq!(out, compressed_by_byte(c), "case {i}: {} bytes", c.len());
         }
     }
 

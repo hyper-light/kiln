@@ -612,22 +612,82 @@ fn logs_request(sender: u64, first: u64, records: u64, now_ns: u64) -> Vec<u8> {
     w.buf
 }
 
+/// The flood's log monitors: each over the last five minutes, none to alert. The first two are
+/// checked after it (its errors; each host's records), the rest are a server's work meanwhile.
+const FLOOD_MONITORS: [&str; 8] = [
+    r#"logs("service:flood status:error").last("5m") > 100000000"#,
+    r#"logs("service:flood").rollup("count").by("host").last("5m") > 100000000"#,
+    r#"logs("service:flood").rollup("cardinality", "@user.id").by("host").last("5m") > 100000000"#,
+    r#"logs("service:flood").rollup("count").by("@http.route").last("5m") > 100000000"#,
+    r#"logs("service:flood status:error").rollup("count").by("@thread.name").last("5m") > 100000000"#,
+    r#"logs("service:flood paid").rollup("count").by("status").last("5m") > 100000000"#,
+    r#"logs("service:flood 4242").last("5m") > 100000000"#,
+    r#"logs("*").rollup("count").by("service").last("5m") > 100000000"#,
+];
+
+/// Each log monitor's groups, as an evaluation found them: the group's values joined, its value,
+/// and when it was evaluated (ms).
+fn monitor_groups(f: &Fleet, id: &str) -> anyhow::Result<Vec<(String, f64, i64)>> {
+    let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+    Ok(at(&m, &["groups"])
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|g| {
+            let group = at(g, &["group"]).as_array().into_iter().flatten().filter_map(|kv| kv.get(1).and_then(serde_json::Value::as_str)).collect::<Vec<_>>().join(",");
+            (group, at(g, &["value"]).as_f64().unwrap_or(f64::NAN), at(g, &["last_data"]).as_i64().unwrap_or(0))
+        })
+        .collect())
+}
+
+/// A metric's points from `from` to `to` (ms) added up, by its group (the tags' values, joined).
+fn metric_totals(f: &Fleet, q: &str, from: i64, to: i64) -> anyhow::Result<std::collections::BTreeMap<String, f64>> {
+    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": to, "step": 10_000 })))?;
+    let mut out = std::collections::BTreeMap::new();
+    for s in at(&a, &["series"]).as_array().into_iter().flatten() {
+        let group = at(s, &["tags"]).as_object().map(|o| o.values().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default();
+        *out.entry(group).or_insert(0.0) += at(s, &["values"]).as_array().into_iter().flatten().filter_map(serde_json::Value::as_f64).sum::<f64>();
+    }
+    Ok(out)
+}
+
 /// docs/observe.md §13: an OTLP logs flood, as the metrics' (above): senders as fast as they are
-/// answered, half to the server and half to the runner's receiver, a reader searching meanwhile.
-/// What it proves: every record answered 200 is stored once (counted by its sender's host), none
-/// dropped for room, and the replicas agree; what it measures: records a second, a request's time,
-/// a search's under the flood, until the last records are found, and what each node spends (by
-/// thread) and holds. `KOBS_LOGS_SECS` (20), `KOBS_LOGS_SENDERS` (8), `KOBS_LOGS_RECORDS` (500 a
-/// request).
+/// answered, half to the server and half to the runner's receiver, a reader searching meanwhile,
+/// and the server's monitors and metrics from logs at their work. What it proves: every record
+/// answered 200 is stored once (counted by its sender's host), none dropped for room, and the
+/// replicas agree; the monitors' first evaluation after finds every record (the errors; each
+/// host's), and the metrics from logs count each record once (each host's; the errors; a word
+/// every record says). What it measures: records a second, a request's time, a search's under the
+/// flood, until the last records are found, and what each node spends (by thread) and holds.
+/// `KOBS_LOGS_SECS` (20), `KOBS_LOGS_SENDERS` (8), `KOBS_LOGS_RECORDS` (500 a request),
+/// `KOBS_LOGS_MONITORS` (8, [`FLOOD_MONITORS`]' first), `KOBS_LOGS_METRICS` (1: three metrics
+/// from logs; 0: none).
 #[test]
 #[ignore = "starts real processes and loads them"]
 fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::Result<()> {
     let secs = env("KOBS_LOGS_SECS", 20);
     let senders = env("KOBS_LOGS_SENDERS", 8);
     let records = env("KOBS_LOGS_RECORDS", 500);
+    let monitors = (env("KOBS_LOGS_MONITORS", FLOOD_MONITORS.len() as u64) as usize).min(FLOOD_MONITORS.len());
+    let log_metrics = env("KOBS_LOGS_METRICS", 1) != 0;
     let mut f = Fleet::new()?;
     f.start_runner("r1")?;
     f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    // Evaluated every ten seconds, the most often a monitor may be.
+    let mut monitor_ids = Vec::new();
+    for (i, q) in FLOOD_MONITORS.iter().take(monitors).enumerate() {
+        let m = f.call("POST", "/api/observe/v1/monitors", Some(&json!({ "name": format!("flood {i}"), "query": q, "options": { "every": 10 } })))?;
+        monitor_ids.push(at(&m, &["id"]).as_str().unwrap_or_default().to_owned());
+    }
+    if log_metrics {
+        for (name, filter, by) in [("flood.records", "service:flood", "host"), ("flood.errors", "service:flood status:error", "@thread.name"), ("flood.paid", "service:flood paid", "@http.route")] {
+            f.call("POST", "/api/observe/v1/log_metrics", Some(&json!({ "name": name, "compute": { "aggregation_type": "count" }, "filter": { "query": filter }, "group_by": [{ "path": by }] })))?;
+        }
+        // A metric counts from the first window that begins after it is made (none counted in
+        // part): the flood begins in one.
+        let made = common::now_ms();
+        std::thread::sleep(Duration::from_millis((10_000 - made.rem_euclid(10_000) + 250) as u64));
+    }
     let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
     let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
     let server_pid = f.server.as_ref().map_or(0, |p| p.child.id());
@@ -750,6 +810,59 @@ fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyh
     let (r_cpu1, r_rss) = usage(runner_pid);
     let r_flt = MINFLT.with(std::cell::Cell::get) - r_flt0;
     let (s_threads1, r_threads1) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
+    // The monitors' first evaluation after every record was stored finds them all: the errors (one
+    // in fifty of each sender's records), and each host's records.
+    let stored_at = common::now_ms();
+    let errors_sent: u64 = taken_by.iter().map(|t| t / 50).sum();
+    let want_hosts: std::collections::BTreeMap<String, f64> = taken_by.iter().enumerate().map(|(i, t)| (format!("load-{i}"), *t as f64)).collect();
+    let mut monitors_found = None;
+    if let (Some(errors_id), Some(hosts_id)) = (monitor_ids.first(), monitor_ids.get(1)) {
+        let looked = Instant::now();
+        loop {
+            let (e, h) = (monitor_groups(&f, errors_id)?, monitor_groups(&f, hosts_id)?);
+            let after = |g: &[(String, f64, i64)]| !g.is_empty() && g.iter().all(|(_, _, t)| *t > stored_at);
+            if after(&e) && after(&h) {
+                let errors = e.first().map_or(f64::NAN, |g| g.1);
+                let hosts: std::collections::BTreeMap<String, f64> = h.iter().map(|(g, v, _)| (g.clone(), *v)).collect();
+                anyhow::ensure!(errors == errors_sent as f64, "the errors' monitor found {errors}: {errors_sent} were sent");
+                anyhow::ensure!(hosts == want_hosts, "the hosts' monitor found {hosts:?}: sent {want_hosts:?}");
+                monitors_found = Some(looked.elapsed());
+                break;
+            }
+            anyhow::ensure!(looked.elapsed() < Duration::from_secs(60), "no evaluation of the monitors in the minute after the flood: {e:?}, {h:?}\n{}", f.logs());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    // The metrics from logs count every record once: each host's, the errors, a word every record
+    // says. A count above what was sent fails at once (a record counted twice never comes right).
+    let mut metrics_found = None;
+    if log_metrics {
+        let to = common::now_ms() + 60_000;
+        let one = |v: u64| std::collections::BTreeMap::from([(String::new(), v as f64)]);
+        let want = [("sum:flood.records{*} by {host}.as_count()", want_hosts.clone()), ("sum:flood.errors{*}.as_count()", one(errors_sent)), ("sum:flood.paid{*}.as_count()", one(all.taken))];
+        let looked = Instant::now();
+        loop {
+            let mut right = true;
+            for (q, w) in &want {
+                let got = metric_totals(&f, q, from_ms, to)?;
+                for (g, v) in &got {
+                    anyhow::ensure!(w.get(g).is_some_and(|w| v <= w), "{q}: {g:?} counted {v}, more than was sent ({:?})", w.get(g));
+                }
+                right &= got == *w;
+            }
+            if right {
+                metrics_found = Some(looked.elapsed());
+                break;
+            }
+            if looked.elapsed() > Duration::from_secs(120) {
+                let got: Vec<_> = want.iter().map(|(q, _)| metric_totals(&f, q, from_ms, to).map(|g| g.values().sum::<f64>()).unwrap_or(f64::NAN)).collect();
+                let counting = f.call("GET", "/api/observe/v1/log_metrics", None).map(|v| at(&v, &["counting"]).clone()).unwrap_or_default();
+                anyhow::bail!("the metrics from logs did not come right in two minutes: counted {got:?} of {:?}; counting {counting}\n{}", [all.taken, errors_sent, all.taken], f.logs());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    let counting = if log_metrics { f.call("GET", "/api/observe/v1/log_metrics", None).map(|v| at(&v, &["counting"]).clone()).unwrap_or_default() } else { serde_json::Value::Null };
     let (index, digest) = f.verify(2)?;
     all.latencies_us.sort_unstable();
     let ms = |us: u64| us as f64 / 1000.0;
@@ -770,6 +883,20 @@ fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyh
     eprintln!("  stored     every sender's records counted {:.0} ms after the flood", lag.as_secs_f64() * 1000.0);
     eprintln!("  errors     the last minute's newest 50: {}", parts(&mut search));
     eprintln!("  by status  the last minute counted: {}", parts(&mut facets));
+    if let Some(t) = monitors_found {
+        eprintln!("  monitors   {monitors} of logs, every 10 s over the last 5 min: the first evaluation after found every record, {:.1} s after", t.as_secs_f64());
+    }
+    if let Some(t) = metrics_found {
+        let n = |k: &str| at(&counting, &[k]).as_u64().unwrap_or(0);
+        eprintln!(
+            "  metrics    3 from logs, every record counted once {:.1} s after: {} windows counted ({} again), {} rows read in {} ms",
+            t.as_secs_f64(),
+            n("windows_counted"),
+            n("windows_recounted"),
+            n("rows_scanned"),
+            n("count_ms")
+        );
+    }
     eprintln!(
         "  server     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.4} minor faults a record",
         s_cpu1 - s_cpu0,

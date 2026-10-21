@@ -2194,6 +2194,35 @@ A third of the time on five threads, not a fifth: the reading is memory's (LZ4 a
 machine others share. A search of the newest records stays one thread's: it stops at its limit, its
 blocks newest first.
 
+Then the seal (2026-10-20). Under the logs flood (§13) the thread that applies spent 54.5 thousand
+instructions a record (perf, user space, counted over the whole run), nearly all of it sealing the
+head into blocks, under the store's exclusive hold: the token set's SipHash (23%), LZ4 (15%; half of
+it extending a match a byte at a time), UTF-8 checks (15%: each row's attributes checked as the row
+was read, again as it was written into the block, again as it was tokenized), the tokenizer itself
+(14%: a character decoded and tested against Unicode's tables at a time) and each record's service,
+host, source and keys searched for in the block's lists (6%). Now, each to the byte of what was
+written before (tests against copies of the code as it was: the tokens, a block sealed, a row
+written again, LZ4's output):
+
+- the token set hashes its keys (two hashes already) folded with a key the process draws and mixed
+  once, so no tokens a sender writes collide in it (sorting them instead was measured slower: a
+  log's words repeat);
+- ASCII is tokenized a run at a time, a character past it decoded alone;
+- a row's attributes are checked as they are read (`RecordRef::attrs`), and written into a block as
+  their bytes are, unread; every row is still checked whole as its batch is applied (`within_logs`:
+  a malformed one, a remote writer's, is refused there, and never reaches the head, whose seals and
+  cuts read every row);
+- a record's service, host and source are looked for only when they differ from the last record's,
+  its keys only where they differ from the last record's in place;
+- a seal works in what the thread kept from its last (its text alone past the allocator's
+  threshold for memory of its own);
+- LZ4 extends a match eight bytes at a time.
+
+The bench above: ingest 1.00–1.01 M records a second before, 1.19–1.20 M after the seal's changes,
+1.16–1.25 M with LZ4's too (nine runs), its searches and analytics as they were (±5%). The flood: 34.2 thousand
+instructions a record against 54.4 (37% fewer, the server's and the runner's alike, both of two runs in
+turn).
+
 ### 12.9 The group: writes through the replicated log
 
 2026-10-18, same machine, NVMe under btrfs (a raw `write` + `fdatasync` there: 2.8 ms for 4 KiB,
@@ -3336,6 +3365,21 @@ error in the records as they are. What is left long is a query of metrics (and a
 an SLO's), which reads under a hold for its scan, a writer's wait and so every reader's after it. A
 cut writes its files under a shared hold too, but on the thread that applies: no write waits for
 it, so no reader does.
+
+The flood now runs as a server does, with its work beside it: eight log monitors over the last five
+minutes, each evaluated every ten seconds (counts by host, route and thread, a cardinality of users,
+words searched for), and three metrics from logs (each host's records, the errors by thread, a word
+every record says, by route), made a window before the flood (a metric counts from the first window
+that begins after it is made). What it proves besides: the monitors' first evaluation after the
+flood finds every record (the errors, one in fifty of each sender's; each host's records, to the
+record), and the metrics count every record once (a count above what was sent fails at once).
+Measured in turn on adacachy (others' work at a load of 17 to 34), the build before the monitors'
+holds and the seal's pass against both, two runs each: the errors' search waited for the store 2.14
+s and 493 ms at p99 before (the monitors' one hold, a writer behind it), 5.5 and 34 ms after; the
+count by status's 11.6 and 12.3 ms, 5.9 and 34; the flood taken at 213 k and 236 k records a second,
+254 k and 188 k after (the second run's machine was busier: its answers' p99 9.5 ms against 1.3 to
+1.5 in the others, its count by status's reading 2.2 s at p99, starved); the thread that applies
+54.4 thousand instructions a record before, 34.2 after (§12.8).
 
 **Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is

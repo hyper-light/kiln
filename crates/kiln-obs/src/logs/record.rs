@@ -171,6 +171,13 @@ fn get_str<'a>(at: &mut &'a [u8]) -> Option<&'a str> {
     std::str::from_utf8(b).ok()
 }
 
+/// Past a string, its text unread.
+fn skip_str(at: &mut &[u8]) -> Option<()> {
+    let n = usize::try_from(varint::get(at)?).ok()?;
+    *at = at.get(n..)?;
+    Some(())
+}
+
 /// `s`, at most `max` bytes of it, cut at a character's start: what a row keeps of a text.
 pub fn cut(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -193,7 +200,44 @@ pub fn put_row(out: &mut Vec<u8>, r: &Record, prev_ts: i64) {
 /// Appends a row read in place, without copying it out first: as it is (a row's values were cut,
 /// if at all, as it was first written; a span's are longer than a log's).
 pub fn put_row_ref(out: &mut Vec<u8>, r: &RecordRef<'_>, prev_ts: i64) {
-    put_fields(out, r.ts, r.severity, [r.service, r.host, r.source], r.message, r.attrs(), r.attr_count, r.trace_id, r.span_id, prev_ts, usize::MAX);
+    if r.attr_count > crate::batch::MAX_TAGS || !keys_within(r.attrs_raw, r.attr_count) {
+        put_fields(out, r.ts, r.severity, [r.service, r.host, r.source], r.message, r.attrs(), r.attr_count, r.trace_id, r.span_id, prev_ts, usize::MAX);
+        return;
+    }
+    // Its attributes' bytes as they are: what `put_fields` writes of them again (a value is not
+    // cut here, a key within its bound is not), not read to write them.
+    varint::put(out, varint::zig(r.ts.wrapping_sub(prev_ts)));
+    out.push(r.severity);
+    for s in [r.service, r.host, r.source] {
+        put_str(out, cut(s, crate::batch::MAX_NAME_BYTES));
+    }
+    put_str(out, cut(r.message, MAX_MESSAGE_BYTES));
+    varint::put(out, r.attr_count as u64);
+    out.extend_from_slice(r.attrs_raw);
+    out.push(u8::from(r.trace_id.is_some()) | (u8::from(r.span_id.is_some()) << 1));
+    if let Some(t) = r.trace_id {
+        out.extend_from_slice(&t);
+    }
+    if let Some(s) = r.span_id {
+        out.extend_from_slice(&s);
+    }
+}
+
+/// Whether `raw` is `n` attributes, each key within a name's bound (as every row's are written):
+/// read for their lengths alone.
+fn keys_within(mut raw: &[u8], n: usize) -> bool {
+    for _ in 0..n {
+        let Some(k) = varint::get(&mut raw).and_then(|k| usize::try_from(k).ok()) else { return false };
+        if k > crate::batch::MAX_NAME_BYTES {
+            return false;
+        }
+        let Some(rest) = raw.get(k..) else { return false };
+        raw = rest;
+        if skip_str(&mut raw).is_none() {
+            return false;
+        }
+    }
+    raw.is_empty()
 }
 
 /// Appends a row from its fields, for a writer that makes no [`Record`] of it (a span decoded,
@@ -329,10 +373,12 @@ impl<'a> Rows<'a> {
         if attr_count > crate::batch::MAX_TAGS {
             return None;
         }
+        // The attributes' bounds found, their text checked as `RecordRef::attrs` reads them: a seal
+        // reads each once, a search those it asks of (a batch's are all checked as it is applied,
+        // `crate::store`'s `within_logs`).
         let attrs_start = *at;
-        for _ in 0..attr_count {
-            get_str(at)?;
-            get_str(at)?;
+        for _ in 0..attr_count * 2 {
+            skip_str(at)?;
         }
         let attrs_raw = attrs_start.get(..attrs_start.len() - at.len())?;
         let (&flags, rest) = at.split_first()?;
@@ -372,6 +418,53 @@ mod tests {
             trace_id: (i % 2 == 0).then_some([i as u8; 16]),
             span_id: (i % 4 == 0).then_some([7u8; 8]),
         }
+    }
+
+    /// A row read and written again (`put_row_ref`, its attributes' bytes copied) is the row
+    /// `put_fields` writes of what it holds, to the byte, of every shape a writer makes (stacks
+    /// among the attributes, none, the most a row may hold, text past ASCII, ids or none); a key
+    /// past a name's bound (a row no writer makes) is cut as `put_fields` cuts it.
+    #[test]
+    fn a_row_written_again_is_the_row_its_fields_write() {
+        let mut rng = crate::testkit::Rng::new(5);
+        let values = ["", "200", "/api/v1/orders/42", "Straße 東京 😀", "Traceback (most recent call last):\n  File \"x.py\""];
+        let keys = ["http.status_code", "route", "error.stack", "user.id", "exception.stacktrace", "ünïcode"];
+        for i in 0..5_000 {
+            let n = match i % 7 {
+                0 => 0,
+                1 => crate::batch::MAX_TAGS,
+                _ => rng.below(6) as usize,
+            };
+            let attrs: Vec<(String, String)> =
+                (0..n).map(|j| (format!("{}{j}", keys[rng.below(keys.len() as u64) as usize]), values[rng.below(values.len() as u64) as usize].repeat(1 + rng.below(3) as usize))).collect();
+            let r = Record { trace_id: (i % 2 == 0).then_some([7; 16]), span_id: (i % 3 == 0).then_some([9; 8]), attrs, ..sample(i) };
+            let mut row = Vec::new();
+            put_row(&mut row, &r, 0);
+            let got = Rows::new(&row, 1).next_row().unwrap().unwrap();
+            let (mut again, mut fields) = (Vec::new(), Vec::new());
+            put_row_ref(&mut again, &got, 0);
+            put_fields(&mut fields, got.ts, got.severity, [got.service, got.host, got.source], got.message, got.attrs(), got.attr_count, got.trace_id, got.span_id, 0, usize::MAX);
+            assert_eq!(again, fields, "row {i}");
+            assert_eq!(again, row, "row {i}: as it was written");
+        }
+        // A key no writer would write: its row written again as `put_fields` writes it, cut.
+        let long = "k".repeat(crate::batch::MAX_NAME_BYTES + 9);
+        let mut row = Vec::new();
+        varint::put(&mut row, varint::zig(5));
+        row.push(9);
+        for s in ["api", "h1", "kiln", "hello"] {
+            put_str(&mut row, s);
+        }
+        varint::put(&mut row, 1);
+        put_str(&mut row, &long);
+        put_str(&mut row, "v");
+        row.push(0);
+        let got = Rows::new(&row, 1).next_row().unwrap().unwrap();
+        let (mut again, mut fields) = (Vec::new(), Vec::new());
+        put_row_ref(&mut again, &got, 0);
+        put_fields(&mut fields, got.ts, got.severity, [got.service, got.host, got.source], got.message, got.attrs(), got.attr_count, got.trace_id, got.span_id, 0, usize::MAX);
+        assert_eq!(again, fields);
+        assert_ne!(again, row, "the key is cut");
     }
 
     /// Runs written alone and joined, each first time chained again, read as the one run written

@@ -1962,15 +1962,19 @@ impl Heap {
 }
 
 
-/// A batch's log rows without those later than `horizon` (ns): the rows as they are when none is
-/// (as nearly always), else written again without them; how many went.
-/// A batch's rows within `horizon` (those past it dropped): the rows, how many, and how many were
-/// dropped; the windows of those kept told to `windows`, if given (metrics from logs).
+/// A batch's rows within `horizon` (ns): the rows as they are when none is past it (as nearly
+/// always), else written again without those that are; how many there are, and how many were
+/// dropped; the windows of those kept told to `windows`, if given (metrics from logs). Every row is
+/// read whole, its attributes' text too: a batch with a malformed row (a remote writer's) is refused
+/// here, never taken into the head, whose seals and cuts read every row.
 fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64, mut windows: Option<&mut BatchWindows>) -> Result<(Vec<u8>, u32, u64), crate::logs::record::RowError> {
-    use crate::logs::record::{Rows, put_row_ref};
+    use crate::logs::record::{RowError, Rows, put_row_ref};
     let mut it = Rows::new(&raw, rows as usize);
     let mut any = false;
     while let Some(r) = it.next_row()? {
+        if r.attrs().count() != r.attr_count {
+            return Err(RowError);
+        }
         if r.ts > horizon {
             any = true;
             break;
@@ -1986,6 +1990,9 @@ fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64, mut windows: Option<&mut B
     let (mut n, mut ahead, mut prev) = (0u32, 0u64, 0i64);
     let mut it = Rows::new(&raw, rows as usize);
     while let Some(r) = it.next_row()? {
+        if r.attrs().count() != r.attr_count {
+            return Err(RowError);
+        }
         if r.ts > horizon {
             ahead += 1;
             continue;

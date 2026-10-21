@@ -8,10 +8,24 @@
 //! filters: a survey", 2004), the `k` positions from two hashes as `h1 + i·h2` (Kirsch and
 //! Mitzenmacher, "Less hashing, same performance", 2006).
 
-/// Calls `f` with each token of `text`, lowercased into `buf`.
+/// Calls `f` with each token of `text`, lowercased into `buf`. ASCII (nearly all of a log) is
+/// taken a run at a time, as Unicode's rules take it (its letters and digits alphanumeric, each
+/// lowercased to one byte); a character past it is decoded and tested alone.
 pub fn tokens(text: &str, buf: &mut String, mut f: impl FnMut(&str)) {
     buf.clear();
-    for c in text.chars() {
+    let mut rest = text;
+    while let Some(&b) = rest.as_bytes().first() {
+        if b.is_ascii_alphanumeric() {
+            let run = rest.bytes().take_while(u8::is_ascii_alphanumeric).count();
+            let start = buf.len();
+            buf.push_str(rest.get(..run).unwrap_or_default());
+            if let Some(added) = buf.get_mut(start..) {
+                added.make_ascii_lowercase();
+            }
+            rest = rest.get(run..).unwrap_or_default();
+            continue;
+        }
+        let c = if b.is_ascii() { char::from(b) } else { rest.chars().next().unwrap_or(char::REPLACEMENT_CHARACTER) };
         if c.is_alphanumeric() {
             for l in c.to_lowercase() {
                 buf.push(l);
@@ -20,6 +34,7 @@ pub fn tokens(text: &str, buf: &mut String, mut f: impl FnMut(&str)) {
             f(buf);
             buf.clear();
         }
+        rest = rest.get(c.len_utf8()..).unwrap_or_default();
     }
     if !buf.is_empty() {
         f(buf);
@@ -78,8 +93,9 @@ pub fn salted(h: (u64, u64), salt: u64) -> (u64, u64) {
     (mix(h.0 ^ salt), mix(h.1 ^ salt.rotate_left(29)) | 1)
 }
 
+/// SplitMix64's finalizer (Steele et al. 2014): every output bit depends on every input bit.
 #[inline]
-fn mix(mut z: u64) -> u64 {
+pub(crate) fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
@@ -145,6 +161,43 @@ impl Bloom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tokens as Unicode's rules state them, a character at a time: what filters on disk were
+    /// written with.
+    fn tokens_by_char(text: &str) -> Vec<String> {
+        let (mut out, mut buf) = (Vec::new(), String::new());
+        for c in text.chars() {
+            if c.is_alphanumeric() {
+                buf.extend(c.to_lowercase());
+            } else if !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+        }
+        if !buf.is_empty() {
+            out.push(buf);
+        }
+        out
+    }
+
+    /// Text of every kind a log holds, ASCII runs and what is past ASCII (letters lowercased to
+    /// more than one character, digits of other scripts, marks, CJK, emoji, a replacement
+    /// character) mixed at random: tokenized a run at a time, the tokens are those of a character
+    /// at a time, each one.
+    #[test]
+    fn tokens_taken_a_run_at_a_time_are_a_character_s_at_a_time() {
+        let ascii = ["GET", "/api/v1/", "runs", "?id=", "42", " ", "-", "Service", "UNAVAILABLE", "\t", "\n", "_", "x1Y2", "."];
+        let beyond = ["Straße", "İstanbul", "ΣΊΣΥΦΟΣ", "Ünïcode", "e\u{301}", "東京", "٣٤٥", "😀", "\u{fffd}", "ǅ", "ﬃ", "日本語テキスト"];
+        let parts: Vec<&str> = ascii.iter().chain(&beyond).copied().collect();
+        let mut rng = crate::testkit::Rng::new(7);
+        let mut buf = String::new();
+        for _ in 0..20_000 {
+            let n = 1 + rng.below(12) as usize;
+            let text: String = (0..n).map(|_| parts[rng.below(parts.len() as u64) as usize]).collect();
+            let mut got = Vec::new();
+            tokens(&text, &mut buf, |t| got.push(t.to_owned()));
+            assert_eq!(got, tokens_by_char(&text), "{text:?}");
+        }
+    }
 
     #[test]
     fn tokens_split_on_anything_not_alphanumeric_and_lowercase() {
