@@ -8,7 +8,7 @@
 //! It starts real processes, so it is not run by default:
 //! `cargo test -p kiln --test observe_live -- --ignored --nocapture`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::Command;
@@ -179,13 +179,21 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A CI run, by hand, of a job that passes and one after it that fails: each job's end a point of
+/// each metric and an event; the run a trace (Datadog's CI visibility's model: the run its root,
+/// each job a span under it, each step under its job, failures marked) found by its spans and read
+/// as a waterfall draws it; a trace analytics monitor of failed CI spans by resource alerting on
+/// those alone.
 #[test]
 #[ignore = "starts a kiln server and a runner as processes, and runs a CI job"]
-fn a_ci_job_that_runs_is_in_the_metrics_and_the_events() -> anyhow::Result<()> {
-    // A repository on disk, with a pipeline of one job, run by hand.
+fn a_ci_run_is_in_the_metrics_the_events_and_a_trace_a_span_monitor_watches() -> anyhow::Result<()> {
+    // A repository on disk, with a pipeline of two jobs, the second failing, run by hand.
     let repo_dir = tempfile::tempdir()?;
     std::fs::create_dir_all(repo_dir.path().join(".kiln"))?;
-    std::fs::write(repo_dir.path().join(".kiln/ci.yaml"), "name: ci\non:\n  manual: true\njobs:\n  hello:\n    runs-on: [baremetal]\n    steps:\n      - name: say\n        run: echo hello from e2e\n")?;
+    std::fs::write(
+        repo_dir.path().join(".kiln/ci.yaml"),
+        "name: ci\non:\n  manual: true\njobs:\n  hello:\n    runs-on: [baremetal]\n    steps:\n      - name: say\n        run: echo hello from e2e\n  broken:\n    needs: [hello]\n    runs-on: [baremetal]\n    steps:\n      - name: fail\n        run: exit 3\n",
+    )?;
     git(repo_dir.path(), &["init", "-q", "-b", "main"])?;
     git(repo_dir.path(), &["add", "."])?;
     git(repo_dir.path(), &["commit", "-q", "-m", "a pipeline"])?;
@@ -194,6 +202,13 @@ fn a_ci_job_that_runs_is_in_the_metrics_and_the_events() -> anyhow::Result<()> {
     f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
     f.start_runner("r1")?;
     f.until(Duration::from_secs(60), "r1 caught up", |s| caught_up(s, &["r1"]))?;
+    // CI's failures by resource, watched as Datadog's trace analytics monitors watch spans.
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({ "name": "e2e ci failures", "type": "trace-analytics alert", "query": "trace-analytics(\"service:kiln.ci status:error\").by(\"resource_name\").last(\"15m\") > 0", "message": "{{resource_name.name}} failed", "options": { "every": 10, "thresholds": { "critical": 0 } } })),
+    )?;
+    let monitor = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
     let start = Instant::now();
     let id = loop {
         let repos = f.call("GET", "/api/repos", None)?;
@@ -217,7 +232,11 @@ fn a_ci_job_that_runs_is_in_the_metrics_and_the_events() -> anyhow::Result<()> {
     loop {
         let now = crate_now();
         let jobs = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:kiln.ci.jobs.finished{repo:e2e} by {job,status,runner}.as_count()", "from": now - 600_000, "to": now + 60_000, "step": 60_000 })))?;
-        let events = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "source:kiln.event @event.type:ci.job.finished @repo:e2e", "from": now - 600_000, "to": now + 60_000, "limit": 5 })))?;
+        let events = f.call(
+            "POST",
+            "/api/observe/v1/logs/search",
+            Some(&json!({ "query": "source:kiln.event @event.type:ci.job.finished @repo:e2e @job:hello", "from": now - 600_000, "to": now + 60_000, "limit": 5 })),
+        )?;
         let series = at(&jobs, &["series"]).as_array().cloned().unwrap_or_default();
         let one = series.iter().any(|s| at(s, &["tags", "job"]) == "hello" && at(s, &["tags", "runner"]) == "r1" && at(s, &["tags", "status"]) == "succeeded" && at(s, &["values"]).as_array().is_some_and(|v| v.iter().filter_map(Value::as_f64).sum::<f64>() == 1.0));
         let event = at(&events, &["records"]).as_array().and_then(|a| a.first()).cloned();
@@ -230,6 +249,69 @@ fn a_ci_job_that_runs_is_in_the_metrics_and_the_events() -> anyhow::Result<()> {
     }
     let d = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "max:kiln.ci.job.duration{repo:e2e,job:hello}", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "step": 60_000 })))?;
     anyhow::ensure!(at(&d, &["series"]).as_array().is_some_and(|s| !s.is_empty()), "the job's duration: {d}");
+
+    // The run, a trace: its root found among CI's spans (the run's, as it ended), then read whole.
+    let start = Instant::now();
+    let trace = loop {
+        let now = crate_now();
+        let roots = f.call(
+            "POST",
+            "/api/observe/v1/spans/search",
+            Some(&json!({ "query": "service:kiln.ci @ci.provider.name:kiln @git.repository:e2e", "from": now - 600_000, "to": now + 60_000, "limit": 5 })),
+        )?;
+        if let Some(t) = at(&roots, &["spans"]).as_array().and_then(|r| r.first()).and_then(|r| at(r, &["trace_id"]).as_str().map(str::to_owned)) {
+            break t;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(120), "the run's span never came: {roots}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let t = f.call("GET", &format!("/api/observe/v1/traces/{trace}"), None)?;
+    let placed = at(&t, &["spans"]).as_array().cloned().unwrap_or_default();
+    let attr = |s: &Value, k: &str| at(s, &["attributes", k]).as_str().unwrap_or("").to_owned();
+    let names: Vec<(String, u64, String)> =
+        placed.iter().map(|s| (at(s, &["resource_name"]).as_str().unwrap_or("").to_owned(), at(s, &["depth"]).as_u64().unwrap_or(99), at(s, &["status"]).as_str().unwrap_or("").to_owned())).collect();
+    let want: Vec<(String, u64, String)> =
+        [("ci", 0, "error"), ("hello", 1, "info"), ("say", 2, "info"), ("broken", 1, "error"), ("fail", 2, "error")].iter().map(|(n, d, s)| ((*n).to_owned(), *d, (*s).to_owned())).collect();
+    let (mut sorted_got, mut sorted_want) = (names.clone(), want.clone());
+    sorted_got.sort();
+    sorted_want.sort();
+    anyhow::ensure!(sorted_got == sorted_want, "the run's spans: {names:?}\n{t}");
+    anyhow::ensure!(at(&t, &["roots"]) == 1 && at(&t, &["errors"]) == 3 && at(&t, &["root", "service"]) == "kiln.ci" && at(&t, &["root", "resource_name"]) == "ci", "the trace: {t}");
+    // Each step under its job, each job under the run; the run's and the failing job's say why.
+    let index = |n: &str| names.iter().position(|(x, _, _)| x == n);
+    let parent_of = |n: &str| index(n).and_then(|i| placed.get(i)).and_then(|s| at(s, &["parent"]).as_u64()).and_then(|p| usize::try_from(p).ok());
+    anyhow::ensure!(
+        parent_of("say") == index("hello") && parent_of("fail") == index("broken") && parent_of("hello") == index("ci") && parent_of("broken") == index("ci") && parent_of("ci").is_none(),
+        "each span its parent's child: {names:?}"
+    );
+    let span = |n: &str| index(n).and_then(|i| placed.get(i)).cloned().unwrap_or(Value::Null);
+    anyhow::ensure!(
+        attr(&span("broken"), "ci.status") == "failed" && attr(&span("broken"), "error.message").contains("step 1") && attr(&span("fail"), "exit_code") == "3" && attr(&span("fail"), "ci.status") == "failed",
+        "the failing job and step: {} {}",
+        span("broken"),
+        span("fail")
+    );
+    anyhow::ensure!(attr(&span("ci"), "ci.status") == "failed" && attr(&span("ci"), "git.branch") == "main" && attr(&span("hello"), "runner") == "r1", "the run: {}", span("ci"));
+    let offsets: Vec<i64> = placed.iter().filter_map(|s| at(s, &["offset_ns"]).as_i64()).collect();
+    anyhow::ensure!(offsets.len() == 5 && offsets.iter().all(|o| *o >= 0) && at(&span("ci"), &["offset_ns"]) == 0, "the waterfall's offsets: {offsets:?}");
+    // The monitor: an alert for each failed span's resource, and none for what passed.
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{monitor}"), None)?;
+        let alerting: BTreeSet<String> = at(&m, &["groups"])
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|g| at(g, &["state"]) == "ALERT")
+            .filter_map(|g| at(g, &["group"]).as_array().and_then(|kv| kv.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        if alerting == BTreeSet::from(["ci".to_owned(), "broken".to_owned(), "fail".to_owned()]) {
+            anyhow::ensure!(at(&m, &["state"]) == "ALERT", "the monitor: {m}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the monitor's alerts: {alerting:?} {m}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
     // kiln's registry, as Prometheus scraped it (once, as the server started: the families it had
     // then), with the families observe reports itself left out.
     let names = f.call("GET", "/api/observe/v1/metrics?match=kiln_*", None)?;
