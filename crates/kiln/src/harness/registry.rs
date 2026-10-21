@@ -14,7 +14,7 @@ use super::kept::{Job, Keeper, Kept};
 use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
-use super::session::{Info, MAX_NAME, Spec};
+use super::session::{Info, MAX_NAME, Spec, SubagentBrief};
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
 use crate::rt::Broadcast;
@@ -587,9 +587,15 @@ impl Registry {
                     continue;
                 }
                 info.status = Status::Disconnected;
+                let state: Value = u.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
+                // Old stored list entries predate native subagent briefs. Their last task
+                // snapshot still supplies those read-only children while the machine is away.
+                if let Some(tasks) = state.get("tasks").and_then(|v| serde_json::from_value::<Vec<super::model::Task>>(v.clone()).ok()) {
+                    info.subagents = SubagentBrief::of(&tasks);
+                }
                 let mut m = Mirror::new(info.clone(), Location::Machine(machine));
                 m.meta = u.meta.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
-                m.state = u.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
+                m.state = state;
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
@@ -1153,6 +1159,7 @@ impl Registry {
                         approvals: Vec::new(),
                         queued: 0,
                         tasks_running: 0,
+                        subagents: Vec::new(),
                         cost_usd: 0.0,
                         activity: None,
                         last_activity: now,
@@ -1207,6 +1214,30 @@ impl Registry {
         let id = crate::util::new_id();
         g.insert(id.clone(), Upload { name, mime, data, at: std::time::Instant::now() });
         Ok(id)
+    }
+
+    /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
+    /// message to many agents carries to each (an upload is taken by the first message that sends
+    /// it). One whose upload is gone (or expired) is left out.
+    pub fn inline_uploads(&self, attachments: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        attachments
+            .into_iter()
+            .filter_map(|mut a| {
+                a.path = None;
+                let Some(fid) = a.file_id.take() else { return (!a.data_base64.is_empty()).then_some(a) };
+                let u = self.uploads.lock().remove(&fid)?;
+                if a.name.is_empty() {
+                    a.name = u.name;
+                }
+                if a.mime.is_empty() {
+                    a.mime = u.mime;
+                }
+                a.data_base64 = b64.encode(&u.data);
+                Some(a)
+            })
+            .collect()
     }
 
     /// A message's attachments, made ready for where the session runs: uploads resolved, and

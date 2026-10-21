@@ -1,0 +1,108 @@
+/* What waits on you, wherever you are (approval-toasts.tsx): cards at the top right, under the
+   header (on a phone, across the top), so they never cover a composer or kiln's passing words. */
+.rq-viewport {
+  position: fixed;
+  z-index: 121;
+  top: 76px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(400px, calc(100vw - 32px));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@media (max-width: 640px) {
+  .rq-viewport {
+    top: calc(env(safe-area-inset-top, 0px) + 8px);
+    right: 8px;
+    left: 8px;
+    width: auto;
+  }
+}
+.toast.rq {
+  padding: 12px 8px 12px 14px;
+  touch-action: pan-y;
+}
+.toast.rq::before {
+  background: #c6b08e;
+}
+.rq-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: #d8bb95;
+}
+.rq-body {
+  flex: 1;
+  min-width: 0;
+}
+.rq-head {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #eceef2;
+}
+.rq-name {
+  font-weight: 450;
+  color: inherit;
+}
+.rq-name:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.rq-lead {
+  color: #b9bcc4;
+}
+.rq-where {
+  margin-left: auto;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: #7d808a;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rq-line {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 4px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #ece0ca;
+  word-break: break-word;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.rq-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+}
+.rq-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 4px;
+  font-size: 12.5px;
+  color: #b9bcc4;
+}
+.rq-open:hover {
+  color: #eceef2;
+}
+.rq-close {
+  margin: -6px 0 0;
+}
+.toast.rq-rest {
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #b9bcc4;
+}

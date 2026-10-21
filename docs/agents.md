@@ -59,6 +59,30 @@ Ending the agent stops what it left running, then ends whatever else is still in
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
 
+## Mission control
+
+- **Order.** By default (Needs you first) the agents that wait on you come first, longest waiting
+  first, then those stopped, paused, finished since you last looked, working, ready, offline and
+  ended. The list follows the agents as they change: one that comes to need you rises at once.
+  While you use the list (a finger or button pressed on it, focus on one of its controls, a menu
+  or dialog open, agents selected, or a moment after the pointer last moved over it), its rows
+  hold still, then glide to their places. A sort chosen on purpose (by name, age, activity,
+  runner, harness or cost) is followed as it is.
+- **Requests anywhere.** On any other page (and an agent's page, for the other agents), each
+  agent's oldest request shows as a card at the top: a tool call is allowed or denied there, a
+  question or plan opens the agent. Two at once (one on a phone), then a line for the rest. ×, or
+  a swipe, puts one away until that agent asks for something else.
+- **Answers at once.** An answer shows as given wherever its request showed (its row, its card, the
+  agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
+- **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
+  it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
+  many, with Select all and Done. With a mouse, rows keep their checkboxes.
+- **The message box.** It writes to the agents selected (each named in its To line, put back with
+  its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
+  harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say
+  into the mic, queued, steered or sent now as an agent's own box sends it; or a command from its
+  list. It empties as it sends, and says how it went.
+
 ## API
 
 | Method | Path | |
@@ -71,7 +95,7 @@ counted.
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
 | POST | `/api/harness/command` | `{ids, command}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`) |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
-| GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
+| GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
@@ -174,7 +198,9 @@ that continues a copy of the conversation (Claude Code's `--fork-session`, Codex
     prompt route sends its words, a control sends its command, a panel (`/model`) or a command the
     harness can't run from kiln is skipped, saying why; a name not in its catalog goes as typed
     (its harness may know it, as a skill). `mode` for a prompt: `queue` (after the current turn,
-    the default), `steer` (into it) or `now` (stopping it).
+    the default), `steer` (into it) or `now` (stopping it). `attachments`: files with the prompt
+    (or alone, without `text`), as an agent's own message takes them (each uploaded first with
+    `POST /api/harness/files`, then named by `file_id`): each agent gets its own copy.
   - `command`: a command as the console sends one (`{"type": "interrupt"}`,
     `{"type": "set_mode", "mode": "plan"}`, `{"type": "restart"}`, ...). A `send` gets its own
     message id per agent.
@@ -242,6 +268,14 @@ is the agent that asked, which kiln knows from how it asked (its MCP token, its 
 for it, or the machine seeing its process), never from what it asked. A child gets no more than
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
+
+Mission Control shows only standalone kiln sessions, in a flat list. Managed children and native
+subagents are excluded from its rows, counts, filters, conversation search and bulk actions.
+Subagent status and output remain available inside the agent chats, including after they finish.
+The session list carries small
+`subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
+Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
+do not create kiln sessions or change the harness's isolation, permissions or execution.
 
 ### Told, not made to wait
 
@@ -355,11 +389,24 @@ child starts: a person may change its mode later, as for any agent.
 Codex applies approval and sandbox settings per turn. Changing them during a turn interrupts
 that turn and continues its work with the new settings before queued messages. A stop or a new
 "Send now" message takes precedence over that continuation. Pending requests from the interrupted
-turn are cancelled, never approved automatically; existing native subagents keep their own
-permissions. Choosing approval and sandbox settings separately shows `Custom` unless they match
-a preset. An explicit Full access choice is retained across restarts.
+turn are cancelled, never approved automatically. Choosing approval and sandbox settings
+separately shows `Custom` unless they match a preset. An explicit Full access choice is retained
+across restarts.
 Runners advertise this behavior as `permissions_live`; the picker can also reapply the current
 preset to a turn inherited from an older runner. Older runners still show "From the next turn."
+
+A native Codex subagent keeps the settings it started with (its spawner's) for its whole life:
+Codex has no way to change them, and refuses kiln's input to a subagent. kiln notes them when it
+sees the spawn. A change stops (interrupts) subagents still working with more than the new
+settings allow. Under an approval policy of `never` (Full access), nothing started with the
+session's settings asks, so a request for approval comes from work started with earlier ones: the
+session's own turn (one inherited from an older runner) is interrupted and continued with the
+current settings, and a subagent is stopped. Such a request is held back from the person while
+that work stops, which withdraws it; it's never answered for them. Should Codex refuse to stop it
+(or it's still waiting after 30 s), it's shown after all. The parent hears which subagents kiln
+stopped and is told to start new ones for their unfinished work, since new ones take the current
+settings: in its turn, or in the turn continuing after the change (a change between turns that
+stopped some starts one), else with the next message it's sent.
 
 ### Waiting
 
@@ -522,8 +569,8 @@ resolved; dismissing is a person's). A failure that keeps coming back from rerun
 tells the agent to stop rerunning. An incident waits for a person instead (`waiting`, saying why)
 while its attachment is paused, past its limit for the day, or when its agent couldn't start.
 **Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
-its workflows' and environments' too. Mission Control puts the agents an attachment woke under it,
-and their questions come to Needs you and to notifications as any agent's do. A runner doctor's
+its workflows' and environments' too. Mission Control lists the agents an attachment woke with
+the other agents; their questions come to Needs you and to notifications as any agent's do. A runner doctor's
 open incident shows in the runner's row in Settings → Updates.
 
 | Operation | Route | |
@@ -852,10 +899,17 @@ Codex's native subagents keep their own threads and execution settings. kiln tra
 its native thread ID and keeps its work under the original spawning call, including later
 messages and follow-up work. Read-only `thread/read` and `thread/turns/list` requests fill in its
 status, latest 100 turns, elapsed time and result; live child notifications update that same
-view. Tracking never starts, resumes or attaches another executor to the child. Its messages,
+view. Tracking never starts, resumes or attaches another executor to the child (it may interrupt
+one working with other permissions than the session's: see permission modes above). Its messages,
 commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
 finishing does not mean the child has finished, and unavailable child history does not end the
 parent.
+
+The task output endpoint projects a native Codex child's assistant messages and tool results,
+scoped to that child and its original spawning call. Its stored final result remains readable
+after timeline eviction. Each read replaces the previous snapshot, so history imports and
+streaming replacements do not duplicate output. An unavailable completed result returns an
+error rather than a successful empty read.
 
 `state.left_behind` counts the tasks left running while no turn is under way (the agent idle or
 exited): shells, monitors, workflows, background calls and subagents sent to the background.

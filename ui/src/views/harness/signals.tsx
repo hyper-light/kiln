@@ -3,6 +3,8 @@ import * as React from "react";
 import "./signals.css";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useNow } from "@/lib/hooks";
+import { thinkingWords } from "./thinking";
 
 export type OpticState = "idle" | "thinking" | "tool" | "waiting" | "done" | "ended";
 
@@ -46,17 +48,13 @@ export function formatThought(seconds: number) {
   return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
 }
 
-/** Use the reported effort, never elapsed time or a typography change, to describe a think. */
-export function thinkingWords(effort?: string): string {
-  switch (effort?.toLowerCase()) {
-    case "minimal":
-    case "low": return "Thinking briefly";
-    case "high": return "Thinking deeply";
-    case "xhigh":
-    case "max":
-    case "ultra": return "Thinking very deeply";
-    default: return "Thinking";
-  }
+/** A live phase's words and clock share the same start, in a thought block or between steps. */
+export function ThinkingLabel({ since, doing }: { since?: number; doing?: string }) {
+  const now = useNow();
+  const [observed] = React.useState(Date.now);
+  const seconds = Math.max(0, (now - (since ?? observed)) / 1000);
+  const what = doing && /^(compact|retr|wait|summar)/i.test(doing) ? doing : thinkingWords(seconds);
+  return <><PrismLabel live>{what}</PrismLabel><span className="sg-num">{formatThought(seconds)}</span></>;
 }
 
 /** The toggle above a thinking block: live it breathes ("Thinking"); settled it reads "Thought · 12s" with a chevron. */
@@ -66,14 +64,14 @@ export function ThinkingHead({
   open,
   onToggle,
   className,
-  effort,
+  since,
 }: {
   live: boolean;
   seconds?: number;
   open: boolean;
   onToggle: () => void;
   className?: string;
-  effort?: string;
+  since?: number;
 }) {
   return (
     <button type="button" className={cn("sg-think-head", "sg-thinking-line", className)} data-live={live ? "true" : "false"} aria-expanded={open} onClick={onToggle}>
@@ -82,7 +80,7 @@ export function ThinkingHead({
         <Optic state={live ? "thinking" : "done"} />
       </span>
       {live ? (
-        <PrismLabel live>{thinkingWords(effort)}</PrismLabel>
+        <ThinkingLabel since={since} />
       ) : (
         <>
           <PrismLabel>
@@ -111,33 +109,30 @@ const BEAM_LABELS: Record<BeamStatus, string> = {
   cancelled: "Cancelled",
 };
 
-/** A tool call's 30px signal: a prism rule with a travelling bead while running, collapsing into an outcome chip. */
-// hyperlight's mark (hyperlight-site lib/brand.ts): the open loop of light, and the refraction where it leaves.
+// hyperlight's mark (hyperlight-site lib/brand.ts): the open loop of light, and the refraction where
+// it leaves. (signals.css draws the same two paths as the running light's mask.)
 const LOOP = "M6.4 22.5C2.4 17.1 7.1 6.2 14 4.5C21.4 2.7 27.4 10.1 25.1 16.5C22.8 22.9 13.1 28.8 8.8 26.6";
 const TAIL = "M8.8 26.6C6.9 25.6 5.6 23.6 5.2 21.3";
-const PRISM = ["#b8d9d2", "#a6c4ed", "#b8a6d5", "#d6a2aa", "#d8cbb0"];
 
 /**
- * A tool call's state, drawn as hyperlight's mark. While it runs, a short spectral segment travels
- * the loop, changing hue as it goes, and leaves through the refraction. Once settled, the loop is
- * drawn whole in the outcome's tone: broken for an error, dashed when denied, faint while pending.
+ * A tool call's state, drawn as hyperlight's mark. While it runs, a spectral light sweeps the loop
+ * and out through the refraction: a gradient turning behind the mark's shape, which the GPU turns
+ * (nothing on the page is painted again for it). Once settled, the loop is drawn whole in the
+ * outcome's tone: broken for an error, dashed when denied, faint and breathing while pending.
  */
 export function Beam({ status, className }: { status: BeamStatus; className?: string }) {
-  // One gradient per glyph; useId's punctuation isn't safe inside url(#…).
-  const gradient = `sg-trace-${React.useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   return (
-    <svg className={cn("sg-trace", className)} data-status={status} viewBox="0 0 32 32" role="img" aria-label={BEAM_LABELS[status]}>
-      <defs>
-        <linearGradient id={gradient} x1="5" y1="27" x2="27" y2="5" gradientUnits="userSpaceOnUse">
-          {PRISM.map((c, i) => (
-            <stop key={c} offset={i / (PRISM.length - 1)} stopColor={c} />
-          ))}
-        </linearGradient>
-      </defs>
-      <path className="sg-trace-loop" d={LOOP} pathLength={100} />
-      <path className="sg-trace-light" d={LOOP} pathLength={100} stroke={`url(#${gradient})`} />
-      <path className="sg-trace-tail" d={TAIL} />
-    </svg>
+    <span className={cn("sg-beam", className)} data-status={status} role="img" aria-label={BEAM_LABELS[status]}>
+      <svg className="sg-trace" data-status={status} viewBox="0 0 32 32" aria-hidden="true">
+        <path className="sg-trace-loop" d={LOOP} pathLength={100} />
+        <path className="sg-trace-tail" d={TAIL} />
+      </svg>
+      {status === "running" && (
+        <span className="sg-trace-glow" aria-hidden="true">
+          <span />
+        </span>
+      )}
+    </span>
   );
 }
 

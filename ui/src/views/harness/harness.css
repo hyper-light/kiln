@@ -286,8 +286,7 @@ textarea.hx-input {
   height: 2px;
   border-radius: 16px 16px 0 0;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
+  animation: prism-breathe 2.4s ease-in-out infinite alternate;
 }
 .hx-card[data-status="waiting"]::before {
   background: linear-gradient(90deg, transparent, var(--color-warn), transparent);
@@ -522,6 +521,62 @@ textarea.hx-input {
   grid-template-columns: minmax(0, 1fr) minmax(380px, 34%);
   flex: 1;
   min-height: 0;
+}
+.hx-desktop {
+  position: relative;
+  min-width: 0;
+}
+.hx-desktop-tray {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.hx-desktop-tray[hidden] {
+  display: none;
+}
+.hx-desktop-tray > .hx-side {
+  flex: 1;
+  min-width: 0;
+}
+.hx-tray-rail {
+  border-left: 1px solid #1d1f23;
+  background: #0a0b0d;
+}
+.hx-tray-toggle {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  color: var(--color-subtle);
+}
+.hx-tray-toggle:hover {
+  background: rgb(255 255 255 / 5%);
+  color: var(--color-bright);
+}
+.hx-tray-resize {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  bottom: 0;
+  width: 10px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.hx-tray-resize::after {
+  content: "";
+  position: absolute;
+  inset: 0 4px;
+}
+.hx-tray-resize:hover::after,
+.hx-tray-resize:focus-visible::after,
+.hx-desktop[data-resizing] .hx-tray-resize::after {
+  background: var(--color-secondary);
+}
+.hx-desktop[data-resizing] {
+  cursor: col-resize;
+  user-select: none;
 }
 .hx-agent-phone {
   display: flex;
@@ -1405,6 +1460,10 @@ textarea.hx-input {
   flex-direction: column;
   gap: 8px;
 }
+/* While you type, the box is a layer of its own: a keystroke repaints it, not the page around it. */
+.hx-compose-box:focus-within {
+  will-change: transform;
+}
 .hx-compose-box {
   border: 1px solid #272930;
   border-radius: 16px;
@@ -1567,6 +1626,20 @@ textarea.hx-input {
 
 .hx-inspector {
   min-height: 0;
+}
+.hx-inspector-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  border-bottom: 1px solid #1d1f23;
+}
+.hx-inspector-head[hidden] {
+  display: none;
+}
+.hx-inspector-head > .hx-tabs {
+  flex: 1;
+  min-width: 0;
+  border-bottom: 0;
 }
 .hx-tabs {
   display: flex;
@@ -3133,7 +3206,8 @@ textarea.hx-input {
   color: #8a8e98;
 }
 .hx-step-body {
-  padding: 2px 2px 14px 26px;
+  /* Expanded content shares the header's outer inset; nested cards pad their own contents. */
+  padding: 2px 2px 14px;
 }
 .hx-note {
   padding: 12px 0;
@@ -3156,8 +3230,6 @@ textarea.hx-input {
   height: 2px;
   margin-bottom: 12px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
 }
 .hx-outcome-foot {
   border-top-color: #1d1f24;

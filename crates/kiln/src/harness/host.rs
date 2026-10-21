@@ -828,6 +828,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         approvals: Vec::new(),
         queued: 0,
         tasks_running: 0,
+        subagents: Vec::new(),
         cost_usd: 0.0,
         activity: None,
         last_activity: now,
