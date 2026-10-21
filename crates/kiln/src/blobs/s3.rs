@@ -176,6 +176,20 @@ impl Answer {
     }
 }
 
+/// What a request sends (its bytes and their SHA-256, hex), and the most of its answer read.
+struct Payload<'a> {
+    bytes: Bytes,
+    sha: &'a str,
+    limit: u64,
+}
+
+impl Payload<'static> {
+    /// Nothing sent; at most `limit` of the answer read.
+    fn none(limit: u64) -> Self {
+        Self { bytes: Bytes::new(), sha: EMPTY_SHA, limit }
+    }
+}
+
 /// What head says of an object, S3's own ETag beside kiln's SHA-256 (none: not written through
 /// kiln yet).
 #[derive(Debug, Clone)]
@@ -358,10 +372,10 @@ impl S3Blobs {
         if self.https { "https" } else { "http" }
     }
 
-    /// Signs and sends one request, its body's SHA-256 (hex) given, reading at most `limit` of its
-    /// answer, as a task of its own; once again a backoff apart while S3 answers `503 SlowDown`, or
-    /// `409` to a conditional write.
-    async fn send(&self, method: Http, s3key: Option<&str>, query: &[(&str, String)], headers: &[(String, String)], body: Bytes, body_sha: &str, limit: u64) -> Result<Answer, Refusal> {
+    /// Signs and sends one request, as a task of its own; once again a backoff apart while S3
+    /// answers `503 SlowDown`, or `409` to a conditional write.
+    async fn send(&self, method: Http, s3key: Option<&str>, query: &[(&str, String)], headers: &[(String, String)], payload: Payload<'_>) -> Result<Answer, Refusal> {
+        let Payload { bytes: body, sha: body_sha, limit } = payload;
         let path = self.path(s3key);
         let query: Vec<(String, String)> = query.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect();
         let qs = query_string(&query);
@@ -418,7 +432,7 @@ impl S3Blobs {
 
     /// A request with no body, its answer's body read up to [`DOCUMENT_MAX`].
     async fn ask(&self, method: Http, s3key: Option<&str>, query: &[(&str, String)], headers: &[(String, String)]) -> Result<Answer, Refusal> {
-        self.send(method, s3key, query, headers, Bytes::new(), EMPTY_SHA, DOCUMENT_MAX).await
+        self.send(method, s3key, query, headers, Payload::none(DOCUMENT_MAX)).await
     }
 
     /// Makes the bucket, when it isn't there.
@@ -436,7 +450,7 @@ impl S3Blobs {
             format!("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>", self.region).into_bytes()
         };
         let sha = crate::util::sha256_hex(&body);
-        let a = self.send(Http::Put, None, &[], &[], Bytes::from(body), &sha, DOCUMENT_MAX).await?;
+        let a = self.send(Http::Put, None, &[], &[], Payload { bytes: Bytes::from(body), sha: &sha, limit: DOCUMENT_MAX }).await?;
         if a.ok() || a.error().code == "BucketAlreadyOwnedByYou" { Ok(()) } else { Err(unavailable(a.error())) }
     }
 
@@ -476,7 +490,7 @@ impl S3Blobs {
             if f.size > self.limits.object {
                 return Err(Refusal::TooLarge { what: "an object to take in", size: f.size, limit: self.limits.object });
             }
-            let a = self.send(Http::Get, Some(s3key), &[], &[("if-match".to_owned(), format!("\"{}\"", f.etag))], Bytes::new(), EMPTY_SHA, self.limits.object).await?;
+            let a = self.send(Http::Get, Some(s3key), &[], &[("if-match".to_owned(), format!("\"{}\"", f.etag))], Payload::none(self.limits.object)).await?;
             match a.status {
                 404 => return Err(Refusal::NotFound(key.to_owned())),
                 412 => continue,
@@ -516,7 +530,7 @@ impl S3Blobs {
         let mut at = 0u64;
         while at < size {
             let end = at.saturating_add(READ_PIECE.saturating_sub(1)).min(size.saturating_sub(1));
-            let a = self.send(Http::Get, Some(s3key), &[], &[("range".into(), format!("bytes={at}-{end}"))], Bytes::new(), EMPTY_SHA, READ_PIECE).await?;
+            let a = self.send(Http::Get, Some(s3key), &[], &[("range".into(), format!("bytes={at}-{end}"))], Payload::none(READ_PIECE)).await?;
             if !a.ok() {
                 return Err(unavailable(a.error()));
             }
@@ -572,7 +586,7 @@ impl S3Blobs {
         }
         let xml = complete_xml(&parts);
         let sha_xml = crate::util::sha256_hex(xml.as_bytes());
-        let a = self.send(Http::Post, Some(to), &[("uploadId", id.clone())], &[], Bytes::from(xml), &sha_xml, DOCUMENT_MAX).await?;
+        let a = self.send(Http::Post, Some(to), &[("uploadId", id.clone())], &[], Payload { bytes: Bytes::from(xml), sha: &sha_xml, limit: DOCUMENT_MAX }).await?;
         if a.failed() {
             let _ = self.ask(Http::Delete, Some(to), &[("uploadId", id)], &[]).await;
             return Err(unavailable(format!("S3 didn't join the copy: {}", a.error())));
@@ -717,7 +731,7 @@ impl Blobs for S3Blobs {
                         headers.push(("if-match".to_owned(), format!("\"{etag}\"")));
                     }
                 }
-                let a = self.send(Http::Put, Some(&s3key), &[], &headers, bytes.clone(), &sha, DOCUMENT_MAX).await?;
+                let a = self.send(Http::Put, Some(&s3key), &[], &headers, Payload { bytes: bytes.clone(), sha: &sha, limit: DOCUMENT_MAX }).await?;
                 if a.ok() {
                     let modified = a.header("date").and_then(http_date_ms).unwrap_or_else(|| self.clock.unix_ms().div_euclid(1000).saturating_mul(1000));
                     return Ok(Meta { key: key.to_owned(), size, etag: sha, modified_ms: modified });
@@ -751,7 +765,7 @@ impl Blobs for S3Blobs {
                     Some(Range { start, end: None }) => vec![("range".into(), format!("bytes={start}-"))],
                     None => Vec::new(),
                 };
-                let a = self.send(Http::Get, Some(&s3key), &[], &headers, Bytes::new(), EMPTY_SHA, self.limits.object).await?;
+                let a = self.send(Http::Get, Some(&s3key), &[], &headers, Payload::none(self.limits.object)).await?;
                 match a.status {
                     404 => return Err(Refusal::NotFound(key.to_owned())),
                     416 => {
@@ -873,7 +887,7 @@ impl Blobs for S3Blobs {
             let b = Arc::clone(&bytes);
             let sha = crate::rt::blocking(move || hex::encode(Sha256::digest(b.as_slice()))).await.map_err(|e| unavailable(format!("{e:#}")))?;
             let body = Bytes::from(bytes.as_ref().clone());
-            let a = self.send(Http::Put, Some(&self.joined(&place)), &[("partNumber", part.to_string()), ("uploadId", s3id)], &[], body, &sha, DOCUMENT_MAX).await?;
+            let a = self.send(Http::Put, Some(&self.joined(&place)), &[("partNumber", part.to_string()), ("uploadId", s3id)], &[], Payload { bytes: body, sha: &sha, limit: DOCUMENT_MAX }).await?;
             if !a.ok() {
                 let e = a.error();
                 return Err(if e.code == "NoSuchUpload" || e.status == 404 { Refusal::NoSuchUpload(upload.to_owned()) } else { unavailable(e) });
@@ -907,7 +921,7 @@ impl Blobs for S3Blobs {
             let joined = self.joined(&place);
             let xml = complete_xml(&parts);
             let sha_xml = crate::util::sha256_hex(xml.as_bytes());
-            let a = self.send(Http::Post, Some(&joined), &[("uploadId", s3id.clone())], &[], Bytes::from(xml), &sha_xml, DOCUMENT_MAX).await?;
+            let a = self.send(Http::Post, Some(&joined), &[("uploadId", s3id.clone())], &[], Payload { bytes: Bytes::from(xml), sha: &sha_xml, limit: DOCUMENT_MAX }).await?;
             if a.failed() {
                 let e = a.error();
                 return Err(match e.code.as_str() {

@@ -1352,8 +1352,9 @@ clause!(c139, f, b, {
     put(b, "k-one", b"one's").await?;
     put(b, "k-two", b"two's").await?;
     let url = fine("presign", b.presign("k-one", Method::Get, Duration::from_secs(60)).await)?;
-    let other = url.replacen("/k-one?", "/k-two?", 1);
-    ensure(other != url, || format!("the key isn't in the URL {url:?} as /k-one?"))?;
+    // The key as the URL carries it: every store's URL names it once, as it is.
+    let other = url.replacen("k-one", "k-two", 1);
+    ensure(other != url, || format!("the key isn't in the URL {url:?} as k-one"))?;
     let got = f.redeem(&other, Method::Get, None).await;
     ensure(got.is_err(), || format!("a URL changed to name k-two gave {got:?}"))
 });
