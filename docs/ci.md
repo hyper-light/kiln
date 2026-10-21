@@ -4408,10 +4408,18 @@ GraphQL; merging through GraphQL is left.
   - GitHub-shaped run links redirected to kiln's pages.
   - Search (`search.rs`): `GET /search/issues` and GraphQL's `search` over the job's repository's
     pull requests, with issue search's qualifiers (`repo:`, `is:`/`type:` with `pr`, `open`,
-    `closed`, `merged`, `unmerged` and `draft`, `head:`, `base:`, `author:`, `label:`, `-label:`,
-    `no:label`, `sort:`, and words in a title or body); `is:issue` finds none, a native
-    repository having no issues besides its pull requests (`w14_r11_search_qualifiers`, and
-    `w14_r11_graphql` asking both from a job).
+    `closed`, `merged`, `unmerged` and `draft`, `head:`, `base:`, `author:`, `label:` (a list is
+    either), `-label:`, `no:label`, `sort:`, and words in a title or body) in the advanced syntax
+    (`AND`, `OR`, `NOT`, parentheses; `SearchType` says `ISSUE_ADVANCED`). `is:issue` finds
+    none, a native repository having no issues besides its pull requests
+    (`w14_r11_search_qualifiers`, and `w14_r11_graphql` asking both from a job).
+  - `gh` end to end (`w14_r11_gh_against_the_facade`): GitHub's CLI 2.102.0, the release kiln's
+    runner image installs, in a pull request's job over HTTPS, given the job's token as workflows
+    give it (`GH_TOKEN`; the runtime makes it Enterprise Server's). It reads the repository with
+    `gh api`, views and lists the pull request, finds it by search, comments, and adds and
+    removes labels. `/meta` says an Enterprise Server version (3.18.0), which `gh` reads to know
+    what it may ask (as a body field only, so clients that look for the header still take kiln
+    for github.com).
   - Checked end to end:
     - `github-script` (statuses, checks, repository, commit, contents);
     - `docker/metadata-action`;
@@ -4422,7 +4430,7 @@ GraphQL; merging through GraphQL is left.
       (`w14_r11_runs_and_code_scanning`).
 - *Left.* Everything else:
   - GraphQL's merge mutations (`mergePullRequest`, `enablePullRequestAutoMerge`) and the land
-    queue's equivalent for jobs, and `gh` run end to end in kiln's runner image;
+    queue's equivalent for jobs;
   - replies by email or chat (R05, with W11-R06);
   - AC05 as one run of its own (its parts are checked above: `github-script`, the release with
     an asset, `actions/checkout` from the facade; left are a checkout at a diff version with

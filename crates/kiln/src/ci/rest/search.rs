@@ -21,29 +21,51 @@ pub struct Query {
     pub repo: Option<String>,
     /// `is:issue` (and no `is:pr`): issues only.
     pub issues_only: bool,
-    pub state: Option<String>,
-    pub merged: Option<bool>,
-    pub draft: Option<bool>,
-    pub head: Option<String>,
-    pub base: Option<String>,
-    pub author: Option<String>,
-    pub labels: Vec<String>,
-    pub without: Vec<String>,
-    pub unlabelled: bool,
-    pub words: Vec<String>,
     /// `created`, `updated` or `comments`, and whether descending.
     pub sort: Option<(String, bool)>,
+    /// What a match is: the terms, with `AND`, `OR`, `NOT` (or `-`) and parentheses, as
+    /// GitHub's advanced issue search has them.
+    pub filter: Expr,
 }
 
-/// Its words and qualifiers, a double-quoted value kept whole.
+/// A search's condition.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum Expr {
+    #[default]
+    All,
+    Term(Term),
+    Not(Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
+}
+
+/// One condition on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Term {
+    State(String),
+    Merged(bool),
+    Draft(bool),
+    Head(String),
+    Base(String),
+    Author(String),
+    Label(String),
+    Unlabelled,
+    /// A word (or a quoted phrase) a title or a body holds.
+    Word(String),
+}
+
+/// Its words, qualifiers, parentheses and operators, a double-quoted value kept whole.
 fn tokens(q: &str) -> Vec<String> {
     let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
     for c in q.chars() {
         match c {
             '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => {
+            c if (c.is_whitespace() || c == '(' || c == ')') && !quoted => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
+                }
+                if c == '(' || c == ')' {
+                    out.push(c.to_string());
                 }
             }
             c => cur.push(c),
@@ -59,64 +81,132 @@ fn tokens(q: &str) -> Vec<String> {
 pub fn parse(q: &str) -> Query {
     let mut out = Query::default();
     let (mut prs, mut issues) = (false, false);
+    // What isn't a condition (the repository, the kind, the order) comes out first.
+    let mut rest = Vec::new();
     for t in tokens(q) {
-        let Some((key, value)) = t.split_once(':') else {
-            out.words.push(t.to_lowercase());
-            continue;
-        };
-        let value = value.to_owned();
-        match (key.to_ascii_lowercase().as_str(), value.to_ascii_lowercase().as_str()) {
-            ("repo", _) => out.repo = Some(value),
-            ("is" | "type", "pr" | "pull-request") => prs = true,
-            ("is" | "type", "issue") => issues = true,
-            ("is" | "state", s @ ("open" | "closed")) => out.state = Some(s.to_owned()),
-            ("is", "merged") => out.merged = Some(true),
-            ("is", "unmerged") => out.merged = Some(false),
-            ("is", "draft") => out.draft = Some(true),
-            ("draft", d) => out.draft = Some(d == "true"),
-            ("head", _) => out.head = Some(value),
-            ("base", _) => out.base = Some(value),
-            ("author", _) => out.author = Some(value),
-            ("label", _) => out.labels.extend(value.split(',').map(str::to_owned)),
-            ("-label", _) => out.without.extend(value.split(',').map(str::to_owned)),
-            ("no", "label") => out.unlabelled = true,
-            ("sort", s) => {
+        let lower = t.to_ascii_lowercase();
+        match lower.split_once(':') {
+            Some(("repo", _)) => out.repo = t.split_once(':').map(|(_, v)| v.to_owned()),
+            Some(("is" | "type", "pr" | "pull-request")) => prs = true,
+            Some(("is" | "type", "issue")) => issues = true,
+            Some(("sort", s)) => {
                 let (field, desc) = match s.rsplit_once('-') {
                     Some((f, dir)) => (f.to_owned(), dir != "asc"),
                     None => (s.to_owned(), true),
                 };
                 out.sort = Some((field, desc));
             }
-            _ => {}
+            _ => rest.push(t),
         }
     }
     out.issues_only = issues && !prs;
+    let mut at = 0;
+    out.filter = or(&rest, &mut at);
     out
+}
+
+fn or(t: &[String], at: &mut usize) -> Expr {
+    let mut any = vec![and(t, at)];
+    while t.get(*at).is_some_and(|w| w == "OR") {
+        *at += 1;
+        any.push(and(t, at));
+    }
+    if any.len() == 1 { any.pop().unwrap_or_default() } else { Expr::Or(any) }
+}
+
+fn and(t: &[String], at: &mut usize) -> Expr {
+    let mut all = Vec::new();
+    while let Some(w) = t.get(*at) {
+        match w.as_str() {
+            "OR" | ")" => break,
+            "AND" => *at += 1,
+            _ => all.push(not(t, at)),
+        }
+    }
+    match all.len() {
+        0 => Expr::All,
+        1 => all.pop().unwrap_or_default(),
+        _ => Expr::And(all),
+    }
+}
+
+fn not(t: &[String], at: &mut usize) -> Expr {
+    let Some(w) = t.get(*at).cloned() else { return Expr::All };
+    *at += 1;
+    match w.as_str() {
+        "NOT" => Expr::Not(Box::new(not(t, at))),
+        "(" => {
+            let inner = or(t, at);
+            if t.get(*at).is_some_and(|w| w == ")") {
+                *at += 1;
+            }
+            inner
+        }
+        _ => match w.strip_prefix('-').filter(|q| q.contains(':')) {
+            Some(q) => Expr::Not(Box::new(term(q))),
+            None => term(&w),
+        },
+    }
+}
+
+/// One term: a qualifier kiln has the data for, or a word. A qualifier it hasn't (`org:`,
+/// `archived:`, …) narrows nothing.
+fn term(w: &str) -> Expr {
+    let Some((key, value)) = w.split_once(':') else { return Expr::Term(Term::Word(w.to_lowercase())) };
+    let lower = value.to_ascii_lowercase();
+    let t = match (key.to_ascii_lowercase().as_str(), lower.as_str()) {
+        ("is" | "state", s @ ("open" | "closed")) => Term::State(s.to_owned()),
+        ("is", "merged") => Term::Merged(true),
+        ("is", "unmerged") => Term::Merged(false),
+        ("is", "draft") => Term::Draft(true),
+        ("draft", d) => Term::Draft(d == "true"),
+        ("head", _) => Term::Head(value.to_owned()),
+        ("base", _) => Term::Base(value.to_owned()),
+        ("author", _) => Term::Author(value.to_owned()),
+        ("label", _) => {
+            // `label:a,b` is either of them.
+            let any: Vec<Expr> = value.split(',').map(|l| Expr::Term(Term::Label(l.to_lowercase()))).collect();
+            return if any.len() == 1 { any.into_iter().next().unwrap_or_default() } else { Expr::Or(any) };
+        }
+        ("no", "label") => Term::Unlabelled,
+        _ => return Expr::All,
+    };
+    Expr::Term(t)
 }
 
 fn text<'a>(v: &'a Value, at: &str) -> &'a str {
     v.pointer(at).and_then(Value::as_str).unwrap_or_default()
 }
 
+impl Expr {
+    fn holds(&self, pr: &Value) -> bool {
+        match self {
+            Expr::All => true,
+            Expr::Not(e) => !e.holds(pr),
+            Expr::And(all) => all.iter().all(|e| e.holds(pr)),
+            Expr::Or(any) => any.iter().any(|e| e.holds(pr)),
+            Expr::Term(t) => {
+                let names = || pr.get("labels").and_then(Value::as_array).into_iter().flatten().map(|l| text(l, "/name").to_lowercase()).collect::<Vec<_>>();
+                match t {
+                    Term::State(s) => text(pr, "/state") == s,
+                    Term::Merged(m) => !pr.get("merged_at").is_none_or(Value::is_null) == *m,
+                    Term::Draft(d) => pr.get("draft").and_then(Value::as_bool).unwrap_or(false) == *d,
+                    Term::Head(h) => text(pr, "/head/ref") == h.rsplit(':').next().unwrap_or(h),
+                    Term::Base(b) => text(pr, "/base/ref") == b,
+                    Term::Author(a) => text(pr, "/user/login").eq_ignore_ascii_case(a),
+                    Term::Label(l) => names().contains(l),
+                    Term::Unlabelled => names().is_empty(),
+                    Term::Word(w) => format!("{} {}", text(pr, "/title"), text(pr, "/body")).to_lowercase().contains(w.as_str()),
+                }
+            }
+        }
+    }
+}
+
 impl Query {
     /// Whether pull request `pr` (the facade's JSON of one) is a match.
     pub fn matches(&self, pr: &Value) -> bool {
-        if self.issues_only {
-            return false;
-        }
-        let names: Vec<String> = pr.get("labels").and_then(Value::as_array).into_iter().flatten().map(|l| text(l, "/name").to_lowercase()).collect();
-        let merged = !pr.get("merged_at").is_none_or(Value::is_null);
-        let words = format!("{} {}", text(pr, "/title"), text(pr, "/body")).to_lowercase();
-        self.state.as_deref().is_none_or(|s| text(pr, "/state") == s)
-            && self.merged.is_none_or(|m| merged == m)
-            && self.draft.is_none_or(|d| pr.get("draft").and_then(Value::as_bool).unwrap_or(false) == d)
-            && self.head.as_deref().is_none_or(|h| text(pr, "/head/ref") == h.rsplit(':').next().unwrap_or(h))
-            && self.base.as_deref().is_none_or(|b| text(pr, "/base/ref") == b)
-            && self.author.as_deref().is_none_or(|a| text(pr, "/user/login").eq_ignore_ascii_case(a))
-            && self.labels.iter().all(|l| names.contains(&l.to_lowercase()))
-            && !self.without.iter().any(|l| names.contains(&l.to_lowercase()))
-            && (!self.unlabelled || names.is_empty())
-            && self.words.iter().all(|w| words.contains(w.as_str()))
+        !self.issues_only && self.filter.holds(pr)
     }
 
     /// Whether it asks about the repository named `name` (or none at all).
@@ -211,5 +301,10 @@ mod tests {
         assert_eq!(numbers("is:pr sort:created-asc"), [1, 2, 3]);
         assert_eq!(numbers("is:pr sort:created-desc"), [3, 2, 1]);
         assert!(parse("repo:acme/app").of("Acme/App") && !parse("repo:acme/other").of("acme/app") && parse("is:pr").of("acme/app"));
+        // The advanced syntax, as `gh pr list --search` sends it: parentheses, AND, OR, NOT.
+        assert_eq!(numbers("( author:dev OR author:ada ) repo:acme/app state:open type:pr"), [1]);
+        assert_eq!(numbers("(author:lin OR label:bug) AND is:pr"), [1, 2]);
+        assert_eq!(numbers("NOT author:ada"), [2]);
+        assert_eq!(numbers("label:perf,bug"), [1, 2], "a list of labels is either");
     }
 }

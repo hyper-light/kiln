@@ -654,6 +654,7 @@ async fn resolve(cx: &Cx<'_>, ty: &str, obj: &Value, f: &Field, args: &Map<Strin
         ("Commit", "statusCheckRollup") => rollup(cx, text(obj, "oid")).await,
         ("StatusCheckRollup", "contexts") => connection(obj.get("_contexts").and_then(Value::as_array).cloned().unwrap_or_default(), args, "StatusCheckRollupContext"),
         ("__Type", "fields") => obj.get("_fields").cloned().unwrap_or(Value::Null),
+        ("__Type", "enumValues") => obj.get("_enumValues").cloned().unwrap_or(Value::Null),
         _ => match obj.get(&f.name) {
             Some(v) => v.clone(),
             None if wants_connection(sub) => connection(Vec::new(), args, "Unknown"),
@@ -664,6 +665,15 @@ async fn resolve(cx: &Cx<'_>, ty: &str, obj: &Value, f: &Field, args: &Map<Strin
 
 /// The fields kiln answers of each type it knows, for `__type`.
 fn introspect(name: &str) -> Value {
+    // The enums clients ask about before they ask: `gh`, whether search takes the advanced
+    // syntax (it does: `search.rs`).
+    if name == "SearchType" {
+        let values: Vec<Value> = ["ISSUE", "ISSUE_ADVANCED", "REPOSITORY", "USER", "DISCUSSION"]
+            .iter()
+            .map(|v| json!({ "__typename": "__EnumValue", "name": v, "description": Value::Null, "isDeprecated": false, "deprecationReason": Value::Null }))
+            .collect();
+        return json!({ "__typename": "__Type", "name": name, "kind": "ENUM", "description": Value::Null, "_enumValues": values });
+    }
     let fields: &[&str] = match name {
         "PullRequest" => &[
             "id",

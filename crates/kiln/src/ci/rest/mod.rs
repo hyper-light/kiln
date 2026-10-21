@@ -54,6 +54,10 @@ async fn body(req: Request) -> Result<Value, Fail> {
     srv::body_json(req.into_body(), 4 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))
 }
 
+/// The GitHub Enterprise Server version the facade answers as, to clients that ask (`gh`): one
+/// whose API the facade's routes are.
+const GHES_VERSION: &str = "3.18.0";
+
 const DOCS: &str = "https://github.com/hyper-light/kiln/blob/main/docs/ci.md#w14-code-hosting-stacked-diffs-review-and-landing";
 
 fn message(status: StatusCode, msg: &str) -> Response {
@@ -205,8 +209,13 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             search::issues(s.as_ref(), &q).await
         }
         // What clients ask of a GitHub they don't know (codeql-action, the toolkit): no
-        // `X-GitHub-Enterprise-Version`, so they take kiln as github.com's API shape.
-        (&Method::GET, ["meta"]) => Ok(srv::json(StatusCode::OK, &json!({ "verifiable_password_authentication": false, "hooks": [], "web": [], "api": [], "git": [], "packages": [], "pages": [], "importer": [], "actions": [], "dependabot": [] }))),
+        // `X-GitHub-Enterprise-Version`, so they take kiln as github.com's API shape. `gh`, which
+        // takes any host but github.com for Enterprise Server, reads the version it says
+        // (`installed_version`) to know what it may ask.
+        (&Method::GET, ["meta"]) => Ok(srv::json(
+            StatusCode::OK,
+            &json!({ "installed_version": GHES_VERSION, "verifiable_password_authentication": false, "hooks": [], "web": [], "api": [], "git": [], "packages": [], "pages": [], "importer": [], "actions": [], "dependabot": [] }),
+        )),
         // A run and its workflow, GitHub's shape (codeql-action reads its workflow's path).
         (&Method::GET, ["repos", owner, repo, "actions", "runs", run]) => {
             let Some(repo_id) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
