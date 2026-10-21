@@ -326,6 +326,56 @@
     stroke-dashoffset: 0;
   }
 }
+
+/* ------------------------------------------------------------ loading (a conversation on its way) */
+
+/* hyperlight's mark, large and thin: a quarter of the loop in the prism travels it end to end and
+   out through the refraction, which lights as the light reaches it. */
+.sg-load {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  overflow: visible;
+  fill: none;
+  stroke-linecap: round;
+}
+.sg-load path {
+  stroke-width: 1.1;
+}
+.sg-load-loop {
+  stroke: #97999f;
+  opacity: 0.22;
+}
+.sg-load-light {
+  stroke-dasharray: 26 74;
+  stroke-dashoffset: 100;
+  animation: sg-load-run 1.8s linear infinite;
+}
+.sg-load-tail {
+  stroke: #bcb1d8;
+  opacity: 0.15;
+  animation: sg-load-refract 1.8s linear infinite;
+}
+@keyframes sg-load-run {
+  from {
+    stroke-dashoffset: 100;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes sg-load-refract {
+  0%,
+  62% {
+    opacity: 0.15;
+  }
+  82% {
+    opacity: 0.85;
+  }
+  100% {
+    opacity: 0.15;
+  }
+}
 @keyframes sg-soft-pulse {
   from {
     opacity: 1;
@@ -364,6 +414,7 @@
 :root[data-motion="paused"] .sg-trace path,
 :root[data-motion="paused"] .sg-beam,
 :root[data-motion="paused"] .sg-trace-glow > span,
+:root[data-motion="paused"] .sg-load path,
 :root[data-motion="paused"] .sg-caret {
   animation-play-state: paused;
 }
@@ -376,6 +427,7 @@
   .sg-trace path,
   .sg-beam,
   .sg-trace-glow > span,
+  .sg-load path,
   .sg-caret,
   .sg-chev {
     animation: none !important;
@@ -385,6 +437,9 @@
   .sg-trace-glow > span {
     background: linear-gradient(45deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0);
   }
+  .sg-load-light {
+    stroke-dasharray: none;
+  }
 }
 
 /* Clipped-gradient text would vanish under forced colours; fall back to the system text colour. */
@@ -393,7 +448,8 @@
     color: CanvasText;
     background: none;
   }
-  .sg-trace path {
+  .sg-trace path,
+  .sg-load path {
     stroke: CanvasText;
   }
   .sg-trace-glow {
