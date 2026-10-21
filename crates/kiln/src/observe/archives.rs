@@ -59,6 +59,11 @@ const GZIP_LEVEL: u32 = 6;
 /// Parts of one archive open at once in a file (each an hour's events): past it, the one written to
 /// longest ago is closed. A file's records span an hour or two but for late ones.
 const OPEN_PARTS: usize = 8;
+/// Files archived at once (their encoding on the blocking pool, their parts written as they close):
+/// an encoder writes some 53 MB/s of log lines a core at gzip's level 6 (§12.26) and the store
+/// applies 106 at the most (§12.8), so three keep pace with a store at its busiest; fewer on a
+/// machine of fewer cores (one left to the rest).
+const IN_FLIGHT: usize = 3;
 /// A failing archive is tried again after two rounds (a minute), doubling to this.
 const BACKOFF_MAX: Duration = Duration::from_secs(16 * 60);
 /// Azure Storage's REST version blobs are written with (a bearer token needs 2017-11-09 or later; a
@@ -720,14 +725,16 @@ impl Archives {
         }
     }
 
-    /// One round: every file held (`files`, oldest first) that an archive wants, in order, each
-    /// archive's objects of it written, the archive done with it then; an archive that fails is
-    /// left for the round (and tried again after its backoff). kiln's counts of it written with
+    /// One round: every file held (`files`, oldest first) that an archive wants, [`IN_FLIGHT`] at
+    /// once, each archive's objects of it written; then, file by file in order, each archive done
+    /// with it that wrote it all (or that its routing does not name), and none past a file it
+    /// failed: an archive that fails is left for the round (its parts written since are kept, and
+    /// not written again) and tried again after its backoff. kiln's counts of it written with
     /// `write`, its events (failing, recovered) with `event`.
     async fn round(&self, files: &[(u64, Arc<LogFile>)], write: Counted<'_>, event: Said<'_>) {
         let keys: Vec<(u64, FileKey)> = files.iter().map(|(seq, f)| (*seq, FileKey::of(f))).collect();
         let now = Instant::now();
-        let mut stopped: BTreeSet<String> = lock(&self.status).iter().filter(|(_, s)| s.retry_at.is_some_and(|t| t > now)).map(|(id, _)| id.clone()).collect();
+        let stopped: Mutex<BTreeSet<String>> = Mutex::new(lock(&self.status).iter().filter(|(_, s)| s.retry_at.is_some_and(|t| t > now)).map(|(id, _)| id.clone()).collect());
         {
             let mut inner = lock(&self.inner);
             let Inner { archives, state } = &mut *inner;
@@ -738,30 +745,58 @@ impl Archives {
                 self.saved_state(state);
             }
         }
-        for ((seq, file), (_, key)) in files.iter().zip(&keys) {
-            let Some(work) = self.begin(*seq, *key, &stopped) else { continue };
-            let results = self.archive_file(*key, file, &work).await;
-            let mut inner = lock(&self.inner);
-            let Inner { archives, state } = &mut *inner;
-            for ((route, want), result) in work.routes.iter().zip(&work.want).zip(results) {
-                if !*want {
-                    continue;
-                }
-                let Some(name) = archives.iter().find(|a| a.id == route.id).map(|a| a.name.clone()) else { continue };
-                match result {
-                    Ok(counts) => {
-                        state.done.insert(route.id.clone(), Some(Place { seq: *seq, file: *key }));
-                        self.worked(&route.id, &name, counts, write, event);
+        let in_flight = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1)).clamp(1, IN_FLIGHT);
+        let stopped = &stopped;
+        // Each file owned by its future (borrowed items would make the round's future less general
+        // than a task needs), all polled on this task (hyper-rt's I/O asks it), handed over in order.
+        let items: Vec<(u64, Arc<LogFile>, FileKey)> = files.iter().zip(&keys).map(|((seq, f), (_, key))| (*seq, Arc::clone(f), *key)).collect();
+        crate::rt::each_in_order(
+            items,
+            in_flight,
+            |(seq, file, key)| async move {
+                let snapshot = lock(stopped).clone();
+                let work = self.begin(seq, key, &snapshot);
+                let results = if work.want.contains(&true) { self.archive_file(key, &file, &work).await } else { Vec::new() };
+                (seq, key, work, results)
+            },
+            |(seq, key, work, results)| {
+                let mut inner = lock(&self.inner);
+                let Inner { archives, state } = &mut *inner;
+                let mut stop = lock(stopped);
+                // The archives kept that its routing does not name (made after it was begun) are
+                // done with it, in their turn.
+                for a in archives.iter() {
+                    if !work.routes.iter().any(|r| r.id == a.id) && !stop.contains(&a.id) && state.wants(&a.id, seq) {
+                        state.done.insert(a.id.clone(), Some(Place { seq, file: key }));
                     }
-                    Err(e) => {
-                        stopped.insert(route.id.clone());
-                        self.failed(&route.id, &name, &e, write, event);
+                }
+                for ((route, want), result) in work.routes.iter().zip(&work.want).zip(results) {
+                    if !*want {
+                        continue;
+                    }
+                    let Some(name) = archives.iter().find(|a| a.id == route.id).map(|a| a.name.clone()) else { continue };
+                    match result {
+                        Ok(counts) => {
+                            self.counted(&route.id, &name, counts, write);
+                            // Past a file it failed this round, an archive stays where it is.
+                            if !stop.contains(&route.id) {
+                                state.done.insert(route.id.clone(), Some(Place { seq, file: key }));
+                                self.worked(&route.id, &name, event);
+                            }
+                        }
+                        Err(e) => {
+                            if stop.insert(route.id.clone()) {
+                                self.failed(&route.id, &name, &e, write, event);
+                            }
+                        }
                     }
                 }
-            }
-            state.follow(archives, &keys);
-            self.saved_state(state);
-        }
+                drop(stop);
+                state.follow(archives, &keys);
+                self.saved_state(state);
+            },
+        )
+        .await;
         // What each archive has yet to write.
         let inner = lock(&self.inner);
         let mut status = lock(&self.status);
@@ -778,33 +813,20 @@ impl Archives {
         write(series);
     }
 
-    /// File `seq` (`file`) as this round finds it: the archives that want it (in the routing it was
-    /// begun with, or begun now with the archives as they are), none of them stopped; the archives
-    /// kept that its routing does not name (made after it was begun) are done with it.
-    fn begin(&self, seq: u64, file: FileKey, stopped: &BTreeSet<String>) -> Option<Work> {
+    /// File `seq` (`file`) as this round finds it: its routing (the one it was begun with, or the
+    /// archives as they are), and which of them want it (kept, not stopped, yet to write it): begun
+    /// now, with that routing, if one does.
+    fn begin(&self, seq: u64, file: FileKey, stopped: &BTreeSet<String>) -> Work {
         let mut inner = lock(&self.inner);
         let Inner { archives, state } = &mut *inner;
         let pinned = state.routing(&file).cloned();
         let routes = pinned.clone().unwrap_or_else(|| routes_of(archives));
-        let mut changed = false;
-        for a in archives.iter() {
-            if !routes.iter().any(|r| r.id == a.id) && !stopped.contains(&a.id) && state.wants(&a.id, seq) {
-                state.done.insert(a.id.clone(), Some(Place { seq, file }));
-                changed = true;
-            }
-        }
         let want: Vec<bool> = routes.iter().map(|r| archives.iter().any(|a| a.id == r.id) && !stopped.contains(&r.id) && state.wants(&r.id, seq)).collect();
-        let work = want.contains(&true).then(|| {
-            if pinned.is_none() {
-                state.pin(file, seq, &routes);
-                changed = true;
-            }
-            Work { routes, want }
-        });
-        if changed {
+        if pinned.is_none() && want.contains(&true) {
+            state.pin(file, seq, &routes);
             self.saved_state(state);
         }
-        work
+        Work { routes, want }
     }
 
     /// One file archived: its records encoded on the blocking pool, each part written as it closes
@@ -896,30 +918,38 @@ impl Archives {
         result
     }
 
-    fn worked(&self, id: &str, name: &str, c: Counts, write: Counted<'_>, event: Said<'_>) {
+    /// What an archive wrote of a file, as it wrote it: its status's counts, and kiln's
+    /// (`kiln.archives.*`).
+    fn counted(&self, id: &str, name: &str, c: Counts, write: Counted<'_>) {
+        if c.objects == 0 {
+            return;
+        }
         let ms = super::clock_ms();
+        {
+            let mut st = lock(&self.status);
+            let s = st.entry(id.to_owned()).or_default();
+            (s.events, s.objects, s.bytes, s.last_written) = (s.events + c.events, s.objects + c.objects, s.bytes + c.bytes, Some(ms));
+        }
+        let mut series = Vec::new();
+        for (metric, v) in [("kiln.archives.events", c.events), ("kiln.archives.objects", c.objects), ("kiln.archives.bytes", c.bytes)] {
+            if let Ok(k) = SeriesKey::new(metric, [("archive", name)], Kind::Count) {
+                series.push((k, vec![(ms, v as f64)]));
+            }
+        }
+        write(series);
+    }
+
+    /// An archive done with a file: working (again: said once).
+    fn worked(&self, id: &str, name: &str, event: Said<'_>) {
         let was_failing = {
             let mut st = lock(&self.status);
             let s = st.entry(id.to_owned()).or_default();
             let was = s.state == "FAILING";
             (s.state, s.error, s.failures, s.retry_at) = ("WORKING", None, 0, None);
-            (s.events, s.objects, s.bytes) = (s.events + c.events, s.objects + c.objects, s.bytes + c.bytes);
-            if c.objects > 0 {
-                s.last_written = Some(ms);
-            }
             was
         };
         if was_failing {
             event(archive_event(name, 9, "recovered", format!("archive {name} recovered: writing again")));
-        }
-        if c.objects > 0 {
-            let mut series = Vec::new();
-            for (metric, v) in [("kiln.archives.events", c.events), ("kiln.archives.objects", c.objects), ("kiln.archives.bytes", c.bytes)] {
-                if let Ok(k) = SeriesKey::new(metric, [("archive", name)], Kind::Count) {
-                    series.push((k, vec![(ms, v as f64)]));
-                }
-            }
-            write(series);
         }
     }
 

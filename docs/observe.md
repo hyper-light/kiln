@@ -1840,6 +1840,9 @@ search names them.
   with the oldest. An install numbers the files anew; each place follows its file by its contents.
 - **When**: every 30 s, the files cut since: about a minute's records under load, and within 15
   minutes of a record when they come slowly (§4.5), as Datadog's own archives come within minutes.
+  Three files at once (each archive still done with them in order, none past one it failed): one
+  core writes the events of some 53 MB/s of log lines, half what the store applies at its most
+  (§12.26).
 - **Failing**: an upload is tried again on a 429 or 5xx (after its `Retry-After`, else 1 s
   doubling; four tries); then the archive is `FAILING`, its error in the store's words, and is tried
   again after a minute, doubling to 16. Its state (Datadog's `UNKNOWN`, `WORKING`, `FAILING`), what
@@ -3208,6 +3211,33 @@ distribution's newer request, one `query` rather than a list (`request_type: his
 An import costs 105 to 112 µs a dashboard (three runs each, a release build, fedora), from 133 to
 157 µs: the lexer tells a filter's `*` from a product by the braces it has open, counted as it goes,
 where it scanned its tokens back each time.
+
+### 12.26 Log archives' encoding
+
+`KOBS_LOGS=<journal> cargo bench -p kiln-obs --bench archive` (adacachy, 2026-10-21, a release
+build, one thread pinned to a core; the machine was busy, so throughput is per second of CPU, which
+its load does not inflate): the journal of §12.8 as 325,068 records (50.2 MB of lines) cut into seven
+logs files as a busy store cuts them, each file read back and written as Datadog's archived events,
+then gzip'd as an object holds them.
+
+| | events / CPU-s | JSON MB / CPU-s | allocations an event | gzip's ratio | bytes kept a byte of line |
+| --- | --- | --- | --- | --- | --- |
+| read, written as events | 1,354,450 | 426.0 | 0.0001 | | 2.04 (the JSON) |
+| … with tags | 1,250,262 | 458.5 | 0.0001 | | 2.38 (the JSON) |
+| … gzip'd, level 1 | 738,791 | 232.4 | 0.0003 | 9.62 | 0.212 |
+| … level 3 | 433,424 | 136.3 | 0.0003 | 14.18 | 0.144 |
+| … level 6 | 328,352 | 103.3 | 0.0003 | 15.17 | 0.134 |
+| … level 9 | 255,959 | 80.5 | 0.0003 | 15.55 | 0.131 |
+| the archiver's path: searched (`*`), written, level 6 | 342,177 | 107.6 | 0.0003 | 15.17 | 0.134 |
+
+An event is read and written in some 740 ns and allocates nothing (its attributes listed on the
+stack, its date and tags written in place, where at first each event allocated a vector and a string
+or more); gzip is three quarters of the cost at level 6. Level 6, zlib's default and Datadog's
+writers', keeps 15.2 times less than the events' JSON (a seventh of the lines' own bytes); level 3
+would take a quarter less CPU and keep 7.5% more, level 9 28% more CPU to keep 2% less. An archive is
+written once and kept for years: level 6. At it one core writes the events of 53 MB/s of log lines
+(the corpus' lines are 154 bytes), half what the store applies at its most (106 MB/s, §12.8): so the
+archiver works on three files at once (`IN_FLIGHT`), each encoded on a thread of the blocking pool.
 
 ## 13. Scenarios
 

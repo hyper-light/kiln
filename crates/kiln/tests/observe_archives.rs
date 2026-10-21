@@ -398,15 +398,15 @@ fn between<'a>(s: &'a str, open: &str, close: &str) -> Vec<&'a str> {
 }
 
 /// An S3 stood in for: each PUT taken whose payload's hash is the one signed and whose
-/// authorization is SigV4's for S3 naming it, unless the PUTs it was told to let through are
-/// gone: then S3's SlowDown (503) until told otherwise.
+/// authorization is SigV4's for S3 naming it, but those of the objects it was told to fail: S3's
+/// SlowDown (503) until told otherwise.
 #[derive(Default)]
 struct Flaky {
     objects: BTreeMap<String, Vec<u8>>,
     /// Each key's PUTs taken.
     puts: BTreeMap<String, usize>,
-    /// PUTs let through before the rest fail; none: every one.
-    allow: Option<usize>,
+    /// Objects whose keys hold this fail; none: none do.
+    failing: Option<String>,
     refused: usize,
     bad: Vec<String>,
 }
@@ -429,15 +429,11 @@ fn flaky(state: Arc<Mutex<Flaky>>) -> impl Fn(&Req) -> Resp + Send + Sync + 'sta
             st.bad.push(format!("{} {} {authz}", r.method, r.path));
             return xml(400, "<Error><Code>InvalidRequest</Code></Error>");
         }
-        match st.allow {
-            Some(0) => {
-                st.refused += 1;
-                return xml(503, "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>");
-            }
-            Some(n) => st.allow = Some(n - 1),
-            None => {}
-        }
         let key = decode(r.path.trim_start_matches('/'), false);
+        if st.failing.as_deref().is_some_and(|f| key.contains(f)) {
+            st.refused += 1;
+            return xml(503, "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>");
+        }
         st.objects.insert(key.clone(), r.body.clone());
         *st.puts.entry(key).or_default() += 1;
         xml(200, "")
@@ -752,9 +748,10 @@ fn every_record_goes_once_to_the_first_archive_that_takes_it_written_as_datadog_
 }
 
 /// One archive, its store failing part way through a file: the parts written stay written (none
-/// written again), the archive says it is failing (an event says so, not archived); the server
-/// killed meanwhile, and a second archive made first in order, every record is written once: those
-/// of the files begun before to the first archive, those cut after to the second.
+/// written again), the file after it is written while the archive waits on the one it failed, the
+/// archive says it is failing (an event says so, not archived); the server killed meanwhile, and a
+/// second archive made first in order, every record is written once: those of the files begun
+/// before to the first archive, those cut after to the second.
 #[test]
 #[ignore = "starts a kiln server as a process, and an S3 stood in for that fails"]
 fn a_store_away_and_the_server_killed_lose_nothing_and_write_nothing_twice() -> anyhow::Result<()> {
@@ -766,7 +763,9 @@ fn a_store_away_and_the_server_killed_lose_nothing_and_write_nothing_twice() -> 
     let first = ok(&f, "POST", "/api/observe/v1/archives", Some(&s3("first", "first", "a")))?;
     let first_id = first["id"].as_str().unwrap_or("").to_owned();
     let t0 = now_ms() - 60_000;
-    let sent: BTreeMap<i64, Sent> = (0..900).map(|i| (i, Sent::new(i, t0))).collect();
+    let mut sent: BTreeMap<i64, Sent> = (0..900).map(|i| (i, Sent::new(i, t0))).collect();
+    // Records 900 to 949: of the newest hour alone.
+    sent.extend((900..950).map(|i| (i, Sent { ts: t0 - (i - 900) * 7, ..Sent::new(i, t0) })));
     let batch = |r: std::ops::Range<i64>| r.map(|i| sent[&i].json()).collect::<Vec<Value>>();
     // The seqs each bucket holds, and its objects' keys.
     let held = |bucket: &str| -> (Vec<i64>, Vec<String>) {
@@ -780,9 +779,12 @@ fn a_store_away_and_the_server_killed_lose_nothing_and_write_nothing_twice() -> 
     send(&f, &batch(0..300))?;
     until(&f, "the first batch archived", Duration::from_secs(60), &|| held("first").0.len() >= 300)?;
 
-    // The store lets one more object through, then fails: the second batch's file (a part an hour,
-    // three hours of records) is written in part.
-    lock(&st).allow = Some(1);
+    // The store fails the objects of the second batch's middle hour (its file is a part an hour,
+    // three hours of records, written oldest first): that file is written in part.
+    let date = rfc3339_ms(t0 - 3_600_000);
+    let folder = format!("dt={}{}{}/hour={}", &date[0..4], &date[5..7], &date[8..10], &date[11..13]);
+    anyhow::ensure!((900..950).all(|i| !rfc3339_ms(sent[&i].ts).starts_with(&date[..13])), "the newest hour's records are of another hour than the middle one");
+    lock(&st).failing = Some(folder);
     send(&f, &batch(300..600))?;
     until(&f, "the archive failing", Duration::from_secs(90), &|| {
         ok(&f, "GET", &format!("/api/observe/v1/archives/{first_id}"), None).is_ok_and(|a| a["state"] == "FAILING" && a["status"]["error"].as_str().is_some_and(|e| e.contains("503")))
@@ -801,6 +803,17 @@ fn a_store_away_and_the_server_killed_lose_nothing_and_write_nothing_twice() -> 
     };
     until(&f, "an event saying it is failing", Duration::from_secs(30), &|| said("failing") == 1)?;
 
+    // A file after it (cut apart: the newest hour's records alone) is written beside the one it
+    // failed, as it is tried again, and the archive stays where it was.
+    std::thread::sleep(Duration::from_secs(3));
+    send(&f, &batch(900..950))?;
+    until(&f, "the file after it written while the archive fails", Duration::from_secs(90), &|| {
+        let seqs: BTreeSet<i64> = held("first").0.into_iter().collect();
+        (900..950).all(|i| seqs.contains(&i))
+    })?;
+    let a = ok(&f, "GET", &format!("/api/observe/v1/archives/{first_id}"), None)?;
+    anyhow::ensure!(a["state"] == "FAILING" && a["status"]["pending"].as_u64().is_some_and(|n| n >= 2), "still failing, both files pending: {a}");
+
     // A second archive, made first in order (as Datadog's API orders them): the files begun keep
     // their routing.
     let second = ok(&f, "POST", "/api/observe/v1/archives", Some(&s3("second", "second", "b")))?;
@@ -810,17 +823,17 @@ fn a_store_away_and_the_server_killed_lose_nothing_and_write_nothing_twice() -> 
 
     // The server killed; the store back; the server again, and a third batch.
     f.kill_server();
-    lock(&st).allow = None;
+    lock(&st).failing = None;
     f.start_server()?;
     send(&f, &batch(600..900))?;
-    until(&f, "every batch archived", Duration::from_secs(120), &|| held("first").0.len() >= 600 && held("second").0.len() >= 300)?;
+    until(&f, "every batch archived", Duration::from_secs(120), &|| held("first").0.len() >= 650 && held("second").0.len() >= 300)?;
     std::thread::sleep(Duration::from_secs(4));
 
     let (first_seqs, _) = held("first");
     let (second_seqs, _) = held("second");
     let once = |seqs: &[i64]| seqs.iter().copied().collect::<BTreeSet<i64>>().len() == seqs.len();
     anyhow::ensure!(once(&first_seqs) && once(&second_seqs), "a record written twice");
-    anyhow::ensure!(first_seqs.iter().copied().collect::<BTreeSet<_>>() == (0..600).collect(), "the first archive: the first two batches, every record");
+    anyhow::ensure!(first_seqs.iter().copied().collect::<BTreeSet<_>>() == (0..600).chain(900..950).collect(), "the first archive: the batches before the second archive, every record");
     anyhow::ensure!(second_seqs.iter().copied().collect::<BTreeSet<_>>() == (600..900).collect(), "the second archive: the third batch, every record");
     let st = lock(&st);
     anyhow::ensure!(st.bad.is_empty(), "requests not signed as S3 asks: {:?}", st.bad);

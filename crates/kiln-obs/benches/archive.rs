@@ -1,7 +1,9 @@
 //! Log archives' encoding on recorded data (`docs/observe.md` §10.5, §12.26): the lines of §12.6 as
 //! records, cut into a store's logs files as a busy store cuts them, each file then read back and
 //! written as Datadog's archived events (`kiln_obs::logs::archive::event`), gzip'd at the levels a
-//! writer might choose. One core; throughput is of the events' JSON.
+//! writer might choose. One thread; throughput is of the events' JSON, per second of wall time and
+//! per second of CPU (what a loaded machine's wall time overstates), with instructions where the OS
+//! counts them.
 //!
 //! `KOBS_LOGS=<journal>:<pods> cargo bench -p kiln-obs --bench archive`
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss)]
@@ -24,7 +26,8 @@ mod loglines;
 #[global_allocator]
 static COUNTING: alloc::Counting = alloc::Counting;
 
-/// What one pass over the files did: events, their JSON's bytes, gzip's bytes, allocations, seconds.
+/// What one pass over the files did: events, their JSON's bytes, gzip's bytes, allocations, wall
+/// and CPU seconds, instructions.
 #[derive(Default)]
 struct Pass {
     events: u64,
@@ -32,6 +35,8 @@ struct Pass {
     gz: u64,
     allocs: u64,
     secs: f64,
+    cpu: f64,
+    instructions: Option<u64>,
 }
 
 /// Every file's records read and written as events (`tags` when asked), each through `search` when
@@ -42,6 +47,7 @@ fn pass(files: &[std::sync::Arc<LogFile>], tags: bool, search: Option<&Search>, 
     let mut rs = RowScratch::default();
     let seed = [7u8; 8];
     let mut p = Pass::default();
+    let u0 = hyper_measure::usage::this().unwrap();
     alloc::begin();
     let t = Instant::now();
     for f in files {
@@ -74,7 +80,28 @@ fn pass(files: &[std::sync::Arc<LogFile>], tags: bool, search: Option<&Search>, 
     }
     p.secs = t.elapsed().as_secs_f64();
     p.allocs = alloc::end().calls();
+    let u1 = hyper_measure::usage::this().unwrap();
+    p.cpu = u1.cpu_ns().saturating_sub(u0.cpu_ns()) as f64 / 1e9;
+    p.instructions = u1.instructions.zip(u0.instructions).map(|(a, b)| a.saturating_sub(b));
     p
+}
+
+/// A row: what `p` did, per event and per second.
+fn row(name: &str, p: &Pass, raw_bytes: usize) {
+    let ratio = if p.gz > 0 { format!("{:.2}", p.json as f64 / p.gz as f64) } else { String::new() };
+    let per_line = if p.gz > 0 { p.gz as f64 / raw_bytes as f64 } else { p.json as f64 / raw_bytes as f64 };
+    let ins = p.instructions.map_or_else(String::new, |i| format!("{:.0}", i as f64 / p.events.max(1) as f64));
+    println!(
+        "{:<44} {:>11.0} {:>11.0} {:>9.1} {:>10.4} {:>7} {:>9.3} {:>10}",
+        name,
+        p.events as f64 / p.secs,
+        p.events as f64 / p.cpu.max(1e-9),
+        p.json as f64 / p.cpu.max(1e-9) / 1e6,
+        p.allocs as f64 / p.events.max(1) as f64,
+        ratio,
+        per_line,
+        ins
+    );
 }
 
 fn main() {
@@ -103,46 +130,19 @@ fn main() {
     // Warm: the files' pages in memory, as a file just cut is.
     let _ = pass(&files, false, None, None);
 
-    println!("\n{:<44} {:>12} {:>10} {:>12} {:>10} {:>12}", "", "events/s", "MB/s", "allocs/event", "ratio", "JSON/line");
+    println!("\n{:<44} {:>11} {:>11} {:>9} {:>10} {:>7} {:>9} {:>10}", "", "events/s", "events/cpu", "MB/cpu", "allocs/ev", "ratio", "out/line", "instr/ev");
     for (name, tags) in [("read, written as events", false), ("read, written as events with tags", true)] {
-        let p = pass(&files, tags, None, None);
-        println!(
-            "{:<44} {:>12.0} {:>10.1} {:>12.4} {:>10} {:>12.2}",
-            name,
-            p.events as f64 / p.secs,
-            p.json as f64 / p.secs / 1e6,
-            p.allocs as f64 / p.events as f64,
-            "",
-            p.json as f64 / raw_bytes as f64
-        );
+        row(name, &pass(&files, tags, None, None), raw_bytes);
     }
     for level in [1u32, 3, 6, 9] {
-        let p = pass(&files, false, None, Some(level));
-        println!(
-            "{:<44} {:>12.0} {:>10.1} {:>12.4} {:>10.2} {:>12.3}",
-            format!("and gzip'd, level {level}"),
-            p.events as f64 / p.secs,
-            p.json as f64 / p.secs / 1e6,
-            p.allocs as f64 / p.events as f64,
-            p.json as f64 / p.gz as f64,
-            p.gz as f64 / raw_bytes as f64
-        );
+        row(&format!("and gzip'd, level {level}"), &pass(&files, false, None, Some(level)), raw_bytes);
     }
     // The archiver's path: each record through an archive's search (kiln's events left out), then
     // written and gzip'd as it writes them.
     let all = parse(&kiln_obs::monitor::logs_only("*")).unwrap();
     let errors = parse(&kiln_obs::monitor::logs_only("status:error")).unwrap();
     for (name, s) in [("searched (*), written, gzip'd 6", &all), ("searched (status:error), written, gzip'd 6", &errors)] {
-        let p = pass(&files, false, Some(s), Some(6));
-        println!(
-            "{:<44} {:>12.0} {:>10.1} {:>12.4} {:>10.2} {:>12.3}",
-            name,
-            p.events as f64 / p.secs,
-            p.json as f64 / p.secs / 1e6,
-            p.allocs as f64 / p.events.max(1) as f64,
-            p.json as f64 / p.gz.max(1) as f64,
-            p.gz as f64 / raw_bytes as f64
-        );
+        row(name, &pass(&files, false, Some(s), Some(6)), raw_bytes);
     }
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
