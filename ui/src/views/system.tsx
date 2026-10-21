@@ -5,7 +5,7 @@ import type { AuditEntry, SystemInfo } from "@/api/types";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { CopyButton, EmptyState, PageIntro, Panel, SectionHeading } from "@/components/ui/misc";
+import { CopyButton, EmptyState, FoldSection, PageIntro } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,9 @@ import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 
 const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 15_000 } };
+
+const CRASH_LEAD = "Recorded by kiln supervise when the server exits abnormally.";
+const CONFIG_LEAD = "Secrets are redacted by the server.";
 
 /** Lightweight JSON syntax colouring using the site's prose palette. */
 function JsonView({ value }: { value: unknown }) {
@@ -191,12 +194,11 @@ function auditTakes(a: AuditEntry, chosen: Chosen, q: string, skip?: string) {
 function AuditSection() {
   const [win, setWin] = React.useState<AuditWindow>("7");
   return (
-    <section className="mt-12">
-      <SectionHeading index="03" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />} />
+    <FoldSection id="system.audit" index="05" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
       <Loadable label="the audit log" fallback={<TableHold head={<AuditHead />} rows={8} rowHeight={39} />}>
         <AuditTable win={win} />
       </Loadable>
-    </section>
+    </FoldSection>
   );
 }
 
@@ -275,8 +277,7 @@ function SystemBody() {
     <>
       <Kpis d={d} />
 
-      <section className="mt-12">
-        <SectionHeading index="01" label="Supervisor" title="Children" />
+      <FoldSection id="system.children" index="01" label="Supervisor" title="Children">
         <div className="table-wrap">
           <table className="data-table">
             <ChildrenHead />
@@ -305,26 +306,27 @@ function SystemBody() {
             </tbody>
           </table>
         </div>
-      </section>
+      </FoldSection>
 
-      <section className="mt-12 grid gap-4 lg:grid-cols-2">
-        <Panel eyebrow="Process" title="Crash log" description="Recorded by kiln supervise when the server exits abnormally.">
-          {d.crash_log.length === 0 ? (
-            <div className="flex items-center gap-2.5 py-6 font-mono text-[11px] text-[#a8c9bc]">
-              <i className="dot" data-status="succeeded" /> No crashes recorded.
-            </div>
-          ) : (
-            <pre className="max-h-[420px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#d8c8b0]">
-              {d.crash_log.join("\n")}
-            </pre>
-          )}
-        </Panel>
-        <Panel eyebrow="Read-only" title="Effective configuration" description="Secrets are redacted by the server.">
-          <JsonView value={d.config} />
-        </Panel>
-      </section>
+      <FoldSection id="system.crash" index="02" label="Process" title="Crash log">
+        <p className="section-lead">{CRASH_LEAD}</p>
+        {d.crash_log.length === 0 ? (
+          <div className="flex items-center gap-2.5 py-2 font-mono text-[11px] text-[#a8c9bc]">
+            <i className="dot" data-status="succeeded" /> No crashes recorded.
+          </div>
+        ) : (
+          <pre className="max-h-[420px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#d8c8b0]">
+            {d.crash_log.join("\n")}
+          </pre>
+        )}
+      </FoldSection>
 
-      <StoresSection index="02" />
+      <FoldSection id="system.config" index="03" label="Read-only" title="Effective configuration">
+        <p className="section-lead">{CONFIG_LEAD}</p>
+        <JsonView value={d.config} />
+      </FoldSection>
+
+      <StoresSection index="04" />
 
       <AuditSection />
     </>
@@ -336,26 +338,23 @@ function SystemHold() {
   return (
     <>
       <Kpis d={null} />
-      <section className="mt-12">
-        <SectionHeading index="01" label="Supervisor" title="Children" />
+      <FoldSection id="system.children" index="01" label="Supervisor" title="Children">
         <TableHold head={<ChildrenHead />} rows={8} rowHeight={39} label="Loading the system" />
-      </section>
-      <section className="mt-12 grid gap-4 lg:grid-cols-2">
-        <Panel eyebrow="Process" title="Crash log" description="Recorded by kiln supervise when the server exits abnormally.">
-          <Hold height={160} />
-        </Panel>
-        <Panel eyebrow="Read-only" title="Effective configuration" description="Secrets are redacted by the server.">
-          <Hold height={160} />
-        </Panel>
-      </section>
-      <section className="mt-12">
-        <SectionHeading index="02" label="Conversations" title="Conversation stores" />
+      </FoldSection>
+      <FoldSection id="system.crash" index="02" label="Process" title="Crash log">
+        <p className="section-lead">{CRASH_LEAD}</p>
+        <Hold height={160} />
+      </FoldSection>
+      <FoldSection id="system.config" index="03" label="Read-only" title="Effective configuration">
+        <p className="section-lead">{CONFIG_LEAD}</p>
+        <Hold height={160} />
+      </FoldSection>
+      <FoldSection id="system.stores" index="04" label="Conversations" title="Conversation stores">
         <StoresHold />
-      </section>
-      <section className="mt-12">
-        <SectionHeading index="03" label="Audit" title="Audit log" />
+      </FoldSection>
+      <FoldSection id="system.audit" index="05" label="Audit" title="Audit log">
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
-      </section>
+      </FoldSection>
     </>
   );
 }

@@ -536,6 +536,60 @@ html.fills-window body {
   color: #92959f;
   font-size: 9px;
 }
+/* A heading that folds its section: its title is the button, and the whole heading answers it. */
+.section-fold {
+  position: relative;
+}
+.section-fold:not([data-open]) {
+  margin-bottom: 0;
+}
+.section-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: inherit;
+  text-align: left;
+}
+.section-toggle::after {
+  position: absolute;
+  inset: -6px 0;
+  content: "";
+}
+.section-fold .section-aside {
+  position: relative;
+  z-index: 1;
+}
+.section-chev {
+  flex: none;
+  color: #6f7380;
+  transition:
+    transform 0.2s var(--ease),
+    color 0.2s;
+}
+.section-fold:not([data-open]) .section-chev {
+  transform: rotate(-90deg);
+}
+.section-fold:hover .section-chev,
+.section-toggle:focus-visible .section-chev {
+  color: #ededee;
+}
+.section-toggle:focus-visible {
+  outline: 2px solid rgb(165 160 191 / 35%);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+/* What a section is, in a line under its heading. */
+.section-lead {
+  margin: -6px 0 14px;
+  color: #8f939e;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+@media (prefers-reduced-motion: reduce) {
+  .section-chev {
+    transition: none;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* Card (project-card) — 7px radius, prism hairline on hover            */
