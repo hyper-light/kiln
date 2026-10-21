@@ -37,6 +37,7 @@ import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
 import { useEndWithChildren } from "./family";
 import { Beam, PrismLabel } from "./signals";
+import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -139,7 +140,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
 
   const send = React.useCallback(
     (c: Command) => {
-      if (!store.send(c)) toast.error("Not connected", "The agent's machine is reconnecting; try again in a moment.");
+      // An answer shows as given at once (answered.ts); back if it couldn't go.
+      if (c.type === "approve") markAnswered([c.id]);
+      if (store.send(c)) return;
+      if (c.type === "approve") unmark([c.id]);
+      toast.error("Not connected", "The agent's machine is reconnecting; try again in a moment.");
     },
     [store],
   );
@@ -495,7 +500,9 @@ function keepTyping(e: React.PointerEvent | React.MouseEvent) {
 
 /** A phone's tabs, with what each holds. */
 function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; onTab: (t: PhoneTab) => void }) {
-  const approvals = useSession(store, (s) => s.state?.approvals.length ?? 0);
+  const asked = useSession(store, (s) => s.state?.approvals);
+  const done = useAnswered();
+  const approvals = asked ? stillAsked(asked, done).length : 0;
   const changes = useSession(store, (s): FileChange[] | null => s.changes);
   // Counted from the conversation's edits only when the server sends no changeset.
   const events = useSession(store, (s) => (s.changes ? NO_EVENTS : s.events));

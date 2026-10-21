@@ -21,7 +21,7 @@ import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
 import { useDrafts, useHeld, useSendMode, type Held } from "./state";
 
-const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
+export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
   { id: "steer", label: "Steer", hint: "Into the running turn — it reads it at its next step", feature: "steer" },
   { id: "now", label: "Now", hint: "Stop the current turn and send this at once", feature: "send_now" },
@@ -184,7 +184,7 @@ function Queued({ queue, label, hint, acts }: { queue: { id: string; text: strin
 }
 
 /** How a message goes while it works: kept until changed (the composer's typing doesn't render it). */
-const SendModes = React.memo(function SendModes({ modes, mode, onMode }: { modes: typeof MODES; mode: SendMode; onMode: (m: SendMode) => void }) {
+export const SendModes = React.memo(function SendModes({ modes, mode, onMode }: { modes: typeof MODES; mode: SendMode; onMode: (m: SendMode) => void }) {
   return (
     <>
       <div className="cp-modes" role="radiogroup" aria-label="How to send while it works">

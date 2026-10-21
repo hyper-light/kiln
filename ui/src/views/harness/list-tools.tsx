@@ -1,8 +1,8 @@
 /**
  * How Mission control's list is shown: one filter field (names as you type; runner, harness,
- * state, folder, model and mode as checkboxes with counts) and a sort select beside it. The list
- * holds still while agents work: it is taken when you change the filter or the sort (or refresh
- * it), new agents come in on top, and the list says when it no longer matches what's chosen.
+ * state, folder, model and mode as checkboxes with counts) and a sort select beside it. By default
+ * the agents that need you come first, as they come to: the list follows them while they work,
+ * and holds still while you use it (useListHold), its rows then gliding to their places (useGlide).
  */
 import * as React from "react";
 import type { AgentInfo } from "@/api/harness";
@@ -11,16 +11,17 @@ import { SelectField } from "@/components/ui/misc";
 import { modelLabel, tildify } from "./derive";
 import { machineName } from "./parts";
 
-export type SortId = "newest" | "oldest" | "active" | "name" | "name-desc" | "runner" | "harness" | "state" | "cost";
+export type SortId = "priority" | "newest" | "oldest" | "active" | "name" | "name-desc" | "runner" | "harness" | "cost";
 
 export interface ListView {
   sort: SortId;
   /** Chosen options, by facet. */
   facets: Chosen;
 }
-export const DEFAULT_VIEW: ListView = { sort: "newest", facets: {} };
+export const DEFAULT_VIEW: ListView = { sort: "priority", facets: {} };
 
 const SORTS: { value: SortId; label: string }[] = [
+  { value: "priority", label: "Needs you first" },
   { value: "newest", label: "Newest first" },
   { value: "oldest", label: "Oldest first" },
   { value: "active", label: "Recently active" },
@@ -28,11 +29,10 @@ const SORTS: { value: SortId; label: string }[] = [
   { value: "name-desc", label: "Name, Z to A" },
   { value: "runner", label: "Runner" },
   { value: "harness", label: "Harness" },
-  { value: "state", label: "State, needs you first" },
   { value: "cost", label: "Cost, highest first" },
 ];
 
-/** Where an agent stands, in Mission control's words; sorting by state follows this order. */
+/** Where an agent stands, in Mission control's words (the State filter lists them so). */
 export const STANDS = [
   { id: "needs", label: "Needs you" },
   { id: "crashed", label: "Stopped" },
@@ -44,6 +44,15 @@ export const STANDS = [
   { id: "ended", label: "Ended" },
 ];
 const RANK = new Map(STANDS.map((s, i) => [s.id, i]));
+
+/**
+ * Who needs you most, first: waiting on you, stopped, paused, then what finished since you last
+ * looked (its next step is yours), then the rest.
+ */
+const PRIORITY = new Map(["needs", "crashed", "paused", "finished", "working", "ready", "offline", "ended"].map((s, i) => [s, i]));
+
+/** Since when it has waited on you: its oldest request (or, without one, its last word). */
+const waitingSince = (a: AgentInfo) => a.approvals.reduce((at, p) => Math.min(at, p.at || at), a.approvals.length > 0 ? Infinity : a.last_activity);
 
 export interface ViewRow {
   a: AgentInfo;
@@ -114,6 +123,15 @@ const DIMENSIONS: {
 
 function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
   switch (sort) {
+    case "priority":
+      return (x, y) => {
+        const by = (PRIORITY.get(x.stand) ?? PRIORITY.size) - (PRIORITY.get(y.stand) ?? PRIORITY.size);
+        if (by !== 0) return by;
+        // Waiting on you the longest first; the latest news first; otherwise the newest.
+        if (x.stand === "needs") return waitingSince(x.a) - waitingSince(y.a);
+        if (x.stand === "crashed" || x.stand === "paused" || x.stand === "finished") return y.a.last_activity - x.a.last_activity;
+        return y.a.created_at - x.a.created_at;
+      };
     case "newest":
       return (x, y) => y.a.created_at - x.a.created_at;
     case "oldest":
@@ -128,19 +146,18 @@ function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
       return (x, y) => collator.compare(machineName(x.a.target), machineName(y.a.target));
     case "harness":
       return (x, y) => collator.compare(x.a.kind_name, y.a.kind_name);
-    case "state":
-      return (x, y) => (RANK.get(x.stand) ?? STANDS.length) - (RANK.get(y.stand) ?? STANDS.length);
     case "cost":
       return (x, y) => (y.a.cost_usd ?? 0) - (x.a.cost_usd ?? 0);
   }
 }
 
-/** Agents that need you come first, whatever the sort; the sort orders the rest. */
-const needsFirst = (x: ViewRow, y: ViewRow) => Number(y.stand === "needs") - Number(x.stand === "needs");
+/** A sort kept from before (one since gone, like "state") is the default. */
+export const sortOf = (sort: string): SortId => (SORTS.some((s) => s.value === sort) ? (sort as SortId) : DEFAULT_VIEW.sort);
 
+/** In the sort's order; a sort chosen on purpose (by name, by age…) is followed as it is. */
 export function sortRows<T extends ViewRow>(rows: T[], sort: SortId): T[] {
-  const by = sortBy(SORTS.some((s) => s.value === sort) ? sort : "newest");
-  return [...rows].sort((x, y) => needsFirst(x, y) || by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
+  const by = sortBy(sortOf(sort));
+  return [...rows].sort((x, y) => by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
 }
 
 /** Matches the typed words (its name or title) and every facet chosen (any of a facet's options). */
@@ -199,21 +216,19 @@ export function ListBar({ rows, q, onQuery, view, onView }: { rows: ViewRow[]; q
   );
 }
 
-interface Taken {
-  key: string;
-  /** In order: what showed, each in the list or among the ended. */
+/** What showed when the list began to be held: in order, each in the list or among the ended. */
+interface Kept {
   ids: string[];
   ended: ReadonlySet<string>;
-  /** Every agent there was: one not among them is new. */
-  known: ReadonlySet<string>;
 }
 
 /**
- * The list as shown: what the filter and sort gave when last applied, with each agent as it is now
- * (an agent that no longer matches stays until then, its words saying where it stands). New agents
- * come in on top. `stale`: applying them again would show something else.
+ * The list as shown: what the filter and sort give, with each agent as it is now, so one that comes
+ * to need you rises to the top as it does. While the list is `held` (in use: useListHold) its rows
+ * keep their places, an agent that no longer matches included, and new agents come in on top; then
+ * it follows again.
  */
-export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, loaded: boolean) {
+export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, held: boolean) {
   const now = React.useMemo(
     () =>
       sortRows(
@@ -222,33 +237,174 @@ export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListV
       ),
     [all, q, view],
   );
-  const [tick, setTick] = React.useState(0);
-  const key = `${JSON.stringify(view)}|${q}|${loaded ? 1 : 0}|${tick}`;
-  const [taken, setTaken] = React.useState<Taken | null>(null);
-  let t = taken;
-  if (!t || t.key !== key) {
-    t = {
-      key,
-      ids: now.map((r) => r.a.id),
-      ended: new Set(now.filter((r) => r.stand === "ended").map((r) => r.a.id)),
-      known: new Set(all.map((r) => r.a.id)),
-    };
-    setTaken(t);
-  }
-  const shown = React.useMemo(() => {
+  // Choosing another filter or sort is using the list too, but it asks for that order at once.
+  const chosen = `${JSON.stringify(view)}|${q}`;
+  const [kept, setKept] = React.useState<{ chosen: string; was: Kept } | null>(null);
+  if (held && (!kept || kept.chosen !== chosen)) {
+    setKept({ chosen, was: { ids: now.map((r) => r.a.id), ended: new Set(now.filter((r) => r.stand === "ended").map((r) => r.a.id)) } });
+  } else if (!held && kept) setKept(null);
+  const was = held && kept?.chosen === chosen ? kept.was : null;
+  return React.useMemo(() => {
+    if (!was) return { live: now.filter((r) => r.stand !== "ended"), ended: now.filter((r) => r.stand === "ended"), matching: now.length };
     const byId = new Map(all.map((r) => [r.a.id, r]));
-    const fresh = now.filter((r) => !t.known.has(r.a.id));
-    const kept = t.ids.map((id) => byId.get(id)).filter((r): r is T => r !== undefined);
+    const known = new Set(was.ids);
+    const fresh = now.filter((r) => !known.has(r.a.id));
+    const stayed = was.ids.map((id) => byId.get(id)).filter((r): r is T => r !== undefined);
     return {
-      live: [...fresh.filter((r) => r.stand !== "ended"), ...kept.filter((r) => !t.ended.has(r.a.id))],
-      ended: [...fresh.filter((r) => r.stand === "ended"), ...kept.filter((r) => t.ended.has(r.a.id))],
+      live: [...fresh.filter((r) => r.stand !== "ended"), ...stayed.filter((r) => !was.ended.has(r.a.id))],
+      ended: [...fresh.filter((r) => r.stand === "ended"), ...stayed.filter((r) => was.ended.has(r.a.id))],
+      matching: now.length,
     };
-  }, [all, now, t]);
-  const stale = React.useMemo(() => {
-    const live = now.filter((r) => r.stand !== "ended").map((r) => r.a.id);
-    const ended = now.filter((r) => r.stand === "ended").map((r) => r.a.id);
-    return live.join() !== shown.live.map((r) => r.a.id).join() || ended.join() !== shown.ended.map((r) => r.a.id).join();
-  }, [now, shown]);
-  const refresh = React.useCallback(() => setTick((n) => n + 1), []);
-  return { ...shown, stale, refresh, matching: now.length };
+  }, [all, now, was]);
+}
+
+/** After the pointer last moved over the list (or a finger left it), this long before it moves again. */
+const QUIET_MS = 1200;
+/** While one of these is open (a row's menu, a dialog from it), the list holds still (one closing doesn't count). */
+const OPEN = ':is([role="menu"], [role="dialog"], [role="alertdialog"]):not([data-state="closed"])';
+
+/**
+ * Whether the list is in use, so its rows hold still: a finger or button pressed on it, focus on one
+ * of its controls, a menu or dialog open, or a moment after the pointer last moved over it.
+ * `bind` goes on the element around the list.
+ */
+export function useListHold(extra = false) {
+  const [hold] = React.useState(() => {
+    let pressed = false;
+    let focused = false;
+    let moved = 0;
+    let value = false;
+    let timer = 0;
+    const listeners = new Set<() => void>();
+    const update = () => {
+      window.clearTimeout(timer);
+      const quiet = Date.now() - moved;
+      const open = typeof document !== "undefined" && document.querySelector(OPEN) !== null;
+      const next = pressed || focused || open || quiet < QUIET_MS;
+      // Released by itself: once it's quiet (and checked again while something is open).
+      if (next && !pressed && !focused) timer = window.setTimeout(update, open ? 500 : QUIET_MS - quiet + 20);
+      if (next !== value) {
+        value = next;
+        listeners.forEach((l) => l());
+      }
+    };
+    const touch = () => {
+      moved = Date.now();
+      if (!value) update();
+    };
+    const control = (el: EventTarget | null) => el instanceof Element && el.closest("button, a, input, textarea, select, [role='menuitem']") !== null;
+    return {
+      subscribe: (l: () => void) => {
+        listeners.add(l);
+        return () => listeners.delete(l);
+      },
+      get: () => value,
+      bind: {
+        // The page scrolling (a finger flinging it on, a wheel) is the list in use as well.
+        ref: (el: HTMLElement | null) => {
+          if (!el) return;
+          window.addEventListener("scroll", touch, { passive: true });
+          return () => {
+            window.removeEventListener("scroll", touch);
+            window.clearTimeout(timer);
+          };
+        },
+        onPointerDown: () => {
+          pressed = true;
+          moved = Date.now();
+          update();
+        },
+        onPointerUp: () => {
+          pressed = false;
+          moved = Date.now();
+          update();
+        },
+        onPointerCancel: () => {
+          pressed = false;
+          moved = Date.now();
+          update();
+        },
+        onPointerMove: touch,
+        onWheel: touch,
+        onPointerLeave: () => {
+          pressed = false;
+          update();
+        },
+        onFocus: (e: React.FocusEvent) => {
+          focused = control(e.target) && (e.target as Element).matches(":focus-visible");
+          update();
+        },
+        onBlur: (e: React.FocusEvent) => {
+          focused = e.currentTarget.contains(e.relatedTarget as Node | null) && control(e.relatedTarget);
+          moved = Date.now();
+          update();
+        },
+      },
+    };
+  });
+  const held = React.useSyncExternalStore(hold.subscribe, hold.get, () => false);
+  return { held: held || extra, bind: hold.bind };
+}
+
+/** How long a row takes to glide to its new place. */
+const GLIDE_MS = 260;
+
+/** Where each gliding item is, from the top of the list it's in. */
+function places(root: HTMLElement): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const el of root.querySelectorAll<HTMLElement>("[data-glide]")) {
+    const parent = el.parentElement;
+    if (parent) out.set(el.dataset.glide ?? "", el.getBoundingClientRect().top - parent.getBoundingClientRect().top);
+  }
+  return out;
+}
+
+/**
+ * Items (`data-glide="<key>"`) that glide to their new places when the order (`order`) changes,
+ * from where they were, rather than jump; new ones fade in. Not when motion is paused here or by the
+ * device. The ref goes on the element around them. While an item glides, it can't be pressed, so a
+ * tap meant for what was there doesn't land on what slid under it.
+ */
+export function useGlide(order: string) {
+  const [last] = React.useState(() => ({ order, root: null as HTMLElement | null, before: null as Map<string, number> | null }));
+  if (last.order !== order) {
+    // About to show another order: where everything is now (the page still shows the last one).
+    last.order = order;
+    last.before = last.root && document.documentElement.dataset.motion !== "paused" ? places(last.root) : null;
+  }
+  return React.useCallback(
+    (el: HTMLElement | null) => {
+      if (!el) return;
+      last.root = el;
+      const before = last.before;
+      last.before = null;
+      const off = () => {
+        if (last.root === el) last.root = null;
+      };
+      if (!before) return off;
+      for (const item of el.querySelectorAll<HTMLElement>("[data-glide]")) {
+        const parent = item.parentElement;
+        const was = before.get(item.dataset.glide ?? "");
+        if (!parent) continue;
+        if (was === undefined) {
+          item.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 180, easing: "ease-out" });
+          continue;
+        }
+        const dy = was - (item.getBoundingClientRect().top - parent.getBoundingClientRect().top);
+        if (Math.abs(dy) < 1) continue;
+        item.style.pointerEvents = "none";
+        const run = item.animate([{ transform: `translateY(${dy}px)` }, { transform: "none" }], { duration: GLIDE_MS, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" });
+        const done = () => {
+          item.style.pointerEvents = "";
+        };
+        run.onfinish = done;
+        run.oncancel = done;
+      }
+      return off;
+    },
+    // A new ref for each order: React hands it the list once that order is on the page (and the
+    // last one's cleanup runs first, so what was measured for this order is still there).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [order],
+  );
 }

@@ -485,6 +485,8 @@ export interface BroadcastTo {
 export interface BroadcastBody {
   to: BroadcastTo;
   text?: string;
+  /** Files with the prompt (uploaded first), each agent its own copy. */
+  attachments?: Attachment[];
   mode?: SendMode;
   command?: Command;
   approvals?: "allow" | "deny";

@@ -185,8 +185,7 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   isolation: isolate;
   border-color: transparent;
   --ag-rim: conic-gradient(#8d869f, #aca1d5 21%, #d3c6ee 29%, #8a7cae 42%, #b5a7db 68%, #8d869f);
-  --ag-glint: #e1d7f5;
-  --ag-shimmer: 0.35;
+  --ag-glint: rgb(225 215 245 / 35%);
   --ag-current: 24s;
   --ag-spark: 19s;
 }
@@ -215,41 +214,38 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 }
 .ag-turn-control[data-state="active"] {
   --ag-rim: conic-gradient(#b8d9d2, #7194c9 8%, #c8e0ef 13%, #a6c4ed 23%, #8677ad 32%, #d7c1ee 37%, #b8a6d5 46%, #d6a2aa 55%, #eed6bc 59%, #a2bfae 66%, #d8cbb0 77%, #a6c4ed 85%, #d6a2aa 91%, #b8d9d2);
-  --ag-glint: #f5eaff;
-  --ag-shimmer: 0.9;
+  --ag-glint: rgb(245 234 255 / 90%);
   --ag-current: 5.3s;
   --ag-spark: 3.7s;
 }
 .ag-turn-control[data-state="stopped"] {
   --ag-rim: conic-gradient(#996f77, #d1aaad 23%, #e1bdc0 30%, #a17b83 46%, #c29ba1 73%, #996f77);
-  --ag-glint: #e9c5c8;
-  --ag-shimmer: 0.2;
+  --ag-glint: rgb(233 197 200 / 20%);
   --ag-current: 52s;
   --ag-spark: 43s;
 }
 .ag-turn-control[data-state="finished"] {
   --ag-rim: conic-gradient(#79978a, #a8c9bc 22%, #d2e6d8 32%, #8aafa0 49%, #b4d0bd 76%, #79978a);
-  --ag-glint: #e1f0e5;
-  --ag-shimmer: 0.3;
+  --ag-glint: rgb(225 240 229 / 30%);
   --ag-current: 32s;
   --ag-spark: 27s;
 }
 .ag-turn-control[data-state="disconnected"] {
   --ag-rim: conic-gradient(#555962, #797c84 24%, #898c94 34%, #656872 53%, #777a82 80%, #555962);
-  --ag-glint: #a3a6ad;
-  --ag-shimmer: 0.1;
+  --ag-glint: rgb(163 166 173 / 10%);
   --ag-current: 100s;
   --ag-spark: 83s;
 }
 @keyframes ag-rim-current {
   to { transform: rotate(360deg); }
 }
-/* Unevenly spaced highlights pass the underlying gradient at changing speeds. */
+/* Unevenly spaced highlights pass the underlying gradient at changing speeds (their strength per
+   state is the glint's alpha: plain numbers here keep the animation on the GPU). */
 @keyframes ag-rim-shimmer {
-  0%, 100% { opacity: calc(var(--ag-shimmer) * 0.45); }
-  17% { opacity: var(--ag-shimmer); }
-  43% { opacity: calc(var(--ag-shimmer) * 0.3); }
-  71% { opacity: calc(var(--ag-shimmer) * 0.8); }
+  0%, 100% { opacity: 0.45; }
+  17% { opacity: 1; }
+  43% { opacity: 0.3; }
+  71% { opacity: 0.8; }
   0% { transform: rotate(0deg); }
   21% { transform: rotate(41deg); }
   47% { transform: rotate(192deg); }
@@ -266,7 +262,7 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
     animation: none;
   }
   .ag-turn-control::after {
-    opacity: calc(var(--ag-shimmer) * 0.45);
+    opacity: 0.45;
   }
 }
 .ag-actions {

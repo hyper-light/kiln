@@ -49,7 +49,8 @@ const underPeer: LocationRewrite | undefined = PEER_BASE
   : undefined;
 
 export function getRouter() {
-  return createRouter({ routeTree, rewrite: underPeer, scrollRestoration: ({ location }) => !keepsItsPlace(location.pathname), parseSearch, stringifySearch });
+  // A page's code is fetched as a link to it is pointed at or touched, so it's there by the tap.
+  return createRouter({ routeTree, rewrite: underPeer, scrollRestoration: ({ location }) => !keepsItsPlace(location.pathname), parseSearch, stringifySearch, defaultPreload: "intent" });
 }
 
 declare module "@tanstack/react-router" {

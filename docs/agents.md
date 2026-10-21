@@ -59,6 +59,30 @@ Ending the agent stops what it left running, then ends whatever else is still in
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
 
+## Mission control
+
+- **Order.** By default (Needs you first) the agents that wait on you come first, longest waiting
+  first, then those stopped, paused, finished since you last looked, working, ready, offline and
+  ended. The list follows the agents as they change: one that comes to need you rises at once.
+  While you use the list (a finger or button pressed on it, focus on one of its controls, a menu
+  or dialog open, agents selected, or a moment after the pointer last moved over it), its rows
+  hold still, then glide to their places. A sort chosen on purpose (by name, age, activity,
+  runner, harness or cost) is followed as it is.
+- **Requests anywhere.** On any other page (and an agent's page, for the other agents), each
+  agent's oldest request shows as a card at the top: a tool call is allowed or denied there, a
+  question or plan opens the agent. Two at once (one on a phone), then a line for the rest. ×, or
+  a swipe, puts one away until that agent asks for something else.
+- **Answers at once.** An answer shows as given wherever its request showed (its row, its card, the
+  agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
+- **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
+  it (and drag over more), tap rows while selecting, or swipe one right; the list's head says how
+  many, with Select all and Done. With a mouse, rows keep their checkboxes.
+- **The message box.** It writes to the agents selected (each named in its To line, put back with
+  its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
+  harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say
+  into the mic, queued, steered or sent now as an agent's own box sends it; or a command from its
+  list. It empties as it sends, and says how it went.
+
 ## API
 
 | Method | Path | |
@@ -174,7 +198,9 @@ that continues a copy of the conversation (Claude Code's `--fork-session`, Codex
     prompt route sends its words, a control sends its command, a panel (`/model`) or a command the
     harness can't run from kiln is skipped, saying why; a name not in its catalog goes as typed
     (its harness may know it, as a skill). `mode` for a prompt: `queue` (after the current turn,
-    the default), `steer` (into it) or `now` (stopping it).
+    the default), `steer` (into it) or `now` (stopping it). `attachments`: files with the prompt
+    (or alone, without `text`), as an agent's own message takes them (each uploaded first with
+    `POST /api/harness/files`, then named by `file_id`): each agent gets its own copy.
   - `command`: a command as the console sends one (`{"type": "interrupt"}`,
     `{"type": "set_mode", "mode": "plan"}`, `{"type": "restart"}`, ...). A `send` gets its own
     message id per agent.
@@ -243,10 +269,10 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
-Mission Control shows kiln sessions and native subagents in a flat list, without relationship
-labels or nested disclosures. Search, status filters and sorting apply to each row independently.
-Native subagents show their own status and open their work inside
-the parent's conversation, including after they finish. The session list carries small
+Mission Control shows only standalone kiln sessions, in a flat list. Managed children and native
+subagents are excluded from its rows, counts, filters, conversation search and bulk actions.
+Subagent status and output remain available inside the agent chats, including after they finish.
+The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
 do not create kiln sessions or change the harness's isolation, permissions or execution.
