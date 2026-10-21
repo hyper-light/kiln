@@ -137,14 +137,18 @@ fn blobs_config(store: Store, lab: &str) -> anyhow::Result<(String, Option<Strin
     match store {
         Store::Local => Ok((String::new(), None)),
         Store::S3 => {
-            let (endpoint, bucket, access, secret) = s3_spec()?;
             let prefix = format!("labs/{}/{lab}", hex::encode(rand::random::<[u8; 6]>()));
-            let cfg = format!(
-                "[blobs]\nstore = \"s3\"\n\n[blobs.s3]\nendpoint = \"{endpoint}\"\nbucket = \"{bucket}\"\nprefix = \"{prefix}\"\naccess_key_id = \"{access}\"\nsecret_access_key_file = \"{secret}\"\ncreate_bucket = true\n"
-            );
-            Ok((cfg, Some(prefix)))
+            Ok((s3_section("s3", &prefix)?, Some(prefix)))
         }
     }
+}
+
+/// `[blobs]` with the lab's S3 under `prefix`, the store kiln uses `store` (`local` or `s3`).
+fn s3_section(store: &str, prefix: &str) -> anyhow::Result<String> {
+    let (endpoint, bucket, access, secret) = s3_spec()?;
+    Ok(format!(
+        "[blobs]\nstore = \"{store}\"\n\n[blobs.s3]\nendpoint = \"{endpoint}\"\nbucket = \"{bucket}\"\nprefix = \"{prefix}\"\naccess_key_id = \"{access}\"\nsecret_access_key_file = \"{secret}\"\ncreate_bucket = true\n"
+    ))
 }
 
 /// The lab's S3 store, as the server keeps it, to look into.
@@ -502,5 +506,48 @@ fn presigned_urls_grant_exactly_what_they_say_and_nothing_else() -> anyhow::Resu
     let blobs = kiln::store::Store::open(&data.join("kiln.db"))?;
     let kept: i64 = kiln::rt::block_on(async move { blobs.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM blob_keys WHERE key IN ('lab/long', 'lab/short')", [], |r| r.get(0))?)).await })?;
     anyhow::ensure!(kept == 0, "refused puts kept {kept} objects");
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------ moving to S3
+
+/// CP-T10.1, AC-T10.1.1: a server that kept its bytes on its local store moves them to an S3 one:
+/// stopped, `kiln blobs copy`, `[blobs] store = "s3"`, started: what it kept is there, served from
+/// S3 (a runner binary, sync's contents, a CI object), and a second copy has nothing to do.
+#[test]
+#[ignore = "needs an S3: KILN_TEST_S3 (docs/blobs.md, \"The labs\")"]
+fn a_server_moves_its_bytes_to_s3() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let prefix = format!("labs/{}/move", hex::encode(rand::random::<[u8; 6]>()));
+    let (target, binary) = other_platform();
+    let contents = noise(5 << 20, 7);
+    let digest = sha256(&contents);
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &s3_section("local", &prefix)? })?;
+    let auth = format!("Bearer {}", s.admin);
+    let r = send(s.port, "POST", &format!("/api/updates/binaries?target={target}"), &[("Authorization", &auth)], &binary)?;
+    anyhow::ensure!(r.status == 200, "the upload: {}", r.status);
+    let build = r.json().get("build").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let r = send(s.port, "PUT", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &auth)], &contents)?;
+    anyhow::ensure!(r.status == 201, "sync's contents: {}", r.status);
+    drop(s);
+    let copy = || -> anyhow::Result<String> {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_kiln")).args(["--config", &dir.path().join("kiln.toml").to_string_lossy(), "blobs", "copy"]).env("HOME", dir.path().join("home")).output()?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        anyhow::ensure!(out.status.success(), "kiln blobs copy: {text}");
+        Ok(text)
+    };
+    let first = copy()?;
+    anyhow::ensure!(first.contains(&format!("sync/{digest}")) && first.contains(&format!("binaries/kiln-{target}")), "{first}");
+    let again = copy()?;
+    anyhow::ensure!(again.contains("copied 0 objects"), "a second copy: {again}");
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &s3_section("s3", &prefix)? })?;
+    let auth = format!("Bearer {}", s.admin);
+    anyhow::ensure!(listed_build(s.port, &s.admin, target)?.as_deref() == Some(build.as_str()), "the binary, listed from S3");
+    let got = send(s.port, "GET", &format!("/dl/kiln/{target}/{build}"), &[], b"")?;
+    anyhow::ensure!(got.status == 200 && got.body == binary, "the binary, served from S3: {}", got.status);
+    wait_for("sync's contents listed from S3", Duration::from_secs(30), || Ok(send(s.port, "HEAD", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &auth)], b"")?.status == 200))?;
+    let got = send(s.port, "GET", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &auth)], b"")?;
+    anyhow::ensure!(got.status == 200 && got.body == contents, "sync's contents, served from S3: {}", got.status);
+    anyhow::ensure!(held(Store::S3, &dir.path().join("data"), Some(&prefix), &format!("sync/{digest}"), &digest)?, "in the S3 store");
     Ok(())
 }

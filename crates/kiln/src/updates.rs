@@ -316,7 +316,12 @@ pub async fn load(hub: &Hub) {
 /// Takes the binaries kept as files before (`<data>/binaries`) into the local store, where they
 /// lie, once: a `.taken` mark says it's done.
 pub async fn take_in(hub: &Hub, local: &crate::blobs::local::LocalBlobs) -> anyhow::Result<()> {
-    let dir = old_dir(&hub.cfg);
+    take_in_from(&hub.cfg, local).await
+}
+
+/// [`take_in`] for the server `cfg` names (`kiln blobs copy`).
+pub async fn take_in_from(cfg: &crate::config::Config, local: &crate::blobs::local::LocalBlobs) -> anyhow::Result<()> {
+    let dir = old_dir(cfg);
     let mark = dir.join(".taken");
     if mark.exists() || !dir.is_dir() {
         return Ok(());

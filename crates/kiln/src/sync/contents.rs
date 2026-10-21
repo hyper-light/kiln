@@ -207,7 +207,7 @@ impl Contents {
 
 /// Takes the contents kept as files before (`<dir>/<2 hex>/<hash>`) into the local store where they
 /// lie, once: a `.taken` mark says it's done.
-async fn take_in(local: &crate::blobs::local::LocalBlobs, dir: &Path) -> anyhow::Result<()> {
+pub async fn take_in(local: &crate::blobs::local::LocalBlobs, dir: &Path) -> anyhow::Result<()> {
     let mark = dir.join(TAKEN);
     if mark.exists() || !dir.is_dir() {
         return Ok(());

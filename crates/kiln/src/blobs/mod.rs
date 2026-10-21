@@ -15,6 +15,7 @@
 //!   (`crate::convo::archive`).
 
 pub mod chunks;
+pub mod cli;
 pub mod io;
 pub mod local;
 pub mod s3;
