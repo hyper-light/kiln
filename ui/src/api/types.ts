@@ -477,6 +477,27 @@ export interface ConvoStatus {
 }
 
 /** `GET /api/conversations/series`: one store's series, a column each; `t` in unix seconds. */
+/** A line of the replication log (`GET /api/conversations/log`): what moved between the stores
+ * since the board's sample before (`batch`: a runner's store into the server's; `restore`: a mirror's
+ * copy sent back; `ship`: the server's store to a mirror's copy), or what happened to one (`note`). */
+export interface ConvoLogLine {
+  at: number;
+  /** Its store's key on the board (`fedora/abc`, `server`, `mirror:adacachy`). */
+  key: string;
+  kind: "batch" | "restore" | "ship" | "note";
+  level: "info" | "warn" | "error";
+  text: string;
+  moved?: { batches: number; rows: number; bytes: number; rev: number | null };
+}
+
+/** The replication log, newest first; `total` lines kept, `matched` of them have what was searched. */
+export interface ConvoLog {
+  at: number;
+  total: number;
+  matched: number;
+  lines: ConvoLogLine[];
+}
+
 export interface ConvoSeries {
   key: string;
   step: number;

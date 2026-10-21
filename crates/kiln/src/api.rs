@@ -756,6 +756,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // page; docs/conversations.md, "Telemetry").
         (&Method::GET, ["api", "conversations", "status"]) => Ok(srv::json(StatusCode::OK, &crate::harness::stores::status(&hub))),
         (&Method::GET, ["api", "conversations", "series"]) => conversation_series(&hub, &q),
+        (&Method::GET, ["api", "conversations", "log"]) => conversation_log(&hub, &q),
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
         (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => boxed(|| harness_kept_file(&hub, id, sha, &req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "file"]) => boxed(|| harness_file(&hub, id, q.get("path").cloned(), &req)).await,
@@ -3502,6 +3503,18 @@ fn conversation_series(hub: &Hub, q: &HashMap<String, String>) -> R {
     let window = q.get("window").and_then(|v| v.parse::<i64>().ok()).unwrap_or(3600).clamp(60, 86_400);
     let series = hub.harness.board.series(key, window, crate::util::now_ms()).unwrap_or_else(|| crate::convo::board::SeriesView { key: key.to_owned(), ..Default::default() });
     Ok(srv::json(StatusCode::OK, &series))
+}
+
+/// `GET /api/conversations/log?since=&q=&limit=`: the replication log, newest first: what moved
+/// between the conversation stores, sample by sample, and what happened to them; after `since`
+/// (unix ms), with `q` in the line (any case). `total`: every line it holds; `matched`: those with `q`.
+fn conversation_log(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let since = q.get("since").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1_000).clamp(1, 5_000);
+    let words = q.get("q").map_or("", String::as_str);
+    let board = &hub.harness.board;
+    let (total, matched) = board.log_len(words);
+    Ok(srv::json(StatusCode::OK, &json!({ "at": crate::util::now_ms(), "total": total, "matched": matched, "lines": board.log(since, words, limit) })))
 }
 
 fn goals_err(e: crate::goals::Error) -> ApiError {
