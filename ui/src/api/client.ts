@@ -238,7 +238,7 @@ export const api = {
   /** The audit log, filtered by any of its fields (exact values, comma-separated for any of), `q` and `since`. */
   audit: (filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit: 300, ...filters })}`, signal),
 
-  /** Settings → Updates: the server, every runner, recent upgrades and the binaries kiln has. */
+  /** System → Updates: the server, every runner, recent upgrades and the binaries kiln has. */
   updates: (signal?: AbortSignal) => get<UpdatesOverview>("/api/updates", signal),
   /** Ask GitHub (and, in Kubernetes, the image on the node) again; an `updates` event follows. */
   checkUpdates: () => post<UpdatesOverview>("/api/updates/check"),

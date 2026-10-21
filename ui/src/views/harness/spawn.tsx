@@ -216,7 +216,7 @@ function PastList({ target, kind, kindName, onPick, busy }: { target: string; ki
     ),
   ).data;
   return error ? (
-    <p className="ps-none">{/(502|404|not found)/i.test(error) ? "This machine's runner can't list its past sessions yet — upgrade it in Settings → Updates." : error}</p>
+    <p className="ps-none">{/(502|404|not found)/i.test(error) ? "This machine's runner can't list its past sessions yet — upgrade it in System → Updates." : error}</p>
   ) : list.length === 0 ? (
     <p className="ps-none">No past {kindName} sessions on this machine.</p>
   ) : (
@@ -236,7 +236,7 @@ function PastList({ target, kind, kindName, onPick, busy }: { target: string; ki
   );
 }
 
-/** Start inside this shell (its machine and folder), like another agent (Duplicate), or with a first message written for it (Diagnose, in Settings → Updates). */
+/** Start inside this shell (its machine and folder), like another agent (Duplicate), or with a first message written for it (Diagnose, in System → Updates). */
 type Defaults = { target?: string; shell?: string; cwd?: string; kind?: string; prompt?: string };
 
 /** What starting agents needs to know: each machine's harnesses, the machines, their shells, and the runners its commands can go to. */

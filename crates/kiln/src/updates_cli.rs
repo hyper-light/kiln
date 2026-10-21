@@ -1,5 +1,5 @@
 //! `kiln updates`: the fleet's kiln versions and update policies from the command line, as
-//! Settings → Updates shows and sets them (docs/releases.md): `list` (the default), `policy`,
+//! System → Updates shows and sets them (docs/releases.md): `list` (the default), `policy`,
 //! `upgrade` and `build`. Talks to a server as `kiln runs` does (`--url`, `--token`, or this
 //! machine's own server).
 

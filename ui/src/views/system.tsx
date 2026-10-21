@@ -5,16 +5,18 @@ import type { AuditEntry, SystemInfo } from "@/api/types";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { CopyButton, EmptyState, FoldSection, PageIntro, SearchField } from "@/components/ui/misc";
+import { CopyButton, EmptyState, FoldSection, PageIntro, SearchField, openFold } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
-import { useRes, warm, type Res } from "@/lib/data";
+import { updatesRes, useRes, warm, type Res } from "@/lib/data";
 import { fileStamp, saveFile, toCsv } from "@/lib/download";
 import { absoluteTime, formatUptime } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { useLocation } from "@/lib/router";
 import { childStatus, RelTime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
+import { BuildsSection, UpdatesSection } from "./updates/section";
 
 // Live while the page is open: the children, the crash log and the figures follow the server within seconds.
 const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 5_000 } };
@@ -70,8 +72,17 @@ function JsonView({ value }: { value: unknown }) {
 }
 
 export default function System() {
+  warm(updatesRes);
+  // At /system#<section>, arriving or following a link here: that one opens, and comes into view.
+  const { hash } = useLocation();
+  const arrived = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (el && hash) openFold(hash);
+    },
+    [hash],
+  );
   return (
-    <div className="container-console page">
+    <div ref={arrived} className="container-console page">
       <title>System · kiln</title>
       <PageIntro
         index={9}
@@ -83,6 +94,7 @@ export default function System() {
             variant="ghost"
             onClick={() => {
               invalidate("system");
+              invalidate("updates");
               invalidate("conversations");
               invalidate("audit");
             }}
@@ -196,7 +208,7 @@ function auditTakes(a: AuditEntry, chosen: Chosen, q: string, skip?: string) {
 function AuditSection() {
   const [win, setWin] = React.useState<AuditWindow>("7");
   return (
-    <FoldSection id="system.audit" index="05" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
+    <FoldSection id="system.audit" index="07" label="Audit" title="Audit log" aside={<Segmented label="Window" value={win} onChange={setWin} options={AUDIT_WINDOWS} />}>
       <Loadable label="the audit log" fallback={<TableHold head={<AuditHead />} rows={8} rowHeight={39} />}>
         <AuditTable win={win} />
       </Loadable>
@@ -356,17 +368,21 @@ function SystemBody() {
         </div>
       </FoldSection>
 
-      <FoldSection id="system.crash" index="02" label="Process" title="Crash log">
+      <UpdatesSection />
+
+      <BuildsSection />
+
+      <FoldSection id="system.crash" index="04" label="Process" title="Crash log">
         <p className="section-lead">{CRASH_LEAD}</p>
         <CrashLog lines={d.crash_log} />
       </FoldSection>
 
-      <FoldSection id="system.config" index="03" label="Read-only" title="Effective configuration">
+      <FoldSection id="system.config" index="05" label="Read-only" title="Effective configuration">
         <p className="section-lead">{CONFIG_LEAD}</p>
         <JsonView value={d.config} />
       </FoldSection>
 
-      <StoresSection index="04" />
+      <StoresSection index="06" />
 
       <AuditSection />
     </>
@@ -381,18 +397,20 @@ function SystemHold() {
       <FoldSection id="system.children" index="01" label="Supervisor" title="Children">
         <TableHold head={<ChildrenHead />} rows={8} rowHeight={39} label="Loading the system" />
       </FoldSection>
-      <FoldSection id="system.crash" index="02" label="Process" title="Crash log">
+      <UpdatesSection hold />
+      <BuildsSection hold />
+      <FoldSection id="system.crash" index="04" label="Process" title="Crash log">
         <p className="section-lead">{CRASH_LEAD}</p>
         <Hold height={160} />
       </FoldSection>
-      <FoldSection id="system.config" index="03" label="Read-only" title="Effective configuration">
+      <FoldSection id="system.config" index="05" label="Read-only" title="Effective configuration">
         <p className="section-lead">{CONFIG_LEAD}</p>
         <Hold height={160} />
       </FoldSection>
-      <FoldSection id="system.stores" index="04" label="Conversations" title="Conversation stores">
+      <FoldSection id="system.stores" index="06" label="Conversations" title="Conversation stores">
         <StoresHold />
       </FoldSection>
-      <FoldSection id="system.audit" index="05" label="Audit" title="Audit log">
+      <FoldSection id="system.audit" index="07" label="Audit" title="Audit log">
         <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
       </FoldSection>
     </>

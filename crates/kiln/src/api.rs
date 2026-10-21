@@ -1243,7 +1243,7 @@ async fn ai_takeover(hub: &Hub, machine: &str, pid: &str, q: &HashMap<String, St
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): taking it over ends it there, so ask with {{\"stop\": true}}")));
         }
         (TakeOver::Upgrade, _) => {
-            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in Settings → Updates first")));
+            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in System → Updates first")));
         }
         (TakeOver::Outside, _) => {
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}), as a harness kiln might not resume: quit it there first, then continue it")));
@@ -1270,7 +1270,7 @@ async fn ai_fork(hub: &Hub, machine: &str, pid: &str) -> R {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
     if !forks_on(hub, machine) {
-        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in Settings → Updates first")));
+        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in System → Updates first")));
     }
     let Some(spec) = found.fork_spec() else {
         return Err(if !found.started() {
@@ -2806,7 +2806,7 @@ async fn download_binary() -> R {
 }
 
 /// The binary for `target`: this server's own when it was built for that target, one uploaded
-/// or fetched here (Settings → Updates), otherwise a redirect to the release build of the same
+/// or fetched here (System → Builds), otherwise a redirect to the release build of the same
 /// version on GitHub.
 async fn download_for(hub: &Hub, target: &str) -> R {
     if target == TARGET {
@@ -2866,7 +2866,7 @@ async fn build_binary(hub: &Arc<Hub>, id: &str, q: &HashMap<String, String>, req
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
-// ------------------------------------------------------------------ updates (Settings → Updates)
+// ------------------------------------------------------------------ updates (System → Updates)
 
 /// `GET /api/updates`: this server and how it is upgraded, every machine's runner, the latest
 /// upgrades and the binaries kiln can hand out. `POST /api/updates/check` asks GitHub (and, in

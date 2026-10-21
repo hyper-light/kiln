@@ -1,4 +1,4 @@
-//! Upgrading kiln from its own UI (Settings → Updates).
+//! Upgrading kiln from its own UI (System → Updates).
 //!
 //! * **Runners**, without a restart and without losing anything, always through
 //!   `kiln install --agent --upgrade` on the machine: a runner from before in-place upgrades gets
@@ -619,7 +619,7 @@ pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u
     let version = env!("CARGO_PKG_VERSION");
     let Some(bytes) = download_release(version, target).await? else {
         anyhow::bail!(
-            "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under Settings → Updates.",
+            "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under System → Builds.",
             crate::api::TARGET
         );
     };
@@ -1058,7 +1058,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
 
 // ------------------------------------------------------------------ runners
 
-/// A machine's runner as Settings → Updates shows it.
+/// A machine's runner as System → Updates shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerInfo {
     pub name: String,
@@ -1127,7 +1127,7 @@ pub struct WayOpen {
     pub why: String,
 }
 
-/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in Settings → Updates.
+/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in System → Updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Policy {
@@ -1175,7 +1175,7 @@ pub async fn set_policy(hub: &Hub, machine: &str, p: Policy) -> anyhow::Result<(
 }
 
 /// How long kiln waits on a runner's upgrade before it calls it failed: `[updates]` in kiln.toml,
-/// unless changed in Settings → Updates. A change applies to upgrades under way too.
+/// unless changed in System → Updates. A change applies to upgrades under way too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Waits {
@@ -1249,7 +1249,7 @@ pub fn said(d: Duration) -> String {
     }
 }
 
-/// Where the waits chosen in Settings → Updates are kept (none: kiln.toml's).
+/// Where the waits chosen in System → Updates are kept (none: kiln.toml's).
 const WAITS_KEY: &str = "updates/waits";
 
 /// How long upgrades are waited on now.
@@ -1263,7 +1263,7 @@ pub async fn waits(hub: &Hub) -> Waits {
     w
 }
 
-/// The waits were changed in Settings → Updates: kiln.toml's don't apply.
+/// The waits were changed in System → Updates: kiln.toml's don't apply.
 pub async fn waits_changed(hub: &Hub) -> bool {
     hub.store.kv_get(WAITS_KEY.to_owned()).await.ok().flatten().is_some()
 }

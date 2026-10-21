@@ -414,7 +414,7 @@ pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
         Some(machine) => {
             let caps = hub.instances.lock().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
             if !caps {
-                return Err(format!("{machine}'s kiln is older than workspaces: upgrade it (Settings → Updates)"));
+                return Err(format!("{machine}'s kiln is older than workspaces: upgrade it (System → Updates)"));
             }
             match hub.agents.lock().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone())) {
                 Some(f) => f,
