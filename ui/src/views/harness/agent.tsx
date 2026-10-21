@@ -36,7 +36,7 @@ import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
 import { useEndWithChildren } from "./family";
-import { Beam, PrismLabel } from "./signals";
+import { LoadingMark, PrismLabel } from "./signals";
 import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
 
 type PhoneTab = "work" | InspectorTab;
@@ -560,7 +560,7 @@ function AgentLoading({ id }: { id: string }) {
   const work = (
     <div className="hx-main">
       <div className="hx-timeline ag-loading" role="status">
-        <span aria-hidden="true"><Beam status="running" /></span>
+        <LoadingMark />
         <PrismLabel live>Loading conversation</PrismLabel>
       </div>
       <div className="hx-dock">

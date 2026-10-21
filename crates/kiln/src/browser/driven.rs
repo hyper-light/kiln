@@ -479,8 +479,13 @@ async fn start_webdriver(dir: &Path, sim: Option<&super::simulators::Sim>) -> an
         (None, None) => json!({"capabilities": {"alwaysMatch": {}}}),
     };
     let made = http(&format!("{root}/session"), Some(caps)).await.map_err(|e| {
-        if safari && format!("{e:#}").to_ascii_lowercase().contains("remote automation") {
+        let said = format!("{e:#}").to_ascii_lowercase();
+        if safari && said.contains("remote automation") {
             anyhow::anyhow!("Safari's remote automation is off on this Mac: run `safaridriver --enable` there once (it asks for an administrator's password)")
+        } else if safari && said.contains("already paired") {
+            // One automated Safari at a time: another tool's, or one whose end Safari never took
+            // (a session ended while its Mac was locked).
+            anyhow::anyhow!("Safari on this Mac is already driven by another WebDriver session: quit its automated window (the one with the striped address bar) and open this again")
         } else {
             e
         }
