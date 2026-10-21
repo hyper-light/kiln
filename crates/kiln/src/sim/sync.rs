@@ -720,7 +720,14 @@ impl Sim {
         // Each peer's messages in the order made; the peers in a fixed order (a map's isn't).
         messages.sort_by_key(|msg| msg.to);
         let mut frames: Vec<(Who, Frame)> = messages.into_iter().filter(|msg| msg.to == SERVER).map(|msg| (Who::Server, Frame::Raft(Box::new(msg)))).collect();
-        let wanted = rn.r.machine_mut().work(&blobs).unwrap_or_default();
+        let wanted = match rn.r.machine_mut().work(&blobs) {
+            Ok(wanted) => wanted,
+            Err(err) => {
+                // As the runner does: the folder's error is said, and the next drive takes it again.
+                self.trace.note(|| format!("{now:?} {}'s folder: {err}", mc.name));
+                Vec::new()
+            }
+        };
         // Its contents, fetched a few at a time.
         rn.retry.retain(|_, t| *t > now);
         for hash in wanted {
@@ -1348,6 +1355,57 @@ mod tests {
             let got = disk.read("/home/m2/repo/docs/a.txt").map_err(e)?;
             if got != bytes {
                 return Err(format!("seed {seed}: after a power loss docs/a.txt holds {} bytes, not the {} sync wrote there", got.len(), bytes.len()));
+            }
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, the second bug kiln-sim found, by its seeds: a write failing part-way through
+    /// applying a step (an I/O error, a full disk) left the step taken by the copy's tree with the
+    /// rest of its files unwritten; tried again, the tree had it already, so they never were. A
+    /// conflict copy missing from a folder for good (sync seed 184, moves 136 and 170), a file left
+    /// at an older version (sync seed 125).
+    #[test]
+    fn the_seeds_where_a_write_failed_part_way_through_a_step_converge() -> Result<(), String> {
+        for seed in [184, 125] {
+            run(seed, 0, Plant::default(), Mode::Sync)?;
+        }
+        for seed in [136, 170] {
+            run(seed, 0, Plant::default(), Mode::Moves)?;
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, the second bug's contract: a step whose writes fail part-way, at any of them, is
+    /// applied whole when it's tried again: every file it brings is in the folder.
+    #[test]
+    fn a_step_a_write_failed_part_way_through_is_applied_whole_when_tried_again() -> Result<(), String> {
+        use crate::sync::{Change, Copy, State};
+        for fail_at in 0..40u64 {
+            let disk = Disk::new(SimClock::new(), Rng::new(fail_at), DiskFaults::none());
+            let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+            let root = PathBuf::from("/home/m2/repo");
+            fs.create_dir_all(&root).map_err(e)?;
+            let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
+            let mut changes = Vec::new();
+            let mut want = BTreeMap::new();
+            for (path, body) in [("a.txt", "one"), ("src/b.rs", "two"), ("docs/c/d.md", "three")] {
+                let hash = blobs.put_bytes(body.as_bytes()).map_err(e)?;
+                want.insert(path.to_owned(), body.as_bytes().to_vec());
+                changes.push(Change { path: path.into(), to: Some(Version::File { hash, exec: false }), base: None });
+            }
+            let step = Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes };
+            let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
+            disk.freeze_after(fail_at);
+            let first = copy.apply(&step, &blobs);
+            disk.thaw();
+            if first.is_err() {
+                copy.apply(&step, &blobs).map_err(|err| format!("failing at write {fail_at}, then again: {err}"))?;
+            }
+            let have: BTreeMap<String, Vec<u8>> =
+                disk.files("/home/m2/repo").into_iter().filter(|(p, _)| !p.rsplit('/').next().is_some_and(|n| n.starts_with(TEMP_PREFIX))).map(|(p, (b, _))| (p, b)).collect();
+            if have != want {
+                return Err(format!("failing at write {fail_at}: the folder holds {:?}, the step brings {:?}", have.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>()));
             }
         }
         Ok(())

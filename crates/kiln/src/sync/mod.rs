@@ -441,8 +441,20 @@ impl Copy {
     }
 
     /// Applies a committed step, in log order (`needs` says which blobs it reads). A step taken
-    /// before changes nothing.
+    /// before changes nothing. All or nothing to the copy's state: when writing its files fails
+    /// part-way (a full disk, an I/O error), the state is put back as it was before it, so the step
+    /// is applied again, whole, next time, its files already written found in place; taken by the
+    /// tree with the rest unwritten, they'd never be written at all.
     pub fn apply(&mut self, step: &Step, blobs: &Blobs) -> io::Result<Vec<Outcome>> {
+        let undo = Undo::of(&self.state, step, self.ours(step));
+        let applied = self.apply_whole(step, blobs);
+        if applied.is_err() {
+            undo.restore(&mut self.state);
+        }
+        applied
+    }
+
+    fn apply_whole(&mut self, step: &Step, blobs: &Blobs) -> io::Result<Vec<Outcome>> {
         let ours = self.ours(step);
         if ours {
             // The log has it: it isn't sent again.
@@ -576,6 +588,70 @@ impl Copy {
                 self.touch(&full, made_dirs);
                 Ok(())
             }
+        }
+    }
+}
+
+/// What applying a step may change of a copy's state, as it was before ([`Copy::apply`]): the tree's,
+/// synced and pending versions of its paths and of the names their conflict copies would take,
+/// its member's last number, and, for a step of the copy's own, its unsent steps.
+struct Undo {
+    seq: Option<(u64, Option<u64>)>,
+    files: Vec<(String, Option<Version>)>,
+    synced: Vec<(String, Option<Version>)>,
+    pending: Vec<(String, Option<Option<Version>>)>,
+    sent: Option<Vec<Step>>,
+}
+
+impl Undo {
+    fn of(st: &State, step: &Step, ours: bool) -> Self {
+        let mut paths: Vec<String> = Vec::new();
+        for c in &step.changes {
+            paths.push(c.path.clone());
+            if c.to.is_some() {
+                paths.push(conflict_name(&c.path, &step.by, step.at));
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Self {
+            seq: (step.seq != 0).then(|| (step.member, st.tree.seqs.get(&step.member).copied())),
+            files: paths.iter().map(|p| (p.clone(), st.tree.files.get(p).cloned())).collect(),
+            synced: paths.iter().map(|p| (p.clone(), st.synced.get(p).cloned())).collect(),
+            pending: paths.iter().map(|p| (p.clone(), st.pending.get(p).cloned())).collect(),
+            sent: ours.then(|| st.sent.clone()),
+        }
+    }
+
+    fn restore(self, st: &mut State) {
+        if let Some((member, seq)) = self.seq {
+            match seq {
+                Some(s) => {
+                    st.tree.seqs.insert(member, s);
+                }
+                None => {
+                    st.tree.seqs.remove(&member);
+                }
+            }
+        }
+        for (p, v) in self.files {
+            set(&mut st.tree.files, &p, v);
+        }
+        for (p, v) in self.synced {
+            set(&mut st.synced, &p, v);
+        }
+        for (p, v) in self.pending {
+            match v {
+                Some(v) => {
+                    st.pending.insert(p, v);
+                }
+                None => {
+                    st.pending.remove(&p);
+                }
+            }
+        }
+        if let Some(sent) = self.sent {
+            st.sent = sent;
         }
     }
 }
