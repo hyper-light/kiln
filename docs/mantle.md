@@ -402,6 +402,19 @@ API, roadmap or trust model is Ada's to decide, marked **[Ada]** here and listed
 - **Through S3** (kiln's `s3` store against Mantle's listener, phase B), kiln's SHA-256 etags map
   as they do against any S3.
 
+### Agreed next
+
+- **Mantle's listener against kiln's suite:** Mantle's agent tells kiln's when its HTTP/1.1 listener
+  serves (the next goal in its stack); kiln points `KILN_TEST_S3` at it and runs the 161 clauses of
+  the `Blobs` suite; failing clauses are Mantle's to fix.
+- **kiln's workload in Mantle's tests:** large objects put once in sequential 16 MiB parts and read
+  many times in ranges; many small puts and gets of source files; frequent conditional puts per
+  key; rare listings in pages of 1,000; prefix deletes. Its gateway cuts 8 MiB blocks, so a 16 MiB
+  part is two; conditional puts are judged in the Name range as the write commits, so writers racing
+  on one key cost a round each, with no lock.
+- **The measured mix:** once CP-T10.1's `kiln_blobs_*` metrics are live, kiln sends the request mix
+  by operation, size and latency; it sets the listener's benchmark workload.
+
 ### Decisions for Ada
 
 From Mantle's answers, each Ada's to make:
