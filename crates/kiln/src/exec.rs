@@ -619,8 +619,12 @@ impl Exec {
         }
         let a = &self.assign;
         let url = format!("{}/api/jobs/{}/artifacts/upload", a.server_url.trim_end_matches('/'), a.job_id);
-        // Tried again when it breaks off (a connection reset on a busy network): three times in all.
         let bytes = bytes::Bytes::from(bytes);
+        // In pieces, where the server takes them so.
+        if self.upload_pieces(&url, &bytes).await? {
+            return Ok(count);
+        }
+        // Whole (an older server), tried again when it breaks off: three times in all.
         let mut last = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
@@ -636,7 +640,64 @@ impl Exec {
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("it wasn't sent")))
     }
+
+    /// A job's artifacts in pieces, each taken before the next goes and the whole checked at the
+    /// end (its size and digest): one that breaks off costs that piece, and the upload goes on
+    /// from where the server's pieces end. `false`: the server doesn't take them so (an older one,
+    /// which answers no `GET` for how much came).
+    async fn upload_pieces(&self, url: &str, bytes: &bytes::Bytes) -> anyhow::Result<bool> {
+        use sha2::Digest as _;
+        let token = &self.assign.job_token;
+        let have = |v: &serde_json::Value| v.get("have").and_then(serde_json::Value::as_u64).and_then(|n| usize::try_from(n).ok());
+        // Where the server's pieces end.
+        let had = || async {
+            let r = self.http.get(url).bearer(token).timeout(Duration::from_secs(30)).send().await.ok()?;
+            if !r.is_success() {
+                return None;
+            }
+            have(&r.json::<serde_json::Value>(1 << 10).await.ok()?)
+        };
+        if had().await.is_none() {
+            return Ok(false);
+        }
+        let total = bytes.len();
+        let (mut at, mut misses) = (0usize, 0u32);
+        while at < total {
+            let piece = bytes.slice(at..at.saturating_add(ARTIFACT_PIECE).min(total));
+            match self.http.put(&format!("{url}?at={at}")).bearer(token).body(piece).timeout(Duration::from_secs(120)).send().await {
+                Ok(r) if r.is_success() || r.status() == 409 => {
+                    // Taken (or not where they ended): on from where they end now.
+                    let ok = r.is_success();
+                    let next = r.json::<serde_json::Value>(1 << 10).await.ok().as_ref().and_then(have);
+                    match next {
+                        Some(n) if n <= total => at = n,
+                        _ => anyhow::bail!("the server's pieces of its artifacts end past them"),
+                    }
+                    if ok {
+                        misses = 0;
+                        continue;
+                    }
+                }
+                Ok(r) if r.status() < 500 => anyhow::bail!("HTTP {} for a piece of its artifacts", r.status()),
+                _ => {}
+            }
+            misses += 1;
+            anyhow::ensure!(misses <= 6, "its artifacts' upload broke off {misses} times running");
+            crate::rt::sleep(Duration::from_secs(2 * u64::from(misses))).await;
+            if let Some(n) = had().await.filter(|n| *n <= total) {
+                at = n;
+            }
+        }
+        let digest = hex::encode(sha2::Sha256::digest(bytes));
+        let r = self.http.post(&format!("{url}?size={total}&sha256={digest}")).bearer(token).timeout(Duration::from_secs(300)).send().await?;
+        anyhow::ensure!(r.is_success(), "HTTP {} as its artifacts' upload ended", r.status());
+        Ok(true)
+    }
 }
+
+/// How big each piece of an upload in pieces is (`Exec::upload_pieces`): what one holds on its way
+/// is no more than this, and a piece that breaks off costs no more.
+const ARTIFACT_PIECE: usize = 8 << 20;
 
 /// Records a running step's process group on disk so that, if this agent dies without cleaning
 /// up (SIGKILL, power loss, server crash for the in-process agent), the next start can kill the
