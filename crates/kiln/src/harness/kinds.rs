@@ -283,6 +283,9 @@ impl Adapter {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        // A new process: nothing an earlier one ran, in this harness or the one before a switch,
+        // goes on under it.
+        core.end_harness_work();
         match self {
             Self::Claude(a) => a.start(core),
             Self::Codex(a) => a.start(core),
@@ -316,6 +319,9 @@ impl Adapter {
             Self::Acp(a) => a.exited(core, code, error),
             Self::Agy(a) => a.exited(core, code, error),
         }
+        // Whatever the harness and whatever its adapter knew: what it ran ends with its process
+        // (a switch, a stop, a restart or a crash), its subagents' and shells' calls with it.
+        core.end_harness_work();
     }
 
     /// A run (`Effect::Run` or `Effect::Fetch`) ended: its exit code (None: it could not start
@@ -610,5 +616,58 @@ mod tests {
             assert_eq!(serde_json::to_value(back.freeze())?, out, "{id}");
         }
         Ok(())
+    }
+
+    /// A session moved from Codex to another harness: what Codex left live (an older image kept
+    /// it so) can never be settled by the adapter after it, whichever that is.
+    #[test]
+    fn whatever_the_harness_what_it_ran_ends_with_its_process_and_a_new_one_inherits_none_of_it() {
+        use super::super::model::{Body, Task, ToolCall, ToolKind, ToolStatus};
+        let call = |id: &str| {
+            Body::Tool(Box::new(ToolCall {
+                tool_id: id.into(),
+                name: "shell".into(),
+                tool: ToolKind::Shell,
+                title: "python3 -m http.server".into(),
+                detail: None,
+                input: serde_json::Value::Null,
+                status: ToolStatus::Running,
+                output: None,
+                truncated: false,
+                diffs: Vec::new(),
+                todos: Vec::new(),
+                task: None,
+                exit_code: None,
+                started: 0,
+                ended: None,
+                server: None,
+                tool_short: None,
+                skill: None,
+                runner: None,
+            }))
+        };
+        let row = |id: &str, tool: &str, class: &str| Task { id: id.into(), tool_id: Some(tool.into()), class: Some(class.into()), status: "running".into(), ..Task::default() };
+        let mut core = Core::new();
+        core.state.tasks = vec![row("terminal-exec-1", "exec-1", "shell"), row("01a15afd", "call_spawn", "agent"), Task { id: "left-77".into(), status: "running".into(), ..Task::default() }];
+        core.upsert("exec-1", None, call("exec-1"));
+        // An adapter that keeps no tasks of its own (ACP) still ends them with its process.
+        let mut acp = Adapter::Acp(Box::new(Acp::new(None)));
+        acp.exited(&mut core, Some(0), None);
+        assert_eq!(core.state.tasks.iter().map(|t| t.status.as_str()).collect::<Vec<_>>(), ["stopped", "stopped", "running"]);
+        assert!(core.get("exec-1").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Cancelled && t.ended.is_some())));
+        // Codex's own exit ends its terminals' calls too, not only their rows.
+        core.state.tasks.push(row("terminal-exec-2", "exec-2", "shell"));
+        core.upsert("exec-2", None, call("exec-2"));
+        let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
+        codex.exited(&mut core, None, None);
+        assert!(core.get("exec-2").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Cancelled)));
+        // A new process starts with nothing of an earlier one's still running.
+        core.state.tasks.push(row("terminal-exec-3", "exec-3", "shell"));
+        core.upsert("exec-3", None, call("exec-3"));
+        let mut claude = Adapter::Claude(Box::new(Claude::new(false)));
+        claude.start(&mut core);
+        assert!(core.state.tasks.iter().filter(|t| t.id != "left-77").all(|t| !t.live()));
+        assert!(core.get("exec-3").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Cancelled)));
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "left-77").map(|t| t.status.as_str()), Some("running"), "kiln's own, taken back over");
     }
 }
