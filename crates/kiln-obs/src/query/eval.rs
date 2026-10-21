@@ -1821,6 +1821,29 @@ impl Drop for Helpers {
     }
 }
 
+/// Helper threads taken from the budget metric queries read on (a log scan's: `crate::logs::store`),
+/// given back when dropped.
+pub(crate) struct Taken(Helpers);
+
+impl Taken {
+    /// How many were free to take.
+    pub(crate) fn count(&self) -> usize {
+        self.0.0
+    }
+}
+
+/// As many as `want` of the queries' helper threads, as many as are free.
+pub(crate) fn take_helpers(want: usize) -> Taken {
+    Taken(Helpers::take(want))
+}
+
+/// What a helper thread runs first ([`on_helper_start`]'s), a log scan's too.
+pub(crate) fn helper_started() {
+    if let Some(f) = HELPER_START.get() {
+        f();
+    }
+}
+
 /// The threads every query reads on, when a test says so.
 #[cfg(test)]
 fn forced_threads() -> Option<usize> {

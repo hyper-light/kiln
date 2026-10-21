@@ -1,7 +1,9 @@
 //! Logs on recorded data (`docs/observe.md` §12.8): kiln's own log lines as records, ingested
 //! through batches into a store on disk, then searched.
 //!
-//! `KOBS_LOGS=<file of log lines>[:<file>...] cargo bench -p kiln-obs --bench logs`
+//! `KOBS_LOGS=<file of log lines>[:<file>...] cargo bench -p kiln-obs --bench logs` (`KOBS_HELPERS`:
+//! the helper threads a query's scan may take, as the server's `query_helpers` says; unset, a quarter
+//! of the cores less one)
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss)]
 
 use std::time::Instant;
@@ -27,7 +29,15 @@ fn main() {
             return;
         }
     };
-    println!("records: {} ({:.1} MB of lines)", records.len(), raw_bytes as f64 / 1e6);
+    if let Some(n) = std::env::var("KOBS_HELPERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        kiln_obs::query::eval::set_helpers(n);
+    }
+    println!(
+        "records: {} ({:.1} MB of lines), query helpers {}",
+        records.len(),
+        raw_bytes as f64 / 1e6,
+        std::env::var("KOBS_HELPERS").unwrap_or_else(|_| kiln_obs::query::eval::default_helpers().to_string())
+    );
     let dir = std::env::temp_dir().join(format!("kobs-logs-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut store = Store::open(&dir, Keyed::new()).unwrap();

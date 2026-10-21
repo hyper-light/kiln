@@ -17,7 +17,8 @@ pub fn days(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// `2026-10-17T15:03:59.435765226Z` or `2026-10-17T17:00:19-0700` at the line's start: ns.
+/// `2026-10-17T15:03:59.435765226Z`, `2026-10-17T17:00:19-0700` or `2026-10-16T19:52:49-07:00`
+/// (journalctl's `short-iso`) at the line's start: ns.
 pub fn leading_time(line: &str) -> Option<(i64, usize)> {
     let b = line.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[10] != b'T' {
@@ -40,10 +41,11 @@ pub fn leading_time(line: &str) -> Option<(i64, usize)> {
     match b.get(at) {
         Some(b'Z') => at += 1,
         Some(&c) if c == b'+' || c == b'-' => {
+            let colon = usize::from(b.get(at + 3) == Some(&b':'));
             let hh = n(at + 1..at + 3)?;
-            let mm = n(at + 3..at + 5)?;
+            let mm = n(at + 3 + colon..at + 5 + colon)?;
             off = (hh * 3600 + mm * 60) * if c == b'+' { 1 } else { -1 };
-            at += 5;
+            at += 5 + colon;
         }
         _ => {}
     }

@@ -16,6 +16,89 @@ pub enum LogStoreError {
     Row(#[from] RowError),
     #[error("a log block's text does not decompress")]
     Text,
+    #[error("a thread reading log blocks failed")]
+    Helper,
+}
+
+/// Rows a scan's thread takes at the least before another is asked for: some ten milliseconds of
+/// reading at 190 ns a row (`docs/observe.md` §12.8), against the tens of microseconds a thread
+/// takes to start and its groups' merging.
+pub const SPLIT_ROWS: u64 = 1 << 16;
+
+/// A block a scan reads: one sealed in memory, or a file's (its `i`th).
+#[derive(Clone, Copy)]
+enum Src<'a> {
+    Sealed(&'a LogBlock),
+    File(&'a LogFile, usize, &'a LogBlock),
+}
+
+impl<'a> Src<'a> {
+    fn block(&self) -> &'a LogBlock {
+        match self {
+            Self::Sealed(b) | Self::File(_, _, b) => b,
+        }
+    }
+}
+
+/// One thread's reading of a scan: what it matches, its room kept from block to block.
+struct Scan<'q> {
+    search: &'q Search,
+    from: i64,
+    to: i64,
+    scratch: RowScratch,
+    text: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+impl<'q> Scan<'q> {
+    fn new(search: &'q Search, from: i64, to: i64) -> Self {
+        Self { search, from, to, scratch: RowScratch::default(), text: Vec::new(), raw: Vec::new() }
+    }
+
+    /// A row read: to `f` if it is in the range and matches.
+    fn row<E>(&mut self, r: &RecordRef<'_>, f: &mut impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<(), E> {
+        if r.ts < self.from || r.ts > self.to || !self.search.row(r, &mut self.scratch) {
+            return Ok(());
+        }
+        f(r)
+    }
+
+    /// The head's rows: how many.
+    fn head<E: From<LogStoreError>>(&mut self, store: &LogStore, f: &mut impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<u64, E> {
+        let mut n = 0;
+        for (seg, rows) in &store.head {
+            let mut it = Rows::new(seg, *rows as usize);
+            while let Some(r) = it.next_row().map_err(LogStoreError::from)? {
+                n += 1;
+                self.row(&r, f)?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// A block's rows: how many.
+    fn block<E: From<LogStoreError>>(&mut self, src: Src<'_>, f: &mut impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<u64, E> {
+        let mut raw = std::mem::take(&mut self.raw);
+        let read = match src {
+            Src::Sealed(b) => b.decompress(&mut raw).map_err(|_| LogStoreError::Text),
+            Src::File(file, i, b) => match file.read_text(i, &mut self.text) {
+                Ok(_) => b.decompress_text(&self.text, &mut raw).map_err(|_| LogStoreError::Text),
+                Err(e) => Err(LogStoreError::from(e)),
+            },
+        };
+        let result = (|| {
+            read?;
+            let mut n = 0;
+            let mut it = src.block().rows(&raw);
+            while let Some(r) = it.next_row().map_err(LogStoreError::from)? {
+                n += 1;
+                self.row(&r, f)?;
+            }
+            Ok(n)
+        })();
+        self.raw = raw;
+        result
+    }
 }
 
 /// A logs file the store holds.
@@ -456,6 +539,20 @@ impl Acc {
         Self { n: 0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY, distinct: None }
     }
 
+    /// Another's, of the same group and bucket, taken in.
+    fn merge(&mut self, o: Acc) {
+        self.n += o.n;
+        self.sum += o.sum;
+        self.min = self.min.min(o.min);
+        self.max = self.max.max(o.max);
+        if let Some(d) = o.distinct {
+            match &mut self.distinct {
+                Some(mine) => mine.extend(d),
+                None => self.distinct = Some(d),
+            }
+        }
+    }
+
     fn value(&self, measure: &Measure) -> f64 {
         match measure {
             Measure::Count => self.n as f64,
@@ -488,7 +585,12 @@ impl Grouping {
         if by.len() > MAX_BY {
             return Err(AggregateError::TooManyFacets);
         }
-        Ok(Self { hash: crate::hash::Keyed::new(), keys: Vec::new(), by_key: hashbrown::HashTable::new(), cells: hashbrown::HashTable::new() })
+        Ok(Self::empty())
+    }
+
+    /// A grouping of nothing yet (its facets checked by [`Grouping::new`] first).
+    fn empty() -> Self {
+        Self { hash: crate::hash::Keyed::new(), keys: Vec::new(), by_key: hashbrown::HashTable::new(), cells: hashbrown::HashTable::new() }
     }
 
     /// The cell of the group of `values` and `bucket`, made if new.
@@ -548,6 +650,27 @@ impl Grouping {
         }
         Ok(())
     }
+
+    /// Another grouping's cells taken into this one's, each into the cell of its group's values
+    /// and its bucket (a scan's threads' groupings, merged in their blocks' order).
+    fn merge(&mut self, other: Grouping, cells_max: usize) -> Result<(), AggregateError> {
+        let Grouping { keys, cells, .. } = other;
+        for (c, a) in cells {
+            let Some(key) = keys.get((c >> 32) as usize) else { continue };
+            let mut values: [&str; MAX_BY] = [""; MAX_BY];
+            for (slot, v) in values.iter_mut().zip(key) {
+                *slot = v;
+            }
+            self.cell(values.get(..key.len()).unwrap_or_default(), (c & u64::from(u32::MAX)) as u32, cells_max)?.merge(a);
+        }
+        Ok(())
+    }
+}
+
+/// Whether a measure's value is the same whatever order its records come in (and so a scan of it
+/// may be split among threads): a sum's bits are not.
+fn order_free(measure: &Measure) -> bool {
+    matches!(measure, Measure::Count | Measure::Cardinality(_) | Measure::Min(_) | Measure::Max(_))
 }
 
 impl LogStore {
@@ -575,60 +698,138 @@ impl LogStore {
     /// blocks and files (blocks a search rules out are never read); the rows read and the blocks
     /// ruled out.
     fn each_match<E: From<LogStoreError>>(&self, search: &Search, from: i64, to: i64, mut f: impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<(u64, u64), E> {
-        let (mut rows_scanned, mut blocks_pruned) = (0u64, 0u64);
         if to < from {
             return Ok((0, 0));
         }
-        let mut scratch = RowScratch::default();
-        let mut row = |r: &RecordRef<'_>, rows_scanned: &mut u64| -> Result<(), E> {
-            *rows_scanned += 1;
-            if r.ts < from || r.ts > to || !search.row(r, &mut scratch) {
-                return Ok(());
-            }
-            f(r)
-        };
-        for (seg, n) in &self.head {
-            let mut rows = Rows::new(seg, *n as usize);
-            while let Some(r) = rows.next_row().map_err(LogStoreError::from)? {
-                row(&r, &mut rows_scanned)?;
-            }
-        }
-        let (mut text, mut raw) = (Vec::new(), Vec::new());
-        let consider = |b: &LogBlock| b.max_ts >= from && b.min_ts <= to && search.block_in(b, self.spans) != Maybe::No;
-        for b in &self.sealed {
-            if !consider(b) {
-                blocks_pruned += 1;
-                continue;
-            }
-            b.decompress(&mut raw).map_err(|_| LogStoreError::Text)?;
-            let mut rows = b.rows(&raw);
-            while let Some(r) = rows.next_row().map_err(LogStoreError::from)? {
-                row(&r, &mut rows_scanned)?;
-            }
-        }
-        for file in &self.files {
-            for (i, b) in file.log.blocks.iter().enumerate() {
-                if !consider(b) {
-                    blocks_pruned += 1;
-                    continue;
-                }
-                file.log.read_text(i, &mut text).map_err(LogStoreError::from)?;
-                b.decompress_text(&text, &mut raw).map_err(|_| LogStoreError::Text)?;
-                let mut rows = b.rows(&raw);
-                while let Some(r) = rows.next_row().map_err(LogStoreError::from)? {
-                    row(&r, &mut rows_scanned)?;
-                }
-            }
+        let mut scan = Scan::new(search, from, to);
+        let mut rows_scanned = scan.head(self, &mut f)?;
+        let (srcs, blocks_pruned) = self.candidates(search, from, to);
+        for s in &srcs {
+            rows_scanned += scan.block(*s, &mut f)?;
         }
         Ok((rows_scanned, blocks_pruned))
+    }
+
+    /// The blocks a scan of `[from, to]` for `search` reads, sealed then files' in order, and how
+    /// many it rules out.
+    fn candidates(&self, search: &Search, from: i64, to: i64) -> (Vec<Src<'_>>, u64) {
+        let consider = |b: &LogBlock| b.max_ts >= from && b.min_ts <= to && search.block_in(b, self.spans) != Maybe::No;
+        let all = self.sealed.iter().map(Src::Sealed).chain(self.files.iter().flat_map(|f| f.log.blocks.iter().enumerate().map(|(i, b)| Src::File(&f.log, i, b))));
+        let (mut srcs, mut pruned) = (Vec::new(), 0u64);
+        for s in all {
+            if consider(s.block()) {
+                srcs.push(s);
+            } else {
+                pruned += 1;
+            }
+        }
+        (srcs, pruned)
+    }
+
+    /// As [`each_match`](Self::each_match), each matching record to `fold` of a state its thread
+    /// holds (`init`'s): where the blocks hold enough rows ([`SPLIT_ROWS`] a thread) and the
+    /// queries' helper threads are free, split among them in order, each thread its run of blocks.
+    /// The states in the blocks' order, this thread's first (the head's in it), to be merged; the
+    /// rows read and the blocks ruled out. For what does not hang on the order records come in
+    /// (counts, distinct values, the least and most): a sum's bits would.
+    fn each_match_split<S: Send, E: From<LogStoreError> + Send>(
+        &self,
+        search: &Search,
+        from: i64,
+        to: i64,
+        threads: Option<usize>,
+        init: &(dyn Fn() -> S + Sync),
+        fold: &(dyn Fn(&mut S, &RecordRef<'_>) -> Result<(), E> + Sync),
+    ) -> Result<(Vec<S>, u64, u64), E> {
+        let mut first = init();
+        if to < from {
+            return Ok((vec![first], 0, 0));
+        }
+        let mut scan = Scan::new(search, from, to);
+        let mut rows_scanned = scan.head(self, &mut |r| fold(&mut first, r))?;
+        let (srcs, blocks_pruned) = self.candidates(search, from, to);
+        let rows: u64 = srcs.iter().map(|s| u64::from(s.block().rows)).sum();
+        let want = usize::try_from(rows / SPLIT_ROWS).unwrap_or(usize::MAX).min(srcs.len()).saturating_sub(1);
+        let taken = match threads {
+            Some(_) => None,
+            None => Some(crate::query::eval::take_helpers(want)),
+        };
+        let n = threads.unwrap_or_else(|| taken.as_ref().map_or(0, crate::query::eval::Taken::count) + 1).clamp(1, srcs.len().max(1));
+        if n == 1 {
+            for s in &srcs {
+                rows_scanned += scan.block(*s, &mut |r| fold(&mut first, r))?;
+            }
+            return Ok((vec![first], rows_scanned, blocks_pruned));
+        }
+        // Runs of blocks of about equal rows, in order: the first this thread's.
+        let mut runs: Vec<&[Src<'_>]> = Vec::with_capacity(n);
+        let (mut at, mut acc, per) = (0usize, 0u64, rows.div_ceil(n as u64).max(1));
+        for (i, s) in srcs.iter().enumerate() {
+            acc += u64::from(s.block().rows);
+            if acc >= per && runs.len() + 1 < n {
+                runs.push(srcs.get(at..=i).unwrap_or_default());
+                (at, acc) = (i + 1, 0);
+            }
+        }
+        runs.push(srcs.get(at..).unwrap_or_default());
+        let failed = || E::from(LogStoreError::Helper);
+        std::thread::scope(|scope| {
+            let mut helpers = Vec::with_capacity(runs.len().saturating_sub(1));
+            for run in runs.iter().skip(1).copied() {
+                let job = move || -> Result<(S, u64), E> {
+                    crate::query::eval::helper_started();
+                    let (mut state, mut sc, mut rows) = (init(), Scan::new(search, from, to), 0u64);
+                    for s in run {
+                        rows += sc.block(*s, &mut |r| fold(&mut state, r))?;
+                    }
+                    Ok((state, rows))
+                };
+                // A helper that does not start: its run is this thread's to read, in its place.
+                helpers.push(std::thread::Builder::new().name("kiln-query".into()).spawn_scoped(scope, job).map_err(|_| run));
+            }
+            if let Some(run) = runs.first() {
+                for s in *run {
+                    rows_scanned += scan.block(*s, &mut |r| fold(&mut first, r))?;
+                }
+            }
+            let mut states = Vec::with_capacity(runs.len());
+            states.push(first);
+            for h in helpers {
+                let (state, rows) = match h {
+                    Ok(h) => h.join().map_err(|_| failed())??,
+                    Err(run) => {
+                        let (mut state, mut rows) = (init(), 0u64);
+                        for s in run {
+                            rows += scan.block(*s, &mut |r| fold(&mut state, r))?;
+                        }
+                        (state, rows)
+                    }
+                };
+                rows_scanned += rows;
+                states.push(state);
+            }
+            Ok((states, rows_scanned, blocks_pruned))
+        })
     }
 
     /// Every record in `[from, to]` (ns) that `search` matches, grouped by `by` and measured: log
     /// analytics' `count() by {service}`, and what a log monitor counts. Every matching record
     /// counts.
     pub fn aggregate(&self, search: &Search, from: i64, to: i64, by: &[Facet], measure: &Measure) -> Result<Aggregated, AggregateError> {
-        let mut g = Grouping::new(by)?;
-        let (rows_scanned, blocks_pruned) = self.each_match(search, from, to, |r| g.take(r, by, measure, 0, MAX_GROUPS))?;
+        self.aggregate_on(search, from, to, by, measure, None)
+    }
+
+    /// [`aggregate`](Self::aggregate), its scan split among `threads` (a test's), else as many as
+    /// it is worth and are free; one, a sum's or an average's.
+    fn aggregate_on(&self, search: &Search, from: i64, to: i64, by: &[Facet], measure: &Measure, threads: Option<usize>) -> Result<Aggregated, AggregateError> {
+        Grouping::new(by)?;
+        let threads = if order_free(measure) { threads } else { Some(1) };
+        let (states, rows_scanned, blocks_pruned) = self.each_match_split(search, from, to, threads, &Grouping::empty, &|g: &mut Grouping, r: &RecordRef<'_>| g.take(r, by, measure, 0, MAX_GROUPS))?;
+        let mut states = states.into_iter();
+        let mut g = states.next().unwrap_or_else(Grouping::empty);
+        for other in states {
+            g.merge(other, MAX_GROUPS)?;
+        }
         let mut accs: Vec<Option<Acc>> = std::iter::repeat_with(|| None).take(g.keys.len()).collect();
         for (c, a) in g.cells {
             if let Some(slot) = accs.get_mut((c >> 32) as usize) {
@@ -644,15 +845,29 @@ impl LogStore {
     /// most first (ties by value), the first `top` of each: the explorer's facet list, every facet
     /// in one pass over the records.
     pub fn facet_counts(&self, search: &Search, from: i64, to: i64, facets: &[Facet], top: usize) -> Result<FacetCounts, AggregateError> {
-        let mut gs: Vec<Grouping> = facets.iter().map(|_| Grouping::new(&[])).collect::<Result<_, _>>()?;
-        let mut matched = 0u64;
-        let (rows_scanned, blocks_pruned) = self.each_match(search, from, to, |r| {
-            matched += 1;
+        self.facet_counts_on(search, from, to, facets, top, None)
+    }
+
+    /// [`facet_counts`](Self::facet_counts), its scan split among `threads` (a test's), else as
+    /// many as it is worth and are free.
+    fn facet_counts_on(&self, search: &Search, from: i64, to: i64, facets: &[Facet], top: usize, threads: Option<usize>) -> Result<FacetCounts, AggregateError> {
+        let init = || -> (Vec<Grouping>, u64) { (facets.iter().map(|_| Grouping::empty()).collect(), 0) };
+        let fold = |(gs, matched): &mut (Vec<Grouping>, u64), r: &RecordRef<'_>| {
+            *matched += 1;
             for (g, f) in gs.iter_mut().zip(facets) {
                 g.take(r, std::slice::from_ref(f), &Measure::Count, 0, MAX_GROUPS)?;
             }
             Ok::<(), AggregateError>(())
-        })?;
+        };
+        let (states, rows_scanned, blocks_pruned) = self.each_match_split(search, from, to, threads, &init, &fold)?;
+        let mut states = states.into_iter();
+        let (mut gs, mut matched) = states.next().unwrap_or_else(init);
+        for (others, m) in states {
+            matched += m;
+            for (g, o) in gs.iter_mut().zip(others) {
+                g.merge(o, MAX_GROUPS)?;
+            }
+        }
         let facets = gs
             .into_iter()
             .map(|g| {
@@ -677,14 +892,28 @@ impl LogStore {
     /// As [`aggregate`](Self::aggregate), each group in `buckets` of time: the records of `[from,
     /// to]` that fall in one.
     pub fn aggregate_buckets(&self, search: &Search, from: i64, to: i64, buckets: Buckets, by: &[Facet], measure: &Measure) -> Result<Bucketed, AggregateError> {
+        self.aggregate_buckets_on(search, from, to, buckets, by, measure, None)
+    }
+
+    /// [`aggregate_buckets`](Self::aggregate_buckets), its scan split among `threads` (a test's),
+    /// else as many as it is worth and are free; one, a sum's or an average's.
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_buckets_on(&self, search: &Search, from: i64, to: i64, buckets: Buckets, by: &[Facet], measure: &Measure, threads: Option<usize>) -> Result<Bucketed, AggregateError> {
         if buckets.n > MAX_BUCKETS {
             return Err(AggregateError::TooManyBuckets);
         }
-        let mut g = Grouping::new(by)?;
-        let (rows_scanned, blocks_pruned) = self.each_match(search, from, to, |r| match buckets.of(r.ts) {
+        Grouping::new(by)?;
+        let threads = if order_free(measure) { threads } else { Some(1) };
+        let fold = |g: &mut Grouping, r: &RecordRef<'_>| match buckets.of(r.ts) {
             Some(b) => g.take(r, by, measure, b, MAX_CELLS),
             None => Ok(()),
-        })?;
+        };
+        let (states, rows_scanned, blocks_pruned) = self.each_match_split(search, from, to, threads, &Grouping::empty, &fold)?;
+        let mut states = states.into_iter();
+        let mut g = states.next().unwrap_or_else(Grouping::empty);
+        for other in states {
+            g.merge(other, MAX_CELLS)?;
+        }
         // Each group's every bucket is in the answer: as many values as the cells could be.
         if g.keys.len().saturating_mul(buckets.n) > MAX_CELLS {
             return Err(AggregateError::TooManyCells);
@@ -842,6 +1071,48 @@ mod tests {
         assert!(matches!(s.aggregate(&parse("*").unwrap(), 0, i64::MAX, &nine, &Measure::Count), Err(AggregateError::TooManyFacets)));
         // More groups than kept: refused, not cut short.
         assert!(matches!(s.aggregate(&parse("*").unwrap(), 0, i64::MAX, &[Facet::Attr("n".into())], &Measure::Count), Err(AggregateError::TooManyGroups)));
+    }
+
+    /// A scan split among threads answers as one thread does, to the bit, however many and whatever
+    /// the blocks (the head, sealed ones, files'), for every measure that does not hang on the order
+    /// records come in, bucketed or whole, and the explorer's facets.
+    #[test]
+    fn a_scan_split_among_threads_answers_as_one_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_of_30k(dir.path());
+        let sec = 1_000_000_000i64;
+        let measures = [Measure::Count, Measure::Min("n".into()), Measure::Max("n".into()), Measure::Cardinality(Facet::Host)];
+        let bys: [&[Facet]; 3] = [&[], &[Facet::Service], &[Facet::Service, Facet::Host]];
+        let mut cases = 0;
+        for q in ["*", "status:error", "service:web -status:error", "failed"] {
+            let search = parse(q).unwrap();
+            for (from, to) in [(0, 29_999 * sec), (123 * sec + 1, 24_567 * sec)] {
+                for by in bys {
+                    for m in &measures {
+                        let one = s.aggregate_on(&search, from, to, by, m, Some(1)).unwrap();
+                        let buckets = Buckets::over(from, to, 600 * sec).unwrap();
+                        let one_b = s.aggregate_buckets_on(&search, from, to, buckets, by, m, Some(1)).unwrap();
+                        for t in 2..=5 {
+                            let many = s.aggregate_on(&search, from, to, by, m, Some(t)).unwrap();
+                            assert_eq!((&many.groups, many.rows_scanned, many.blocks_pruned), (&one.groups, one.rows_scanned, one.blocks_pruned), "{q} by {by:?} {m:?} on {t}");
+                            let many_b = s.aggregate_buckets_on(&search, from, to, buckets, by, m, Some(t)).unwrap();
+                            assert_eq!((&many_b.groups, many_b.rows_scanned), (&one_b.groups, one_b.rows_scanned), "{q} by {by:?} {m:?} in buckets on {t}");
+                            cases += 1;
+                        }
+                    }
+                }
+                let facets = [Facet::Service, Facet::Host, Facet::Status];
+                let one = s.facet_counts_on(&search, from, to, &facets, 3, Some(1)).unwrap();
+                for t in 2..=5 {
+                    let many = s.facet_counts_on(&search, from, to, &facets, 3, Some(t)).unwrap();
+                    assert_eq!((&many.facets, many.matched, many.rows_scanned), (&one.facets, one.matched, one.rows_scanned), "{q}: facets on {t}");
+                }
+            }
+        }
+        assert_eq!(cases, 4 * 2 * 3 * 4 * 4);
+        // A sum's scan stays one thread's, its bits the order's.
+        let sum = s.aggregate_on(&parse("*").unwrap(), 0, i64::MAX, &[], &Measure::Sum("n".into()), Some(4)).unwrap();
+        assert_eq!(sum.groups, vec![(Vec::new(), (0..30_000i64).sum::<i64>() as f64)]);
     }
 
     /// Blocks of spans that share what every block of a service holds (its name, its kind, its

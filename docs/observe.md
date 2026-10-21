@@ -18,7 +18,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7), described in OpenAPI 3.1 and held to what its routes answer; Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP and OTLP/gRPC metrics and logs (protobuf, JSON, gzip; gRPC over HTTP/2, an official SDK's exporters checked against it) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events; DogStatsD on every machine (§8.4: Datadog's protocol over UDP and Unix sockets, aggregated as its Agent aggregates, checked live with Datadog's own client; 5 M messages a second a listener, §12.20); Prometheus's remote write 1.0 and 2.0 on the server and every runner, native histograms as distributions (§8.5, checked live against Prometheus 3.7, sample for sample; §12.21); Datadog's Agent at Datadog's own paths (§8.6: its metrics, sketches, service checks, events and logs, zstd read by kiln's own decoder; checked live against Agent 7.84); OTLP's logs decoded straight into rows, as spans are, but those a pipeline reads (a record 3× faster, no allocation a record, §12.10) | done |
-| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
+| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row, a scan split among the queries' helper threads where its measure does not hang on the records' order (three times faster on five, §12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
@@ -2164,6 +2164,31 @@ read cloned the block's whole summary (its dictionaries and token filter) to get
 are now found by their values borrowed from the row (a keyed table of the groups' places; a group's
 key allocated once, when it is new), and a file's block text is read into a buffer kept across
 blocks. What is left is reading: about 1 GB/s of rows decoded, LZ4 included.
+
+Then a scan split among threads (2026-10-20): the blocks a search reads (once the summaries have
+ruled out the rest) split into runs of about equal rows, in order, each run read on a thread of the
+budget metric queries read on (`query::eval`'s helpers, a quarter of the cores less one unless the
+server's `query_helpers` says otherwise; one thread a 65,536 rows at the most, some ten milliseconds
+of reading, `logs::store::SPLIT_ROWS`), each thread its own groups, merged in the runs' order. For
+counts, distinct values and the least and most: what does not hang on the order records come in, so
+the answer is one thread's to the bit (a test over four searches, two ranges, three groupings and
+those four measures, on two to five threads, bucketed and whole, and the explorer's facets); a sum or
+an average stays one thread's, its bits the order's. On this machine's journal (fedora, 367,666
+records, 89.5 MB of lines, others' builds at a load of 20 to 27), `KOBS_HELPERS=0` against the
+default (five threads for these), two runs each in turn:
+
+| aggregation | one thread | five threads |
+| --- | --- | --- |
+| `count by {service}` | 88.4–89.7 ms | 27.5–28.1 ms |
+| `count by {status}` | 86.3–88.3 ms | 25.7–26.8 ms |
+| `count by {service,status}` | 88.9–93.7 ms | 25.4–28.5 ms |
+| `count by {@application}` | 117.9–122.7 ms | 36.2–37.6 ms |
+| the explorer's facets (four, one pass) | 119.9–124.9 ms | 37.3–38.3 ms |
+| the explorer's histogram (60 buckets) | 84.1–85.8 ms | 27.5–27.6 ms |
+
+A third of the time on five threads, not a fifth: the reading is memory's (LZ4 and the rows), on a
+machine others share. A search of the newest records stays one thread's: it stops at its limit, its
+blocks newest first.
 
 ### 12.9 The group: writes through the replicated log
 

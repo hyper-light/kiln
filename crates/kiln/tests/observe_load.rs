@@ -569,6 +569,220 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     Ok(())
 }
 
+/// An OTLP logs request of `records` records of `sender`'s, as an SDK's batch processor sends
+/// them (its resource's nine attributes, four a record, its trace's ids, one an error in fifty),
+/// record `n` on from `first`, each `n` its own (`seq`), its time `now_ns`'s.
+fn logs_request(sender: u64, first: u64, records: u64, now_ns: u64) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.message(1, |rl| {
+        rl.message(1, |res| {
+            for (k, v) in [
+                ("service.name", "flood".to_owned()),
+                ("host.name", format!("load-{sender}")),
+                ("deployment.environment.name", "load".to_owned()),
+                ("service.version", "4.2.0".to_owned()),
+                ("service.instance.id", format!("6f1c2a8e-{sender:04}")),
+                ("telemetry.sdk.name", "opentelemetry".to_owned()),
+                ("telemetry.sdk.language", "java".to_owned()),
+                ("telemetry.sdk.version", "1.43.0".to_owned()),
+                ("k8s.pod.name", format!("flood-7d9f8b6c5-{sender:05}")),
+            ] {
+                kv(res, 1, k, &v);
+            }
+        });
+        rl.message(2, |sl| {
+            sl.message(1, |scope| scope.str(1, "com.shop.Flood"));
+            for n in first..first + records {
+                sl.message(2, |r| {
+                    r.fixed64(1, now_ns + (n - first) * 1_000);
+                    let error = n % 50 == 0;
+                    r.varint(2, if error { 17 } else { 9 });
+                    r.str(3, if error { "ERROR" } else { "INFO" });
+                    r.message(5, |b| b.str(1, &format!("order {n} paid in {} ms by a card ending 4242", n % 900)));
+                    kv(r, 6, "seq", &((sender << 40) | n).to_string());
+                    kv(r, 6, "http.route", &format!("/api/v1/orders/{}", n % 37));
+                    kv(r, 6, "user.id", &format!("u{}", n % 9973));
+                    kv(r, 6, "thread.name", &format!("http-nio-8080-exec-{}", n % 16));
+                    r.bytes(9, &trace_id(sender, n));
+                    r.bytes(10, &((sender << 48) | (n + 1)).to_be_bytes());
+                });
+            }
+        });
+    });
+    w.buf
+}
+
+/// docs/observe.md §13: an OTLP logs flood, as the metrics' (above): senders as fast as they are
+/// answered, half to the server and half to the runner's receiver, a reader searching meanwhile.
+/// What it proves: every record answered 200 is stored once (counted by its sender's host), none
+/// dropped for room, and the replicas agree; what it measures: records a second, a request's time,
+/// a search's under the flood, until the last records are found, and what each node spends (by
+/// thread) and holds. `KOBS_LOGS_SECS` (20), `KOBS_LOGS_SENDERS` (8), `KOBS_LOGS_RECORDS` (500 a
+/// request).
+#[test]
+#[ignore = "starts real processes and loads them"]
+fn an_otlp_log_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::Result<()> {
+    let secs = env("KOBS_LOGS_SECS", 20);
+    let senders = env("KOBS_LOGS_SENDERS", 8);
+    let records = env("KOBS_LOGS_RECORDS", 500);
+    let mut f = Fleet::new()?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    let server_pid = f.server.as_ref().map_or(0, |p| p.child.id());
+    let runner_pid = f.runners.get("r1").and_then(Option::as_ref).map_or(0, |p| p.child.id());
+    let (s_cpu0, _) = usage(server_pid);
+    let s_flt0 = MINFLT.with(std::cell::Cell::get);
+    let (r_cpu0, _) = usage(runner_pid);
+    let r_flt0 = MINFLT.with(std::cell::Cell::get);
+    let (s_threads0, r_threads0) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
+    let from_ms = common::now_ms() - 60_000;
+    let stop = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    let mut threads = Vec::new();
+    for sender in 0..senders {
+        let (stop, ingest) = (stop.clone(), ingest.clone());
+        let (port, auth) = if sender % 2 == 0 { (f.http, format!("Authorization: Bearer {ingest}\r\n")) } else { (r1, String::new()) };
+        threads.push(std::thread::spawn(move || -> Sent {
+            let mut sent = Sent::default();
+            let mut conn = Conn::new(port);
+            let headers = format!("{auth}Content-Type: application/x-protobuf\r\nContent-Encoding: gzip\r\n");
+            let mut n: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let body = gzip(&logs_request(sender, n, records, common::now_ms() as u64 * 1_000_000)).unwrap_or_default();
+                let t = Instant::now();
+                let answer = conn.send("/v1/logs", &headers, &body);
+                sent.latencies_us.push(t.elapsed().as_micros() as u64);
+                sent.requests += 1;
+                match answer {
+                    Ok(a) if a.code == 200 => {
+                        sent.taken += records;
+                        n += records;
+                    }
+                    Ok(a) if a.code == 503 => {
+                        sent.refused += records;
+                        std::thread::sleep(Duration::from_millis(a.retry_after.map_or(100, |s| s * 1000).min(2_000)));
+                    }
+                    Ok(a) => sent.errors.push(format!("{}: {}", a.code, String::from_utf8_lossy(&a.body))),
+                    Err(e) => sent.errors.push(e.to_string()),
+                }
+                if sent.errors.len() > 20 {
+                    break;
+                }
+            }
+            sent
+        }));
+    }
+    // What the logs explorer asks meanwhile: the last minute's errors, and its records by status.
+    let reader = {
+        let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
+        std::thread::spawn(move || -> (Vec<u64>, Vec<u64>, Vec<String>) {
+            let (mut search, mut facets, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+            let mut conn = Conn::new(port);
+            let headers = format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n");
+            while !stop.load(Ordering::Relaxed) {
+                let now = common::now_ms();
+                for (path, body, into) in [
+                    ("/api/observe/v1/logs/search", json!({ "query": "service:flood status:error", "from": now - 60_000, "to": now, "limit": 50 }), &mut search),
+                    ("/api/observe/v1/logs/aggregate", json!({ "query": "service:flood", "from": now - 60_000, "to": now, "by": ["status"] }), &mut facets),
+                ] {
+                    let t = Instant::now();
+                    match conn.send(path, &headers, &serde_json::to_vec(&body).unwrap_or_default()) {
+                        Ok(a) if a.code == 200 => into.push(t.elapsed().as_micros() as u64),
+                        Ok(a) => errors.push(format!("{path}: {}", a.code)),
+                        Err(e) => errors.push(format!("{path}: {e}")),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            (search, facets, errors)
+        })
+    };
+    std::thread::sleep(Duration::from_secs(secs));
+    stop.store(true, Ordering::Relaxed);
+    let flood = started.elapsed();
+    let mut all = Sent::default();
+    let mut taken_by: Vec<u64> = Vec::new();
+    for t in threads {
+        let s = t.join().map_err(|_| anyhow::anyhow!("a sender panicked"))?;
+        taken_by.push(s.taken);
+        all.taken += s.taken;
+        all.refused += s.refused;
+        all.requests += s.requests;
+        all.errors.extend(s.errors);
+        all.latencies_us.extend(s.latencies_us);
+    }
+    let (mut search, mut facets, read_errors) = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))?;
+    anyhow::ensure!(all.errors.is_empty(), "senders' errors (but 503s): {:?}\n{}", all.errors.iter().take(5).collect::<Vec<_>>(), f.logs());
+    anyhow::ensure!(read_errors.is_empty(), "the reader's errors: {read_errors:?}");
+    // Every record taken, stored once: each sender's count settles at what it had taken.
+    let settled = Instant::now();
+    let to_ms = common::now_ms() + 60_000;
+    let mut have: Vec<u64> = vec![0; taken_by.len()];
+    while settled.elapsed() < Duration::from_secs(180) {
+        let a = f.call("POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "query": "service:flood", "from": from_ms, "to": to_ms, "by": ["host"] })))?;
+        have.iter_mut().for_each(|h| *h = 0);
+        for g in at(&a, &["groups"]).as_array().into_iter().flatten() {
+            let host = at(g, &["group"]).as_object().and_then(|o| o.values().next()).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+            if let Some(h) = host.strip_prefix("load-").and_then(|n| n.parse::<usize>().ok()).and_then(|n| have.get_mut(n)) {
+                *h = at(g, &["value"]).as_f64().unwrap_or(0.0) as u64;
+            }
+        }
+        if have.iter().zip(&taken_by).all(|(h, t)| h >= t) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let lag = settled.elapsed();
+    let s = f.status()?;
+    let dropped = at(&s, &["dropped"]).as_u64().unwrap_or(0) + at(&s, &["machines"]).as_array().into_iter().flatten().map(|m| at(m, &["status", "dropped"]).as_u64().unwrap_or(0)).sum::<u64>();
+    anyhow::ensure!(dropped == 0, "{dropped} records dropped for room after being taken\n{}", f.logs());
+    anyhow::ensure!(have == taken_by, "taken by sender {taken_by:?}, stored {have:?}\n{}", f.logs());
+    let (s_cpu1, s_rss) = usage(server_pid);
+    let s_flt = MINFLT.with(std::cell::Cell::get) - s_flt0;
+    let (r_cpu1, r_rss) = usage(runner_pid);
+    let r_flt = MINFLT.with(std::cell::Cell::get) - r_flt0;
+    let (s_threads1, r_threads1) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
+    let (index, digest) = f.verify(2)?;
+    all.latencies_us.sort_unstable();
+    search.sort_unstable();
+    facets.sort_unstable();
+    let ms = |us: u64| us as f64 / 1000.0;
+    eprintln!("\nan OTLP logs flood: {senders} senders × {records} records a request, gzip, {:.1} s", flood.as_secs_f64());
+    eprintln!("  taken      {:>12} records, {:>10.0} records/s, {} requests", all.taken, all.taken as f64 / flood.as_secs_f64(), all.requests);
+    eprintln!("  refused    {:>12} records (503, sent again when told), {:.2}% of requests", all.refused, 100.0 * (all.refused / records.max(1)) as f64 / all.requests.max(1) as f64);
+    eprintln!("  a request  p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms", ms(pct(&all.latencies_us, 0.5)), ms(pct(&all.latencies_us, 0.99)), ms(pct(&all.latencies_us, 1.0)));
+    eprintln!("  stored     every sender's records counted {:.0} ms after the flood", lag.as_secs_f64() * 1000.0);
+    eprintln!(
+        "  search     errors p50 {:.2} ms, p99 {:.2} ms ({} reads); by status p50 {:.2} ms, p99 {:.2} ms",
+        ms(pct(&search, 0.5)),
+        ms(pct(&search, 0.99)),
+        search.len(),
+        ms(pct(&facets, 0.5)),
+        ms(pct(&facets, 0.99))
+    );
+    eprintln!(
+        "  server     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.4} minor faults a record",
+        s_cpu1 - s_cpu0,
+        (s_cpu1 - s_cpu0) / flood.as_secs_f64(),
+        s_rss as f64 / 1048576.0,
+        s_flt as f64 / all.taken.max(1) as f64
+    );
+    eprintln!("    by thread: {}", spent(&s_threads0, &s_threads1));
+    eprintln!(
+        "  runner     {:.1} CPU s ({:.2} cores), peak RSS {:.0} MiB, {:.4} minor faults a record",
+        r_cpu1 - r_cpu0,
+        (r_cpu1 - r_cpu0) / flood.as_secs_f64(),
+        r_rss as f64 / 1048576.0,
+        r_flt as f64 / all.taken.max(1) as f64
+    );
+    eprintln!("    by thread: {}", spent(&r_threads0, &r_threads1));
+    eprintln!("  replicas   agree at index {index}: {digest:016x}");
+    f.stop_gently();
+    Ok(())
+}
+
 /// An OTLP traces request of `traces` traces of `sender`'s service (`load-svc-<sender>`), trace `n`
 /// on from `first`, each a server's span, its call out and its database's query (both clients'):
 /// every id its own, the times now's.
