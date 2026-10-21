@@ -349,7 +349,11 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   );
   const runningFrom = step.calls.reduce((t, c) => (c.status === "running" ? Math.max(t, c.started) : t), -Infinity);
   const runs = useHeld(status === "running", OPEN_AFTER_MS, Date.now() - runningFrom > RUNNING_BEFORE_MS);
-  const isOpen = open ?? (runs || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
+  // Opened while it ran, it stays open once it ends: shutting it then flashes its body away (a call
+  // of a second or so) and pulls everything after it up the page. Folding it is the person's.
+  const [opened] = React.useState(() => ({ yes: false }));
+  if (runs) opened.yes = true;
+  const isOpen = open ?? (opened.yes || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
   const last = step.calls.at(-1);
