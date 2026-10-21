@@ -133,6 +133,68 @@ pub fn read_stream(b: Arc<dyn Blobs>, key: String, first: u64, last: u64) -> asy
     rx
 }
 
+/// An object written a piece at a time, from wherever its bytes come: held up to a part in memory,
+/// sent in parts of [`PART`] past it, put whole when it's no bigger.
+pub struct Writer<'a> {
+    b: &'a dyn Blobs,
+    key: String,
+    buf: Vec<u8>,
+    upload: Option<String>,
+    parts: Vec<(u32, String)>,
+}
+
+impl<'a> Writer<'a> {
+    pub fn new(b: &'a dyn Blobs, key: &str) -> Self {
+        Self { b, key: key.to_owned(), buf: Vec::new(), upload: None, parts: Vec::new() }
+    }
+
+    /// The next bytes.
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), Refusal> {
+        self.buf.extend_from_slice(data);
+        let part = usize::try_from(PART).unwrap_or(usize::MAX);
+        while self.buf.len() >= part {
+            let rest = self.buf.split_off(part);
+            let full = std::mem::replace(&mut self.buf, rest);
+            self.send(full).await?;
+        }
+        Ok(())
+    }
+
+    async fn send(&mut self, bytes: Vec<u8>) -> Result<(), Refusal> {
+        let upload = match &self.upload {
+            Some(u) => u.clone(),
+            None => {
+                let u = self.b.start_upload(&self.key).await?;
+                self.upload = Some(u.clone());
+                u
+            }
+        };
+        let n = u32::try_from(self.parts.len()).unwrap_or(u32::MAX).saturating_add(1);
+        let etag = self.b.upload_part(&upload, n, bytes).await?;
+        self.parts.push((n, etag));
+        Ok(())
+    }
+
+    /// The object, whole: put, or its upload's last part sent and the upload completed.
+    pub async fn finish(mut self) -> Result<Meta, Refusal> {
+        let Some(upload) = self.upload.clone() else {
+            return self.b.put(&self.key, std::mem::take(&mut self.buf), Put::default()).await;
+        };
+        if !self.buf.is_empty() {
+            let last = std::mem::take(&mut self.buf);
+            self.send(last).await?;
+        }
+        self.b.complete_upload(&upload, std::mem::take(&mut self.parts)).await
+    }
+
+    /// Gives it up: an upload under way is aborted.
+    pub async fn abort(self) {
+        if let Some(u) = &self.upload {
+            let _ = self.b.abort_upload(u).await;
+        }
+    }
+}
+
 /// `key`'s whole object, refused `TooLarge` past `limit`.
 pub async fn get_all(b: &dyn Blobs, key: &str, limit: u64) -> Result<(Meta, Vec<u8>), Refusal> {
     let meta = b.head(key).await?;

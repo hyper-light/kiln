@@ -1065,7 +1065,21 @@ async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Requ
 async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &Request) -> R {
     let rec = hub.harness.streams.recordings(id, person(req).as_deref()).into_iter().find(|r| r.id == rid).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such recording"))?;
     let path = rec.file(what).ok_or_else(|| err(StatusCode::NOT_FOUND, "a recording's files are its video, inputs and test"))?.to_owned();
-    let mut r = serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?;
+    let mut r = match rec.kept.get(what) {
+        // Copied into kiln's store of bytes: served from there, its machine there or not.
+        Some(meta) => {
+            let etag = format!("W/\"{}-{}\"", meta.size, meta.mtime);
+            if let Some(r) = unchanged(req, &etag, false) {
+                return Ok(r);
+            }
+            let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+            let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+            let key = crate::harness::streams::recording_key(id, rid, what);
+            let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, start, end) };
+            file_response(meta, &path, &etag, false, range, srv::channel_body(body))
+        }
+        None => serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?,
+    };
     if what != "video" {
         let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().replace('"', "")).unwrap_or_default();
         r.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/plain; charset=utf-8"));
