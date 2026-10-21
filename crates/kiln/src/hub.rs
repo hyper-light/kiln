@@ -1108,7 +1108,12 @@ impl Hub {
             }
             // A streamed page's chunks and events (`crate::harness::streams`): to its viewers.
             AgentMsg::StreamFrame { stream, data } => self.harness.streams.chunk(&agent, &stream, data),
-            AgentMsg::StreamEvent { stream, json } => self.harness.streams.event(&agent, &stream, json),
+            AgentMsg::StreamEvent { stream, json } => {
+                // Opened: the size its viewer asked for while it was being set up, asked again.
+                if let Some((live, again)) = self.harness.streams.event(&agent, &stream, json) {
+                    live.control(self, &again).await;
+                }
+            }
             // Connections to its ports (`crate::harness::opened`).
             AgentMsg::PortOpened { conn, error } => self.harness.ports.opened(&agent, conn, error),
             AgentMsg::PortData { conn, data } => self.harness.ports.data(&agent, conn, data),

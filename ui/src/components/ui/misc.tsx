@@ -255,7 +255,7 @@ export function SelectField({
   label: string;
   value: string;
   onChange: (v: string) => void;
-  options: { value: string; label: string }[];
+  options: { value: string; label: string; disabled?: boolean }[];
   className?: string;
   hideLabel?: boolean;
 }) {
@@ -268,7 +268,7 @@ export function SelectField({
       <div className="select">
         <select id={id} value={value} onChange={(e) => onChange(e.target.value)}>
           {options.map((o) => (
-            <option key={o.value} value={o.value}>
+            <option key={o.value} value={o.value} disabled={o.disabled}>
               {o.label}
             </option>
           ))}

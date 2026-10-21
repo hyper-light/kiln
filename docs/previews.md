@@ -154,7 +154,16 @@ page appears in the conversation, live.
 - **Shared with the agent.** `use_live` clicks, taps, types, presses keys, scrolls and goes places
   in the same page, and gets a picture back. The person sees it happen, and where the agent
   touched.
-- **Where it is:** the frame shows the page's address. Type another, or go back, forward, reload.
+- **Where it is:** the frame shows the page's address. Type another (a host without its scheme
+  goes over https, or over http when it's this machine's, its LAN's or has a port; words are
+  searched for, on DuckDuckGo), or go back, forward, reload.
+- **Tabs, as a browser's** (Chromium). A link to a new tab, or a popup (a sign-in's, say), opens a
+  tab of the stream's own, shown as Chrome shows it (one opened in the background isn't). With
+  more than one, a select says which is shown and Close tab closes it (the tab that opened it is
+  shown in its place); New tab opens a blank one, its address field ready to type in. The capture
+  moves to the tab shown (the same encoders, from a key frame), and what's done in the frame goes
+  to it. The agent's `use_live` has them too (`{"tab": {"show" | "new" | "close": ...}}`), and its
+  answer lists them. Closing the last closes the stream.
 - **Out of view** the frame lets go of the stream (it pauses) and keeps its last picture. A stream
   that ended can be started again from the frame.
 
@@ -186,11 +195,17 @@ socket (WebCodecs) otherwise. Nothing changes for the page or its runner: the se
   and keys, is clear over WebRTC's video). If the peer doesn't play within ten seconds (the
   server's port is out of reach), fails, or the server's WebRTC stops, the pictures come over the
   socket again, from a key frame. A page that saw WebRTC fail twice doesn't try it again.
-- **With no WebCodecs, WebRTC alone.** A browser hides WebCodecs on an http:// address other than
-  localhost (kiln at its LAN or Tailscale address), and WebRTC needs no secure context: there the
-  viewer connects as ever and its picture and sound come over WebRTC alone. If WebRTC can't get
-  through, or the server has none, the frame says so, lets its socket go and offers Try again; over
-  https, or on localhost, the socket's pictures would stand in.
+- **With no WebCodecs, Media Source.** A browser hides WebCodecs on an http:// address other than
+  localhost (kiln at its LAN or Tailscale address). There the socket's pictures play through the
+  browser's Media Source Extensions, which need no secure context (`ui/src/views/harness/live-source.ts`):
+  each H.264 picture becomes a fragment of MP4 of its own, as it comes, on a timeline with no gaps
+  (each lasts a sixtieth of a second and playing waits at the last for the next), the stream marked
+  live so Chrome shows each picture as soon as it's decoded. No sound comes that way. It needs no
+  WebRTC and no UDP, so it works where the server has no WebRTC or the network carries only TCP (a
+  company's proxy). Where WebRTC gets through it takes over, as it does from WebCodecs. Only a
+  browser with neither (an iPhone before iOS 17.1) has WebRTC alone, and says so if that can't get
+  through. Measured on one machine: a tap's picture shown 45 to 53 ms after it, at a real http://
+  address as with WebRTC.
 - **Measured** on one machine (server, runner and viewer together): the first picture came over
   the socket 0.3 s after Open and the pictures over WebRTC 0.4 s after. A tap's picture came 22 ms
   after the tap and was shown a millisecond later, on a desktop and a phone alike (the lab notices
@@ -307,7 +322,8 @@ and it streams there, live, with Close to end it.
   "Start the app" starts it on the agent's machine and opens it once it listens (on `127.0.0.1`
   or `::1`). Its output goes to `browser/apps/<session>.log` in the runner's state folder. It runs
   until it's stopped (Stop the app) or its conversation closes.
-- **Another address**, typed: `localhost:3000` is `http://localhost:3000`.
+- **Another address**, typed: `localhost:3000` is `http://localhost:3000`, `github.com/x` is
+  `https://github.com/x`, and words are searched for.
 
 #### Profiles
 
