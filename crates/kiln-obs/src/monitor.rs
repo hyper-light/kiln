@@ -35,7 +35,7 @@ pub mod downtime;
 use crate::logs::search::Search;
 use crate::logs::store::{Facet, Measure};
 use crate::query::eval::{self, Request};
-use crate::store::Store;
+use crate::store::{LogsAt, Store};
 
 /// The longest a monitor's window may be: a week (Datadog's longest, `last_1w`), so that one
 /// evaluation reads a bounded range.
@@ -561,29 +561,41 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
         Kind::Forecast { highest, ahead_ms, query } => forecast_values(store, query, *highest, *ahead_ms, to),
         Kind::Slo { .. } => Err(MonitorError::Eval("an SLO's monitor is evaluated with its SLO".into())),
         Kind::ErrorTracking { .. } => Err(MonitorError::Eval("an Error Tracking monitor is evaluated with its issues".into())),
-        Kind::Logs { search, measure, by, window_ms } => {
-            let parsed: Search = crate::logs::search::parse(&logs_only(search)).map_err(|e| MonitorError::Eval(e.to_string()))?;
-            let ns = |ms: i64| ms.saturating_mul(1_000_000);
-            let agg = store.aggregate_logs(&parsed, ns(to - window_ms), ns(to) - 1, by, measure).map_err(|e| MonitorError::Eval(e.to_string()))?;
-            let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value { group: by.iter().map(Facet::name).zip(vals).collect(), value }).collect();
-            // A count of nothing is a count: an ungrouped monitor of "fewer than 1 a minute" must
-            // see zero when nothing came.
-            if out.is_empty() && by.is_empty() && *measure == Measure::Count {
-                out.push(Value { group: Vec::new(), value: 0.0 });
-            }
-            Ok(out)
-        }
-        Kind::Spans { search, measure, by, window_ms } => {
-            let parsed: Search = crate::logs::search::parse_spans(search).map_err(|e| MonitorError::Eval(e.to_string()))?;
-            let ns = |ms: i64| ms.saturating_mul(1_000_000);
-            let agg = store.aggregate_spans(&parsed, ns(to - window_ms), ns(to) - 1, by, measure).map_err(|e| MonitorError::Eval(e.to_string()))?;
-            let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value { group: by.iter().map(Facet::name).zip(vals).collect(), value }).collect();
-            if out.is_empty() && by.is_empty() && *measure == Measure::Count {
-                out.push(Value { group: Vec::new(), value: 0.0 });
-            }
-            Ok(out)
-        }
+        Kind::Logs { .. } => evaluate_records(&store.logs_at(), q, now, delay_ms),
+        Kind::Spans { .. } => evaluate_records(&store.spans_at(), q, now, delay_ms),
     }
+}
+
+/// Whether a monitor reads log records or spans (`Some(true)`: spans), which
+/// [`evaluate_records`] reads as they were taken, with no hold of the store.
+pub fn reads_records(q: &Query) -> Option<bool> {
+    match q.kind {
+        Kind::Logs { .. } => Some(false),
+        Kind::Spans { .. } => Some(true),
+        _ => None,
+    }
+}
+
+/// A log or span monitor's values ([`evaluate`]) from its records as they were taken
+/// ([`Store::logs_at`], [`Store::spans_at`]: which, [`reads_records`] says), read with no hold of
+/// the store.
+pub fn evaluate_records(at: &LogsAt, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
+    let to = now - delay_ms.max(0);
+    let (parsed, measure, by, window_ms) = match &q.kind {
+        Kind::Logs { search, measure, by, window_ms } => (crate::logs::search::parse(&logs_only(search)), measure, by, *window_ms),
+        Kind::Spans { search, measure, by, window_ms } => (crate::logs::search::parse_spans(search), measure, by, *window_ms),
+        _ => return Err(MonitorError::Eval("a monitor of neither logs nor spans".into())),
+    };
+    let parsed: Search = parsed.map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let ns = |ms: i64| ms.saturating_mul(1_000_000);
+    let agg = at.aggregate(&parsed, ns(to - window_ms), ns(to) - 1, by, measure).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value { group: by.iter().map(Facet::name).zip(vals).collect(), value }).collect();
+    // A count of nothing is a count: an ungrouped monitor of "fewer than 1 a minute" must see zero
+    // when nothing came.
+    if out.is_empty() && by.is_empty() && *measure == Measure::Count {
+        out.push(Value { group: Vec::new(), value: 0.0 });
+    }
+    Ok(out)
 }
 
 /// A forecast monitor's values: over the next `ahead_ms` (in [`FORECAST_POINTS`] buckets, or its

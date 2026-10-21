@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kiln_obs::machine::Shared;
 use kiln_obs::monitor::checks::{self, CheckQuery, CheckThresholds};
 use kiln_obs::monitor::composite::{self, Composite, Group};
 use kiln_obs::monitor::{self, State, Thresholds, Transition, Vars};
@@ -42,6 +43,12 @@ const CHECK_NO_DATA_MS: i64 = 86_400_000;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The store, held to read: by one monitor's evaluation at a time, or to take its records as they
+/// are, so a write waits for no more than one (and no reader behind that write).
+fn held(store: &Shared) -> std::sync::RwLockReadGuard<'_, kiln_obs::store::Store> {
+    store.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -152,7 +159,7 @@ fn issue_of(m: &Monitor, g: &GroupState) -> Option<super::errors::Issue> {
 /// An issue's variables for its monitor's message, Datadog's (`issue.attributes.error.*`): its
 /// type, message and file, and its latest error's stack when the message asks for it (a search);
 /// what only a browser's or a phone's error says (`is_crash`, `category`, `handling`) nothing.
-fn issue_vars(store: &kiln_obs::store::Store, i: &super::errors::Issue, template: &str, now: i64) -> Vec<(String, String)> {
+fn issue_vars(store: &Shared, i: &super::errors::Issue, template: &str, now: i64) -> Vec<(String, String)> {
     let var = |k: &str, v: &str| (format!("issue.attributes.error.{k}"), v.to_owned());
     let mut out = vec![var("type", &i.kind), var("message", &i.message), var("file", &i.file), var("is_crash", ""), var("category", ""), var("handling", "")];
     if template.contains("issue.attributes.error.stack") {
@@ -163,8 +170,9 @@ fn issue_vars(store: &kiln_obs::store::Store, i: &super::errors::Issue, template
 
 /// A service check monitor's group's variables for its message: Datadog's `{{check_message}}`, its
 /// latest run's message, and that run's status (`{{check_status}}`: OK, WARNING, CRITICAL, UNKNOWN).
-fn check_vars(store: &kiln_obs::store::Store, q: &CheckQuery, group: &[(String, String)], now: i64) -> Vec<(String, String)> {
-    let run = checks::latest_run(store, &q.check, group, now, CHECK_NO_DATA_MS);
+fn check_vars(store: &Shared, q: &CheckQuery, group: &[(String, String)], now: i64) -> Vec<(String, String)> {
+    let logs = held(store).logs_at();
+    let run = checks::latest_run(&logs, &q.check, group, now, CHECK_NO_DATA_MS);
     let status = run.as_ref().and_then(|r| r.attrs.iter().find(|(k, _)| k == "check_status")).map_or(checks::UNKNOWN, |(_, v)| checks::code(v));
     vec![("check_message".into(), run.map(|r| r.message).unwrap_or_default()), ("check_status".into(), checks::name(status).into())]
 }
@@ -453,8 +461,8 @@ impl Monitors {
         worst.unwrap_or(State::Ok).as_str()
     }
 
-    /// Evaluates every monitor due by `now`.
-    fn tick(self: &Arc<Self>, store: &kiln_obs::store::Store, now: i64) {
+    /// Evaluates every monitor due by `now`, each under a hold of the store of its own.
+    fn tick(self: &Arc<Self>, store: &Shared, now: i64) {
         let due: Vec<Monitor> = {
             let mut d = lock(&self.due);
             lock(&self.defs)
@@ -491,7 +499,7 @@ impl Monitors {
     /// Downtimes' windows that ended since last looked at: each group one held that is in one of
     /// its end states told once (as a renotification), and asked, if the downtime says so, to keep
     /// its first recovery quiet. Whether any state changed.
-    fn tell_ends(&self, store: &kiln_obs::store::Store, now: i64) -> bool {
+    fn tell_ends(&self, store: &Shared, now: i64) -> bool {
         let ended = self.downtimes.ended(now);
         if ended.is_empty() {
             return false;
@@ -532,18 +540,26 @@ impl Monitors {
     }
 
     /// One monitor's evaluation: each group's next state, events and notifications for changes.
-    /// Whether any state changed.
-    fn evaluate(&self, store: &kiln_obs::store::Store, m: &Monitor, now: i64) -> bool {
+    /// Whether any state changed. A monitor of logs or spans reads its records as they are, the
+    /// store let go (`kiln_obs::store::LogsAt`); another reads under a hold of its own.
+    fn evaluate(&self, store: &Shared, m: &Monitor, now: i64) -> bool {
         let (q, t) = match m.compiled() {
             Ok(Compiled::Query(q, t)) => (q, t),
             Ok(Compiled::Check(q, t)) => return self.evaluate_check(store, m, &q, &t, now),
             _ => return false,
         };
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
-        let values = match &q.kind {
-            monitor::Kind::Slo { id, burn } => slo_values(store, id, *burn, now - delay),
-            monitor::Kind::ErrorTracking { search, new, by, window_ms } => error_values(store, search, *new, by, *window_ms, m.modified, now - delay),
-            _ => monitor::evaluate(store, &q, now, delay),
+        let values = match (&q.kind, monitor::reads_records(&q)) {
+            (monitor::Kind::Slo { id, burn }, _) => slo_values(&held(store), id, *burn, now - delay),
+            (monitor::Kind::ErrorTracking { search, new, by, window_ms }, _) => error_values(&held(store), search, *new, by, *window_ms, m.modified, now - delay),
+            (_, Some(spans)) => {
+                let at = {
+                    let s = held(store);
+                    if spans { s.spans_at() } else { s.logs_at() }
+                };
+                monitor::evaluate_records(&at, &q, now, delay)
+            }
+            (_, None) => monitor::evaluate(&held(store), &q, now, delay),
         };
         let values = match values {
             Ok(v) => v,
@@ -572,10 +588,11 @@ impl Monitors {
     /// while it has a run within the no-data timeframe (a day unless the monitor says, Datadog's for
     /// a service check); one not found has had none for that long, and goes to NO DATA at once
     /// when the monitor asks to be told.
-    fn evaluate_check(&self, store: &kiln_obs::store::Store, m: &Monitor, q: &CheckQuery, t: &CheckThresholds, now: i64) -> bool {
+    fn evaluate_check(&self, store: &Shared, m: &Monitor, q: &CheckQuery, t: &CheckThresholds, now: i64) -> bool {
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
         let lookback = m.options.no_data_timeframe.map_or(CHECK_NO_DATA_MS, |mins| i64::from(mins) * 60_000);
-        let found = checks::evaluate(store, q, t, now - delay, lookback).into_iter().map(|g| (g.group, Some(f64::from(g.status)), g.state)).collect();
+        let groups = checks::evaluate(&held(store), q, t, now - delay, lookback);
+        let found = groups.into_iter().map(|g| (g.group, Some(f64::from(g.status)), g.state)).collect();
         let said = Said { threshold: f64::from(t.critical), warning: t.warning.map(f64::from) };
         self.apply(store, m, now, 0, found, |prev, _, made| made.unwrap_or(prev), said)
     }
@@ -583,7 +600,7 @@ impl Monitors {
     /// A composite's evaluation: its groups' states from the states of the monitors it reads, as
     /// they last found them. A group that comes out NO DATA keeps its last state, unless the
     /// composite asks to be told (Datadog's "last known state").
-    fn evaluate_composite(&self, store: &kiln_obs::store::Store, m: &Monitor, c: &Composite, now: i64) -> bool {
+    fn evaluate_composite(&self, store: &Shared, m: &Monitor, c: &Composite, now: i64) -> bool {
         let inputs: Vec<Vec<(Group, State)>> = {
             let all = lock(&self.states);
             c.ids.iter().map(|id| all.get(id).map(|gs| gs.values().map(|g| (g.group.clone(), State::parse(&g.state).unwrap_or(State::Ok))).collect()).unwrap_or_default()).collect()
@@ -603,7 +620,7 @@ impl Monitors {
     #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
-        store: &kiln_obs::store::Store,
+        store: &Shared,
         m: &Monitor,
         now: i64,
         no_data_ms: i64,
@@ -674,7 +691,7 @@ impl Monitors {
     /// group is an issue's: its message given the issue's variables, its link the issue's page,
     /// and nothing said of it while the issue is ignored (Datadog's).
     #[allow(clippy::too_many_arguments)]
-    fn say(&self, store: &kiln_obs::store::Store, m: &Monitor, said: Said, g: &GroupState, from: State, to: State, now: i64) {
+    fn say(&self, store: &Shared, m: &Monitor, said: Said, g: &GroupState, from: State, to: State, now: i64) {
         let issue = issue_of(m, g);
         let link = match &issue {
             Some(i) => format!("{}/observe/errors/{}", self.link_base, i.id),
@@ -761,11 +778,7 @@ impl Monitors {
             }
             let Some(store) = o.store() else { continue };
             let me = self.clone();
-            let _ = crate::rt::blocking(move || {
-                let s = store.read().unwrap_or_else(PoisonError::into_inner);
-                me.tick(&s, crate::util::now_ms());
-            })
-            .await;
+            let _ = crate::rt::blocking(move || me.tick(&store, crate::util::now_ms())).await;
         }
     }
 }

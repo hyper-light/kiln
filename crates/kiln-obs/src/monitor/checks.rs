@@ -17,7 +17,7 @@ use super::{MonitorError, State, literal, syntax, unescape};
 use crate::batch::{Kind, SeriesKey};
 use crate::index::{Clause, NameMatch, Selector, ValueMatch};
 use crate::logs::record::Record;
-use crate::store::{Scratch, Store};
+use crate::store::{LogsAt, Scratch, Store};
 
 /// The metric a check's runs are samples of: its status.
 pub const STATUS_METRIC: &str = "kiln.service_check.status";
@@ -360,8 +360,9 @@ pub fn latest(store: &Store, check: &str, over: &[Clause], by: Option<&[String]>
 
 /// A group's latest run as its record, for what a notification says of it (Datadog's
 /// `{{check_message}}`): the newest record of the check whose fields and attributes hold the
-/// group's tags, up to `to` (ms) and as far back as `lookback_ms`.
-pub fn latest_run(store: &Store, check: &str, group: &[(String, String)], to: i64, lookback_ms: i64) -> Option<Record> {
+/// group's tags, up to `to` (ms) and as far back as `lookback_ms`, of the logs as they were taken
+/// (`Store::logs_at`: read with no hold of the store).
+pub fn latest_run(logs: &LogsAt, check: &str, group: &[(String, String)], to: i64, lookback_ms: i64) -> Option<Record> {
     let quoted = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
     let mut q = format!("source:{SOURCE} @check:{}", quoted(check));
     for (k, v) in group.iter().filter(|(_, v)| v != "N/A") {
@@ -370,7 +371,7 @@ pub fn latest_run(store: &Store, check: &str, group: &[(String, String)], to: i6
     }
     let search = crate::logs::search::parse(&q).ok()?;
     let ns = |ms: i64| ms.saturating_mul(1_000_000);
-    store.search_logs(&search, ns(to - lookback_ms), ns(to), 1).ok()?.records.into_iter().next()
+    logs.search(&search, ns(to - lookback_ms), ns(to), 1).ok()?.records.into_iter().next()
 }
 
 #[cfg(test)]
@@ -506,9 +507,9 @@ mod tests {
         assert_eq!(each.iter().map(|l| l.at).max(), Some((1_700_000_000 + 39 * 15 + 1) * 1000));
         assert!(latest(&s, "backup.done", &[], None, to, 1_800_000).is_empty());
         // The latest run's record, for its message.
-        let r = latest_run(&s, "http.can_connect", &[("host".into(), "web-1".into())], to, 3_600_000).unwrap();
+        let r = latest_run(&s.logs_at(), "http.can_connect", &[("host".into(), "web-1".into())], to, 3_600_000).unwrap();
         assert_eq!(r.message, format!("http.can_connect on web-1 at {}", 1_700_000_000 + 39 * 15));
-        assert!(latest_run(&s, "http.can_connect", &[("host".into(), "nowhere".into())], to, 3_600_000).is_none());
+        assert!(latest_run(&s.logs_at(), "http.can_connect", &[("host".into(), "nowhere".into())], to, 3_600_000).is_none());
     }
 
     /// A check's sample is of its check, host and tags; a record of another source has none, and

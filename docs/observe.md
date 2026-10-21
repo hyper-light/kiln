@@ -1334,7 +1334,10 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   integrations (§10).
 - The server, the leader, evaluates each on the blocking pool; each group's change is an event
   (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
-  are saved as they change.
+  are saved as they change. Each evaluation holds the store on its own (a write waits on no more
+  than one); a monitor of logs or spans reads its records as they are, the store let go, as the
+  explorers do (§13, logs under load), and so do a notification's searches (a check's last run, an
+  issue's stack).
 - **Forecasts**: Datadog's `max(next_1w):forecast(<metric query>, 'linear', 2, ...) >= 90`: a group's
   value is its forecast's highest upper bound over the next window (`max`, alerting above), or its
   lowest lower bound (`min`, with `<=`, below): "the edge of the forecast confidence bounds goes above
@@ -3313,14 +3316,26 @@ a brief hold (`Store::logs_at`, `spans_at`: a few dozen shared pointers copied, 
 and reads with the hold let go (`api::read_apart`); a file let go meanwhile stays readable (its open
 handle keeps it, on Windows too: Rust opens files sharing their deletion). A test reads a snapshot
 taken before rows came, a cut was written and taken in, and the oldest file was deleted: what it held,
-to the record. Measured on adacachy loaded by others' work (half the server's CPU of the run before),
-the count by status's wait for the store 28 ms at p99 (12 before, 1.2 s with sealing apart); what is
-left of the waits is the store's other long holds (the monitors evaluate under one; a query of
-metrics reads under one), each a writer's wait and so every reader's after it. Metrics from logs and
-from spans count as the explorers read: each window's records taken with the windows touched under a
-brief hold, counted with it let go (`LogsAt::count_metrics`; the log-metric test endpoint one
-taking for its whole range). A cut writes its files under a shared hold too, but on the thread that
-applies: no write waits for it, so no reader does.
+to the record. Measured against the build before, in turn: on fedora (others' work light, a load of
+9 to 16), the errors' search waited for the store 922 and 848 ms at p99 before, 23 and 20 after (the
+count by status's 29 and 19, 25 and 19; the search had waited behind the count's whole scan, a
+writer between them); on adacachy (a load of 18 to 30), 1.58 s before, 7.3 ms after, and the flood
+taken 241 k records a second against 173 k (a write no longer waits on a scan, so the batcher
+refuses less). The thread that applies does the work it did a record: 54.4 thousand instructions
+against 53.9 (perf, user space, the server's and the runner's alike, on adacachy). On fedora its CPU
+time a record rose (4.6 µs from 3.3, both nodes' alike, with the same records a second): not more
+work, so, by the counts, more cycles for it, as the scans now run beside it on the machine's cores and
+caches rather than in its place.
+
+Metrics from logs and from spans count as the explorers read: each window's records taken with the
+windows touched under a brief hold, counted with it let go (`LogsAt::count_metrics`; the log-metric
+test endpoint one taking for its whole range). The monitors evaluate each under a hold of its own (a
+write waits for one at the most), a monitor of logs or spans from its records as they are, the store
+let go; Error Tracking's scan reads its metric under a hold and searches for a new issue's first
+error in the records as they are. What is left long is a query of metrics (and a metric monitor's,
+an SLO's), which reads under a hold for its scan, a writer's wait and so every reader's after it. A
+cut writes its files under a shared hold too, but on the thread that applies: no write waits for
+it, so no reader does.
 
 **Clock skew** (`observe_live.rs`): a runner whose clock is an hour ahead
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is

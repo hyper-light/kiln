@@ -373,17 +373,25 @@ impl Issues {
             }
             let Some(store) = o.store() else { continue };
             let me = self.clone();
+            // The metric read under a hold; each new issue's first error searched for in the records
+            // as they are then, the store let go.
             let _ = crate::rt::blocking(move || {
-                let s = store.read().unwrap_or_else(PoisonError::into_inner);
+                let held = || store.read().unwrap_or_else(PoisonError::into_inner);
                 me.scan(
                     crate::util::now_ms(),
                     |from, to| {
-                        kiln_obs::errors::seen(&s, &[], from, to).unwrap_or_else(|e| {
+                        kiln_obs::errors::seen(&held(), &[], from, to).unwrap_or_else(|e| {
                             tracing::warn!(error = %e, "Error Tracking's metric was not read");
                             Vec::new()
                         })
                     },
-                    |id, first, now| sample_of(&s, id, first, now),
+                    |id, first, now| {
+                        let (spans, logs) = {
+                            let s = held();
+                            (s.spans_at(), s.logs_at())
+                        };
+                        sample_of(&spans, &logs, id, first, now)
+                    },
                 );
             })
             .await;
@@ -414,17 +422,18 @@ fn cut(s: &str) -> String {
     s.get(..end).unwrap_or("").to_owned()
 }
 
-/// An issue's first error, from the span store, else the log store: the newest of the minute its
-/// first window began, else of the range read.
-pub fn sample_of(s: &kiln_obs::store::Store, id: &str, first_ms: i64, now_ms: i64) -> Option<Sample> {
+/// An issue's first error, from the spans, else the logs (each as they were taken:
+/// `Store::spans_at`, `logs_at`): the newest of the minute its first window began, else of the
+/// range read.
+pub fn sample_of(spans: &kiln_obs::store::LogsAt, logs: &kiln_obs::store::LogsAt, id: &str, first_ms: i64, now_ms: i64) -> Option<Sample> {
     let ns = |ms: i64| ms.saturating_mul(1_000_000);
     let query = format!("@issue.id:{id}");
     let ranges = [(ns(first_ms), ns(first_ms.saturating_add(60_000))), (ns(first_ms.saturating_sub(HORIZON_MS)), ns(now_ms))];
-    for (source, spans) in [("span", true), ("log", false)] {
-        let search = if spans { kiln_obs::logs::search::parse_spans(&query) } else { kiln_obs::logs::search::parse(&query) };
+    for (source, at) in [("span", spans), ("log", logs)] {
+        let search = if source == "span" { kiln_obs::logs::search::parse_spans(&query) } else { kiln_obs::logs::search::parse(&query) };
         let Ok(search) = search else { continue };
         for (from, to) in ranges {
-            let found = if spans { s.search_spans(&search, from, to, 1) } else { s.search_logs(&search, from, to, 1) };
+            let found = at.search(&search, from, to, 1);
             if let Some(r) = found.ok().and_then(|f| f.records.into_iter().next()) {
                 return Some(sample_from(source, &r));
             }
@@ -519,16 +528,19 @@ impl kiln_obs::logs::search::Fields for ErrorsOf<'_> {
 }
 
 /// The stack of an issue's latest error, where its errors are said (its spans, or its logs), from
-/// a little before its last one.
-pub fn latest_stack(s: &kiln_obs::store::Store, i: &Issue, now_ms: i64) -> Option<String> {
+/// a little before its last one: of the records as they are (`Store::spans_at`, `logs_at`), read
+/// with the store let go.
+pub fn latest_stack(store: &kiln_obs::machine::Shared, i: &Issue, now_ms: i64) -> Option<String> {
     let ns = |ms: i64| ms.saturating_mul(1_000_000);
     let query = format!("@issue.id:{}", i.id);
     let (from, to) = (ns(i.last_seen.saturating_sub(HORIZON_MS)), ns(now_ms));
-    let found = match i.source.as_str() {
-        "log" => kiln_obs::logs::search::parse(&query).ok().and_then(|q| s.search_logs(&q, from, to, 1).ok()),
-        _ => kiln_obs::logs::search::parse_spans(&query).ok().and_then(|q| s.search_spans(&q, from, to, 1).ok()),
-    }?;
-    let r = found.records.into_iter().next()?;
+    let logs = i.source == "log";
+    let search = if logs { kiln_obs::logs::search::parse(&query) } else { kiln_obs::logs::search::parse_spans(&query) }.ok()?;
+    let at = {
+        let s = store.read().unwrap_or_else(PoisonError::into_inner);
+        if logs { s.logs_at() } else { s.spans_at() }
+    };
+    let r = at.search(&search, from, to, 1).ok()?.records.into_iter().next()?;
     kiln_obs::errors::STACK_KEYS.iter().find_map(|k| r.attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone()))
 }
 
