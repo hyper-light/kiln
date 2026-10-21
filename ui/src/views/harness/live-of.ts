@@ -29,6 +29,23 @@ export function pagePoint(at: { x: number; y: number }, frame: { width: number; 
   return { x: clamp(((at.x - ox) * page.width) / w, page.width), y: clamp(((at.y - oy) * page.height) / h, page.height) };
 }
 
+/** What's typed in an address field, as an address: one with its scheme as typed (http, https,
+ *  file, about); a host and its path over https, or over http when it's this machine's, its LAN's
+ *  or has a port (a dev server's); anything else, words, searched for. */
+export function typedUrl(typed: string): string {
+  const t = typed.trim();
+  if (!t) return "";
+  if (/^(https?|file):\/\//i.test(t) || /^about:/i.test(t)) return t;
+  const host = /^([^\s/?#]+)(?:[/?#]\S*)?$/.exec(t)?.[1];
+  if (host) {
+    const port = /:\d+$/.test(host);
+    const name = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
+    const local = name === "localhost" || name.endsWith(".localhost") || name.endsWith(".local") || name === "::1" || /^(127|10)\.\d|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^169\.254\./.test(name);
+    if (name.includes(".") || name.includes(":") || name === "localhost" || port) return `${local || port ? "http" : "https"}://${t}`;
+  }
+  return `https://duckduckgo.com/?q=${encodeURIComponent(t)}`;
+}
+
 /** Whether a tool call is an agent showing a live page (Claude Code's and Codex's names for kiln's tool). */
 export const isShowLive = (c: Pick<ToolCall, "name">): boolean => /^mcp__kiln(?:[-_]reach)?__show_live$/.test(c.name);
 

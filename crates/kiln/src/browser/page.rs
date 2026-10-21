@@ -44,6 +44,13 @@ impl Page {
             None => cdp.call(None, "Target.createTarget", json!({"url": url})).await?,
         };
         let target = field(&made, "targetId")?;
+        Self::attach(browser, context, target).await
+    }
+
+    /// The page `target` is (one kiln opened, or one a page opened itself: a link to a new tab,
+    /// a popup), attached to as it is.
+    pub(super) async fn attach(browser: Arc<Browser>, context: Option<String>, target: String) -> anyhow::Result<Self> {
+        let cdp = browser.cdp.clone();
         let attached = cdp.call(None, "Target.attachToTarget", json!({"targetId": target, "flatten": true})).await?;
         let session = field(&attached, "sessionId")?;
         let events = cdp.listen(Some(&session));

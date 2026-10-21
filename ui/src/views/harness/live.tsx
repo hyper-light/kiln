@@ -4,7 +4,8 @@
  * files, its network), streamed here. Its picture comes as video (the size of this frame at this
  * screen's density), its sound as Opus once you turn it on: over WebRTC when the server has it and
  * it gets through, else over its socket (WebCodecs) as it does until then; in a browser with no
- * WebCodecs (any, on an http:// address other than localhost), over WebRTC alone. What you do in it goes back:
+ * WebCodecs (any, on an http:// address other than localhost), its socket's pictures play through
+ * the browser's Media Source (`live-source.ts`, no sound) until WebRTC does. What you do in it goes back:
  * taps and the mouse, the wheel, keys by meaning, text from a phone's keyboard, a paste. Out of
  * view it's let go (the stream pauses, nothing is sent) and its last picture stays.
  *
@@ -14,13 +15,15 @@
  * of what was done in it, and that as a test) on the agent's machine; each recording shows below.
  */
 import * as React from "react";
-import { ArrowLeft, ArrowRight, Circle, Copy, Keyboard, RotateCw, Square, Volume2, VolumeX, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Circle, Copy, Keyboard, Plus, RotateCw, Square, Volume2, VolumeX, X } from "lucide-react";
 import { harnessApi, recordingUrl, type Recording, type ToolCall } from "@/api/harness";
+import { SelectField } from "@/components/ui/misc";
 import { formatBytes } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import { duration } from "./derive";
 import { Beam, PrismLabel } from "./signals";
-import { chunkOf, fieldAt, liveOf, modifiers, pagePoint, secret, shapeOf, type FieldPlace, type LiveStream, type PageField } from "./live-of";
+import { chunkOf, fieldAt, liveOf, modifiers, pagePoint, secret, shapeOf, typedUrl, type FieldPlace, type LiveStream, type PageField } from "./live-of";
+import { SourcePlayer, sourcePlays } from "./live-source";
 import "./page.css";
 import "./live.css";
 
@@ -31,26 +34,37 @@ const touchViewer = typeof window !== "undefined" && window.matchMedia?.("(point
 const decodes = typeof window !== "undefined" && "VideoDecoder" in window;
 const plays = typeof window !== "undefined" && "AudioDecoder" in window;
 const rtcs = typeof window !== "undefined" && "RTCPeerConnection" in window;
-/** No WebCodecs (a browser hides them on an http:// address other than localhost): WebRTC is the
- *  one way its picture comes. */
-const rtcOnly = !decodes && rtcs;
+/** No WebCodecs (a browser hides them on an http:// address other than localhost): its socket's
+ *  pictures play through the browser's Media Source. */
+const sources = !decodes && sourcePlays;
+/** Nor that (an iPhone before iOS 17.1): WebRTC is the one way its picture comes. */
+const rtcOnly = !decodes && !sources && rtcs;
 const insecure = typeof window !== "undefined" && window.isSecureContext === false;
 /** WebRTC that didn't play here (this server's port out of reach, a codec this browser lacks):
  *  after two, this page doesn't try it again (the socket does). */
 let rtcMisses = 0;
 
-/** Why it can't be shown here (`rtc`: what became of WebRTC, when it was the one way left). */
+/** Why it can't be shown here, and what to do (`rtc`: what became of WebRTC, when it was the one
+ *  way left). */
 function cantShow(rtc?: "off" | "missed"): string {
-  if (!rtcs) return insecure ? "This browser can't show live pages on an http:// address: open kiln over https, or on localhost." : "This browser can't show live pages (it has neither WebCodecs nor WebRTC).";
-  const no = insecure ? "On an http:// address this browser has no WebCodecs (they need https, or localhost)" : "This browser has no WebCodecs";
-  return rtc === "off" ? `${no}, and this kiln has no WebRTC to show live pages with.` : `${no}, and WebRTC couldn't get through to kiln from here.`;
+  if (!rtcs) return insecure ? "This browser can't show live pages from kiln at a plain http:// address. Open kiln over https, or at localhost on kiln's own computer." : "This browser can't show live pages. Use a current Chrome, Edge, Firefox or Safari.";
+  if (!insecure) return rtc === "off" ? "This browser is too old to show live pages without WebRTC, and this kiln's server doesn't have WebRTC turned on. Use a current browser, or turn WebRTC on for the server (webrtc_addr, docs/previews.md)." : "This browser is too old to show live pages without WebRTC, and WebRTC couldn't reach this kiln's server from here. Use a current browser.";
+  return rtc === "off"
+    ? "At a plain http:// address this browser shows live pages only over WebRTC (an iPhone needs iOS 17.1 or later for more), and this kiln's server doesn't have WebRTC turned on. Open kiln over https, or turn WebRTC on for the server (webrtc_addr, docs/previews.md)."
+    : "At a plain http:// address this browser shows live pages only over WebRTC (an iPhone needs iOS 17.1 or later for more), and WebRTC couldn't reach this kiln's server from here: its UDP port may be blocked between you. Open kiln over https, or let that port through (docs/previews.md, “WebRTC”).";
 }
 
 /** One viewing of a stream: its socket, its decoders, what it draws; its WebRTC peer, when the
- *  server has WebRTC (`rtc`: its picture plays in `player`, under the canvas, which is clear then). */
+ *  server has WebRTC (`rtc`: its picture plays in `player`, under the canvas, which is clear then).
+ *  With no WebCodecs, its socket's pictures play in `sourced` (under `player`) through Media Source. */
 class Viewing {
   private ws: WebSocket;
   private video: VideoDecoder | null = null;
+  private source: SourcePlayer | null = null;
+  /** The size its pictures are coded at (its decoder's configuration says it). */
+  private coded = { width: 0, height: 0 };
+  /** Whether the canvas has a picture drawn on it (over what plays under it). */
+  private painted = false;
   private audio: AudioDecoder | null = null;
   private ctx: AudioContext | null = null;
   private playAt = 0;
@@ -61,9 +75,9 @@ class Viewing {
   private pc: RTCPeerConnection | null = null;
   private rtc = false;
   private rtcWait: ReturnType<typeof setTimeout> | undefined;
-  /** With WebRTC the one way: the server's word that it has it, awaited; one try again once a peer
-   *  that played goes. */
-  private canWait: ReturnType<typeof setTimeout> | undefined;
+  /** Whether anything came yet: a server with WebRTC says so first, before anything else. */
+  private heard = false;
+  /** With WebRTC the one way: one try again once a peer that played goes. */
   private retried = false;
   private soundOn = false;
   closed = false;
@@ -72,16 +86,21 @@ class Viewing {
     url: string,
     private canvas: HTMLCanvasElement,
     private player: HTMLVideoElement | null,
-    private on: { open: () => void; status: (s: Status, why?: string) => void; event: (e: Record<string, unknown>) => void; fps: (n: number) => void; rtc: (on: boolean) => void },
+    private sourced: HTMLVideoElement | null,
+    private on: { open: () => void; status: (s: Status, why?: string) => void; event: (e: Record<string, unknown>) => void; fps: (n: number) => void; path: (p: "webrtc" | "socket" | "source") => void },
   ) {
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
-    this.ws.onopen = () => {
-      this.on.open();
-      // The server says at once whether it has WebRTC.
-      if (rtcOnly) this.canWait = setTimeout(() => this.cant("off"), 4000);
+    this.ws.onopen = () => this.on.open();
+    this.ws.onmessage = (m) => {
+      // A server with WebRTC says so in its first word, however long its runner takes: anything
+      // else first, and it has none (all a browser with no WebCodecs could show it with).
+      const first = !this.heard;
+      this.heard = true;
+      if (first && rtcOnly && !(typeof m.data === "string" && m.data.includes('"can"'))) return this.cant("off");
+      if (typeof m.data === "string") this.event(m.data);
+      else this.chunk(m.data as ArrayBuffer);
     };
-    this.ws.onmessage = (m) => (typeof m.data === "string" ? this.event(m.data) : this.chunk(m.data as ArrayBuffer));
     this.ws.onclose = (e) => {
       if (!this.closed) this.on.status("ended", e.code === 1000 ? "" : "The connection to it was lost.");
       this.closed = true;
@@ -107,11 +126,18 @@ class Viewing {
 
   close() {
     this.closed = true;
-    clearTimeout(this.canWait);
     this.unpeer(false);
     this.ws.close(1000);
     for (const d of [this.video, this.audio]) if (d && d.state !== "closed") d.close();
     void this.ctx?.close();
+    // Its last picture stays.
+    const v = this.sourced;
+    if (this.source && v && v.videoWidth > 0 && !this.painted) {
+      this.canvas.getContext("2d")?.drawImage(v, 0, 0, this.canvas.width, this.canvas.height);
+      this.painted = true;
+    }
+    this.source?.close();
+    this.source = null;
   }
 
   private event(text: string) {
@@ -123,10 +149,7 @@ class Viewing {
     }
     const w = e.webrtc as { can?: boolean; answer?: string; error?: string; gone?: string } | undefined;
     if (!w) return this.on.event(e);
-    if (w.can) {
-      clearTimeout(this.canWait);
-      void this.offer();
-    }
+    if (w.can) void this.offer();
     else if (w.answer && this.pc) this.pc.setRemoteDescription({ type: "answer", sdp: w.answer }).catch(() => this.unpeer(true));
     else if (w.error !== undefined || w.gone !== undefined) this.unpeer(false);
   }
@@ -217,7 +240,8 @@ class Viewing {
       clearTimeout(this.rtcWait);
       this.send({ webrtc: { playing: true } });
       c.getContext("2d")?.clearRect(0, 0, c.width, c.height);
-      this.on.rtc(true);
+      this.painted = false;
+      this.on.path("webrtc");
     }
     if (c.width !== player.videoWidth || c.height !== player.videoHeight) {
       c.width = player.videoWidth;
@@ -239,12 +263,15 @@ class Viewing {
     const v = this.player;
     if (v) {
       // Its last picture stays until the socket's first.
-      if (was && v.videoWidth > 0) this.canvas.getContext("2d")?.drawImage(v, 0, 0, this.canvas.width, this.canvas.height);
+      if (was && v.videoWidth > 0) {
+        this.canvas.getContext("2d")?.drawImage(v, 0, 0, this.canvas.width, this.canvas.height);
+        this.painted = true;
+      }
       v.srcObject = null;
     }
     if (was) {
       this.needKey = true;
-      this.on.rtc(false);
+      this.on.path(this.source ? "source" : "socket");
     } else rtcMisses++;
     if (tell) this.send({ webrtc: { playing: false, close: true } });
     // With no other way here: a peer that played is tried again once; else it can't be shown.
@@ -296,15 +323,72 @@ class Viewing {
       this.needKey = true;
       return;
     }
-    if (!this.video || this.video.state !== "configured") return;
     const key = c.flags === "k";
+    if (this.source) {
+      if (this.needKey && !key) return;
+      this.needKey = !this.source.picture(data, key, this.coded.width, this.coded.height);
+      return;
+    }
+    if (!this.video || this.video.state !== "configured") return;
     if (this.needKey && !key) return;
     this.needKey = false;
     this.video.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: c.ts, data }));
   }
 
+  /** Its pictures through Media Source: the player made once (with the first H.264 configuration),
+   *  each picture it shows counted, the canvas clear over them. */
+  private sourceFor(codec: string) {
+    const v = this.sourced;
+    if (this.source || !v || !sources) return;
+    if (!codec.startsWith("avc1")) {
+      if (!this.rtc && !this.pc) this.on.status("unsupported", `This browser plays only H.264 at a plain http:// address, and this page's stream is ${codec}. Open kiln over https.`);
+      return;
+    }
+    this.source = new SourcePlayer(v, (why) => {
+      if (this.closed || this.rtc) return;
+      this.on.status("unsupported", `This browser couldn't play the page's pictures (${why}). Open kiln over https, or try another browser.`);
+    });
+    this.on.path("source");
+    const each = (frames: number) => {
+      if (this.closed || !this.source) return;
+      if (!this.rtc && v.videoWidth > 0) {
+        const c = this.canvas;
+        if (this.painted) {
+          c.getContext("2d")?.clearRect(0, 0, c.width, c.height);
+          this.painted = false;
+        }
+        if (c.width !== v.videoWidth || c.height !== v.videoHeight) {
+          c.width = v.videoWidth;
+          c.height = v.videoHeight;
+        }
+        this.count(frames);
+      }
+    };
+    const fv = v as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number };
+    if (fv.requestVideoFrameCallback) {
+      const next = () => {
+        each(1);
+        if (!this.closed && this.source) fv.requestVideoFrameCallback?.(next);
+      };
+      fv.requestVideoFrameCallback(next);
+      return;
+    }
+    let seen = 0;
+    const t = setInterval(() => {
+      if (this.closed || !this.source) return clearInterval(t);
+      const n = v.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
+      if (n > seen) each(n - seen);
+      seen = n;
+    }, 250);
+  }
+
   private configureVideo(cfg: { codec: string; codedWidth?: number; codedHeight?: number; description?: string }) {
-    if (!decodes) return;
+    this.coded = { width: cfg.codedWidth ?? this.coded.width, height: cfg.codedHeight ?? this.coded.height };
+    if (!decodes) {
+      this.sourceFor(cfg.codec);
+      this.needKey = true;
+      return;
+    }
     if (this.video && this.video.state !== "closed") this.video.close();
     this.video = new VideoDecoder({
       output: (f) => this.draw(f),
@@ -404,18 +488,31 @@ function fieldWord(f: PageField | null): string {
 
 /** What the agent did, in a few words ("the agent clicked, typed"). */
 function agentWords(did: Record<string, unknown>[]): string {
-  const verbs: Record<string, string> = { click: "clicked", tap: "tapped", type: "typed", key: "pressed a key", scroll: "scrolled", go: "went to a page", back: "went back", forward: "went forward", reload: "reloaded" };
+  const verbs: Record<string, string> = { click: "clicked", tap: "tapped", type: "typed", key: "pressed a key", scroll: "scrolled", go: "went to a page", back: "went back", forward: "went forward", reload: "reloaded", tab: "changed tabs" };
   const said = [...new Set(did.flatMap((d) => Object.keys(d).map((k) => verbs[k]).filter(Boolean)))];
   return said.length ? `the agent ${said.join(", ")}` : "";
+}
+
+/** A tab of a live page's (a Chromium page's: its runner says them). */
+type PageTab = { id: string; url: string; title: string };
+
+/** A tab, as its select says it: its title, else its address, else that it's new. */
+function tabWord(t: PageTab): string {
+  if (t.title && t.title !== "about:blank") return t.title;
+  return t.url && t.url !== "about:blank" ? t.url : "New tab";
 }
 
 /** The live page, its controls above it (`onClose`: it may be closed from here). */
 export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: string; onClose?: () => void }) {
   const [stream, setStream] = React.useState(first);
-  const [status, setStatus] = React.useState<Status>(decodes || rtcs ? "connecting" : "unsupported");
+  const [status, setStatus] = React.useState<Status>(decodes || sources || rtcs ? "connecting" : "unsupported");
   const [why, setWhy] = React.useState("");
   const [address, setAddress] = React.useState(first.url);
   const [editing, setEditing] = React.useState<string | null>(null);
+  const addressEl = React.useRef<HTMLInputElement | null>(null);
+  /** Its tabs and the shown one's, once its runner says them (a Chromium page's). */
+  const [tabs, setTabs] = React.useState<{ list: PageTab[]; shown: string } | null>(null);
+  const tabsSeq = React.useRef(0);
   const [title, setTitle] = React.useState(first.title);
   const [fps, setFps] = React.useState(0);
   const [sound, setSound] = React.useState(false);
@@ -425,9 +522,11 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const [marks, setMarks] = React.useState<{ n: number; x: number; y: number }[]>([]);
   const quiet = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const canvas = React.useRef<HTMLCanvasElement | null>(null);
-  /** WebRTC's picture, and whether it's what's seen (else the socket's, drawn on the canvas). */
+  /** WebRTC's picture, and the socket's through Media Source (with no WebCodecs here); which is
+   *  what's seen (else the socket's, drawn on the canvas). */
   const player = React.useRef<HTMLVideoElement | null>(null);
-  const [path, setPath] = React.useState<"webrtc" | "socket">("socket");
+  const sourced = React.useRef<HTMLVideoElement | null>(null);
+  const [path, setPath] = React.useState<"webrtc" | "socket" | "source">("socket");
   /** The page's field that has the focus, and where its fields are; text selected in it. */
   const [field, setField] = React.useState<PageField | null>(null);
   const places = React.useRef<FieldPlace[]>([]);
@@ -467,10 +566,10 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
 
   const connect = React.useCallback(() => {
     const c = canvas.current;
-    if (!c || !(decodes || rtcs) || viewing.current) return;
+    if (!c || !(decodes || sources || rtcs) || viewing.current) return;
     const s = live.current.stream;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const v = new Viewing(`${proto}//${location.host}/api/harness/sessions/${encodeURIComponent(s.session)}/streams/${s.id}/ws`, c, player.current, {
+    const v = new Viewing(`${proto}//${location.host}/api/harness/sessions/${encodeURIComponent(s.session)}/streams/${s.id}/ws`, c, player.current, sourced.current, {
       // Its size first, before anything done in it: the page lays out at this frame's.
       open: () => {
         resize();
@@ -483,7 +582,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         if ((st === "ended" || st === "unsupported") && viewing.current === v) viewing.current = null;
       },
       fps: setFps,
-      rtc: (on) => setPath(on ? "webrtc" : "socket"),
+      path: setPath,
       event: (e) => {
         const opened = e.opened as { platform?: string; engine?: string; device?: { name: string; width: number; height: number } | null } | undefined;
         if (opened) {
@@ -492,7 +591,13 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           setHeld(opened.device ? { name: opened.device.name, width: opened.device.width, height: opened.device.height } : null);
         }
         const nav = e.navigated as { url?: string } | undefined;
-        if (nav?.url) setAddress(nav.url);
+        if (nav?.url) setAddress(nav.url === "about:blank" ? "" : nav.url);
+        // Its tabs, unless these are older than the last (said first, come later).
+        const t = e.tabs as { list?: PageTab[]; shown?: string; seq?: number } | undefined;
+        if (t && Array.isArray(t.list) && (t.seq ?? 0) >= tabsSeq.current) {
+          tabsSeq.current = t.seq ?? 0;
+          setTabs({ list: t.list, shown: t.shown ?? "" });
+        }
         if (typeof e.hidden === "boolean") setHidden(e.hidden);
         const loaded = e.loaded as { title?: string } | undefined;
         if (loaded?.title) setTitle(loaded.title);
@@ -593,7 +698,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   );
 
   // Where in the page: the frame's own point, or (held to a device, drawn whole in it) the page's.
-  const at = (e: React.PointerEvent | React.WheelEvent) => {
+  const at = (e: { clientX: number; clientY: number; currentTarget: EventTarget | null }) => {
     const c = e.currentTarget as HTMLCanvasElement;
     const r = c.getBoundingClientRect();
     const p = { x: e.clientX - r.left, y: e.clientY - r.top };
@@ -601,6 +706,33 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     return h ? pagePoint(p, r, { width: c.width, height: c.height }, h) : { x: Math.round(p.x), y: Math.round(p.y) };
   };
   const mods = (e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; key?: string }) => modifiers(e, macViewer, live.current.macPage);
+  // The wheel (a mouse's, a trackpad's, a pinch as a ctrl-wheel) is the page's, not the
+  // conversation's around it: React's wheel listener is passive and can't keep it, so the frame
+  // has one of its own. What comes within a frame goes as one, its deltas summed (in pixels: a
+  // line is 40, a page the frame's height).
+  const wheeled = React.useRef<{ x: number; y: number; dx: number; dy: number; mods: number } | null>(null);
+  const canvasEl = React.useCallback((c: HTMLCanvasElement | null) => {
+    canvas.current = c;
+    if (!c) return;
+    const on = (e: WheelEvent) => {
+      e.preventDefault();
+      const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? c.clientHeight || 800 : 1;
+      const p = at({ clientX: e.clientX, clientY: e.clientY, currentTarget: c });
+      const w = wheeled.current;
+      if (w) {
+        Object.assign(w, p, { dx: w.dx + e.deltaX * k, dy: w.dy + e.deltaY * k, mods: mods(e) });
+        return;
+      }
+      wheeled.current = { ...p, dx: e.deltaX * k, dy: e.deltaY * k, mods: mods(e) };
+      requestAnimationFrame(() => {
+        const w = wheeled.current;
+        wheeled.current = null;
+        if (w) input([{ t: "w", ...w }]);
+      });
+    };
+    c.addEventListener("wheel", on, { passive: false });
+    return () => c.removeEventListener("wheel", on);
+  }, [input]);
   const pointer = (k: "down" | "move" | "up" | "cancel") => (e: React.PointerEvent<HTMLCanvasElement>) => {
     const p = { t: "p", k, ...at(e), button: e.button, buttons: e.buttons, pt: e.pointerType, id: e.pointerId, mods: mods(e), clicks: k === "move" ? 0 : Math.max(1, e.detail || 1) };
     if (k === "down") {
@@ -695,11 +827,18 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     else el.style.removeProperty("--lv-kb-h");
   }, []);
 
-  const go = (url: string) => {
-    const u = /^[a-z]+:\/\//i.test(url) ? url : `http://${url}`;
+  const go = (typed: string) => {
+    const u = typedUrl(typed);
+    if (!u) return;
     send({ control: { go: u } });
     setAddress(u);
     setEditing(null);
+  };
+  // A blank tab, its address to type in.
+  const newTab = () => {
+    send({ control: { tab: { new: "" } } });
+    setEditing("");
+    addressEl.current?.focus();
   };
   const startAgain = async () => {
     const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600, profile: stream.profile, engine: stream.engine, device: stream.device }) });
@@ -736,7 +875,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         </span>
         <span className="pg-actions">
           {/* Its sound comes over WebRTC, or over its socket where WebCodecs' AudioDecoder plays it. */}
-          {(plays || rtcs) && (
+          {(plays || path === "webrtc") && (
             <button
               type="button"
               className="pg-action"
@@ -782,6 +921,23 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           )}
         </span>
       </div>
+      {/* Its tabs, as a browser's (a link to a new tab, a sign-in's popup, one of yours). */}
+      {tabs && tabs.list.length > 1 && (
+        <div className="lv-tabs">
+          <SelectField
+            label="Tab"
+            hideLabel
+            className="lv-tab"
+            value={tabs.shown}
+            onChange={(id) => send({ control: { tab: { show: id } } })}
+            options={tabs.list.map((t, i) => ({ value: t.id, label: `${i + 1}. ${tabWord(t)}` }))}
+          />
+          <button type="button" className="pg-action" onClick={() => send({ control: { tab: { close: tabs.shown } } })}>
+            <X size={12} aria-hidden="true" />
+            Close tab
+          </button>
+        </div>
+      )}
       <div className="lv-bar">
         <button type="button" className="pg-action" aria-label="Back" title="Back" onClick={() => send({ control: { back: true } })}>
           <ArrowLeft size={12} aria-hidden="true" />
@@ -792,6 +948,11 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         <button type="button" className="pg-action" aria-label="Reload" title="Reload" onClick={() => send({ control: { reload: true } })}>
           <RotateCw size={12} aria-hidden="true" />
         </button>
+        {tabs && (
+          <button type="button" className="pg-action" aria-label="New tab" title="New tab" onClick={newTab}>
+            <Plus size={12} aria-hidden="true" />
+          </button>
+        )}
         {/* While a field of the page's takes text, the viewer's own for it (`shape`) is here; the
             page's address otherwise. It's always there, so a tap can give it the focus at once. */}
         {shown && <span className="lv-typing-what">{fieldWord(field)}</span>}
@@ -824,27 +985,32 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           }}
         />
         <input
+          ref={addressEl}
           className="hx-input lv-address"
           hidden={shown}
           value={editing ?? address}
+          placeholder="Search or type an address"
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
+          inputMode="url"
+          enterKeyHint="go"
           aria-label="Address"
           onChange={(e) => setEditing(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && editing) go(editing.trim());
+            if (e.key === "Enter" && editing) go(editing);
             if (e.key === "Escape") setEditing(null);
           }}
           onBlur={() => setEditing(null)}
         />
       </div>
       <div className="pg-box lv-box" ref={box}>
-        {/* WebRTC's picture, once it plays: under the canvas, which takes what's done in the page
-            and is clear then. */}
-        <video ref={player} className="lv-video" muted playsInline autoPlay aria-hidden="true" tabIndex={-1} />
+        {/* The socket's pictures through Media Source (no WebCodecs here), and WebRTC's over them
+            once it plays: under the canvas, which takes what's done in the page and is clear then. */}
+        <video ref={sourced} className="lv-video lv-source" muted playsInline autoPlay aria-hidden="true" tabIndex={-1} />
+        <video ref={player} className="lv-video lv-rtc" muted playsInline autoPlay aria-hidden="true" tabIndex={-1} />
         <canvas
-          ref={canvas}
+          ref={canvasEl}
           className="lv-canvas"
           tabIndex={0}
           aria-label={`${title}, live`}
@@ -852,7 +1018,6 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           onPointerMove={pointer("move")}
           onPointerUp={pointer("up")}
           onPointerCancel={pointer("cancel")}
-          onWheel={(e) => input([{ t: "w", ...at(e), dx: e.deltaX, dy: e.deltaY, mods: mods(e) }])}
           onKeyDown={key("down")}
           onKeyUp={key("up")}
           onPaste={(e) => {

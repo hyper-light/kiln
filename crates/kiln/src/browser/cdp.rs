@@ -127,8 +127,9 @@ impl Cdp {
         let Some(method) = v.get("method").and_then(Value::as_str) else { return };
         let event = Event { session: v.get("sessionId").and_then(Value::as_str).map(str::to_owned), method: method.to_owned(), params: v.get("params").cloned().unwrap_or(Value::Null) };
         // To each listener for its session (or for all): one that's full misses it, one gone goes.
+        // The browser's own events are its session `""`'s.
         self.listeners.lock().retain(|(session, tx)| {
-            if session.is_none() || *session == event.session {
+            if session.is_none() || session.as_deref() == Some(event.session.as_deref().unwrap_or("")) {
                 let _ = tx.try_send(event.clone());
             }
             !tx.is_closed()
@@ -178,5 +179,11 @@ impl Cdp {
         let (tx, rx) = async_channel::bounded(4096);
         self.listeners.lock().push((session.map(str::to_owned), tx));
         rx
+    }
+
+    /// What the browser itself says from now on (a target made, changed or gone), none of its
+    /// pages' sessions.
+    pub fn listen_browser(&self) -> async_channel::Receiver<Event> {
+        self.listen(Some(""))
     }
 }

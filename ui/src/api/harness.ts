@@ -864,6 +864,8 @@ export interface PreviewLook {
   devices?: Device[];
   /** The machine's system (`macos`, `linux`, `windows`). */
   platform?: string;
+  /** Whether the one asking may open pages in a profile of their own, and why not. */
+  personal?: { ok: boolean; why?: string | null };
 }
 
 /** A live page of a session, as the server relays it (`crate::harness::streams::Live::view`). */
