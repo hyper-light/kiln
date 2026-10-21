@@ -270,6 +270,10 @@ function Palette() {
               } else if (e.key === "Escape") {
                 e.preventDefault();
                 setPaletteOpen(false);
+              } else if (e.key === "Tab") {
+                // Its field is all there is to it (the list goes by the arrows): Tab stays here,
+                // where a modal dialog would otherwise let it out to the browser's own stops.
+                e.preventDefault();
               }
             }}
           />

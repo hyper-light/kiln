@@ -123,7 +123,18 @@ page appears in the conversation, live.
   compositor draws it, only when something changed, so a still page costs nothing. It encodes it
   right there with WebCodecs: H.264 (VP8, VP9 or AV1 when asked) at the viewer's own window size and
   pixel density, and the page's sound as Opus. Once the page is still, its last picture is sent
-  again, sharp.
+  again, sharp. Its bitrate follows its size (about a tenth of a bit a pixel at its rate, 2 to
+  25 Mb/s; a page's flat colours and text take far less than video), unless the stream asked for
+  one. Each size is captured exactly, even (a capture left to choose its own within a shape comes
+  odd, and each picture cut to even was a key frame of its own); a new size is a new capture, the
+  encoders kept. A picture the encoder is too far behind to take is let go before it's encoded, so
+  no key frame has to follow it.
+- **Drawn on the machine's GPU** where it has one: on Linux, a render node the runner may open
+  (`/dev/dri/renderD*`) has the stream's browser draw and composite on it, through ANGLE's EGL, not
+  on the processor. A heavy page, or a big window, comes several times as fast (on a busy machine,
+  GitHub's diff scrolled at 57 pictures a second against 33; 1440p at 48 against 13).
+  `KILN_BROWSER_GPU=0` in the runner's environment keeps it on the processor, and
+  `KILN_BROWSER_FLAGS` gives the browser more flags of the machine's own.
 - **Relayed by the server.** Chunks go up the runner's stream lane (`LANE_STREAM`, runners with
   `CAP_STREAM`) and out to each viewer's socket. A viewer that joins gets the decoders'
   configuration and a fresh key frame at once. One too slow for a chunk loses it, and the next key
@@ -137,7 +148,15 @@ page appears in the conversation, live.
   frame is the page's window: the conversation's width, as tall as the conversation shows. The
   page lays out at that size on the agent's machine, as a phone lays it out for a phone. Its
   sound plays once the person turns it on.
-- **What the person does goes to it:** taps and the mouse (as touch from a phone), the wheel, keys
+- **Its resolution, as the person picks it:** Fit (the frame's own size, at the screen's density,
+  by default), or a screen's: 720p (1280×720), 1080p (1920×1080), 1440p (2560×1440) or 4K
+  (3840×2160, laid out at 1920×1080 at 2×). A screen's window is drawn whole in the frame, and what's
+  done in the frame lands where the page has it. Measured on one machine (a Ryzen 9950X3D, its
+  GPU drawing), 1080p streamed at 60 pictures a second and 1440p at about 50; 4K's capture took
+  about 45 a second and Chrome's encoder about 30 (H.264 in software: a GPU's encoder, where
+  Chrome uses one, as on a Mac, does more).
+- **What the person does goes to it:** taps and the mouse (as touch from a phone), the wheel (the
+  frame's own: the conversation around it doesn't scroll, and a frame's turns go as one), keys
   by meaning (a Mac's Command is Control on a page elsewhere, for its shortcuts), text from a
   phone's keyboard (Type), compositions, a paste. Measured on one machine, a tap shows in the
   picture 12 to 30 ms later (17 ms at the median).
@@ -154,7 +173,16 @@ page appears in the conversation, live.
 - **Shared with the agent.** `use_live` clicks, taps, types, presses keys, scrolls and goes places
   in the same page, and gets a picture back. The person sees it happen, and where the agent
   touched.
-- **Where it is:** the frame shows the page's address. Type another, or go back, forward, reload.
+- **Where it is:** the frame shows the page's address. Type another (a host without its scheme
+  goes over https, or over http when it's this machine's, its LAN's or has a port; words are
+  searched for, on DuckDuckGo), or go back, forward, reload.
+- **Tabs, as a browser's** (Chromium). A link to a new tab, or a popup (a sign-in's, say), opens a
+  tab of the stream's own, shown as Chrome shows it (one opened in the background isn't). With
+  more than one, a select says which is shown and Close tab closes it (the tab that opened it is
+  shown in its place); New tab opens a blank one, its address field ready to type in. The capture
+  moves to the tab shown (the same encoders, from a key frame), and what's done in the frame goes
+  to it. The agent's `use_live` has them too (`{"tab": {"show" | "new" | "close": ...}}`), and its
+  answer lists them. Closing the last closes the stream.
 - **Out of view** the frame lets go of the stream (it pauses) and keeps its last picture. A stream
   that ended can be started again from the frame.
 
@@ -186,11 +214,17 @@ socket (WebCodecs) otherwise. Nothing changes for the page or its runner: the se
   and keys, is clear over WebRTC's video). If the peer doesn't play within ten seconds (the
   server's port is out of reach), fails, or the server's WebRTC stops, the pictures come over the
   socket again, from a key frame. A page that saw WebRTC fail twice doesn't try it again.
-- **With no WebCodecs, WebRTC alone.** A browser hides WebCodecs on an http:// address other than
-  localhost (kiln at its LAN or Tailscale address), and WebRTC needs no secure context: there the
-  viewer connects as ever and its picture and sound come over WebRTC alone. If WebRTC can't get
-  through, or the server has none, the frame says so, lets its socket go and offers Try again; over
-  https, or on localhost, the socket's pictures would stand in.
+- **With no WebCodecs, Media Source.** A browser hides WebCodecs on an http:// address other than
+  localhost (kiln at its LAN or Tailscale address). There the socket's pictures play through the
+  browser's Media Source Extensions, which need no secure context (`ui/src/views/harness/live-source.ts`):
+  each H.264 picture becomes a fragment of MP4 of its own, as it comes, on a timeline with no gaps
+  (each lasts a sixtieth of a second and playing waits at the last for the next), the stream marked
+  live so Chrome shows each picture as soon as it's decoded. No sound comes that way. It needs no
+  WebRTC and no UDP, so it works where the server has no WebRTC or the network carries only TCP (a
+  company's proxy). Where WebRTC gets through it takes over, as it does from WebCodecs. Only a
+  browser with neither (an iPhone before iOS 17.1) has WebRTC alone, and says so if that can't get
+  through. Measured on one machine: a tap's picture shown 45 to 53 ms after it, at a real http://
+  address as with WebRTC.
 - **Measured** on one machine (server, runner and viewer together): the first picture came over
   the socket 0.3 s after Open and the pictures over WebRTC 0.4 s after. A tap's picture came 22 ms
   after the tap and was shown a millisecond later, on a desktop and a phone alike (the lab notices
@@ -307,7 +341,8 @@ and it streams there, live, with Close to end it.
   "Start the app" starts it on the agent's machine and opens it once it listens (on `127.0.0.1`
   or `::1`). Its output goes to `browser/apps/<session>.log` in the runner's state folder. It runs
   until it's stopped (Stop the app) or its conversation closes.
-- **Another address**, typed: `localhost:3000` is `http://localhost:3000`.
+- **Another address**, typed: `localhost:3000` is `http://localhost:3000`, `github.com/x` is
+  `https://github.com/x`, and words are searched for.
 
 #### Profiles
 

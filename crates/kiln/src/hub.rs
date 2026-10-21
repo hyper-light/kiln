@@ -1113,8 +1113,14 @@ impl Hub {
             // A streamed page's chunks and events (`crate::harness::streams`): to its viewers.
             AgentMsg::StreamFrame { stream, data } => self.harness.streams.chunk(&agent, &stream, data),
             AgentMsg::StreamEvent { stream, json } => {
-                if let Some((session, rec)) = self.harness.streams.event(&agent, &stream, json) {
+                let after = self.harness.streams.event(&agent, &stream, json);
+                // A recording that ended: its files kept in kiln's store of bytes.
+                if let Some((session, rec)) = after.ended {
                     self.harness.streams.keep(self, session, rec);
+                }
+                // Opened: the size its viewer asked for while it was being set up, asked again.
+                if let Some((live, again)) = after.again {
+                    live.control(self, &again).await;
                 }
             }
             // Connections to its ports (`crate::harness::opened`).

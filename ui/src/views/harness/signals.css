@@ -128,12 +128,44 @@
   letter-spacing: 0.02em;
   text-transform: none;
 }
-/* While it thinks, the prism sweeps through its words: the holographic shimmer. One line per
-   conversation, so its repaint stays cheap; other live labels only breathe. */
-.sg-thinking-line .sg-label[data-live="true"] {
-  background-size: 250% 100%;
-  animation: sg-prism-current 6s ease-in-out infinite alternate;
+/* While it thinks, the prism sweeps through its words: the holographic shimmer (other live labels
+   only breathe). The GPU moves it: the words are drawn white on black, a strip of the prism two
+   and a half times their width is multiplied over them and slides across, and the whole is
+   screened onto the page, where black adds nothing and the words take the prism's colours, as
+   they would clipped to a sliding background. Only the strip's transform changes, so nothing is
+   painted again for it (a sliding background was, every frame, and every animation on the page
+   restyled with it). */
+.sg-label[data-live="true"][data-sweep] {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  color: #fff;
+  background: #000;
+  -webkit-background-clip: border-box;
+  background-clip: border-box;
+  mix-blend-mode: screen;
+  animation: none;
 }
+.sg-sweep {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 250%;
+  background: var(--sg-prism);
+  mix-blend-mode: multiply;
+  pointer-events: none;
+  animation: sg-prism-sweep 6s ease-in-out infinite alternate;
+}
+@keyframes sg-prism-sweep {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-60%);
+  }
+}
+/* The same sweep painted every frame (the conversation loader's words). */
 @keyframes sg-prism-current {
   from {
     background-position: 0% 50%;
@@ -410,6 +442,7 @@
 
 :root[data-motion="paused"] .sg-optic > span,
 :root[data-motion="paused"] .sg-label,
+:root[data-motion="paused"] .sg-sweep,
 :root[data-motion="paused"] .sg-think::before,
 :root[data-motion="paused"] .sg-trace path,
 :root[data-motion="paused"] .sg-beam,
@@ -423,6 +456,7 @@
 @media (prefers-reduced-motion: reduce) {
   .sg-optic > span,
   .sg-label,
+  .sg-sweep,
   .sg-think::before,
   .sg-trace path,
   .sg-beam,
@@ -444,9 +478,14 @@
 
 /* Clipped-gradient text would vanish under forced colours; fall back to the system text colour. */
 @media (forced-colors: active) {
-  .sg-label[data-live="true"] {
+  .sg-label[data-live="true"],
+  .sg-label[data-live="true"][data-sweep] {
     color: CanvasText;
     background: none;
+    mix-blend-mode: normal;
+  }
+  .sg-sweep {
+    display: none;
   }
   .sg-trace path,
   .sg-load path {

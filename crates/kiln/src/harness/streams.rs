@@ -59,6 +59,9 @@ pub struct Live {
     said: Mutex<HashMap<String, String>>,
     /// When the last viewer left (unix ms; 0 while someone looks).
     unwatched: AtomicI64,
+    /// The size its viewer last asked for: asked again as it opens (one asked while its runner was
+    /// still setting it up wasn't heard).
+    resized: Mutex<Option<Value>>,
 }
 
 #[derive(Default)]
@@ -71,6 +74,14 @@ pub struct Relay {
     recordings: Mutex<HashMap<String, Vec<Recording>>>,
     /// Recordings' copies into kiln's store of bytes under way.
     copying: AtomicU64,
+}
+
+/// What's left to do once a runner's event is relayed ([`Relay::event`]).
+pub struct Evented {
+    /// As it opens, the stream and the size its viewer asked for meanwhile, to ask of it again.
+    pub again: Option<(Arc<Live>, Value)>,
+    /// A recording that ended, with its session, for its files to be kept ([`Relay::keep`]).
+    pub ended: Option<(String, Recording)>,
 }
 
 /// Whose a stream is: its session, its machine, its profile.
@@ -176,6 +187,7 @@ impl Relay {
             audio: Mutex::default(),
             said: Mutex::default(),
             unwatched: AtomicI64::new(crate::util::now_ms()),
+            resized: Mutex::default(),
         });
         self.live.lock().insert(id.clone(), live.clone());
         if !hub.send_to_agent(&machine, LANE_STREAM, &msg).await {
@@ -199,9 +211,8 @@ impl Relay {
     }
 
     /// An event from a runner: kept when a joining viewer needs it, sent on to each viewer; a
-    /// stream that closed or failed to open goes. A recording that ended is answered, with its
-    /// session, for its files to be kept ([`Relay::keep`]).
-    pub fn event(&self, machine: &str, id: &str, mut json: String) -> Option<(String, Recording)> {
+    /// stream that closed or failed to open goes. What's left to do is answered ([`Evented`]).
+    pub fn event(&self, machine: &str, id: &str, mut json: String) -> Evented {
         let mut v: Value = serde_json::from_str(&json).unwrap_or_default();
         // A recording's end: kept, and said to its viewers with the id to get its files by.
         let ended = v.get("recorded").and_then(|r| self.recorded(machine, id, r));
@@ -211,11 +222,24 @@ impl Relay {
             }
             json = v.to_string();
         }
-        let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return ended };
+        let mut after = Evented { again: None, ended };
+        let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return after };
+        // Its tabs as they were before the ones it said last (said later, arrived first): no news.
+        let seq = |v: &Value| v.pointer("/tabs/seq").and_then(Value::as_u64);
+        if let Some(new) = seq(&v)
+            && live.said.lock().get("tabs").and_then(|kept| serde_json::from_str::<Value>(kept).ok()).and_then(|kept| seq(&kept)).is_some_and(|kept| kept > new)
+        {
+            return after;
+        }
         if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
+            if k == "opened"
+                && let Some(r) = live.resized.lock().clone()
+            {
+                after.again = Some((live.clone(), json!({"resize": r})));
+            }
             // What a viewer joining later needs to show it as it is now (whether its window can be
-            // seen where it runs, too: Safari's on a locked Mac).
-            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected" | "hidden") {
+            // seen where it runs, too: Safari's on a locked Mac; its tabs).
+            if matches!(k.as_str(), "opened" | "navigated" | "loaded" | "focus" | "fields" | "selected" | "hidden" | "tabs") {
                 live.said.lock().insert(k.clone(), json.clone());
             }
             if matches!(k.as_str(), "closed" | "error") {
@@ -227,7 +251,7 @@ impl Relay {
             }
         }
         live.send(&ToViewer::Event(json));
-        ended
+        after
     }
 
     /// Copies a recording's files into kiln's store of bytes, in the background; past
@@ -459,6 +483,9 @@ impl Live {
 
     /// What a viewer asks of the stream, to its runner.
     pub async fn control(&self, hub: &Hub, c: &Value) {
+        if let Some(r) = c.get("resize") {
+            *self.resized.lock() = Some(r.clone());
+        }
         let _ = hub.send_to_agent(&self.machine, LANE_STREAM, &ServerMsg::StreamControl { stream: self.id.clone(), session: self.session.clone(), json: c.to_string() }).await;
     }
 
@@ -583,6 +610,7 @@ mod tests {
             audio: Mutex::default(),
             said: Mutex::default(),
             unwatched: AtomicI64::new(0),
+            resized: Mutex::default(),
         })
     }
 
@@ -609,7 +637,16 @@ mod tests {
         assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("true")));
         r.event("m1", "v1", json!({"hidden": false}).to_string());
         assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("false")));
-        assert_eq!(rx.len(), 6);
+        // A size its viewer asked for before it opened is asked again as it does.
+        *l.resized.lock() = Some(json!({"width": 400, "height": 300, "scale": 2}));
+        let again = r.event("m1", "v1", json!({"opened": {"width": 390}}).to_string()).again;
+        assert_eq!(again.map(|(_, c)| c), Some(json!({"resize": {"width": 400, "height": 300, "scale": 2}})));
+        while rx.try_recv().is_ok() {}
+        // Its tabs, as they are now; a list said before (arriving after) is no news.
+        r.event("m1", "v1", json!({"tabs": {"list": [{"id": "t1", "url": "http://localhost:5173/a", "title": "A"}], "shown": "t1", "seq": 2}}).to_string());
+        r.event("m1", "v1", json!({"tabs": {"list": [], "shown": "", "seq": 1}}).to_string());
+        assert!(l.said.lock().get("tabs").is_some_and(|t| t.contains("\"shown\":\"t1\"")));
+        assert_eq!(rx.len(), 1);
         while rx.try_recv().is_ok() {}
         assert_eq!(l.codec(), "avc1.42E01f");
         assert_eq!(live("v9", "m1").codec(), "h264");

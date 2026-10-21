@@ -71,16 +71,80 @@ const MERGES: Partial<Record<StepGroup, boolean>> = { explore: true, edit: true,
  * `openLast`: the last turn is still going, so it has no answer yet (its latest note stays where it
  * is instead of jumping to the answer slot and back as the turn goes on).
  */
-export function turnsOf(events: HEvent[], parent?: string, openLast = false): Turn[] {
-  const turns: Turn[] = [];
+export function turnsOf(events: HEvent[], parent?: string, openLast = false, thread?: string): Turn[] {
+  return turnsFrom(null, events, parent, openLast, thread).turns;
+}
+
+/** Turns worked out from `events` (for `parent`, `openLast`), and where in `events` each began. */
+export interface TurnsMemo {
+  events: HEvent[];
+  parent: string | undefined;
+  thread: string | undefined;
+  openLast: boolean;
+  turns: Turn[];
+  starts: number[];
+}
+
+/**
+ * `turnsOf`, from what was worked out before (`was`): the turns before the one the first changed
+ * event is in (and the one before it, whose end and answer the next can change) are kept as they
+ * were, and only the rest is read again. A conversation streaming into its last turn costs that
+ * turn, not the thousands of events before it.
+ */
+export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: string, openLast = false, thread?: string): TurnsMemo {
+  let from = 0;
+  if (was && was.parent === parent && was.thread === thread) {
+    let k = 0;
+    const n = Math.min(events.length, was.events.length);
+    while (k < n && events[k] === was.events[k]) k++;
+    if (k === events.length && k === was.events.length) {
+      if (was.openLast === openLast) return was;
+      // Only whether the last turn goes on changed: that turn is worked out again.
+      k = was.starts.at(-1) ?? 0;
+    }
+    // The turn event `k` is in, and the one before it.
+    let t = was.starts.length - 1;
+    while (t >= 0 && was.starts[t]! > k) t--;
+    from = Math.max(0, t - 1);
+  }
+  const turns = was && from > 0 ? was.turns.slice(0, from) : [];
+  const starts = was && from > 0 ? was.starts.slice(0, from) : [];
+  readTurns(events, was && from > 0 ? (was.starts[from] ?? events.length) : 0, parent, thread, turns, starts);
+  // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
+  for (let ti = from; ti < turns.length; ti++) {
+    const t = turns[ti]!;
+    if (openLast && ti === turns.length - 1) break;
+    if (t.divider) continue;
+    for (let i = t.items.length - 1; i >= 0; i--) {
+      const it = t.items[i];
+      if (!it || it.type === "thought" || it.type === "notice") continue;
+      if (it.type === "note" && !it.event.streaming) {
+        t.outcome = it.event;
+        t.items.splice(i, 1);
+      }
+      break;
+    }
+  }
+  return { events, parent, thread, openLast, turns, starts };
+}
+
+/**
+ * The turns of `events` from index `at` (where a turn begins) on, onto `turns`, with where each begins onto `starts`.
+ * `thread`: a Codex child's thread, whose own events (`child:<thread>:…`) are its whatever call they hang from.
+ */
+function readTurns(events: HEvent[], at: number, parent: string | undefined, thread: string | undefined, turns: Turn[], starts: number[]) {
+  const own = thread ? `child:${thread}:` : null;
   let cur: Turn | null = null;
+  let i = at;
   const open = (prompt: Turn["prompt"], at: number, key: string) => {
     cur = { key, prompt, items: [], outcome: null, started: at, ended: null };
     turns.push(cur);
+    starts.push(i);
     return cur;
   };
-  for (const e of events) {
-    if ((e.parent ?? undefined) !== parent) continue;
+  for (; i < events.length; i++) {
+    const e = events[i]!;
+    if ((e.parent ?? undefined) !== parent && !(own && e.id.startsWith(own))) continue;
     if (e.kind === "user") {
       if (cur) (cur as Turn).ended = e.at;
       open(e, e.at, e.id);
@@ -90,6 +154,7 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
     const divider = switchOf(e);
     if (divider) {
       turns.push({ key: e.id, prompt: null, items: [], outcome: null, started: e.at, ended: null, divider });
+      starts.push(i);
       cur = null;
       continue;
     }
@@ -118,21 +183,6 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
       else t.items.push({ type: "notice", key: e.id, event: e });
     }
   }
-  // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
-  for (const [ti, t] of turns.entries()) {
-    if (openLast && ti === turns.length - 1) break;
-    if (t.divider) continue;
-    for (let i = t.items.length - 1; i >= 0; i--) {
-      const it = t.items[i];
-      if (!it || it.type === "thought" || it.type === "notice") continue;
-      if (it.type === "note" && !it.event.streaming) {
-        t.outcome = it.event;
-        t.items.splice(i, 1);
-      }
-      break;
-    }
-  }
-  return turns;
 }
 
 const sameList = <T>(a: readonly T[] | undefined, b: readonly T[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b?.[i]);
@@ -154,7 +204,7 @@ function sameItem(a: Item, b: Item): boolean {
 export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
   const out = next.map((t) => {
     const was = kept.get(t.key);
-    if (!was) return t;
+    if (!was || was === t) return t;
     const before = new Map(was.items.map((it) => [it.key, it]));
     const items = t.items.map((it) => {
       const b = before.get(it.key);

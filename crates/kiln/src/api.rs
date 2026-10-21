@@ -725,8 +725,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 Err(err(StatusCode::NOT_FOUND, "no such opening"))
             }
         }
-        (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => boxed(|| preview_look(&hub, id, "look")).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => boxed(|| preview_look(&hub, id, "stop")).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => {
+            let refusal = personal_refusal(&req);
+            boxed(|| preview_look(&hub, id, "look", refusal)).await
+        }
+        (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => boxed(|| preview_look(&hub, id, "stop", None)).await,
         (&Method::DELETE, ["api", "harness", "sessions", id, "streams", sid]) => {
             let me = person(&req);
             let ours = hub.harness.streams.get(sid).is_some_and(|l| l.session == *id && l.for_whom(me.as_deref()));
@@ -3863,10 +3866,34 @@ fn person(req: &Request) -> Option<String> {
     }
 }
 
+/// Why this caller can't have a browser profile of its own (`None`: it can). A profile of one's
+/// own keeps a person's sign-ins, so it's theirs alone: signed in as themselves, not through an
+/// agent, a job, or a token allowed less than its owner.
+fn personal_refusal(req: &Request) -> Option<String> {
+    if person(req).is_some() {
+        return None;
+    }
+    let as_whom = match req.extensions().get::<crate::authz::Caller>() {
+        Some(c) if c.agent.is_some() => format!("an agent ({})", c.name),
+        Some(c) if matches!(c.kind, crate::authz::gate::Kind::Job) => format!("a CI job ({})", c.name),
+        Some(c) => format!("a token allowed less than its owner ({})", c.name),
+        None => "someone kiln can't name".to_owned(),
+    };
+    Some(format!(
+        "Your own profile keeps your sign-ins, so only you can use it, signed in to kiln as yourself. This browser is signed in as {as_whom}. Pick Conversation (kept with this conversation) or Clean (fresh each time), or sign in to kiln as yourself (your password, or the admin token)."
+    ))
+}
+
 async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "owner".to_owned(), |c| c.name.clone());
     let me = person(&req);
+    let refusal = personal_refusal(&req);
     let mut spec: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if spec.get("profile").and_then(serde_json::Value::as_str) == Some("personal")
+        && let Some(why) = refusal
+    {
+        return Err(err(StatusCode::FORBIDDEN, why));
+    }
     // `{"start": true}`: the project's app first (its `.kiln/preview.yaml`), then its page.
     if spec.get("start").and_then(serde_json::Value::as_bool) == Some(true) {
         let started = crate::harness::streams::preview(hub, id, "start").await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
@@ -3924,10 +3951,17 @@ async fn open_on_device(hub: &Arc<Hub>, id: &str, req: Request) -> R {
 /// `GET /api/harness/sessions/:id/preview`: what a person may open live from the session (the
 /// ports its machine serves, its agent's first; its project's app); `POST .../preview/stop` stops
 /// that app.
-async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
-    let v = crate::harness::streams::preview(hub, id, op).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str, personal_refused: Option<String>) -> R {
+    let mut v = crate::harness::streams::preview(hub, id, op).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     if op == "stop" && v.get("stopped").and_then(serde_json::Value::as_bool) == Some(true) {
         hub.store.audit("admin".into(), "agent.app.stop".into(), id.to_owned()).await;
+    }
+    // Whether the one asking may have a profile of their own, and why not (the form says so
+    // before they choose it).
+    if op == "look"
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("personal".into(), serde_json::json!({"ok": personal_refused.is_none(), "why": personal_refused}));
     }
     Ok(srv::json(StatusCode::OK, &v))
 }
@@ -3991,16 +4025,18 @@ async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, so
         Stream(Result<ToViewer, async_channel::RecvError>),
     }
     let (mut tx, mut rx) = socket.split();
-    let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
     let rtc = &hub.harness.webrtc;
+    // Said first, before joining (which waits on the stream's runner): a viewer that can show the
+    // stream only over WebRTC knows at once whether it can.
+    if rtc.on() {
+        tx.send(ws::text(serde_json::json!({"webrtc": {"can": true}}).to_string())).await?;
+    }
+    let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
     // The viewer's WebRTC peer, and whether it shows the stream (its chunks then go there alone).
     let mut peer: Option<Peer> = None;
     let mut playing = false;
     let mut keyed: Option<std::time::Instant> = None;
     let r: anyhow::Result<()> = async {
-        if rtc.on() {
-            tx.send(ws::text(serde_json::json!({"webrtc": {"can": true}}).to_string())).await?;
-        }
         loop {
             let next = {
                 let said = async {

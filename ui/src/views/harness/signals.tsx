@@ -30,11 +30,13 @@ export function Optic({ state, size = 14, className }: { state: OpticState; size
   );
 }
 
-/** A mono eyebrow; live text carries the prism gradient sweeping through it. */
-export function PrismLabel({ live = false, className, children }: { live?: boolean; className?: string; children: React.ReactNode }) {
+/** A mono eyebrow; live text carries the prism gradient sweeping through it (`sweep`: the thinking
+ *  line's, a strip of the prism the GPU slides across its words; signals.css). */
+export function PrismLabel({ live = false, sweep = false, className, children }: { live?: boolean; sweep?: boolean; className?: string; children: React.ReactNode }) {
   return (
-    <span className={cn("sg-label", className)} data-live={live ? "true" : "false"}>
+    <span className={cn("sg-label", className)} data-live={live ? "true" : "false"} data-sweep={live && sweep ? "" : undefined}>
       {children}
+      {live && sweep && <span className="sg-sweep" aria-hidden="true" />}
     </span>
   );
 }
@@ -54,7 +56,7 @@ export function ThinkingLabel({ since, doing }: { since?: number; doing?: string
   const [observed] = React.useState(Date.now);
   const seconds = Math.max(0, (now - (since ?? observed)) / 1000);
   const what = doing && /^(compact|retr|wait|summar)/i.test(doing) ? doing : thinkingWords(seconds);
-  return <><PrismLabel live>{what}</PrismLabel><span className="sg-num">{formatThought(seconds)}</span></>;
+  return <><PrismLabel live sweep>{what}</PrismLabel><span className="sg-num">{formatThought(seconds)}</span></>;
 }
 
 /** The toggle above a thinking block: live it breathes ("Thinking"); settled it reads "Thought · 12s" with a chevron. */

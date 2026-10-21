@@ -10,7 +10,7 @@ import { useSession, type Approval, type Command, type Delivery, type HEvent, ty
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { AccountCard, saysSignedOut } from "./account-card";
-import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, taskDot, taskDuration, taskLive, taskOfCall, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
+import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, taskDot, taskDuration, taskLive, taskOfCall, turnsFrom, type Item, type Step, type ToolEvent, type Turn, type TurnsMemo } from "./derive";
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
@@ -27,6 +27,7 @@ import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, typ
 import { latestThought, thinkingStarted, thoughtIsLive, type ThoughtItem } from "./thinking";
 import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
+import { useHeld, useRecent } from "./dom";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -326,19 +327,29 @@ function AgentBody({ calls, tasks, onOpenTask }: { calls: ToolEvent[]; tasks: Ta
 
 /* ------------------------------------------------------------------ step */
 
+/**
+ * A step opens by itself while it runs once it has run this long: calls that come and go faster (an
+ * agent reading, searching and running at full speed) don't open and close it on each one.
+ */
+const OPEN_AFTER_MS = 500;
+/** A call that had been running this long when the page saw it first (by this device's clock, with room for another's) opens at once. */
+const RUNNING_BEFORE_MS = 2000;
+
 const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { step: Step; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
   const status = stepStatus(step.calls);
   const failures = step.calls.filter((c) => c.status === "error" || (c.tool === "shell" && c.exit_code !== undefined && c.exit_code !== 0)).length;
   const asking = React.useContext(Asking);
   const asked = step.calls.some((c) => asking.has(c.tool_id));
-  // Open by default: what needs attention, and what is happening right now.
+  // Open by default: what needs attention, and what is happening right now (once it has gone on a moment).
   const [open, setOpen] = React.useState<boolean | null>(null);
   // A match found in it opens it.
   useRevealed(
     (id) => step.calls.some((c) => c.id === id),
     () => setOpen(true),
   );
-  const isOpen = open ?? (status === "running" || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
+  const runningFrom = step.calls.reduce((t, c) => (c.status === "running" ? Math.max(t, c.started) : t), -Infinity);
+  const runs = useHeld(status === "running", OPEN_AFTER_MS, Date.now() - runningFrom > RUNNING_BEFORE_MS);
+  const isOpen = open ?? (runs || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
   const last = step.calls.at(-1);
@@ -412,7 +423,7 @@ function Thought({ item, live, since }: { item: ThoughtItem; live: boolean; sinc
       {open && (
         <ThinkingBody live={live}>
           {all.map((x) => (
-            <Prose key={x.id} text={x.text} className="hx-thought-text" ev={x.id} />
+            <Prose key={x.id} text={x.text} className="hx-thought-text" ev={x.id} streaming={x.streaming} />
           ))}
         </ThinkingBody>
       )}
@@ -472,13 +483,17 @@ function CopyMsg({ text, label, className }: { text: string; label: string; clas
   );
 }
 
-function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
+/** When something was said, "14:05": one formatter for every message (making one for each, as each renders, is slow). */
+const SAID_AT = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+
+/** What was asked: it renders only when it changes, not as the turn under it streams. */
+const Prompt = React.memo(function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
   const system = e.origin && e.origin !== "human";
   return (
     <div className="hx-prompt" data-origin={e.origin ?? "human"} data-ev={e.id}>
       <div className="hx-prompt-meta">
         <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
-        <span className="hx-dim">{new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+        <span className="hx-dim">{SAID_AT.format(e.at)}</span>
         {delivery && <span className="hx-dim">· {DELIVERY[delivery]}</span>}
         {e.attachments?.length ? (
           <span className="hx-dim hx-trunc" title={e.attachments.join(", ")}>
@@ -495,7 +510,7 @@ function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "
       <div className="hx-prompt-text">{e.text}</div>
     </div>
   );
-}
+});
 
 /** A step that started a subagent: it shows the subagent's task as it goes. */
 function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenTask?: (t: string) => void }) {
@@ -503,7 +518,8 @@ function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenT
   return <StepRow step={step} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
 }
 
-function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; active: boolean; since: number }) {
+/** One thing in a turn: it renders again only when it changes (or starts or stops being the live one), not as the rest of the turn streams. */
+const ItemView = React.memo(function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: string; onOpenTask?: (t: string) => void; active: boolean; since: number }) {
   switch (item.type) {
     case "step":
       return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
@@ -511,7 +527,7 @@ function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: s
       // A tap (or a pointer resting on it) shows its copy icon.
       return (
         <div className="hx-said" data-ev={item.event.id} tabIndex={-1}>
-          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} />
+          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
           {!item.event.streaming && item.event.text && <CopyMsg text={item.event.text} label="Copy what it said" className="hx-said-copy" />}
         </div>
       );
@@ -533,7 +549,7 @@ function ItemView({ item, cwd, onOpenTask, active, since }: { item: Item; cwd: s
         <StepRow step={{ type: "step", key: item.key, group: "tool", calls: [item.event] }} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />
       );
   }
-}
+});
 
 /** Whether the end of a live turn shows it at work: a reply or a thought streaming, a call running. */
 function moving(items: Item[], turnStarted?: number): boolean {
@@ -545,6 +561,9 @@ function moving(items: Item[], turnStarted?: number): boolean {
   if (last.type === "page" || last.type === "live") return last.event.status === "running" || last.event.status === "pending";
   return false;
 }
+
+/** How long the end of a turn holds still before it shows the turn at work: not in the moment between one quick call and the next. */
+const TAIL_AFTER_MS = 600;
 
 /** The end of a turn under way while nothing at its end moves: what it's doing (a model thinking
  *  after a call shows nothing for minutes) and the elapsed time across the whole turn, so it
@@ -602,6 +621,10 @@ const TurnView = React.memo(function TurnView({
   const items = sought ? turn.items : turn.items.slice(hidden, end);
   const currentItem = turn.items.findLast((item) => item.type !== "notice");
   const since = thinkingStarted(turn, turnStarted);
+  // At work with nothing moving at its end: said once the end has held still a moment (from the
+  // start, before anything has moved, at once).
+  const moves = live && moving(turn.items, turnStarted);
+  const movedLately = useRecent(moves, TAIL_AFTER_MS);
   if (turn.divider) {
     return (
       <section className="hx-turn hx-turn-switch">
@@ -624,7 +647,7 @@ const TurnView = React.memo(function TurnView({
         {items.map((it) => (
           <ItemView key={it.key} since={since} item={it} cwd={cwd} onOpenTask={onOpenTask} active={live && it === currentItem && (it.type !== "thought" || thoughtIsLive(it, true, turnStarted))} />
         ))}
-        {live && !turn.outcome && !moving(turn.items, turnStarted) && <LiveTail doing={doing} since={since} />}
+        {live && !turn.outcome && !movedLately && <LiveTail doing={doing} since={since} />}
       </div>
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
@@ -896,10 +919,25 @@ export const Timeline = React.memo(function Timeline({
   const keptFiles = useSession(store, (s) => s.files);
   const conversationFiles = React.useMemo(() => ({ session: agent, cwd, files: keptFiles }), [agent, cwd, keptFiles]);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
+  // A Codex child's own work is keyed by its thread: opened from any of its calls, or with its row
+  // gone, it still shows (its row's id, else the thread the opened call names).
+  const thread = React.useMemo(() => {
+    if (!parent) return undefined;
+    if (task) return task.id;
+    const call = events.find((e) => e.id === parent);
+    return call?.kind === "tool" ? call.task : undefined;
+  }, [parent, task, events]);
   const going = parent ? Boolean(task && taskLive(task)) : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
-  // Turns that didn't change stay the same objects, so only what changed renders again.
+  // Turns that didn't change stay the same objects, so only what changed renders again; and only
+  // the turns from the first change on are worked out again (derive.ts), not the whole history.
   const [kept] = React.useState(() => new Map<string, Turn>());
-  const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
+  const [memo] = React.useState<{ last: TurnsMemo | null }>(() => ({ last: null }));
+  const turns = React.useMemo(() => {
+    const next = turnsFrom(memo.last, events, parent, going, thread);
+    const shared = shareTurns(kept, next.turns);
+    memo.last = { ...next, turns: shared };
+    return shared;
+  }, [kept, memo, events, parent, going, thread]);
   const keeper = useKeeper(placeKey(agent, parent));
   const { read, restore, atEnd, setTail, toEnd } = keeper;
   // Scrolling records the place for the next content update without rendering the conversation.

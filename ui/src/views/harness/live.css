@@ -8,6 +8,34 @@
   gap: 2px;
   margin: 2px 0 6px;
 }
+/* Its tabs (a Chromium page's), when it has more than one: the one shown, in a select of the one
+   style, as compact as the address. */
+.lv-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 0 0;
+}
+.lv-tab {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* Its resolution, among its actions: the one style's select, as small as they are. */
+.lv-res select {
+  min-height: 22px;
+  padding: 1px 24px 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lv-res > .select > svg {
+  right: 6px;
+}
+.lv-tab select {
+  min-height: 28px;
+  padding: 4px 28px 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
 .lv-address,
 .lv-mirror {
   flex: 1 1 auto;
