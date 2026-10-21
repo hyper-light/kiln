@@ -314,11 +314,12 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
 
 impl Registry {
     pub fn new(dir: std::path::PathBuf) -> Self {
-        Self::with(dir, &crate::config::Conversations::default())
+        Self::with(dir, &crate::config::Conversations::default(), crate::rt::clock())
     }
 
-    /// The registry, its store in `dir`, its mirrors as `conversations` says.
-    pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations) -> Self {
+    /// The registry, its store in `dir`, its mirrors as `conversations` says, the server's own
+    /// sessions' host on `clock` (the hub's).
+    pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>) -> Self {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
@@ -348,7 +349,7 @@ impl Registry {
         if !restore_auto.is_empty() {
             tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
         }
-        let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
+        let local = Host::with_clock(tx, Some(dir.join("local.json")), Limits::default(), clock);
         // The server's own agents' workspaces of their own are kept beside their record.
         crate::workspace::slates::init(&dir);
         let keeper = Keeper::new(&dir);
