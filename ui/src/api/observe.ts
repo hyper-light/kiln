@@ -668,6 +668,48 @@ export interface PipelineIn {
 /** A pipeline as the API shows it; kiln's own (`builtin`) read-only but for whether it is on. */
 export type Pipeline = PipelineIn & { id: string; builtin: boolean; created?: number; modified?: number };
 
+/** The kiln cloud integration whose credentials write an archive's objects (`cloud`, its name); Datadog's own fields beside it kept as given. */
+export type ArchiveIntegration = { cloud: string } & Record<string, unknown>;
+
+/** S3's server-side encryption of an archive's objects: the bucket's own, S3's keys, or a KMS key's. */
+export interface ArchiveEncryption {
+  type: "NO_OVERRIDE" | "SSE_S3" | "SSE_KMS";
+  key?: string;
+}
+
+/** Where a log archive's objects go (docs/observe.md §10.5): an S3 bucket (or an S3-compatible store's, at `endpoint`), a Cloud Storage bucket, an Azure Storage container. */
+export type ArchiveDestination =
+  | { type: "s3"; bucket: string; path?: string; integration: ArchiveIntegration; region?: string; storage_class?: string; encryption?: ArchiveEncryption; endpoint?: string }
+  | { type: "gcs"; bucket: string; path?: string; integration: ArchiveIntegration; endpoint?: string }
+  | { type: "azure"; storage_account: string; container: string; path?: string; integration: ArchiveIntegration; endpoint?: string };
+
+/** A log archive as it is sent (Datadog's): the records it takes (a log search), where it writes, whether its events carry tags. */
+export interface ArchiveIn {
+  name: string;
+  query?: string;
+  destination: ArchiveDestination;
+  include_tags?: boolean;
+  rehydration_tags?: string[];
+  rehydration_max_scan_size_in_gb?: number;
+}
+
+/** Datadog's state of an archive: unknown until it writes or fails. */
+export type ArchiveState = "UNKNOWN" | "WORKING" | "FAILING";
+
+/** How an archive fares: what it wrote since the server started (bytes gzip'd), why it fails, and the log files it has yet to write. */
+export interface ArchiveStatus {
+  state: ArchiveState;
+  error: string | null;
+  events: number;
+  objects: number;
+  bytes: number;
+  last_written: number | null;
+  pending: number;
+}
+
+/** An archive as the API shows it. */
+export type Archive = ArchiveIn & { id: string; created: number; modified: number; state: ArchiveState; status: ArchiveStatus };
+
 /** A metric from logs as it is sent (Datadog's definition): what it computes, of which records, grouped by what. */
 export interface LogMetricIn {
   name: string;
@@ -1114,6 +1156,11 @@ export const observeApi = {
   updatePipeline: (id: string, p: PipelineIn) => request<Pipeline>("PUT", `${BASE}/pipelines/${enc(id)}`, p),
   deletePipeline: (id: string) => request<void>("DELETE", `${BASE}/pipelines/${enc(id)}`),
   orderPipelines: (ids: string[]) => request<void>("PUT", `${BASE}/pipeline_order`, { pipeline_ids: ids }),
+  archives: (signal?: AbortSignal) => request<{ archives: Archive[] }>("GET", `${BASE}/archives`, undefined, { signal }).then((r) => r.archives),
+  createArchive: (a: ArchiveIn) => request<Archive>("POST", `${BASE}/archives`, a),
+  updateArchive: (id: string, a: ArchiveIn) => request<Archive>("PUT", `${BASE}/archives/${enc(id)}`, a),
+  deleteArchive: (id: string) => request<void>("DELETE", `${BASE}/archives/${enc(id)}`),
+  orderArchives: (ids: string[]) => request<{ archive_ids: string[] }>("PUT", `${BASE}/archive_order`, { archive_ids: ids }),
   tryPipeline: (pipeline: PipelineIn | null, records: PipelineSample[]) =>
     request<{ records: PipelineResult[] }>("POST", `${BASE}/pipeline_test`, { ...(pipeline ? { pipeline } : {}), records }).then((r) => r.records),
   logMetrics: (signal?: AbortSignal) => request<{ log_metrics: LogMetric[]; counting: LogMetricCounting }>("GET", `${BASE}/log_metrics`, undefined, { signal }),

@@ -1321,6 +1321,161 @@ const scenarios = {
     }
   },
 
+  /**
+   * An archive made on its page (S3's, at an S3 stood in for here), writing the records that come
+   * after it as Datadog's archives hold them, its row saying what it wrote; the store failing, the
+   * row saying so in the store's words; another put ahead of it from its row; it edited; both
+   * removed. On a phone, the page fits across.
+   */
+  async "an archive is made, writes what comes after, fails saying why, is reordered and removed"() {
+    const http = await import("node:http");
+    const zlib = await import("node:zlib");
+    // S3 as far as an archive asks it: PUTs signed with SigV4 naming their payload's hash, each
+    // object kept; S3's SlowDown while failing.
+    const objects = new Map();
+    let failing = false;
+    const s3 = http.createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const signed = (req.headers.authorization ?? "").startsWith("AWS4-HMAC-SHA256 Credential=AKIDE2E/") && /^[0-9a-f]{64}$/.test(req.headers["x-amz-content-sha256"] ?? "");
+        if (req.method !== "PUT" || !signed) {
+          res.writeHead(400, { "content-type": "application/xml" });
+          res.end("<Error><Code>InvalidRequest</Code></Error>");
+          return;
+        }
+        if (failing) {
+          res.writeHead(503, { "content-type": "application/xml" });
+          res.end("<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>");
+          return;
+        }
+        objects.set(decodeURIComponent(req.url ?? ""), Buffer.concat(chunks));
+        res.writeHead(200);
+        res.end();
+      });
+    });
+    await new Promise((r) => s3.listen(0, "127.0.0.1", r));
+    const endpoint = `http://127.0.0.1:${s3.address().port}`;
+    const cloud = `e2e-archives-${run}`;
+    const name = `E2E everything ${run}`;
+    const other = `E2E other ${run}`;
+    const service = `e2e-archive-${run}`;
+    const rowOf = (n) => page.locator("table.data-table tbody tr").filter({ has: page.getByText(n, { exact: true }) });
+    const archives = async () => (await api("GET", "/api/observe/v1/archives")).body.archives;
+    const events = () =>
+      [...objects.values()].flatMap((b) =>
+        zlib
+          .gunzipSync(b)
+          .toString("utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l)),
+      );
+    const stored = async (n) =>
+      until(
+        `${n} records stored`,
+        async () => (await api("POST", "/api/observe/v1/logs/search", { query: `service:${service}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 10 })).body?.records?.length === n,
+      );
+    const made = [];
+    try {
+      expect((await api("PUT", `/api/observe/v1/clouds/${cloud}`, { kind: "aws", access_key_id: "AKIDE2E", secret_access_key: "e2e-secret", paused: true })).status === 204, "a cloud to write with");
+      await page.goto(`${BASE}/observe/archives`);
+      await page.getByRole("button", { name: "New archive", exact: true }).click();
+      const d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("Name", { exact: true }), name);
+      await fillIn(d.getByLabel("Of the records", { exact: true }), `service:${service}`);
+      await d.getByLabel("AWS integration", { exact: true }).selectOption(cloud);
+      await fillIn(d.getByLabel("Bucket", { exact: true }), "e2e-bucket");
+      await fillIn(d.getByLabel("Path", { exact: true }), "/kiln");
+      await fillIn(d.getByLabel("Endpoint", { exact: true }), endpoint);
+      await d.getByRole("checkbox", { name: /Events carry their tags/ }).check();
+      await d.getByRole("button", { name: "Make it", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      const row = rowOf(name);
+      await row.getByText("Waiting", { exact: true }).waitFor();
+      const kept = (await archives()).find((a) => a.name === name);
+      made.push(kept.id);
+      expect(
+        kept.query === `service:${service}` &&
+          kept.include_tags &&
+          kept.destination.type === "s3" &&
+          kept.destination.bucket === "e2e-bucket" &&
+          kept.destination.integration.cloud === cloud &&
+          kept.destination.endpoint === endpoint,
+        `kept as made: ${JSON.stringify(kept)}`,
+      );
+      // Records that come after, the store cut now: written as Datadog's archives hold them.
+      expect(
+        (
+          await api(
+            "POST",
+            "/api/observe/v1/logs",
+            [0, 1, 2].map((i) => ({ message: `archived ${i}`, service, hostname: "e2e", source: "app", status: i === 0 ? "error" : "info" })),
+          )
+        ).status === 202,
+        "posting records",
+      );
+      await stored(3);
+      await api("POST", "/api/observe/v1/compact", {});
+      await until("the archive writing them", async () => events().filter((e) => e.service === service).length === 3, 90_000);
+      const first = events().find((e) => e.message === "archived 0");
+      const keys = [...objects.keys()];
+      expect(
+        first.status === "error" &&
+          first.tags.includes(`service:${service}`) &&
+          /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(first.date) &&
+          keys.every((k) => /^\/e2e-bucket\/kiln\/dt=\d{8}\/hour=\d\d\/archive_\d{6}\.\d{4}\.[0-9a-f-]{36}\.json\.gz$/.test(k)),
+        `as Datadog's: ${JSON.stringify(first)} ${keys.join(" ")}`,
+      );
+      await until("its row says what it wrote", async () => /Writing/.test((await row.textContent()) ?? "") && /3 records/.test((await row.textContent()) ?? ""), 30_000);
+      // The store failing: the row says so, in its words.
+      failing = true;
+      expect((await api("POST", "/api/observe/v1/logs", [{ message: "not archived yet", service, hostname: "e2e", source: "app" }])).status === 202, "posting another");
+      await stored(4);
+      await api("POST", "/api/observe/v1/compact", {});
+      await until("its row says it fails, and why", async () => /Failing/.test((await row.textContent()) ?? "") && /503 .*SlowDown/.test((await row.textContent()) ?? ""), 90_000);
+      failing = false;
+      // Another (the API's) put ahead of it from its row.
+      const second = await api("POST", "/api/observe/v1/archives", { name: other, query: "service:nothing-e2e", destination: { type: "s3", bucket: "e2e-other", integration: { cloud }, endpoint } });
+      expect(second.status === 201, `another made: ${JSON.stringify(second.body)}`);
+      made.push(second.body.id);
+      await page.reload();
+      await rowOf(other)
+        .getByRole("button", { name: `Move ${other} up`, exact: true })
+        .click();
+      await until("put ahead on the server", async () => {
+        const ids = (await api("GET", "/api/observe/v1/archive_order")).body.archive_ids;
+        return ids.indexOf(second.body.id) === ids.indexOf(kept.id) - 1;
+      });
+      // Edited from its row: its search.
+      await rowOf(name)
+        .getByRole("button", { name: `Edit ${name}`, exact: true })
+        .click();
+      const ed = page.getByRole("dialog");
+      await fillIn(ed.getByLabel("Of the records", { exact: true }), `service:${service} status:error`);
+      await ed.getByRole("button", { name: "Save", exact: true }).click();
+      await ed.waitFor({ state: "detached" });
+      await until("saved", async () => (await archives()).find((a) => a.id === kept.id)?.query === `service:${service} status:error`);
+      await fitsAcross("the archives' page");
+      // Removed from their rows.
+      for (const n of [name, other]) {
+        await rowOf(n)
+          .getByRole("button", { name: `Remove ${n}`, exact: true })
+          .click();
+        await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+        await until(`${n} gone`, async () => (await rowOf(n).count()) === 0);
+      }
+      expect(
+        (await archives()).every((a) => !made.includes(a.id)),
+        "removed on the server",
+      );
+    } finally {
+      for (const id of made) await api("DELETE", `/api/observe/v1/archives/${id}`);
+      await api("DELETE", `/api/observe/v1/clouds/${cloud}`);
+      s3.close();
+    }
+  },
+
   /** A metric from logs tried on the records of the last fifteen minutes, made, counting the
    * records that come after (as the API's query says), charted, and removed. */
   async "a metric from logs is tried, made, counts what comes after, and is removed"() {

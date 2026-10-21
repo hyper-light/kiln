@@ -1964,6 +1964,14 @@ time range and the search in the address (a page is a link).
   window ends it is counted, and what came late. Made and edited in a form (what it computes stays
   once made) that counts the definition over the last fifteen minutes, each group's total, before it
   is kept; each charted in the metrics explorer in a click.
+- **Archives** (a link from the logs explorer): each archive in the order records are matched
+  against them, the records it takes, where it writes (as its store's URL), its state (writing,
+  failing in its store's words, waiting for its first file), what it wrote (records, objects, bytes,
+  when last) and the files it has yet to write; moved, edited and removed from its row. Made and
+  edited in a form: a name, a search, the store (S3, Cloud Storage, Azure Storage) and the cloud
+  integration of its cloud that writes there (the only one taken unless chosen), a bucket or account
+  and container, a path (its objects' keys shown as it is typed), an S3's region, storage class and
+  encryption, another store's endpoint, and whether its events carry tags.
 - **Logs kiln collects** (Integrations' fourth part): each source's state over the machines that
   read it (reading, failing, no files), what it reads, its records and how far behind it is;
   added and edited in a form that tests the source on the server (the files it matches, how the
@@ -3774,7 +3782,13 @@ archive `FAILING` with the store's 503 and an event saying so; an archive made a
 order (as Datadog's API orders them); the server killed (SIGKILL), the store back, the server
 started again, a third batch: the first two batches' every record in the first archive, the
 third's in the second, each once, and no object written twice (the part written before the failure
-not written again). 2026-10-21: both pass (19 s and 29 s; macOS, arm64).
+not written again). 2026-10-21: both pass (19 s and 29 s; macOS, arm64). In a browser
+(`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): an archive made on its
+page (its cloud integration chosen, a path, another store's endpoint, tags) writes the records that
+come after to an S3 stood in for, as Datadog's archives hold them, its row saying what it wrote; the
+store failing (S3's SlowDown), the row says so, its reason first; another put ahead of it from its
+row, it edited, both removed; the page within a phone's width. 2026-10-21: passes in all four
+(24 s each).
 
 **SLOs** (`observe_live.rs`): requests counted a minute for three hours ending at a five-minute
 edge, a thousandth failing but in the last 70 minutes, when half do, and a latency high then; a

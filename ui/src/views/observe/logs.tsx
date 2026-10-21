@@ -126,6 +126,9 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
               <Button variant="secondary" asChild>
                 <Link to="/observe/log-metrics">Metrics from logs</Link>
               </Button>
+              <Button variant="secondary" asChild>
+                <Link to="/observe/archives">Archives</Link>
+              </Button>
             </div>
           ) : undefined
         }

@@ -894,7 +894,7 @@ impl Archives {
             return Ok(false);
         }
         let object = archive::key(a.destination.path(), part.newest_ms, &archive::uuid(file.seed(id), part.hour, part.number));
-        self.upload(&a, &object, Bytes::from(part.body)).await.map_err(|e| format!("{object}: {e}"))?;
+        self.upload(&a, &object, Bytes::from(part.body)).await.map_err(|e| format!("{e} (writing {object})"))?;
         let mut inner = lock(&self.inner);
         if inner.state.begun.iter().any(|b| b.file == file) {
             inner.state.written.insert(w);

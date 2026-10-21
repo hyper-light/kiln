@@ -23,6 +23,7 @@ import {
   type Slo,
   type LogSource,
   type Pipeline,
+  type Archive,
   type LogMetric,
   type Downtime,
   type LogMetricCounting,
@@ -460,6 +461,7 @@ export const statsdRes: Res<Statsd[]> = { key: "observe/statsd", fetch: (s) => o
 export const syntheticsRes: Res<Synthetic[]> = { key: "observe/synthetics", fetch: (s) => observeApi.synthetics(s), opts: { pollMs: 10_000 } };
 export const logSourcesRes: Res<LogSource[]> = { key: "observe/log_sources", fetch: (s) => observeApi.logSources(s), opts: { pollMs: 10_000 } };
 export const pipelinesRes: Res<Pipeline[]> = { key: "observe/pipelines", fetch: (s) => observeApi.pipelines(s) };
+export const archivesRes: Res<Archive[]> = { key: "observe/archives", fetch: (s) => observeApi.archives(s), opts: { pollMs: 10_000 } };
 export const logMetricsRes: Res<{ log_metrics: LogMetric[]; counting: LogMetricCounting }> = { key: "observe/log_metrics", fetch: (s) => observeApi.logMetrics(s), opts: { pollMs: 10_000 } };
 export const pipelineRes = (id: string): Res<Pipeline> => ({ key: `observe/pipeline/${id}`, fetch: (s) => observeApi.pipeline(id, s) });
 export const dashboardsRes: Res<DashboardSummary[]> = { key: "observe/dashboards", fetch: (s) => observeApi.dashboards(s) };
