@@ -604,6 +604,22 @@ impl Disk {
         Ok(())
     }
 
+    /// Makes `path` (a file's bytes, or a folder) and every change of names so far durable, with
+    /// no fault and no crash point: a model's own act, as a person's editor saving a file whole.
+    /// What a power loss tears after that is then what the code under test left unsynced.
+    pub fn make_durable(&self, path: &str) {
+        let mut st = self.inner.lock();
+        let p = normal(path);
+        if let Some(Entry::Ino(i)) = st.live.get(&p).copied()
+            && let Some(n) = st.inodes.get_mut(&i)
+        {
+            n.durable = n.live.clone();
+            n.dirty = false;
+        }
+        let all = st.journal.len();
+        st.commit(all);
+    }
+
     // ---------------------------------------------------------------------------- the nemesis
 
     /// The power goes: names keep a prefix of what wasn't durable, each file written since its

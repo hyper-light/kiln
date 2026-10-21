@@ -12,6 +12,7 @@
 //! | [`queue`] | a model's own events, by when they're due |
 //! | [`net`] | frames between nodes: dropped, duplicated, delayed (reordered), partitioned while the nemesis lasts |
 //! | [`disk`] | a machine's disk: what's durable apart from what's seen, power losses that tear, lose or keep what wasn't fsynced, fsync errors, ENOSPC, a crash at any write |
+//! | [`records`] | a crash at any commit of a kiln-seams `Records` store, before it takes effect or after |
 //! | [`trace`] | what a run did, folded into a digest (and its last steps in words, on a replay) |
 //! | [`seeds`] | budgets, seeds a minute, replay of one seed, and running a seed twice |
 //!
@@ -27,6 +28,7 @@
 pub mod disk;
 pub mod net;
 pub mod queue;
+pub mod records;
 pub mod rng;
 pub mod seeds;
 pub mod trace;
