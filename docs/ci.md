@@ -2637,7 +2637,9 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
   the server's log. AC06:
   - a table of edits changes the hash, one input at a time;
   - E2E on a local server: a README-only push reused the build, a change under its `paths` ran
-    it, and "run anyway" ran it.
+    it, and "run anyway" ran it; now an integration test too
+    (`w08_ac06_a_leg_takes_a_result_for_the_same_inputs`: the reused leg names its source run and
+    shows its log, and the run-anyway rerun builds again at the reused commit).
 - *Done.* R09's `kiln/cache@v1` and the kiln dialect's `cache:` key, on the chunked protocol
   (`crates/kiln/src/ci/services/chunks.rs`, `crates/kiln/src/runner/cache.rs`):
   - `/_kiln/cache` answers for a leg's token:
@@ -2717,7 +2719,8 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
     (`cache_v1.rs` and the chunked cache record every lookup and save; W19 shows them by key
     prefix, with the time hits saved).
   - A diff that only rebases reusing what it didn't touch (W14).
-  - AC01 (the toolkit harness: 1,000 files, 2 GiB), AC06, AC09.
+  - AC01 (the toolkit harness: 1,000 files, 2 GiB) and AC09, which run the published toolkit
+    packages and `actions/cache` themselves.
 
 ### W09 Secrets and variables
 
@@ -3485,9 +3488,10 @@ package registries of the top ~25 languages and the top ~10 OCI registries; publ
   - Nimble's package list (nim-lang.org's), its packages through `http`.
   - Unit-tested (`w12_r04_immutables`, `w12_r04_composer_swift_conan_and_vcpkg`), and end to end
     against stand-ins for Packagist and ConanCenter (`w12_r04_composer_conan_and_vcpkg`).
-- *Left.* R02's runners beyond Docker pulls (containerd's `hosts.toml` for the cluster, shards'
-  settings, Firecracker's root file systems, with W13); D.2's Alibaba ACR and Oracle OCIR
-  federations; AC04 (user-assisted, against test tenants).
+- *Left.* R02's runners beyond Docker's pulls and Firecracker's (whose root file systems come
+  through kiln's mirrors as Docker's images do: W13-R05): containerd's `hosts.toml` for the
+  cluster and shards' settings, with W13; D.2's Alibaba ACR and Oracle OCIR federations; AC04
+  (user-assisted, against test tenants).
 
 ### W13 Runners and executors
 
@@ -3930,6 +3934,10 @@ enforcement points to W18, agent isolation to W20.
     root.
   - What the proxy refuses is annotated on the step, as elsewhere. The microVM ends with its leg
     (a kept leg's stays: W17-R02), and a leg that outruns its own timeout and cleanup is stopped.
+  - When the leg's image has Docker (`dockerd`), the guest starts its daemon: cgroups mounted, its
+    data on the scratch disk, no bridge or iptables of its own. The leg's Docker actions run there
+    on the guest's network, their images pulled through the egress proxy
+    (`w13_r05_docker_actions_in_a_microvm_with_docker`, with `docker:dind`).
   - R09's `firecracker` pools: each executor is a microVM of the pool's image, booted and waiting,
     so a leg for the pool starts in it at once (its image ready, its microVM up), and the pool
     boots another for the next (`w13_r09_a_firecracker_pool_keeps_a_microvm_ready`).
@@ -3945,7 +3953,8 @@ enforcement points to W18, agent isolation to W20.
   - Pools restored from a booted snapshot of each image, rather than booted each: a snapshot
     names the disks and sockets of the microVM it was taken in, so each restore needs those
     paths of its own (the jailer's chroot, or a mount namespace).
-  - Docker inside a guest image that has a container runtime.
+  - Services and job containers in a microVM whose image has Docker reach out only on the guest's
+    own network: their bridges lead nowhere.
   - The `shards` executor (R06) and its pool kind.
   - R11's other parts: checking Agentfiles by shards' own parser (its `agentfile` crate isn't
     one kiln can build against yet), kiln's shipped definitions beyond the runner image, and

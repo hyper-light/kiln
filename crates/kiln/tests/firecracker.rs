@@ -281,3 +281,32 @@ fn w13_r09_a_firecracker_pool_keeps_a_microvm_ready() -> anyhow::Result<()> {
     })?;
     Ok(())
 }
+
+/// W13-R05's last part: in a microVM whose image has Docker (`docker:dind`), the guest starts its
+/// daemon, and a Docker action runs there (on the guest's kernel), its image pulled through the
+/// egress proxy.
+#[test]
+fn w13_r05_docker_actions_in_a_microvm_with_docker() -> anyhow::Result<()> {
+    let Some((fc, kernel)) = machine() else {
+        eprintln!("skipped: KILN_TEST_FIRECRACKER and KILN_TEST_FIRECRACKER_KERNEL don't name Firecracker and its kernel, or /dev/kvm can't be opened");
+        return Ok(());
+    };
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let docker = "\n[[ci.routing]]\nmatch = { labels = [\"dockervm\"] }\nexecutor = [\"firecracker\"]\nimage = \"docker.io/library/docker:dind\"\n";
+    let (s, home, work, push) = vm_server(dir.path(), &fc, &kernel, docker)?;
+    let workflow =
+        "on: push\njobs:\n  docker:\n    runs-on: dockervm\n    steps:\n      - uses: docker://alpine:3.20\n        with:\n          args: sh -c \"echo from-a-docker-action-on-$(uname -r)\"\n";
+    let (run, leg) = push_run(&s, &home, &work, &push, ".github/workflows/docker.yml", workflow)?;
+    until(&s, 1200, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        let done = runs.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id") == Some(&json!(run)) && r.get("finished_at").is_some_and(|f| !f.is_null()));
+        Ok((!done).then_some(body))
+    })?;
+    let (about, log) = leg_and_log(&s, &leg)?;
+    assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{about}\n{log}\n{}", s.log());
+    let host = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
+    let said = log.lines().find_map(|l| l.split("from-a-docker-action-on-").nth(1)).unwrap_or_default().trim().to_owned();
+    assert!(!said.is_empty() && said != host.trim(), "the action ran in the microVM's Docker, on its kernel: {log}");
+    Ok(())
+}

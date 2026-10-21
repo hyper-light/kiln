@@ -234,6 +234,8 @@ fn leg() -> anyhow::Result<()> {
     mount("devpts", "/mnt/root/dev/pts", "devpts", MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC, Some("gid=5,mode=620,ptmxmode=666"))?;
     mount("tmpfs", "/mnt/root/dev/shm", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV, Some("mode=1777"))?;
     mount("tmpfs", "/mnt/root/run", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV, Some("mode=755"))?;
+    // cgroups, for a container runtime the image has.
+    let _ = nix::mount::mount(Some("cgroup2"), "/mnt/root/sys/fs/cgroup", Some("cgroup2"), MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC, None::<&str>);
     // Into the image, kiln's disk kept at `/.kiln` (this binary runs from it).
     std::env::set_current_dir("/mnt/root")?;
     nix::unistd::pivot_root(".", ".kiln").context("moving into the image")?;
@@ -369,6 +371,8 @@ fn prepare() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
     }
     // kiln's own requests go through the proxy to private addresses too: the guest has no other way.
     env.push(("KILN_PROXY_PRIVATE".into(), "1".into()));
+    // Docker actions share the guest's network, so the proxy on its loopback is theirs too.
+    env.push(("KILN_CONTAINER_NETWORK".into(), "host".into()));
     for (k, v) in &env {
         if !k.is_empty() && !k.contains(['=', '\0']) && !v.contains('\0') {
             #[allow(unsafe_code)]
@@ -382,7 +386,41 @@ fn prepare() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
     if let Some(port) = start.server_port {
         forward(port, SERVER_PORT)?;
     }
+    if let Err(e) = docker_daemon() {
+        eprintln!("kiln guest: the image's Docker: {e:#}");
+    }
     Ok((start, conn))
+}
+
+/// When the image has Docker (`dockerd`), its daemon, for the leg's Docker actions and services
+/// (W13-R05): its data on the scratch disk (an overlay can't hold its layers), its pulls through
+/// the egress proxy like the rest, and no networking of its own beyond its containers' bridges.
+fn docker_daemon() -> anyhow::Result<()> {
+    let Some(dockerd) = crate::os::which("dockerd") else { return Ok(()) };
+    let data = Path::new("/.kiln/mnt/scratch/docker");
+    std::fs::create_dir_all(data)?;
+    std::fs::create_dir_all("/var/lib/docker")?;
+    std::fs::create_dir_all("/var/log")?;
+    nix::mount::mount(Some(data), "/var/lib/docker", None::<&str>, MsFlags::MS_BIND, None::<&str>).context("its data on the scratch disk")?;
+    let log = std::fs::File::create("/var/log/kiln-dockerd.log")?;
+    std::process::Command::new(dockerd)
+        // `host.docker.internal` is the guest itself: its containers share its network.
+        .args(["--iptables=false", "--ip6tables=false", "--bridge=none", "--host-gateway-ip=127.0.0.1", "--host=unix:///var/run/docker.sock", "--data-root=/var/lib/docker"])
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("starting dockerd")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while UnixStream::connect("/var/run/docker.sock").is_err() {
+        if std::time::Instant::now() > deadline {
+            let said = std::fs::read_to_string("/var/log/kiln-dockerd.log").unwrap_or_default();
+            let from = said.len().saturating_sub(2000);
+            anyhow::bail!("dockerd didn't answer within a minute:\n{}", said.get(from..).unwrap_or_default());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 /// What the guest's runner hears: the host, or one of its terminals.
