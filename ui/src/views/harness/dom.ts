@@ -82,9 +82,15 @@ export function useClock(ms: number): number {
 function useCome(at: number): boolean {
   const subscribe = useCallback(
     (notify: () => void) => {
-      const wait = at - performance.now();
-      if (!Number.isFinite(at) || wait <= 0) return () => undefined;
-      const timer = window.setTimeout(notify, wait + 1);
+      if (!Number.isFinite(at) || at <= performance.now()) return () => undefined;
+      // Once it has come (a timer that fires a moment early waits the rest).
+      let timer = 0;
+      const check = () => {
+        const left = at - performance.now();
+        if (left > 0) timer = window.setTimeout(check, left + 1);
+        else notify();
+      };
+      check();
       return () => window.clearTimeout(timer);
     },
     [at],
