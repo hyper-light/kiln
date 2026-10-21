@@ -348,13 +348,16 @@ mod tests {
         assert!(matches!(plan("docker", &locked, bin).as_slice(), [Step::Run { root: true, program, args, .. }] if program == "usermod" && args == &["-aG", "docker", "ada"]));
         let grouped = Machine { groups: vec!["docker".into()], ..locked.clone() };
         assert!(matches!(plan("docker", &grouped, bin).as_slice(), [Step::Do(t)] if t.contains("daemon running")));
-        // Firecracker: no KVM stops it; KVM not ours yet is the group; then the fetch, then its networking said.
+        // Firecracker: no KVM stops it; KVM not ours yet is the group; then the fetches and
+        // e2fsprogs, then its networking said.
         assert!(matches!(plan("firecracker", &base, bin).as_slice(), [Step::Do(t)] if t.contains("/dev/kvm")));
         let kvm = Machine { kvm: Some(false), ..base.clone() };
         let steps = plan("firecracker", &kvm, bin);
         assert!(matches!(steps.first(), Some(Step::Run { args, .. }) if args == &["-aG", "kvm", "ada"]), "{steps:?}");
         assert_eq!(steps.get(1), Some(&Step::Fetch { to: bin.to_path_buf() }));
-        assert!(matches!(steps.get(2), Some(Step::Ok(t)) if t.contains("W13-R05")));
+        assert_eq!(steps.get(2), Some(&Step::FetchKernel { to: kernel_path() }));
+        assert!(matches!(steps.get(3), Some(Step::Do(t)) if t.contains("e2fsprogs")), "{steps:?}");
+        assert!(matches!(steps.last(), Some(Step::Ok(t)) if t.contains("W13-R05")), "{steps:?}");
         let ready = Machine { kvm: Some(true), firecracker: Some(bin.join("firecracker")), kernel: Some(bin.join("vmlinux")), mkfs: Some("/usr/bin/mke2fs".into()), ..base.clone() };
         assert!(plan("firecracker", &ready, bin).iter().all(|s| matches!(s, Step::Ok(_))));
         // Its guest kernel fetched when there's none, and e2fsprogs asked for.

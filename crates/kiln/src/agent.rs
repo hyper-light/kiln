@@ -1519,6 +1519,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 for w in pool_execs.drain() {
                     crate::rt::spawn(crate::runner::pool::discard(w));
                 }
+                #[cfg(target_os = "linux")]
+                crate::rt::spawn(crate::runner::firecracker::drain_warm());
                 // Whether this machine takes upgrades (an older server skips it).
                 if !o.ephemeral && !o.outpost {
                     let accept = takes_updates(&o);
@@ -1807,17 +1809,30 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::TermInput { session, data } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::in_microvm(&session) {
+                            crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermInput { session: session.clone(), data });
+                            continue;
+                        }
                         if let Some((pty, _)) = terms.get(&session) {
                             pty.write(data);
                         }
                     }
                     ServerMsg::TermResize { session, cols, rows } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermResize { session: session.clone(), cols, rows }) {
+                            continue;
+                        }
                         if let Some((pty, state)) = terms.get(&session) {
                             pty.resize(cols, rows);
                             state.send(crate::termsess::Input::Resize { cols, rows });
                         }
                     }
                     ServerMsg::TermAttach { session } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermAttach { session: session.clone() }) {
+                            continue;
+                        }
                         let msg = match terms.get(&session) {
                             Some((_, state)) => {
                                 let a = state.attach();
@@ -1829,6 +1844,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         uplink.0.send(Up::Term(msg)).await.ok();
                     }
                     ServerMsg::TermClose { session } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermClose { session: session.clone() }) {
+                            continue;
+                        }
                         terms.remove(&session);
                     }
                     ServerMsg::AiTranscript { req, pid } => match &ai {
@@ -2325,53 +2344,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if terms.contains_key(&session) {
                             continue;
                         }
+                        // A leg in a microVM here (W13-R05): its terminal opens in there.
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::open_terminal(&job, &session, cols, rows, command.clone()) {
+                            continue;
+                        }
                         let Some(shell) = crate::runner::kept::shell(&job) else {
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg isn't running or kept on this runner".into()) })).await.ok();
                             continue;
                         };
-                        let (program, env) = match (&shell.exec, &command) {
-                            (Some(_), Some(c)) => shell.exec_with(c).map_or((None, Vec::new()), |(argv, env)| (Some(argv), env)),
-                            (Some((argv, env)), None) => (Some(argv.clone()), env.clone()),
-                            (None, _) => (None, shell.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                        };
-                        let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                        let cwd = program.is_none().then_some(shell.workdir.as_path());
-                        // A command runs as a step would, in bash; a terminal opens the runner's shell.
-                        let sh = if command.is_some() && !cfg!(windows) { Some("bash") } else { o.shell.as_deref() };
-                        let cmd = command.as_deref().filter(|_| program.is_none());
-                        match terminal::spawn_at(sh, cmd, program.as_deref(), cwd, cols, rows, &env) {
+                        let l = shell.launch(command.as_deref(), o.shell.as_deref());
+                        let env: Vec<(&str, String)> = l.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                        match terminal::spawn_at(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env) {
                             Ok((pty, rx)) => {
-                                let tx = term_tx.clone();
-                                let s = session.clone();
-                                let mut masker = kiln_ci::runner::mask::Masker::new(&shell.masks);
+                                let (tx, s, masked) = (term_tx.clone(), session.clone(), crate::runner::kept::masked(rx, &shell.masks));
                                 crate::rt::spawn(async move {
-                                    // The masker holds back what could be the start of a secret (as
-                                    // long as the leg's longest, a token of a kilobyte); a terminal
-                                    // shows the rest, masked, as soon as output pauses.
-                                    loop {
-                                        let out = match crate::rt::timeout(std::time::Duration::from_millis(25), rx.recv()).await {
-                                            Ok(Ok(out)) => out,
-                                            Ok(Err(_)) => break,
-                                            Err(_) => {
-                                                let held = masker.finish();
-                                                if !held.is_empty() && tx.send((s.clone(), PtyOut::Data(held))).await.is_err() {
-                                                    break;
-                                                }
-                                                continue;
-                                            }
-                                        };
-                                        let (out, exit) = match out {
-                                            PtyOut::Data(d) => (PtyOut::Data(masker.push(&d)), false),
-                                            PtyOut::Exit(code) => {
-                                                let rest = masker.finish();
-                                                if !rest.is_empty() && tx.send((s.clone(), PtyOut::Data(rest))).await.is_err() {
-                                                    break;
-                                                }
-                                                (PtyOut::Exit(code), true)
-                                            }
-                                        };
-                                        let empty = matches!(&out, PtyOut::Data(d) if d.is_empty());
-                                        if (!empty && tx.send((s.clone(), out)).await.is_err()) || exit {
+                                    while let Ok(out) = masked.recv().await {
+                                        if tx.send((s.clone(), out)).await.is_err() {
                                             break;
                                         }
                                     }
@@ -2386,11 +2375,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // A kept leg let go now, or kept longer (W17-R02).
                     ServerMsg::KeepRelease { job } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::Release) {
+                            continue;
+                        }
                         crate::rt::spawn(async move {
                             crate::runner::kept::release(&job).await;
                         });
                     }
                     ServerMsg::KeepExtend { job, minutes } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::Extend(minutes)) {
+                            continue;
+                        }
                         crate::runner::kept::extend(&job, minutes);
                     }
                     ServerMsg::Received { job } if job.is_empty() => receipts = true,
@@ -2401,6 +2398,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::JobRerunStep { job, step, idx } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::RerunStep { step, idx }) {
+                            continue;
+                        }
                         if !crate::runner::runtime::rerun_step(&job, step, idx) {
                             tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
                         }

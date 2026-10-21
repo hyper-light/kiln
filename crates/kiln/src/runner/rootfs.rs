@@ -36,15 +36,32 @@ pub async fn lock(key: &str) -> futures::lock::OwnedMutexGuard<()> {
     m.lock_owned().await
 }
 
-/// Where to pull `image` from for leg `a`: through kiln when kiln mirrors its registry, signed in
-/// with the job's token at kiln's own registry, and anonymously anywhere else.
-fn source(image: &str, a: &kiln_ci::wire::AssignmentV2) -> anyhow::Result<(oci::Registry, oci::Reference)> {
+/// What an image is pulled with: kiln's origin, a token for its registry, and the registries kiln
+/// mirrors (`(upstream, prefix)`).
+#[derive(Debug, Clone, Default)]
+pub struct Pull {
+    pub origin: String,
+    pub token: String,
+    pub mirrors: Vec<(String, String)>,
+}
+
+impl Pull {
+    /// A leg's: its runtime's registry, its job's token.
+    pub fn of(a: &kiln_ci::wire::AssignmentV2) -> Pull {
+        let origin = if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url };
+        Pull { origin: origin.clone(), token: a.runtime.github_token.clone(), mirrors: a.runtime.mirrors.clone() }
+    }
+}
+
+/// Where to pull `image` from: through kiln when kiln mirrors its registry, signed in with the
+/// token at kiln's own registry, and anonymously anywhere else.
+fn source(image: &str, pull: &Pull) -> anyhow::Result<(oci::Registry, oci::Reference)> {
     let r = oci::parse_reference(image)?;
-    let origin = if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url };
+    let origin = &pull.origin;
     let own = crate::githost::host_of(origin);
     let own_plain = origin.starts_with("http://");
-    let job = Some(("kiln".to_owned(), a.runtime.github_token.clone())).filter(|(_, t)| !t.is_empty());
-    if let Some((_, prefix)) = a.runtime.mirrors.iter().find(|(up, _)| *up == r.registry).filter(|_| !own.is_empty()) {
+    let job = Some(("kiln".to_owned(), pull.token.clone())).filter(|(_, t)| !t.is_empty());
+    if let Some((_, prefix)) = pull.mirrors.iter().find(|(up, _)| *up == r.registry).filter(|_| !own.is_empty()) {
         let through = oci::Reference { registry: own.clone(), repository: format!("{prefix}/{}", r.repository), ..r };
         return Ok((oci::Registry::for_name(&own, job, own_plain), through));
     }
@@ -56,9 +73,9 @@ fn source(image: &str, a: &kiln_ci::wire::AssignmentV2) -> anyhow::Result<(oci::
     Ok((oci::Registry::for_name(&r.registry, None, local), r))
 }
 
-/// `image` as a root file system for leg `a`: kept already, or pulled and built now.
-pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, a: &kiln_ci::wire::AssignmentV2) -> anyhow::Result<Rootfs> {
-    let (registry, reference) = source(image, a)?;
+/// `image` as a root file system: kept already, or pulled and built now.
+pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: &Pull) -> anyhow::Result<Rootfs> {
+    let (registry, reference) = source(image, pull)?;
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
@@ -156,12 +173,12 @@ fn build(m: &Machine, work: &Path, kiln: &Path, out: &Path, total: u64, layers: 
 mod tests {
     use super::*;
 
-    fn leg(registry_url: &str, mirrors: &[(&str, &str)]) -> kiln_ci::wire::AssignmentV2 {
+    fn leg(registry_url: &str, mirrors: &[(&str, &str)]) -> Pull {
         let mut a = kiln_ci::wire::AssignmentV2::default();
         a.runtime.registry_url = registry_url.into();
         a.runtime.github_token = "job-token".into();
         a.runtime.mirrors = mirrors.iter().map(|(u, p)| ((*u).to_owned(), (*p).to_owned())).collect();
-        a
+        Pull::of(&a)
     }
 
     /// W13-R05 with W12-R02: an image from a registry kiln mirrors is pulled through kiln, signed

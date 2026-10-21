@@ -184,11 +184,11 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; the server's and agents' own workload tokens (R11); `secrets.use:<name>` (each run held to whoever started it), run lists, the event stream and the overview narrowed for scoped callers; passkeys and people's own passwords; Settings → People and → Tokens; the issuer reached from the internet (its own address, or published to a directory, S3 or Cloud Storage: R12); the cloud ACs left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08); notification channels (W11-R06), OpenTelemetry (R09), and Linear and Jira issue trackers (R07) |
 | W12 | Registries | W08 (store) | in progress | kiln's OCI registry (Distribution Spec v1.1; the conformance suite passes); Docker's token auth; referrers; collection; `registry_package` events; pull-through caches; caching proxies for every D.1 ecosystem (AC03 with the real tools for eight), vcpkg's binary cache kept by kiln; jobs' registry credentials through `docker-credential-kiln`; offline fallbacks |
-| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy); its jailer, snapshot pools and terminals, and `shards`, left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); runner images built in kiln (`kiln/build-image@v1`: Dockerfiles through buildx, Agentfiles through shards, pushed to kiln's registry and registered with their platforms); `docker` pools (`[[ci.pools]]`, `/api/ci/pools`, warm executors, one leg each, AC04); the Runners page's pools (their scaling history) and images, and the image builder (Dockerfiles and Agentfiles made, built and pushed in the UI); `k8s` pools (a pod per leg, each its own runner, a leg's `container:` and `services:` in a pod made for it, an opt-in Docker sidecar for Docker actions, KCI4032 as a leg is queued without one, terminals into its legs); `kiln runner setup`; the `firecracker` executor (a microVM per leg from its OCI image, out only through its egress proxy; its pools; terminals and kept legs in it); its jailer and snapshot restores, and `shards`, left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments, pull requests and issues' comments and labels, workflow runs, code scanning, the dependency graph's compare), GraphQL (pull requests, comments, labels, reviews, checks; `gh`'s host and token); the GitHub App (R10, R12); the review UI (AC06, in Chromium and WebKit); GraphQL's merges left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers and teams, wait timers, branch and tag policies, deploy windows, custom gates, `after:`/`soak:` promotion), concurrency limits, approvals on the run page and CLI, deployment records with URLs; `kiln/deploy@v1` and the `deploy:` shorthand (CI drives CD through the deploy service); kinds and targets (host, container and microVM jobs routed to their runners, a platform's integration bound), the starter set, an environment's page and the board; container and microVM deploying, previews and the live-cluster ACs left (with CD) |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint (on every platform), `bench-gate` (on runs, diffs and the land queue), Tests and Benchmarks panels, `kiln/test-results@v1` and opt-in discovery; a repository's tests and its metrics' trends on Insights; AC05 left |
-| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; microVM terminals left |
+| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; in Firecracker microVMs terminals, keeping, extend and release, and reruns in place (W13-R05); shards' left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; the dependency changes a diff makes, on its review page (R03); attestations as referrers in other registries too; Firecracker microVMs contained (no network device: out only through the egress proxy, W13-R05); shards' left |
 | W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
@@ -3928,8 +3928,11 @@ enforcement points to W18, agent isolation to W20.
     anywhere but the host's own and link-local addresses. kiln's server is reached on the
     guest's loopback when it's on the host's. This is in place of R05's tap device, and needs no
     root.
-  - What the proxy refuses is annotated on the step, as elsewhere. The microVM ends with its leg,
-    and a leg that outruns its own timeout and cleanup is stopped.
+  - What the proxy refuses is annotated on the step, as elsewhere. The microVM ends with its leg
+    (a kept leg's stays: W17-R02), and a leg that outruns its own timeout and cleanup is stopped.
+  - R09's `firecracker` pools: each executor is a microVM of the pool's image, booted and waiting,
+    so a leg for the pool starts in it at once (its image ready, its microVM up), and the pool
+    boots another for the next (`w13_r09_a_firecracker_pool_keeps_a_microvm_ready`).
   - Checked end to end (`w13_r05_a_leg_runs_in_a_firecracker_microvm`, with Firecracker 1.17 and
     its 6.1 kernel, when `KILN_TEST_FIRECRACKER` and `KILN_TEST_FIRECRACKER_KERNEL` name them):
     an Alpine job runs on the guest's kernel, `/etc/shadow` keeps Alpine's `shadow` group, the
@@ -3937,10 +3940,12 @@ enforcement points to W18, agent isolation to W20.
     proxy. Unit-tested: layers' whiteouts, frames, pulls through kiln, `ldd`'s libraries,
     private networks through the guest's proxy.
 - *Left.*
-  - R05's jailer around each VMM (it needs root: the VMM now runs as the runner's user, under
-    Firecracker's own seccomp filters), warm pools of booted snapshots and the `firecracker` pool
-    kind (R09), terminals into a microVM's leg and keeping one on failure (W17), and Docker inside
-    a guest image that has a container runtime.
+  - R05's jailer around each VMM: it needs root (the VMM runs as the runner's user, under
+    Firecracker's own seccomp filters).
+  - Pools restored from a booted snapshot of each image, rather than booted each: a snapshot
+    names the disks and sockets of the microVM it was taken in, so each restore needs those
+    paths of its own (the jailer's chroot, or a mount namespace).
+  - Docker inside a guest image that has a container runtime.
   - The `shards` executor (R06) and its pool kind.
   - R11's other parts: checking Agentfiles by shards' own parser (its `agentfile` crate isn't
     one kiln can build against yet), kiln's shipped definitions beyond the runner image, and
@@ -4810,15 +4815,17 @@ reruns, rerunning a failed step in place, and running workflows locally with `ki
 - **W17-AC04 `kiln run`.** The jobs of F-03 that need no secrets give the same step results with
   `kiln run` as on the server. *Integration test.*
 
-**Progress.** In progress: R01, R02 and R04 on the `host` and `docker` executors, R01 in `k8s`
-pods, and R06. R03 is W06-R13's debug reruns.
+**Progress.** In progress: R01, R02 and R04 on the `host` and `docker` executors and in
+Firecracker microVMs, R01 in `k8s` pods, and R06. R03 is W06-R13's debug reruns.
 
 - *R01, terminals* (`runner/kept.rs`, the agent's `JobTerminalOpen`, `GET /api/ci/legs/:id/terminal`):
   - A running or kept leg says what a terminal into it opens. On `host` that is a shell in its
     workspace with its environment, which also needs `runners.terminal`; in a container it is
     `docker exec` into the job container; in a `k8s` pool's pod (W13-R07) it is the pod's own
     shell, in the leg's workspace with its environment, and the leg is recorded as `k8s`, so
-    `runs.debug` is enough.
+    `runs.debug` is enough. In a Firecracker microVM (W13-R05) it opens inside, in the leg's
+    workspace with its environment, as on the host: the host runner passes the terminal's
+    traffic (and a command run there, R05) to the microVM over vsock.
   - Output is masked with the leg's secrets. What could start a secret is held back until output
     pauses for 25 ms.
   - Sessions are audited, and a terminal closes when its leg ends or is let go.
@@ -4832,6 +4839,9 @@ pods, and R06. R03 is W06-R13's debug reruns.
   - The server remembers kept legs across a restart. A restarted runner forgets their shells
     (their environments held secrets, and nothing is written to disk) and sweeps their workspaces
     when the keep runs out.
+  - A kept leg in a Firecracker microVM keeps its microVM running, with its terminals, Extend and
+    reruns in place (R04), until the keep runs out or it's released; then the microVM ends and its
+    disks go.
 - *R04*: `kiln debug rerun-step <leg> <step>`, `POST /api/ci/legs/:id/rerun-step`, or the failed
   step's "Rerun this step in place" runs the step again with the environment, paths and outputs
   the leg ended with, as a new section of its log ("Rerun: …"). A second rerun while one runs is
@@ -4848,6 +4858,9 @@ pods, and R06. R03 is W06-R13's debug reruns.
     works, and Release stops the containers and removes the workspace.
   - AC03: a step that failed on a missing file passed when rerun after the file was created in the
     kept leg's terminal.
+  - AC01 to AC03 in a Firecracker microVM (`w17_a_kept_leg_in_a_microvm`): the failed leg kept, a
+    terminal into it in its workspace with its environment and its secret masked, the file made
+    there, the step rerun in place and passing, and the release ending the microVM.
   - The run page's controls in Chromium and WebKit, at desktop and phone widths.
 - *R06* ships as **`kiln workflow run`**: `kiln run` was taken by reach (a command on another runner,
   `kiln run --on linux/amd64 -- make`), which machines and agents already use. Everything else is

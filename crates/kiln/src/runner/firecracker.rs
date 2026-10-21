@@ -15,11 +15,12 @@
 //! - **Still to come**: the jailer around each VMM, warm pools of booted snapshots, and terminals
 //!   into a running microVM (W17-R01).
 
+use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -212,14 +213,19 @@ pub fn tail(console: &Path) -> String {
     String::from_utf8_lossy(text.get(from..).unwrap_or_default()).trim().to_owned()
 }
 
-/// Each connection the guest makes to vsock `port`, spliced to `127.0.0.1:to` here, until `stop`.
-fn relay(socks: &Socks, port: u32, to: u16, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+/// Each connection the guest makes to vsock `port`, spliced to `127.0.0.1:<to>` here (turned away
+/// while `to` is 0), until `stop`.
+fn relay(socks: &Socks, port: u32, to: Arc<AtomicU16>, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     let l = UnixListener::bind(socks.port(port))?;
     l.set_nonblocking(true)?;
     std::thread::Builder::new().name(format!("vsock-{port}")).spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             match l.accept() {
                 Ok((s, _)) => {
+                    let to = to.load(Ordering::Relaxed);
+                    if to == 0 {
+                        continue;
+                    }
                     let _ = std::thread::Builder::new().name(format!("vsock-{port}-conn")).spawn(move || {
                         if s.set_nonblocking(false).is_ok()
                             && let Ok(t) = std::net::TcpStream::connect(("127.0.0.1", to))
@@ -355,16 +361,65 @@ pub async fn run(leg: Leg, ca: Option<Vec<u8>>) -> JobResult {
 }
 
 async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
-    use crate::exec::Up;
-    let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs (`kiln runner setup firecracker`)")?;
     let a = &leg.a;
-    let cache = leg.work_dir.join("_firecracker");
     let image = a.executor.image.clone().filter(|i| !i.trim().is_empty()).unwrap_or_else(|| crate::pipeline::toolchain_image(None).to_owned());
-    let kiln = kiln_disk(&m, &cache).await.context("kiln's disk for the microVM")?;
-    let root = super::rootfs::prepare(&m, &cache, &kiln, &image, a).await.with_context(|| format!("the image {image}"))?;
-    let key = crate::util::sha256_hex(a.job_id.as_bytes()).get(..12).unwrap_or("leg").to_owned();
-    let dir = cache.join("vms").join(&key);
-    let socks = Socks::new(&key)?;
+    // Its pool's microVM, booted before it came (W13-R09), when that's of its image.
+    let warm = a.executor.slot.as_deref().and_then(|s| WARM.lock().remove(s));
+    let warm = match warm {
+        Some(b) if b.image == image => Some(b),
+        Some(b) => {
+            crate::rt::spawn(b.discard());
+            None
+        }
+        None => None,
+    };
+    let booted = match warm {
+        Some(b) => b,
+        None => {
+            let m = crate::rt::blocking(Machine::find)
+                .await?
+                .context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs (`kiln runner setup firecracker`)")?;
+            let key = crate::util::sha256_hex(a.job_id.as_bytes()).get(..12).unwrap_or("leg").to_owned();
+            boot_for(&m, &leg.work_dir.join("_firecracker"), &key, &image, &super::rootfs::Pull::of(a)).await?
+        }
+    };
+    run_in(booted, leg, ca).await
+}
+
+/// A microVM booted for a leg, its guest dialled in and ready for one.
+pub struct Booted {
+    vm: Vm,
+    socks: Socks,
+    dir: PathBuf,
+    conn: UnixStream,
+    stop: Arc<AtomicBool>,
+    /// Where its connections out go (the leg's egress proxy), once it has a leg.
+    proxy_to: Arc<AtomicU16>,
+    /// Where the server's port on its loopback goes, once it has a leg.
+    server_to: Arc<AtomicU16>,
+    image: String,
+    /// The image's environment.
+    env: Vec<(String, String)>,
+}
+
+impl Booted {
+    /// Let go without a leg: its guest hung up on, its VMM stopped, its disks and sockets gone.
+    async fn discard(self) {
+        let Booted { vm, socks, dir, conn, stop, .. } = self;
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = crate::rt::blocking(move || drop(vm)).await;
+        drop(socks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A microVM of `image`, booted and ready for a leg, as `key` (its directories' name).
+async fn boot_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Booted> {
+    let kiln = kiln_disk(m, cache).await.context("kiln's disk for the microVM")?;
+    let root = super::rootfs::prepare(m, cache, &kiln, image, pull).await.with_context(|| format!("the image {image}"))?;
+    let dir = cache.join("vms").join(key);
+    let socks = Socks::new(key)?;
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let scratch = dir.join("scratch.ext4");
@@ -372,20 +427,16 @@ async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
         let (m, scratch) = (m.clone(), scratch.clone());
         crate::rt::blocking(move || mkfs(&m, &scratch, SCRATCH, "scratch", None)).await??;
     }
-    // Its ways out: the leg's egress proxy here, and the server's own port when it's on loopback.
-    let allow = a.network.as_ref().map(|n| n.allow.clone()).unwrap_or_else(|| vec!["*".to_owned()]);
-    let (pool, proxy_port) = super::egress::Pool::local(super::egress::Policy::for_leg(&a.runtime, allow)).await?;
+    // Its ways out, pointed where they go once it has a leg.
     let stop = Arc::new(AtomicBool::new(false));
-    relay(&socks, guest::PROXY_PORT, proxy_port, Arc::clone(&stop))?;
-    let server_port = loopback_port(&a.runtime);
-    if let Some(p) = server_port {
-        relay(&socks, guest::SERVER_PORT, p, Arc::clone(&stop))?;
-    }
+    let (proxy_to, server_to) = (Arc::new(AtomicU16::new(0)), Arc::new(AtomicU16::new(0)));
+    relay(&socks, guest::PROXY_PORT, Arc::clone(&proxy_to), Arc::clone(&stop))?;
+    relay(&socks, guest::SERVER_PORT, Arc::clone(&server_to), Arc::clone(&stop))?;
     let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
     let cpus = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
     let vcpus = u32::try_from(cpus).unwrap_or(2);
-    let mut vm = boot(
-        &m,
+    let vm = boot(
+        m,
         &dir,
         &socks,
         &[Drive { id: "kiln", path: &kiln, read_only: true }, Drive { id: "image", path: &root.path, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
@@ -394,11 +445,34 @@ async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
         2048,
     )?;
     let (vm, conn) = crate::rt::blocking(move || {
-        let conn = vm.accept(&control, BOOT);
+        let mut vm = vm;
+        let conn = vm.accept(&control, BOOT).and_then(|mut c| {
+            c.set_read_timeout(Some(BOOT))?;
+            match guest::recv::<FromGuest>(&mut c) {
+                Ok(Some(FromGuest::Ready)) => {
+                    c.set_read_timeout(None)?;
+                    Ok(c)
+                }
+                _ => Err(anyhow::anyhow!("the microVM's guest didn't say it was ready:\n{}", tail(&vm.console))),
+            }
+        });
         (vm, conn)
     })
     .await?;
-    let conn = conn?;
+    Ok(Booted { vm, socks, dir, conn: conn?, stop, proxy_to, server_to, image: image.to_owned(), env: root.env })
+}
+
+/// A leg run in a microVM booted for it.
+async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
+    let a = &leg.a;
+    let Booted { vm, socks, dir, conn, stop, proxy_to, server_to, env, .. } = b;
+    // Its ways out: the leg's egress proxy here (W18-R08), and the server's own port when it's on
+    // this machine's loopback.
+    let allow = a.network.as_ref().map(|n| n.allow.clone()).unwrap_or_else(|| vec!["*".to_owned()]);
+    let (pool, proxy_port) = super::egress::Pool::local(super::egress::Policy::for_leg(&a.runtime, allow)).await?;
+    proxy_to.store(proxy_port, Ordering::Relaxed);
+    let server_port = loopback_port(&a.runtime);
+    server_to.store(server_port.unwrap_or(0), Ordering::Relaxed);
     // Frames each way on threads of their own.
     let (from_tx, from_rx) = async_channel::unbounded::<FromGuest>();
     let (to_tx, to_rx) = async_channel::unbounded::<ToGuest>();
@@ -417,8 +491,7 @@ async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
             }
         }
     })?;
-    anyhow::ensure!(matches!(from_rx.recv().await, Ok(FromGuest::Ready)), "the microVM's guest didn't say it was ready:\n{}", tail(&vm.console));
-    let start = guest::LegStart { assignment: serde_json::to_string(a)?, runner_name: leg.runner_name.clone(), cache_max: leg.cache_max, env: root.env.clone(), ca, server_port };
+    let start = guest::LegStart { assignment: serde_json::to_string(a)?, runner_name: leg.runner_name.clone(), cache_max: leg.cache_max, env, ca, server_port };
     to_tx.send(ToGuest::Leg(Box::new(start))).await.map_err(|_| anyhow::anyhow!("the microVM's guest hung up"))?;
     // A cancel goes in; so does what the egress proxy refuses, as it does.
     let done = crate::rt::Shutdown::new();
@@ -442,38 +515,175 @@ async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
             }
         });
     }
+    LEGS.lock().insert(a.job_id.clone(), to_tx.clone());
     drop(to_tx);
     // Bounded here too: the leg's own timeout, its cleanup and a margin.
     let bound = Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60 + 15 * 60);
     let relayed = crate::rt::timeout(bound, async {
         while let Ok(f) = from_rx.recv().await {
             match f {
-                FromGuest::Msg(m) => leg.up.msg(m).await,
-                FromGuest::Log(c) => {
-                    let _ = leg.up.0.send(Up::Log(c)).await;
-                }
-                FromGuest::Term(m) => {
-                    let _ = leg.up.0.send(Up::Term(m)).await;
-                }
                 FromGuest::Done(r) => return Some(r),
-                FromGuest::Ready | FromGuest::Built(_) => {}
+                FromGuest::Bye => return None,
+                f => say(&leg.up, f).await,
             }
         }
         None
     })
     .await;
-    done.cancel();
-    let console = vm.console.clone();
-    let _ = crate::rt::blocking(move || vm.finish(SHUTDOWN)).await;
-    stop.store(true, Ordering::Relaxed);
-    let said = tail(&console);
-    drop(socks);
-    let _ = std::fs::remove_dir_all(&dir);
+    let end = End { job: a.job_id.clone(), up: leg.up.clone(), vm, socks, stop, dir, done };
     match relayed {
-        Ok(Some(r)) => Ok(r),
-        Ok(None) => anyhow::bail!("the microVM ended before its leg did:\n{said}"),
-        Err(_) => anyhow::bail!("the leg's microVM ran past {} minutes and was stopped:\n{said}", bound.as_secs() / 60),
+        Ok(Some(r)) => {
+            // A kept leg (W17-R02) keeps its microVM, with its terminals and its reruns: what it
+            // says still goes up until it lets go, and the microVM ends then.
+            crate::rt::spawn(async move {
+                let _ = crate::rt::timeout(KEPT, async {
+                    while let Ok(f) = from_rx.recv().await {
+                        if matches!(f, FromGuest::Bye) {
+                            break;
+                        }
+                        say(&end.up, f).await;
+                    }
+                })
+                .await;
+                end.finish().await;
+            });
+            Ok(r)
+        }
+        Ok(None) => {
+            let said = end.finish().await;
+            anyhow::bail!("the microVM ended before its leg did:\n{said}")
+        }
+        Err(_) => {
+            let said = end.finish().await;
+            anyhow::bail!("the leg's microVM ran past {} minutes and was stopped:\n{said}", bound.as_secs() / 60)
+        }
     }
+}
+
+/// What a leg's microVM says, as this runner says it.
+async fn say(up: &crate::exec::Uplink, f: FromGuest) {
+    use crate::exec::Up;
+    match f {
+        FromGuest::Msg(m) => up.msg(m).await,
+        FromGuest::Log(c) => {
+            let _ = up.0.send(Up::Log(c)).await;
+        }
+        FromGuest::Term(m) => {
+            let _ = up.0.send(Up::Term(m)).await;
+        }
+        FromGuest::Ready | FromGuest::Done(_) | FromGuest::Built(_) | FromGuest::Bye => {}
+    }
+}
+
+/// How long a kept leg's microVM may stay after its result: as long as a leg is kept, and an hour.
+const KEPT: Duration = Duration::from_secs((super::kept::MAX_KEEP_MINUTES as u64 + 60) * 60);
+
+/// A leg's microVM and what it holds, until it's done with.
+struct End {
+    job: String,
+    up: crate::exec::Uplink,
+    vm: Vm,
+    socks: Socks,
+    stop: Arc<AtomicBool>,
+    dir: PathBuf,
+    done: crate::rt::Shutdown,
+}
+
+impl End {
+    /// The microVM ended (or stopped), its terminals said to be over, its disks and sockets gone:
+    /// the end of its console.
+    async fn finish(self) -> String {
+        self.done.cancel();
+        LEGS.lock().remove(&self.job);
+        let ended: Vec<String> = {
+            let mut sessions = SESSIONS.lock();
+            let ids: Vec<String> = sessions.iter().filter(|(_, j)| **j == self.job).map(|(s, _)| s.clone()).collect();
+            for s in &ids {
+                sessions.remove(s);
+            }
+            ids
+        };
+        for session in ended {
+            let _ = self.up.0.send(crate::exec::Up::Term(crate::proto::AgentMsg::TermExit { session, code: None, error: Some("the leg's microVM ended".into()) })).await;
+        }
+        let console = self.vm.console.clone();
+        let vm = self.vm;
+        let _ = crate::rt::blocking(move || vm.finish(SHUTDOWN)).await;
+        self.stop.store(true, Ordering::Relaxed);
+        let said = tail(&console);
+        drop(self.socks);
+        let _ = std::fs::remove_dir_all(&self.dir);
+        said
+    }
+}
+
+/// A `firecracker` pool's microVMs (W13-R09), booted and waiting for a leg each, by executor.
+static WARM: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Booted>>> = std::sync::LazyLock::new(Default::default);
+
+/// Starts pool executor `ask.executor`: a microVM of the pool's image, booted and waiting for its
+/// leg, which starts at once when it comes.
+pub async fn start_warm(work: &Path, ask: &super::pool::Ask) -> anyhow::Result<()> {
+    let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs")?;
+    let image = ask.image.clone().filter(|i| !i.trim().is_empty()).context("the pool names no image")?;
+    let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new() };
+    let key = format!("p{}", crate::util::sha256_hex(ask.executor.as_bytes()).get(..11).unwrap_or("ool"));
+    let b = boot_for(&m, &work.join("_firecracker"), &key, &image, &pull).await?;
+    tracing::info!(executor = %ask.executor, pool = %ask.pool, image = %image, "pool microVM ready");
+    WARM.lock().insert(ask.executor.clone(), b);
+    Ok(())
+}
+
+/// A pool's microVM let go (its pool stopped it).
+pub async fn discard_warm(id: &str) {
+    let b = WARM.lock().remove(id);
+    if let Some(b) = b {
+        b.discard().await;
+    }
+}
+
+/// Every pool microVM here let go: the server forgot them (a new connection).
+pub async fn drain_warm() {
+    let all: Vec<Booted> = WARM.lock().drain().map(|(_, b)| b).collect();
+    for b in all {
+        b.discard().await;
+    }
+}
+
+/// The legs running (or kept) in microVMs here, by leg: what goes in to each.
+static LEGS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, async_channel::Sender<ToGuest>>>> = std::sync::LazyLock::new(Default::default);
+/// Terminals into those legs (W17-R01), by session: their leg.
+static SESSIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
+
+/// `m` sent in to leg `job`'s microVM: `false` when it doesn't run in one here.
+pub fn to_leg(job: &str, m: ToGuest) -> bool {
+    let tx = LEGS.lock().get(job).cloned();
+    tx.is_some_and(|tx| tx.try_send(m).is_ok())
+}
+
+/// A terminal into leg `job` (or a command run there), opened in its microVM when it runs in one
+/// here; `false` when it doesn't.
+pub fn open_terminal(job: &str, session: &str, cols: u16, rows: u16, command: Option<String>) -> bool {
+    if !LEGS.lock().contains_key(job) {
+        return false;
+    }
+    SESSIONS.lock().insert(session.to_owned(), job.to_owned());
+    to_leg(job, ToGuest::TermOpen { session: session.to_owned(), cols, rows, command })
+}
+
+/// Whether terminal `session` is into a microVM's leg here.
+pub fn in_microvm(session: &str) -> bool {
+    SESSIONS.lock().contains_key(session)
+}
+
+/// `m` for terminal `session`, sent in when it's into a microVM's leg here; `false` when it isn't.
+pub fn to_session(session: &str, m: ToGuest) -> bool {
+    let job = SESSIONS.lock().get(session).cloned();
+    let Some(job) = job else { return false };
+    if matches!(m, ToGuest::TermClose { .. }) {
+        SESSIONS.lock().remove(session);
+    }
+    to_leg(&job, m);
+    true
 }
 
 #[cfg(test)]

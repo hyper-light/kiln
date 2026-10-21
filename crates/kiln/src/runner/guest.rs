@@ -55,6 +55,38 @@ pub enum ToGuest {
     Cancel,
     /// What the host's egress proxy refused (W18-R08).
     Blocked(String),
+    /// A terminal into the leg (W17-R01), or one command run there (W17-R05).
+    TermOpen {
+        session: String,
+        cols: u16,
+        rows: u16,
+        command: Option<String>,
+    },
+    TermInput {
+        session: String,
+        data: Vec<u8>,
+    },
+    TermResize {
+        session: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// What brings a fresh terminal to the session's state.
+    TermAttach {
+        session: String,
+    },
+    TermClose {
+        session: String,
+    },
+    /// The kept leg let go (W17-R02).
+    Release,
+    /// The kept leg kept this many minutes from now.
+    Extend(u32),
+    /// A step of the kept leg run again in place, as step `idx` of its log (W17-R04).
+    RerunStep {
+        step: u32,
+        idx: u32,
+    },
 }
 
 /// A leg for the guest's runner.
@@ -91,6 +123,8 @@ pub enum FromGuest {
     Done(JobResult),
     /// The build: `None` when it went well, else why not.
     Built(Option<String>),
+    /// The guest is done: nothing follows.
+    Bye,
 }
 
 /// Sends one frame: its length (big-endian `u32`), then the value in postcard.
@@ -351,25 +385,33 @@ fn prepare() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
     Ok((start, conn))
 }
 
-/// The leg, run: frames to the host on a thread of their own, the host's on another.
+/// What the guest's runner hears: the host, or one of its terminals.
+enum Ev {
+    Host(ToGuest),
+    Pty(String, crate::terminal::PtyOut),
+}
+
+/// The leg, run: frames to the host on a thread of their own, the host's on another. Its result
+/// goes once every event before it has; a kept leg keeps the microVM, its terminals and its reruns,
+/// until it's let go.
 async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
-    use crate::exec::Up;
-    let mut a: kiln_ci::wire::AssignmentV2 = serde_json::from_str(&start.assignment).context("the leg's assignment")?;
-    // Nothing is kept of a microVM after its leg yet (W17-R02 comes with its terminals).
-    a.debug.keep_on_failure_minutes = None;
+    let a: kiln_ci::wire::AssignmentV2 = serde_json::from_str(&start.assignment).context("the leg's assignment")?;
+    let job = a.job_id.clone();
     let (out_tx, out_rx) = async_channel::unbounded::<FromGuest>();
     let (mut reader, mut writer) = (conn.try_clone()?, conn);
     let wrote = std::thread::Builder::new().name("guest-out".into()).spawn(move || {
         while let Ok(f) = out_rx.recv_blocking() {
-            if send(&mut writer, &f).is_err() {
+            let last = matches!(f, FromGuest::Bye);
+            if send(&mut writer, &f).is_err() || last {
                 break;
             }
         }
     })?;
-    let (in_tx, in_rx) = async_channel::unbounded::<ToGuest>();
+    let (ev_tx, ev_rx) = async_channel::unbounded::<Ev>();
+    let from_host = ev_tx.clone();
     std::thread::Builder::new().name("guest-in".into()).spawn(move || {
         while let Ok(Some(m)) = recv::<ToGuest>(&mut reader) {
-            if in_tx.send_blocking(m).is_err() {
+            if from_host.send_blocking(Ev::Host(m)).is_err() {
                 break;
             }
         }
@@ -377,37 +419,14 @@ async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
     let (blocked_tx, blocked_rx) = async_channel::unbounded();
     let _ = BLOCKED.set(blocked_rx);
     let cancel = crate::rt::Shutdown::new();
-    let c = cancel.clone();
-    crate::rt::spawn(async move {
-        while let Ok(m) = in_rx.recv().await {
-            match m {
-                ToGuest::Cancel => c.cancel(),
-                ToGuest::Blocked(b) => {
-                    let _ = blocked_tx.send(b).await;
-                }
-                ToGuest::Leg(_) | ToGuest::Build(_) => {}
-            }
-        }
-    });
+    crate::rt::spawn(serve(ev_rx, ev_tx, out_tx.clone(), cancel.clone(), blocked_tx, job.clone()));
     let http = std::sync::Arc::new(match start.ca {
         Some(ca) => crate::http::client::Client::new(crate::http::client::Roots::WebPkiPlusDer(ca), None)?,
         None => crate::http::client::Client::public()?,
     });
-    let (up_tx, up_rx) = async_channel::unbounded::<Up>();
-    let out = out_tx.clone();
-    let relay = crate::rt::spawn(async move {
-        while let Ok(up) = up_rx.recv().await {
-            let f = match up {
-                Up::Msg(m) => FromGuest::Msg(m),
-                Up::Log(c) => FromGuest::Log(c),
-                Up::Term(m) => FromGuest::Term(m),
-                _ => continue,
-            };
-            if out.send(f).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (up_tx, up_rx) = async_channel::unbounded::<crate::exec::Up>();
+    let (result_tx, result_rx) = async_channel::bounded::<JobResult>(1);
+    let relay = crate::rt::spawn(relay_up(up_rx, result_rx, out_tx.clone()));
     let leg = super::runtime::Leg {
         a,
         work_dir: PathBuf::from(WORK),
@@ -419,12 +438,166 @@ async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
         cache_max: start.cache_max,
     };
     let result = leg.run().await;
-    // What's left of its events, then its result.
-    let _ = crate::rt::timeout(Duration::from_secs(30), relay).await;
-    out_tx.send(FromGuest::Done(result)).await.ok();
-    drop(out_tx);
+    let _ = result_tx.send(result).await;
+    // Kept (W17-R02): here until its keep runs out or it's let go.
+    while super::kept::kept_until(&job).is_some() {
+        crate::rt::sleep(Duration::from_millis(500)).await;
+    }
+    let _ = crate::rt::timeout(Duration::from_secs(5), relay).await;
+    let _ = out_tx.send(FromGuest::Bye).await;
     let _ = crate::rt::blocking(move || wrote.join()).await;
     Ok(())
+}
+
+/// The leg's events as they come, its result once every event before it has gone, then what its
+/// kept leg says (its reruns) until the leg lets go of it.
+async fn relay_up(up_rx: async_channel::Receiver<crate::exec::Up>, result_rx: async_channel::Receiver<JobResult>, out: async_channel::Sender<FromGuest>) {
+    use futures::future::Either;
+    loop {
+        let next = {
+            let up = std::pin::pin!(up_rx.recv());
+            let result = std::pin::pin!(result_rx.recv());
+            match futures::future::select(up, result).await {
+                Either::Left((up, _)) => Either::Left(up),
+                Either::Right((result, _)) => Either::Right(result),
+            }
+        };
+        match next {
+            Either::Left(Ok(up)) => to_host(&out, up).await,
+            Either::Left(Err(_)) => {
+                // Nothing more from the leg: its result, when it comes, is the last.
+                if let Ok(result) = result_rx.recv().await {
+                    let _ = out.send(FromGuest::Done(result)).await;
+                }
+                return;
+            }
+            Either::Right(Ok(result)) => {
+                while let Ok(up) = up_rx.try_recv() {
+                    to_host(&out, up).await;
+                }
+                let _ = out.send(FromGuest::Done(result)).await;
+                break;
+            }
+            Either::Right(Err(_)) => break,
+        }
+    }
+    while let Ok(up) = up_rx.recv().await {
+        to_host(&out, up).await;
+    }
+}
+
+async fn to_host(out: &async_channel::Sender<FromGuest>, up: crate::exec::Up) {
+    use crate::exec::Up;
+    let f = match up {
+        Up::Msg(m) => FromGuest::Msg(m),
+        Up::Log(c) => FromGuest::Log(c),
+        Up::Term(m) => FromGuest::Term(m),
+        _ => return,
+    };
+    let _ = out.send(f).await;
+}
+
+/// The host's requests for the leg (its cancel, its kept leg's release, extension and reruns,
+/// terminals into it) and its terminals' output.
+async fn serve(
+    ev_rx: async_channel::Receiver<Ev>,
+    ev_tx: async_channel::Sender<Ev>,
+    out: async_channel::Sender<FromGuest>,
+    cancel: crate::rt::Shutdown,
+    blocked: async_channel::Sender<String>,
+    job: String,
+) {
+    use crate::terminal::PtyOut;
+    let ended = |session: String, why: String| FromGuest::Term(AgentMsg::TermExit { session, code: None, error: Some(why) });
+    let mut terms: std::collections::HashMap<String, (crate::terminal::PtySession, std::sync::Arc<crate::termsess::Session>)> = std::collections::HashMap::new();
+    while let Ok(ev) = ev_rx.recv().await {
+        match ev {
+            Ev::Host(ToGuest::Cancel) => cancel.cancel(),
+            Ev::Host(ToGuest::Blocked(b)) => {
+                let _ = blocked.send(b).await;
+            }
+            Ev::Host(ToGuest::TermOpen { session, cols, rows, command }) => {
+                if terms.contains_key(&session) {
+                    continue;
+                }
+                let Some(shell) = super::kept::shell(&job) else {
+                    let _ = out.send(ended(session, "the leg isn't running or kept in its microVM".into())).await;
+                    continue;
+                };
+                let mut l = shell.launch(command.as_deref(), None);
+                // A command runs in bash, as a step would, where the image has it.
+                if l.shell.as_deref() == Some("bash") && crate::os::which("bash").is_none() {
+                    l.shell = Some("sh".into());
+                }
+                let env: Vec<(&str, String)> = l.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                match crate::terminal::spawn_at(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env) {
+                    Ok((pty, rx)) => {
+                        let (tx, s, masked) = (ev_tx.clone(), session.clone(), super::kept::masked(rx, &shell.masks));
+                        crate::rt::spawn(async move {
+                            while let Ok(o) = masked.recv().await {
+                                if tx.send(Ev::Pty(s.clone(), o)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
+                        terms.insert(session, (pty, state));
+                    }
+                    Err(e) => {
+                        let _ = out.send(ended(session, format!("{e:#}"))).await;
+                    }
+                }
+            }
+            Ev::Host(ToGuest::TermInput { session, data }) => {
+                if let Some((pty, _)) = terms.get(&session) {
+                    pty.write(data);
+                }
+            }
+            Ev::Host(ToGuest::TermResize { session, cols, rows }) => {
+                if let Some((pty, state)) = terms.get(&session) {
+                    pty.resize(cols, rows);
+                    state.send(crate::termsess::Input::Resize { cols, rows });
+                }
+            }
+            Ev::Host(ToGuest::TermAttach { session }) => {
+                let msg = match terms.get(&session) {
+                    Some((_, state)) => {
+                        let a = state.attach();
+                        state.detach();
+                        FromGuest::Term(AgentMsg::TermReplay { session, data: a.replay })
+                    }
+                    None => ended(session, "session no longer exists".into()),
+                };
+                let _ = out.send(msg).await;
+            }
+            Ev::Host(ToGuest::TermClose { session }) => {
+                terms.remove(&session);
+            }
+            Ev::Host(ToGuest::Release) => {
+                let j = job.clone();
+                crate::rt::spawn(async move {
+                    super::kept::release(&j).await;
+                });
+            }
+            Ev::Host(ToGuest::Extend(minutes)) => {
+                let _ = super::kept::extend(&job, minutes);
+            }
+            Ev::Host(ToGuest::RerunStep { step, idx }) => {
+                let _ = super::runtime::rerun_step(&job, step, idx);
+            }
+            Ev::Host(ToGuest::Leg(_) | ToGuest::Build(_)) => {}
+            Ev::Pty(session, PtyOut::Data(data)) => {
+                if let Some((_, state)) = terms.get(&session) {
+                    state.output(&data);
+                }
+                let _ = out.send(FromGuest::Term(AgentMsg::TermOutput { session, data })).await;
+            }
+            Ev::Pty(session, PtyOut::Exit(code)) => {
+                terms.remove(&session);
+                let _ = out.send(FromGuest::Term(AgentMsg::TermExit { session, code, error: None })).await;
+            }
+        }
+    }
 }
 
 /// An image built: its layers (`/dev/vdb`) extracted onto its new root file system (`/dev/vdc`).

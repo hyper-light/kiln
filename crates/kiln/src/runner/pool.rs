@@ -5,7 +5,9 @@
 //! executor lays out a leg's (W13-R04) under a directory of its own (`<work>/p/<id>`), so a leg
 //! that comes to it runs there at once. A leg it can't take as it is (one with `container:`,
 //! `services:` or a contained network) runs the usual way, and the executor is discarded all the
-//! same. The other kinds (`firecracker`, `shards`, `k8s`) are refused until this runner has them.
+//! same. A `firecracker` executor is a microVM of the pool's image, booted and waiting for its
+//! leg (W13-R05). `shards` is refused until this runner has it; `k8s`'s executors are the
+//! server's own pods.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -93,8 +95,11 @@ pub async fn handle(execs: &Executors, work: &Path, ask: Ask) -> Option<Said> {
             if let Some(w) = execs.take(&ask.executor) {
                 discard(w).await;
             }
+            #[cfg(target_os = "linux")]
+            super::firecracker::discard_warm(&ask.executor).await;
             None
         }
+        "start" if ask.kind == "firecracker" => Some(start_microvm(work, &ask).await),
         "start" => Some(match start(work, &ask).await {
             Ok(w) => {
                 let said = Said { executor: w.id.clone(), state: "ready".into(), error: None };
@@ -107,8 +112,23 @@ pub async fn handle(execs: &Executors, work: &Path, ask: Ask) -> Option<Said> {
     }
 }
 
+/// A `firecracker` pool's executor: a microVM booted and waiting for its leg.
+async fn start_microvm(work: &Path, ask: &Ask) -> Said {
+    #[cfg(target_os = "linux")]
+    let started = super::firecracker::start_warm(work, ask).await;
+    #[cfg(not(target_os = "linux"))]
+    let started: anyhow::Result<()> = {
+        let _ = work;
+        Err(anyhow::anyhow!("microVMs run on Linux hosts with KVM"))
+    };
+    match started {
+        Ok(()) => Said { executor: ask.executor.clone(), state: "ready".into(), error: None },
+        Err(e) => Said { executor: ask.executor.clone(), state: "failed".into(), error: Some(format!("{e:#}")) },
+    }
+}
+
 async fn start(work: &Path, ask: &Ask) -> anyhow::Result<Warm> {
-    anyhow::ensure!(ask.kind == "docker", "this runner starts `docker` pools' executors; `{}` comes with its executor (docs/ci.md W13-R05 to R07)", ask.kind);
+    anyhow::ensure!(ask.kind == "docker", "this runner starts `docker` and `firecracker` pools' executors; `{}` comes with its executor (docs/ci.md W13-R06, R07)", ask.kind);
     let image = ask.image.clone().filter(|i| !i.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("the pool names no image"))?;
     let bin = crate::rt::blocking(docker::find).await?.ok_or_else(|| anyhow::anyhow!("this runner has no working Docker or Podman"))?;
     let dir = dir_of(work, &ask.executor);
