@@ -423,7 +423,7 @@ function Thought({ item, live, since }: { item: ThoughtItem; live: boolean; sinc
       {open && (
         <ThinkingBody live={live}>
           {all.map((x) => (
-            <Prose key={x.id} text={x.text} className="hx-thought-text" ev={x.id} />
+            <Prose key={x.id} text={x.text} className="hx-thought-text" ev={x.id} streaming={x.streaming} />
           ))}
         </ThinkingBody>
       )}
@@ -527,7 +527,7 @@ const ItemView = React.memo(function ItemView({ item, cwd, onOpenTask, active, s
       // A tap (or a pointer resting on it) shows its copy icon.
       return (
         <div className="hx-said" data-ev={item.event.id} tabIndex={-1}>
-          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} />
+          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} seq={item.event.seq} streaming={item.event.streaming} />
           {!item.event.streaming && item.event.text && <CopyMsg text={item.event.text} label="Copy what it said" className="hx-said-copy" />}
         </div>
       );
