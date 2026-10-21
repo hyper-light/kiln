@@ -493,6 +493,17 @@ function agentWords(did: Record<string, unknown>[]): string {
   return said.length ? `the agent ${said.join(", ")}` : "";
 }
 
+/** What a live page's window can be: this frame's own, at this screen's density (`fit`), or a
+ *  screen's, drawn whole in the frame (its pixels, as laid out: 4K is 1920×1080 at 2×). */
+const RESOLUTIONS = [
+  { value: "fit", label: "Fit", title: "The frame's own size, at this screen's density" },
+  { value: "720p", label: "720p", title: "1280×720", width: 1280, height: 720, scale: 1 },
+  { value: "1080p", label: "1080p", title: "1920×1080", width: 1920, height: 1080, scale: 1 },
+  { value: "1440p", label: "1440p", title: "2560×1440", width: 2560, height: 1440, scale: 1 },
+  { value: "4k", label: "4K", title: "3840×2160 (laid out at 1920×1080, 2×)", width: 1920, height: 1080, scale: 2 },
+] as const;
+type Resolution = (typeof RESOLUTIONS)[number]["value"];
+
 /** A tab of a live page's (a Chromium page's: its runner says them). */
 type PageTab = { id: string; url: string; title: string };
 
@@ -556,13 +567,27 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
   const live = React.useRef({ stream, sound, macPage, held });
   live.current = { stream, sound, macPage, held };
   const moved = React.useRef<Record<string, unknown> | null>(null);
+  /** Its resolution: this frame's own (`fit`), or a screen's (its window fixed, drawn whole). */
+  const [resolution, setResolution] = React.useState<Resolution>("fit");
+  const fixed = React.useRef<{ width: number; height: number; scale: number } | null>(null);
+  const fixedName = React.useRef("");
 
   const send = React.useCallback((m: unknown) => viewing.current?.send(m), []);
   const input = React.useCallback((events: unknown[]) => send({ input: events }), [send]);
   const resize = React.useCallback(() => {
+    const f = fixed.current;
+    if (f) return send({ control: { resize: { ...f, mobile: false } } });
     const { width, height } = size.current;
     if (width > 0 && height > 0) send({ control: { resize: { width, height, scale: Math.min(2, Math.max(1, window.devicePixelRatio || 1)), mobile: touchViewer } } });
   }, [send]);
+  const resolve = (value: Resolution) => {
+    const r = RESOLUTIONS.find((x) => x.value === value);
+    setResolution(value);
+    fixed.current = r && "width" in r ? { width: r.width, height: r.height, scale: r.scale } : null;
+    fixedName.current = r?.label ?? "";
+    setHeld(r && "width" in r ? { name: r.label, width: r.width, height: r.height } : null);
+    resize();
+  };
 
   const connect = React.useCallback(() => {
     const c = canvas.current;
@@ -588,7 +613,8 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
         if (opened) {
           setMacPage(opened.platform === "macos");
           setEngine(opened.engine ?? "chromium");
-          setHeld(opened.device ? { name: opened.device.name, width: opened.device.width, height: opened.device.height } : null);
+          const f = fixed.current;
+          setHeld(opened.device ? { name: opened.device.name, width: opened.device.width, height: opened.device.height } : f ? { name: fixedName.current, width: f.width, height: f.height } : null);
         }
         const nav = e.navigated as { url?: string } | undefined;
         if (nav?.url) setAddress(nav.url === "about:blank" ? "" : nav.url);
@@ -874,6 +900,17 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           {recording !== null ? <Since at={recording} /> : agentDid || word}
         </span>
         <span className="pg-actions">
+          {/* Its resolution (a device it's held to has its own). */}
+          {!stream.device && (
+            <SelectField
+              label="Resolution"
+              hideLabel
+              className="lv-res"
+              value={resolution}
+              onChange={(v) => resolve(v as Resolution)}
+              options={RESOLUTIONS.map((r) => ({ value: r.value, label: r.label }))}
+            />
+          )}
           {/* Its sound comes over WebRTC, or over its socket where WebCodecs' AudioDecoder plays it. */}
           {(plays || path === "webrtc") && (
             <button

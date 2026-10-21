@@ -20,6 +20,16 @@
   flex: 1 1 auto;
   min-width: 0;
 }
+/* Its resolution, among its actions: the one style's select, as small as they are. */
+.lv-res select {
+  min-height: 22px;
+  padding: 1px 24px 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lv-res > .select > svg {
+  right: 6px;
+}
 .lv-tab select {
   min-height: 28px;
   padding: 4px 28px 4px 8px;

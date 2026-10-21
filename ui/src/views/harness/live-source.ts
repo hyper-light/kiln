@@ -275,6 +275,10 @@ export class SourcePlayer {
   private at = 0;
   private trimmed = 0;
   private open = false;
+  /** Where playing last was, and since when: one that stopped there with newer pictures behind it
+   *  is moved on to the newest (`chase`). */
+  private moved = { t: -1, at: 0 };
+  private again: ReturnType<typeof setTimeout> | undefined;
   /** Pictures that came before it opened (a key frame first). */
   private early: { data: Uint8Array; key: boolean; width: number; height: number }[] = [];
   failed = false;
@@ -386,8 +390,18 @@ export class SourcePlayer {
     if (!r.length) return;
     const end = r.end(r.length - 1);
     const behind = end - v.currentTime;
+    const now = performance.now();
+    if (v.currentTime !== this.moved.t) this.moved = { t: v.currentTime, at: now };
+    // A moment on, again: the last pictures of a burst are shown too.
+    clearTimeout(this.again);
+    if (behind > 0.001) this.again = setTimeout(() => this.chase(), 80);
     if (behind > 1 || v.currentTime < r.start(r.length - 1)) v.currentTime = Math.max(r.start(r.length - 1), end - 0.02);
-    else v.playbackRate = behind > 0.25 ? 2 : behind > 0.1 ? 1.25 : 1;
+    // Playing stopped at a picture with newer ones behind it (a browser that holds them until
+    // more come, as for a still page that changed once): the newest, shown now.
+    else if (behind > 0.001 && now - this.moved.at > 50) {
+      v.currentTime = end - 0.001;
+      this.moved = { t: v.currentTime, at: now };
+    } else v.playbackRate = behind > 0.25 ? 2 : behind > 0.1 ? 1.25 : 1;
     if (v.paused) void v.play().catch(() => undefined);
     if (v.currentTime - this.trimmed > 20) {
       this.trimmed = v.currentTime - 5;
@@ -404,6 +418,7 @@ export class SourcePlayer {
   close() {
     this.failed = true;
     this.queue = [];
+    clearTimeout(this.again);
     try {
       if (this.source.readyState === "open") this.source.endOfStream();
     } catch {

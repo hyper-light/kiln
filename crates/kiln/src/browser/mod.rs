@@ -153,7 +153,15 @@ impl Browser {
         if std::env::var("KILN_BROWSER_SANDBOX").is_ok_and(|v| v == "0") {
             args.push("--no-sandbox".to_owned());
         }
+        // More of its flags, as the machine's environment says (its GPU's, say: `--use-gl=angle
+        // --use-angle=gl-egl` draws pages on it rather than on the processor).
+        if let Ok(more) = std::env::var("KILN_BROWSER_FLAGS") {
+            args.extend(more.split_whitespace().map(str::to_owned));
+        }
         if let Some(ext) = &launch.extension {
+            // A streamed page drawn on the machine's GPU, where it has one: a heavy page's, or a
+            // big window's, pictures come several times as fast as drawn on the processor.
+            args.extend(gpu_flags());
             args.push(format!("--load-extension={}", ext.display()));
             args.push(format!("--disable-extensions-except={}", ext.display()));
             args.push(format!("--allowlisted-extension-id={}", launch.id));
@@ -214,6 +222,23 @@ impl Drop for Browser {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// The flags that draw a browser's pages on this machine's GPU: on Linux with a render node
+/// (`/dev/dri/renderD*`) it may open, through ANGLE's EGL. None elsewhere (a machine without one,
+/// or one it may not use, draws faster with Chrome's own software renderer than with EGL's), nor
+/// with `KILN_BROWSER_GPU=0` in the machine's environment.
+fn gpu_flags() -> Vec<String> {
+    if !cfg!(target_os = "linux") || std::env::var("KILN_BROWSER_GPU").is_ok_and(|v| v == "0") {
+        return Vec::new();
+    }
+    let usable = std::fs::read_dir("/dev/dri").is_ok_and(|d| {
+        d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("renderD") && std::fs::OpenOptions::new().read(true).write(true).open(e.path()).is_ok())
+    });
+    if !usable {
+        return Vec::new();
+    }
+    ["--use-gl=angle", "--use-angle=gl-egl", "--enable-gpu-rasterization", "--ignore-gpu-blocklist"].iter().map(|f| (*f).to_owned()).collect()
 }
 
 /// The first target `pick` takes (`Target.getTargets`' entries), waiting a few seconds for it.

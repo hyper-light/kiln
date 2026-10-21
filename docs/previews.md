@@ -123,7 +123,18 @@ page appears in the conversation, live.
   compositor draws it, only when something changed, so a still page costs nothing. It encodes it
   right there with WebCodecs: H.264 (VP8, VP9 or AV1 when asked) at the viewer's own window size and
   pixel density, and the page's sound as Opus. Once the page is still, its last picture is sent
-  again, sharp.
+  again, sharp. Its bitrate follows its size (about a tenth of a bit a pixel at its rate, 2 to
+  25 Mb/s; a page's flat colours and text take far less than video), unless the stream asked for
+  one. Each size is captured exactly, even (a capture left to choose its own within a shape comes
+  odd, and each picture cut to even was a key frame of its own); a new size is a new capture, the
+  encoders kept. A picture the encoder is too far behind to take is let go before it's encoded, so
+  no key frame has to follow it.
+- **Drawn on the machine's GPU** where it has one: on Linux, a render node the runner may open
+  (`/dev/dri/renderD*`) has the stream's browser draw and composite on it, through ANGLE's EGL, not
+  on the processor. A heavy page, or a big window, comes several times as fast (on a busy machine,
+  GitHub's diff scrolled at 57 pictures a second against 33; 1440p at 48 against 13).
+  `KILN_BROWSER_GPU=0` in the runner's environment keeps it on the processor, and
+  `KILN_BROWSER_FLAGS` gives the browser more flags of the machine's own.
 - **Relayed by the server.** Chunks go up the runner's stream lane (`LANE_STREAM`, runners with
   `CAP_STREAM`) and out to each viewer's socket. A viewer that joins gets the decoders'
   configuration and a fresh key frame at once. One too slow for a chunk loses it, and the next key
@@ -137,7 +148,15 @@ page appears in the conversation, live.
   frame is the page's window: the conversation's width, as tall as the conversation shows. The
   page lays out at that size on the agent's machine, as a phone lays it out for a phone. Its
   sound plays once the person turns it on.
-- **What the person does goes to it:** taps and the mouse (as touch from a phone), the wheel, keys
+- **Its resolution, as the person picks it:** Fit (the frame's own size, at the screen's density,
+  by default), or a screen's: 720p (1280×720), 1080p (1920×1080), 1440p (2560×1440) or 4K
+  (3840×2160, laid out at 1920×1080 at 2×). A screen's window is drawn whole in the frame, and what's
+  done in the frame lands where the page has it. Measured on one machine (a Ryzen 9950X3D, its
+  GPU drawing), 1080p streamed at 60 pictures a second and 1440p at about 50; 4K's capture took
+  about 45 a second and Chrome's encoder about 30 (H.264 in software: a GPU's encoder, where
+  Chrome uses one, as on a Mac, does more).
+- **What the person does goes to it:** taps and the mouse (as touch from a phone), the wheel (the
+  frame's own: the conversation around it doesn't scroll, and a frame's turns go as one), keys
   by meaning (a Mac's Command is Control on a page elsewhere, for its shortcuts), text from a
   phone's keyboard (Type), compositions, a paste. Measured on one machine, a tap shows in the
   picture 12 to 30 ms later (17 ms at the median).
