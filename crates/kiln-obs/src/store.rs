@@ -254,6 +254,17 @@ pub struct Store {
     /// from reading the store to taking the change in: they write their files under a shared hold
     /// of the store (or none), one at a time. Taken before the store's own lock, never after.
     manifest_lock: Arc<Mutex<()>>,
+    /// The numbering of the series the store holds now: one no other in this process had (`fresh`),
+    /// drawn again whenever its series are numbered anew (retention dropping some; an install, an
+    /// open). A query that lets go of the store between its parts reads on only while it is the one
+    /// it began with (`crate::query::eval::Lease`).
+    generation: u64,
+}
+
+/// A numbering of series no store of this process had before.
+fn fresh() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for Store {
@@ -570,7 +581,14 @@ impl Store {
             spans_touched: None,
             read_rollups: true,
             manifest_lock: Arc::new(Mutex::new(())),
+            generation: fresh(),
         }
+    }
+
+    /// The numbering of the series it holds now ([`Store`]'s `generation`): a series' id means
+    /// that series while this is the same.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Log records applied from here on are published to `feed` (live tail, [`crate::logs::tail`]).
@@ -664,6 +682,7 @@ impl Store {
         self.symbols = symbols;
         self.index = index;
         self.last = last;
+        self.generation = fresh();
         Ok(())
     }
 
@@ -707,6 +726,7 @@ impl Store {
         self.index = index;
         self.head = head;
         self.last = last;
+        self.generation = fresh();
         Ok(dropped)
     }
 

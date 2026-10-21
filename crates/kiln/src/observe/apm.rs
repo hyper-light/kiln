@@ -9,10 +9,11 @@ use http::StatusCode;
 use kiln_obs::logs::record::Record;
 use kiln_obs::logs::search::{Search, parse_spans};
 use kiln_obs::logs::store::{Facet, Measure};
+use kiln_obs::query::eval::Source;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::api::{AttrsOut, Fail, HexOut, RecordOut, fail, read_apart, reading};
+use super::api::{AttrsOut, Fail, HexOut, RecordOut, apart, fail, read_apart};
 use crate::http::server::{self as srv, Response};
 
 /// Spans a search answers with at the most: a log search's.
@@ -212,14 +213,15 @@ pub async fn trace(id: &str, q: &HashMap<String, String>) -> Result<Response, Fa
         (None, None) => (i64::MIN / 1_000_000, super::clock_ms() + 3_600_000),
         _ => range(q, 3_600_000)?,
     };
-    reading(move |s| {
+    // The spans as they are, read with the store let go.
+    read_apart(kiln_obs::store::Store::spans_at, move |at, _| {
         let started = std::time::Instant::now();
         let mut spans: Vec<Record> = Vec::new();
         // Past the bound, the earliest are kept (a waterfall is read from its start): the latest
         // kept on top of a heap, replaced by an earlier one.
         let mut latest: std::collections::BinaryHeap<(i64, usize)> = std::collections::BinaryHeap::new();
         let mut matched = 0usize;
-        s.each_span(&Search::trace(id), ns(from), ns(to).saturating_add(999_999), |r| {
+        at.each(&Search::trace(id), ns(from), ns(to).saturating_add(999_999), |r| {
             matched += 1;
             if spans.len() < TRACE_SPANS {
                 latest.push((r.ts, spans.len()));
@@ -277,10 +279,11 @@ pub(super) fn env_filter(q: &HashMap<String, String>) -> Option<String> {
 pub async fn services(q: &HashMap<String, String>) -> Result<Response, Fail> {
     let (from, to) = range(q, 3_600_000)?;
     let env = env_filter(q);
-    reading(move |s| {
+    // The trace metrics read a round of series at a time (`kiln_obs::query::eval::Lease`).
+    apart(move |store| {
         let filter: Vec<(&str, &str)> = env.as_deref().map(|e| ("env", e)).into_iter().collect();
-        let rows = kiln_obs::apm::red(s, false, &filter, "service", from, to).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let envs: Vec<&str> = s.tag_values("env").into_iter().collect();
+        let rows = kiln_obs::apm::red(Source::Shared(store), false, &filter, "service", from, to).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let envs: Vec<String> = store.read().unwrap_or_else(std::sync::PoisonError::into_inner).tag_values("env").into_iter().map(str::to_owned).collect();
         let services: Vec<Value> = rows.iter().filter(|r| r.hits > 0.0).map(|r| red_json(r, "service")).collect();
         Ok(srv::json(StatusCode::OK, &json!({ "from": from, "to": to, "env": env, "envs": envs, "services": services })))
     })
@@ -292,12 +295,13 @@ pub async fn service(name: &str, q: &HashMap<String, String>) -> Result<Response
     let (from, to) = range(q, 3_600_000)?;
     let env = env_filter(q);
     let name = name.to_owned();
-    reading(move |s| {
+    // The trace metrics read a round of series at a time (`kiln_obs::query::eval::Lease`).
+    apart(move |store| {
         let mut filter: Vec<(&str, &str)> = vec![("service", name.as_str())];
         if let Some(e) = env.as_deref() {
             filter.push(("env", e));
         }
-        let red = |outbound: bool, by: &str| kiln_obs::apm::red(s, outbound, &filter, by, from, to).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e));
+        let red = |outbound: bool, by: &str| kiln_obs::apm::red(Source::Shared(store), outbound, &filter, by, from, to).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e));
         let summary = red(false, "service")?;
         let resources = red(false, "resource_name")?;
         let kinds = red(false, "span.kind")?;
@@ -328,16 +332,20 @@ pub async fn service(name: &str, q: &HashMap<String, String>) -> Result<Response
 pub async fn map(q: &HashMap<String, String>) -> Result<Response, Fail> {
     let (from, to) = range(q, 15 * 60_000)?;
     let env = env_filter(q);
-    reading(move |s| {
+    let (a, b) = (ns(from), ns(to).saturating_add(999_999));
+    let store = super::api::shared()?;
+    // The spans as they are (and how many lie in the range) taken under a brief hold, read with the
+    // store let go; the trace metrics' figures a round of series at a time.
+    let take = move |s: &kiln_obs::store::Store| (s.spans_at(), s.span_rows_between(a, b));
+    read_apart(take, move |(at, rows), _| {
         let started = std::time::Instant::now();
         let search = match env.as_deref() {
             Some(e) => parse(&format!("env:\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"")))?,
             None => Search::all(),
         };
-        let (a, b) = (ns(from), ns(to).saturating_add(999_999));
-        let k = s.span_rows_between(a, b).div_ceil(MAP_SPANS).max(1);
+        let k = rows.div_ceil(MAP_SPANS).max(1);
         let mut m = kiln_obs::apm::MapBuilder::new();
-        s.each_span(&search, a, b, |r| {
+        at.each(&search, a, b, |r| {
             if kiln_obs::apm::sampled(r.trace_id, k) {
                 m.take(r);
             }
@@ -348,7 +356,7 @@ pub async fn map(q: &HashMap<String, String>) -> Result<Response, Fail> {
         // Agent's stats and a runner's concentrator count those dropped), each edge its share of
         // the groups that count its calls; the spans' only where the metrics have none.
         let filter: Vec<(&str, &str)> = env.as_deref().map(|e| ("env", e)).into_iter().collect();
-        let figures = kiln_obs::apm::figures(s, &map, &filter, from, to, k).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let figures = kiln_obs::apm::figures(Source::Shared(&store), &map, &filter, from, to, k).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let nodes: Vec<Value> = figures.nodes.iter().map(|n| json!({ "service": n.service, "hits": n.hits, "errors": n.errors, "inferred": n.inferred })).collect();
         let edges: Vec<Value> =
             figures.edges.iter().map(|e| json!({ "from": e.from, "to": e.to, "calls": e.calls, "errors": e.errors, "avg_s": e.avg_s, "inferred": e.inferred, "counted": e.counted })).collect();

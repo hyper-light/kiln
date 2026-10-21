@@ -49,7 +49,97 @@ pub enum QueryError {
     TooManySeries(usize, usize),
     #[error("{0}")]
     Invalid(String),
+    /// The store's series were numbered anew while the query let go of it ([`Lease`]): read again,
+    /// never an answer ([`eval_shared`] asks again).
+    #[error("the store's series were numbered anew as the query read")]
+    Moved,
 }
+
+/// How a query holds the store. `Held`: its caller holds it throughout. `Shared`: taken a part at
+/// a time (finding its series, then a round of them a thread, `ROUND`), each part under a shared
+/// hold of its own, so a write waits for one part at the most, and no reader waits behind that
+/// write for the whole query (the lock lets a waiting writer in before new readers). A part that
+/// finds the series numbered anew since the query began (`Store::generation`: retention, an
+/// install) ends the query with [`QueryError::Moved`], to be asked again. Each series is read whole
+/// within one part: what it holds as of that part.
+pub enum Lease<'a> {
+    Held(&'a Store),
+    Shared { store: &'a std::sync::RwLock<Store>, generation: u64, waited_ns: std::sync::atomic::AtomicU64 },
+}
+
+/// A part's hold of the store ([`Lease::hold`]).
+pub enum Hold<'a> {
+    Held(&'a Store),
+    Guard(std::sync::RwLockReadGuard<'a, Store>),
+}
+
+impl std::ops::Deref for Hold<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        match self {
+            Self::Held(s) => s,
+            Self::Guard(g) => g,
+        }
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        if matches!(self, Self::Guard(_)) {
+            HOLDING.with(|h| h.set(false));
+        }
+    }
+}
+
+thread_local! {
+    /// Whether this thread holds a part's hold: a part asked for within another would wait behind
+    /// a writer that waits for the first (the lock lets a waiting writer in before new readers),
+    /// for good, so it is refused.
+    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl<'a> Lease<'a> {
+    /// A lease of `store`, of its series as they are numbered now.
+    pub fn shared(store: &'a std::sync::RwLock<Store>) -> Self {
+        let generation = store.read().unwrap_or_else(std::sync::PoisonError::into_inner).generation();
+        Self::Shared { store, generation, waited_ns: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// The store, for a part: held for it alone, unless the caller holds it throughout.
+    pub(crate) fn hold(&self) -> Result<Hold<'_>, QueryError> {
+        match self {
+            Self::Held(s) => Ok(Hold::Held(s)),
+            Self::Shared { store, generation, waited_ns } => {
+                if HOLDING.with(|h| h.replace(true)) {
+                    return Err(QueryError::Invalid("a part of a query asked for the store within another".into()));
+                }
+                #[cfg(test)]
+                tests::before_hold();
+                let asked = std::time::Instant::now();
+                let g = store.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let g = Hold::Guard(g);
+                waited_ns.fetch_add(u64::try_from(asked.elapsed().as_nanos()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
+                if g.generation() != *generation {
+                    return Err(QueryError::Moved);
+                }
+                Ok(g)
+            }
+        }
+    }
+
+    /// How long its parts waited for the store, in all (ms).
+    pub fn waited_ms(&self) -> f64 {
+        match self {
+            Self::Held(_) => 0.0,
+            Self::Shared { waited_ns, .. } => waited_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        }
+    }
+}
+
+/// Times a shared query is asked again when the store's series are numbered anew as it reads,
+/// before the last asking holds the store throughout (so a query always ends: retention numbers
+/// them anew once a cutoff passes, minutes apart).
+const AGAIN: usize = 2;
 
 /// What to evaluate.
 #[derive(Debug, Clone)]
@@ -253,8 +343,71 @@ enum Value {
     Named(String, String),
 }
 
-/// Evaluates a query.
+/// Evaluates a query, its caller holding the store throughout.
 pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
+    eval_with(&Lease::Held(store), req)
+}
+
+/// Evaluates a query of a shared store, a part at a time ([`Lease`]): its answer, and how long it
+/// waited for the store in all (ms).
+pub fn eval_shared(store: &std::sync::RwLock<Store>, req: &Request<'_>) -> Result<(Answer, f64), QueryError> {
+    shared(store, |lease| eval_with(lease, req))
+}
+
+/// A store as queries are asked of it: one its caller holds throughout, or a shared one, each query
+/// read a part at a time ([`eval_shared`]).
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    Held(&'a Store),
+    Shared(&'a std::sync::RwLock<Store>),
+}
+
+impl<'a> From<&'a Store> for Source<'a> {
+    fn from(s: &'a Store) -> Self {
+        Self::Held(s)
+    }
+}
+
+impl<'a> From<&'a std::sync::RwLock<Store>> for Source<'a> {
+    fn from(s: &'a std::sync::RwLock<Store>) -> Self {
+        Self::Shared(s)
+    }
+}
+
+impl Source<'_> {
+    /// `req`'s answer ([`eval`]'s, or [`eval_shared`]'s).
+    pub fn ask(self, req: &Request<'_>) -> Result<Answer, QueryError> {
+        match self {
+            Self::Held(s) => eval(s, req),
+            Self::Shared(s) => eval_shared(s, req).map(|(a, _)| a),
+        }
+    }
+}
+
+/// `f` with a shared lease of `store`, asked again if the series are numbered anew as it reads
+/// ([`AGAIN`] times), then with the store held throughout.
+pub(crate) fn shared<T>(store: &std::sync::RwLock<Store>, f: impl Fn(&Lease<'_>) -> Result<T, QueryError>) -> Result<(T, f64), QueryError> {
+    let mut waited = 0.0;
+    for _ in 0..AGAIN {
+        let lease = Lease::shared(store);
+        let got = f(&lease);
+        waited += lease.waited_ms();
+        match got {
+            Err(QueryError::Moved) => {
+                #[cfg(test)]
+                tests::RESTARTS.with(|r| r.set(r.get() + 1));
+                continue;
+            }
+            got => return got.map(|a| (a, waited)),
+        }
+    }
+    let asked = std::time::Instant::now();
+    let s = store.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    waited += asked.elapsed().as_secs_f64() * 1000.0;
+    f(&Lease::Held(&s)).map(|a| (a, waited))
+}
+
+fn eval_with(lease: &Lease<'_>, req: &Request<'_>) -> Result<Answer, QueryError> {
     let ast = parse(req.query)?;
     if req.to <= req.from {
         return Err(QueryError::EmptyRange);
@@ -276,7 +429,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
             Node::Metric(q) => {
                 let g = at(ext.get(id).copied().unwrap_or(0));
                 let edges = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
-                Value::Set(metric(store, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned)?)
+                Value::Set(metric(lease, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned)?)
             }
             Node::Records(r) => {
                 let g = at(ext.get(id).copied().unwrap_or(0));
@@ -284,7 +437,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
                 if edges.is_some() {
                     return Err(QueryError::Invalid("a log, span or event query is read in even buckets: no calendar rollup or calendar shift of one".into()));
                 }
-                Value::Set(records(store, r, g, off, req.max_series, &mut scanned)?)
+                Value::Set(records(lease, r, g, off, req.max_series, &mut scanned)?)
             }
             Node::Neg(x) => match take(&mut values, *x)? {
                 Value::Scalar(a) => Value::Scalar(-a),
@@ -1078,12 +1231,12 @@ fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<(&'q str, Pa
 /// bound positive) to its upper; in the `+Inf` bucket, the highest finite bound. Within a bucket's
 /// width of the truth, as any reading of explicit buckets is.
 #[allow(clippy::too_many_arguments)]
-fn explicit_quantile(store: &Store, q: &MetricQuery, bucket: &str, grid: Grid, spans: Spans<'_>, p: f64, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+fn explicit_quantile(lease: &Lease<'_>, q: &MetricQuery, bucket: &str, grid: Grid, spans: Spans<'_>, p: f64, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     let NameMatch::Exact(name) = &q.metric else { return Ok(Vec::new()) };
     let mut by = q.by.clone();
     by.push("le".into());
     let part = MetricQuery { metric: NameMatch::Exact(format!("{name}{bucket}")), space: SpaceAgg::Sum, by, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, fill: None, ..q.clone() };
-    let per_le = metric(store, &part, grid, spans, max_series.saturating_mul(64), scratch, scanned)?;
+    let per_le = metric(lease, &part, grid, spans, max_series.saturating_mul(64), scratch, scanned)?;
     // Each group (its tags but `le`): its bounds and their counts in each bucket of time.
     let mut groups: std::collections::BTreeMap<Vec<(String, String)>, Vec<(f64, Vec<f64>)>> = std::collections::BTreeMap::new();
     for s in per_le {
@@ -1140,15 +1293,15 @@ fn buckets_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
 /// read as `crate::dist::Merged` reads them; `avg` its sums over its counts; `sum`, `count`, `min`
 /// and `max` its own of those, each a bucket's total.
 #[allow(clippy::too_many_arguments)]
-fn distribution(store: &Store, q: &MetricQuery, parts: Parts, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+fn distribution(lease: &Lease<'_>, q: &MetricQuery, parts: Parts, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     let NameMatch::Exact(name) = &q.metric else { return Ok(Vec::new()) };
     let part = |suffix: &str, space: SpaceAgg| MetricQuery { metric: NameMatch::Exact(format!("{name}{suffix}")), space, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, ..q.clone() };
     let p = match q.space {
         SpaceAgg::Pct(p) => p,
-        SpaceAgg::CountWhere(t, x) => return threshold_counts(store, q, name, t, x, grid, spans, max_series, scratch, scanned),
+        SpaceAgg::CountWhere(t, x) => return threshold_counts(lease, q, name, t, x, grid, spans, max_series, scratch, scanned),
         SpaceAgg::Avg => {
-            let sums = metric(store, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
-            let counts = metric(store, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
+            let sums = metric(lease, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
+            let counts = metric(lease, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
             return Ok(sums
                 .into_iter()
                 .filter_map(|mut s| {
@@ -1160,46 +1313,25 @@ fn distribution(store: &Store, q: &MetricQuery, parts: Parts, grid: Grid, spans:
                 })
                 .collect());
         }
-        SpaceAgg::Sum => return metric(store, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
-        SpaceAgg::Count => return metric(store, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Sum => return metric(lease, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Count => return metric(lease, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
         // Prometheus's histogram keeps no least or most: none to read.
-        SpaceAgg::Min => return parts.min.map_or(Ok(Vec::new()), |min| metric(store, &MetricQuery { mode: None, ..part(min, SpaceAgg::Min) }, grid, spans, max_series, scratch, scanned)),
-        SpaceAgg::Max => return parts.max.map_or(Ok(Vec::new()), |max| metric(store, &MetricQuery { mode: None, ..part(max, SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned)),
+        SpaceAgg::Min => return parts.min.map_or(Ok(Vec::new()), |min| metric(lease, &MetricQuery { mode: None, ..part(min, SpaceAgg::Min) }, grid, spans, max_series, scratch, scanned)),
+        SpaceAgg::Max => return parts.max.map_or(Ok(Vec::new()), |max| metric(lease, &MetricQuery { mode: None, ..part(max, SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned)),
     };
-    let mut ids = Vec::new();
-    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
-    if ids.is_empty() {
+    // Found under a hold let go before the reading (and before an explicit histogram's).
+    let groups = bucket_groups(&*lease.hold()?, q, name, max_series)?;
+    let Some(groups) = groups else {
         // No exponential buckets: an explicit histogram's, if it has them.
-        return explicit_quantile(store, q, parts.bucket, grid, spans, p, max_series, scratch, scanned);
-    }
-    // In the order of the series' fingerprints, the same on every replica: each group's buckets
-    // summed in one order everywhere.
-    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
-    // Groups by the query's tags' values, each its buckets' series: (id, scale, bucket). The key
-    // built in one buffer, copied only for a new group.
-    let mut groups: std::collections::BTreeMap<Vec<&str>, Vec<(u32, i32, crate::dist::Bucket)>> = std::collections::BTreeMap::new();
-    let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
-    for &id in &ids {
-        let Some(s) = store.series(id) else { continue };
-        let Some((scale, b)) = s.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value) else { continue };
-        key.clear();
-        key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
-        if let Some(members) = groups.get_mut(key.as_slice()) {
-            members.push((id, scale, b));
-            continue;
-        }
-        if groups.len() >= max_series {
-            return Err(QueryError::TooManySeries(groups.len() + 1, max_series));
-        }
-        groups.insert(key.clone(), vec![(id, scale, b)]);
-    }
+        return explicit_quantile(lease, q, parts.bucket, grid, spans, p, max_series, scratch, scanned);
+    };
     let mut out = Vec::with_capacity(groups.len());
     let mut table = DistTable::default();
     let mut totals = vec![0.0; grid.n];
     let q01 = (p / 100.0).clamp(0.0, 1.0);
     for (values, members) in groups {
-        let scale = dist_counts(store, q, grid, spans, &members, scratch, scanned, &mut table)?;
-        let tags = q.by.iter().zip(values).map(|(k, v)| (k.clone(), v.to_owned())).collect();
+        let scale = dist_counts(lease, q, grid, spans, &members, scratch, scanned, &mut table)?;
+        let tags = q.by.iter().cloned().zip(values).collect();
         // Each bucket of time: the rank's bucket, DDSketch's way (`crate::dist::Merged::quantile`).
         totals.fill(0.0);
         for &row in &table.sorted {
@@ -1241,7 +1373,7 @@ fn distribution(store: &Store, q: &MetricQuery, parts: Parts, grid: Grid, spans:
 /// none where the group has no value, and `.as_rate()` a count a second.
 #[allow(clippy::too_many_arguments)]
 fn threshold_counts(
-    store: &Store,
+    lease: &Lease<'_>,
     q: &MetricQuery,
     name: &str,
     t: Threshold,
@@ -1252,35 +1384,17 @@ fn threshold_counts(
     scratch: &mut Scratch,
     scanned: &mut (u64, u64),
 ) -> Result<Vec<Series>, QueryError> {
-    let mut ids = Vec::new();
-    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
-    if ids.is_empty() {
+    let groups = bucket_groups(&*lease.hold()?, q, name, max_series)?;
+    let Some(groups) = groups else {
         return Err(QueryError::Invalid(format!("count(v: …) reads a distribution's values: {name} keeps none (a distribution with percentiles keeps them)")));
-    }
-    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
-    let mut groups: std::collections::BTreeMap<Vec<&str>, Vec<(u32, i32, crate::dist::Bucket)>> = std::collections::BTreeMap::new();
-    let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
-    for &id in &ids {
-        let Some(s) = store.series(id) else { continue };
-        let Some((scale, b)) = s.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value) else { continue };
-        key.clear();
-        key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
-        if let Some(members) = groups.get_mut(key.as_slice()) {
-            members.push((id, scale, b));
-            continue;
-        }
-        if groups.len() >= max_series {
-            return Err(QueryError::TooManySeries(groups.len() + 1, max_series));
-        }
-        groups.insert(key.clone(), vec![(id, scale, b)]);
-    }
+    };
     let rate = q.mode == Some(CountMode::Rate);
     let mut table = DistTable::default();
     let mut totals = vec![0.0; grid.n];
     let mut out = Vec::with_capacity(groups.len());
     for (values, members) in groups {
-        let scale = dist_counts(store, q, grid, spans, &members, scratch, scanned, &mut table)?;
-        let tags = q.by.iter().zip(values).map(|(k, v)| (k.clone(), v.to_owned())).collect();
+        let scale = dist_counts(lease, q, grid, spans, &members, scratch, scanned, &mut table)?;
+        let tags = q.by.iter().cloned().zip(values).collect();
         totals.fill(0.0);
         let mut passed = vec![0.0; grid.n];
         for &row in &table.sorted {
@@ -1410,7 +1524,7 @@ impl DistTable {
 /// A distribution's buckets in a bucket of time each, into `table`: `members`' (series id, scale,
 /// bucket), each made the coarsest scale's among them, their counts summed; the scale.
 #[allow(clippy::too_many_arguments)]
-fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, members: &[(u32, i32, crate::dist::Bucket)], scratch: &mut Scratch, scanned: &mut (u64, u64), table: &mut DistTable) -> Result<i32, QueryError> {
+fn dist_counts(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, members: &[(u32, i32, crate::dist::Bucket)], scratch: &mut Scratch, scanned: &mut (u64, u64), table: &mut DistTable) -> Result<i32, QueryError> {
     let counted = MetricQuery { mode: Some(CountMode::Count), rollup: Some((Some(Rollup::Sum), None)), calendar: None, weighted: false, fill: None, ..q.clone() };
     let (from, end) = (spans.start(0), spans.start(grid.n));
     let scale = members.iter().map(|m| m.1).min().unwrap_or(crate::dist::SCALE);
@@ -1420,7 +1534,14 @@ fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, mem
     each.resize(grid.n, f64::NAN);
     let tier = tier_for(spans);
     let (mut rolled, mut window_n) = (rolled_for(tier, from, end, &counted), Vec::new());
-    for &(id, at, b) in members {
+    let mut held: Option<Hold<'_>> = None;
+    for (i, &(id, at, b)) in members.iter().enumerate() {
+        // A hold a round of series.
+        if i % ROUND == 0 {
+            drop(held.take());
+            held = Some(lease.hold()?);
+        }
+        let Some(store) = held.as_deref() else { break };
         let Some(s) = store.series(id) else { continue };
         ts.clear();
         vs.clear();
@@ -1446,9 +1567,42 @@ fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, mem
             table.add(row, &each);
         }
     }
+    drop(held);
     (table.ts, table.vs, table.each) = (ts, vs, each);
     table.sort();
     Ok(scale)
+}
+
+/// A distribution's buckets' series (`<name>.dist`) found under one hold of the store, grouped by
+/// the query's tags' values, in their order: each group its tags' values and its members (series
+/// id, scale, bucket), in the series' fingerprints' order (the same on every replica: each group's
+/// buckets summed in one order everywhere). None when it keeps no buckets.
+fn bucket_groups(store: &Store, q: &MetricQuery, name: &str, max_series: usize) -> Result<Option<Vec<(Vec<String>, Vec<(u32, i32, crate::dist::Bucket)>)>>, QueryError> {
+    let mut ids = Vec::new();
+    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
+    // The key built in one buffer, copied only for a new group.
+    let mut groups: std::collections::BTreeMap<Vec<&str>, Vec<(u32, i32, crate::dist::Bucket)>> = std::collections::BTreeMap::new();
+    let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
+    for &id in &ids {
+        let Some(s) = store.series(id) else { continue };
+        let Some((scale, b)) = s.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value) else { continue };
+        key.clear();
+        key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
+        if let Some(members) = groups.get_mut(key.as_slice()) {
+            members.push((id, scale, b));
+            continue;
+        }
+        if groups.len() >= max_series {
+            return Err(QueryError::TooManySeries(groups.len() + 1, max_series));
+        }
+        groups.insert(key.clone(), vec![(id, scale, b)]);
+    }
+    // Owned, for the reading that follows with the store let go.
+    Ok(Some(groups.into_iter().map(|(k, m)| (k.into_iter().map(str::to_owned).collect(), m)).collect()))
 }
 
 /// A heatmap of a query (`docs/observe.md` §6): each bucket of time, how many values fell in each
@@ -1469,25 +1623,47 @@ pub struct Heatmap {
 /// The most rows a heatmap has: a chart's height in pixels' worth, a few to a row.
 pub const HEATMAP_ROWS: usize = 120;
 
+/// A heatmap of a query, its caller holding the store throughout.
 pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap, QueryError> {
+    heatmap_with(&Lease::Held(store), req, rows)
+}
+
+/// [`heatmap`] of a shared store, a part at a time ([`Lease`]): it, and how long it waited for the
+/// store in all (ms).
+pub fn heatmap_shared(store: &std::sync::RwLock<Store>, req: &Request<'_>, rows: usize) -> Result<(Heatmap, f64), QueryError> {
+    shared(store, |lease| heatmap_with(lease, req, rows))
+}
+
+fn heatmap_with(lease: &Lease<'_>, req: &Request<'_>, rows: usize) -> Result<Heatmap, QueryError> {
     let rows = rows.clamp(1, HEATMAP_ROWS);
     let ast = parse(req.query)?;
     if req.to <= req.from {
         return Err(QueryError::EmptyRange);
     }
-    if let Some(Node::Metric(q)) = ast.nodes.get(ast.root)
-        && buckets_of(store, q).is_some()
-        && let NameMatch::Exact(name) = &q.metric
-    {
+    // A distribution's buckets' series, found under one hold; read after, a round at a time.
+    let buckets = match ast.nodes.get(ast.root) {
+        Some(Node::Metric(q)) => {
+            let store = lease.hold()?;
+            match &q.metric {
+                NameMatch::Exact(name) if buckets_of(&store, q).is_some() => {
+                    let mut ids = Vec::new();
+                    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
+                    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
+                    let members: Vec<(u32, i32, crate::dist::Bucket)> =
+                        ids.iter().filter_map(|&id| store.series(id)?.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value).map(|(s, b)| (id, s, b))).collect();
+                    Some((q, members))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some((q, members)) = buckets {
         let grid = grid_for(&ast, req)?;
         let edges = grid.edges(0);
         let spans = Spans::new(grid, 0, edges.as_deref());
-        let mut ids = Vec::new();
-        store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
-        ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
-        let members: Vec<(u32, i32, crate::dist::Bucket)> = ids.iter().filter_map(|&id| store.series(id)?.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value).map(|(s, b)| (id, s, b))).collect();
         let (mut table, mut coarser) = (DistTable::default(), DistTable::default());
-        let mut scale = dist_counts(store, q, grid, spans, &members, &mut Scratch::default(), &mut (0, 0), &mut table)?;
+        let mut scale = dist_counts(lease, q, grid, spans, &members, &mut Scratch::default(), &mut (0, 0), &mut table)?;
         // Coarser until the rows fit: each step halves the buckets of each sign, exactly.
         while table.buckets.len() > rows && scale > crate::dist::MIN_SCALE {
             scale -= 1;
@@ -1503,7 +1679,7 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
         let counts = (0..grid.n).map(|t| table.sorted.iter().map(|&r| table.counts(r).get(t).copied().unwrap_or(0.0)).collect()).collect();
         return Ok(Heatmap { grid, rows, counts, distribution: true });
     }
-    let a = eval(store, req)?;
+    let a = eval_with(lease, req)?;
     let finite = a.series.iter().flat_map(|s| s.values.iter().copied()).filter(|v| v.is_finite());
     let (lo, hi) = finite.fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| (l.min(v), h.max(v)));
     if lo > hi {
@@ -1533,16 +1709,17 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
 /// values). A count's bucket nothing fell in is 0, as a count of nothing is, and a count by nothing
 /// of nothing is one series of 0; another measure's is none. A shift by a part of the step reads
 /// the buckets it falls in (the store's buckets are the step's own).
-fn records(store: &Store, r: &RecordQuery, grid: Grid, off: i64, max_series: usize, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+fn records(lease: &Lease<'_>, r: &RecordQuery, grid: Grid, off: i64, max_series: usize, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     const NS: i64 = 1_000_000;
     let step = grid.step.max(1);
     let (from, to) = (grid.from.saturating_add(off), grid.time(grid.n).saturating_add(off));
     let (from_ns, to_ns, step_ns) = (from.saturating_mul(NS), to.saturating_mul(NS).saturating_sub(1), step.saturating_mul(NS));
-    let found = match r.of {
-        RecordSource::Spans => store.aggregate_spans_buckets(&r.search, from_ns, to_ns, step_ns, &r.by, &r.measure),
-        RecordSource::Logs | RecordSource::Events => store.aggregate_logs_buckets(&r.search, from_ns, to_ns, step_ns, &r.by, &r.measure),
-    }
-    .map_err(|e| QueryError::Invalid(e.to_string()))?;
+    // The records as they are, read with the store let go (`Store::logs_at`).
+    let at = {
+        let s = lease.hold()?;
+        if r.of == RecordSource::Spans { s.spans_at() } else { s.logs_at() }
+    };
+    let found = at.aggregate_buckets(&r.search, from_ns, to_ns, step_ns, &r.by, &r.measure).map_err(|e| QueryError::Invalid(e.to_string()))?;
     scanned.1 = scanned.1.saturating_add(found.rows_scanned);
     if found.groups.len() > max_series {
         return Err(QueryError::TooManySeries(found.groups.len(), max_series));
@@ -1571,48 +1748,54 @@ fn records(store: &Store, r: &RecordQuery, grid: Grid, off: i64, max_series: usi
 }
 
 /// A metric query's series on the grid.
-fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
-    if let Some((_, parts)) = distribution_of(store, q) {
-        return distribution(store, q, parts, grid, spans, max_series, scratch, scanned);
+fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+    let dist = distribution_of(&*lease.hold()?, q);
+    if let Some((_, parts)) = dist {
+        return distribution(lease, q, parts, grid, spans, max_series, scratch, scanned);
     }
     if let SpaceAgg::CountWhere(..) = q.space {
         let (NameMatch::Exact(name) | NameMatch::Glob(name)) = &q.metric;
         return Err(QueryError::Invalid(format!("count(v: …) reads a distribution's values: {name} is none")));
     }
-    let mut ids = Vec::new();
-    store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
-    // In the order of the series' fingerprints, the same on every replica (ids are each one's
-    // own), so a group's values are summed in one order everywhere: floating-point addition does
-    // not associate, and every replica answers to the bit.
-    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
-    // Groups: by-tag values → index; the key built in one buffer, copied only for a new group.
-    let mut groups: HashMap<Vec<&str>, usize> = HashMap::new();
-    let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
-    let mut group_tags: Vec<Vec<(String, String)>> = Vec::new();
-    let mut acc: Vec<Acc> = Vec::new();
-    let mut group_of: Vec<usize> = Vec::with_capacity(ids.len());
-    for &id in &ids {
-        let Some(s) = store.series(id) else {
-            group_of.push(usize::MAX);
-            continue;
-        };
-        key.clear();
-        key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
-        let g = match groups.get(&key) {
-            Some(&g) => g,
-            None => {
-                let g = acc.len();
-                if g >= max_series {
-                    return Err(QueryError::TooManySeries(g + 1, max_series));
+    // Its series and their groups, found under one hold; read after, a round at a time.
+    let (ids, group_of, group_tags, mut acc) = {
+        let store = lease.hold()?;
+        let mut ids = Vec::new();
+        store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
+        // In the order of the series' fingerprints, the same on every replica (ids are each one's
+        // own), so a group's values are summed in one order everywhere: floating-point addition
+        // does not associate, and every replica answers to the bit.
+        ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
+        // Groups: by-tag values → index; the key built in one buffer, copied only for a new group.
+        let mut groups: HashMap<Vec<&str>, usize> = HashMap::new();
+        let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
+        let mut group_tags: Vec<Vec<(String, String)>> = Vec::new();
+        let mut acc: Vec<Acc> = Vec::new();
+        let mut group_of: Vec<usize> = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            let Some(s) = store.series(id) else {
+                group_of.push(usize::MAX);
+                continue;
+            };
+            key.clear();
+            key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
+            let g = match groups.get(&key) {
+                Some(&g) => g,
+                None => {
+                    let g = acc.len();
+                    if g >= max_series {
+                        return Err(QueryError::TooManySeries(g + 1, max_series));
+                    }
+                    group_tags.push(q.by.iter().zip(&key).map(|(k, v)| (k.clone(), (*v).to_owned())).collect());
+                    acc.push(Acc::new(q.space, grid.n));
+                    groups.insert(key.clone(), g);
+                    g
                 }
-                group_tags.push(q.by.iter().zip(&key).map(|(k, v)| (k.clone(), (*v).to_owned())).collect());
-                acc.push(Acc::new(q.space, grid.n));
-                groups.insert(key.clone(), g);
-                g
-            }
-        };
-        group_of.push(g);
-    }
+            };
+            group_of.push(g);
+        }
+        (ids, group_of, group_tags, acc)
+    };
     let (from, end) = (spans.start(0), spans.start(grid.n));
     // A grid of whole windows of a tier is read window by window (`crate::rollup`): from rollups
     // where a block holds them.
@@ -1629,7 +1812,14 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
         intervals.reserve(ids.len());
         let (mut ts, mut vs) = (Vec::new(), Vec::new());
         let mut buckets = vec![f64::NAN; grid.n];
-        for (&id, &g) in ids.iter().zip(&group_of) {
+        let mut held: Option<Hold<'_>> = None;
+        for (i, (&id, &g)) in ids.iter().zip(&group_of).enumerate() {
+            // A hold a round of series.
+            if i % ROUND == 0 {
+                drop(held.take());
+                held = Some(lease.hold()?);
+            }
+            let Some(store) = held.as_deref() else { break };
             let Some(s) = store.series(id) else { continue };
             ts.clear();
             vs.clear();
@@ -1656,7 +1846,7 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
             }
         }
     } else {
-        let at = Reading { store, q, grid, spans, tier, from, end };
+        let at = Reading { lease, q, grid, spans, tier, from, end };
         let mut reader = Reader::new(&at, std::mem::take(scratch));
         let read = read_groups(&at, &ids, &group_of, &mut acc, &mut reader, scanned);
         *scratch = reader.scratch;
@@ -1689,10 +1879,11 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
     Ok(out)
 }
 
-/// What every series of a query is read at: its store, its query, its grid and the range read.
+/// What every series of a query is read at: its store (a part at a time: [`Lease`]), its query,
+/// its grid and the range read.
 #[derive(Clone, Copy)]
 struct Reading<'a> {
-    store: &'a Store,
+    lease: &'a Lease<'a>,
     q: &'a MetricQuery,
     grid: Grid,
     spans: Spans<'a>,
@@ -1717,9 +1908,9 @@ impl Reader {
     }
 
     /// Series `id`'s values on the grid, into `self.buckets`: the samples it read, or none if the
-    /// store holds no such series.
-    fn read(&mut self, at: &Reading<'_>, id: u32) -> Result<Option<u64>, QueryError> {
-        let Some(s) = at.store.series(id) else { return Ok(None) };
+    /// store holds no such series (`store`: the part's hold of it).
+    fn read(&mut self, at: &Reading<'_>, store: &Store, id: u32) -> Result<Option<u64>, QueryError> {
+        let Some(s) = store.series(id) else { return Ok(None) };
         self.ts.clear();
         self.vs.clear();
         // A counter's increase into the first bucket needs the sample before it.
@@ -1727,11 +1918,11 @@ impl Reader {
         if let Some(width) = at.tier {
             self.rolled.clear();
             let roll = Roll { width, from: at.from, to: at.end, kind: s.kind(), cols: columns_for(s.kind(), at.q) };
-            at.store.read_rolled(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &roll, &mut self.scratch, &mut self.ts, &mut self.vs, &mut self.rolled)?;
+            store.read_rolled(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &roll, &mut self.scratch, &mut self.ts, &mut self.vs, &mut self.rolled)?;
             rollup_windows(s.kind(), at.q, at.spans, width, &self.ts, &self.vs, &self.rolled, &mut self.buckets, &mut self.window_n);
             Ok(Some(self.ts.len() as u64 + self.rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>()))
         } else {
-            at.store.read_with(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &mut self.scratch, &mut self.ts, &mut self.vs)?;
+            store.read_with(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &mut self.scratch, &mut self.ts, &mut self.vs)?;
             rollup(s.kind(), at.q, at.spans, &self.ts, &self.vs, &mut self.buckets, None);
             Ok(Some(self.ts.len() as u64))
         }
@@ -1743,7 +1934,7 @@ impl Reader {
 const ALONE: std::time::Duration = std::time::Duration::from_millis(2);
 /// Series a thread reads a round, at the most, before what was read is added in: what a round of
 /// many threads holds is bounded (`grid.n` values a series).
-const ROUND: usize = 64;
+pub(crate) const ROUND: usize = 64;
 
 /// Helper threads queries may read on beside their own, shared by every query at once: how many
 /// at the most, and how many are taken.
@@ -1863,6 +2054,7 @@ fn read_groups(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [Acc
     let started = std::time::Instant::now();
     let forced = forced_threads();
     let mut asked = false;
+    let mut held: Option<Hold<'_>> = None;
     let mut i = 0;
     while i < ids.len() {
         let left = ids.len() - i;
@@ -1874,11 +2066,19 @@ fn read_groups(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [Acc
             };
             if helpers.0 > 0 {
                 let (Some(rest), Some(groups)) = (ids.get(i..), group_of.get(i..)) else { break };
+                // Each part takes a hold of its own.
+                drop(held);
                 return read_together(at, rest, groups, acc, reader, scanned, helpers.0 + 1);
             }
         }
+        // A hold a round of series, so a write waits for one round at the most.
+        if i % ROUND == 0 {
+            drop(held.take());
+            held = Some(at.lease.hold()?);
+        }
+        let Some(store) = held.as_deref() else { break };
         let (Some(&id), Some(&g)) = (ids.get(i), group_of.get(i)) else { break };
-        if let Some(samples) = reader.read(at, id)? {
+        if let Some(samples) = reader.read(at, store, id)? {
             scanned.0 += 1;
             scanned.1 += samples;
             if let Some(a) = acc.get_mut(g) {
@@ -1905,8 +2105,10 @@ fn read_part(r: &mut Reader, at: &Reading<'_>, ids: &[u32], part: &mut Part) -> 
     part.values.clear();
     part.there.clear();
     part.samples = 0;
+    // A part's series (a round's share, `ROUND` at the most) under one hold of the store.
+    let store = at.lease.hold()?;
     for &id in ids {
-        match r.read(at, id)? {
+        match r.read(at, &store, id)? {
             Some(k) => {
                 part.samples += k;
                 part.values.extend_from_slice(&r.buckets);
@@ -2937,6 +3139,257 @@ mod tests {
             0 => None,
             n => Some(n),
         }
+    }
+
+    thread_local! {
+        /// A test's: what runs before each part of a shared query on this thread takes its hold
+        /// (the store let go), told how many such parts came before it.
+        static BEFORE_HOLD: std::cell::RefCell<Option<(usize, Box<dyn FnMut(usize)>)>> = const { std::cell::RefCell::new(None) };
+        /// Shared queries this thread asked again, their series numbered anew as they read.
+        pub(super) static RESTARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn before_hold() {
+        BEFORE_HOLD.with(|b| {
+            if let Some((n, f)) = b.borrow_mut().as_mut() {
+                f(*n);
+                *n += 1;
+            }
+        });
+    }
+
+    fn on_hold(f: impl FnMut(usize) + 'static) {
+        BEFORE_HOLD.with(|b| *b.borrow_mut() = Some((0, Box::new(f))));
+    }
+
+    fn off_hold() {
+        BEFORE_HOLD.with(|b| *b.borrow_mut() = None);
+    }
+
+    /// An answer as bits: each series' tags and values, the scalar, what was read.
+    fn bits(a: &Answer) -> (Vec<(Vec<(String, String)>, Vec<u64>)>, Option<u64>, (u64, u64)) {
+        (a.series.iter().map(|s| (s.tags.clone(), s.values.iter().map(|v| v.to_bits()).collect())).collect(), a.scalar.map(f64::to_bits), (a.scanned_series, a.scanned_samples))
+    }
+
+    /// Series `s:i` of `m`, each its value `i`, its newest sample `i` ms past the others' newest: a
+    /// cutoff of 49,000 + k ms drops those below `k`, and numbers the rest anew.
+    fn numbered(n: u32) -> Store {
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        for i in 0..n {
+            let k = SeriesKey::new("m", [("s", i.to_string().as_str())], Kind::Gauge).unwrap();
+            b.define(&k);
+            b.run(k.fp, (0..50i64).map(|j| (j * 1_000 + if j == 49 { i64::from(i) } else { 0 }, f64::from(i))));
+        }
+        s.apply(&b.finish()).unwrap();
+        s
+    }
+
+    /// `sum:m{*} by {s}`'s groups, by `i`, each its one value.
+    fn by_number(a: &Answer) -> Vec<(u32, f64)> {
+        let mut got: Vec<(u32, f64)> = a.series.iter().map(|s| (s.tags[0].1.parse().unwrap(), s.values[0])).collect();
+        got.sort_by_key(|x| x.0);
+        got
+    }
+
+    /// Every kind of query read a part at a time (`eval_shared`: its series found under one hold,
+    /// then read a round at a time, each round under a hold of its own) answers as one held
+    /// throughout, to the bit, read on one thread and on several: gauges, counts and counters (a
+    /// rate, a rollup), weighted, a percentile across series, a distribution's percentile, mean,
+    /// count and threshold count, logs in a formula with a metric, and a heatmap of each kind.
+    #[test]
+    fn a_query_read_a_part_at_a_time_answers_as_one_held_throughout() {
+        use crate::logs::record::Record;
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut rng = crate::testkit::Rng::new(31);
+        let mut b = Builder::new();
+        for i in 0..400u32 {
+            let host = format!("h{}", i % 5);
+            let kind = [Kind::Gauge, Kind::Count, Kind::Counter][i as usize % 3];
+            let k = SeriesKey::new(["a", "b", "c"][i as usize % 3], [("host", host.as_str()), ("s", i.to_string().as_str())], kind).unwrap();
+            b.define(&k);
+            let mut c = 0.0;
+            let mut pts = Vec::new();
+            for j in 0..300i64 {
+                if rng.below(9) == 0 {
+                    continue;
+                }
+                c += rng.f64() * 100.0;
+                pts.push((j * 12_000, if kind == Kind::Counter { c } else { rng.f64() * 10f64.powi(rng.below(9) as i32) }));
+            }
+            b.run(k.fp, pts);
+        }
+        for host in ["h0", "h1", "h2"] {
+            let points: Vec<(i64, Vec<f64>)> = (0..60).map(|m| (m * 60_000 + 5_000, (0..20).map(|_| (rng.f64() * 6.0).exp()).collect())).collect();
+            for (key, pts) in crate::dist::series_of("lat", &[("host", host)], &points).unwrap() {
+                b.define(&key);
+                b.run(key.fp, pts);
+            }
+        }
+        let logs: Vec<Record> = (0..600i64)
+            .map(|i| Record {
+                ts: (i * 6_000 + 1_000) * 1_000_000,
+                severity: if i % 7 == 0 { 17 } else { 9 },
+                service: ["web", "api"][(i % 2) as usize].into(),
+                host: "a".into(),
+                source: "app".into(),
+                message: format!("request {i}"),
+                ..Record::default()
+            })
+            .collect();
+        b.logs(&logs);
+        s.apply(&b.finish()).unwrap();
+        let lock = std::sync::RwLock::new(s);
+        let queries = [
+            ("sum:a{*} by {host}", 60_000),
+            ("avg:a{*}", 60_000),
+            ("avg:a{*} by {host}.weighted()", 60_000),
+            ("sum:b{*} by {host}.as_count()", 60_000),
+            ("sum:c{*} by {host}.as_rate()", 60_000),
+            ("max:a{*} by {host}", 60_000),
+            ("p90:a{*}", 60_000),
+            ("sum:a{*} by {host}.rollup(sum, 300)", 300_000),
+            ("p99:lat{*} by {host}", 60_000),
+            ("avg:lat{*}", 60_000),
+            ("count:lat{*} by {host}", 60_000),
+            ("count(v: v>=50):lat{*} by {host}", 60_000),
+            (r#"100 * logs("status:error") / logs("*")"#, 60_000),
+            (r#"sum:b{*}.as_count() / logs("service:web")"#, 60_000),
+        ];
+        for threads in [1usize, 3] {
+            THREADS.store(threads, std::sync::atomic::Ordering::SeqCst);
+            for (q, step) in queries {
+                let mut r = Request::new(q, 0, 3_600_000);
+                r.step = Some(step);
+                let held = eval(&lock.read().unwrap(), &r).unwrap();
+                let (apart, _) = eval_shared(&lock, &r).unwrap();
+                assert!(!held.series.is_empty(), "{q}: nothing to compare");
+                assert_eq!(bits(&apart), bits(&held), "{q} on {threads} threads");
+            }
+            for q in ["avg:lat{*}", "avg:a{*} by {host}"] {
+                let mut r = Request::new(q, 0, 3_600_000);
+                r.step = Some(60_000);
+                let held = heatmap(&lock.read().unwrap(), &r, 20).unwrap();
+                let (apart, _) = heatmap_shared(&lock, &r, 20).unwrap();
+                assert!(!held.rows.is_empty(), "{q}: an empty heatmap");
+                assert_eq!(apart, held, "{q}'s heatmap on {threads} threads");
+            }
+        }
+        THREADS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A query whose series are numbered anew between its parts (retention dropping some: their ids
+    /// are others' after) is read again from the start, once, and answers of the new numbering, as
+    /// one held after the change does: never a series' values under another's name.
+    #[test]
+    fn a_query_whose_series_are_numbered_anew_between_its_parts_answers_of_the_new_numbering() {
+        let store = std::sync::Arc::new(std::sync::RwLock::new(numbered(300)));
+        let mut r = Request::new("sum:m{*} by {s}", 0, 60_000);
+        r.step = Some(60_000);
+        assert_eq!(by_number(&eval_shared(&store, &r).unwrap().0), (0..300).map(|i| (i, f64::from(i))).collect::<Vec<_>>());
+        // Before this thread's third part (its first round of reading, the series found): the
+        // cutoff passes the first hundred.
+        let s2 = store.clone();
+        on_hold(move |part| {
+            if part == 2 {
+                s2.write().unwrap().retain_logical(49_100, 0);
+            }
+        });
+        let restarts = RESTARTS.with(std::cell::Cell::get);
+        let (a, _) = eval_shared(&store, &r).unwrap();
+        off_hold();
+        assert_eq!(RESTARTS.with(std::cell::Cell::get) - restarts, 1, "asked again, once");
+        assert_eq!(by_number(&a), (100..300).map(|i| (i, f64::from(i))).collect::<Vec<_>>());
+        assert_eq!(bits(&a), bits(&eval(&store.read().unwrap(), &r).unwrap()));
+    }
+
+    /// Queries read a part at a time while retention numbers their series anew over and over (a
+    /// cutoff passing a series at a time, 299 times): each answer is of one numbering, every series
+    /// it holds its own value and every one the cutoff then kept there; never a series' values
+    /// under another's name, none missing.
+    #[test]
+    fn queries_read_beside_retention_answer_each_of_one_numbering() {
+        let store = std::sync::RwLock::new(numbered(600));
+        let mut r = Request::new("sum:m{*} by {s}", 0, 60_000);
+        r.step = Some(60_000);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let answered = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut n = 0u32;
+                loop {
+                    let got = by_number(&eval_shared(&store, &r).unwrap().0);
+                    let from = got.first().map_or(600, |x| x.0);
+                    assert_eq!(got, (from..600).map(|i| (i, f64::from(i))).collect::<Vec<_>>(), "of one numbering");
+                    n += 1;
+                    if done.load(std::sync::atomic::Ordering::SeqCst) {
+                        return n;
+                    }
+                }
+            });
+            for k in 1..300i64 {
+                store.write().unwrap().retain_logical(49_000 + k, 0);
+                std::thread::sleep(std::time::Duration::from_micros(300));
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            reader.join().unwrap()
+        });
+        assert!(answered > 1, "{answered} answers");
+    }
+
+    /// A write waits for a part of a query read a part at a time, never for all of it: beside a
+    /// query of 2,000 series read over and over, held throughout a write waits for what is left of
+    /// the query (half of it, at the median); read a part at a time, for what is left of a round,
+    /// a third of that at the most at the median and half at the 90th percentile, the machine as it
+    /// is for both (alike loaded, alike measured).
+    #[test]
+    fn a_write_waits_for_a_part_of_a_query_not_for_all_of_it() {
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        for i in 0..2_000u32 {
+            let k = SeriesKey::new("w", [("host", format!("h{}", i % 10).as_str()), ("s", i.to_string().as_str())], Kind::Gauge).unwrap();
+            b.define(&k);
+            b.run(k.fp, (0..300i64).map(|j| (j * 10_000, f64::from(i) + j as f64)));
+        }
+        s.apply(&b.finish()).unwrap();
+        let store = std::sync::RwLock::new(s);
+        let mut r = Request::new("sum:w{*} by {host}", 0, 3_000_000);
+        r.step = Some(60_000);
+        let t = std::time::Instant::now();
+        eval_shared(&store, &r).unwrap();
+        let alone = t.elapsed();
+        let waits = |apart: bool| -> Vec<std::time::Duration> {
+            let done = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                        if apart {
+                            eval_shared(&store, &r).unwrap();
+                        } else {
+                            eval(&store.read().unwrap(), &r).unwrap();
+                        }
+                    }
+                });
+                let mut w = Vec::new();
+                for _ in 0..80 {
+                    std::thread::sleep(alone / 10);
+                    let t = std::time::Instant::now();
+                    drop(store.write().unwrap());
+                    w.push(t.elapsed());
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                w.sort();
+                w
+            })
+        };
+        let (apart, held) = (waits(true), waits(false));
+        let at = |w: &[std::time::Duration], pct: usize| w[w.len() * pct / 100];
+        assert!(
+            at(&apart, 50) * 3 < at(&held, 50),
+            "a write waited {:?} at the median beside a query read a part at a time, {:?} beside it held (the query alone: {alone:?})",
+            at(&apart, 50),
+            at(&held, 50)
+        );
+        assert!(at(&apart, 90) * 2 < at(&held, 90), "a write waited {:?} at p90 beside a query read a part at a time, {:?} beside it held (the query alone: {alone:?})", at(&apart, 90), at(&held, 90));
     }
 
     /// Queries over many series read on one thread and on several (as many as a round holds, and

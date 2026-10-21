@@ -92,8 +92,9 @@ impl SloDef {
 }
 
 /// An SLO's standing as the API shows it: its SLI, the budget left, the state; and the burn rates
-/// of the workbook's windows and, with `days`, each day's.
-pub fn standing(store: &kiln_obs::store::Store, def: &SloDef, now: i64, days: bool) -> Value {
+/// of the workbook's windows and, with `days`, each day's. Of a store held throughout, or of a
+/// shared one, each query read a part at a time (`kiln_obs::query::eval::Source`).
+pub fn standing(store: kiln_obs::query::eval::Source<'_>, def: &SloDef, now: i64, days: bool) -> Value {
     let slo = match def.slo() {
         Ok(s) => s,
         Err(e) => return json!({ "state": "INVALID", "error": e }),

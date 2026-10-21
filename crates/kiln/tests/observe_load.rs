@@ -1650,15 +1650,19 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
             (posted, errors)
         })
     };
-    // A dashboard: one series and every host, over the last 15 minutes, every 2 s.
-    let reader = {
-        let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
-        std::thread::spawn(move || -> (Vec<Read>, Vec<String>) {
-            let (mut took, mut errors) = (Vec::new(), Vec::new());
-            let mut conn = Conn::new(port);
-            while !stop.load(Ordering::Relaxed) {
-                let now = common::now_ms();
-                for (which, q) in ["avg:load.v{host:load-0,s:7}", "sum:load.v{*} by {host}"].into_iter().enumerate() {
+    // A dashboard watched by two at once: one series, and every host, each over the last 15
+    // minutes every 2 s, on a connection of its own (so the one-series query can come while the
+    // wide one reads: what one waits for the other, the store's hold, is seen).
+    let readers: Vec<_> = ["avg:load.v{host:load-0,s:7}", "sum:load.v{*} by {host}"]
+        .into_iter()
+        .enumerate()
+        .map(|(which, q)| {
+            let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
+            std::thread::spawn(move || -> (Vec<Read>, Vec<String>) {
+                let (mut took, mut errors) = (Vec::new(), Vec::new());
+                let mut conn = Conn::new(port);
+                while !stop.load(Ordering::Relaxed) {
+                    let now = common::now_ms();
                     let body = serde_json::to_vec(&json!({ "query": q, "from": now - 900_000, "to": now })).unwrap_or_default();
                     let t = Instant::now();
                     match conn.send("/api/observe/v1/query", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &body) {
@@ -1670,12 +1674,12 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
                         Ok(a) => errors.push(format!("{q}: {}", a.code)),
                         Err(e) => errors.push(format!("{q}: {e}")),
                     }
+                    std::thread::sleep(Duration::from_secs(2));
                 }
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            (took, errors)
+                (took, errors)
+            })
         })
-    };
+        .collect();
     // A watchdog: the server asked twice a second, its health (nothing in the way) and observe's
     // status (through the API's authentication), each within 5 s; an answer slower than 2 s has the
     // server's every thread's stack saved (three times at the most): where a stall is.
@@ -1759,7 +1763,13 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
     to_server.sort_unstable();
     to_runner.sort_unstable();
     let (posted, log_errors) = logs.join().map_err(|_| anyhow::anyhow!("the log sender panicked"))?;
-    let (read, read_errors) = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))?;
+    let (mut read, mut read_errors) = (Vec::new(), Vec::new());
+    for r in readers {
+        let (took, errors) = r.join().map_err(|_| anyhow::anyhow!("a reader panicked"))?;
+        read.extend(took);
+        read_errors.extend(errors);
+    }
+    read.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
     let (mut health, mut status_us, slow) = watchdog.join().map_err(|_| anyhow::anyhow!("the watchdog panicked"))?;
     anyhow::ensure!(all.errors.is_empty() && log_errors.is_empty() && read_errors.is_empty(), "errors: {:?} {:?} {:?}\n{}", all.errors.iter().take(5).collect::<Vec<_>>(), log_errors.iter().take(5).collect::<Vec<_>>(), read_errors.iter().take(5).collect::<Vec<_>>(), f.logs());
     // Every point and record taken, stored once.
@@ -1811,6 +1821,9 @@ fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> any
             ms(med(|r| r.took_us)),
             slow.iter().rev().take(8).map(|r| r.at_s.round() as u64).collect::<Vec<_>>()
         );
+        let mut waited: Vec<u64> = mine.iter().map(|r| r.waited_us).collect();
+        waited.sort_unstable();
+        eprintln!("  {:<10} waited for the store p50 {:.2} ms, p99 {:.2} ms, most {:.2} ms ({} reads)", "", ms(pct(&waited, 0.5)), ms(pct(&waited, 0.99)), ms(pct(&waited, 1.0)), waited.len());
     }
     // The widest query's readings, from when it was asked to when it was answered (µs into the run).
     let mut wide: Vec<(u64, u64)> = read

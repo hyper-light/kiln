@@ -523,6 +523,14 @@ pub(super) async fn read_apart<T: Send + 'static, R: Send + 'static>(
     .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
 }
 
+/// Runs `f` on the blocking pool with the store not held: what it reads, it holds a part at a time
+/// itself (`eval::Source::Shared`), so no write waits for all of it, nor any reader behind that
+/// write.
+pub(super) async fn apart<R: Send + 'static>(f: impl FnOnce(&kiln_obs::machine::Shared) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
+    let store = shared()?;
+    crate::rt::blocking(move || f(&store)).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+}
+
 /// [`reading`], `f` told what it waited for.
 pub(super) async fn reading_waited<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store, Waited) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
     let asked = std::time::Instant::now();
@@ -589,7 +597,7 @@ fn summary_json(m: &kiln_obs::store::MetricSummary, rate: Option<f64>) -> Value 
 }
 
 /// An SLO as the API shows it: its definition and its standing (`days`: day by day too).
-fn slo_json(s: &kiln_obs::store::Store, d: &super::slos::SloDef, now: i64, days: bool) -> Value {
+fn slo_json(s: eval::Source<'_>, d: &super::slos::SloDef, now: i64, days: bool) -> Value {
     let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
         o.insert("standing".into(), super::slos::standing(s, d, now, days));
@@ -1273,9 +1281,9 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::GET, ["openapi.json"]) => Ok(srv::json(StatusCode::OK, &super::openapi::document(env!("CARGO_PKG_VERSION")))),
         (&Method::GET, ["slos"]) => {
             let list = slos()?.list();
-            reading(move |s| {
+            apart(move |store| {
                 let now = crate::util::now_ms();
-                let out: Vec<Value> = list.iter().map(|d| slo_json(s, d, now, false)).collect();
+                let out: Vec<Value> = list.iter().map(|d| slo_json(eval::Source::Shared(store), d, now, false)).collect();
                 Ok(srv::json(StatusCode::OK, &json!({ "slos": out })))
             })
             .await
@@ -1289,8 +1297,8 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::GET, ["slos", id]) => {
             let d = slos()?.get(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such SLO"))?;
             let alerts: Vec<Value> = monitors().map(|ms| ms.list().iter().filter(|m| reads_slo(m, &d.id)).map(|m| json!({ "id": m.id, "name": m.name, "query": m.query, "state": ms.overall(&m.id) })).collect()).unwrap_or_default();
-            reading(move |s| {
-                let mut v = slo_json(s, &d, crate::util::now_ms(), true);
+            apart(move |store| {
+                let mut v = slo_json(eval::Source::Shared(store), &d, crate::util::now_ms(), true);
                 if let Some(o) = v.as_object_mut() {
                     o.insert("alerts".into(), Value::from(alerts));
                 }
@@ -1406,15 +1414,14 @@ async fn check_status(body: CheckStatusBody) -> Result<Response, Fail> {
 
 async fn query(body: QueryBody) -> Result<Response, Fail> {
     // What a query waits for, said with what it took: a thread to read on, then the store (held by
-    // a write, or a cut).
+    // a write), in all: it reads a part at a time, each under a hold of its own (`eval::Lease`), so
+    // a write waits for one part of it at the most, and no reader for all of it.
     let asked = std::time::Instant::now();
     let store = shared()?;
     crate::rt::blocking(move || {
         let queued = asked.elapsed();
-        let s = store.read().unwrap_or_else(PoisonError::into_inner);
-        let waited = asked.elapsed() - queued;
-        let s = &*s;
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let applied = || store.read().unwrap_or_else(PoisonError::into_inner).applied();
         let started = std::time::Instant::now();
         let mut r = QueryRequest::new(&body.query, body.from, body.to);
         // A forecast() forecasts past its series' last point, to the range's end.
@@ -1427,21 +1434,21 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
             r.max_series = m.clamp(1, eval::DEFAULT_MAX_SERIES);
         }
         if let Some(rows) = body.heatmap {
-            let h = eval::heatmap(s, &r, rows).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let (h, waited) = eval::heatmap_shared(&store, &r, rows).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
             let rows: Vec<[f64; 2]> = h.rows.iter().map(|&(lo, hi)| [lo, hi]).collect();
             return Ok(srv::json(
                 StatusCode::OK,
                 &json!({
                     "grid": { "from": h.grid.from, "step": h.grid.step, "n": h.grid.n },
                     "heatmap": { "rows": rows, "counts": h.counts, "distribution": h.distribution },
-                    "applied": s.applied(),
-                    "took_ms": started.elapsed().as_secs_f64() * 1000.0,
+                    "applied": applied(),
+                    "took_ms": (ms(started.elapsed()) - waited).max(0.0),
                     "queued_ms": ms(queued),
-                    "waited_ms": ms(waited),
+                    "waited_ms": waited,
                 }),
             ));
         }
-        let a = eval::eval(s, &r).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let (a, waited) = eval::eval_shared(&store, &r).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let series: Vec<Value> = a
             .series
             .iter()
@@ -1473,10 +1480,10 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
                 "series": series,
                 "scalar": a.scalar,
                 "scanned": { "series": a.scanned_series, "samples": a.scanned_samples },
-                "applied": s.applied(),
-                "took_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "applied": applied(),
+                "took_ms": (ms(started.elapsed()) - waited).max(0.0),
                 "queued_ms": ms(queued),
-                "waited_ms": ms(waited),
+                "waited_ms": waited,
             }),
         ))
     })

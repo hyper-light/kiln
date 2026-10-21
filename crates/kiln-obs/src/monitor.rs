@@ -34,7 +34,7 @@ pub mod downtime;
 
 use crate::logs::search::Search;
 use crate::logs::store::{Facet, Measure};
-use crate::query::eval::{self, Request};
+use crate::query::eval::{Request, Source};
 use crate::store::{LogsAt, Store};
 
 /// The longest a monitor's window may be: a week (Datadog's longest, `last_1w`), so that one
@@ -509,11 +509,11 @@ fn aligned(window_ms: i64, to: i64) -> (i64, i64, i64) {
     (end - window_ms, end, step)
 }
 
-fn metric_values(store: &Store, query: &str, aggr: TimeAggr, window_ms: i64, to: i64) -> Result<Vec<Value>, MonitorError> {
+fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, to: i64) -> Result<Vec<Value>, MonitorError> {
     let (from, to, step) = aligned(window_ms, to);
     let mut req = Request::new(query, from, to);
     req.step = Some(step);
-    let a = eval::eval(store, &req).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let a = src.ask(&req).map_err(|e| MonitorError::Eval(e.to_string()))?;
     let mut out = Vec::new();
     if let Some(v) = a.scalar.filter(|v| v.is_finite()) {
         out.push(Value { group: Vec::new(), value: v });
@@ -540,14 +540,40 @@ fn metric_values(store: &Store, query: &str, aggr: TimeAggr, window_ms: i64, to:
 }
 
 /// The query's value a group, as of `now` (ms), the window ending `delay_ms` before it (data a
-/// little late still counts).
+/// little late still counts), its caller holding the store throughout.
 pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
+    match &q.kind {
+        Kind::Logs { .. } => evaluate_records(&store.logs_at(), q, now, delay_ms),
+        Kind::Spans { .. } => evaluate_records(&store.spans_at(), q, now, delay_ms),
+        _ => evaluate_metrics(Source::Held(store), q, now, delay_ms),
+    }
+}
+
+/// [`evaluate`] of a shared store, holding it as little as it may: a monitor of metrics read a part
+/// at a time (`eval::Lease`: a write waits for one part of its queries at the most), one of logs
+/// or spans from its records as they are, read with no hold of it.
+pub fn evaluate_shared(store: &std::sync::RwLock<Store>, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
+    match reads_records(q) {
+        Some(spans) => {
+            let at = {
+                let s = store.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if spans { s.spans_at() } else { s.logs_at() }
+            };
+            evaluate_records(&at, q, now, delay_ms)
+        }
+        None => evaluate_metrics(Source::Shared(store), q, now, delay_ms),
+    }
+}
+
+/// A monitor of metrics' values (its kind's: a metric's, a change's, a forecast's), its queries
+/// asked of `src`.
+fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
     let to = now - delay_ms.max(0);
     match &q.kind {
-        Kind::Metric { aggr, window_ms, query } => metric_values(store, query, *aggr, *window_ms, to),
+        Kind::Metric { aggr, window_ms, query } => metric_values(src, query, *aggr, *window_ms, to),
         Kind::Change { aggr, window_ms, shift_ms, pct, query } => {
-            let now_v = metric_values(store, query, *aggr, *window_ms, to)?;
-            let then_v = metric_values(store, query, *aggr, *window_ms, to - shift_ms)?;
+            let now_v = metric_values(src, query, *aggr, *window_ms, to)?;
+            let then_v = metric_values(src, query, *aggr, *window_ms, to - shift_ms)?;
             Ok(now_v
                 .into_iter()
                 .filter_map(|v| {
@@ -558,11 +584,10 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
                 })
                 .collect())
         }
-        Kind::Forecast { highest, ahead_ms, query } => forecast_values(store, query, *highest, *ahead_ms, to),
+        Kind::Forecast { highest, ahead_ms, query } => forecast_values(src, query, *highest, *ahead_ms, to),
         Kind::Slo { .. } => Err(MonitorError::Eval("an SLO's monitor is evaluated with its SLO".into())),
         Kind::ErrorTracking { .. } => Err(MonitorError::Eval("an Error Tracking monitor is evaluated with its issues".into())),
-        Kind::Logs { .. } => evaluate_records(&store.logs_at(), q, now, delay_ms),
-        Kind::Spans { .. } => evaluate_records(&store.spans_at(), q, now, delay_ms),
+        Kind::Logs { .. } | Kind::Spans { .. } => Err(MonitorError::Eval("a monitor of logs or spans reads its records (`evaluate_records`)".into())),
     }
 }
 
@@ -601,11 +626,11 @@ pub fn evaluate_records(at: &LogsAt, q: &Query, now: i64, delay_ms: i64) -> Resu
 /// A forecast monitor's values: over the next `ahead_ms` (in [`FORECAST_POINTS`] buckets, or its
 /// `interval`'s), each group's forecast's highest upper bound or lowest lower one. A group whose
 /// forecast could not be made (too little history) has none.
-fn forecast_values(store: &Store, query: &str, highest: bool, ahead_ms: i64, now: i64) -> Result<Vec<Value>, MonitorError> {
+fn forecast_values(src: Source<'_>, query: &str, highest: bool, ahead_ms: i64, now: i64) -> Result<Vec<Value>, MonitorError> {
     let mut req = Request::new(query, now, now + ahead_ms);
     req.points = FORECAST_POINTS;
     req.now = Some(now);
-    let a = eval::eval(store, &req).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let a = src.ask(&req).map_err(|e| MonitorError::Eval(e.to_string()))?;
     let mut out = Vec::new();
     for s in a.series {
         let Some(b) = &s.bounds else { continue };
@@ -980,6 +1005,18 @@ mod tests {
             let st = step_for(w);
             assert!(w % st == 0 && w / st >= (w / 10_000).min(10), "{w}: {st}");
         }
+        // Of a shared store (its metrics read a part at a time, its logs as they are): the same.
+        let shared = std::sync::RwLock::new(s);
+        for q in [
+            "avg(last_5m):avg:cpu{*} by {host} > 90",
+            "change(avg(last_5m),last_5m):avg:cpu{*} by {host} > 0",
+            r#"logs("status:error").last("5m") > 3"#,
+            r#"logs("source:kiln.event status:error").last("5m") > 3"#,
+        ] {
+            let q = parse(q).unwrap();
+            let held = evaluate(&shared.read().unwrap(), &q, now, 0).unwrap();
+            assert_eq!(evaluate_shared(&shared, &q, now, 0).unwrap(), held, "{q:?}");
+        }
     }
 
     /// Datadog's forecast monitor: two hosts' disks, one filling a percent an hour from 80 and one
@@ -1020,6 +1057,11 @@ mod tests {
         let low = parse("min(next_12h):forecast(avg:disk{*} by {host}, 'linear', 2) <= 40").unwrap();
         let got = evaluate(&s, &low, now, 0).unwrap();
         assert!(got.iter().all(|v| v.value > 40.0), "{got:?}");
+        // Of a shared store, read a part at a time: the same.
+        let shared = std::sync::RwLock::new(s);
+        for q in [&q, &low] {
+            assert_eq!(evaluate_shared(&shared, q, now, 0).unwrap(), evaluate(&shared.read().unwrap(), q, now, 0).unwrap());
+        }
         for bad in ["max(next_10m):forecast(avg:disk{*}, 'linear', 2) >= 95", "max(next_1y):forecast(avg:disk{*}, 'linear', 2) >= 95", "avg(next_1d):forecast(avg:disk{*}, 'linear', 2) >= 95", "max(next_1d):avg:disk{*} >= 95"] {
             assert!(parse(bad).is_err(), "{bad} parsed");
         }

@@ -15,8 +15,7 @@
 //! alerts): the long one says the rate is real, the short one that it is still so.
 
 use crate::monitor::Op;
-use crate::query::eval::{self, Request};
-use crate::store::Store;
+use crate::query::eval::{Request, Source};
 
 /// The timeframes an SLO may be over (Datadog's: 7, 30 and 90 days).
 pub const TIMEFRAMES_MS: [i64; 3] = [7 * 86_400_000, 30 * 86_400_000, 90 * 86_400_000];
@@ -100,18 +99,20 @@ const SLICES_A_READ: i64 = 10_000;
 
 /// `query`'s series over `[from, to)` at `step`: the grid's first bucket's start, and each series'
 /// values.
-fn series(store: &Store, query: &str, from: i64, to: i64, step: i64) -> Result<(i64, Vec<Vec<f64>>), SloError> {
+fn series(src: Source<'_>, query: &str, from: i64, to: i64, step: i64) -> Result<(i64, Vec<Vec<f64>>), SloError> {
     let mut r = Request::new(query, from, to);
     r.step = Some(step);
-    let a = eval::eval(store, &r).map_err(|e| SloError::Query(format!("{query}: {e}")))?;
+    let a = src.ask(&r).map_err(|e| SloError::Query(format!("{query}: {e}")))?;
     Ok((a.grid.from, a.series.into_iter().map(|s| s.values).collect()))
 }
 
 /// The SLI's good and total in each bucket of `step` over `[from, to)` (the grid's: a bucket begins
 /// at a multiple of `step`): `(its start, good, total)`. A ratio's counts are each bucket's sums
 /// across series; a time slice's, its slices met and with a value, read a slice at a time in parts
-/// of [`SLICES_A_READ`].
-pub fn buckets(store: &Store, sli: &Sli, from: i64, to: i64, step: i64) -> Result<Vec<(i64, f64, f64)>, SloError> {
+/// of [`SLICES_A_READ`]. Of a store held throughout, or of a shared one, each query read a part at
+/// a time (`eval::Source`).
+pub fn buckets<'a>(store: impl Into<Source<'a>>, sli: &Sli, from: i64, to: i64, step: i64) -> Result<Vec<(i64, f64, f64)>, SloError> {
+    let src = store.into();
     let first = from.div_euclid(step) * step;
     let n = usize::try_from((to - first + step - 1) / step).unwrap_or(0);
     let mut out: Vec<(i64, f64, f64)> = (0..n).map(|i| (first + i as i64 * step, 0.0, 0.0)).collect();
@@ -125,7 +126,7 @@ pub fn buckets(store: &Store, sli: &Sli, from: i64, to: i64, step: i64) -> Resul
     match sli {
         Sli::Ratio { good, total } => {
             for (q, is_good) in [(good, true), (total, false)] {
-                let (g0, all) = series(store, q, from, to, step)?;
+                let (g0, all) = series(src, q, from, to, step)?;
                 for s in all {
                     for (i, v) in s.into_iter().enumerate().filter(|(_, v)| v.is_finite()) {
                         let t = g0 + i as i64 * step;
@@ -138,7 +139,7 @@ pub fn buckets(store: &Store, sli: &Sli, from: i64, to: i64, step: i64) -> Resul
             let mut at = from;
             while at < to {
                 let end = (at + SLICES_A_READ * slice_ms).min(to);
-                let (g0, all) = series(store, query, at, end, *slice_ms)?;
+                let (g0, all) = series(src, query, at, end, *slice_ms)?;
                 for s in all {
                     for (i, v) in s.into_iter().enumerate().filter(|(_, v)| v.is_finite()) {
                         let t = g0 + i as i64 * slice_ms;
@@ -156,7 +157,7 @@ pub fn buckets(store: &Store, sli: &Sli, from: i64, to: i64, step: i64) -> Resul
 
 /// The SLI's good and total over `[from, to)`, read at `step` (a ratio's buckets begin at multiples
 /// of it, so the range's start is read to it).
-pub fn counts(store: &Store, sli: &Sli, from: i64, to: i64, step: i64) -> Result<(f64, f64), SloError> {
+pub fn counts<'a>(store: impl Into<Source<'a>>, sli: &Sli, from: i64, to: i64, step: i64) -> Result<(f64, f64), SloError> {
     Ok(buckets(store, sli, from, to, step)?.into_iter().fold((0.0, 0.0), |(g, t), b| (g + b.1, t + b.2)))
 }
 
@@ -171,7 +172,7 @@ fn whole(window_ms: i64, now: i64) -> (i64, i64, i64) {
 
 /// The burn rate over the `window_ms` before `now` (its whole steps): its error rate over the
 /// budget's; none without data in it.
-pub fn burn_rate(store: &Store, slo: &Slo, window_ms: i64, now: i64) -> Result<Option<f64>, SloError> {
+pub fn burn_rate<'a>(store: impl Into<Source<'a>>, slo: &Slo, window_ms: i64, now: i64) -> Result<Option<f64>, SloError> {
     let (from, to, step) = whole(window_ms, now);
     let (good, total) = counts(store, &slo.sli, from, to, step)?;
     Ok((total > 0.0).then(|| ((total - good).max(0.0) / total) / slo.budget()))
@@ -199,11 +200,12 @@ fn left(good: f64, total: f64, budget: f64) -> Option<f64> {
 /// An SLO's standing: its SLI over the timeframe's whole steps ([`step_for`]: five minutes for a
 /// week, an hour beyond), the budget left, and day by day (one read of a day's step: rollups'
 /// hours; a slice SLO's slices).
-pub fn status(store: &Store, slo: &Slo, now: i64) -> Result<Status, SloError> {
+pub fn status<'a>(store: impl Into<Source<'a>>, slo: &Slo, now: i64) -> Result<Status, SloError> {
+    let src = store.into();
     let (from, to, step) = whole(slo.timeframe_ms, now);
-    let (good, total) = counts(store, &slo.sli, from, to, step)?;
+    let (good, total) = counts(src, &slo.sli, from, to, step)?;
     let (mut g, mut t) = (0.0, 0.0);
-    let days = buckets(store, &slo.sli, from, now, 86_400_000)?
+    let days = buckets(src, &slo.sli, from, now, 86_400_000)?
         .into_iter()
         .map(|(day, dg, dt)| {
             g += dg;
@@ -220,6 +222,7 @@ mod tests {
     use super::*;
     use crate::batch::{Builder, Kind, SeriesKey};
     use crate::hash::Keyed;
+    use crate::store::Store;
 
     /// Ten days of requests, a hundred a minute, a tenth of a percent failing but for one hour of
     /// day 8 when half do; and a latency, its p99 under 300 ms but in that hour.

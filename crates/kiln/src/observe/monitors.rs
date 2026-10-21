@@ -116,7 +116,9 @@ pub struct Monitor {
 /// An SLO monitor's value (`monitor::Kind::Slo`): the lesser of its SLO's burn rates over the long
 /// window and the short (both must pass for it to; none while either has no data), or its error
 /// budget left, percent.
-fn slo_values(store: &kiln_obs::store::Store, id: &str, burn: Option<(i64, i64)>, now: i64) -> Result<Vec<monitor::Value>, monitor::MonitorError> {
+fn slo_values(store: &Shared, id: &str, burn: Option<(i64, i64)>, now: i64) -> Result<Vec<monitor::Value>, monitor::MonitorError> {
+    // Its queries read a part at a time (`kiln_obs::query::eval::Source`).
+    let store = kiln_obs::query::eval::Source::Shared(store);
     let def = super::api::slo_def(id).ok_or_else(|| monitor::MonitorError::Eval(format!("no SLO {id}")))?;
     let slo = def.slo().map_err(monitor::MonitorError::Eval)?;
     let eval = |e: kiln_obs::slo::SloError| monitor::MonitorError::Eval(e.to_string());
@@ -541,7 +543,8 @@ impl Monitors {
 
     /// One monitor's evaluation: each group's next state, events and notifications for changes.
     /// Whether any state changed. A monitor of logs or spans reads its records as they are, the
-    /// store let go (`kiln_obs::store::LogsAt`); another reads under a hold of its own.
+    /// store let go (`kiln_obs::store::LogsAt`); one of metrics, or an SLO's, a part at a time
+    /// (`kiln_obs::query::eval::Lease`); Error Tracking's under a hold of its own.
     fn evaluate(&self, store: &Shared, m: &Monitor, now: i64) -> bool {
         let (q, t) = match m.compiled() {
             Ok(Compiled::Query(q, t)) => (q, t),
@@ -549,17 +552,10 @@ impl Monitors {
             _ => return false,
         };
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
-        let values = match (&q.kind, monitor::reads_records(&q)) {
-            (monitor::Kind::Slo { id, burn }, _) => slo_values(&held(store), id, *burn, now - delay),
-            (monitor::Kind::ErrorTracking { search, new, by, window_ms }, _) => error_values(&held(store), search, *new, by, *window_ms, m.modified, now - delay),
-            (_, Some(spans)) => {
-                let at = {
-                    let s = held(store);
-                    if spans { s.spans_at() } else { s.logs_at() }
-                };
-                monitor::evaluate_records(&at, &q, now, delay)
-            }
-            (_, None) => monitor::evaluate(&held(store), &q, now, delay),
+        let values = match &q.kind {
+            monitor::Kind::Slo { id, burn } => slo_values(store, id, *burn, now - delay),
+            monitor::Kind::ErrorTracking { search, new, by, window_ms } => error_values(&held(store), search, *new, by, *window_ms, m.modified, now - delay),
+            _ => monitor::evaluate_shared(store, &q, now, delay),
         };
         let values = match values {
             Ok(v) => v,

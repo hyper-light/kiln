@@ -1335,9 +1335,9 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
 - The server, the leader, evaluates each on the blocking pool; each group's change is an event
   (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
   are saved as they change. Each evaluation holds the store on its own (a write waits on no more
-  than one); a monitor of logs or spans reads its records as they are, the store let go, as the
-  explorers do (§13, logs under load), and so do a notification's searches (a check's last run, an
-  issue's stack).
+  than one); a monitor of metrics (an SLO's too) reads a round of series at a time (§12.19); one of
+  logs or spans reads its records as they are, the store let go, as the explorers do (§13, logs
+  under load), and so do a notification's searches (a check's last run, an issue's stack).
 - **Forecasts**: Datadog's `max(next_1w):forecast(<metric query>, 'linear', 2, ...) >= 90`: a group's
   value is its forecast's highest upper bound over the next window (`max`, alerting above), or its
   lowest lower bound (`min`, with `<=`, below): "the edge of the forecast confidence bounds goes above
@@ -2849,6 +2849,30 @@ matters where cores are contended: with idle cores the 15 helpers' tail was alik
 once (the bench: 23 MiB to 42, the C library's arenas of the threads that read), then hold it (no
 page faults a query after the first); every soak run held its level.
 
+Then a query of metrics holds the store a part at a time (2026-10-20). The writes above are
+requests taken; what applies them takes the store's exclusive hold, and a query held its shared
+hold for all its reading, so an apply that came meanwhile waited for the whole query, and every
+reader after it waited behind the apply (the lock lets a waiting writer in before new readers): a
+dashboard watched by two, the one-series query waited for the wide one's reading. Now a query finds
+its series under one hold, then reads them a round at a time (`ROUND`, 64 series a thread), each
+round under a hold of its own (`query::eval::Lease`), so a write waits for one round at the most.
+Retention numbers the series anew (an id is another series' after), so each round checks the
+numbering it began with (`Store::generation`, a number no other numbering of the process had); a
+query that finds it changed is asked again, twice at the most, then once more holding the store
+throughout, so it always ends. Each series is read whole within one round, as its samples are then;
+the operands of a formula (and a distribution's sums and counts) each as of their own rounds, as
+Datadog's are (no query of it reads a snapshot). A thread never takes a part's hold within another
+(it would wait behind a writer that waits for the first): asked to, it refuses, an error and not a
+hang. The API's queries and heatmaps read so (`eval_shared`), as do the monitors of metrics
+(`monitor::evaluate_shared`) and the SLOs, their monitors and their pages (`slo::status`, `burn_rate`
+of an `eval::Source`). Tests: every kind of query both ways (gauges, counts, counters, a rate, a
+rollup, weighted, a percentile across series, a distribution's percentile, mean, count and threshold
+count, logs in a formula, heatmaps), on one thread and on three, to the bit; the series numbered
+anew between two parts (asked again once, the new numbering's answer); queries beside a cutoff
+passing a series at a time 299 times (every answer of one numbering, none of a series' values under
+another's name); and a write beside a query of 2,000 series read over and over, nine in ten waiting
+under a fourth of the query's time.
+
 ### 12.20 DogStatsD
 
 `cargo bench -p kiln-obs --bench statsd`: datagrams as Datadog's clients pack them (1,432 bytes over
@@ -3361,10 +3385,11 @@ windows touched under a brief hold, counted with it let go (`LogsAt::count_metri
 test endpoint one taking for its whole range). The monitors evaluate each under a hold of its own (a
 write waits for one at the most), a monitor of logs or spans from its records as they are, the store
 let go; Error Tracking's scan reads its metric under a hold and searches for a new issue's first
-error in the records as they are. What is left long is a query of metrics (and a metric monitor's,
-an SLO's), which reads under a hold for its scan, a writer's wait and so every reader's after it. A
-cut writes its files under a shared hold too, but on the thread that applies: no write waits for
-it, so no reader does.
+error in the records as they are. A query of metrics (the API's, a metric monitor's, an SLO's)
+holds the store a round of series at a time (§12.19), and APM's trace and map read their spans as
+they are. What is left whole under a hold reads metrics without a query: APM's services' RED
+figures, an issue's timeline, the metrics' list and summaries. A cut writes its files under a shared
+hold too, but on the thread that applies: no write waits for it, so no reader does.
 
 The flood now runs as a server does, with its work beside it: eight log monitors over the last five
 minutes, each evaluated every ten seconds (counts by host, route and thread, a cardinality of users,

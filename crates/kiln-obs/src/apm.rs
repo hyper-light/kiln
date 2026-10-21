@@ -27,6 +27,7 @@ use crate::logs::metrics::{Compute, LogMetric};
 use crate::logs::record::{Record, RecordRef};
 use crate::logs::search::parse_spans;
 use crate::logs::store::Facet;
+use crate::query::eval::{Lease, QueryError, Source};
 
 /// A service's entry spans: its servers' and consumers', and a trace's root that is neither a
 /// client's nor a producer's.
@@ -87,7 +88,18 @@ pub struct Red {
 /// twelfth of the range wide, so its edges, the two windows at most it reads as samples, are at
 /// most a sixth of it; a week of a series is 168 hours' sums, not 60,480 samples. A count's total is
 /// its windows' sums and its samples' added, the most the greatest of its windows' and samples'.
-pub fn red(store: &crate::store::Store, outbound: bool, filter: &[(&str, &str)], by: &str, from: i64, to: i64) -> Result<Vec<Red>, crate::store::StoreError> {
+///
+/// Of a store held throughout, or of a shared one read a part at a time (`query::eval::Source`):
+/// each part's series found under one hold, then read a round at a time, each round under a hold of
+/// its own, so a write waits for one round at the most (`query::eval::Lease`).
+pub fn red<'a>(store: impl Into<Source<'a>>, outbound: bool, filter: &[(&str, &str)], by: &str, from: i64, to: i64) -> Result<Vec<Red>, QueryError> {
+    match store.into() {
+        Source::Held(s) => red_on(&Lease::Held(s), outbound, filter, by, from, to),
+        Source::Shared(s) => crate::query::eval::shared(s, |lease| red_on(lease, outbound, filter, by, from, to)).map(|(r, _)| r),
+    }
+}
+
+fn red_on(lease: &Lease<'_>, outbound: bool, filter: &[(&str, &str)], by: &str, from: i64, to: i64) -> Result<Vec<Red>, QueryError> {
     use crate::dist::{Merged, SCALE, parse_tag_value};
     use crate::rollup::{Col, Rolled, TIERS};
     let prefix = if outbound { "trace.outbound" } else { "trace" };
@@ -96,44 +108,58 @@ pub fn red(store: &crate::store::Store, outbound: bool, filter: &[(&str, &str)],
     let mut scratch = crate::store::Scratch::default();
     let width = TIERS.iter().rev().copied().find(|&w| w.saturating_mul(RED_WINDOWS) <= to.saturating_sub(from));
     let mut rolled = Rolled::default();
+    // A part's series, each its group, its bucket and its kind.
+    let mut found: Vec<(u32, String, Option<(i32, crate::dist::Bucket)>, crate::batch::Kind)> = Vec::new();
     for part in ["hits", "errors", "duration.sum", "duration.max", "duration.dist"] {
         let name = format!("{prefix}.{part}");
         let mut sel = crate::index::Selector::metric(&name);
         for (k, v) in filter {
             sel = sel.tag(k, v);
         }
-        ids.clear();
-        store.select(&sel, &mut ids);
+        found.clear();
+        {
+            let store = lease.hold()?;
+            ids.clear();
+            store.select(&sel, &mut ids);
+            found.extend(ids.iter().filter_map(|&id| {
+                let series = store.series(id)?;
+                let bucket = if part == "duration.dist" { series.tag(crate::dist::BUCKET_TAG).and_then(parse_tag_value) } else { None };
+                Some((id, series.tag(by).unwrap_or(crate::logs::metrics::NONE).to_owned(), bucket, series.kind()))
+            }));
+        }
         let most = part == "duration.max";
         let cols: &[Col] = if most { &[Col::Max] } else { &[Col::Sum] };
-        for &id in &ids {
-            let Some(series) = store.series(id) else { continue };
-            let group = series.tag(by).unwrap_or(crate::logs::metrics::NONE).to_owned();
-            let bucket = if part == "duration.dist" { series.tag(crate::dist::BUCKET_TAG).and_then(parse_tag_value) } else { None };
-            ts.clear();
-            vs.clear();
-            rolled.clear();
-            match width {
-                Some(width) => {
-                    let roll = crate::store::Roll { width, from, to, kind: series.kind(), cols };
-                    store.read_rolled(id, from, to.saturating_sub(1), &roll, &mut scratch, &mut ts, &mut vs, &mut rolled)?;
-                }
-                None => store.read_with(id, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?,
-            }
-            let total = || vs.iter().sum::<f64>() + rolled.sum.iter().sum::<f64>();
-            let (r, m) = groups.entry(group.clone()).or_insert_with(|| (Red { group, ..Red::default() }, Merged::new(SCALE)));
-            match part {
-                "hits" => r.hits += total(),
-                "errors" => r.errors += total(),
-                "duration.sum" => r.duration_sum += total(),
-                "duration.max" => {
-                    if let Some(x) = vs.iter().chain(&rolled.max).copied().filter(|v| v.is_finite()).reduce(f64::max) {
-                        r.max = Some(r.max.map_or(x, |m| m.max(x)));
+        for round in found.chunks(crate::query::eval::ROUND) {
+            let store = lease.hold()?;
+            for (id, group, bucket, kind) in round {
+                ts.clear();
+                vs.clear();
+                rolled.clear();
+                match width {
+                    Some(width) => {
+                        let roll = crate::store::Roll { width, from, to, kind: *kind, cols };
+                        store.read_rolled(*id, from, to.saturating_sub(1), &roll, &mut scratch, &mut ts, &mut vs, &mut rolled)?;
                     }
+                    None => store.read_with(*id, from, to.saturating_sub(1), &mut scratch, &mut ts, &mut vs)?,
                 }
-                _ => {
-                    if let Some((scale, b)) = bucket {
-                        m.add(b, scale, total());
+                let total = || vs.iter().sum::<f64>() + rolled.sum.iter().sum::<f64>();
+                if !groups.contains_key(group.as_str()) {
+                    groups.insert(group.clone(), (Red { group: group.clone(), ..Red::default() }, Merged::new(SCALE)));
+                }
+                let Some((r, m)) = groups.get_mut(group.as_str()) else { continue };
+                match part {
+                    "hits" => r.hits += total(),
+                    "errors" => r.errors += total(),
+                    "duration.sum" => r.duration_sum += total(),
+                    "duration.max" => {
+                        if let Some(x) = vs.iter().chain(&rolled.max).copied().filter(|v| v.is_finite()).reduce(f64::max) {
+                            r.max = Some(r.max.map_or(x, |m| m.max(x)));
+                        }
+                    }
+                    _ => {
+                        if let Some((scale, b)) = *bucket {
+                            m.add(b, scale, total());
+                        }
                     }
                 }
             }
@@ -566,8 +592,9 @@ pub struct MapFigures {
 /// only of calls: a client library's), else its spans read's; an inferred one's, what its callers
 /// call it.
 #[allow(clippy::cast_precision_loss)]
-pub fn figures(store: &crate::store::Store, map: &ServiceMap, filter: &[(&str, &str)], from: i64, to: i64, k: u64) -> Result<MapFigures, crate::store::StoreError> {
+pub fn figures<'a>(store: impl Into<Source<'a>>, map: &ServiceMap, filter: &[(&str, &str)], from: i64, to: i64, k: u64) -> Result<MapFigures, QueryError> {
     use crate::logs::metrics::NONE;
+    let store = store.into();
     let entries: HashMap<String, Red> = red(store, false, filter, "service", from, to)?.into_iter().filter(|r| r.hits > 0.0).map(|r| (r.group.clone(), r)).collect();
     let exits: HashMap<String, Red> = red(store, true, filter, "service", from, to)?.into_iter().filter(|r| r.hits > 0.0).map(|r| (r.group.clone(), r)).collect();
     // Each calling service's calls by the peer they name.
@@ -817,6 +844,7 @@ mod tests {
         let map = map_of(traces.get(..2).unwrap());
         let ms = window / 1_000_000;
         let f = figures(&st, &map, &[], ms, ms + 10_000, 1).unwrap();
+        assert_eq!(figures(&std::sync::RwLock::new(st), &map, &[], ms, ms + 10_000, 1).unwrap(), f, "of a shared store, read a round of series at a time");
         let edges: Vec<(&str, &str, f64, f64, bool, bool)> = f.edges.iter().map(|e| (e.from.as_str(), e.to.as_str(), e.calls, e.errors, e.inferred, e.counted)).collect();
         assert_eq!(
             edges,
@@ -970,6 +998,10 @@ mod tests {
         assert_eq!(calls.iter().map(|r| (r.group.as_str(), r.hits, r.errors)).collect::<Vec<_>>(), vec![("cart.internal", 1.0, 0.0), ("kafka", 1.0, 1.0)]);
         // A range without its window: nothing.
         assert!(red(&st, false, &[], "service", ms + 10_000, ms + 20_000).unwrap().iter().all(|r| r.hits == 0.0));
+        // Of a shared store, read a round of series at a time: the same.
+        let shared = std::sync::RwLock::new(st);
+        assert_eq!(red(&shared, false, &[], "service", ms, ms + 10_000).unwrap(), services);
+        assert_eq!(red(&shared, true, &[("service", "checkout")], "peer.service", ms, ms + 10_000).unwrap(), calls);
     }
 
     #[test]
