@@ -131,12 +131,12 @@ function ChildrenHead() {
   return (
     <thead>
       <tr>
-        <th className="w-6" aria-label="Health" />
-        <th>Child</th>
-        <th>State</th>
-        <th className="num">Restarts</th>
-        <th className="hidden sm:table-cell">Since</th>
-        <th>Last error</th>
+        <th className="w-7" aria-label="Health" />
+        <th className="sm:w-[26%]">Child</th>
+        <th className="w-px sm:w-[14%]">State</th>
+        <th className="num w-px sm:w-[10%]">Restarts</th>
+        <th className="hidden w-[14%] sm:table-cell">Since</th>
+        <th className="hidden sm:table-cell">Last error</th>
       </tr>
     </thead>
   );
@@ -281,13 +281,18 @@ function SystemBody() {
                   <td>
                     <StatusDot status={childStatus(c)} title={c.state} />
                   </td>
-                  <td className="text-[#e4e5e7]">{c.name}</td>
-                  <td className="cell-mono">{c.state}</td>
+                  <td className="whitespace-nowrap text-[#e4e5e7]">
+                    {c.name}
+                    {/* On a phone its error reads in full under its name: a column that narrow shows nothing of it. */}
+                    {c.last_error && <div className="mt-0.5 font-mono text-[10.5px] whitespace-normal text-[#cbb69a] [overflow-wrap:anywhere] sm:hidden">{c.last_error}</div>}
+                  </td>
+                  <td className="cell-mono whitespace-nowrap">{c.state}</td>
                   <td className={`num cell-mono ${c.restarts > 0 ? "!text-[#cbb69a]" : ""}`}>{c.restarts}</td>
                   <td className="cell-mono hidden whitespace-nowrap sm:table-cell" title={absoluteTime(c.since_unix)}>
                     <RelTime ts={c.since_unix} />
                   </td>
-                  <td className="truncate-cell font-mono text-[11px] text-[#cbb69a]" title={c.last_error ?? undefined}>
+                  {/* Cut to its share of the width: the columns before it keep theirs. */}
+                  <td className="hidden max-w-0 truncate font-mono text-[11px] text-[#cbb69a] sm:table-cell" title={c.last_error ?? undefined}>
                     {c.last_error ?? <span className="text-[#6d7078]">—</span>}
                   </td>
                 </tr>
