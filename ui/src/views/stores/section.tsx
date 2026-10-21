@@ -10,7 +10,7 @@ import { Chart } from "@/components/charts/chart";
 import { SERIES } from "@/components/charts/types";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { EmptyState, Facts, Panel, SectionHeading, Sparkline } from "@/components/ui/misc";
+import { EmptyState, Facts, FoldSection, Panel, SectionHeading, Sparkline } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
@@ -48,12 +48,11 @@ function storeName(s: ConvoStore) {
 
 export function StoresSection({ index }: { index: string }) {
   return (
-    <section className="mt-12">
-      <SectionHeading index={index} label="Conversations" title="Conversation stores" />
+    <FoldSection id="system.stores" index={index} label="Conversations" title="Conversation stores">
       <Loadable label="the conversation stores" fallback={<StoresHold />}>
         <StoresBody />
       </Loadable>
-    </section>
+    </FoldSection>
   );
 }
 

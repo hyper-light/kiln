@@ -6,10 +6,44 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{Approval, Body, Event, Meta, State, Status, ToolStatus, TurnEnd};
+use super::model::{Approval, Body, Event, Meta, State, Status, Task, ToolStatus, TurnEnd, clip_middle};
 
 /// The ids of the messages kiln sends to keep an agent going (`goals::keep`); they show as kiln's.
 pub const KEEP_ID: &str = "kiln-keep-";
+
+/// Tasks a session's state keeps: beyond these the oldest finished go. The state goes to viewers
+/// whole, in one frame, and a long Codex session runs hundreds of terminals.
+pub const TASKS_KEPT: usize = 200;
+/// Longest command a finished task keeps (its call in the timeline keeps it whole).
+const ENDED_COMMAND_MAX: usize = 2_000;
+
+/// The tasks a state carries kept bounded: a finished one keeps the start and the end of a long
+/// command, and beyond [`TASKS_KEPT`] the oldest finished go, subagents last (a subagent's row is
+/// how its thread is found, and there are few of them). The ids of those that went.
+pub fn bound_tasks(tasks: &mut Vec<Task>) -> Vec<String> {
+    for t in tasks.iter_mut().filter(|t| !t.live()) {
+        if let Some(c) = t.command.as_mut().filter(|c| c.len() > ENDED_COMMAND_MAX) {
+            // Under the limit once shortened, so never shortened again.
+            *c = clip_middle(c, ENDED_COMMAND_MAX - 64).0;
+        }
+    }
+    let mut gone = Vec::new();
+    for agents in [false, true] {
+        let mut over = tasks.len().saturating_sub(TASKS_KEPT);
+        if over == 0 {
+            break;
+        }
+        tasks.retain(|t| {
+            if over == 0 || t.live() || (t.class.as_deref() == Some("agent")) != agents {
+                return true;
+            }
+            over -= 1;
+            gone.push(t.id.clone());
+            false
+        });
+    }
+    gone
+}
 
 /// Who a sent message is from, by its id: one of kiln's own keep-going ones, or a person's.
 pub fn origin_of(client_id: &str) -> &'static str {
@@ -19,6 +53,15 @@ pub fn origin_of(client_id: &str) -> &'static str {
 /// Words that end by asking something (their last line ends with a question mark).
 fn asks_you(text: &str) -> bool {
     text.trim_end().trim_end_matches(['*', '_', '`', ')', '"']).ends_with('?')
+}
+
+/// A call still running or waiting, or text still being written.
+fn still_open(body: &Body) -> bool {
+    match body {
+        Body::Tool(t) => matches!(t.status, ToolStatus::Running | ToolStatus::Pending),
+        Body::Assistant { streaming, .. } | Body::Thinking { streaming, .. } => *streaming,
+        _ => false,
+    }
 }
 
 /// Timeline events kept per session (the oldest go first).
@@ -299,6 +342,10 @@ impl Core {
         c.writes = f.writes;
         c.hold = f.hold;
         c.harness = f.harness;
+        // An older image kept every task: the first state this one sends must fit a frame.
+        for id in bound_tasks(&mut c.state.tasks) {
+            c.task_output.remove(&id);
+        }
         c
     }
 
@@ -610,8 +657,67 @@ impl Core {
         Some(self.state.approvals.remove(pos))
     }
 
+    /// The harness's process ended, or a new one starts: nothing the old one ran goes on (what
+    /// kiln took back over runs apart from it: `survivors`), whichever harness it was and
+    /// whatever its adapter knew. Its tasks still live end stopped, its calls still running or
+    /// waiting end cancelled, text it was writing stops; all of it stays to read.
+    pub fn end_harness_work(&mut self) {
+        let now = Self::now();
+        for t in self.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
+            t.status = "stopped".into();
+            t.ended.get_or_insert(now);
+            self.state_dirty = true;
+        }
+        let ids: Vec<String> = self.events.iter().filter(|e| still_open(&e.body)).map(|e| e.id.clone()).collect();
+        self.close(&ids, now);
+    }
+
+    /// Going on with a harness process after an upgrade: what another harness (the one before a
+    /// switch) left running in the timeline, and the tasks it started, can't still be running (an
+    /// older image left them so).
+    pub fn settle_foreign(&mut self) {
+        let Some(now_in) = self.harness.clone() else { return };
+        let foreign = |e: &Event| e.by.as_deref().is_some_and(|by| by != now_in);
+        let ids: Vec<String> = self.events.iter().filter(|e| foreign(e) && still_open(&e.body)).map(|e| e.id.clone()).collect();
+        let theirs: Vec<String> = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT))
+            .filter(|t| t.tool_id.as_deref().and_then(|id| self.get(id)).is_some_and(foreign))
+            .map(|t| t.id.clone())
+            .collect();
+        let now = Self::now();
+        for t in self.state.tasks.iter_mut().filter(|t| theirs.contains(&t.id)) {
+            t.status = "stopped".into();
+            t.ended.get_or_insert(now);
+            self.state_dirty = true;
+        }
+        self.close(&ids, now);
+    }
+
+    /// These events end: a call cancelled, text no longer streaming.
+    fn close(&mut self, ids: &[String], now: i64) {
+        for id in ids {
+            let Some(e) = self.get_mut(id) else { continue };
+            match &mut e.body {
+                Body::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Pending) => {
+                    t.status = ToolStatus::Cancelled;
+                    t.ended.get_or_insert(now);
+                }
+                Body::Assistant { streaming, .. } | Body::Thinking { streaming, .. } => *streaming = false,
+                _ => {}
+            }
+        }
+    }
+
     /// Move everything pending into `out`, in order: changed events, streamed text, then state.
     pub fn flush(&mut self) {
+        if self.state_dirty || self.reset {
+            for id in bound_tasks(&mut self.state.tasks) {
+                self.task_output.remove(&id);
+            }
+        }
         if std::mem::take(&mut self.reset) {
             let snap = self.snapshot(256 * 1024);
             self.out.extend(snap);
@@ -653,7 +759,9 @@ impl Core {
     pub fn snapshot(&self, batch_bytes: usize) -> Vec<Update> {
         // Cleared and nothing since: the store still keeps what came before.
         let from = self.events.front().map(|e| e.seq).or(self.state.cleared);
-        let mut out = vec![Update::Reset { from }, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(self.state.clone()) }];
+        let mut state = self.state.clone();
+        bound_tasks(&mut state.tasks);
+        let mut out = vec![Update::Reset { from }, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(state) }];
         if !self.changes.is_empty() {
             out.push(Update::Changes { files: self.changes() });
         }
@@ -941,6 +1049,104 @@ mod tests {
         assert_eq!((c.state.files_changed, c.state.lines_added, c.state.lines_removed), (0, 0, 0));
         c.set_change("/a.rs", None, None);
         assert!(c.take_out().is_empty());
+    }
+
+    fn task(id: &str, tool: Option<&str>, status: &str) -> Task {
+        Task { id: id.into(), tool_id: tool.map(str::to_owned), status: status.into(), class: Some("shell".into()), ..Task::default() }
+    }
+
+    fn status_of(c: &Core, id: &str) -> Option<ToolStatus> {
+        c.get(id).and_then(|e| match &e.body {
+            Body::Tool(t) => Some(t.status),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_state_keeps_its_tasks_bounded_and_the_live_ones_whole() -> anyhow::Result<()> {
+        let mut c = Core::new();
+        c.take_out();
+        // A long Codex session: a heredoc in nearly every finished terminal, one server running.
+        let server = format!("python3 -m http.server 17873 # {}", "s".repeat(30_000));
+        c.state.tasks.push(Task { command: Some(server.clone()), ..task("terminal-server", Some("server"), "running") });
+        c.state.tasks.push(task("child", Some("spawn"), "paused"));
+        // A subagent long finished: its row stays (it's how its thread is found) while shells go.
+        c.state.tasks.push(Task { class: Some("agent".into()), ..task("01a15b9d", Some("call_spawn"), "completed") });
+        for i in 0..TASKS_KEPT + 48 {
+            c.state.tasks.push(Task { command: Some(format!("cat > index.html <<'HTML'\n{}\nHTML", "y".repeat(20_000))), ..task(&format!("terminal-{i}"), Some(&format!("exec-{i}")), "completed") });
+        }
+        c.task_output.entry("terminal-0".into()).or_default().append(b"old output");
+        c.task_output.entry("terminal-60".into()).or_default().append(b"kept output");
+        c.touch_state();
+        let sent = |out: Vec<Update>| {
+            out.into_iter().find_map(|u| match u {
+                Update::State { state } => Some(*state),
+                _ => None,
+            })
+        };
+        let state = sent(c.take_out()).ok_or_else(|| anyhow::anyhow!("no state"))?;
+        assert_eq!(state.tasks.len(), TASKS_KEPT);
+        // The live ones whole (stopping a terminal finds it by its whole command), the oldest
+        // finished gone with the output kiln kept of them.
+        assert_eq!(state.tasks.first().and_then(|t| t.command.clone()), Some(server));
+        assert!(state.tasks.iter().any(|t| t.id == "child") && state.tasks.iter().any(|t| t.id == "01a15b9d"));
+        assert!(!state.tasks.iter().any(|t| t.id == "terminal-50") && state.tasks.iter().any(|t| t.id == "terminal-51"));
+        assert!(!c.task_output.contains_key("terminal-0") && c.task_output.contains_key("terminal-60"));
+        let ended = state.tasks.iter().find(|t| t.id == "terminal-60").and_then(|t| t.command.clone()).unwrap_or_default();
+        assert!(ended.len() <= ENDED_COMMAND_MAX && ended.starts_with("cat > index.html") && ended.ends_with("\nHTML"), "{}", ended.len());
+        assert!(serde_json::to_vec(&Update::State { state: Box::new(state.clone()) })?.len() < 512 * 1024, "fits one frame");
+        // Bounded once, it stays as it is.
+        c.touch_state();
+        assert_eq!(sent(c.take_out()).map(|s| s.tasks), Some(state.tasks));
+        Ok(())
+    }
+
+    #[test]
+    fn what_a_harness_ran_ends_with_it_but_what_kiln_took_over_does_not() {
+        let mut c = Core::new();
+        c.state.tasks = vec![
+            task("terminal-server", Some("server"), "running"),
+            Task { class: Some("agent".into()), ..task("child", Some("spawn"), "paused") },
+            task("left-4242", None, "running"),
+            Task { ended: Some(5), ..task("terminal-done", Some("done"), "failed") },
+        ];
+        c.upsert("server", None, tool(ToolStatus::Running));
+        c.upsert("spawn", None, tool(ToolStatus::Done));
+        c.upsert("done", None, tool(ToolStatus::Error));
+        c.upsert("child:child:command", Some("spawn".into()), tool(ToolStatus::Pending));
+        c.upsert("child:child:said", Some("spawn".into()), Body::Assistant { text: "Checking".into(), streaming: true });
+        c.take_out();
+        c.end_harness_work();
+        let status = |id: &str| c.state.tasks.iter().find(|t| t.id == id).map(|t| (t.status.clone(), t.ended.is_some()));
+        assert_eq!(status("terminal-server"), Some(("stopped".to_owned(), true)));
+        assert_eq!(status("child"), Some(("stopped".to_owned(), true)));
+        assert_eq!(status("left-4242"), Some(("running".to_owned(), false)), "kiln's own, taken back over, runs apart from it");
+        assert_eq!(c.state.tasks.iter().find(|t| t.id == "terminal-done").and_then(|t| t.ended), Some(5));
+        assert_eq!(
+            ["server", "spawn", "done", "child:child:command"].map(|id| status_of(&c, id)),
+            [Some(ToolStatus::Cancelled), Some(ToolStatus::Done), Some(ToolStatus::Error), Some(ToolStatus::Cancelled)]
+        );
+        assert!(c.get("server").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.ended.is_some())));
+        // All of it stays to read.
+        assert!(c.get("child:child:said").is_some_and(|e| matches!(&e.body, Body::Assistant { text, streaming: false } if text == "Checking")));
+        assert_eq!(c.events().count(), 5);
+        assert!(c.take_out().iter().any(|u| matches!(u, Update::State { .. })));
+    }
+
+    #[test]
+    fn going_on_after_an_upgrade_settles_only_what_the_harness_before_a_switch_left_open() {
+        let mut c = Core::new();
+        c.harness = Some("Codex".into());
+        c.upsert("exec-server", None, tool(ToolStatus::Running));
+        c.state.tasks.push(task("terminal-exec-server", Some("exec-server"), "running"));
+        c.harness = Some("Claude Code".into());
+        c.upsert("toolu_1", None, tool(ToolStatus::Running));
+        c.upsert("msg:0", None, Body::Assistant { text: "Working".into(), streaming: true });
+        c.state.tasks.push(task("b7", Some("toolu_1"), "running"));
+        c.settle_foreign();
+        assert_eq!([status_of(&c, "exec-server"), status_of(&c, "toolu_1")], [Some(ToolStatus::Cancelled), Some(ToolStatus::Running)]);
+        assert_eq!(c.state.tasks.iter().map(|t| t.status.as_str()).collect::<Vec<_>>(), ["stopped", "running"]);
+        assert!(c.get("msg:0").is_some_and(|e| matches!(&e.body, Body::Assistant { streaming: true, .. })));
     }
 
     #[test]

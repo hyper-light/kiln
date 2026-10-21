@@ -191,6 +191,10 @@ pub struct Conversations {
     /// while the store has nothing else to do, then put in its place. Runners and mirrors compact
     /// theirs.
     pub compact: bool,
+    /// No conversation store for this server: tests that don't use one (`KILN_CONVERSATIONS=off`
+    /// does it for a whole process). Never read from a config file.
+    #[serde(skip)]
+    pub off: bool,
 }
 
 /// `[agents]`: how far agents may start agents (docs/agents.md, "Agents that run agents").
@@ -453,7 +457,7 @@ impl Default for Terminal {
 
 impl Default for Conversations {
     fn default() -> Self {
-        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, compact: true }
+        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, compact: true, off: false }
     }
 }
 

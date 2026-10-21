@@ -1,7 +1,7 @@
 /**
- * The command palette: jump to a page, a repository, a run or a terminal. It opens in the header
- * (Ctrl/⌘ K, or Search), in the page's flow under the header's bar: no overlay. Its pages and
- * actions are there the moment it opens; repositories, recent runs and terminals join them as they
+ * The command palette: jump to a page, a repository, a run or a terminal. It opens (Ctrl/⌘ K, or
+ * Search) as a modal over the page, which doesn't move under it: Escape or a press outside it closes
+ * it, and focus goes back where it was. Its pages and actions are there the moment it opens; repositories, recent runs and terminals join them as they
  * arrive (asked for by the action that opens it), so what you type is never lost to a loader.
  */
 import * as React from "react";
@@ -44,9 +44,12 @@ interface PaletteState {
 export const usePalette = create<PaletteState>(() => ({ open: false, repos: [], runs: [], agents: [] }));
 
 let loading: AbortController | null = null;
+/** What had focus when it opened: it gets it back when the palette closes. */
+let returnTo: HTMLElement | null = null;
 
 export function setPaletteOpen(open: boolean) {
   if (open === usePalette.getState().open) return;
+  if (open) returnTo = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   usePalette.setState({ open });
   loading?.abort();
   loading = null;
@@ -208,21 +211,37 @@ function Palette() {
     if (it) document.getElementById(`cmdk-${it.id}`)?.scrollIntoView({ block: "nearest" });
   };
 
-  // Closes when you press or tap anywhere outside the header (the Search button inside it toggles).
-  const away = React.useCallback((el: HTMLDivElement | null) => {
+  // A modal over the page: the page under it can't be reached and doesn't move. Escape or a press on
+  // its backdrop (the dialog itself, outside its panel) closes it; focus then goes back where it was.
+  const modal = React.useCallback((el: HTMLDialogElement | null) => {
     if (!el) return;
-    const header = el.closest(".site-header") ?? el;
-    const onDown = (e: PointerEvent) => {
-      if (!header.contains(e.target as Node)) setPaletteOpen(false);
+    if (!el.open) el.showModal();
+    const onCancel = (e: Event) => {
+      e.preventDefault();
+      setPaletteOpen(false);
     };
-    document.addEventListener("pointerdown", onDown);
-    return () => document.removeEventListener("pointerdown", onDown);
+    const onDown = (e: PointerEvent) => {
+      if (e.target !== el) return;
+      // The press only closes it: its mouse events don't follow, so focus stays where it goes back to.
+      e.preventDefault();
+      setPaletteOpen(false);
+    };
+    el.addEventListener("cancel", onCancel);
+    el.addEventListener("pointerdown", onDown);
+    return () => {
+      el.removeEventListener("cancel", onCancel);
+      el.removeEventListener("pointerdown", onDown);
+      if (el.open) el.close();
+      const back = returnTo;
+      returnTo = null;
+      if (back?.isConnected) back.focus({ preventScroll: true });
+    };
   }, []);
 
   let lastGroup = "";
   return (
-    <div ref={away} className="header-band palette-band" role="search" aria-label="Command palette">
-      <div className="palette-inner">
+    <dialog ref={modal} className="palette-dialog" aria-label="Command palette">
+      <div className="palette-inner" role="search">
         <div className="relative">
           <Search size={17} className="absolute top-1/2 left-[18px] -translate-y-1/2 text-[#8f939e]" aria-hidden="true" />
           <input
@@ -281,6 +300,6 @@ function Palette() {
           <span>esc close</span>
         </div>
       </div>
-    </div>
+    </dialog>
   );
 }

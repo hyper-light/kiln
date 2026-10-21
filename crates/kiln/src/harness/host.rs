@@ -2,12 +2,18 @@
 //! them, routes commands to them, enforces limits, and keeps a small record on disk so that after
 //! the process holding them restarts they continue where they were (each harness resumes its own
 //! session), with kiln's queue of waiting messages intact.
+//!
+//! Its time is its clock's (kiln-seams' `Clock`, docs/seams.md): its watch of what the harnesses
+//! run, and the pause that gathers changes into one write of its record, go by kiln's runtime in
+//! production and by a simulated clock in tests.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+
+use kiln_seams::Clock;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -115,6 +121,11 @@ pub struct Host {
     files_dir: PathBuf,
     /// Files received (whole), by file id.
     received: Mutex<HashMap<String, PathBuf>>,
+    clock: Arc<dyn Clock>,
+    /// Looks the watch has taken, and records written: told to `changed`'s listeners.
+    looks: AtomicU64,
+    saves: AtomicU64,
+    changed: event_listener::Event,
 }
 
 /// Largest file a message can carry.
@@ -124,6 +135,11 @@ pub const PACKAGE_MAX: u64 = 1 << 30;
 
 impl Host {
     pub fn new(sink: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
+        Self::with_clock(sink, file, limits, crate::rt::clock())
+    }
+
+    /// A host whose time is `clock`'s.
+    pub fn with_clock(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
@@ -142,7 +158,32 @@ impl Host {
             me: me.clone(),
             files_dir,
             received: Mutex::new(HashMap::new()),
+            clock,
+            looks: AtomicU64::new(0),
+            saves: AtomicU64::new(0),
+            changed: event_listener::Event::new(),
         })
+    }
+
+    /// Looks the watch has taken at what the harnesses run.
+    pub fn looks(&self) -> u64 {
+        self.looks.load(Ordering::Acquire)
+    }
+
+    /// Records of the sessions written (a write that failed isn't one).
+    pub fn saves(&self) -> u64 {
+        self.saves.load(Ordering::Acquire)
+    }
+
+    /// Completes once `holds` holds, looked at again after each look and each record written.
+    pub async fn until(&self, holds: impl Fn(&Self) -> bool) {
+        loop {
+            let listener = self.changed.listen();
+            if holds(self) {
+                return;
+            }
+            listener.await;
+        }
     }
 
     /// A piece of a file attached to a message for `session` (blocking; small writes).
@@ -478,7 +519,7 @@ impl Host {
                 }
                 let found = super::survivors::scan(&[(rec.id.clone(), None)]);
                 let apart = found.get(&rec.id).map(|f| f.apart.clone()).unwrap_or_default();
-                let now_s = u64::try_from(crate::util::now_unix()).unwrap_or(0);
+                let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
                 self.open_record(rec, None, apart, now_s).map(|_| ())
             }
         }
@@ -537,7 +578,7 @@ impl Host {
             tracing::info!(processes = ?outlived.iter().map(|r| r.pid).collect::<Vec<_>>(), "agent harnesses outlived their runner: stopped before their sessions resume");
             super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
         }
-        let now_s = u64::try_from(crate::util::now_unix()).unwrap_or(0);
+        let now_s = u64::try_from(self.clock.unix_s()).unwrap_or(0);
         // What the sessions started that still runs: found by their mark, and as recorded.
         let found = super::survivors::scan(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>());
         for s in saved {
@@ -617,24 +658,25 @@ impl Host {
         Ok(trees.len())
     }
 
-    /// Every few seconds, what each session's harness runs: noted (and kept in the record when it
-    /// changes), and what it started that runs on once no longer under it (a command that
-    /// daemonized, a harness started again) taken over as left running, until it ends.
+    /// Every [`WATCH_EVERY`] by its clock, what each session's harness runs: noted (and kept in the
+    /// record when it changes), and what it started that runs on once no longer under it (a command
+    /// that daemonized, a harness started again) taken over as left running, until it ends.
     fn watch(&self) {
         if self.watching.swap(true, Ordering::AcqRel) {
             return;
         }
         let me = self.me.clone();
+        let clock = Arc::clone(&self.clock);
         crate::rt::spawn(async move {
             loop {
-                crate::rt::sleep(WATCH_EVERY).await;
+                clock.sleep(WATCH_EVERY).await;
                 let Some(h) = me.upgrade() else { return };
                 let sessions: Vec<Arc<Session>> = h.sessions.lock().values().cloned().collect();
                 let which: Vec<(String, Option<u32>)> = sessions.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect();
                 let known: Vec<super::survivors::Ran> = sessions.iter().flat_map(|s| s.ran.lock().1.clone()).collect();
                 let Ok((seen, alive)) = crate::rt::blocking(move || (super::survivors::scan(&which), super::survivors::alive(&known))).await else { continue };
                 let alive: HashMap<u32, u64> = alive.into_iter().map(|r| (r.pid, r.started)).collect();
-                let now_s = u64::try_from(crate::util::now_unix()).unwrap_or(0);
+                let now_s = u64::try_from(clock.unix_s()).unwrap_or(0);
                 let mut changed = false;
                 for s in &sessions {
                     if h.note(s, seen.get(&s.id).cloned().unwrap_or_default(), &alive, now_s) {
@@ -644,6 +686,8 @@ impl Host {
                 if changed {
                     h.mark_dirty();
                 }
+                h.looks.fetch_add(1, Ordering::AcqRel);
+                h.changed.notify(usize::MAX);
             }
         });
     }
@@ -701,9 +745,10 @@ impl Host {
             return;
         }
         let me = self.me.clone();
+        let clock = Arc::clone(&self.clock);
         crate::rt::spawn(async move {
             // Coalesce bursts (a session's id arriving, its queue changing) into one write.
-            crate::rt::sleep(Duration::from_millis(500)).await;
+            clock.sleep(SAVE_AFTER).await;
             if let Some(h) = me.upgrade() {
                 h.dirty.store(false, Ordering::Release);
                 let _ = crate::rt::blocking(move || h.save_now()).await;
@@ -718,9 +763,13 @@ impl Host {
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
         let tmp = file.with_extension("tmp");
         let wrote = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::util::write_secret(&tmp, &json, 0o600)).and_then(|()| std::fs::rename(&tmp, file));
-        if let Err(e) = wrote {
-            tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions");
+        match wrote {
+            Ok(()) => {
+                self.saves.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(e) => tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions"),
         }
+        self.changed.notify(usize::MAX);
     }
 }
 
@@ -736,7 +785,9 @@ fn picks_up(queue: &mut Vec<QueueItem>, also: &str) {
 }
 
 /// How often what the harnesses run is looked at.
-const WATCH_EVERY: Duration = Duration::from_secs(10);
+pub const WATCH_EVERY: Duration = Duration::from_secs(10);
+/// How long changes are gathered before the record is written.
+pub const SAVE_AFTER: Duration = Duration::from_millis(500);
 
 /// A session's timeline and state as the conversation store kept them, for its restart: None when
 /// the store kept nothing of it (or can't say in time), and the session starts as it always did.
@@ -767,11 +818,14 @@ pub(crate) fn stop_process(pid: u32) {
         return;
     }
     let _ = killpg(Pid::from_raw(p), Signal::SIGTERM);
-    for _ in 0..30 {
+    let end = std::time::Instant::now() + Duration::from_secs(3);
+    let mut pause = Duration::from_millis(1);
+    while std::time::Instant::now() < end {
         if !crate::os::pid_alive(pid) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(pause);
+        pause = super::survivors::next_look(pause);
     }
     let _ = killpg(Pid::from_raw(p), Signal::SIGKILL);
 }
@@ -868,12 +922,96 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kiln_seams::clock::SimClock;
 
+    /// A host on a simulated clock of its own, never moved: its watch never looks and its record
+    /// is written only when a test says (`save_now`).
+    fn sim(tx: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Host> {
+        Host::with_clock(tx, file, limits, Arc::new(SimClock::new()))
+    }
+
+    /// `Host::until`, failing the test rather than waiting forever when what it waits for never
+    /// comes (a write that failed): 30 s, which no passing run comes near.
+    async fn until(host: &Host, holds: impl Fn(&Host) -> bool) -> anyhow::Result<()> {
+        crate::rt::timeout(Duration::from_secs(30), host.until(holds)).await.map_err(|_| anyhow::anyhow!("what the test waited for didn't come in 30 s"))
+    }
+
+    fn no_harness(dir: &std::path::Path) -> Spec {
+        Spec {
+            kind: "claude".into(),
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            program: Some(dir.join("no-such-claude").to_string_lossy().into_owned()),
+            ..Spec::default()
+        }
+    }
+
+    /// The watch looks at what the harnesses run every 10 s by the host's clock: not before
+    /// (CP-M2's AC-M2.1: the harness host's watch on the simulated clock in tests).
+    #[test]
+    fn the_watch_looks_every_10_s_by_the_host_s_clock() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let clock = SimClock::new();
+            let start = clock.now();
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::with_clock(tx, None, Limits::default(), Arc::new(clock.clone()));
+            // A session starts the watch; closed again, a look has nothing to scan.
+            host.open(Some("watched".into()), no_harness(dir.path()))?;
+            assert!(host.close("watched"));
+            let mut slept = 0;
+            for n in 1..=2u32 {
+                // The watch sleeps till its next look: 10 s on from the last, and it's the only
+                // way to a look, so one that hasn't woken is one that hasn't looked.
+                clock.sleeping_since(slept, 1).await;
+                slept = clock.registrations();
+                assert_eq!((clock.sleepers(), clock.next_deadline()), (1, Some(start + WATCH_EVERY * n)), "the watch's sleep");
+                clock.advance(WATCH_EVERY.saturating_sub(Duration::from_millis(1)));
+                assert_eq!((clock.sleepers(), host.looks()), (1, u64::from(n - 1)), "awake, or a look, before 10 s");
+                clock.advance(Duration::from_millis(1));
+                until(&host, |h| h.looks() == u64::from(n)).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Changes in a burst are written once, half a second by the host's clock after the first
+    /// (CP-M2, AC-M2.1).
+    #[test]
+    fn changes_are_written_once_half_a_second_after_them_by_the_host_s_clock() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let clock = SimClock::new();
+            let start = clock.now();
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::with_clock(tx, Some(file.clone()), Limits::default(), Arc::new(clock.clone()));
+            host.open(Some("first".into()), no_harness(dir.path()))?;
+            // The watch's sleep, and the write's: the write sleeps half a second, and it's the
+            // only way to the write, so one that hasn't woken is one that hasn't written.
+            clock.sleeping_since(0, 2).await;
+            assert_eq!((clock.sleepers(), clock.next_deadline()), (2, Some(start + SAVE_AFTER)), "the write's sleep");
+            host.open(Some("second".into()), no_harness(dir.path()))?;
+            clock.advance(SAVE_AFTER.saturating_sub(Duration::from_millis(1)));
+            assert_eq!((clock.sleepers(), clock.next_deadline()), (2, Some(start + SAVE_AFTER)), "awake before half a second");
+            assert!(host.saves() == 0 && !file.exists());
+            clock.advance(Duration::from_millis(1));
+            until(&host, |h| h.saves() == 1).await?;
+            let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let mut ids: Vec<&str> = saved.iter().map(Saved::id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, ["first", "second"], "both changes in the one write");
+            // (What the sessions do next, their harnesses failing to start, is the next burst's.)
+            assert_eq!(host.saves(), 1);
+            Ok(())
+        })
+    }
+
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn limits_and_unknown_kinds_are_refused() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (tx, _rx) = async_channel::unbounded();
-            let host = Host::new(tx, None, Limits { per_machine: 1, per_shell: 1 });
+            let host = sim(tx, None, Limits { per_machine: 1, per_shell: 1 });
             assert!(host.open(None, Spec { kind: "nope".into(), ..Spec::default() }).is_err());
             let dir = tempfile::tempdir()?;
             // A program that does not exist: the session reports why it is down, nothing runs.
@@ -895,6 +1033,7 @@ mod tests {
         })
     }
 
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_restarted_session_takes_its_timeline_from_the_conversation_store() -> anyhow::Result<()> {
         use super::super::core::Update;
@@ -911,7 +1050,7 @@ mod tests {
             // Before the restart: the session, saved; its conversation, in the store.
             {
                 let (tx, _rx) = async_channel::unbounded();
-                let host = Host::new(tx, Some(file.clone()), Limits::default());
+                let host = sim(tx, Some(file.clone()), Limits::default());
                 host.open(Some("timeline".into()), spec)?;
                 host.save_now();
             }
@@ -924,7 +1063,7 @@ mod tests {
             store.sync()?;
             // After it: the session comes back with that timeline, in order, by id.
             let (tx, _rx) = async_channel::unbounded();
-            let again = Host::new(tx, Some(file.clone()), Limits::default());
+            let again = sim(tx, Some(file.clone()), Limits::default());
             again.restore_from(Some(&store));
             let back = again.sessions.lock().get("timeline").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
             let core = back.core.lock();
@@ -934,6 +1073,7 @@ mod tests {
         })
     }
 
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_turn_a_restart_cut_short_goes_on_first_thing() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -951,7 +1091,7 @@ mod tests {
             };
             {
                 let (tx, _rx) = async_channel::unbounded();
-                let host = Host::new(tx, Some(file.clone()), Limits::default());
+                let host = sim(tx, Some(file.clone()), Limits::default());
                 // A turn under way in one, none in the other, as the runner is stopped.
                 host.open(Some("busy".into()), spec.clone())?.turn_open.store(true, Ordering::Relaxed);
                 host.open(Some("idle".into()), spec.clone())?;
@@ -960,7 +1100,7 @@ mod tests {
             assert_eq!(cut(&file)?, ["busy"]);
             let restore = || -> anyhow::Result<(Arc<Host>, Vec<QueueItem>, Vec<QueueItem>)> {
                 let (tx, _rx) = async_channel::unbounded();
-                let again = Host::new(tx, Some(file.clone()), Limits::default());
+                let again = sim(tx, Some(file.clone()), Limits::default());
                 again.restore();
                 let queue = |id: &str| again.sessions.lock().get(id).map(|s| s.core.lock().state.queue.clone()).unwrap_or_default();
                 let (busy, idle) = (queue("busy"), queue("idle"));
@@ -988,6 +1128,9 @@ mod tests {
         })
     }
 
+    /// What a harness left running is taken back over. The test waits for its stop on the
+    /// session's updates, each a look; it doesn't sleep (CP-M2, AC-M2.3; the stop it asks for
+    /// polls the process, as stopping one does).
     #[cfg(unix)]
     #[test]
     fn what_a_session_left_running_is_taken_back_over_after_a_restart() -> anyhow::Result<()> {
@@ -1026,14 +1169,14 @@ mod tests {
             let (h, r) = (ran(harness.id())?, ran(recorded.id())?);
             {
                 let (tx, _rx) = async_channel::unbounded();
-                let host = Host::new(tx, Some(file.clone()), Limits::default());
+                let host = sim(tx, Some(file.clone()), Limits::default());
                 let s = host.open(Some("left-running".into()), spec.clone())?;
                 s.turn_open.store(true, Ordering::Relaxed);
                 *s.ran.lock() = (Some(h.clone()), vec![r.clone()]);
                 host.save_now();
             }
-            let (tx, _rx) = async_channel::unbounded();
-            let again = Host::new(tx, Some(file.clone()), Limits::default());
+            let (tx, rx) = async_channel::unbounded();
+            let again = sim(tx, Some(file.clone()), Limits::default());
             again.restore();
             // The harness was stopped; what it started wasn't.
             let _ = harness.wait();
@@ -1049,17 +1192,20 @@ mod tests {
             }
             let said = queue.first().map(|q| q.text.clone()).unwrap_or_default();
             assert!(said.contains("Pick up where you left off") && said.contains("sleep 61") && said.contains("62"), "{said}");
-            // Stopped from kiln, it ends (waited for without holding up the session doing it).
-            s.command(Command::StopTask { task: format!("left-{}", recorded.id()) });
-            let mut stopped = false;
-            for _ in 0..80 {
-                if s.core.lock().state.tasks.iter().any(|t| t.id == format!("left-{}", recorded.id()) && t.status == "stopped") {
-                    stopped = true;
-                    break;
+            // Stopped from kiln, it ends (waited for without holding up the session doing it): each
+            // update the session sends is a look at whether its task says so yet.
+            let task = format!("left-{}", recorded.id());
+            s.command(Command::StopTask { task: task.clone() });
+            let stopped = || s.core.lock().state.tasks.iter().any(|t| t.id == task && t.status == "stopped");
+            let waited = crate::rt::timeout(Duration::from_secs(30), async {
+                while !stopped() {
+                    if rx.recv().await.is_err() {
+                        return;
+                    }
                 }
-                crate::rt::sleep(Duration::from_millis(100)).await;
-            }
-            assert!(stopped, "its task says it stopped");
+            })
+            .await;
+            assert!(waited.is_ok() && stopped(), "its task says it stopped");
             assert!(survivors::alive(std::slice::from_ref(&r)).is_empty(), "and it ended");
             let _ = recorded.wait();
             survivors::stop(&[marked]);
@@ -1071,13 +1217,14 @@ mod tests {
         })
     }
 
+    /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_session_is_saved_and_restored_with_its_pause_without_deadlocking() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (tx, _rx) = async_channel::unbounded();
             let dir = tempfile::tempdir()?;
             let file = dir.path().join("harness.json");
-            let host = Host::new(tx, Some(file.clone()), Limits::default());
+            let host = sim(tx, Some(file.clone()), Limits::default());
             let spec = Spec {
                 kind: "claude".into(),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
@@ -1106,12 +1253,72 @@ mod tests {
             assert_eq!(a.get("pause_at").and_then(serde_json::Value::as_u64), Some(90));
             // Another start of the machine picks the pause up, its check under way asked again.
             let (tx2, _rx2) = async_channel::unbounded();
-            let again = Host::new(tx2, Some(file.clone()), Limits::default());
+            let again = sim(tx2, Some(file.clone()), Limits::default());
             again.restore();
             let back = again.sessions.lock().get("paused").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
             let p = back.core.lock().state.pause.clone().ok_or_else(|| anyhow::anyhow!("pause not restored"))?;
             assert_eq!((p.since, p.checking), (7, None));
             assert_eq!(back.core.lock().state.pause_at, Some(90));
+            Ok(())
+        })
+    }
+
+    /// Ending an agent while its harness runs (and while it's down): the last state it sends
+    /// before it closes, what the ended agent shows, has nothing still running.
+    #[cfg(unix)]
+    #[test]
+    fn an_ended_agents_last_state_has_its_tasks_stopped() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        use super::super::model::Task;
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            // A harness that runs and says nothing.
+            let quiet = dir.path().join("quiet-claude");
+            std::fs::write(&quiet, "#!/bin/sh\nexec sleep 30\n")?;
+            std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755))?;
+            for (id, program) in [("running", quiet.clone()), ("down", dir.path().join("no-such-claude"))] {
+                let (tx, rx) = async_channel::unbounded();
+                let host = Host::new(tx, None, Limits::default());
+                let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+                let s = host.open(Some(id.into()), spec)?;
+                // Its harness running (and its adapter started), or down (it could not start). One
+                // lock at a time.
+                let ready = |s: &Session| {
+                    if id == "down" {
+                        return s.core.lock().state.status == Status::Exited;
+                    }
+                    let spawned = s.pid.lock().is_some();
+                    spawned && !s.core.lock().meta.features.is_empty()
+                };
+                let started = crate::rt::timeout(Duration::from_secs(10), async {
+                    while !ready(&s) {
+                        crate::rt::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await;
+                anyhow::ensure!(started.is_ok(), "{id}: the session never got going");
+                {
+                    let mut core = s.core.lock();
+                    core.state.tasks.push(Task { id: "b7".into(), class: Some("shell".into()), status: "running".into(), background: true, stoppable: true, ..Task::default() });
+                    core.touch_state();
+                }
+                assert!(host.close(id));
+                let last = crate::rt::timeout(Duration::from_secs(20), async {
+                    let mut last = None;
+                    while let Ok((_, u)) = rx.recv().await {
+                        match u {
+                            Update::State { state } => last = Some(state),
+                            Update::Closed => return Some(last),
+                            _ => {}
+                        }
+                    }
+                    None
+                })
+                .await;
+                let state = last.ok().flatten().flatten().ok_or_else(|| anyhow::anyhow!("{id}: never closed, or no state before it"))?;
+                assert!(state.tasks.iter().any(|t| t.id == "b7") && state.tasks.iter().all(|t| !t.live()), "{id}: {:?}", state.tasks);
+            }
             Ok(())
         })
     }
