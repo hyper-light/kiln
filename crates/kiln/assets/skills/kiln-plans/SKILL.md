@@ -52,9 +52,10 @@ the person pauses or skips it.
   list, merge items, or add only the first few.
 - **Where it stands**: `goals_get` gives each goal's status (pending, active, met, unmet,
   skipped) and whether the stack runs, is paused or is done.
-- **Changing it**: `goals_set` with the goals not yet started as they should be (by `id`,
-  reordered, edited, removed, added); `goals_control` with `pause`, `start` (resume), `skip`
-  (leave the one under way) or `clear`.
+- **Changing it**: `goals_set` with the goals still to go as they should be (by `id`,
+  reordered, edited, removed, added; the one under way may be among them: after others, it goes
+  back among them and the first goes next); `goals_control` with `pause`, `start` (resume),
+  `skip` (leave the one under way), `clear`, or `restore` (bring back the goals cleared last).
 - **Another agent's stack**: name it with `agent`. You line up and change goals only for
   yourself and the agents you started (and theirs).
 

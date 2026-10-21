@@ -3523,7 +3523,7 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     Ok(srv::json(StatusCode::OK, &s))
 }
 
-/// Start, pause, skip or clear an agent's goal stack.
+/// Start, pause, skip, clear or restore an agent's goal stack.
 async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
     let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
     may_steer_goals(hub, caller, id)?;

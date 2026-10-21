@@ -99,7 +99,7 @@ counted.
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
-| POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear}` | run, pause, skip the goal under way, or empty its goal stack |
+| POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
