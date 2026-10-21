@@ -63,6 +63,9 @@ mod tests {
 
     /// The clauses kiln's registry holds until sends are acknowledged end to end.
     const HOLDS_TODAY: [&str; 3] = ["HARNESS-1", "HARNESS-2", "HARNESS-4"];
+    /// The clauses that need what reached an agent, which isn't seen here until then (CP-T3.2,
+    /// CP-T3.3).
+    const WAIT_FOR_T3: [&str; 2] = ["HARNESS-3", "HARNESS-5"];
 
     /// The registry, its agents under the names the cases give them (it names its own).
     struct Named {
@@ -130,27 +133,38 @@ mod tests {
         fn say(&self, text: &str) -> Command {
             Command::Send { id: crate::util::new_id(), text: text.to_owned(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
         }
-        fn heard<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Vec<String>> {
-            // What reached the agent isn't observable here until sends are acknowledged (CP-T3.3).
-            Box::pin(async { Vec::new() })
+        fn heard<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
+            // What reached the agent isn't seen here until sends are acknowledged (CP-T3.3).
+            Box::pin(async { None })
         }
         fn id_of(&self, agent: &Info) -> String {
             self.port.ids.lock().iter().find(|(_, id)| **id == agent.id).map_or_else(|| agent.id.clone(), |(name, _)| name.clone())
         }
     }
 
+    /// The registry is kiln's HarnessPort: it holds HARNESS-1, -2 and -4 now, and HARNESS-3 and -5
+    /// fail only for want of seeing what reached an agent (CP-M2's AC-M2.2: "or will pass once
+    /// its track lands the real one").
     #[test]
-    fn kiln_s_registry_passes_the_harness_port_clauses_it_holds_today() -> anyhow::Result<()> {
+    fn kiln_s_registry_holds_the_harness_port_clauses_it_can_today_and_says_why_not_the_rest() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
-            let cases: Vec<_> = cases::<RegistryFixture>().into_iter().filter(|c| HOLDS_TODAY.contains(&c.id)).collect();
-            anyhow::ensure!(cases.len() == HOLDS_TODAY.len(), "a clause the registry holds is missing from the suite");
+            let cases = cases::<RegistryFixture>();
+            // A hub of its own for each case.
+            let hubs = futures::future::join_all(cases.iter().map(|_| crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true))).await;
+            let mut hubs: std::collections::VecDeque<Arc<Hub>> = hubs.into_iter().collect::<anyhow::Result<_>>()?;
+            let last = hubs.back().cloned().ok_or_else(|| anyhow::anyhow!("no cases"))?;
             let dir = tempfile::tempdir()?;
             let make = || {
-                let (hub, cwd) = (Arc::clone(&hub), dir.path().to_path_buf());
+                // There are as many hubs as cases: the last is never handed out twice.
+                let hub = hubs.pop_front().unwrap_or_else(|| Arc::clone(&last));
+                let cwd = dir.path().to_path_buf();
                 async move { RegistryFixture { port: Named { hub, ids: Mutex::new(HashMap::new()) }, cwd } }
             };
-            kiln_seams::conformance::run("HarnessPort (kiln's registry)", &cases, make).await.into_result().map_err(anyhow::Error::msg)?;
+            let report = kiln_seams::conformance::run("HarnessPort (kiln's registry)", &cases, make).await;
+            anyhow::ensure!(report.passed == HOLDS_TODAY, "held: {:?}, failed: {:?}", report.passed, report.failed);
+            let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
+            anyhow::ensure!(failed == WAIT_FOR_T3, "failed: {:?}", report.failed);
+            anyhow::ensure!(report.failed.iter().all(|(_, why)| why.ends_with("can't be seen here")), "failed otherwise: {:?}", report.failed);
             Ok(())
         })
     }

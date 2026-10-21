@@ -561,11 +561,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_registry_passes_the_artifacts_suite() -> Result<(), String> {
         futures::executor::block_on(run("Artifacts", &cases::<SimArtifactsFixture>(), || async { SimArtifactsFixture(SimArtifacts::new()) })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: names, tags and digests as the Distribution Specification has them.
     #[test]
     fn the_grammars_are_the_distribution_specification_s() {
         assert!(valid_name("library/ubuntu") && valid_name("a.b_c__d-e---f") && !valid_name("a_.b") && !valid_name(&"a".repeat(256)));

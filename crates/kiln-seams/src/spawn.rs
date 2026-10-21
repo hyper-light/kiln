@@ -96,7 +96,7 @@ where
 
 /// Most tasks a [`SimSpawn`] holds at once by default.
 pub const SIM_TASKS: usize = 10_000;
-/// Most polls one [`SimSpawn::run_until_stalled`] makes.
+/// Most polls one [`SimSpawn::run_until_stalled`] makes by default.
 pub const SIM_POLLS: u64 = 1_000_000;
 
 /// An executor that runs its tasks only in [`SimSpawn::run_until_stalled`]: each woken task is
@@ -109,6 +109,8 @@ pub struct SimSpawn {
 
 struct ExecInner {
     limit: usize,
+    /// Most polls a run makes.
+    polls: u64,
     state: Mutex<ExecState>,
 }
 
@@ -160,7 +162,12 @@ impl SimSpawn {
 
     /// An executor that holds at most `limit` tasks at once.
     pub fn with_limit(limit: usize) -> Self {
-        Self { inner: Arc::new(ExecInner { limit, state: Mutex::new(ExecState::default()) }) }
+        Self::with_limits(limit, SIM_POLLS)
+    }
+
+    /// An executor that holds at most `tasks` tasks at once, and makes at most `polls` polls a run.
+    pub fn with_limits(tasks: usize, polls: u64) -> Self {
+        Self { inner: Arc::new(ExecInner { limit: tasks, polls, state: Mutex::new(ExecState::default()) }) }
     }
 
     /// Tasks not yet ended.
@@ -189,7 +196,7 @@ impl SimSpawn {
     pub fn run_until_stalled(&self) -> Ran {
         let mut polls = 0u64;
         loop {
-            if polls >= SIM_POLLS {
+            if polls >= self.inner.polls {
                 return Ran::Budget;
             }
             let next = {
@@ -246,7 +253,8 @@ impl Spawn for SimSpawn {
 pub trait SpawnFixture: Send + Sync {
     fn spawner(&self) -> Arc<dyn Spawn>;
     /// `fut`'s output, while the executor runs its tasks; `None` when it can't come (a simulated
-    /// executor with nothing left to run; a real one, past a bounded wait).
+    /// executor with nothing left to run, or past its polls a run; a real one, past a bounded
+    /// wait).
     fn finish<'a, T: Send + 'a>(&'a self, fut: BoxFuture<'a, T>) -> BoxFuture<'a, Option<T>>;
 }
 
@@ -259,12 +267,21 @@ impl SpawnFixture for SimSpawnFixture {
     }
     fn finish<'a, T: Send + 'a>(&'a self, mut fut: BoxFuture<'a, T>) -> BoxFuture<'a, Option<T>> {
         Box::pin(async move {
+            let mut polls = 0u64;
             loop {
                 if let Some(v) = (&mut fut).now_or_never() {
                     return Some(v);
                 }
-                if matches!(self.0.run_until_stalled(), Ran::Stalled { polls: 0 }) {
-                    return (&mut fut).now_or_never();
+                match self.0.run_until_stalled() {
+                    // Nothing left to run, or a task waking itself forever: it can't come.
+                    Ran::Stalled { polls: 0 } | Ran::Budget => return (&mut fut).now_or_never(),
+                    Ran::Stalled { polls: n } => {
+                        // Tasks and `fut` waking each other forever: past the budget, the same.
+                        polls = polls.saturating_add(n);
+                        if polls >= self.0.inner.polls {
+                            return (&mut fut).now_or_never();
+                        }
+                    }
                 }
             }
         })
@@ -368,11 +385,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_executor_passes_the_spawn_suite() -> Result<(), String> {
         futures::executor::block_on(run("Spawn", &cases::<SimSpawnFixture>(), || async { SimSpawnFixture(SimSpawn::new()) })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: the simulator, deterministic.
     #[test]
     fn tasks_run_only_when_the_test_says_in_the_order_they_were_woken() {
         let ex = SimSpawn::new();
@@ -387,6 +406,7 @@ mod tests {
         assert_eq!(ex.tasks(), 0);
     }
 
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
     #[test]
     fn a_full_executor_refuses_and_a_stopped_one_too() {
         let ex = SimSpawn::with_limit(1);
@@ -397,14 +417,18 @@ mod tests {
         assert_eq!(ex.spawn_boxed(Box::pin(async {})), Err(Refused::Stopped));
     }
 
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
     #[test]
     fn a_task_that_wakes_itself_forever_ends_the_run_at_its_budget() {
-        let ex = SimSpawn::new();
+        let ex = SimSpawn::with_limits(SIM_TASKS, 1000);
         assert!(ex.spawn_boxed(Box::pin(futures::future::poll_fn(|cx| {
             cx.waker().wake_by_ref();
             Poll::<()>::Pending
         })))
         .is_ok());
         assert_eq!(ex.run_until_stalled(), Ran::Budget);
+        // A suite's wait for an output that can't come ends there too.
+        let f = SimSpawnFixture(ex.clone());
+        assert_eq!(futures::executor::block_on(f.finish(Box::pin(futures::future::pending::<()>()))), None);
     }
 }

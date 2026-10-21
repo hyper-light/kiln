@@ -16,7 +16,8 @@ use crate::clock::{Clock, SimClock};
 use crate::conformance::{Case, Failure, ensure, fine, same};
 
 /// A secret's value. It never shows: `Debug` and `Display` say only how long it is; `expose` is
-/// the one way to the bytes. Its bytes are overwritten when it's dropped.
+/// the one way to the bytes. Dropped, its buffer is zeroed by writes the compiler keeps
+/// (`zeroize`); a copy made of it (a clone, the bytes it was made from) is the copy's to clear.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretValue(Vec<u8>);
 
@@ -49,7 +50,7 @@ impl fmt::Display for SecretValue {
 
 impl Drop for SecretValue {
     fn drop(&mut self) {
-        self.0.iter_mut().for_each(|b| *b = 0);
+        zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
 
@@ -630,13 +631,15 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_store_passes_the_secrets_suite() -> Result<(), String> {
         futures::executor::block_on(run("Secrets", &cases::<SimSecretsFixture>(), || async { SimSecretsFixture::default() })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: a secret's value never shows.
     #[test]
-    fn a_value_is_zeroed_when_dropped_and_only_its_length_shows() {
+    fn only_a_value_s_length_shows() {
         let value = SecretValue::new(b"abc".to_vec());
         assert_eq!(format!("{value:?}"), "SecretValue(<3 bytes, redacted>)");
         assert_eq!(value.to_string(), "<redacted>");

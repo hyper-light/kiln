@@ -334,11 +334,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_placement_passes_the_placement_suite() -> Result<(), String> {
         futures::executor::block_on(run("Placement", &cases::<SimPlacementFixture>(), || async { SimPlacementFixture::default() })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: the simulator's placement, and its refusals, typed.
     #[test]
     fn it_places_on_the_node_with_the_most_memory_free_and_says_why_it_cant() {
         let p = SimPlacement::new(conformance_nodes());

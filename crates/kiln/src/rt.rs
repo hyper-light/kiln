@@ -908,8 +908,8 @@ mod tests {
         })
     }
 
-    /// kiln's runtime passes kiln-seams' Clock suite on real time (CP-M2): the clause the goal
-    /// driver and the harness host take their time by.
+    /// kiln's runtime passes kiln-seams' Clock suite on real time (CP-M2, AC-M2.2): the clock the
+    /// goal driver and the harness host take their time by in production (AC-M2.1).
     struct RtClockFixture;
 
     impl kiln_seams::clock::ClockFixture for RtClockFixture {
@@ -924,6 +924,7 @@ mod tests {
         }
     }
 
+    /// CP-M2, AC-M2.1 and AC-M2.2: production's clock passes the Clock suite.
     #[test]
     fn the_runtime_passes_the_clock_suite() -> anyhow::Result<()> {
         block_on(async {
@@ -945,6 +946,7 @@ mod tests {
         }
     }
 
+    /// CP-M2, AC-M2.2: kiln's runtime passes the Spawn suite.
     #[test]
     fn the_runtime_passes_the_spawn_suite() -> anyhow::Result<()> {
         block_on(async {

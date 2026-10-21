@@ -41,7 +41,10 @@ impl Report {
     }
 }
 
-/// Runs each case against a fixture of its own (`make` builds one per case), in order.
+/// Runs each case against a fixture of its own (`make` builds one per case), in order. A case has
+/// no deadline of its own: where it waits on the implementation, it waits as long as its fixture
+/// lets it. The simulators' fixtures end every wait they can't finish (`SimSpawnFixture::finish`
+/// at its poll budget); a real implementation's bounds its own (kiln's runtime's: 10 s).
 pub async fn run<F, M, Fut>(seam: &'static str, cases: &[Case<F>], mut make: M) -> Report
 where
     M: FnMut() -> Fut,

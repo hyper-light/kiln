@@ -407,11 +407,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_bus_passes_the_bus_suite() -> Result<(), String> {
         futures::executor::block_on(run("Bus", &cases::<SimBusFixture>(), || async { SimBusFixture(SimBus::default()) })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: the simulator, on the simulated clock.
     #[test]
     fn messages_are_stamped_by_the_bus_clock() {
         let clock = SimClock::new();

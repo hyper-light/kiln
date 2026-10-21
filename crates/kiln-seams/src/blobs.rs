@@ -683,11 +683,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_store_passes_the_blobs_suite() -> Result<(), String> {
         futures::executor::block_on(run("Blobs", &cases::<SimBlobsFixture>(), || async { SimBlobsFixture::default() })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
     #[test]
     fn its_bytes_and_objects_are_bounded() {
         let b = SimBlobs::new(Arc::new(SimClock::new()), SimLimits { object: 4, total: 6, objects: 3, uploads: 1, part_min: 1 });

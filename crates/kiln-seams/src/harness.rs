@@ -4,7 +4,7 @@
 //! command it's handed, stamped by its clock, so a test of the goal driver reads exactly what
 //! went to an agent, and when.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -47,7 +47,8 @@ pub trait HarnessPort: Send + Sync + 'static {
 
 /// Most commands a [`SimHarness`] keeps per agent by default; past it, a send is refused `Full`.
 pub const SIM_INBOX: usize = 100_000;
-/// Most agents a [`SimHarness`] knows at once; past it, `open` takes no more.
+/// Most agents a [`SimHarness`] knows at once; past it, `open` takes no more. It keeps what as many
+/// closed agents were sent, the oldest closed going first.
 pub const SIM_AGENTS: usize = 100_000;
 
 /// A command the simulator was handed, and when (its clock's wall time).
@@ -75,12 +76,14 @@ struct SimState<A, C> {
     agents: HashMap<String, A>,
     catalogs: HashMap<String, Value>,
     heard: HashMap<String, Vec<Delivery<C>>>,
+    /// Closed agents whose deliveries are kept, oldest closed first.
+    closed: VecDeque<String>,
     away: HashSet<String>,
 }
 
 impl<A, C> Default for SimState<A, C> {
     fn default() -> Self {
-        Self { order: Vec::new(), agents: HashMap::new(), catalogs: HashMap::new(), heard: HashMap::new(), away: HashSet::new() }
+        Self { order: Vec::new(), agents: HashMap::new(), catalogs: HashMap::new(), heard: HashMap::new(), closed: VecDeque::new(), away: HashSet::new() }
     }
 }
 
@@ -111,6 +114,10 @@ impl<A: Clone, C: Clone> SimHarness<A, C> {
         }
         if st.agents.insert(id.to_owned(), agent).is_none() {
             st.order.push(id.to_owned());
+            // Open again, what it's sent goes on from what it was.
+            if st.heard.contains_key(id) {
+                st.closed.retain(|c| c != id);
+            }
         }
         true
     }
@@ -120,28 +127,48 @@ impl<A: Clone, C: Clone> SimHarness<A, C> {
         self.inner.lock().agents.get_mut(id).map(f).is_some()
     }
 
-    /// Closes agent `id`: no longer known (what it was sent stays readable).
+    /// Closes agent `id`: no longer known. What it was sent stays readable, for the
+    /// [`SIM_AGENTS`] agents closed last.
     pub fn close(&self, id: &str) {
         let mut st = self.inner.lock();
-        st.agents.remove(id);
+        if st.agents.remove(id).is_none() {
+            return;
+        }
         st.order.retain(|o| o != id);
         st.catalogs.remove(id);
         st.away.remove(id);
+        if st.heard.contains_key(id) {
+            st.closed.push_back(id.to_owned());
+        }
+        while st.closed.len() > SIM_AGENTS {
+            if let Some(oldest) = st.closed.pop_front() {
+                st.heard.remove(&oldest);
+            }
+        }
     }
 
-    /// Agent `id`'s machine goes away (`true`) or comes back.
-    pub fn away(&self, id: &str, away: bool) {
+    /// Agent `id`'s machine goes away (`true`) or comes back: false when there's no agent `id`.
+    pub fn away(&self, id: &str, away: bool) -> bool {
         let mut st = self.inner.lock();
+        if !st.agents.contains_key(id) {
+            return false;
+        }
         if away {
             st.away.insert(id.to_owned());
         } else {
             st.away.remove(id);
         }
+        true
     }
 
-    /// What agent `id`'s harness says it takes.
-    pub fn set_catalog(&self, id: &str, catalog: Value) {
-        self.inner.lock().catalogs.insert(id.to_owned(), catalog);
+    /// What agent `id`'s harness says it takes: false, and nothing kept, when there's no agent `id`.
+    pub fn set_catalog(&self, id: &str, catalog: Value) -> bool {
+        let mut st = self.inner.lock();
+        if !st.agents.contains_key(id) {
+            return false;
+        }
+        st.catalogs.insert(id.to_owned(), catalog);
+        true
     }
 
     /// Every command agent `id` was handed, in order.
@@ -205,8 +232,10 @@ pub trait HarnessFixture: Send + Sync {
     fn close<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), Failure>>;
     /// A command that tells an agent `text`.
     fn say(&self, text: &str) -> <Self::Port as HarnessPort>::Command;
-    /// What agent `id` was told, in order (its texts).
-    fn heard<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Vec<String>>;
+    /// What agent `id` was told, in order (its texts); `None` where the implementation can't show
+    /// it (kiln's registry, until sends are acknowledged end to end: CP-T3.3), and the clauses
+    /// that need it fail, saying so.
+    fn heard<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<Vec<String>>>;
     /// An agent's id.
     fn id_of(&self, agent: &<Self::Port as HarnessPort>::Agent) -> String;
 }
@@ -236,9 +265,9 @@ impl HarnessFixture for SimHarnessFixture {
     fn say(&self, text: &str) -> String {
         text.to_owned()
     }
-    fn heard<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Vec<String>> {
+    fn heard<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
         let h = self.0.heard(id).into_iter().map(|d| d.command).collect();
-        Box::pin(async move { h })
+        Box::pin(async move { Some(h) })
     }
     fn id_of(&self, agent: &SimAgent) -> String {
         agent.id.clone()
@@ -247,6 +276,11 @@ impl HarnessFixture for SimHarnessFixture {
 
 fn ids<F: HarnessFixture>(f: &F) -> Vec<String> {
     f.port().agents().iter().map(|a| f.id_of(a)).collect()
+}
+
+/// What agent `id` was told, or why the case can't say.
+async fn heard<F: HarnessFixture>(f: &F, id: &str) -> Result<Vec<String>, Failure> {
+    f.heard(id).await.ok_or_else(|| format!("what {id} was told can't be seen here"))
 }
 
 fn c1<F: HarnessFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
@@ -272,7 +306,7 @@ fn c3<F: HarnessFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
         for t in ["one", "two", "three"] {
             same(&format!("sending {t:?}"), f.port().send("conformance-a", f.say(t)).await, Sent::Delivered)?;
         }
-        let heard = f.heard("conformance-a").await;
+        let heard = heard(f, "conformance-a").await?;
         same("what the agent was told", heard.iter().map(String::as_str).filter(|h| ["one", "two", "three"].contains(h)).collect::<Vec<_>>(), vec!["one", "two", "three"])
     })
 }
@@ -291,7 +325,8 @@ fn c5<F: HarnessFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
         f.open("conformance-a").await?;
         f.open("conformance-b").await?;
         same("sending to a", f.port().send("conformance-a", f.say("for a only")).await, Sent::Delivered)?;
-        ensure(!f.heard("conformance-b").await.iter().any(|h| h == "for a only"), || "what was sent to one agent reached another".into())
+        ensure(heard(f, "conformance-a").await?.iter().any(|h| h == "for a only"), || "what was sent to a didn't reach it".into())?;
+        ensure(!heard(f, "conformance-b").await?.iter().any(|h| h == "for a only"), || "what was sent to one agent reached another".into())
     })
 }
 
@@ -311,11 +346,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_harness_passes_the_harness_port_suite() -> Result<(), String> {
         futures::executor::block_on(run("HarnessPort", &cases::<SimHarnessFixture>(), || async { SimHarnessFixture(SimHarness::default()) })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: the simulator, on the simulated clock, refusing typed.
     #[test]
     fn deliveries_are_stamped_by_the_clock_and_refusals_are_typed() {
         let clock = SimClock::new();
@@ -325,8 +362,36 @@ mod tests {
         assert_eq!(futures::executor::block_on(h.send("a", "first".into())), Sent::Delivered);
         assert_eq!(h.heard("a"), vec![Delivery { at_ms: crate::clock::SIM_EPOCH_MS + 30_000, command: "first".to_owned() }]);
         assert_eq!(futures::executor::block_on(h.send("a", "second".into())), Sent::Full, "its inbox holds one");
-        h.away("a", true);
+        assert!(h.away("a", true));
         assert_eq!(futures::executor::block_on(h.send("a", "third".into())), Sent::Unreachable);
         assert!(h.update("a", |a| a.id = "a".into()) && !h.update("b", |_| {}));
+    }
+
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
+    #[test]
+    fn it_keeps_nothing_for_agents_it_doesn_t_know_and_what_closed_ones_heard_is_bounded() {
+        let h: SimHarness<SimAgent, String> = SimHarness::default();
+        let open = |id: &str| h.open(id, SimAgent { id: id.into() });
+        assert!(!h.set_catalog("never", Value::Null) && !h.away("never", true));
+        assert_eq!(h.catalog("never"), None);
+        // What a closed agent heard stays readable; open again, it goes on from it.
+        assert!(open("a"));
+        assert_eq!(futures::executor::block_on(h.send("a", "before".into())), Sent::Delivered);
+        h.close("a");
+        assert_eq!(h.heard("a").len(), 1);
+        assert!(open("a"));
+        assert_eq!(futures::executor::block_on(h.send("a", "after".into())), Sent::Delivered);
+        assert_eq!(h.heard("a").into_iter().map(|d| d.command).collect::<Vec<_>>(), ["before", "after"]);
+        h.close("a");
+        // Past SIM_AGENTS agents closed since, a's goes.
+        for i in 0..SIM_AGENTS {
+            let id = format!("x{i}");
+            assert!(open(&id));
+            assert_eq!(futures::executor::block_on(h.send(&id, "hi".into())), Sent::Delivered);
+            h.close(&id);
+        }
+        assert!(h.heard("a").is_empty() && h.heard("x0").len() == 1);
+        let st = h.inner.lock();
+        assert_eq!((st.heard.len(), st.closed.len(), st.agents.len()), (SIM_AGENTS, SIM_AGENTS, 0));
     }
 }

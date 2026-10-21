@@ -124,7 +124,8 @@ pub trait Records: Send + Sync + 'static {
     /// Changes to `family` committed after `after`, oldest first, at most `limit`.
     fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>>;
     /// Completes with the newest revision of a change to `family` once there's one after `after`
-    /// (at once when there is already).
+    /// (at once when there is already). Refused `Compacted`, as `changes` is, once the feed no
+    /// longer goes back to `after`.
     fn wait<'a>(&'a self, family: &'a str, after: Rev) -> BoxFuture<'a, Result<Rev, Refusal>>;
     /// The newest commit's revision.
     fn head(&self) -> BoxFuture<'_, Result<Rev, Refusal>>;
@@ -203,8 +204,9 @@ struct SimState {
     families: BTreeMap<String, BTreeMap<Vec<u8>, VecDeque<(Rev, Option<Vec<u8>>)>>>,
     /// Revisions below this may have lost versions (a snapshot there is refused).
     horizon: Rev,
+    /// The feed starts after this revision (a read of changes, or a wait, from before it is
+    /// refused).
     log: VecDeque<(Rev, String, Vec<u8>, Option<Vec<u8>>)>,
-    /// The feed starts after this revision.
     log_horizon: Rev,
     live: usize,
     /// Keys whose newest version is a delete, by that delete's revision.
@@ -245,6 +247,41 @@ impl SimRecords {
         let s = Self::default();
         s.inner.state.lock().limits = limits;
         s
+    }
+
+    /// Forgets the history from before `before` (at most the head), as a compaction does: each
+    /// key keeps the version a snapshot at `before` reads and those after it, a key deleted by
+    /// then goes, and so do the feed's changes from before it. Afterwards snapshots, and the feed,
+    /// from `before` on read as they did; from before it they're refused `Compacted`.
+    pub fn compact(&self, before: Rev) {
+        {
+            let mut st = self.inner.state.lock();
+            let st = &mut *st;
+            let before = before.min(st.head);
+            for keys in st.families.values_mut() {
+                for versions in keys.values_mut() {
+                    while versions.get(1).is_some_and(|(r, _)| *r <= before) {
+                        versions.pop_front();
+                    }
+                }
+            }
+            let kept = st.deleted.split_off(&(before.saturating_add(1), String::new(), Vec::new()));
+            for (_, family, key) in std::mem::replace(&mut st.deleted, kept) {
+                if let Some(keys) = st.families.get_mut(&family) {
+                    keys.remove(&key);
+                    if keys.is_empty() {
+                        st.families.remove(&family);
+                    }
+                }
+            }
+            while st.log.front().is_some_and(|(r, ..)| *r < before) {
+                st.log.pop_front();
+            }
+            st.horizon = st.horizon.max(before);
+            st.log_horizon = st.log_horizon.max(before.saturating_sub(1));
+        }
+        // Waits from before it are refused now, not left waiting.
+        self.inner.changed.notify(usize::MAX);
     }
 }
 
@@ -370,12 +407,13 @@ impl Records for SimRecords {
                     versions.pop_back();
                 }
                 versions.push_back((rev, value.clone()));
-                let mut dropped = None;
+                let mut trimmed = false;
                 while versions.len() > versions_max {
-                    dropped = versions.pop_front().map(|(r, _)| r);
+                    trimmed = versions.pop_front().is_some();
                 }
-                if let Some(r) = dropped {
-                    st.horizon = st.horizon.max(r.saturating_add(1));
+                // A snapshot before the oldest version kept may have read one that went.
+                if let Some(first) = versions.front().map(|(r, _)| *r).filter(|_| trimmed) {
+                    st.horizon = st.horizon.max(first);
                 }
                 st.log.push_back((rev, family, key, value));
                 while st.log.len() > log_max {
@@ -384,7 +422,8 @@ impl Records for SimRecords {
                     }
                 }
             }
-            // Deleted keys past what's kept go, oldest delete first: a snapshot before it is refused.
+            // Deleted keys past what's kept go, oldest delete first: a snapshot before it is refused
+            // (from it on, the key reads as deleted, as it was).
             while st.deleted.len() > st.limits.deleted {
                 let Some((r, family, key)) = st.deleted.pop_first() else { break };
                 if let Some(keys) = st.families.get_mut(&family) {
@@ -393,7 +432,7 @@ impl Records for SimRecords {
                         st.families.remove(&family);
                     }
                 }
-                st.horizon = st.horizon.max(r.saturating_add(1));
+                st.horizon = st.horizon.max(r);
             }
             st.live = live;
             st.head = rev;
@@ -426,6 +465,10 @@ impl Records for SimRecords {
                 let listener = self.inner.changed.listen();
                 {
                     let st = self.inner.state.lock();
+                    // The feed is whole only after its horizon: a change before it may have gone.
+                    if after < st.log_horizon {
+                        return Err(Refusal::Compacted { asked: after, horizon: st.log_horizon });
+                    }
                     if let Some(r) = st.log.iter().rev().find(|(_, f, ..)| f == family).map(|(r, ..)| *r).filter(|r| *r > after) {
                         return Ok(r);
                     }
@@ -446,6 +489,9 @@ impl Records for SimRecords {
 /// What a `Records` conformance suite runs against: an empty store per case.
 pub trait RecordsFixture: Send + Sync {
     fn records(&self) -> &dyn Records;
+    /// Makes the store forget its history from before `before` now, as its compaction would in
+    /// its own time (RECORDS-14).
+    fn compact(&self, before: Rev) -> BoxFuture<'_, ()>;
 }
 
 /// The fixture for a [`SimRecords`].
@@ -454,6 +500,11 @@ pub struct SimRecordsFixture(pub SimRecords);
 impl RecordsFixture for SimRecordsFixture {
     fn records(&self) -> &dyn Records {
         &self.0
+    }
+
+    fn compact(&self, before: Rev) -> BoxFuture<'_, ()> {
+        self.0.compact(before);
+        Box::pin(async {})
     }
 }
 
@@ -661,6 +712,47 @@ fn c13<X: RecordsFixture>(f: &X) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c14<X: RecordsFixture>(f: &X) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let r = f.records();
+        let from = fine("head", r.head().await)?;
+        let r1 = fine("commit", r.commit(tx(vec![put("a", "1"), put("b", "1")])).await)?;
+        let r2 = fine("commit", r.commit(tx(vec![put("a", "2")])).await)?;
+        // Then only another family's: this family's newest change is r2.
+        let other = |v: &str| tx(vec![Write::Put { family: "conformance-other".into(), key: b"x".to_vec(), value: v.as_bytes().to_vec() }]);
+        fine("another family", r.commit(other("1")).await)?;
+        let at = fine("another family", r.commit(other("2")).await)?;
+        f.compact(at).await;
+        // From the compaction's revision on, the store reads as it did.
+        let row = |key: &'static [u8], s: Rev| async move { fine("get", r.get(F, key, Consistency::Snapshot(s)).await).map(|x| x.map(|x| (x.value, x.rev))) };
+        same("a and b at the compaction's revision", (row(b"a", at).await?, row(b"b", at).await?), (Some((b"2".to_vec(), r2)), Some((b"1".to_vec(), r1))))?;
+        same("the feed after it", fine("changes", r.changes(F, at, 10).await)?.changes, Vec::new())?;
+        ensure(futures::FutureExt::now_or_never(r.wait(F, at)).is_none(), || "a wait after it, with no change since, completed".into())?;
+        // From before it: refused Compacted, or answered right, and at once.
+        match r.get(F, b"a", Consistency::Snapshot(r1)).await {
+            Err(Refusal::Compacted { .. }) => {}
+            Ok(Some(x)) if x.value == b"1" && x.rev == r1 => {}
+            other => return Err(format!("a snapshot from before the compaction: {other:?}")),
+        }
+        let whole = vec![
+            Change { rev: r1, key: b"a".to_vec(), value: Some(b"1".to_vec()) },
+            Change { rev: r1, key: b"b".to_vec(), value: Some(b"1".to_vec()) },
+            Change { rev: r2, key: b"a".to_vec(), value: Some(b"2".to_vec()) },
+        ];
+        match r.changes(F, from, 10).await {
+            Err(Refusal::Compacted { .. }) => {}
+            Ok(c) if c.changes == whole => {}
+            other => return Err(format!("the feed from before the compaction: {other:?}")),
+        }
+        match futures::FutureExt::now_or_never(r.wait(F, from)) {
+            Some(Err(Refusal::Compacted { .. })) => Ok(()),
+            Some(Ok(rev)) if rev == r2 => Ok(()),
+            None => Err("a wait from before the compaction, for a change made then, didn't complete".into()),
+            Some(other) => Err(format!("a wait from before the compaction: {other:?}")),
+        }
+    })
+}
+
 /// The `Records` contract, clause by clause (docs/seams.md, "Records").
 pub fn cases<X: RecordsFixture>() -> Vec<Case<X>> {
     vec![
@@ -677,6 +769,7 @@ pub fn cases<X: RecordsFixture>() -> Vec<Case<X>> {
         Case { id: "RECORDS-11", says: "a snapshot read sees the store as it was just after its revision; one ahead of the head is refused Ahead", check: c11::<X> },
         Case { id: "RECORDS-12", says: "bad family names, empty or long keys, large values and large transactions are refused, typed, and write nothing", check: c12::<X> },
         Case { id: "RECORDS-13", says: "a transaction with no writes commits nothing and returns the head; a key written twice in one commit keeps the last", check: c13::<X> },
+        Case { id: "RECORDS-14", says: "after a compaction, snapshots and the feed from its revision on read as before; from before it, a snapshot, a read of changes and a wait are each refused Compacted or answered right, at once", check: c14::<X> },
     ]
 }
 
@@ -685,11 +778,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_store_passes_the_records_suite() -> Result<(), String> {
         futures::executor::block_on(run("Records", &cases::<SimRecordsFixture>(), || async { SimRecordsFixture(SimRecords::new()) })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
     #[test]
     fn its_history_and_rows_are_bounded_and_say_so() {
         let r = SimRecords::with_limits(SimLimits { rows: 2, versions: 2, changes: 3, ..SimLimits::default() });
@@ -707,6 +802,47 @@ mod tests {
         assert!(commit(tx(vec![Write::Delete { family: F.into(), key: b"b".to_vec() }, put("c", "1")])).is_ok());
     }
 
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
+    #[test]
+    fn a_snapshot_between_a_version_dropped_and_the_next_kept_is_refused_not_answered_wrong() {
+        let r = SimRecords::with_limits(SimLimits { versions: 2, ..SimLimits::default() });
+        let commit = |t: Tx| futures::executor::block_on(r.commit(t)).unwrap_or_default();
+        let get = |at: Rev| futures::executor::block_on(r.get(F, b"a", Consistency::Snapshot(at))).map(|x| x.map(|x| x.value));
+        let r1 = commit(tx(vec![put("a", "1")]));
+        let r2 = commit(tx(vec![put("b", "1")]));
+        let r3 = commit(tx(vec![put("a", "3")]));
+        assert_eq!(get(r2), Ok(Some(b"1".to_vec())));
+        // a's version from r1 goes; at r2 it read "1", so a snapshot there is refused from now on.
+        commit(tx(vec![put("a", "4")]));
+        assert_eq!(get(r2), Err(Refusal::Compacted { asked: r2, horizon: r3 }));
+        assert_eq!(get(r1), Err(Refusal::Compacted { asked: r1, horizon: r3 }));
+        assert_eq!(get(r3), Ok(Some(b"3".to_vec())));
+    }
+
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
+    #[test]
+    fn a_wait_from_before_what_the_feed_keeps_is_refused_not_left_waiting() {
+        let r = SimRecords::with_limits(SimLimits { changes: 2, ..SimLimits::default() });
+        let commit = |t: Tx| futures::executor::block_on(r.commit(t)).unwrap_or_default();
+        let other = |v: &str| tx(vec![Write::Put { family: "other".into(), key: b"x".to_vec(), value: v.as_bytes().to_vec() }]);
+        commit(tx(vec![put("a", "1")]));
+        let r2 = commit(other("2"));
+        commit(other("3"));
+        // The family's one change has left the feed, under the other's.
+        commit(other("4"));
+        assert_eq!(futures::FutureExt::now_or_never(r.wait(F, 0)), Some(Err(Refusal::Compacted { asked: 0, horizon: r2 })));
+        assert_eq!(futures::FutureExt::now_or_never(r.changes(F, 0, 10)), Some(Err(Refusal::Compacted { asked: 0, horizon: r2 })));
+        // From the feed's start on, there's nothing to tell: it waits.
+        assert!(futures::FutureExt::now_or_never(r.wait(F, r2)).is_none());
+        // And a wait left waiting while the feed moves past it is refused then.
+        let mut waiting = r.wait(F, r2);
+        assert!(futures::FutureExt::now_or_never(&mut waiting).is_none());
+        commit(other("5"));
+        commit(other("6"));
+        assert!(matches!(futures::executor::block_on(waiting), Err(Refusal::Compacted { asked, .. }) if asked == r2));
+    }
+
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
     #[test]
     fn deleted_keys_past_what_s_kept_go_and_snapshots_before_them_are_refused() {
         let r = SimRecords::with_limits(SimLimits { deleted: 2, ..SimLimits::default() });
@@ -719,6 +855,10 @@ mod tests {
         // Three deleted, two kept: a's went, and a snapshot from before it is refused.
         assert!(matches!(futures::executor::block_on(r.get(F, b"b", Consistency::Snapshot(before))), Err(Refusal::Compacted { .. })));
         assert_eq!(futures::executor::block_on(r.get(F, b"a", Consistency::Linearizable)), Ok(None));
+        // From its delete on, a reads as deleted, as it was, and b as it was.
+        let a_went = before.saturating_add(1);
+        assert_eq!(futures::executor::block_on(r.get(F, b"a", Consistency::Snapshot(a_went))), Ok(None));
+        assert_eq!(futures::executor::block_on(r.get(F, b"b", Consistency::Snapshot(a_went))).ok().flatten().map(|x| x.value), Some(b"1".to_vec()));
         // A key put again is no longer a deleted one.
         assert!(commit(tx(vec![put("b", "2")])).is_ok());
         assert_eq!(futures::executor::block_on(r.get(F, b"b", Consistency::Linearizable)).ok().flatten().map(|x| x.value), Some(b"2".to_vec()));

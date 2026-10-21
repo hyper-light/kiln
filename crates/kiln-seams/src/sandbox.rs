@@ -111,19 +111,25 @@ pub enum Refusal {
     Ended,
 }
 
-/// A run under way.
+/// A run under way: what it's given on stdin, what it says (its output, then its end, once), and
+/// a way to end it.
 pub trait Run: Send + Sync {
+    /// Gives the program `bytes` on its stdin, after what it was given before; refused `Ended`
+    /// once the run has ended.
     fn stdin<'a>(&'a self, bytes: Vec<u8>) -> BoxFuture<'a, Result<(), Refusal>>;
+    /// Closes its stdin: the program reads the end of its input.
     fn close_stdin(&self);
     /// What it says next; `None` once its end has been given.
     fn next(&self) -> BoxFuture<'_, Option<Output>>;
+    /// Ends it, unless it has ended: its end is then `Exited(Killed)`.
     fn kill(&self);
 }
 
 /// Harnesses launched in boundaries.
 pub trait Sandbox: Send + Sync + 'static {
+    /// Starts `launch` in its boundary, within its limits; refused, typed, when it can't.
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>>;
-    /// The boundaries it can hold runs in (`host`, `microvm`).
+    /// The boundaries it can hold runs in, by name (`host`, `container`, `microvm`).
     fn boundaries(&self) -> Vec<&'static str>;
 }
 
@@ -532,11 +538,13 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_sandbox_passes_the_sandbox_suite() -> Result<(), String> {
         futures::executor::block_on(run("Sandbox", &cases::<SimSandboxFixture>(), || async { SimSandboxFixture::default() })).into_result().map(|_| ())
     }
 
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
     #[test]
     fn a_microvm_is_refused_as_unsupported_and_runs_are_bounded() {
         let s = SimSandbox::new();

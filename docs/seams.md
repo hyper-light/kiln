@@ -22,7 +22,8 @@ are stamped with), and sleeps.
 
 - **Implementations:** `kiln::rt::RtClock` (kiln's runtime: `Instant`, the system's clock, the
   runtime's timers); `kiln_seams::clock::SimClock`, whose time moves only when a test moves it
-  (`advance`, `advance_to_next`), its sleeps waking in deadline order. A test waits for the code
+  (`advance`, `advance_to_next`), its sleeps waking in deadline order, at most 1,048,576 of them
+  waiting (one more completes at once, and `refusals()` counts it). A test waits for the code
   under test to come round to its next sleep (`sleeping_since`, `advance_and_settle`) without
   sleeping itself.
 - **Used by:** the goal driver (`goals/mod.rs`, through the hub's clock) and the harness host
@@ -67,7 +68,9 @@ Every record kiln keeps, by family and key, each at the revision of the commit t
 - **Implementations:** Amphora's typed records (CP-T1.5, which takes this suite past 200 cases);
   `kiln_seams::records::SimRecords`: linearizable, snapshot reads from each key's last 32
   versions and the last 100,000 deleted keys' histories (older: refused `Compacted`), a change
-  feed of the last 100,000 changes, a million rows.
+  feed of the last 100,000 changes (a read of changes or a wait from before it: refused
+  `Compacted`), a million rows. Its `compact` forgets the history before a revision at once,
+  as a compaction does; a suite's fixture makes its store do that for RECORDS-14.
 - **Used by:** goal stacks, goal items, plans, plan runs and keep-going, once CP-T1.5 moves them
   off rusqlite; the session journal (CP-T3.1).
 - **Passed by:** the simulator, every clause; Amphora's, when CP-T1.5 lands it.
@@ -89,6 +92,7 @@ Methods: `get`, `scan`, `commit`, `changes`, `wait`, `head`.
 - **RECORDS-11** a snapshot read sees the store as it was just after its revision; one ahead of the head is refused Ahead
 - **RECORDS-12** bad family names, empty or long keys, large values and large transactions are refused, typed, and write nothing
 - **RECORDS-13** a transaction with no writes commits nothing and returns the head; a key written twice in one commit keeps the last
+- **RECORDS-14** after a compaction, snapshots and the feed from its revision on read as before; from before it, a snapshot, a read of changes and a wait are each refused Compacted or answered right, at once
 
 ## Bus
 
@@ -152,7 +156,8 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 
 Secrets by path, after AWS Secrets Manager and Vault: versions, the stages `AWSCURRENT`,
 `AWSPREVIOUS` and `AWSPENDING`, scheduled deletes, and leases. A value never shows: its `Debug`
-and `Display` say only how long it is, and its bytes are overwritten when it's dropped.
+and `Display` say only how long it is, and dropped, its buffer is zeroed (`zeroize`): a copy made
+of it is the copy's to clear.
 
 - **Implementations:** Veil (CP-T8.1); `kiln_seams::secrets::SimSecrets`: in memory, timed by its
   clock, 100,000 secrets and leases.
@@ -160,8 +165,8 @@ and `Display` say only how long it is, and its bytes are overwritten when it's d
   lands Veil.
 - **Passed by:** the simulator, every clause; Veil, when CP-T8.1 lands it.
 - **Bounds:** names 1 to 512 of `A-Z a-z 0-9 / _ + = . @ -` and values to 64 KiB (Secrets
-  Manager's); 100 versions kept a secret (the oldest without a stage go first); deletes 7 to 30
-  days out (Secrets Manager's); leases up to a day.
+  Manager's); 100 names a listing; 100 versions kept a secret (the oldest without a stage go
+  first); deletes 7 to 30 days out (Secrets Manager's); leases up to a day.
 
 Methods: `create`, `put`, `get`, `promote`, `describe`, `list`, `delete`, `restore`, `lease`, `read_leased`, `renew`, `revoke`.
 
@@ -225,6 +230,11 @@ refused a process that copes and ends well ends with its code.
 
 Methods: `launch`, `boundaries`.
 
+A launch gives a `Run`: stdin given to it in order, what it says (its output, then its end, once),
+and a kill (its end, unless it had one, is `Killed`).
+
+Methods of Run: `stdin`, `close_stdin`, `next`, `kill`.
+
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
 - **SANDBOX-2** stdin reaches the program in order, and closing it is the end of its input
 - **SANDBOX-3** a run's stderr and exit code are said as they are, and its end comes once, last
@@ -267,8 +277,9 @@ command catalog), and commands to them. Generic over kiln's types: an agent is k
 
 - **Implementations:** kiln's harness registry (`harness/port.rs`: the hub's own sessions and every
   runner's); `kiln_seams::harness::SimHarness`, which keeps agents in memory and records each
-  command it's handed, stamped by its clock: 100,000 agents, and 100,000 commands an agent (past
-  it, refused `Full`).
+  command it's handed, stamped by its clock: 100,000 agents, what the 100,000 closed last were
+  sent, and 100,000 commands an agent (past it, refused `Full`). It keeps nothing for an agent
+  it doesn't know (a catalog, a machine away).
 - **Used by:** the goal driver and keep-going (`goals/mod.rs`, `goals/keep.rs`); the inbox and the
   dispatcher of sends (CP-T3.2, CP-T3.3).
 - **Passed by:** the simulator, every clause. kiln's registry passes HARNESS-1, HARNESS-2 and

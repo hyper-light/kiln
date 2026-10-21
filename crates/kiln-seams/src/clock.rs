@@ -455,6 +455,7 @@ mod tests {
     use super::*;
     use crate::conformance::run;
 
+    /// CP-M2, AC-M2.2: the simulator and its suite.
     #[test]
     fn the_simulated_clock_passes_the_clock_suite() -> Result<(), String> {
         let n = futures::executor::block_on(run("Clock", &cases::<SimClockFixture>(), || async { SimClockFixture(SimClock::new()) })).into_result()?;
@@ -462,6 +463,7 @@ mod tests {
         Ok(())
     }
 
+    /// CP-M2, AC-M2.2: the simulator, as the goal driver's and the harness host's tests use it.
     #[test]
     fn time_moves_only_when_moved_and_sleepers_wake_in_deadline_order() {
         let c = SimClock::new();
@@ -482,6 +484,7 @@ mod tests {
         assert_eq!(c.sleepers(), 0, "completed sleeps are forgotten");
     }
 
+    /// CP-M2, AC-M2.2: the simulator, bounded, refusing typed past its bounds.
     #[test]
     fn a_dropped_sleep_is_forgotten() {
         let c = SimClock::new();
@@ -493,6 +496,7 @@ mod tests {
         assert_eq!(c.next_deadline(), None);
     }
 
+    /// CP-M2, AC-M2.3: how a test waits for the code under test without sleeping on the wall clock.
     #[test]
     fn a_test_waits_for_the_code_under_test_to_come_round_to_its_next_sleep() {
         let c = SimClock::new();

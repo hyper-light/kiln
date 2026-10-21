@@ -788,7 +788,8 @@ mod tests {
         assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS, false), Next::Remind { worked: true, .. }));
     }
 
-    /// CP-M2's test (docs/seams.md): the driver's reminder back-off, under the simulated clock. An
+    /// CP-M2's test, T-M2.1 (and AC-M2.1: the goal driver on the simulated clock in tests): the
+    /// driver's reminder back-off, under the simulated clock. An
     /// agent stops short of its goal again and again: it's sent the goal 30 s after the goal joined
     /// its stack, then each time twice the gap before, up to 15 minutes, each at exactly its time and
     /// none in between (a tick short of each, nothing has gone).
