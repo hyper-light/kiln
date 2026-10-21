@@ -795,6 +795,29 @@ mod tests {
         }
     }
 
+    /// CP-T6.1: a file sync writes is made durable through a handle to read: a blob a strict umask
+    /// made read-only still goes into the other copy (its bytes synced before its name).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_blob_still_goes_into_the_folder() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut t = Two::new()?;
+        Two::write(&t.a, "notes.txt", "kept read-only")?;
+        t.propose('a', 1_000)?;
+        for step in &t.log {
+            for c in &step.changes {
+                if let Some(Version::File { hash, .. }) = &c.to
+                    && let Some(blob) = t.blobs.path(hash)
+                {
+                    std::fs::set_permissions(blob, std::fs::Permissions::from_mode(0o400))?;
+                }
+            }
+        }
+        t.sync()?;
+        assert_eq!(Two::read(&t.b, "notes.txt").as_deref(), Some("kept read-only"));
+        Ok(())
+    }
+
     #[test]
     fn a_change_on_either_machine_reaches_the_other() -> anyhow::Result<()> {
         let mut t = Two::new()?;

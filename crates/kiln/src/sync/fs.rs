@@ -209,8 +209,16 @@ impl Fs for Std {
         std::fs::create_dir_all(path)
     }
 
+    #[cfg(unix)]
     fn sync_file(&self, path: &Path) -> io::Result<()> {
-        // Opened to write (Windows flushes only what it may write), never cut short.
+        // A handle to read does: fsync needs no right to write, whatever the file's mode (a blob a
+        // strict umask made read-only is copied with it).
+        std::fs::File::open(path)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        // Windows flushes only what it may write; opened so, never cut short.
         std::fs::OpenOptions::new().write(true).open(path)?.sync_all()
     }
 
