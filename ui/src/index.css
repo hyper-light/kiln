@@ -97,6 +97,19 @@
     font: inherit;
     color: inherit;
   }
+  /* A native list draws its own menu: on Windows in its options' colours, else in the system's
+     white under the light text a select inherits here. Every one in kiln's dark. */
+  select {
+    color-scheme: dark;
+  }
+  option,
+  optgroup {
+    background-color: #131417;
+    color: #e3e4e9;
+  }
+  option:disabled {
+    color: #6f7380;
+  }
   button {
     cursor: pointer;
     background: none;
