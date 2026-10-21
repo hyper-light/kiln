@@ -28,11 +28,24 @@ struct Seen {
     deleted: Vec<String>,
     /// The most pods alive at once.
     peak: usize,
+    /// The pods alive now, by name: their processes, which go when the stand-in does.
+    alive: BTreeMap<String, u32>,
 }
 
 struct Kube {
     port: u16,
     seen: Arc<Mutex<Seen>>,
+}
+
+/// The pods still alive as a test ends go with it, as a cluster's would with the test's namespace:
+/// left, each would go on trying for a server that's gone.
+impl Drop for Kube {
+    fn drop(&mut self) {
+        let alive: Vec<u32> = self.seen.lock().map(|s| s.alive.values().copied().collect()).unwrap_or_default();
+        for pid in alive {
+            let _ = Command::new("kill").arg(pid.to_string()).output();
+        }
+    }
 }
 
 fn decode(s: &str) -> String {
@@ -164,6 +177,9 @@ impl Kube {
                         let child = run(&dir, &object);
                         if let Ok(mut s) = keep.lock() {
                             s.created.push(object.clone());
+                            if let Some(c) = &child {
+                                s.alive.insert(name.clone(), c.id());
+                            }
                         }
                         pods.insert(name, Pod { object: object.clone(), child });
                         (201, object)
@@ -180,6 +196,7 @@ impl Kube {
                             }
                             if let Ok(mut s) = keep.lock() {
                                 s.deleted.push((*name).to_owned());
+                                s.alive.remove(*name);
                             }
                             (200, json!({ "kind": "Status", "status": "Success" }))
                         }
