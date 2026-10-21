@@ -31,6 +31,12 @@ type_complexity = "allow"
 [profile.dev.package.sha2]
 opt-level = 3
 
+# SQLite (the store's engine, built from C by rusqlite's libsqlite3-sys) optimized in dev and test
+# builds too: unoptimized, a store's migrations alone took a scratch hub 75 ms; optimized, about 20
+# (every test that opens a store, CP-M2's test timings among them).
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

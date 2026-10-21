@@ -48,6 +48,17 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Write a file atomically with the given mode (temp file + rename; the mode is Unix-only).
 pub fn write_secret(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    write_private(path, contents, mode, true)
+}
+
+/// As [`write_secret`], without waiting for the disk: scratch files a crash may lose (a test's
+/// throwaway keys).
+#[cfg(test)]
+pub fn write_secret_unsynced(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    write_private(path, contents, mode, false)
+}
+
+fn write_private(path: &Path, contents: &[u8], mode: u32, sync: bool) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -57,7 +68,9 @@ pub fn write_secret(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
         let mut f = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(true).write(true), mode)
             .open(&tmp)?;
         f.write_all(contents)?;
-        f.sync_all()?;
+        if sync {
+            f.sync_all()?;
+        }
     }
     std::fs::rename(&tmp, path)
 }

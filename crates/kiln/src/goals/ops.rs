@@ -150,10 +150,17 @@ mod tests {
         }
     }
 
+    /// On a hub with a simulated clock: goals' times are its (CP-M2, AC-M2.1).
     #[test]
     fn an_agent_steers_the_goals_and_plans_of_itself_and_its_own_only() -> anyhow::Result<()> {
         within(async {
-            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            // On a simulated clock (goals' times are its), with no conversation store: what's
+            // steered is goals and plans, not conversations.
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
