@@ -693,8 +693,9 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool, push: bo
         return Next::Wait;
     }
     // Yours goes now: behind a turn under way (its harness queues it), but not to an agent still
-    // starting, whose goal command isn't known yet (`how`).
-    let pushed = push && info.status != Status::Starting;
+    // starting, whose goal command isn't known yet (`how`), nor to one whose machine is away (it
+    // goes when it's back).
+    let pushed = push && !matches!(info.status, Status::Starting | Status::Disconnected);
     // Nothing waiting on you or in its queue; stopped counts (a message starts it again).
     let idle = matches!(info.status, Status::Idle | Status::Exited) && info.approvals.is_empty() && info.queued == 0;
     // Not while agents it started are at work: it ended its turn to let them, and is told when each
@@ -1013,6 +1014,9 @@ mod tests {
         // Yours goes now, behind the turn under way; not to an agent still starting, nor at a usage limit.
         assert!(matches!(decide(&stack(vec![resumed.clone()]), Some(&info(Status::Running, None)), LATER, true, true), Next::Remind { fresh: true, .. }));
         assert!(matches!(decide(&stack(vec![resumed.clone()]), Some(&info(Status::Starting, None)), LATER, true, true), Next::Busy { .. }));
+        // Its machine away: it goes once it's back, as soon as it's idle.
+        assert!(matches!(decide(&stack(vec![resumed.clone()]), Some(&info(Status::Disconnected, None)), LATER, true, true), Next::Wait));
+        assert!(matches!(decide(&stack(vec![resumed.clone()]), Some(&info(Status::Idle, None)), LATER, true, false), Next::Remind { fresh: true, .. }));
         let pause = crate::harness::model::Pause { reason: "limit".into(), since: 1, auto: true, by: "harness".into(), ..Default::default() };
         assert!(matches!(decide(&stack(vec![resumed]), Some(&Info { pause: Some(pause), ..info(Status::Idle, None) }), LATER, false, true), Next::Wait));
         // Sent again as it first went (not as a reminder).

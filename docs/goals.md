@@ -31,8 +31,8 @@ each with how it came out; a field to add goals (a line each); and:
   another before it and it goes back among them (cleared in the agent) while that one goes next;
   give it other words and it goes to the agent again as they say; take its line out and it's
   skipped. Reordering, rewording, removing and adding the goals to come is the same box.
-- **Try it again** or **Go on to the next**, after a goal that ended without being met (stacks from
-  before goals were kept to the end).
+- **Try it again** or **Go on to the next**, after a goal that ended without being met, with none
+  under way (stacks from before goals were kept to the end); with a goal under way, **Resume**.
 - **Clear**: empty the stack; a goal still set in the harness is cleared there too. The goals are
   kept: **Bring back** puts them back as they were (after any goals done since, before any to come)
   and runs the stack, the goal that was under way going to the agent again at once. Only the last
