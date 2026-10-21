@@ -6730,8 +6730,9 @@ and AC02.
 - *Done.* AC06: the UI suite (W21-AC01) runs in kiln's own CI, `.kiln/ci.yaml`'s `ui-checks`
   (`ci/ui/run-all.sh`).
 - *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03 and AC05; the rest of F-21; an authenticated way for legs to
-  read github.com's API (W18's egress proxy).
+  with test tenants (W11-AC03); AC03 and AC05; F-21's last two (`azure/login` with a tenant,
+  `attest-build-provenance` with GitHub's Sigstore); an authenticated way for legs to read
+  github.com's API (W18's egress proxy).
 
 ---
 
@@ -6994,7 +6995,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET · POST | `/api/agents` · POST `/api/agents/:name/probe` (built: runners are kiln's agents) | `ci.runners.list`, `ci.runners.probe` (its facts probed again now) | runners.read, runners.manage | W13 |
 | GET/PUT/DELETE | `/api/ci/pools[/:name]` · GET `/:name/history` | `ci.pools.list`, `.get`, `.set`, `.delete`, `.history` | pools.manage | W13, W21 |
 | GET/POST | `/api/ci/images` · POST `/validate` · POST `/build` (built) | `ci.images.list`, `.propose`, `.validate`, `.build` | images.build | W13, W21 |
-| GET | `/api/ci/registry/mirrors` | `ci.registry.mirrors` (what a machine pulls through kiln with: Docker's `registry-mirrors`, containerd's `hosts.toml`) | runners.read | W12 |
+| GET | `/api/ci/registry/mirrors` | `ci.registry.mirrors` (what a machine pulls through kiln with: Docker's registry mirrors, containerd's host files) | runners.read | W12 |
 | GET/PUT | `/api/ci/routing/rules?scope=` · POST `/explain` | `ci.routing.rules`, `.set`, `.explain` | routing.manage, runs.read | W05 |
 | GET/POST/PATCH/DELETE | `/api/ci/environments[/:name]` · GET `/board` · POST `/starter` | `ci.environments.list`, `.get`, `.save`, `.delete`, `.board`, `.starter` | environments.manage | W15 |
 | GET | `/api/ci/environments/:name/deployments` | `ci.environments.deployments` | runs.read | W15 |
