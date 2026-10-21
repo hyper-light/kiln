@@ -51,6 +51,10 @@ pub struct AssignmentV2 {
     /// `environment.url`, evaluated after its steps too (W15-R04).
     #[serde(default)]
     pub environment_url: Option<Tpl>,
+    /// The environment the job is bound to (W15-R04): where `kiln/deploy@v1` deploys on the runner
+    /// itself, for a `container` or `microvm` one (W15-R02).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Bound>,
     pub contexts: Contexts,
     /// Secrets the leg may read (W09 narrows them to what it references).
     pub secrets: Vec<Secret>,
@@ -89,6 +93,17 @@ pub struct AssignmentV2 {
     /// `None` when they connect freely.
     #[serde(default)]
     pub network: Option<Network>,
+}
+
+/// A job's environment, as its runner deploys to it (W15-R02).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bound {
+    pub name: String,
+    /// One of `kubernetes`, `host`, `container`, `microvm`, `platform`; `None` for one with no
+    /// targets of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// A leg's egress (W18-R08): the hosts it may reach (`*.example.com`, `host:port`) besides kiln's

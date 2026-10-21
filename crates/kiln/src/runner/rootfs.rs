@@ -27,6 +27,42 @@ pub struct Rootfs {
     /// Its config's `Env`.
     pub env: Vec<(String, String)>,
     pub digest: String,
+    /// What it runs, as its config says (a deployment's service, W15-R02).
+    pub runs: Runs,
+}
+
+/// What an image runs: its config's `Entrypoint`, `Cmd`, `WorkingDir`, `User` and `Healthcheck`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Runs {
+    pub entrypoint: Vec<String>,
+    pub cmd: Vec<String>,
+    pub workdir: String,
+    pub user: String,
+    pub health: Option<guest::Health>,
+}
+
+/// What `cfg` (an image's config) runs. Its health check's durations are in nanoseconds, 0 for
+/// Docker's defaults (30 seconds each, three retries, no start period).
+pub fn runs_of(cfg: &serde_json::Value) -> Runs {
+    use serde_json::Value;
+    let c = cfg.get("config").cloned().unwrap_or_default();
+    let list = |v: Option<&Value>| -> Vec<String> { v.and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default() };
+    let text = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let secs = |v: Option<&Value>, default: u64| v.and_then(Value::as_u64).filter(|ns| *ns > 0).map_or(default, |ns| (ns / 1_000_000_000).max(1));
+    let health = c.get("Healthcheck").and_then(|h| {
+        let test = list(h.get("Test"));
+        match test.first().map(String::as_str) {
+            None | Some("NONE") => None,
+            Some(_) => Some(guest::Health {
+                test,
+                interval_secs: secs(h.get("Interval"), 30),
+                timeout_secs: secs(h.get("Timeout"), 30),
+                retries: h.get("Retries").and_then(Value::as_u64).and_then(|r| u32::try_from(r).ok()).filter(|r| *r > 0).unwrap_or(3),
+                start_secs: h.get("StartPeriod").and_then(Value::as_u64).map_or(0, |ns| ns / 1_000_000_000),
+            }),
+        }
+    });
+    Runs { entrypoint: list(c.get("Entrypoint")), cmd: list(c.get("Cmd")), workdir: text("WorkingDir"), user: text("User"), health }
 }
 
 /// One at a time for `key` in this process (an image's build, kiln's disk).
@@ -86,22 +122,23 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     let images = cache.join("images");
     let (path, about) = (images.join(format!("{hex}.ext4")), images.join(format!("{hex}.json")));
     let _one = lock(&format!("image-{hex}")).await;
-    if path.is_file()
-        && let Ok(text) = std::fs::read(&about)
-        && let Ok(env) = serde_json::from_slice::<Vec<(String, String)>>(&text)
-    {
-        return Ok(Rootfs { path, env, digest: pulled.digest });
-    }
-    std::fs::create_dir_all(&images)?;
     let blobs = cache.join("blobs");
     std::fs::create_dir_all(&blobs)?;
     let blob = |d: &str| blobs.join(d.trim_start_matches("sha256:"));
-    // Its config, for its environment.
+    // Its config: its environment, and what it runs.
     let config = blob(&pulled.config);
     if !config.is_file() {
         oci::blob_to(&registry, &reference.repository, &pulled.config, &config).await.context("the image's config")?;
     }
     let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?).context("the image's config doesn't read")?;
+    let runs = runs_of(&cfg);
+    if path.is_file()
+        && let Ok(text) = std::fs::read(&about)
+        && let Ok(env) = serde_json::from_slice::<Vec<(String, String)>>(&text)
+    {
+        return Ok(Rootfs { path, env, digest: pulled.digest, runs });
+    }
+    std::fs::create_dir_all(&images)?;
     let env: Vec<(String, String)> =
         cfg.pointer("/config/Env").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.as_str()?.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect();
     // Its layers, each once.
@@ -133,7 +170,7 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     }
     std::fs::write(&about, serde_json::to_vec(&env)?)?;
     std::fs::rename(&part, &path)?;
-    Ok(Rootfs { path, env, digest: pulled.digest })
+    Ok(Rootfs { path, env, digest: pulled.digest, runs })
 }
 
 /// The build itself, in `work`: the layers' disk made, an empty root file system at `out` sized

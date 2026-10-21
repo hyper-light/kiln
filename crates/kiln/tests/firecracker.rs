@@ -78,6 +78,12 @@ fn vm_server(dir: &Path, fc: &Path, kernel: &Path, more: &str) -> anyhow::Result
 /// `content` committed at `path` and pushed; the run it starts, once it has a leg: its id and its
 /// first leg's.
 fn push_run(s: &Server, home: &Path, work: &Path, push: &str, path: &str, content: &str) -> anyhow::Result<(String, String)> {
+    let newest = || -> anyhow::Result<(String, String)> {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
+        let run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok((run, body))
+    };
+    let (before, _) = newest()?;
     let file = work.join(path);
     if let Some(d) = file.parent() {
         std::fs::create_dir_all(d)?;
@@ -88,9 +94,10 @@ fn push_run(s: &Server, home: &Path, work: &Path, push: &str, path: &str, conten
     git(home, work, &["push", "-q", push, "HEAD:main"])?;
     let (mut run, mut leg) = (String::new(), String::new());
     until(s, 120, "the run's leg", || {
-        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
-        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
-        if run.is_empty() {
+        let body;
+        (run, body) = newest()?;
+        // This push's run, not one before it.
+        if run.is_empty() || run == before {
             return Ok(Some(body));
         }
         let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
@@ -308,5 +315,109 @@ fn w13_r05_docker_actions_in_a_microvm_with_docker() -> anyhow::Result<()> {
     let host = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
     let said = log.lines().find_map(|l| l.split("from-a-docker-action-on-").nth(1)).unwrap_or_default().trim().to_owned();
     assert!(!said.is_empty() && said != host.trim(), "the action ran in the microVM's Docker, on its kernel: {log}");
+    Ok(())
+}
+
+/// F-21's `setup-qemu-action` (W22-AC02), which changes the kernel's binfmt and so needs a runner
+/// of its own: in a microVM with Docker, it registers its emulators with the guest's kernel, and an
+/// arm64 container runs. Needs github.com (the action) and Docker Hub (its images).
+#[test]
+fn w22_ac02_setup_qemu_in_a_microvm() -> anyhow::Result<()> {
+    let Some((fc, kernel)) = machine() else {
+        eprintln!("skipped: KILN_TEST_FIRECRACKER and KILN_TEST_FIRECRACKER_KERNEL don't name Firecracker and its kernel, or /dev/kvm can't be opened");
+        return Ok(());
+    };
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let docker = "\n[[ci.routing]]\nmatch = { labels = [\"dockervm\"] }\nexecutor = [\"firecracker\"]\nimage = \"docker.io/library/docker:dind\"\n";
+    let (s, home, work, push) = vm_server(dir.path(), &fc, &kernel, docker)?;
+    let workflow = "on: push\njobs:\n  qemu:\n    runs-on: dockervm\n    steps:\n      - uses: docker/setup-qemu-action@v3\n        with:\n          platforms: arm64\n      - run: echo \"machine=$(docker run --rm --platform linux/arm64 alpine:3.20 uname -m)\"\n";
+    let (run, leg) = push_run(&s, &home, &work, &push, ".github/workflows/qemu.yml", workflow)?;
+    until(&s, 1800, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        let done = runs.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id") == Some(&json!(run)) && r.get("finished_at").is_some_and(|f| !f.is_null()));
+        Ok((!done).then_some(body))
+    })?;
+    let (about, log) = leg_and_log(&s, &leg)?;
+    assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{about}\n{log}\n{}", s.log());
+    assert!(log.contains("machine=aarch64"), "an arm64 container, emulated in the microVM: {log}");
+    Ok(())
+}
+
+/// A free port on this machine's loopback.
+fn free_port() -> anyhow::Result<u16> {
+    Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+}
+
+/// What `GET /` on this machine's `port` answers (its body), or why it didn't.
+fn fetch(port: u16) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    let mut answer = String::new();
+    s.read_to_string(&mut answer)?;
+    Ok(answer.split_once("\r\n\r\n").map(|(_, body)| body.trim().to_owned()).unwrap_or(answer))
+}
+
+/// The Firecracker processes booted from under `dir`.
+fn microvms_under(dir: &Path) -> Vec<u32> {
+    let under = dir.to_string_lossy().into_owned();
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
+        .filter(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains("--config-file") && String::from_utf8_lossy(&c).contains("firecracker")))
+        .filter(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|d| d.to_string_lossy().starts_with(&under)))
+        .collect()
+}
+
+/// W15-R02 (AC03's `microvm` part): a `microvm` environment's deployment. A job bound to it deploys
+/// an image (busybox's `httpd`, serving what its command wrote) as a microVM of its own on this
+/// runner: the step waits until it answers its health check, it answers on this runner's port
+/// after its job has ended, and the next deployment takes the port over, the one before ending.
+/// They end with the runner.
+#[test]
+fn w15_r02_a_microvm_environment_deploys_an_image() -> anyhow::Result<()> {
+    let Some((fc, kernel)) = machine() else {
+        eprintln!("skipped: KILN_TEST_FIRECRACKER and KILN_TEST_FIRECRACKER_KERNEL don't name Firecracker and its kernel, or /dev/kvm can't be opened");
+        return Ok(());
+    };
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let (s, home, work, push) = vm_server(dir.path(), &fc, &kernel, "")?;
+    let (st, body) = http(s.port, "PUT", "/api/ci/environments/web?repo=acme/vm", &s.admin, Some(&json!({ "kind": "microvm", "targets": { "runners": "label local" } })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let port = free_port()?;
+    let deploy = |says: &str| {
+        format!(
+            "on: push\njobs:\n  ship:\n    runs-on: local\n    environment: web\n    steps:\n      - uses: kiln/deploy@v1\n        with:\n          environment: web\n          image: docker.io/library/busybox:1.36\n          command: mkdir -p /www && echo {says} > /www/index.html && exec httpd -f -p 8080 -h /www\n          ports: 127.0.0.1:{port}:8080\n          health: http://127.0.0.1:8080/\n          timeout: 10m\n"
+        )
+    };
+    for says in ["one", "two"] {
+        let (run, leg) = push_run(&s, &home, &work, &push, ".kiln/ship.yaml", &deploy(says))?;
+        until(&s, 900, "the deployment's run", || {
+            let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
+            let runs: Value = serde_json::from_str(&body)?;
+            let done = runs.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id") == Some(&json!(run)) && r.get("finished_at").is_some_and(|f| !f.is_null()));
+            Ok((!done).then_some(body))
+        })?;
+        let (about, log) = leg_and_log(&s, &leg)?;
+        assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{about}\n{log}\n{}", s.log());
+        assert!(log.contains("Healthy"), "it waited until it was healthy: {log}");
+        // After its job, on this runner's port.
+        let got = fetch(port).map_err(|e| anyhow::anyhow!("GET / on {port}: {e}\n{log}\n{}", s.log()))?;
+        assert_eq!(got, says, "the deployment answers after its job: {log}");
+    }
+    // The second took over from the first, which ended.
+    let vms = microvms_under(dir.path());
+    assert_eq!(vms.len(), 1, "one deployment's microVM runs: {vms:?}");
+    // And it ends with its runner.
+    drop(s);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !microvms_under(dir.path()).is_empty() {
+        anyhow::ensure!(Instant::now() < deadline, "the deployment's microVM outlived its runner: {:?}", microvms_under(dir.path()));
+        std::thread::sleep(Duration::from_millis(500));
+    }
     Ok(())
 }

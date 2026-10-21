@@ -29,7 +29,7 @@ const fn input(name: &'static str, description: &'static str, default: Option<&'
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "deploy",
-        description: "Release an app in the job's environment through kiln's deploy service (W15-R05: CI drives CD), and follow the release to its end: its gates (approvals, windows, soak), its delivery, synced and healthy. The job must be bound to the environment (`environment:`), whose protection passed before it started.",
+        description: "Release an app in the job's environment through kiln's deploy service (W15-R05: CI drives CD), and follow the release to its end: its gates (approvals, windows, soak), its delivery, synced and healthy. A `container` or `microvm` environment's deployment is made on this runner instead (W15-R02). The job must be bound to the environment (`environment:`), whose protection passed before it started.",
         inputs: &[
             input("app", "The app (when left out, the one app that names this repository as its `source` and is registered in the environment).", None),
             Input { name: "environment", description: "Where: the job's environment.", default: None, required: true },
@@ -37,10 +37,24 @@ pub const BUILTINS: &[Builtin] = &[
             input("artifacts", "What it deploys that the run built, as JSON: `{\"web\": {\"repository\": …, \"tag\": …, \"digest\": …}}`.", None),
             input("wait", "`synced` (done once the provider has it synced and healthy) or `healthy` (done when the release succeeds: healthy through the environment's settle time).", Some("healthy")),
             input("timeout", "How long to follow it (`30m`, `1h`); past it the step fails, the release goes on.", Some("30m")),
+            input("compose", "A `container` environment's deployment (W15-R02): a Compose file, which goes up on this runner as the environment's project, running and healthy.", None),
+            input("images", "Or images, one a line, each a service of the environment's project.", None),
+            input("image", "A `microvm` environment's deployment (W15-R02): an image, run as a long-lived microVM of its own on this runner.", None),
+            input("command", "What the microVM runs in place of the image's command: a JSON array, or a line for `/bin/sh -c`.", None),
+            input("env", "The microVM's service's environment: `NAME=value`, one a line.", None),
+            input("ports", "This runner's ports that reach the microVM's: `8080:80` or `127.0.0.1:8080:80`, one a line.", None),
+            input(
+                "health",
+                "How the microVM's service is known to be healthy: a URL it answers (`http://127.0.0.1:8080/healthz`), or a command run in there (else the image's `HEALTHCHECK`, else that it runs).",
+                None,
+            ),
+            input("vcpus", "The microVM's vCPUs.", Some("1")),
+            input("memory", "The microVM's memory (`512M`, `2G`).", Some("512M")),
         ],
         outputs: &[
             ("release-id", "The release."),
             ("state", "Where it ended: `succeeded`, `synced` (with `wait: synced`), `superseded`, `failed`, `cancelled`, `rolled_back`, or where it was when the time ran out."),
+            ("project", "A `container` environment's Compose project, or a `microvm` environment's deployment."),
         ],
     },
     Builtin {

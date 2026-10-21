@@ -1762,6 +1762,11 @@ impl Dispatch {
         }
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // Its environment's kind: a `container` or `microvm` one's deployment is the runner's to make
+        // (W15-R02).
+        if let Some(b) = a.environment.as_mut() {
+            b.kind = super::environments::ensure(&self.hub, &r.repo, &b.name).await.ok().and_then(|d| d.kind);
+        }
         // An action it uses that couldn't be resolved (W07-R03) fails it as it starts, as GitHub
         // fails a job at "Set up job"; the run's other jobs go on.
         if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, &r.actions)) {
@@ -2019,6 +2024,7 @@ impl Dispatch {
             job_defaults: job.map(|j| j.defaults.clone()).unwrap_or_default(),
             outputs: job.map(|j| j.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect()).unwrap_or_default(),
             environment_url: job.and_then(|j| j.environment.as_ref()).and_then(|e| e.url.clone()),
+            environment: l.spec.environment.as_ref().map(|e| e.name.clone()).filter(|n| !n.is_empty()).map(|name| wire::Bound { name, kind: None }),
             contexts: wire::Contexts {
                 github: r.github.clone(),
                 vars,

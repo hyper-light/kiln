@@ -12,18 +12,23 @@
 //!   leg's egress proxy here (W18-R08), with the leg's policy, or to anywhere but this machine's
 //!   own and link-local addresses when the leg has none. The server's port is forwarded too when
 //!   the server is on this machine's loopback.
-//! - **Still to come**: the jailer around each VMM, warm pools of booted snapshots, and terminals
-//!   into a running microVM (W17-R01).
+//! - **Deployments** (W15-R02): a `microvm` environment's image, booted as a microVM of its own
+//!   (`kiln guest serve`) that outlives its job. Its service is kept running and checked in there;
+//!   this runner's ports reach it over vsock, and it takes them from the deployment before it once
+//!   it's healthy. Kept in the cache, so the runner boots it again when it starts.
+//! - **Still to come**: the jailer around each VMM, and warm pools of booted snapshots.
 
 use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
 
 use super::guest::{self, FromGuest, ToGuest};
 use super::runtime::Leg;
@@ -571,7 +576,7 @@ async fn say(up: &crate::exec::Uplink, f: FromGuest) {
         FromGuest::Term(m) => {
             let _ = up.0.send(Up::Term(m)).await;
         }
-        FromGuest::Ready | FromGuest::Done(_) | FromGuest::Built(_) | FromGuest::Bye => {}
+        FromGuest::Ready | FromGuest::Done(_) | FromGuest::Built(_) | FromGuest::Bye | FromGuest::Health { .. } | FromGuest::Output(_) | FromGuest::Exited { .. } => {}
     }
 }
 
@@ -684,6 +689,449 @@ pub fn to_session(session: &str, m: ToGuest) -> bool {
     }
     to_leg(&job, m);
     true
+}
+
+/// A `microvm` environment's deployment (W15-R02), as its step asked for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Deployment {
+    /// `<repository>-<environment>`: one at a time of each here.
+    pub project: String,
+    pub image: String,
+    /// What runs in place of the image's command (after its entrypoint, as Docker's).
+    pub command: Option<Vec<String>>,
+    pub env: Vec<(String, String)>,
+    /// `(address, port here, port in the microVM)`.
+    pub ports: Vec<(String, u16, u16)>,
+    /// In place of the image's own `HEALTHCHECK`.
+    pub health: Option<guest::Health>,
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    /// The hosts it may reach (W18-R08), `*` for anywhere but this machine's own addresses.
+    pub allow: Vec<String>,
+}
+
+/// What a deployment's step hears as it goes: how it's going, and what its service writes.
+pub enum Said {
+    Note(String),
+    Output(Vec<u8>),
+}
+
+/// A deployment as it's kept here: what was asked, and what it boots from (its image's root file
+/// system, its service), so it's booted again when this runner starts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Kept {
+    deployment: Deployment,
+    root: PathBuf,
+    service: guest::Service,
+}
+
+/// A deployment's microVM, running.
+struct Live {
+    vm: Vm,
+    socks: Socks,
+    dir: PathBuf,
+    stop: Arc<AtomicBool>,
+    to: async_channel::Sender<ToGuest>,
+    /// Its way out (W18-R08), as long as it runs.
+    _egress: super::egress::Pool,
+    /// Which of the deployments' microVMs here it is.
+    n: u64,
+    booted: Instant,
+}
+
+impl Live {
+    /// Its service stopped and its microVM ended, its disks and sockets gone: the end of its
+    /// console.
+    async fn end(self) -> String {
+        let Live { vm, socks, dir, stop, to, .. } = self;
+        let _ = to.send(ToGuest::Stop).await;
+        let console = vm.console.clone();
+        let _ = crate::rt::blocking(move || vm.finish(SHUTDOWN)).await;
+        stop.store(true, Ordering::Relaxed);
+        let said = tail(&console);
+        drop(socks);
+        let _ = std::fs::remove_dir_all(&dir);
+        said
+    }
+}
+
+/// The deployments running here, by project.
+static DEPLOYED: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Live>>> = std::sync::LazyLock::new(Default::default);
+/// The ports here deployments are reached on, by address and port.
+static PORTS: std::sync::LazyLock<parking_lot::Mutex<HashMap<(String, u16), Arc<Door>>>> = std::sync::LazyLock::new(Default::default);
+/// The microVMs deployments have had here, counted.
+static BOOTED: AtomicU64 = AtomicU64::new(0);
+
+/// A port here a deployment is reached on: whose it is, and where its connections go now (a
+/// microVM's vsock and the guest's port for its service's), turned away while that's nowhere.
+struct Door {
+    project: String,
+    to: parking_lot::Mutex<Option<(PathBuf, u32)>>,
+    stop: AtomicBool,
+}
+
+/// `address:port` opened for `project`'s deployment.
+fn open_door(address: &str, port: u16, project: &str) -> anyhow::Result<Arc<Door>> {
+    let l = std::net::TcpListener::bind((address, port)).with_context(|| format!("listening on {address}:{port}"))?;
+    l.set_nonblocking(true)?;
+    let door = Arc::new(Door { project: project.to_owned(), to: parking_lot::Mutex::new(None), stop: AtomicBool::new(false) });
+    let d = Arc::clone(&door);
+    std::thread::Builder::new().name(format!("deployed-{port}")).spawn(move || {
+        while !d.stop.load(Ordering::Relaxed) {
+            match l.accept() {
+                Ok((c, _)) => {
+                    let Some((uds, vport)) = d.to.lock().clone() else { continue };
+                    let _ = std::thread::Builder::new().name(format!("deployed-{port}-conn")).spawn(move || {
+                        if c.set_nonblocking(false).is_ok()
+                            && let Ok(v) = connect_in(&uds, vport)
+                        {
+                            guest::splice(c, v);
+                        }
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(25)),
+                Err(_) => std::thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    })?;
+    Ok(door)
+}
+
+/// A connection into the microVM whose vsock is `uds`, to the guest's vsock `port` (Firecracker's
+/// `CONNECT <port>`, answered `OK <port>`).
+fn connect_in(uds: &Path, port: u32) -> anyhow::Result<UnixStream> {
+    let mut s = UnixStream::connect(uds)?;
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+    s.write_all(format!("CONNECT {port}\n").as_bytes())?;
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    while line.len() < 64 {
+        s.read_exact(&mut b)?;
+        if b == *b"\n" {
+            break;
+        }
+        line.extend_from_slice(&b);
+    }
+    anyhow::ensure!(line.starts_with(b"OK "), "the microVM turned the connection away: {}", String::from_utf8_lossy(&line));
+    s.set_read_timeout(None)?;
+    Ok(s)
+}
+
+/// `d`'s ports: those its project has here already, and the rest opened now (the second of each
+/// pair says which). One another project has, or one this machine can't open, fails it.
+fn doors_for(d: &Deployment) -> anyhow::Result<Vec<(Arc<Door>, bool)>> {
+    let mut doors: Vec<(Arc<Door>, bool)> = Vec::new();
+    let fail = |doors: &[(Arc<Door>, bool)], e: anyhow::Error| {
+        close_new(doors);
+        Err(e)
+    };
+    for (address, port, _) in &d.ports {
+        let had = PORTS.lock().get(&(address.clone(), *port)).cloned();
+        match had {
+            Some(door) if door.project == d.project => doors.push((door, false)),
+            Some(door) => return fail(&doors, anyhow::anyhow!("{address}:{port} here is {}'s", door.project)),
+            None => match open_door(address, *port, &d.project) {
+                Ok(door) => {
+                    PORTS.lock().insert((address.clone(), *port), Arc::clone(&door));
+                    doors.push((door, true));
+                }
+                Err(e) => return fail(&doors, e),
+            },
+        }
+    }
+    Ok(doors)
+}
+
+/// The ports `doors_for` opened, closed again: the deployment didn't come up.
+fn close_new(doors: &[(Arc<Door>, bool)]) {
+    let mut ports = PORTS.lock();
+    for (door, new) in doors {
+        if *new {
+            door.stop.store(true, Ordering::Relaxed);
+            ports.retain(|_, d| !Arc::ptr_eq(d, door));
+        }
+    }
+}
+
+/// A deployment's service: the image's entrypoint and command (the step's in place of the
+/// image's), environment, directory, user and health check, with the step's.
+fn service_of(d: &Deployment, root: &super::rootfs::Rootfs) -> guest::Service {
+    let mut argv = root.runs.entrypoint.clone();
+    argv.extend(d.command.clone().unwrap_or_else(|| root.runs.cmd.clone()));
+    let mut env = root.env.clone();
+    env.extend(d.env.iter().cloned());
+    guest::Service {
+        argv,
+        env,
+        cwd: root.runs.workdir.clone(),
+        user: root.runs.user.clone(),
+        health: d.health.clone().or_else(|| root.runs.health.clone()),
+        ports: d.ports.iter().map(|(_, _, p)| *p).collect(),
+    }
+}
+
+/// Where deployments are kept.
+fn kept_dir(cache: &Path) -> PathBuf {
+    cache.join("deployments")
+}
+
+/// Deploys `d` (W15-R02): its image pulled (with `pull`), its microVM booted with its service and
+/// followed (`said` hears how it goes and what the service writes) until it's healthy, within
+/// `within`; then it takes the ports from the deployment before it, which ends, and is kept. One
+/// that doesn't come up healthy ends, and the one before goes on.
+pub async fn deploy(cache: &Path, d: Deployment, pull: &super::rootfs::Pull, said: async_channel::Sender<Said>, within: Duration) -> anyhow::Result<()> {
+    let note = |s: String| {
+        let _ = said.try_send(Said::Note(s));
+    };
+    let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs (`kiln runner setup firecracker`)")?;
+    let _ = CACHE.set(cache.to_path_buf());
+    let _one = super::rootfs::lock(&format!("deploy-{}", d.project)).await;
+    let doors = doors_for(&d)?;
+    let started = async {
+        let kiln = kiln_disk(&m, cache).await.context("kiln's disk for the microVM")?;
+        note(format!("Its image, {}", d.image));
+        let root = super::rootfs::prepare(&m, cache, &kiln, &d.image, pull).await.with_context(|| format!("the image {}", d.image))?;
+        let kept = Kept { service: service_of(&d, &root), deployment: d.clone(), root: root.path };
+        anyhow::ensure!(!kept.service.argv.is_empty(), "the image has no entrypoint or command: say what runs (`command`)");
+        note(format!("Booting its microVM: {}", kept.service.argv.join(" ")));
+        let (live, from) = boot_deployment(&m, cache, &kiln, &kept).await?;
+        Ok((kept, live, from))
+    };
+    let (kept, live, from) = match started.await {
+        Ok(x) => x,
+        Err(e) => {
+            close_new(&doors);
+            return Err(e);
+        }
+    };
+    let healthy = crate::rt::timeout(within, async {
+        while let Ok(f) = from.recv().await {
+            match f {
+                FromGuest::Health { healthy: true, said: why } => {
+                    note(format!("Healthy: {why}"));
+                    return Ok(());
+                }
+                FromGuest::Health { healthy: false, said: why } => note(format!("Not healthy yet: {why}")),
+                FromGuest::Output(o) => {
+                    let _ = said.try_send(Said::Output(o));
+                }
+                FromGuest::Exited { code, again_secs } => {
+                    note(format!("Its service ended ({}); it starts again in {again_secs}s", code.map_or_else(|| "on a signal".to_owned(), |c| format!("exit {c}"))))
+                }
+                FromGuest::Bye => return Err(anyhow::anyhow!("its microVM ended")),
+                _ => {}
+            }
+        }
+        Err(anyhow::anyhow!("its microVM's guest hung up"))
+    })
+    .await;
+    let failed = match healthy {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e),
+        Err(_) => Some(anyhow::anyhow!("it wasn't healthy within {}s", within.as_secs())),
+    };
+    if let Some(e) = failed {
+        close_new(&doors);
+        let console = live.end().await;
+        note("It didn't come up: the deployment before it, if there is one, goes on".to_owned());
+        return Err(anyhow::anyhow!("{e:#}\n\nIts microVM's console ended:\n{console}"));
+    }
+    let old = install(&kept, live, from, &doors);
+    if let Some(old) = old {
+        note("The deployment before it ends".to_owned());
+        old.end().await;
+    }
+    // Kept for this runner only: its environment may hold secrets.
+    let dir = kept_dir(cache);
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(format!("{}.json", d.project));
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&file)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(&serde_json::to_vec_pretty(&kept)?)?;
+    }
+    Ok(())
+}
+
+/// `live` in place of its project's deployment before it (which it returns, to end): the ports
+/// point at it, those the one before had and it doesn't close, and what it says from here on is
+/// followed.
+fn install(kept: &Kept, live: Live, from: async_channel::Receiver<FromGuest>, doors: &[(Arc<Door>, bool)]) -> Option<Live> {
+    let project = kept.deployment.project.clone();
+    for ((door, _), (_, _, port)) in doors.iter().zip(&kept.deployment.ports) {
+        *door.to.lock() = Some((live.socks.uds(), guest::INBOUND + u32::from(*port)));
+    }
+    {
+        let mut ports = PORTS.lock();
+        ports.retain(|_, d| {
+            let keep = d.project != project || doors.iter().any(|(o, _)| Arc::ptr_eq(o, d));
+            if !keep {
+                d.stop.store(true, Ordering::Relaxed);
+            }
+            keep
+        });
+    }
+    let n = live.n;
+    let old = DEPLOYED.lock().insert(project.clone(), live);
+    crate::rt::spawn(follow(project, n, from));
+    old
+}
+
+/// What a deployment's microVM says once it's up: how its health goes (logged), and its end, when
+/// that comes before it's replaced (booted again then, from what's kept).
+async fn follow(project: String, n: u64, from: async_channel::Receiver<FromGuest>) {
+    while let Ok(f) = from.recv().await {
+        match f {
+            FromGuest::Health { healthy, said } => tracing::info!(deployment = %project, healthy, said = %said, "a deployment's health"),
+            FromGuest::Exited { code, again_secs } => tracing::warn!(deployment = %project, code = ?code, again_secs, "a deployment's service ended"),
+            FromGuest::Bye => break,
+            _ => {}
+        }
+    }
+    let ended = {
+        let mut deployed = DEPLOYED.lock();
+        if deployed.get(&project).is_some_and(|l| l.n == n) { deployed.remove(&project) } else { None }
+    };
+    let Some(live) = ended else { return };
+    // Booted again, unless it ended soon after booting: then it waits for its next deployment, or
+    // for this runner to start again.
+    let lasted = live.booted.elapsed();
+    let said = live.end().await;
+    if lasted < Duration::from_secs(60) {
+        tracing::warn!(deployment = %project, console = %said, "a deployment's microVM ended within a minute of booting: it stays down until it's deployed again");
+        return;
+    }
+    tracing::warn!(deployment = %project, console = %said, "a deployment's microVM ended: booting it again");
+    crate::rt::sleep(Duration::from_secs(5)).await;
+    let Some(cache) = CACHE.get() else { return };
+    let file = kept_dir(cache).join(format!("{project}.json"));
+    let kept = std::fs::read(&file).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice::<Kept>(&b)?));
+    if let Err(e) = match kept {
+        Ok(kept) => relaunch(cache, kept).await,
+        Err(e) => Err(e),
+    } {
+        tracing::warn!(deployment = %project, error = %format!("{e:#}"), "a deployment couldn't be booted again");
+    }
+}
+
+/// Where this runner keeps its microVMs, once it has booted a deployment again.
+static CACHE: OnceLock<PathBuf> = OnceLock::new();
+
+/// The deployments kept in `cache` (W15-R02), booted again: this runner has started.
+pub async fn restore(cache: PathBuf) {
+    let _ = CACHE.set(cache.clone());
+    let Ok(entries) = std::fs::read_dir(kept_dir(&cache)) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let kept = match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice::<Kept>(&b)?)) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %format!("{e:#}"), "a kept deployment doesn't read");
+                continue;
+            }
+        };
+        let project = kept.deployment.project.clone();
+        match relaunch(&cache, kept).await {
+            Ok(()) => tracing::info!(deployment = %project, "booted a deployment again"),
+            Err(e) => tracing::warn!(deployment = %project, error = %format!("{e:#}"), "a deployment couldn't be booted again"),
+        }
+    }
+}
+
+/// A kept deployment booted again, from its image's root file system as it was deployed.
+async fn relaunch(cache: &Path, kept: Kept) -> anyhow::Result<()> {
+    let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now")?;
+    let _one = super::rootfs::lock(&format!("deploy-{}", kept.deployment.project)).await;
+    anyhow::ensure!(kept.root.is_file(), "its image's root file system ({}) is gone: deploy it again", kept.root.display());
+    let doors = doors_for(&kept.deployment)?;
+    let booted = async {
+        let kiln = kiln_disk(&m, cache).await.context("kiln's disk for the microVM")?;
+        boot_deployment(&m, cache, &kiln, &kept).await
+    };
+    let (live, from) = match booted.await {
+        Ok(x) => x,
+        Err(e) => {
+            close_new(&doors);
+            return Err(e);
+        }
+    };
+    if let Some(old) = install(&kept, live, from, &doors) {
+        old.end().await;
+    }
+    Ok(())
+}
+
+/// A deployment's microVM booted from what's `kept`, its guest given its service: it, and what it
+/// says.
+async fn boot_deployment(m: &Machine, cache: &Path, kiln: &Path, kept: &Kept) -> anyhow::Result<(Live, async_channel::Receiver<FromGuest>)> {
+    let n = BOOTED.fetch_add(1, Ordering::Relaxed);
+    let key = format!("d{}", crate::util::sha256_hex(format!("{}:{n}", kept.deployment.project).as_bytes()).get(..11).unwrap_or("eployed"));
+    let dir = cache.join("vms").join(&key);
+    let socks = Socks::new(&key)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let scratch = dir.join("scratch.ext4");
+    {
+        let (m, scratch) = (m.clone(), scratch.clone());
+        crate::rt::blocking(move || mkfs(&m, &scratch, SCRATCH, "scratch", None)).await??;
+    }
+    // Its way out: an egress proxy of its own, with its policy.
+    let (egress, proxy) = super::egress::Pool::local(super::egress::Policy::new(kept.deployment.allow.clone(), &[])).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    relay(&socks, guest::PROXY_PORT, Arc::new(AtomicU16::new(proxy)), Arc::clone(&stop))?;
+    let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
+    let d = &kept.deployment;
+    let vm = boot(
+        m,
+        &dir,
+        &socks,
+        &[Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: &kept.root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
+        "serve",
+        d.vcpus.max(1),
+        d.memory_mib.max(128),
+    )?;
+    let service = kept.service.clone();
+    let (vm, conn) = crate::rt::blocking(move || {
+        let mut vm = vm;
+        let conn = vm.accept(&control, BOOT).and_then(|mut c| {
+            c.set_read_timeout(Some(BOOT))?;
+            match guest::recv::<FromGuest>(&mut c) {
+                Ok(Some(FromGuest::Ready)) => {
+                    c.set_read_timeout(None)?;
+                    guest::send(&mut c, &ToGuest::Serve(Box::new(service)))?;
+                    Ok(c)
+                }
+                _ => Err(anyhow::anyhow!("the microVM's guest didn't say it was ready:\n{}", tail(&vm.console))),
+            }
+        });
+        (vm, conn)
+    })
+    .await?;
+    let conn = conn?;
+    let (from_tx, from_rx) = async_channel::unbounded::<FromGuest>();
+    let (to_tx, to_rx) = async_channel::unbounded::<ToGuest>();
+    let (mut reader, mut writer) = (conn.try_clone()?, conn);
+    std::thread::Builder::new().name("deployed-in".into()).spawn(move || {
+        while let Ok(Some(f)) = guest::recv::<FromGuest>(&mut reader) {
+            if from_tx.send_blocking(f).is_err() {
+                break;
+            }
+        }
+    })?;
+    std::thread::Builder::new().name("deployed-out".into()).spawn(move || {
+        while let Ok(m) = to_rx.recv_blocking() {
+            if guest::send(&mut writer, &m).is_err() {
+                break;
+            }
+        }
+    })?;
+    Ok((Live { vm, socks, dir, stop, to: to_tx, _egress: egress, n, booted: Instant::now() }, from_rx))
 }
 
 #[cfg(test)]

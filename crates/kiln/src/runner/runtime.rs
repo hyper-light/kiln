@@ -3274,6 +3274,14 @@ impl Leg {
                 true
             }
             "cache" => self.cache_step(st, idx, &with, &mut outputs).await?,
+            // A `container` or `microvm` environment's deployment is the runner's own to make
+            // (W15-R02).
+            "deploy" if self.a.environment.as_ref().and_then(|b| b.kind.as_deref()) == Some("container") => self.deploy_containers(st, idx, &with, wd, &mut outputs).await?,
+            "deploy" if self.a.environment.as_ref().and_then(|b| b.kind.as_deref()) == Some("microvm") => self.deploy_microvm(st, idx, &with, &mut outputs).await?,
+            "deploy" if with.contains_key("compose") || with.contains_key("images") => {
+                anyhow::bail!("`compose` and `images` deploy to a `container` environment, and this job's isn't one")
+            }
+            "deploy" if with.contains_key("image") => anyhow::bail!("`image` deploys to a `microvm` environment, and this job's isn't one"),
             "deploy" => self.deploy_step(idx, &with, &mut outputs).await?,
             "upload" | "download" => {
                 let svc = super::artifacts::Service { http: &self.http, base: super::artifacts::Service::origin_of(&self.a.runtime.results_url), token: &self.a.runtime.runtime_token, run: &self.a.run_id, job: &self.a.job_id };
@@ -3313,6 +3321,147 @@ impl Leg {
             other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
         };
         Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })
+    }
+
+    /// `kiln/deploy@v1` for a `container` environment (W15-R02): the job deploys it itself, on the
+    /// runner its environment's routing chose. A Compose file (`compose`), or images (`images`, one
+    /// a line, each a service), goes up as a Compose project named for the repository and the
+    /// environment; its containers outlive the job until the next deployment replaces them, and
+    /// the step waits for them to run and, where they have health checks, to be healthy.
+    async fn deploy_containers(&self, st: &State, idx: u32, with: &BTreeMap<String, String>, wd: &Path, outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let env = get("environment").ok_or_else(|| anyhow::anyhow!("`environment`: where it deploys"))?;
+        // Only to the job's own environment, whose protection passed before it started.
+        anyhow::ensure!(
+            self.a.environment.as_ref().is_some_and(|b| b.name.eq_ignore_ascii_case(&env)),
+            "this job deploys only to the environment it's bound to (`environment:` on the job), and `{env}` isn't it"
+        );
+        let timeout = get("timeout").map_or(Some(1800), |t| kiln_ci::trigger::cron::seconds(&t)).ok_or_else(|| anyhow::anyhow!("`timeout` is a duration (`30m`, `1h`)"))?;
+        let project = deployment_name(&self.a.repo, &env);
+        let file = match (get("compose"), get("images")) {
+            (Some(c), _) => wd.join(c),
+            (None, Some(images)) => {
+                // Each image a service of its own, named by its repository's last part.
+                let mut services = String::from("services:\n");
+                for image in images.split(['\n', ',']).map(str::trim).filter(|i| !i.is_empty()) {
+                    let base = image.split('@').next().unwrap_or(image);
+                    let repo = base.rsplit_once(':').filter(|(_, tag)| !tag.contains('/')).map_or(base, |(r, _)| r);
+                    let service: String = repo.rsplit('/').next().unwrap_or("app").chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+                    services.push_str(&format!("  {service}:\n    image: {}\n    restart: unless-stopped\n", serde_json::to_string(image)?));
+                }
+                let path = st.layout.temp.join("_kiln_deploy").join(format!("{project}.yaml"));
+                let (p, text) = (path.clone(), services);
+                crate::rt::blocking(move || -> std::io::Result<()> {
+                    if let Some(d) = p.parent() {
+                        std::fs::create_dir_all(d)?;
+                    }
+                    std::fs::write(&p, text)
+                })
+                .await??;
+                path
+            }
+            (None, None) => anyhow::bail!("`compose` or `images`: what it deploys"),
+        };
+        let cli = self.cli(st).await?;
+        let s = |v: &str| v.to_owned();
+        let file = file.to_string_lossy().into_owned();
+        self.note(idx, &format!("Deploying {project} to {env}: docker compose up, waiting until it's running and healthy")).await;
+        let up = [s("compose"), s("-p"), project.clone(), s("-f"), file.clone(), s("up"), s("-d"), s("--wait"), s("--wait-timeout"), timeout.to_string(), s("--remove-orphans")];
+        let env_map: BTreeMap<String, String> = st.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let done = cli.run(&up, &env_map, Duration::from_secs(timeout + 60)).await;
+        outputs.insert("project".to_owned(), project.clone());
+        let ps = cli
+            .run(
+                &[s("compose"), s("-p"), project.clone(), s("-f"), file.clone(), s("ps"), s("--all"), s("--format"), s("{{.Service}}\t{{.Image}}\t{{.State}}\t{{.Health}}")],
+                &env_map,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap_or_default();
+        for line in ps.lines().filter(|l| !l.trim().is_empty()) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            let (service, image, state, health) = (cols.first().copied().unwrap_or(""), cols.get(1).copied().unwrap_or(""), cols.get(2).copied().unwrap_or(""), cols.get(3).copied().unwrap_or(""));
+            self.note(idx, &format!("{service} ({image}): {state}{}", if health.is_empty() { String::new() } else { format!(", {health}") })).await;
+        }
+        match done {
+            Ok(_) => {
+                outputs.insert("state".to_owned(), "succeeded".to_owned());
+                Ok(true)
+            }
+            Err(e) => {
+                let logs = cli.run(&[s("compose"), s("-p"), project, s("-f"), file, s("logs"), s("--tail"), s("40"), s("--no-color")], &env_map, Duration::from_secs(60)).await.unwrap_or_default();
+                if !logs.is_empty() {
+                    self.log(idx, format!("{}\r\n", st.masker.mask(&logs).replace('\n', "\r\n")).into_bytes()).await;
+                }
+                outputs.insert("state".to_owned(), "failed".to_owned());
+                self.annotate(idx, "error", &format!("the deployment to {env} didn't come up healthy: {e:#}")).await;
+                Ok(false)
+            }
+        }
+    }
+
+    /// `kiln/deploy@v1` for a `microvm` environment (W15-R02): the job deploys it itself, on the
+    /// runner its environment's routing chose. Its image (`image`) runs in a microVM of its own that
+    /// outlives the job, as the deployment named for the repository and the environment: the
+    /// image's service (its entrypoint and command, or `command`) with `env`, reached on this
+    /// runner's `ports` and checked by `health` (else the image's own `HEALTHCHECK`). The step waits
+    /// until it's healthy; it then takes the ports from the deployment before it, which ends.
+    #[cfg(target_os = "linux")]
+    async fn deploy_microvm(&self, st: &State, idx: u32, with: &BTreeMap<String, String>, outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
+        use super::firecracker::{Deployment, Said};
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let env = get("environment").ok_or_else(|| anyhow::anyhow!("`environment`: where it deploys"))?;
+        // Only to the job's own environment, whose protection passed before it started.
+        anyhow::ensure!(
+            self.a.environment.as_ref().is_some_and(|b| b.name.eq_ignore_ascii_case(&env)),
+            "this job deploys only to the environment it's bound to (`environment:` on the job), and `{env}` isn't it"
+        );
+        let image = get("image").ok_or_else(|| anyhow::anyhow!("`image`: what it deploys"))?;
+        let timeout = get("timeout").map_or(Some(1800), |t| kiln_ci::trigger::cron::seconds(&t)).ok_or_else(|| anyhow::anyhow!("`timeout` is a duration (`30m`, `1h`)"))?;
+        let project = deployment_name(&self.a.repo, &env);
+        let d = Deployment {
+            project: project.clone(),
+            image: image.clone(),
+            command: get("command").map(|c| deploy_command(&c)).transpose()?,
+            env: get("env").map(|e| deploy_env(&e)).transpose()?.unwrap_or_default(),
+            ports: get("ports").map(|p| deploy_ports(&p)).transpose()?.unwrap_or_default(),
+            health: get("health").map(|h| deploy_health(&h)),
+            vcpus: get("vcpus").map(|v| v.parse::<u32>()).transpose().map_err(|_| anyhow::anyhow!("`vcpus` is a number"))?.unwrap_or(1).clamp(1, 32),
+            memory_mib: get("memory").map(|m| deploy_memory(&m)).transpose()?.unwrap_or(512),
+            allow: self.a.network.as_ref().map(|n| n.allow.clone()).unwrap_or_else(|| vec!["*".to_owned()]),
+        };
+        self.note(idx, &format!("Deploying {project} to {env}: {image}, in a microVM of its own, waiting until it's healthy")).await;
+        let (tx, rx) = async_channel::unbounded::<Said>();
+        let (cache, pull) = (self.work_dir.join("_firecracker"), super::rootfs::Pull::of(&self.a));
+        let deployed = super::firecracker::deploy(&cache, d, &pull, tx, Duration::from_secs(timeout));
+        let heard = async {
+            while let Ok(said) = rx.recv().await {
+                match said {
+                    Said::Note(n) => self.note(idx, &st.masker.mask(&n)).await,
+                    Said::Output(o) => self.log(idx, st.masker.mask(&String::from_utf8_lossy(&o)).replace("\r\n", "\n").replace('\n', "\r\n").into_bytes()).await,
+                }
+            }
+        };
+        let (done, ()) = futures::future::join(deployed, heard).await;
+        outputs.insert("project".to_owned(), project);
+        match done {
+            Ok(()) => {
+                outputs.insert("state".to_owned(), "succeeded".to_owned());
+                Ok(true)
+            }
+            Err(e) => {
+                outputs.insert("state".to_owned(), "failed".to_owned());
+                let why = st.masker.mask(&format!("{e:#}"));
+                self.log(idx, format!("{}\r\n", why.replace('\n', "\r\n")).into_bytes()).await;
+                self.annotate(idx, "error", &format!("the deployment to {env} didn't come up healthy: {}", why.lines().next().unwrap_or_default())).await;
+                Ok(false)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn deploy_microvm(&self, _st: &State, _idx: u32, _with: &BTreeMap<String, String>, _outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
+        anyhow::bail!("a `microvm` environment deploys from a Linux runner with KVM and Firecracker")
     }
 
     /// `kiln/deploy@v1` (W15-R05): the release asked for (`/_kiln/deploy`), then followed, each
@@ -3947,6 +4096,80 @@ impl Leg {
 
 /// Whether `path` is a report the job wrote (W16-R01's discovery): modified since `t` (less a
 /// second, for coarse clocks), and not a file git tracks (a checkout's are new too).
+/// A deployment's name on its runner (W15-R02): `<repository>-<environment>`, as Compose takes a
+/// project's.
+fn deployment_name(repo: &str, env: &str) -> String {
+    let name = repo.rsplit('/').next().unwrap_or("app");
+    format!("{name}-{env}").to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
+}
+
+/// A microVM deployment's `ports` (`8080:80`, `127.0.0.1:8080:80`, one a line or comma-separated):
+/// `(address, port here, port in the microVM)`, every address when it names none.
+#[cfg(target_os = "linux")]
+fn deploy_ports(text: &str) -> anyhow::Result<Vec<(String, u16, u16)>> {
+    text.split(['\n', ','])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let bad = || anyhow::anyhow!("`{p}`: a port is `here:inside` or `address:here:inside`");
+            let port = |s: &str| s.trim().parse::<u16>().ok().filter(|n| *n > 0).ok_or_else(bad);
+            let parts: Vec<&str> = p.rsplitn(3, ':').collect();
+            match parts.as_slice() {
+                [inside, here] => Ok(("0.0.0.0".to_owned(), port(here)?, port(inside)?)),
+                [inside, here, address] if !address.is_empty() => Ok((address.trim_start_matches('[').trim_end_matches(']').to_owned(), port(here)?, port(inside)?)),
+                _ => Err(bad()),
+            }
+        })
+        .collect()
+}
+
+/// A microVM deployment's `command`: a JSON array as it is, else a line `/bin/sh -c` runs.
+#[cfg(target_os = "linux")]
+fn deploy_command(text: &str) -> anyhow::Result<Vec<String>> {
+    let t = text.trim();
+    if t.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(t).map_err(|e| anyhow::anyhow!("`command`: a JSON array of strings, or a line for the shell ({e})"))
+    } else {
+        Ok(vec!["/bin/sh".to_owned(), "-c".to_owned(), t.to_owned()])
+    }
+}
+
+/// A microVM deployment's `env`: `NAME=value`, one a line.
+#[cfg(target_os = "linux")]
+fn deploy_env(text: &str) -> anyhow::Result<Vec<(String, String)>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_owned(), v.to_owned())).filter(|(k, _)| !k.is_empty()).ok_or_else(|| anyhow::anyhow!("`env`: a line `NAME=value`, and `{l}` isn't one")))
+        .collect()
+}
+
+/// A microVM deployment's `health`: a URL its service answers (`http://127.0.0.1:8080/healthz`), or
+/// a command run in its microVM by `/bin/sh -c`; every two seconds, unhealthy after three failures
+/// in a row.
+#[cfg(target_os = "linux")]
+fn deploy_health(text: &str) -> super::guest::Health {
+    let t = text.trim();
+    let test = if t.starts_with("http://") { vec!["HTTP".to_owned(), t.to_owned()] } else { vec!["CMD-SHELL".to_owned(), t.to_owned()] };
+    super::guest::Health { test, interval_secs: 2, timeout_secs: 10, retries: 3, start_secs: 0 }
+}
+
+/// A microVM deployment's `memory` (`512`, `512M`, `2G`), in MiB: at least 128.
+#[cfg(target_os = "linux")]
+fn deploy_memory(text: &str) -> anyhow::Result<u64> {
+    let t = text.trim().to_ascii_lowercase();
+    let at = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (n, unit) = t.split_at(at);
+    let n: u64 = n.parse().map_err(|_| anyhow::anyhow!("`memory`: a size (`512M`, `2G`)"))?;
+    let mib = match unit.trim() {
+        "" | "m" | "mb" | "mi" | "mib" => n,
+        "g" | "gb" | "gi" | "gib" => n.saturating_mul(1024),
+        other => anyhow::bail!("`memory`: `{other}` isn't a unit (M or G)"),
+    };
+    anyhow::ensure!(mib >= 128, "`memory`: at least 128M");
+    Ok(mib)
+}
+
 fn written_since(path: &Path, t: std::time::SystemTime) -> bool {
     let recent = std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|m| m + Duration::from_secs(1) >= t);
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return recent };
@@ -4000,6 +4223,29 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W15-R02: a microVM deployment's inputs as the step reads them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn w15_r02_microvm_deployment_inputs() -> anyhow::Result<()> {
+        assert_eq!(deployment_name("acme/Web.App", "Production"), "web-app-production");
+        assert_eq!(deploy_ports("8080:80, 127.0.0.1:9090:90\n[::1]:7070:70")?, vec![("0.0.0.0".to_owned(), 8080, 80), ("127.0.0.1".to_owned(), 9090, 90), ("::1".to_owned(), 7070, 70)]);
+        for bad in ["80", "x:80", "8080:0", ":8080:80", "8080:99999"] {
+            assert!(deploy_ports(bad).is_err(), "{bad}");
+        }
+        assert_eq!(deploy_command("[\"httpd\", \"-f\"]")?, ["httpd", "-f"]);
+        assert_eq!(deploy_command("exec httpd -f")?, ["/bin/sh", "-c", "exec httpd -f"]);
+        assert!(deploy_command("[1]").is_err());
+        assert_eq!(deploy_env("A=1\n# not this\nB = two=2\n")?, vec![("A".to_owned(), "1".to_owned()), ("B".to_owned(), " two=2".to_owned())]);
+        assert!(deploy_env("no value").is_err());
+        assert_eq!(deploy_memory("512")?, 512);
+        assert_eq!(deploy_memory("2G")?, 2048);
+        assert_eq!(deploy_memory("768MiB")?, 768);
+        for bad in ["64", "1T", "lots"] {
+            assert!(deploy_memory(bad).is_err(), "{bad}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn w14_r11_gh_gets_the_facade_for_the_job_s_token() {

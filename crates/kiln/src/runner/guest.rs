@@ -11,17 +11,22 @@
 //! - **builds an image** (`kiln guest build`): extracts an OCI image's layers (one file each on
 //!   `/dev/vdb`) onto an empty ext4 (`/dev/vdc`) as root, so owners, modes, device files and
 //!   whiteouts come out as the image has them, and says how it went.
+//! - **runs a deployment** (`kiln guest serve`, W15-R02): enters its image as a leg's, then a
+//!   manager runs the image's service and keeps it running, checks its health, and takes the
+//!   host's connections in to its ports (its way out is the host's egress proxy, as a leg's), until
+//!   the host says stop or hangs up.
 //!
-//! As PID 1 it reaps what's orphaned and, once the runner (or the build) is done, reboots, which
-//! ends the microVM. What goes wrong is said on its console first.
+//! As PID 1 it reaps what's orphaned and, once the runner (or the build, or the deployment) is
+//! done, reboots, which ends the microVM. What goes wrong is said on its console first.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead as _, Read, Write};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use nix::mount::{MntFlags, MsFlags};
@@ -40,6 +45,9 @@ pub const SERVER_PORT: u32 = 10_792;
 pub const LOCAL_PROXY: u16 = 3128;
 /// Where the leg's runner works: on the overlay, so on the leg's scratch disk.
 pub const WORK: &str = "/work";
+/// A deployment's guest takes the host's connections to its service's port `p` on vsock port
+/// `INBOUND + p`.
+pub const INBOUND: u32 = 0x1_0000;
 /// The host, as vsock addresses it.
 const HOST_CID: u32 = 2;
 /// The largest frame either side sends (an assignment with its actions, a log chunk).
@@ -87,6 +95,10 @@ pub enum ToGuest {
         step: u32,
         idx: u32,
     },
+    /// A deployment's service (W15-R02).
+    Serve(Box<Service>),
+    /// The deployment is over: its service stopped, then the microVM.
+    Stop,
 }
 
 /// A leg for the guest's runner.
@@ -102,6 +114,40 @@ pub struct LegStart {
     pub ca: Option<Vec<u8>>,
     /// The server's port on the host's loopback, forwarded to the guest's.
     pub server_port: Option<u16>,
+}
+
+/// A deployment's service (W15-R02): what a `microvm` environment's microVM runs and keeps
+/// running, and how it's known to be healthy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Service {
+    /// The image's entrypoint and command (the step's `command` in place of the image's).
+    pub argv: Vec<String>,
+    /// The image's environment, then the step's.
+    pub env: Vec<(String, String)>,
+    /// Where it runs (the image's `WorkingDir`); `/` when that's empty.
+    pub cwd: String,
+    /// Whom it runs as (the image's `User`: `name`, `uid`, `uid:gid`, `name:group`); root when
+    /// that's empty.
+    pub user: String,
+    pub health: Option<Health>,
+    /// Its ports the host forwards connections to.
+    pub ports: Vec<u16>,
+}
+
+/// A health check, as Docker's `HEALTHCHECK` has it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Health {
+    /// `["CMD", program, args…]`, `["CMD-SHELL", script]`, or `["HTTP", url]`: a `GET` answered
+    /// with a 2xx or 3xx.
+    pub test: Vec<String>,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    /// Failures in a row before it's unhealthy.
+    pub retries: u32,
+    /// How long after it starts its failures don't count.
+    pub start_secs: u64,
 }
 
 /// One of an image's layers, as a file on the layers' disk.
@@ -123,6 +169,18 @@ pub enum FromGuest {
     Done(JobResult),
     /// The build: `None` when it went well, else why not.
     Built(Option<String>),
+    /// A deployment's health as it changes (W15-R02): healthy or not, and why.
+    Health {
+        healthy: bool,
+        said: String,
+    },
+    /// What a deployment's service wrote.
+    Output(Vec<u8>),
+    /// A deployment's service ended; it starts again `again_secs` on.
+    Exited {
+        code: Option<i32>,
+        again_secs: u64,
+    },
     /// The guest is done: nothing follows.
     Bye,
 }
@@ -154,10 +212,15 @@ pub fn recv<T: DeserializeOwned>(r: &mut impl Read) -> anyhow::Result<Option<T>>
 
 /// Bytes both ways between `a` and `b` until each side is done.
 pub fn splice(a: std::net::TcpStream, b: UnixStream) {
+    splice_with(a, b, std::net::Shutdown::Write);
+}
+
+/// As [`splice`], `b` shut down `how` once `a` is done sending.
+fn splice_with(a: std::net::TcpStream, b: UnixStream, how: std::net::Shutdown) {
     let (Ok(mut a_in), Ok(mut b_out)) = (a.try_clone(), b.try_clone()) else { return };
     let there = std::thread::Builder::new().name("vsock-splice".into()).spawn(move || {
         let _ = io::copy(&mut a_in, &mut b_out);
-        let _ = b_out.shutdown(std::net::Shutdown::Write);
+        let _ = b_out.shutdown(how);
     });
     let (mut a_out, mut b_in) = (a, b);
     let _ = io::copy(&mut b_in, &mut a_out);
@@ -167,7 +230,7 @@ pub fn splice(a: std::net::TcpStream, b: UnixStream) {
     }
 }
 
-/// `kiln guest init|build`: the microVM's PID 1. Anywhere else it refuses: it would reboot the
+/// `kiln guest init|build|serve`: the microVM's PID 1. Anywhere else it refuses: it would reboot the
 /// machine it ran on.
 pub fn main(mode: &str) -> std::process::ExitCode {
     if std::process::id() != 1 {
@@ -177,7 +240,8 @@ pub fn main(mode: &str) -> std::process::ExitCode {
     let r = match mode {
         "init" => leg(),
         "build" => build(),
-        other => Err(anyhow::anyhow!("`kiln guest {other}`: `init` or `build`")),
+        "serve" => deployment(),
+        other => Err(anyhow::anyhow!("`kiln guest {other}`: `init`, `build` or `serve`")),
     };
     if let Err(e) = r {
         eprintln!("kiln guest: {e:#}");
@@ -213,8 +277,26 @@ fn system(root: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A leg: the image under an overlay on the scratch disk, moved into, and its runner forked.
+/// A leg: its image entered, and its runner forked.
 fn leg() -> anyhow::Result<()> {
+    enter()?;
+    #[allow(unsafe_code)]
+    // SAFETY: PID 1 has one thread here (no runtime has started and nothing has spawned one), so
+    // the child may go on as this program does.
+    let forked = unsafe { nix::unistd::fork() }.context("starting the leg's runner")?;
+    match forked {
+        nix::unistd::ForkResult::Child => {
+            let code = runner();
+            #[allow(clippy::exit)]
+            std::process::exit(code)
+        }
+        nix::unistd::ForkResult::Parent { child } => reap(child),
+    }
+    Ok(())
+}
+
+/// The image under an overlay on the scratch disk, moved into with kiln's disk at `/.kiln`.
+fn enter() -> anyhow::Result<()> {
     system("")?;
     mount("/dev/vdb", "/mnt/image", "ext4", MsFlags::MS_RDONLY, None)?;
     mount("/dev/vdc", "/mnt/scratch", "ext4", MsFlags::empty(), None)?;
@@ -234,8 +316,10 @@ fn leg() -> anyhow::Result<()> {
     mount("devpts", "/mnt/root/dev/pts", "devpts", MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC, Some("gid=5,mode=620,ptmxmode=666"))?;
     mount("tmpfs", "/mnt/root/dev/shm", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV, Some("mode=1777"))?;
     mount("tmpfs", "/mnt/root/run", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV, Some("mode=755"))?;
-    // cgroups, for a container runtime the image has.
+    // cgroups, for a container runtime the image has; binfmt_misc, for emulators a leg registers
+    // (`setup-qemu-action`): a microVM's kernel is its own to change.
     let _ = nix::mount::mount(Some("cgroup2"), "/mnt/root/sys/fs/cgroup", Some("cgroup2"), MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC, None::<&str>);
+    let _ = nix::mount::mount(Some("binfmt_misc"), "/mnt/root/proc/sys/fs/binfmt_misc", Some("binfmt_misc"), MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC, None::<&str>);
     // Into the image, kiln's disk kept at `/.kiln` (this binary runs from it).
     std::env::set_current_dir("/mnt/root")?;
     nix::unistd::pivot_root(".", ".kiln").context("moving into the image")?;
@@ -248,22 +332,11 @@ fn leg() -> anyhow::Result<()> {
     if let Err(e) = loopback_up() {
         eprintln!("kiln guest: the loopback interface: {e:#}");
     }
-    #[allow(unsafe_code)]
-    // SAFETY: PID 1 has one thread here (no runtime has started and nothing has spawned one), so
-    // the child may go on as this program does.
-    let forked = unsafe { nix::unistd::fork() }.context("starting the leg's runner")?;
-    match forked {
-        nix::unistd::ForkResult::Child => {
-            let code = runner();
-            #[allow(clippy::exit)]
-            std::process::exit(code)
-        }
-        nix::unistd::ForkResult::Parent { child } => reap(child),
-    }
     Ok(())
 }
 
-/// PID 1's work while the runner runs: reaping it and whatever is orphaned, until it's gone.
+/// PID 1's work while the runner (or a deployment's manager) runs: reaping it and whatever is
+/// orphaned, until it's gone.
 fn reap(runner: nix::unistd::Pid) {
     loop {
         match nix::sys::wait::waitpid(None::<nix::unistd::Pid>, None) {
@@ -623,7 +696,7 @@ async fn serve(
             Ev::Host(ToGuest::RerunStep { step, idx }) => {
                 let _ = super::runtime::rerun_step(&job, step, idx);
             }
-            Ev::Host(ToGuest::Leg(_) | ToGuest::Build(_)) => {}
+            Ev::Host(ToGuest::Leg(_) | ToGuest::Build(_) | ToGuest::Serve(_) | ToGuest::Stop) => {}
             Ev::Pty(session, PtyOut::Data(data)) => {
                 if let Some((_, state)) = terms.get(&session) {
                     state.output(&data);
@@ -636,6 +709,382 @@ async fn serve(
             }
         }
     }
+}
+
+/// A deployment (W15-R02): its image entered, and its service's manager forked.
+fn deployment() -> anyhow::Result<()> {
+    enter()?;
+    #[allow(unsafe_code)]
+    // SAFETY: as for a leg: PID 1 has one thread here, so the child may go on as this program does.
+    let forked = unsafe { nix::unistd::fork() }.context("starting the deployment's manager")?;
+    match forked {
+        nix::unistd::ForkResult::Child => {
+            let code = match manage() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("kiln guest: {e:#}");
+                    1
+                }
+            };
+            #[allow(clippy::exit)]
+            std::process::exit(code)
+        }
+        nix::unistd::ForkResult::Parent { child } => reap(child),
+    }
+    Ok(())
+}
+
+/// What's known of a deployment's health, for saying when it changes.
+const UNKNOWN: u8 = 0;
+const HEALTHY: u8 = 1;
+const UNHEALTHY: u8 = 2;
+
+/// The deployment's manager: dialled in and given its service, which it runs, and runs again when
+/// it ends (waiting longer each time it ends soon after starting, up to half a minute), checks, and
+/// takes the host's connections in to; until the host says stop or hangs up, when the service is
+/// stopped (`SIGTERM` to its process group, `SIGKILL` ten seconds on) and the microVM ends.
+fn manage() -> anyhow::Result<()> {
+    let mut conn = dial(CONTROL_PORT)?;
+    send(&mut conn, &FromGuest::Ready)?;
+    let svc = match recv::<ToGuest>(&mut conn)? {
+        Some(ToGuest::Serve(s)) => *s,
+        Some(other) => anyhow::bail!("the host sent {other:?} where a service goes"),
+        None => anyhow::bail!("the host hung up before sending the service"),
+    };
+    anyhow::ensure!(!svc.argv.is_empty(), "the service has no command: its image has no entrypoint or command, and the step gave none");
+    forward(LOCAL_PROXY, PROXY_PORT)?;
+    for &port in &svc.ports {
+        inbound(port)?;
+    }
+    let (out, out_rx) = std::sync::mpsc::channel::<FromGuest>();
+    let mut writer = conn.try_clone()?;
+    let wrote = std::thread::Builder::new().name("guest-out".into()).spawn(move || {
+        while let Ok(f) = out_rx.recv() {
+            let last = matches!(f, FromGuest::Bye);
+            if send(&mut writer, &f).is_err() || last {
+                break;
+            }
+        }
+    })?;
+    // The service's process while it runs.
+    let running: Arc<parking_lot::Mutex<Option<u32>>> = Arc::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    // The host's word: stop, or its hanging up, which is the same.
+    {
+        let (stop, running, mut reader) = (Arc::clone(&stop), Arc::clone(&running), conn);
+        std::thread::Builder::new().name("guest-in".into()).spawn(move || {
+            while let Ok(Some(m)) = recv::<ToGuest>(&mut reader) {
+                if matches!(m, ToGuest::Stop) {
+                    break;
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+            terminate(&running);
+        })?;
+    }
+    let user = user_of(&svc.user)?;
+    let env = service_env(&svc, user.as_ref());
+    let health = Arc::new(AtomicU8::new(UNKNOWN));
+    if let Some(h) = svc.health.clone() {
+        let (stop, out, env, health) = (Arc::clone(&stop), out.clone(), env.clone(), Arc::clone(&health));
+        let user = user.as_ref().map(|u| (u.uid, u.gid));
+        std::thread::Builder::new().name("health".into()).spawn(move || watch(&h, &env, user, &stop, &health, &out))?;
+    }
+    let mut wait = Duration::from_secs(1);
+    while !stop.load(Ordering::SeqCst) {
+        let started = Instant::now();
+        let code = match start(&svc, &env, user.as_ref(), &out) {
+            Ok(mut child) => {
+                let pid = child.id();
+                *running.lock() = Some(pid);
+                // A stop that came as it started.
+                if stop.load(Ordering::SeqCst) {
+                    terminate(&running);
+                }
+                // With no check of its own, it's healthy once it has run two seconds.
+                if svc.health.is_none() {
+                    let (running, out, health) = (Arc::clone(&running), out.clone(), Arc::clone(&health));
+                    std::thread::Builder::new().name("running".into()).spawn(move || {
+                        std::thread::sleep(Duration::from_secs(2));
+                        if *running.lock() == Some(pid) && health.swap(HEALTHY, Ordering::SeqCst) != HEALTHY {
+                            let _ = out.send(FromGuest::Health { healthy: true, said: "running".into() });
+                        }
+                    })?;
+                }
+                let status = child.wait();
+                *running.lock() = None;
+                status.ok().and_then(|s| s.code())
+            }
+            Err(e) => {
+                let _ = out.send(FromGuest::Output(format!("kiln: {e:#}\n").into_bytes()));
+                None
+            }
+        };
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // Said again once it's back, checked or not.
+        health.store(UNKNOWN, Ordering::SeqCst);
+        if svc.health.is_none() {
+            let _ = out.send(FromGuest::Health { healthy: false, said: "it ended".into() });
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            wait = Duration::from_secs(1);
+        }
+        let _ = out.send(FromGuest::Exited { code, again_secs: wait.as_secs() });
+        sleep_unless(&stop, wait);
+        wait = wait.saturating_mul(2).min(Duration::from_secs(30));
+    }
+    let _ = out.send(FromGuest::Bye);
+    let _ = wrote.join();
+    Ok(())
+}
+
+/// Sleeps `d`, or less once `stop` is set.
+fn sleep_unless(stop: &AtomicBool, d: Duration) {
+    let until = Instant::now() + d;
+    while !stop.load(Ordering::SeqCst) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The service told to stop (`SIGTERM` to its process group), and killed ten seconds on if it
+/// hasn't.
+fn terminate(running: &Arc<parking_lot::Mutex<Option<u32>>>) {
+    use nix::sys::signal::{Signal, killpg};
+    let Some(pid) = *running.lock() else { return };
+    let Ok(group) = i32::try_from(pid).map(nix::unistd::Pid::from_raw) else { return };
+    let _ = killpg(group, Signal::SIGTERM);
+    let running = Arc::clone(running);
+    let _ = std::thread::Builder::new().name("terminate".into()).spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        if *running.lock() == Some(pid) {
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+    });
+}
+
+/// Whom a service runs as, from the image's `/etc/passwd` and `/etc/group`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct User {
+    uid: u32,
+    gid: u32,
+    home: Option<String>,
+}
+
+/// `user` (the image's `User`: `name`, `uid`, `uid:gid`, `name:group`), looked up in the image;
+/// `None` for root's.
+fn user_of(user: &str) -> anyhow::Result<Option<User>> {
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    resolve_user(user, &passwd, &group)
+}
+
+fn resolve_user(user: &str, passwd: &str, group: &str) -> anyhow::Result<Option<User>> {
+    let user = user.trim();
+    if user.is_empty() || user == "root" || user == "0" {
+        return Ok(None);
+    }
+    let (u, g) = user.split_once(':').map_or((user, None), |(u, g)| (u, Some(g)));
+    let rows = |text: &str| text.lines().map(|l| l.split(':').map(str::to_owned).collect::<Vec<String>>()).collect::<Vec<_>>();
+    let (users, groups) = (rows(passwd), rows(group));
+    let number = |row: &Vec<String>, i: usize| row.get(i).and_then(|v| v.parse::<u32>().ok());
+    let found = match u.parse::<u32>() {
+        Ok(n) => users.iter().find(|r| number(r, 2) == Some(n)),
+        Err(_) => Some(users.iter().find(|r| r.first().map(String::as_str) == Some(u)).with_context(|| format!("the image has no user `{u}`"))?),
+    };
+    let uid = match u.parse::<u32>() {
+        Ok(n) => n,
+        Err(_) => found.and_then(|r| number(r, 2)).with_context(|| format!("the image's user `{u}` has no uid"))?,
+    };
+    let gid = match g {
+        None => found.and_then(|r| number(r, 3)).unwrap_or(0),
+        Some(g) => match g.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => groups.iter().find(|r| r.first().map(String::as_str) == Some(g)).and_then(|r| number(r, 2)).with_context(|| format!("the image has no group `{g}`"))?,
+        },
+    };
+    Ok(Some(User { uid, gid, home: found.and_then(|r| r.get(5).cloned()).filter(|h| !h.is_empty()) }))
+}
+
+/// The service's environment: a default `PATH` and `HOME`, the image's and the step's, and the way
+/// out through the host's egress proxy unless they say otherwise.
+fn service_env(svc: &Service, user: Option<&User>) -> Vec<(String, String)> {
+    let home = user.map_or_else(|| Some("/root".to_owned()), |u| u.home.clone()).unwrap_or_else(|| "/".to_owned());
+    let mut env: Vec<(String, String)> = vec![("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()), ("HOME".into(), home)];
+    env.extend(svc.env.iter().cloned());
+    let proxy = format!("http://127.0.0.1:{LOCAL_PROXY}");
+    let set = |env: &mut Vec<(String, String)>, k: &str, v: &str| {
+        if !env.iter().any(|(e, _)| e == k) {
+            env.push((k.to_owned(), v.to_owned()));
+        }
+    };
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        set(&mut env, k, &proxy);
+    }
+    for k in ["NO_PROXY", "no_proxy"] {
+        set(&mut env, k, "localhost,127.0.0.1,::1");
+    }
+    env
+}
+
+/// The service started, in its own process group: what it writes goes to the host as it comes.
+fn start(svc: &Service, env: &[(String, String)], user: Option<&User>, out: &std::sync::mpsc::Sender<FromGuest>) -> anyhow::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt as _;
+    let (program, args) = svc.argv.split_first().context("the service has no command")?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .current_dir(if svc.cwd.is_empty() { "/" } else { svc.cwd.as_str() })
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    if let Some(u) = user {
+        cmd.uid(u.uid).gid(u.gid);
+    }
+    let mut child = cmd.spawn().with_context(|| format!("starting {program}"))?;
+    let outs: [Option<Box<dyn Read + Send>>; 2] = [child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>), child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>)];
+    for mut r in outs.into_iter().flatten() {
+        let out = out.clone();
+        std::thread::Builder::new().name("service-output".into()).spawn(move || {
+            let mut buf = vec![0u8; 16 << 10];
+            while let Ok(n) = r.read(&mut buf) {
+                if n == 0 || out.send(FromGuest::Output(buf.get(..n).unwrap_or_default().to_vec())).is_err() {
+                    break;
+                }
+            }
+        })?;
+    }
+    Ok(child)
+}
+
+/// The service's health check, every interval: healthy once it passes, unhealthy once it has
+/// failed `retries` times in a row (failures in its start period don't count), said each time that
+/// changes (and again after the service starts again).
+fn watch(h: &Health, env: &[(String, String)], user: Option<(u32, u32)>, stop: &AtomicBool, health: &AtomicU8, out: &std::sync::mpsc::Sender<FromGuest>) {
+    let started = Instant::now();
+    let mut fails = 0u32;
+    while !stop.load(Ordering::SeqCst) {
+        match check(h, env, user) {
+            Ok(()) => {
+                fails = 0;
+                if health.swap(HEALTHY, Ordering::SeqCst) != HEALTHY {
+                    let _ = out.send(FromGuest::Health { healthy: true, said: "healthy".into() });
+                }
+            }
+            Err(why) => {
+                if started.elapsed() >= Duration::from_secs(h.start_secs) {
+                    fails = fails.saturating_add(1);
+                }
+                if fails >= h.retries.max(1) && health.swap(UNHEALTHY, Ordering::SeqCst) != UNHEALTHY {
+                    let _ = out.send(FromGuest::Health { healthy: false, said: why });
+                }
+            }
+        }
+        sleep_unless(stop, Duration::from_secs(h.interval_secs.max(1)));
+    }
+}
+
+/// One run of a health check: why it failed, when it did.
+fn check(h: &Health, env: &[(String, String)], user: Option<(u32, u32)>) -> Result<(), String> {
+    let timeout = Duration::from_secs(h.timeout_secs.max(1));
+    match h.test.split_first() {
+        Some((kind, rest)) if kind == "HTTP" => get(rest.first().map_or("", String::as_str), timeout),
+        Some((kind, rest)) if kind == "CMD" => run_check(rest, env, user, timeout),
+        Some((kind, rest)) if kind == "CMD-SHELL" => run_check(&["/bin/sh".to_owned(), "-c".to_owned(), rest.join(" ")], env, user, timeout),
+        _ => Ok(()),
+    }
+}
+
+/// A check's command, run within `timeout`: it passes when it exits 0.
+fn run_check(argv: &[String], env: &[(String, String)], user: Option<(u32, u32)>, timeout: Duration) -> Result<(), String> {
+    use std::os::unix::process::CommandExt as _;
+    let (program, args) = argv.split_first().ok_or("the check has no command")?;
+    let said = Path::new("/run/kiln-health.out");
+    let file = std::fs::File::create(said).map_err(|e| format!("{}: {e}", said.display()))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).env_clear().envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str()))).stdin(std::process::Stdio::null());
+    if let Ok(copy) = file.try_clone() {
+        cmd.stdout(copy);
+    }
+    cmd.stderr(file);
+    if let Some((uid, gid)) = user {
+        cmd.uid(uid).gid(gid);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("{program}: {e}"))?;
+    let deadline = Instant::now() + timeout;
+    let output = || {
+        let text = std::fs::read(said).unwrap_or_default();
+        let from = text.len().saturating_sub(300);
+        String::from_utf8_lossy(text.get(from..).unwrap_or_default()).trim().to_owned()
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) if s.success() => return Ok(()),
+            Ok(Some(s)) => {
+                let code = s.code().map_or_else(|| "on a signal".to_owned(), |c| c.to_string());
+                let said = output();
+                return Err(if said.is_empty() { format!("the check exited {code}") } else { format!("the check exited {code}: {said}") });
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("the check took longer than {}s", timeout.as_secs()));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// A `GET` of `url` (`http://host[:port]/path`) within `timeout`: it passes on a 2xx or 3xx.
+fn get(url: &str, timeout: Duration) -> Result<(), String> {
+    use std::net::ToSocketAddrs as _;
+    let rest = url.strip_prefix("http://").ok_or_else(|| format!("{url}: a health check's URL is http://"))?;
+    let (authority, path) = rest.split_once('/').map_or((rest, "/".to_owned()), |(a, p)| (a, format!("/{p}")));
+    let addr = if authority.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { authority.to_owned() } else { format!("{authority}:80") };
+    let to = addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or_else(|| format!("{addr}: no address"))?;
+    let mut s = std::net::TcpStream::connect_timeout(&to, timeout).map_err(|e| format!("{url}: {e}"))?;
+    s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    s.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    write!(s, "GET {path} HTTP/1.0\r\nHost: {authority}\r\nUser-Agent: kiln-health\r\nConnection: close\r\n\r\n").map_err(|e| format!("{url}: {e}"))?;
+    let mut line = String::new();
+    io::BufReader::new(s).read_line(&mut line).map_err(|e| format!("{url}: {e}"))?;
+    let code = line.split_whitespace().nth(1).and_then(|c| c.parse::<u16>().ok()).ok_or_else(|| format!("{url}: not an HTTP answer"))?;
+    if (200..400).contains(&code) { Ok(()) } else { Err(format!("{url} answered {code}")) }
+}
+
+/// The host's connections in to vsock port `INBOUND + port`, each to the service's `port` on the
+/// guest's loopback.
+fn inbound(port: u16) -> anyhow::Result<()> {
+    use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, listen, socket};
+    let vport = INBOUND + u32::from(port);
+    let fd = socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None).context("a vsock socket")?;
+    bind(fd.as_raw_fd(), &VsockAddr::new(nix::libc::VMADDR_CID_ANY, vport)).with_context(|| format!("listening on vsock port {vport}"))?;
+    listen(&fd, Backlog::new(64)?)?;
+    std::thread::Builder::new().name(format!("inbound-{port}")).spawn(move || {
+        loop {
+            match accept(fd.as_raw_fd()) {
+                Ok(c) => {
+                    #[allow(unsafe_code)]
+                    // SAFETY: `accept` made `c`, a descriptor nothing else owns.
+                    let s = UnixStream::from(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(c) });
+                    // Its end once the service is done sending: Firecracker doesn't pass a guest's
+                    // half-close on to the host, which would wait for more.
+                    let _ = std::thread::Builder::new().name(format!("inbound-{port}-conn")).spawn(move || {
+                        if let Ok(t) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                            splice_with(t, s, std::net::Shutdown::Both);
+                        }
+                    });
+                }
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(_) => return,
+            }
+        }
+    })?;
+    Ok(())
 }
 
 /// An image built: its layers (`/dev/vdb`) extracted onto its new root file system (`/dev/vdc`).

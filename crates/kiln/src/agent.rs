@@ -798,6 +798,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::runner::pool::sweep(&o.work_dir);
     // And the containers and networks this runner left running when it last stopped.
     crate::runner::docker::sweep(&o.work_dir).await;
+    // Its microVM deployments (W15-R02), booted again: they end with the runner.
+    #[cfg(target_os = "linux")]
+    crate::rt::spawn(crate::runner::firecracker::restore(o.work_dir.join("_firecracker")));
     let mut exclusive = false;
     let mut draining = false;
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and
