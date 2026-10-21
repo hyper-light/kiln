@@ -51,6 +51,8 @@ pub struct Server {
     /// Its environment beyond the test's, kept for a restart.
     #[allow(dead_code)]
     env: Vec<(String, String)>,
+    /// What its runner left in Docker stays when it's dropped ([`Server::crash`]).
+    leave: bool,
 }
 
 impl Server {
@@ -79,6 +81,13 @@ impl Server {
         }
     }
 
+    /// Killed, as a crash would be: what its runner left in Docker stays, for its next start on the
+    /// same directory to find (dropped, a server's leftovers go with it).
+    #[allow(dead_code)]
+    pub fn crash(mut self) {
+        self.leave = true;
+    }
+
     /// The end of the server's log.
     #[allow(dead_code)]
     pub fn log(&self) -> String {
@@ -92,6 +101,33 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let work = self.dir.join("work");
+        if !self.leave && work.is_dir() {
+            sweep(&work);
+        }
+    }
+}
+
+/// What a killed server's runner left in Docker (its legs' and its pools' containers, then their
+/// networks) removed, as the runner would itself on its next start: found by the label it puts on
+/// all it makes (`runner::docker::owner_label` of its work directory), so no other server's. Left
+/// behind, each network holds one of the engine's few address pools until no leg on the machine
+/// can start.
+fn sweep(work: &Path) {
+    use sha2::Digest as _;
+    let path = std::path::absolute(work).unwrap_or_else(|_| work.to_path_buf());
+    let h = hex::encode(sha2::Sha256::digest(path.to_string_lossy().as_bytes()));
+    let label = format!("label=kiln.runner-work={}", h.get(..16).unwrap_or(&h));
+    let ids = |list: &[&str]| -> Vec<String> {
+        Command::new("docker").args(list).args(["--filter", &label]).output().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_owned).collect()).unwrap_or_default()
+    };
+    let containers = ids(&["ps", "-aq"]);
+    if !containers.is_empty() {
+        let _ = Command::new("docker").args(["rm", "--force"]).args(&containers).output();
+    }
+    let networks = ids(&["network", "ls", "-q"]);
+    if !networks.is_empty() {
+        let _ = Command::new("docker").args(["network", "rm"]).args(&networks).output();
     }
 }
 
@@ -200,7 +236,7 @@ enabled = true
     let mut cmd = server_command(dir, log)?;
     cmd.envs(env.iter().copied());
     let child = cmd.spawn()?;
-    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect() };
+    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = server.child.try_wait()? {

@@ -27,7 +27,8 @@ fn git(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What a test leaves in the engine: the image's tags, and the pool's containers.
+/// What a test leaves in the engine besides what its server's runner made (the pool's executors,
+/// which the server's drop sweeps): the image's tags.
 struct Leftovers {
     images: Vec<String>,
 }
@@ -36,11 +37,6 @@ impl Drop for Leftovers {
     fn drop(&mut self) {
         for i in &self.images {
             let _ = std::process::Command::new("docker").args(["image", "rm", "-f", i]).output();
-        }
-        if let Ok(o) = std::process::Command::new("docker").args(["ps", "-aq", "--filter", "label=kiln.pool=built"]).output() {
-            for c in String::from_utf8_lossy(&o.stdout).split_whitespace() {
-                let _ = std::process::Command::new("docker").args(["rm", "-f", c]).output();
-            }
         }
     }
 }

@@ -84,7 +84,7 @@ fn a_runner_removes_what_it_left_running() -> anyhow::Result<()> {
     let theirs = format!("kiln_leftovers_test_{}", std::process::id());
     let other = docker(&["network", "create", "--label", "kiln.runner-work=someone-else", "--label", "kiln.leg=theirs", &theirs])?;
     // Killed, as a crash would: nothing cleaned up.
-    drop(s);
+    s.crash();
     std::thread::sleep(Duration::from_secs(2));
     assert!(containers.iter().all(|c| exists("container", c)), "a killed runner's containers stay: {containers:?}");
     // Started again on the same work directory: what it left goes before it takes a leg.

@@ -44,18 +44,19 @@ fn compose() -> bool {
     Command::new("docker").args(["compose", "version"]).output().is_ok_and(|o| o.status.success())
 }
 
-/// What a test deployed, taken down when it ends.
+/// What a test deployed, taken down when it ends: its containers, then its network (left behind,
+/// each holds one of the engine's few address pools).
 struct Project(String);
 
 impl Drop for Project {
     fn drop(&mut self) {
-        let ids = Command::new("docker")
-            .args(["ps", "-aq", "--filter", &format!("label=com.docker.compose.project={}", self.0)])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        for id in ids.split_whitespace() {
+        let label = format!("label=com.docker.compose.project={}", self.0);
+        let ids = |list: &[&str]| Command::new("docker").args(list).args(["--filter", &label]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        for id in ids(&["ps", "-aq"]).split_whitespace() {
             let _ = Command::new("docker").args(["rm", "-f", id]).output();
+        }
+        for id in ids(&["network", "ls", "-q"]).split_whitespace() {
+            let _ = Command::new("docker").args(["network", "rm", id]).output();
         }
     }
 }
