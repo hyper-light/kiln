@@ -124,23 +124,30 @@ const UPKEEP_EVERY: Duration = Duration::from_secs(3600);
 
 /// The store at the server's start, before anything reads from it: what an older kiln did to the
 /// local store taken in ([`local::LocalBlobs::ready`]), the upgrade binaries kept as files taken in
-/// where they lie, and what kiln knows of the kept binaries read. Sync's contents are listed by
-/// their own ([`crate::sync::contents`]).
+/// where they lie, and what kiln knows of the kept binaries read. An S3 store's bucket is made and
+/// its binaries read in the background, tried again until it answers: a store slow to answer, or
+/// not at all, never keeps the server from listening. Sync's contents are listed by their own
+/// ([`crate::sync::contents`]).
 pub async fn start(hub: &Arc<crate::hub::Hub>) {
-    if let Some(s3) = &hub.blobs.s3
-        && hub.cfg.blobs.s3.create_bucket
-        && let Err(e) = s3.ensure_bucket().await
-    {
-        tracing::warn!(target: "kiln.blobs", event = "put", error = %e, "the S3 bucket kiln keeps its bytes in couldn't be made");
-    }
     if let Some(local) = &hub.blobs.local {
         local.ready().await;
         if let Err(e) = crate::updates::take_in(hub, local).await {
             tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "runner binaries kept as files couldn't be taken in");
         }
+        if !crate::updates::load(hub).await {
+            crate::rt::spawn(crate::updates::load_until_read(Arc::clone(hub), false));
+        }
     }
-    if !crate::updates::load(hub).await {
-        crate::rt::spawn(crate::updates::load_until_read(Arc::clone(hub)));
+    if let Some(s3) = hub.blobs.s3.clone() {
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            if h.cfg.blobs.s3.create_bucket
+                && let Err(e) = s3.ensure_bucket().await
+            {
+                tracing::warn!(target: "kiln.blobs", event = "put", error = %e, "the S3 bucket kiln keeps its bytes in couldn't be made");
+            }
+            crate::updates::load_until_read(h, true).await;
+        });
     }
 }
 

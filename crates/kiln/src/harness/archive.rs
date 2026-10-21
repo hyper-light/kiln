@@ -94,6 +94,8 @@ pub struct Piece {
     pub lines: u64,
     /// As kept: compressed.
     pub bytes: u64,
+    /// Unpacked: its lines and their newlines.
+    pub raw: u64,
 }
 
 /// A conversation closed: its record is archived [`AFTER`] from now (noted in the background).
@@ -112,7 +114,7 @@ async fn due(store: &crate::store::Store, session: &str) {
         .call(move |c| {
             c.execute(
                 "INSERT INTO transcript_archives (session, closed_ms, due_ms, done_ms) VALUES (?1, ?2, ?3, NULL)
-                 ON CONFLICT (session) DO UPDATE SET closed_ms = MIN(closed_ms, excluded.closed_ms), due_ms = excluded.due_ms, done_ms = NULL",
+                 ON CONFLICT (session) DO UPDATE SET closed_ms = excluded.closed_ms, due_ms = excluded.due_ms, done_ms = NULL",
                 params![s, now, at],
             )?;
             Ok(())
@@ -128,10 +130,10 @@ pub async fn archived(hub: &Hub, session: &str) -> anyhow::Result<Vec<Piece>> {
     let s = session.to_owned();
     hub.store
         .call(move |c| {
-            let mut q = c.prepare("SELECT source, first, last, key, lines, bytes FROM transcript_segments WHERE session = ?1 ORDER BY source, first")?;
+            let mut q = c.prepare("SELECT source, first, last, key, lines, bytes, raw FROM transcript_segments WHERE session = ?1 ORDER BY source, first")?;
             let rows = q.query_map([&s], |r| {
                 let n = |i: usize| r.get::<_, i64>(i).map(|v| u64::try_from(v).unwrap_or(0));
-                Ok(Piece { source: r.get(0)?, first: n(1)?, last: n(2)?, key: r.get(3)?, lines: n(4)?, bytes: n(5)? })
+                Ok(Piece { source: r.get(0)?, first: n(1)?, last: n(2)?, key: r.get(3)?, lines: n(4)?, bytes: n(5)?, raw: n(6)? })
             })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
@@ -352,7 +354,7 @@ async fn pieces(hub: &Hub, convo: &crate::convo::store::Store, session: &str, so
 /// Puts a piece where nothing is (one a cut-short try put already is taken as it is) and records it.
 async fn write_piece(hub: &Hub, session: &str, source: &str, m: Making) -> anyhow::Result<()> {
     let k = key(session, source, m.first, m.last);
-    let Making { first, last, lines, enc, .. } = m;
+    let Making { first, last, lines, raw, enc } = m;
     let bytes = crate::rt::blocking(move || enc.into_inner()).await?;
     let size = match hub.blobs.blobs.put(&k, bytes, Put { cond: Cond::IfNoneMatch, sha256: None }).await {
         Ok(meta) => meta.size,
@@ -364,9 +366,9 @@ async fn write_piece(hub: &Hub, session: &str, source: &str, m: Making) -> anyho
     hub.store
         .call(move |c| {
             c.execute(
-                "INSERT INTO transcript_segments (session, source, first, last, key, codec, lines, bytes, written_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO transcript_segments (session, source, first, last, key, codec, lines, bytes, raw, written_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (session, source, first) DO NOTHING",
-                params![s, src, i(first), i(last), kk, CODEC, i(lines), i(size), now],
+                params![s, src, i(first), i(last), kk, CODEC, i(lines), i(size), i(raw), now],
             )?;
             Ok(())
         })
@@ -394,8 +396,8 @@ pub fn lines(hub: &Arc<Hub>, pieces: Vec<Piece>) -> async_channel::Receiver<byte
                 Ok(out)
             })
             .await;
-            let Ok(Ok(text)) = text else {
-                tracing::warn!(target: "kiln.blobs", event = "get", key = %p.key, "an archived piece couldn't be unpacked; the record ends short");
+            let Ok(Ok(text)) = text.map(|t| t.and_then(|t| if t.len() as u64 == p.raw { Ok(t) } else { Err(std::io::Error::other("unpacked to another length")) })) else {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %p.key, "an archived piece couldn't be unpacked whole; the record ends short");
                 return;
             };
             if tx.send(bytes::Bytes::from(text)).await.is_err() {
@@ -517,6 +519,31 @@ mod tests {
             let given: Option<i64> = hub.store.call(|c| Ok(c.query_row("SELECT done_ms FROM transcript_archives WHERE session = 's-held'", [], |r| r.get(0))?)).await?;
             assert_eq!(given, Some(0), "given up");
             assert_eq!(convo.held(), None, "and holding nothing back");
+            Ok(())
+        })
+    }
+
+    /// CP-T10.1: a conversation archived long ago, resumed and closed again, has its new lines
+    /// archived: its hold and its giving up run from its last close, not its first.
+    #[test]
+    fn a_conversation_closed_again_long_after_has_its_new_lines_archived() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let convo = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let c = convo.clone();
+            assert!(crate::rt::blocking(move || c.put_wait(record("s1", 0..3))).await?);
+            assert_eq!(archive(&hub, &convo, "s1").await?, 1);
+            let long_ago = crate::util::now_ms().saturating_sub(70 * 86_400_000);
+            hub.store.call(move |c| Ok(c.execute("INSERT INTO transcript_archives (session, closed_ms, due_ms, done_ms) VALUES ('s1', ?1, ?1, ?1)", [long_ago])?)).await?;
+            // Resumed, three more lines, closed again now.
+            let c = convo.clone();
+            assert!(crate::rt::blocking(move || c.put_wait(record("s1", 3..6))).await?);
+            due(&hub.store, "s1").await;
+            hub.store.call(|c| Ok(c.execute("UPDATE transcript_archives SET due_ms = 0", [])?)).await?;
+            pass(&hub, &convo).await?;
+            assert_eq!(archived(&hub, "s1").await?.iter().map(|p| (p.first, p.last)).collect::<Vec<_>>(), [(0, 2), (3, 5)]);
+            let done: Option<i64> = hub.store.call(|c| Ok(c.query_row("SELECT done_ms FROM transcript_archives WHERE session = 's1'", [], |r| r.get(0))?)).await?;
+            assert!(done.is_some_and(|d| d > 0), "archived, not given up: {done:?}");
             Ok(())
         })
     }

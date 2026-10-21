@@ -57,11 +57,24 @@ pub struct Contents {
     /// The listing at start ended short (the store unavailable): what's held is known only as it
     /// comes.
     partial: AtomicBool,
+    /// Contents let go, to delete from the store, one at a time: at most as many as the index
+    /// holds ([`INDEX_MAX`]), since each left it to be queued.
+    gone: async_channel::Sender<String>,
 }
 
 impl Contents {
     fn new(blobs: Arc<dyn Blobs>) -> Self {
-        Self { blobs, index: Mutex::default(), loaded_cv: Condvar::new(), partial: AtomicBool::new(false) }
+        let (gone, rx) = async_channel::unbounded::<String>();
+        let b = Arc::clone(&blobs);
+        crate::rt::spawn(async move {
+            while let Ok(k) = rx.recv().await {
+                match b.delete(&k).await {
+                    Ok(()) => crate::metrics::blobs().collected.inc(&["sync"]),
+                    Err(e) => tracing::warn!(target: "kiln.blobs", event = "collect", key = %k, error = %e, "a content nothing needs couldn't be deleted"),
+                }
+            }
+        });
+        Self { blobs, index: Mutex::default(), loaded_cv: Condvar::new(), partial: AtomicBool::new(false), gone }
     }
 
     /// The contents in `blobs`, its index made in the background: files kept before under `legacy`
@@ -193,20 +206,16 @@ impl Contents {
         Ok(hash)
     }
 
-    /// Drops a content nothing needs any more: from the index now, from the store as soon as it
-    /// answers.
+    /// Drops a content nothing needs any more: from the index now, from the store a deletion at a
+    /// time, however many go at once (a repo let go).
     pub fn remove(&self, hash: &str) {
         let Some(i) = id(hash) else { return };
         if self.index.lock().held.remove(&i).is_none() {
             return;
         }
-        let (blobs, k) = (Arc::clone(&self.blobs), key(hash));
-        crate::rt::spawn(async move {
-            match blobs.delete(&k).await {
-                Ok(()) => crate::metrics::blobs().collected.inc(&["sync"]),
-                Err(e) => tracing::warn!(target: "kiln.blobs", event = "collect", key = %k, error = %e, "a content nothing needs couldn't be deleted"),
-            }
-        });
+        if self.gone.try_send(key(hash)).is_err() {
+            tracing::warn!(target: "kiln.blobs", event = "collect", content = hash, "a content nothing needs is left in the store: its deletions have stopped");
+        }
     }
 
     /// Content `hash` as a stream, with its size (`None`: not held).

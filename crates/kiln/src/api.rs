@@ -1109,7 +1109,10 @@ async fn archived_transcript(hub: &Arc<Hub>, id: &str, source: &str) -> R {
     if pieces.is_empty() {
         return Err(err(StatusCode::NOT_FOUND, "no record of that source archived for this conversation"));
     }
-    Ok(srv::response(StatusCode::OK, "application/x-ndjson", srv::channel_body(crate::harness::archive::lines(hub, pieces))))
+    // Its length, so a reader told of every piece knows when one was missing.
+    let length = pieces.iter().fold(0u64, |n, p| n.saturating_add(p.raw));
+    let r = srv::response(StatusCode::OK, "application/x-ndjson", srv::channel_body(crate::harness::archive::lines(hub, pieces)));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &length.to_string()))
 }
 
 /// A file of session `id`'s machine (`location`), in ranges, as it reads it.

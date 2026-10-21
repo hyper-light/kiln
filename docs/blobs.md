@@ -57,8 +57,9 @@ bytes) stops the server at start, saying which.
 | `recordings/<session>/<recording>/<file>` | live pages' recordings (video, log, test), copied from their machine when they end | `harness::streams` | when the conversation closes |
 | `transcripts/<session>/<source>/<first>-<last>.jsonl.br` | a piece of a closed conversation's own record (Claude Code's transcript, Codex's rollouts): lines `first` to `last`, brotli, written once and never replaced | `harness::archive` | `[conversations] keep_archived_days` (365) after its last close; the conversation store lets no record go before it's archived, or given up 30 days past its own keeping |
 
-Keys are 1 to 960 bytes of UTF-8, in `/`-separated segments of 1 to 255 bytes, with no `.` or
-`..` segment, no control characters and no backslash: the same keys on every store.
+Keys are 1 to 960 bytes of UTF-8, in `/`-separated segments of 1 to 254 bytes, with no `.` or
+`..` segment, no segment ending in a space, no control characters and no backslash: the same keys
+on every store.
 
 ## The local store
 
@@ -73,7 +74,9 @@ Keys are 1 to 960 bytes of UTF-8, in `/`-separated segments of 1 to 255 bytes, w
   one transaction.
 - **Durability:** a new chunk is flushed to the disk before it's named, and its folder after; a key
   is written in a transaction once its chunks are. A read of a whole object is checked against its
-  SHA-256: one that doesn't hash to its name is refused, not served.
+  SHA-256: a get of one that doesn't hash to its name is refused, and a read streamed in pieces
+  ends before its last piece, so its reader gets fewer bytes than it was promised, never all of
+  them.
 - **Uploads in parts** are cut into chunks as each part arrives (`blob_uploads`, `blob_parts`); the
   object's SHA-256 is taken as the parts come in order, or read back once at completion.
 - **Letting go:** an object no key holds stays an hour, so a read under way finishes; then it goes,
@@ -198,7 +201,7 @@ refused or unavailable.
 
 ## The suite against MinIO
 
-Every store passes the same suite of the contract's 162 clauses (`kiln_seams::blobs::cases`): the
+Every store passes the same suite of the contract's 163 clauses (`kiln_seams::blobs::cases`): the
 simulator and the local store in every `cargo test`, the S3 store against a MinIO when one is
 named. The lab's MinIO runs in a container on fedora (`cgr.dev/chainguard/minio`, MinIO
 RELEASE.2026-09-22):
@@ -210,7 +213,7 @@ $ KILN_TEST_S3="http://127.0.0.1:19300 kiln-t10 <access key id> <file holding th
     cargo test -p kiln --lib blobs::s3 -- --ignored
 ```
 
-Recorded 2026-10-21 on fedora: 162 of 162 clauses on the simulator, the local store and the S3
+Recorded 2026-10-21 on fedora: 163 of 163 clauses on the simulator, the local store and the S3
 store against MinIO.
 
 ## The labs

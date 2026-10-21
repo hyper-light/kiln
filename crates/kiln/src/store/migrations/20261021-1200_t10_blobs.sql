@@ -64,7 +64,8 @@ CREATE TABLE transcript_archives (
 CREATE INDEX transcript_archives_due ON transcript_archives (done_ms, due_ms);
 
 -- The archived pieces of a record: lines `first` to `last` of a source, an object at `key` written
--- once and never replaced, in `codec`. A session that closes again adds pieces of the lines since.
+-- once and never replaced, in `codec`: `bytes` as kept, `raw` unpacked. A session that closes again
+-- adds pieces of the lines since.
 CREATE TABLE transcript_segments (
   session TEXT NOT NULL,
   source TEXT NOT NULL,
@@ -74,6 +75,7 @@ CREATE TABLE transcript_segments (
   codec TEXT NOT NULL,
   lines INTEGER NOT NULL,
   bytes INTEGER NOT NULL,
+  raw INTEGER NOT NULL,
   written_ms INTEGER NOT NULL,
   PRIMARY KEY (session, source, first)
 );

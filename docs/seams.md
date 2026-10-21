@@ -147,7 +147,8 @@ takes. A put is checked in this order: its key, its size, its checksum, then its
 - **Passed by:** the simulator, every clause; the local store, every clause; the S3 store against
   MinIO, every clause (docs/blobs.md, "The suite against MinIO").
 - **Bounds:** keys 1 to 960 bytes (S3's 1024, less 64 a store may put before them), in segments of
-  1 to 255 bytes between `/`s, none `.` or `..`, with no control characters and no backslash;
+  1 to 254 bytes between `/`s (a file name's 255, less the space an S3 store ends a key with), none
+  `.` or `..` and none ending in a space, with no control characters and no backslash;
   1000 keys a listing (S3's); part numbers 1 to 10,000, every part but the last at least 5 MiB
   (S3's); presigned URLs for up to an hour (S3 allows 7 days: a URL is a credential, kept short),
   their lifetimes rounded up to whole seconds. A presigned URL's signature covers its method, its
@@ -179,7 +180,7 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 - **BLOBS-22** a key with a backslash is refused Invalid, so keys are the same on every platform's file system
 - **BLOBS-23** a key that starts or ends with '/', or holds an empty segment ('//'), is refused Invalid
 - **BLOBS-24** a key with a '.' or '..' segment is refused Invalid; dots within a segment's name ('a.b', '..c', '...') are taken
-- **BLOBS-25** a key's segments are 1 to 255 bytes: one of 255 is taken, one of 256 refused Invalid
+- **BLOBS-25** a key's segments are 1 to 254 bytes: one of 254 is taken, last or not; one of 255 refused Invalid
 - **BLOBS-26** a key's bytes are counted, not its characters: 960 bytes, most of them two-byte characters, are taken, one byte more refused Invalid
 - **BLOBS-27** every request that names a key refuses a bad one Invalid: get, head, delete, start_upload and presign as put does
 - **BLOBS-28** a key refused stores nothing: nothing is listed after
@@ -317,6 +318,7 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 - **BLOBS-160** objects stored by a put, an upload and a presigned put each have their content's SHA-256 as their etag
 - **BLOBS-161** a presigned put takes a body of exactly the length its URL declares: one longer or shorter is refused and stores nothing
 - **BLOBS-162** a listing by a prefix ending in a space gives only the keys that start with it, the space included
+- **BLOBS-163** a key with a segment that ends in a space is refused Invalid; spaces elsewhere in a segment are taken, and listed as they were put
 
 ## Secrets
 

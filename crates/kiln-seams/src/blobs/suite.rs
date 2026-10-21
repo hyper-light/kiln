@@ -421,9 +421,10 @@ clause!(c24, f, b, {
 });
 
 clause!(c25, f, b, {
-    let ok = format!("a/{}/z", "s".repeat(255));
-    put(b, &ok, b"x").await?;
-    invalid("a segment of 256 bytes", put_as(b, &format!("a/{}/z", "s".repeat(256)), b"x", Put::default()).await)
+    put(b, &format!("a/{}/z", "s".repeat(254)), b"x").await?;
+    put(b, &format!("a/{}", "s".repeat(254)), b"x").await?;
+    invalid("a segment of 255 bytes", put_as(b, &format!("a/{}/z", "s".repeat(255)), b"x", Put::default()).await)?;
+    invalid("a last segment of 255 bytes", put_as(b, &format!("a/{}", "s".repeat(255)), b"x", Put::default()).await)
 });
 
 clause!(c26, f, b, {
@@ -1565,11 +1566,21 @@ clause!(c161, f, b, {
 });
 
 clause!(c162, f, b, {
-    for k in ["sp", "sp ", "sp q", "spa"] {
+    for k in ["sp", "sp q", "spa"] {
         put(b, k, k.as_bytes()).await?;
     }
-    same("the keys a prefix ending in a space lists", listed_keys(b, "sp ").await?, vec!["sp ".to_owned(), "sp q".to_owned()])?;
-    same("the keys its first two bytes list", listed_keys(b, "sp").await?, vec!["sp".to_owned(), "sp ".to_owned(), "sp q".to_owned(), "spa".to_owned()])
+    same("the keys a prefix ending in a space lists", listed_keys(b, "sp ").await?, vec!["sp q".to_owned()])?;
+    same("the keys its first two bytes list", listed_keys(b, "sp").await?, vec!["sp".to_owned(), "sp q".to_owned(), "spa".to_owned()])
+});
+
+clause!(c163, f, b, {
+    for k in ["a ", "a /b", "a/b ", " "] {
+        invalid(&format!("{k:?}"), put_as(b, k, b"x", Put::default()).await)?;
+    }
+    for k in ["a", "a b/c", " a/b c"] {
+        put(b, k, b"x").await?;
+    }
+    same("the listing", listed_keys(b, "").await?, vec![" a/b c".to_owned(), "a".to_owned(), "a b/c".to_owned()])
 });
 
 /// The `Blobs` contract, clause by clause (docs/seams.md, "Blobs").
@@ -1599,7 +1610,7 @@ pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
         Case { id: "BLOBS-22", says: "a key with a backslash is refused Invalid, so keys are the same on every platform's file system", check: c22::<F> },
         Case { id: "BLOBS-23", says: "a key that starts or ends with '/', or holds an empty segment ('//'), is refused Invalid", check: c23::<F> },
         Case { id: "BLOBS-24", says: "a key with a '.' or '..' segment is refused Invalid; dots within a segment's name ('a.b', '..c', '...') are taken", check: c24::<F> },
-        Case { id: "BLOBS-25", says: "a key's segments are 1 to 255 bytes: one of 255 is taken, one of 256 refused Invalid", check: c25::<F> },
+        Case { id: "BLOBS-25", says: "a key's segments are 1 to 254 bytes: one of 254 is taken, last or not; one of 255 refused Invalid", check: c25::<F> },
         Case { id: "BLOBS-26", says: "a key's bytes are counted, not its characters: 960 bytes, most of them two-byte characters, are taken, one byte more refused Invalid", check: c26::<F> },
         Case { id: "BLOBS-27", says: "every request that names a key refuses a bad one Invalid: get, head, delete, start_upload and presign as put does", check: c27::<F> },
         Case { id: "BLOBS-28", says: "a key refused stores nothing: nothing is listed after", check: c28::<F> },
@@ -1737,5 +1748,6 @@ pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
         Case { id: "BLOBS-160", says: "objects stored by a put, an upload and a presigned put each have their content's SHA-256 as their etag", check: c160::<F> },
         Case { id: "BLOBS-161", says: "a presigned put takes a body of exactly the length its URL declares: one longer or shorter is refused and stores nothing", check: c161::<F> },
         Case { id: "BLOBS-162", says: "a listing by a prefix ending in a space gives only the keys that start with it, the space included", check: c162::<F> },
+        Case { id: "BLOBS-163", says: "a key with a segment that ends in a space is refused Invalid; spaces elsewhere in a segment are taken, and listed as they were put", check: c163::<F> },
     ]
 }

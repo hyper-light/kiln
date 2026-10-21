@@ -334,18 +334,19 @@ pub async fn load(hub: &Hub) -> bool {
     read
 }
 
-/// [`load`] again, a while apart (a minute, doubling to a quarter of an hour), until the store
-/// answers for every binary: one unavailable when the server started isn't left out for good.
-pub async fn load_until_read(hub: Arc<Hub>) {
+/// [`load`] (at once, when `now`; else a minute on), and again a while apart (a minute, doubling to
+/// a quarter of an hour), until the store answers for every binary: one unavailable when the server
+/// started isn't left out for good.
+pub async fn load_until_read(hub: Arc<Hub>, now: bool) {
     let mut wait = Duration::from_secs(60);
-    loop {
+    if !now {
         crate::rt::sleep(wait).await;
-        if load(&hub).await {
-            tracing::info!(target: "kiln.blobs", event = "get", "the kept binaries are all read");
-            return;
-        }
+    }
+    while !load(&hub).await {
+        crate::rt::sleep(wait).await;
         wait = wait.saturating_mul(2).min(Duration::from_secs(900));
     }
+    tracing::info!(target: "kiln.blobs", event = "get", "the kept binaries are all read");
 }
 
 /// Takes the binaries kept as files (`<data>/binaries`) into the local store, where they lie: each

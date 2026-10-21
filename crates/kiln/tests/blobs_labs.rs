@@ -422,7 +422,8 @@ fn upgrade_lab(store: Store) -> anyhow::Result<()> {
     drop(s);
     let s = start(dir.path(), &Options { agent: false, ci: "", extra: &blobs })?;
     let auth = format!("Bearer {}", s.admin);
-    anyhow::ensure!(listed_build(s.port, &s.admin, target)?.as_deref() == Some(build.as_str()), "listed after a restart");
+    // Read from the store as the server starts (an S3 store's in the background).
+    wait_for("the binary listed after a restart", Duration::from_secs(30), || Ok(listed_build(s.port, &s.admin, target)?.as_deref() == Some(build.as_str())))?;
     let got = send(s.port, "GET", &format!("/dl/kiln/{target}/{build}"), &[], b"")?;
     anyhow::ensure!(got.status == 200 && got.body == binary, "served after a restart: {}", got.status);
     // Removed, it's gone from the store; its platform's download is GitHub's release again.
@@ -542,7 +543,7 @@ fn a_server_moves_its_bytes_to_s3() -> anyhow::Result<()> {
     anyhow::ensure!(again.contains("copied 0 objects"), "a second copy: {again}");
     let s = start(dir.path(), &Options { agent: false, ci: "", extra: &s3_section("s3", &prefix)? })?;
     let auth = format!("Bearer {}", s.admin);
-    anyhow::ensure!(listed_build(s.port, &s.admin, target)?.as_deref() == Some(build.as_str()), "the binary, listed from S3");
+    wait_for("the binary, listed from S3", Duration::from_secs(30), || Ok(listed_build(s.port, &s.admin, target)?.as_deref() == Some(build.as_str())))?;
     let got = send(s.port, "GET", &format!("/dl/kiln/{target}/{build}"), &[], b"")?;
     anyhow::ensure!(got.status == 200 && got.body == binary, "the binary, served from S3: {}", got.status);
     wait_for("sync's contents listed from S3", Duration::from_secs(30), || Ok(send(s.port, "HEAD", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &auth)], b"")?.status == 200))?;

@@ -196,9 +196,9 @@ impl<B: Blobs + ?Sized> Blobs for Arc<B> {
 /// Longest key, in bytes: S3's 1024, less 64 a store may put before a key (an S3 store's prefix
 /// in its bucket), so a key one store takes, every store takes.
 pub const KEY_MAX: usize = 960;
-/// Longest segment of a key between `/`s, in bytes (a file name's, where a store keeps keys as
-/// paths: MinIO does).
-pub const SEGMENT_MAX: usize = 255;
+/// Longest segment of a key between `/`s, in bytes: a file name's 255, where a store keeps keys as
+/// paths (MinIO does), less the one an S3 store marks a key's end with.
+pub const SEGMENT_MAX: usize = 254;
 /// Most keys a listing gives (S3's).
 pub const LIST_MAX: usize = 1000;
 /// Part numbers run 1 to this (S3's).
@@ -210,8 +210,9 @@ pub const PART_MIN: usize = 5 << 20;
 pub const PRESIGN_MAX: Duration = Duration::from_secs(3600);
 
 /// Whether a store takes `key`: 1 to [`KEY_MAX`] bytes of UTF-8 with no control character and no
-/// backslash, its `/`-separated segments each 1 to [`SEGMENT_MAX`] bytes and none `.` or `..` (so
-/// no leading, trailing or doubled `/`).
+/// backslash, its `/`-separated segments each 1 to [`SEGMENT_MAX`] bytes, none `.` or `..` (so no
+/// leading, trailing or doubled `/`) and none ending in a space (an S3 store marks a key's end with
+/// one: `p ` and `p /x` would be a file and a folder of one name where keys are kept as paths).
 pub fn check_key(key: &str) -> Result<(), Refusal> {
     let bad = |why: String| Err(Refusal::Invalid { what: "a key", why });
     if key.is_empty() || key.len() > KEY_MAX {
@@ -229,6 +230,9 @@ pub fn check_key(key: &str) -> Result<(), Refusal> {
         }
         if segment == "." || segment == ".." {
             return bad(format!("it has a {segment:?} segment"));
+        }
+        if segment.ends_with(' ') {
+            return bad("a segment ends with a space".into());
         }
     }
     Ok(())
