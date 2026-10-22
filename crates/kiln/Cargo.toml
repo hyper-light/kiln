@@ -111,3 +111,7 @@ harness = false
 [[bench]]
 name = "dora"
 harness = false
+
+[[bench]]
+name = "catalog"
+harness = false

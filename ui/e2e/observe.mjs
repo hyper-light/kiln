@@ -1777,6 +1777,77 @@ const scenarios = {
     }
   },
 
+  /** A service seen by its deployment, defined from its page in the catalog (its team, a contact, a
+   * runbook), scored by its rules, taking its team into the next deployment; its definition removed,
+   * it is listed as it is seen again. */
+  async "a service seen by its deployment is defined from the catalog, scored, and undefined"() {
+    const service = `e2e-cat-${run}`;
+    const deploy = async (i) => {
+      const at = Date.now() - (3 - i) * 60_000;
+      const r = await api("POST", "/api/observe/v1/dora/deployment", {
+        data: { attributes: { id: `e2e-cat-deploy-${run}-${i}`, service, env: "e2e", version: `1.${i}`, started_at: at - 1000, finished_at: at } },
+      });
+      expect(r.status === 200, `deployment ${i}: ${r.status}`);
+      return `e2e-cat-deploy-${run}-${i}`;
+    };
+    const ids = [];
+    try {
+      ids.push(await deploy(0));
+      await page.goto(`${BASE}/observe/catalog?q=${encodeURIComponent(service)}`);
+      const row = page.locator("table.data-table tbody tr").filter({ has: page.getByRole("link", { name: service, exact: true }) });
+      await until("listed as seen", async () => / · seen/.test((await row.textContent()) ?? ""));
+      await fitsAcross("the catalog");
+      await row.getByRole("link", { name: service, exact: true }).click();
+      await page.waitForURL(new RegExp(`/observe/catalog/${service}$`));
+      await page.getByText("seen by its traces or deployments: no definition yet", { exact: false }).waitFor();
+      await page.getByRole("button", { name: "Define it", exact: true }).click();
+      const d = page.getByRole("dialog");
+      const yaml = [
+        "schema-version: v2.2",
+        `dd-service: ${service}`,
+        "team: e2e-team",
+        "contacts:",
+        "  - type: email",
+        "    contact: e2e-team@example.com",
+        "links:",
+        "  - name: Runbook",
+        "    type: runbook",
+        "    url: https://wiki.example.com/e2e/runbook",
+        "",
+      ].join("\n");
+      await fillIn(d.getByLabel("Definition", { exact: true }), yaml);
+      await d.getByRole("button", { name: "Save", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      const facts = page.locator("dl.facts");
+      await until("its team shown", async () => /e2e-team/.test((await facts.textContent()) ?? ""));
+      await page.getByRole("link", { name: "e2e-team@example.com", exact: true }).waitFor();
+      await page.getByRole("link", { name: "Runbook", exact: true }).waitFor();
+      const rules = page.getByRole("region", { name: "Scorecards" });
+      for (const [rule, passed] of [
+        ["Has a team", true],
+        ["Has contacts", true],
+        ["Has docs", true],
+        ["Has SLOs", false],
+        ["Its deployments are tracked", true],
+      ])
+        await until(`${rule} ${passed ? "passed" : "failed"}`, async () => (await rules.getByText(`${rule}: ${passed ? "passed" : "failed"}`, { exact: false }).count()) > 0);
+      await fitsAcross("a service's page");
+      const kept = (await api("GET", `/api/observe/v1/catalog/${service}`)).body;
+      expect(kept.source === "api" && kept.team === "e2e-team" && kept.definition?.attributes.schema.contacts?.[0]?.contact === "e2e-team@example.com", `defined as said: ${JSON.stringify(kept)}`);
+      // A deployment that names no team takes the catalog's.
+      ids.push(await deploy(1));
+      expect((await api("GET", `/api/observe/v1/dora/deployments/${ids[1]}`)).body.data.attributes.team === "e2e-team", "the next deployment's team, the catalog's");
+      // Removed: listed again as seen.
+      await page.getByRole("button", { name: "Remove", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await page.waitForURL(/\/observe\/catalog$/);
+      expect((await api("GET", `/api/observe/v1/catalog/${service}`)).body.source === "seen", "seen again");
+    } finally {
+      await api("DELETE", `/api/observe/v1/catalog/definitions/${service}`);
+      for (const id of ids) await api("DELETE", `/api/observe/v1/dora/deployments/${id}`);
+    }
+  },
+
   /** A metric from logs tried on the records of the last fifteen minutes, made, counting the
    * records that come after (as the API's query says), charted, and removed. */
   async "a metric from logs is tried, made, counts what comes after, and is removed"() {

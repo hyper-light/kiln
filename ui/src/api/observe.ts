@@ -1158,6 +1158,75 @@ export interface IssueDetail {
 
 const rangeQuery = (from: number, to: number, env?: string) => `from=${Math.floor(from)}&to=${Math.ceil(to)}${env && env !== "*" ? `&env=${enc(env)}` : ""}`;
 
+/** A service's scores: its rules passed of all, and each scorecard's (docs/observe.md §10.8). */
+export interface CatalogScore {
+  passed: number;
+  total: number;
+  scorecards: { name: string; passed: number; total: number }[];
+}
+
+/** A service in the catalog: where its definition came from, who owns it, how it is doing. */
+export interface CatalogService {
+  service: string;
+  source: "api" | "repository" | "seen";
+  repo: string | null;
+  team: string | null;
+  tier: string | null;
+  lifecycle: string | null;
+  type: string | null;
+  description: string | null;
+  /** The last hour's, from the trace metrics. */
+  requests: number;
+  errors: number;
+  error_rate: number | null;
+  p95_s: number | null;
+  open_issues: number;
+  monitors: number;
+  alerting: number;
+  slos: number;
+  deployments_30d: number;
+  failed_30d: number;
+  last_deployment: number | null;
+  score: CatalogScore;
+}
+
+/** A scorecard rule of a service, passed or not, and why. */
+export interface CatalogRule {
+  scorecard: string;
+  id: string;
+  name: string;
+  passed: boolean;
+  why: string;
+}
+
+/** Datadog's service definition v2.2. */
+export interface ServiceDefinition {
+  "schema-version": string;
+  "dd-service": string;
+  team?: string;
+  application?: string;
+  description?: string;
+  tier?: string;
+  lifecycle?: string;
+  type?: string;
+  languages?: string[];
+  contacts?: { name?: string; type: string; contact: string }[];
+  links?: { name: string; type: string; url: string; provider?: string }[];
+  tags?: string[];
+  integrations?: { pagerduty?: { "service-url": string }; opsgenie?: { "service-url": string; region?: string } };
+}
+
+/** A service's page: its definition, every rule, what reads it, its latest deployments. */
+export interface CatalogServiceDetail extends CatalogService {
+  definition: { id: string; attributes: { schema: ServiceDefinition; meta: { "ingestion-source": string; "origin-detail": string; "last-modified-time": string } } } | null;
+  rules: CatalogRule[];
+  monitor_list: { id: string; name: string; state: string }[];
+  slo_list: { id: string; name: string }[];
+  deployments: { id: string; env: string; version: string; finished_at: number; failed: boolean }[];
+  traced: boolean;
+  logs_traced: number;
+}
+
 /** DORA's levels: the 2024 report's clusters (docs/observe.md §10.7). */
 export type DoraLevel = "elite" | "high" | "medium" | "low";
 
@@ -1313,6 +1382,11 @@ export const observeApi = {
   createScanningGroup: (g: ScanningGroupIn) => request<ScanningGroup>("POST", `${BASE}/scanner/groups`, g),
   updateScanningGroup: (id: string, g: ScanningGroupIn) => request<ScanningGroup>("PUT", `${BASE}/scanner/groups/${enc(id)}`, g),
   deleteScanningGroup: (id: string) => request<void>("DELETE", `${BASE}/scanner/groups/${enc(id)}`),
+  catalog: (signal?: AbortSignal) => request<{ services: CatalogService[] }>("GET", `${BASE}/catalog`, undefined, { signal }).then((r) => r.services),
+  catalogService: (name: string, signal?: AbortSignal) => request<CatalogServiceDetail>("GET", `${BASE}/catalog/${enc(name)}`, undefined, { signal }),
+  /** Definitions as Datadog's API takes them: YAML (several `---` apart) or JSON. */
+  defineServices: (text: string) => request<{ data: unknown[] }>("POST", `${BASE}/catalog/definitions`, undefined, { file: new Blob([text]), type: "application/x-yaml" }),
+  undefineService: (name: string) => request<void>("DELETE", `${BASE}/catalog/definitions/${enc(name)}`),
   doraSummary: (q: { from: number; to: number; service?: string; env?: string; team?: string }, signal?: AbortSignal) => {
     const p = new URLSearchParams({ from: String(q.from), to: String(q.to) });
     for (const k of ["service", "env", "team"] as const) if (q[k]) p.set(k, q[k] as string);

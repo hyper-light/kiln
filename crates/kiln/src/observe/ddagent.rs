@@ -97,6 +97,10 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
     if let ["api", "v2", "dora", rest @ ..] = path {
         return super::dora::http::datadog(rest, req).await;
     }
+    // The Service Catalog's definitions (`super::catalog`).
+    if let ["api", "v2", "services", "definitions", rest @ ..] = path {
+        return super::catalog::http::datadog(rest, req).await;
+    }
     if req.method() != Method::POST {
         return srv::json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "errors": ["Datadog's intake takes POST"] }));
     }

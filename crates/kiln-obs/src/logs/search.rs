@@ -72,6 +72,9 @@ pub enum Leaf {
     /// A record's trace id, or its span id.
     TraceId([u8; 16]),
     SpanId([u8; 8]),
+    /// A record that has a trace id, or a span id (`trace_id:*`, `span_id:*`).
+    HasTraceId,
+    HasSpanId,
     /// A span's name (its message), whole.
     Name(Text),
     /// A token, lowercased.
@@ -188,6 +191,8 @@ fn term(text: &str, quoted: bool, at: usize, spans: bool) -> Result<Leaf, Search
                 let r = severities(value).ok_or_else(|| syntax(at, format!("no status {value:?}")))?;
                 return Ok(Leaf::Status(*r.start(), *r.end()));
             }
+            "trace_id" if value == "*" => return Ok(Leaf::HasTraceId),
+            "span_id" if value == "*" => return Ok(Leaf::HasSpanId),
             "trace_id" => return hex_id::<16>(value).map(Leaf::TraceId).ok_or_else(|| syntax(at, "a trace id: 32 hex digits")),
             "span_id" => return hex_id::<8>(value).map(Leaf::SpanId).ok_or_else(|| syntax(at, "a span id: 16 hex digits")),
             "resource_name" | "resource" if spans => return Ok(Leaf::Name(Text::of(value))),
@@ -639,7 +644,7 @@ fn leaf_block(l: &Leaf, b: &LogBlock, buf: &mut String, spans: bool) -> Maybe {
                 Maybe::Unknown
             }
         }
-        Leaf::SpanId(_) => Maybe::Unknown,
+        Leaf::SpanId(_) | Leaf::HasTraceId | Leaf::HasSpanId => Maybe::Unknown,
         Leaf::Name(Text::Exact(n)) => {
             if all_tokens_in(n, buf) {
                 Maybe::Unknown
@@ -750,6 +755,8 @@ fn leaf_row<F: Fields>(l: &Leaf, r: &F, lower: &mut String, lowered: &mut bool, 
         Leaf::Status(lo, hi) => (*lo..=*hi).contains(&r.severity()),
         Leaf::TraceId(t) => r.trace_id() == Some(*t),
         Leaf::SpanId(s) => r.span_id() == Some(*s),
+        Leaf::HasTraceId => r.trace_id().is_some(),
+        Leaf::HasSpanId => r.span_id().is_some(),
         Leaf::Name(t) => t.matches(r.message()),
         Leaf::Attr(k, m) => match r.attr(k) {
             None => false,
@@ -816,6 +823,28 @@ mod tests {
             ("\"über\"", &ascii, false),
         ] {
             assert_eq!(matches(q, r), want, "{q} on {:?}", r.message);
+        }
+    }
+
+    /// `trace_id:*` and `span_id:*` pick the records that carry one, a row's or a record's; a
+    /// trace id's own search picks its own.
+    #[test]
+    fn records_with_ids_are_found_by_their_having_them() {
+        let mut traced = rec("web", 9, "handled", &[]);
+        traced.trace_id = Some([7; 16]);
+        traced.span_id = Some([9; 8]);
+        let bare = rec("web", 9, "handled", &[]);
+        for (q, r, want) in [
+            ("trace_id:*", &traced, true),
+            ("trace_id:*", &bare, false),
+            ("-trace_id:*", &bare, true),
+            ("span_id:*", &traced, true),
+            ("service:web trace_id:*", &traced, true),
+            ("trace_id:07070707070707070707070707070707", &traced, true),
+            ("trace_id:07070707070707070707070707070708", &traced, false),
+        ] {
+            assert_eq!(matches(q, r), want, "{q} on a row");
+            assert_eq!(parse(q).unwrap().record(r, &mut RowScratch::default()), want, "{q} on a record");
         }
     }
 

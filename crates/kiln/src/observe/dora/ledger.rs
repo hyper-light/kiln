@@ -603,6 +603,23 @@ impl Ledger {
         set.values().rev().filter_map(|&i| self.rows.get(i as usize)).find(|r| &*r.version == version).map(|r| r.id.to_string())
     }
 
+    /// The latest finish (ns) of `service`'s deployments, in any environment: a look at the last of
+    /// each of its environments' order, not at every deployment.
+    pub fn last_of(&self, service: &str) -> Option<i64> {
+        let s = self.names.get(service)?;
+        self.order.iter().filter(|((sv, _), _)| *sv == s).filter_map(|(_, set)| set.keys().next_back().map(|(t, _)| *t)).max()
+    }
+
+    /// `service`'s latest `n` deployments, the newest first, in any environment.
+    pub fn latest_of(&self, service: &str, n: usize) -> Vec<RowRef<'_>> {
+        let Some(s) = self.names.get(service) else { return Vec::new() };
+        let mut out: Vec<RowRef<'_>> =
+            self.order.iter().filter(|((sv, _), _)| *sv == s).flat_map(|(_, set)| set.values().rev().take(n)).filter_map(|&i| self.rows.get(i as usize)).map(|r| self.view(r)).collect();
+        out.sort_by_key(|r| std::cmp::Reverse((r.finished_at(), r.id())));
+        out.truncate(n);
+        out
+    }
+
     /// What a kept deployment's commits say of it (its lead, its commits' keys): it as it is now.
     pub fn set_commits(&mut self, id: &str, lead: Option<Lead>, shas: &[u64], titles: &[u64]) -> Option<Deployment> {
         let r = self.get_mut(id)?;
@@ -1309,6 +1326,20 @@ mod tests {
             let id = format!("d{i:04}");
             assert_eq!(l.deployment(&id).is_some(), kept.iter().any(|(_, x)| *x == id), "{id}");
         }
+    }
+
+    /// A service's last deployment and its latest few, from its environments' orders.
+    #[test]
+    fn a_services_latest_deployments_are_found_by_its_order() {
+        let mut l = Ledger::default();
+        l.put(dep("p1", "shop", 1, Some('1')));
+        l.put(Deployment { env: "staging".into(), ..dep("s1", "shop", 3, Some('2')) });
+        l.put(dep("p2", "shop", 2, Some('3')));
+        l.put(dep("o1", "cart", 9, Some('4')));
+        assert_eq!(l.last_of("shop"), Some(T0 + 3 * H));
+        assert_eq!(l.latest_of("shop", 2).iter().map(|r| r.id()).collect::<Vec<_>>(), ["s1", "p2"]);
+        assert_eq!(l.last_of("nobody"), None);
+        assert!(l.latest_of("nobody", 3).is_empty());
     }
 
     /// A deployment said again with a later finish: what comes before its new time is another, not

@@ -241,6 +241,12 @@ impl Dora {
     /// metrics and events written. `unless_running`: none when what it deploys is what the one
     /// before it deployed (a redeploy). What it is, as kept, back.
     pub async fn deploy(&self, mut d: Deployment, unless_running: bool) -> Option<Deployment> {
+        // A deployment that names no team takes its service's, the catalog's (§10.8).
+        if d.team.is_empty()
+            && let Some(team) = super::catalog::team_of(&d.service)
+        {
+            d.team = team;
+        }
         let turn = self.turn(&d.service, &d.env);
         let _t = turn.lock().await;
         let (prev, next, existed) = self.read(|l| {

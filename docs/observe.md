@@ -37,6 +37,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-23 | Rehydration from archives (§10.6): an archive's records of a range that a search takes read back from S3, Cloud Storage or Blob Storage (Datadog's format: what Datadog wrote reads alike) into a view of their own, searched, counted, faceted and patterned as the live logs are (`view`); objects read as they come off the wire (none whole in memory), a read cut short taken up where it stopped; each event read into its record in place (400 ns, nothing allocated; 1.8 million events a second a core as objects come, §12.27); a scan's bound; a view kept for its retention, read again whole when the server stopped in it; checked live against RustFS and the stand-ins, every read cut short (§13) | done |
 | O-24 | Sensitive Data Scanner (§8.9): Datadog's scanning groups and rules, run on every machine where records are taken, after the pipelines, before anything is kept; the standard library (cards with their Luhn digits, IBANs with their checksums, SSNs in their ranges, personal data, network addresses, credentials of a dozen services, private keys, passwords in URLs and assignments), patterns of one's own; what a match becomes (a string, partly hidden, a keyed hash, or tags alone), keywords near, namespaces; the fast path kept for lines no rule may touch; the API, OpenAPI, its pages | done |
 | O-25 | Delivery: DORA metrics (§10.7), Datadog's: deployment frequency, change lead time (each commit's, from kiln's mirrors), change failure rate (rollbacks, reverts and hotfixes found as Datadog finds them, or marked by hand) and failed deployment recovery time, from kiln CD's deploys and Datadog's DORA API; failures; levels from DORA's 2024 report; metrics and events of each; the API, OpenAPI, its page | done |
+| O-26 | Service Catalog (§10.8), Datadog's: service definitions (v2.2) from Datadog's API and from `service.datadog.yaml` in the repositories kiln mirrors, services seen by their traces and deployments, each one's facts (requests, errors, latency, issues, monitors, SLOs, deployments, logs correlated) and Datadog's three scorecards; teams for DORA; the API, OpenAPI, its pages | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -2027,6 +2028,36 @@ written as a deployment comes is not taken back if an earlier one comes after it
   same writes, and `GET summary` for the page: the four keys over a range by service, environment
   and team, week by week. Datadog's list paths answer that they are read through kiln's.
 
+### 10.8 Service Catalog
+
+Every service, who owns it and how it is doing (`crate::observe::catalog`), Datadog's Software
+Catalog: its definitions in Datadog's schema (v2.2, and v2.1 as it is read the same; `additionalProperties`
+refused as Datadog refuses them), each service's facts from what kiln already holds, and scorecards
+of them.
+
+- **Defined**: by Datadog's API (`POST /api/v2/services/definitions`, JSON or YAML, with the ingest
+  token; `DELETE` one), kept by the server (`<observe>/catalog.json`); and by `service.datadog.yaml`
+  at the root of a repository kiln mirrors (its default branch, read every five minutes and as the
+  server starts; several definitions in one file, `---` apart), as Datadog's GitHub integration
+  reads it. A service a repository defines is the repository's: the API changing it is refused,
+  saying which.
+- **Seen**: a service with no definition is listed as it is seen, by its traces (the trace metrics'
+  last day) or its deployments (§10.7).
+- **Its facts**: its requests, errors and latency (the last hour's trace metrics), its open issues
+  (§8.8), the monitors and SLOs that read it (a `service:<name>` in their query or tags) and how they
+  stand, its deployments (the last, how many in 30 days, its change failure rate), whether its logs
+  carry trace ids (the last day's: `service:<name> trace_id:*`).
+- **Scorecards**, Datadog's three, each rule passed or failed and why: production readiness (has
+  SLOs, has monitors, names an on-call: PagerDuty or Opsgenie, deployed in the last 3 months);
+  observability (its deployments tracked, its logs correlated with its traces); ownership and
+  documentation (a team, contacts, a code repository: a `repo` link, or defined in one; docs: a
+  `doc` or `runbook` link).
+- **Teams in DORA**: a deployment that names no team takes its service's (§10.7), as Datadog's DORA
+  Metrics take it from the catalog.
+- **The API**: Datadog's at its paths for what is defined (`POST`, `DELETE`; its `GET`s answer that
+  they are read through kiln's), and kiln's (`/api/observe/v1/catalog`, a session's): the services
+  with their facts and scores, one service, its definition made, changed or removed.
+
 ## 11. UI
 
 Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
@@ -2123,6 +2154,16 @@ time range and the search in the address (a page is a link).
   from zero, cannot); and the monitors that alert on it, the workbook's two for its timeframe added
   in a click while none reads its burn rate. Made and edited in a form: good events over all, or
   time slices of a query meeting a condition.
+- **Catalog** (§10.8): every service, defined or seen, searched by name and narrowed to a team:
+  each its team, tier, lifecycle and where its definition came from (a repository, the API, or
+  seen), its last hour's requests and errors, open issues, its monitors (how many alert), its
+  deployments of 30 days and its score (rules passed of ten, a short bar and the count); on a
+  phone, its name and a line of what matters. A service's page: its facts (team, tier, lifecycle,
+  requests, errors, p95, open issues, deployments), Datadog's three scorecards with each rule passed
+  or failed and why, its owners and links (contacts, runbooks, docs, its repository, its on-call),
+  the monitors and SLOs that read it, its latest deployments (to the Delivery page), and its
+  definition, made or changed in a dialog (YAML or JSON, as Datadog's API takes it) and removed;
+  one a repository defines says so and is changed there.
 - **Delivery** (§10.7): DORA's four keys over 7, 30 or 90 days, narrowed to a service, an
   environment or a team: each its value, what it was taken from, and the 2024 report's four ranges
   beside it, the one it falls in marked in words (a change failure rate beside the clusters' own
@@ -3556,6 +3597,27 @@ title compares titles without a squashed pull request's number (GitHub's `Revert
 (#122)" (#123)`). A sync costs what the disk takes (a temporary folder is often a tmpfs, where it
 costs nothing: the first measure said 0.02 ms).
 
+### 12.30 The catalog's list
+
+`cargo bench -p kiln --bench catalog` (adacachy, 2026-10-22, release, pinned to one core, the
+machine's load some 60 on 32 cores): 2,000 services in two environments, 240 deployments each in
+DORA's ledger (960,000), 500 monitors reading them.
+
+| | ns |
+| --- | --- |
+| a service's deployments: its last, its 30 days' and how many failed | 8.3 µs (19 allocations) |
+| … every service's | 16.5 ms |
+| the first cut's last deployment, a look at every deployment | 10.0 ms a service (20 s the list) |
+| 500 monitors indexed by the services they read | 0.26 ms |
+
+The first cut found a service's last deployment by looking at every deployment, and each monitor
+and SLO that read a service by asking each one of each service (a string made each time): the list
+of 2,000 services would have taken 20 seconds. A service's deployments are now read from its
+environments' orders in the ledger (their last, and the range of 30 days), and the monitors and SLOs
+read once each, indexed by the services their queries and tags name (`service:<name>`, a whole value).
+What is costly to know of every service (who sent traces in the last day, whose logs carry trace ids)
+is read once in five minutes; a service's page reads its own, narrowed to it.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -4133,6 +4195,25 @@ the last day rehydrated from its row (that archive chosen, the last day the rang
 it kept 2 of the 4 records it read; its view searched in the logs explorer (picked there, over its
 own range, no live tail) holding those two, a search within it finding one; the live logs picked
 again; removed from its row, and from the server. 2026-10-21: passes in all four (9 s each).
+
+**Service Catalog** (`crates/kiln/tests/observe_catalog.rs`): a kiln server as a process of its own,
+mirroring a git repository (`[[repos]]`, a `file://` URL) whose `service.datadog.yaml` defines two
+services (`---` apart); a third defined through Datadog's API (YAML, the ingest token); a fourth only
+seen, its spans sent over OTLP. Each listed with where its definition came from, the seen one with
+its requests and its error rate (a quarter of them failed). The repository's first service read by a
+monitor and an SLO, deployed (the deployment naming no team takes the catalog's: `checkout`), its
+logs carrying a trace id (over OTLP): every rule of Datadog's three scorecards passed; the second,
+defined and nothing more, passes its team and its repository alone. What is refused, saying why: a
+key that is not one, a definition of a service the repository defines (409, naming it), a field the
+schema does not name, a contact that is no email address, Datadog's `GET`s (read through kiln's
+API). The server killed and started again: the API's definitions kept, the repository's read again;
+the API's removed (204, then 404), the repository's refused (409). 2026-10-22: passes (84 s;
+adacachy). In a browser (`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a
+phone's): a service seen by its deployment listed as seen, opened, defined from its page (its team,
+an email contact, a runbook link, in the dialog), its facts and owners shown, its rules (a team,
+contacts, docs, deployments tracked passed; SLOs failed), the API agreeing; the next deployment
+takes its team; its definition removed, it is seen again. Nothing on either page wider than a
+phone. 2026-10-22: passes in all four (2–4 s each; adacachy).
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,

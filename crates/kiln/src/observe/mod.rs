@@ -5,6 +5,7 @@
 pub mod api;
 pub mod apm;
 pub mod archives;
+pub mod catalog;
 pub mod cloud;
 pub mod collect;
 pub mod dashboards;

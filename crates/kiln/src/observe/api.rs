@@ -69,6 +69,16 @@ pub fn set_slos(s: std::sync::Arc<super::slos::Slos>) {
     let _ = SLOS.set(s);
 }
 
+/// The monitors, for the catalog (§10.8).
+pub(super) fn monitors_kept() -> Result<&'static std::sync::Arc<super::monitors::Monitors>, Fail> {
+    monitors()
+}
+
+/// The SLOs, for the catalog (§10.8).
+pub(super) fn slos_kept() -> Result<&'static std::sync::Arc<super::slos::Slos>, Fail> {
+    slos()
+}
+
 fn slos() -> Result<&'static std::sync::Arc<super::slos::Slos>, Fail> {
     SLOS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "SLOs are kept by the server"))
 }
@@ -740,6 +750,11 @@ fn reads_slo(m: &super::monitors::Monitor, id: &str) -> bool {
 pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let method = req.method().clone();
     match (&method, rest) {
+        // The Service Catalog (§10.8): every service, one, definitions made and removed.
+        (&Method::GET, ["catalog"]) => super::catalog::http::services().await,
+        (&Method::POST, ["catalog", "definitions"]) => super::catalog::http::define(req).await,
+        (&Method::DELETE, ["catalog", "definitions", name]) => super::catalog::http::undefine(name).await,
+        (&Method::GET, ["catalog", name]) => super::catalog::http::service(name).await,
         // DORA metrics (§10.7): the four keys, deployments and failures.
         (&Method::GET, ["dora", "summary"]) => super::dora::http::summary_of(q),
         (&Method::POST, ["dora", "deployment"]) => super::dora::http::take_deployment(req, "api").await,

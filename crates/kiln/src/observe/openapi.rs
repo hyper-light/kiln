@@ -1236,6 +1236,99 @@ fn schemas() -> Map<String, Value> {
             &["from", "to", "deployments", "per_day", "change_failures", "weeks"],
         ),
     );
+    // The Service Catalog (§10.8): Datadog's service definitions (v2.2), each service's facts.
+    put(
+        "ServiceDefinition",
+        describe(
+            object(
+                &[
+                    ("schema-version", one_of(&["v2.2", "v2.1"])),
+                    ("dd-service", string()),
+                    ("team", string()),
+                    ("application", string()),
+                    ("description", string()),
+                    ("tier", string()),
+                    ("lifecycle", string()),
+                    ("type", one_of(&["web", "db", "cache", "function", "browser", "mobile", "custom"])),
+                    ("languages", array(string())),
+                    (
+                        "contacts",
+                        array(object(
+                            &[("name", string()), ("type", describe(string(), "email, slack, microsoft-teams…")), ("contact", describe(string(), "an email address, else a URI"))],
+                            &["type", "contact"],
+                        )),
+                    ),
+                    (
+                        "links",
+                        array(object(
+                            &[("name", string()), ("type", describe(string(), "runbook, doc, repo, dashboard, other (unless said)")), ("url", string()), ("provider", string())],
+                            &["name", "type", "url"],
+                        )),
+                    ),
+                    ("tags", array(string())),
+                    (
+                        "integrations",
+                        object(
+                            &[
+                                ("pagerduty", object(&[("service-url", describe(string(), "a service's URL in PagerDuty's service directory"))], &["service-url"])),
+                                ("opsgenie", object(&[("service-url", string()), ("region", one_of(&["US", "EU"]))], &["service-url"])),
+                            ],
+                            &[],
+                        ),
+                    ),
+                    ("extensions", describe(any(), "anything, kept as it is")),
+                    ("ci-pipeline-fingerprints", array(string())),
+                ],
+                &["schema-version", "dd-service"],
+            ),
+            "Datadog's service definition v2.2: what it does not name is refused",
+        ),
+    );
+    let score = || {
+        object(
+            &[("passed", integer()), ("total", integer()), ("scorecards", array(object(&[("name", string()), ("passed", integer()), ("total", integer())], &["name", "passed", "total"])))],
+            &["passed", "total", "scorecards"],
+        )
+    };
+    let service_fields = || {
+        vec![
+            ("service", string()),
+            ("source", describe(one_of(&["api", "repository", "seen"]), "where its definition came from: none, seen by its traces or deployments")),
+            ("repo", nullable(string())),
+            ("team", nullable(string())),
+            ("tier", nullable(string())),
+            ("lifecycle", nullable(string())),
+            ("type", nullable(string())),
+            ("description", nullable(string())),
+            ("requests", describe(number(), "the last hour's, from the trace metrics")),
+            ("errors", number()),
+            ("error_rate", nullable(number())),
+            ("p95_s", nullable(number())),
+            ("open_issues", integer()),
+            ("monitors", describe(integer(), "those that read it: service:<name> in their query or tags")),
+            ("alerting", integer()),
+            ("slos", integer()),
+            ("deployments_30d", integer()),
+            ("failed_30d", integer()),
+            ("last_deployment", nullable(integer())),
+            ("score", score()),
+        ]
+    };
+    put("CatalogService", object(&service_fields(), &["service", "source", "score"]));
+    let mut detail = service_fields();
+    detail.extend([
+        (
+            "definition",
+            nullable(object(&[("id", string()), ("type", string()), ("attributes", object(&[("schema", schema("ServiceDefinition")), ("meta", any())], &["schema"]))], &["id", "attributes"])),
+        ),
+        ("rules", array(object(&[("scorecard", string()), ("id", string()), ("name", string()), ("passed", boolean()), ("why", string())], &["scorecard", "id", "name", "passed", "why"]))),
+        ("monitor_list", array(object(&[("id", string()), ("name", string()), ("state", string())], &["id", "name", "state"]))),
+        ("slo_list", array(object(&[("id", string()), ("name", string())], &["id", "name"]))),
+        ("deployments", array(object(&[("id", string()), ("env", string()), ("version", string()), ("finished_at", integer()), ("failed", boolean())], &["id", "finished_at", "failed"]))),
+        ("traced", boolean()),
+        ("logs_traced", describe(integer(), "the last day's logs that carry a trace id")),
+    ]);
+    put("CatalogServiceDetail", object(&detail, &["service", "source", "score", "rules"]));
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
@@ -2108,6 +2201,38 @@ fn ops() -> Vec<Op<'static>> {
             Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("group_ids", array(string()))], &["group_ids"]) } } })),
             vec![no_content()],
         ),
+        // The Service Catalog (§10.8).
+        op(
+            "get",
+            "/catalog",
+            "Every service, defined or seen, with its facts and scorecards",
+            "observe.read",
+            None,
+            vec![("200", answer_of("the services", object(&[("services", array(schema("CatalogService")))], &["services"])))],
+        ),
+        Op {
+            params: vec![name()],
+            ..op("get", "/catalog/{name}", "A service: its definition, facts, every scorecard rule, what reads it, its latest deployments", "observe.read", None, vec![ok("CatalogServiceDetail")])
+        },
+        op(
+            "post",
+            "/catalog/definitions",
+            "Makes or changes service definitions (Datadog's v2.2, JSON or YAML, several `---` apart); one a repository defines is refused",
+            "observe.write",
+            Some(json!({ "required": true, "content": { "application/json": { "schema": schema("ServiceDefinition") }, "application/x-yaml": { "schema": { "type": "string" } } } })),
+            vec![("200", answer_of("kept, as Datadog's API answers", object(&[("data", array(any()))], &["data"]))), ("409", answer("a repository defines it", Some("Error")))],
+        ),
+        Op {
+            params: vec![name()],
+            ..op(
+                "delete",
+                "/catalog/definitions/{name}",
+                "Removes a service's definition (not one a repository makes)",
+                "observe.write",
+                None,
+                vec![no_content(), ("409", answer("a repository defines it", Some("Error")))],
+            )
+        },
         // DORA metrics (§10.7).
         Op {
             params: vec![
@@ -2259,6 +2384,13 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: dd_key(), body: Some(dd_body("events by source, and host metadata (passed over), JSON")), ..op("post", "/intake/", "Datadog's Agent's events", "ingest", None, vec![("202", answer("taken", None))]) },
         Op { params: dd_key(), body: Some(dd_body("log records, JSON")), ..op("post", "/api/v2/logs", "Datadog's Agent's logs", "ingest", None, vec![("202", answer("taken", None))]) },
         Op { params: dd_key(), ..op("get", "/api/v1/validate", "Whether a Datadog API key is one", "ingest", None, vec![("200", answer_of("valid", object(&[("valid", boolean())], &["valid"]))), ("403", answer("not one", None))]) },
+        // Datadog's service definition API (docs/observe.md §10.8).
+        Op {
+            params: dd_key(),
+            body: Some(json!({ "required": true, "content": { "application/json": { "schema": schema("ServiceDefinition") }, "application/x-yaml": { "schema": { "type": "string" } } } })),
+            ..op("post", "/api/v2/services/definitions", "Datadog's: makes or changes service definitions", "ingest", None, vec![("200", answer_of("kept", object(&[("data", array(any()))], &["data"])))])
+        },
+        Op { params: { let mut p = dd_key(); p.push(path_param("name", "the service's")); p }, ..op("delete", "/api/v2/services/definitions/{name}", "Datadog's: removes a service's definition", "ingest", None, vec![("204", answer("removed", None))]) },
         // Datadog's DORA API (docs/observe.md §10.7): what a CD system sends.
         Op { params: dd_key(), body: Some(body("DoraDeploymentIn")), ..op("post", "/api/v2/dora/deployment", "Datadog's DORA deployment event", "ingest", None, vec![("200", answer_of("taken", object(&[("data", object(&[("id", string()), ("type", string())], &["id", "type"]))], &["data"])))]) },
         Op { params: dd_key(), body: Some(body("DoraFailureIn")), ..op("post", "/api/v2/dora/failure", "Datadog's DORA failure (incident) event", "ingest", None, vec![("200", answer_of("taken", object(&[("data", object(&[("id", string()), ("type", string())], &["id", "type"]))], &["data"])))]) },
