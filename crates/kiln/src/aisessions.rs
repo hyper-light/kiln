@@ -379,8 +379,8 @@ struct CodexHead {
     originator: String,
 }
 
-/// Finds the sessions. Keeps the process table and parsed transcripts between scans, so a scan
-/// only rereads transcripts that changed.
+/// Finds the sessions. Keeps parsed transcripts between scans, so a scan only rereads transcripts
+/// that changed.
 pub struct Scanner {
     /// Claude Code's configuration directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and Codex's
     /// (`CODEX_HOME`, else `~/.codex`), as the sessions this machine starts use them.
@@ -428,6 +428,8 @@ impl Scanner {
     /// The sessions running now, most recently active first. `terminals` maps the shell pid of
     /// each kiln terminal on this machine to its session id.
     pub fn scan(&mut self, terminals: &HashMap<u32, String>) -> Vec<AiSession> {
+        // sysinfo keeps names across exec even when the PID and start time stay the same.
+        self.sys = System::new();
         // Names, parents and command lines of everything; working directories only of the tools.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
@@ -1521,6 +1523,52 @@ mod tests {
         let _ = child.wait();
         let found = found.map(|f| (f.tool, f.terminal));
         assert_eq!(found, Some(("claude".to_owned(), Some("t-elsewhere".to_owned()))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_scanned_before_exec_is_discovered_as_its_new_harness() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Stdio;
+
+        struct Running(std::process::Child);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let home = tempfile::tempdir()?;
+        let program = home.path().join("devin");
+        std::fs::write(&program, "#!/bin/sh\nprintf ready\nread -r stop\n")?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+        let mut child = Running(std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ready; read -r release; exec \"$1\"", "sh"])
+            .arg(&program)
+            .env("KILN_TERM_SESSION", "exec-terminal")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?);
+        let pid = child.0.id();
+        let mut input = child.0.stdin.take().ok_or_else(|| anyhow::anyhow!("no child stdin"))?;
+        let mut output = child.0.stdout.take().ok_or_else(|| anyhow::anyhow!("no child stdout"))?;
+        let mut ready = [0; 5];
+        output.read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready");
+        let mut scanner = Scanner::new(home.path().to_owned());
+        scanner.claude = home.path().join("claude");
+        scanner.codex = home.path().join("codex");
+        scanner.devin = home.path().join("native");
+        assert!(!scanner.scan(&HashMap::new()).iter().any(|s| s.pid == pid));
+        assert!(scanner.sys.process(Pid::from_u32(pid)).is_some_and(|p| tool_of(p).is_none()));
+        input.write_all(b"go\n")?;
+        output.read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready");
+        let found = scanner.scan(&HashMap::new()).into_iter().find(|s| s.pid == pid);
+        assert_eq!(found.map(|s| (s.tool, s.terminal)), Some(("devin".to_owned(), Some("exec-terminal".to_owned()))));
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
