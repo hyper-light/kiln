@@ -364,13 +364,15 @@ pub fn sync() -> &'static SyncMetrics {
 
 /// kiln's bytes behind kiln-seams' `Blobs` (docs/blobs.md), by `store` (`local`, `s3`): requests by
 /// `op` and `outcome` (`ok`, `refused`: a typed refusal, `unavailable`: the store couldn't answer);
-/// how long each took; the bytes `written` and `read`; and objects let go by what keeps them
-/// (`kind`: `cas`, `sync`, `recordings`).
+/// how long each took; the bytes `written` and `read`; objects let go by what keeps them (`kind`:
+/// `cas`, `sync`, `recordings`, `transcripts`); and closed conversations whose record couldn't be
+/// archived before the conversation store let it go (`crate::harness::archive`).
 pub struct BlobsMetrics {
     pub requests: CounterVec,
     pub seconds: HistogramVec,
     pub bytes: CounterVec,
     pub collected: CounterVec,
+    pub archives_given_up: Counter,
 }
 
 pub fn blobs() -> &'static BlobsMetrics {
@@ -380,6 +382,7 @@ pub fn blobs() -> &'static BlobsMetrics {
         seconds: HistogramVec::new(&["store", "op"], LATENCY_BUCKETS),
         bytes: CounterVec::new(&["store", "direction"]),
         collected: CounterVec::new(&["kind"]),
+        archives_given_up: Counter::default(),
     })
 }
 
@@ -395,6 +398,8 @@ fn render_blobs(o: &mut String) {
     m.bytes.render(o, "kiln_blobs_bytes_total");
     help(o, "kiln_blobs_collected_total", "counter", "Objects kiln let go that nothing refers to, by what kept them.");
     m.collected.render(o, "kiln_blobs_collected_total");
+    help(o, "kiln_blobs_archives_given_up_total", "counter", "Closed conversations whose record couldn't be archived in the days held past the conversation store's keeping: given up, and let go by the store.");
+    let _ = writeln!(o, "kiln_blobs_archives_given_up_total {}", m.archives_given_up.get());
     help(o, "kiln_blobs_request_seconds", "histogram", "How long requests to the store kiln keeps its bytes in took, by store and operation.");
     m.seconds.render(o, "kiln_blobs_request_seconds");
 }

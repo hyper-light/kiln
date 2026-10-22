@@ -192,8 +192,11 @@ kept as files.
 - `kiln_blobs_bytes_total{store, direction}`: bytes `written` and `read`.
 - `kiln_blobs_collected_total{kind}`: objects let go that nothing refers to any more, by what kept
   them: `cas`, `sync`, `recordings`, `transcripts`.
-- Events on target `kiln.blobs` (`event` = `put`, `get`, `list`, `adopt`, `collect`, `refused`):
-  refusals at debug, an unavailable store at warn.
+- `kiln_blobs_archives_given_up_total`: closed conversations whose record couldn't be archived in
+  the 30 days held past the conversation store's keeping, given up and let go by the store; each is
+  an event `given_up` naming the session and the sources of its record.
+- Events on target `kiln.blobs` (`event` = `put`, `get`, `list`, `adopt`, `collect`, `refused`,
+  `given_up`): refusals at debug, an unavailable store at warn.
 
 The "Blobs" row of the Kiln overview dashboard (deploy/grafana/dashboards/kiln-overview.json)
 shows request rates by operation and outcome, p50 and p99 latency, bytes a second, and the share

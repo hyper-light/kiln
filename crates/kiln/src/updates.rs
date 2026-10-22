@@ -288,8 +288,12 @@ pub fn stored(hub: &Hub, target: &str) -> Option<Binary> {
 /// aren't whole there is left out. Whether every one could be read (one the store couldn't answer
 /// for is read again later: [`load_until_read`]).
 pub async fn load(hub: &Hub) -> bool {
+    load_into(hub.blobs.blobs.as_ref(), &hub.updates.kept).await
+}
+
+/// [`load`] from `blobs` into `kept`.
+async fn load_into(blobs: &dyn kiln_seams::blobs::Blobs, kept: &Mutex<HashMap<String, Binary>>) -> bool {
     use kiln_seams::blobs::Refusal;
-    let blobs = &hub.blobs.blobs;
     // Each platform the store answered for: its binary, or none; one it couldn't is left as it is.
     let mut answered: Vec<(&str, Option<Binary>)> = Vec::new();
     let mut targets: Vec<&str> = crate::api::RELEASE_TARGETS.to_vec();
@@ -298,7 +302,7 @@ pub async fn load(hub: &Hub) -> bool {
     }
     let all = targets.len();
     for t in targets {
-        let meta = match crate::blobs::io::get_all(blobs.as_ref(), &meta_key(t), 1 << 20).await {
+        let meta = match crate::blobs::io::get_all(blobs, &meta_key(t), 1 << 20).await {
             Ok((_, bytes)) => serde_json::from_slice::<Binary>(&bytes).ok(),
             Err(Refusal::NotFound(_)) => None,
             Err(e @ Refusal::Unavailable(_)) => {
@@ -324,7 +328,7 @@ pub async fn load(hub: &Hub) -> bool {
         }
     }
     let read = answered.len() == all;
-    let mut kept = hub.updates.kept.lock();
+    let mut kept = kept.lock();
     for (t, b) in answered {
         match b {
             Some(b) => kept.insert(t.to_owned(), b),
@@ -2810,6 +2814,29 @@ mod tests {
             for t in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
                 assert!(matches!(hub.blobs.blobs.head(&binary_key(t)).await, Err(kiln_seams::blobs::Refusal::NotFound(_))), "{t} kept");
             }
+            Ok(())
+        })
+    }
+
+    /// CP-T10.1, AC-T10.1.1: a store that can't answer leaves what kiln knows of each binary as it
+    /// was, and says not all of it was read; once it answers, every binary it keeps is read.
+    #[test]
+    fn binaries_are_read_again_once_the_store_answers() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use kiln_seams::blobs::{Blobs, Put, SimBlobs, SimLimits};
+            let sim: Arc<dyn Blobs> = Arc::new(SimBlobs::new(crate::rt::clock(), SimLimits::default()));
+            let t = crate::api::TARGET;
+            let binary = |bytes: &[u8]| Binary { target: t.into(), sha256: crate::util::sha256_hex(bytes), size: bytes.len() as u64, origin: "upload".into(), at: 0, build: String::new(), run: None, sha: None, by: None };
+            let (older, newer) = (binary(b"older"), binary(b"\x7fELF, newer"));
+            sim.put(&binary_key(t), b"\x7fELF, newer".to_vec(), Put::default()).await?;
+            sim.put(&meta_key(t), serde_json::to_vec(&newer)?, Put::default()).await?;
+            let flaky = crate::blobs::tests::Flaky::down(Arc::clone(&sim));
+            let kept = Mutex::new(HashMap::from([(t.to_owned(), older.clone())]));
+            assert!(!load_into(&flaky, &kept).await, "the store didn't answer");
+            assert_eq!(kept.lock().get(t).map(|b| b.sha256.clone()), Some(older.sha256), "what it knew, it knows still");
+            flaky.down.store(false, Ordering::Release);
+            assert!(load_into(&flaky, &kept).await);
+            assert_eq!(kept.lock().get(t).map(|b| b.sha256.clone()), Some(newer.sha256));
             Ok(())
         })
     }

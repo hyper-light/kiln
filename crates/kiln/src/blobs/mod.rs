@@ -400,9 +400,66 @@ impl Following {
 pub(crate) mod tests {
     use std::future::Future;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use kiln_seams::blobs::BlobsFixture;
+    use futures::future::BoxFuture;
+    use kiln_seams::blobs::{Access, Blobs, BlobsFixture, Listing, Meta, Put, Range, Refusal};
     use kiln_seams::conformance::Report;
+
+    /// A store that answers `Unavailable` to everything while it's down, and as `inner` does once
+    /// it's up: a store that couldn't be reached for a while.
+    pub(crate) struct Flaky {
+        pub inner: Arc<dyn Blobs>,
+        pub down: AtomicBool,
+    }
+
+    impl Flaky {
+        pub(crate) fn down(inner: Arc<dyn Blobs>) -> Self {
+            Self { inner, down: AtomicBool::new(true) }
+        }
+
+        fn is_down(&self) -> bool {
+            self.down.load(Ordering::Acquire)
+        }
+    }
+
+    fn down<'a, T: Send + 'a>() -> BoxFuture<'a, Result<T, Refusal>> {
+        Box::pin(async { Err(Refusal::Unavailable("the store is down".into())) })
+    }
+
+    impl Blobs for Flaky {
+        fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>, put: Put) -> BoxFuture<'a, Result<Meta, Refusal>> {
+            if self.is_down() { down() } else { self.inner.put(key, bytes, put) }
+        }
+        fn get<'a>(&'a self, key: &'a str, range: Option<Range>) -> BoxFuture<'a, Result<(Meta, Vec<u8>), Refusal>> {
+            if self.is_down() { down() } else { self.inner.get(key, range) }
+        }
+        fn head<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Meta, Refusal>> {
+            if self.is_down() { down() } else { self.inner.head(key) }
+        }
+        fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
+            if self.is_down() { down() } else { self.inner.delete(key) }
+        }
+        fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFuture<'a, Result<Listing, Refusal>> {
+            if self.is_down() { down() } else { self.inner.list(prefix, after, limit) }
+        }
+        fn start_upload<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<String, Refusal>> {
+            if self.is_down() { down() } else { self.inner.start_upload(key) }
+        }
+        fn upload_part<'a>(&'a self, upload: &'a str, part: u32, bytes: Vec<u8>) -> BoxFuture<'a, Result<String, Refusal>> {
+            if self.is_down() { down() } else { self.inner.upload_part(upload, part, bytes) }
+        }
+        fn complete_upload<'a>(&'a self, upload: &'a str, parts: Vec<(u32, String)>) -> BoxFuture<'a, Result<Meta, Refusal>> {
+            if self.is_down() { down() } else { self.inner.complete_upload(upload, parts) }
+        }
+        fn abort_upload<'a>(&'a self, upload: &'a str) -> BoxFuture<'a, Result<(), Refusal>> {
+            if self.is_down() { down() } else { self.inner.abort_upload(upload) }
+        }
+        fn presign<'a>(&'a self, key: &'a str, access: Access, expires: std::time::Duration) -> BoxFuture<'a, Result<String, Refusal>> {
+            if self.is_down() { down() } else { self.inner.presign(key, access, expires) }
+        }
+    }
 
     /// Runs the Blobs suite, each case against a store `make` makes for it, each given `deadline`.
     pub(crate) async fn run_suite<F, M, Fut>(mut make: M, deadline: std::time::Duration) -> anyhow::Result<Report>

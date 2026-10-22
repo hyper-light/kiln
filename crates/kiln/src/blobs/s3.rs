@@ -227,6 +227,15 @@ fn len64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
+/// A refusal for what S3 answered: a key it won't take (its length, MinIO's name rules) is
+/// `Invalid`, as the contract's own check of a key is; anything else is `Unavailable`.
+fn refused(e: S3Error) -> Refusal {
+    match e.code.as_str() {
+        "KeyTooLongError" | "InvalidObjectName" | "XMinioInvalidObjectName" => Refusal::Invalid { what: "a key", why: e.to_string() },
+        _ => unavailable(e),
+    }
+}
+
 fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
 }
@@ -442,7 +451,7 @@ impl S3Blobs {
             return Ok(());
         }
         if a.status != 404 {
-            return Err(unavailable(a.error()));
+            return Err(refused(a.error()));
         }
         let body = if self.region == "us-east-1" {
             Vec::new()
@@ -451,7 +460,7 @@ impl S3Blobs {
         };
         let sha = crate::util::sha256_hex(&body);
         let a = self.send(Http::Put, None, &[], &[], Payload { bytes: Bytes::from(body), sha: &sha, limit: DOCUMENT_MAX }).await?;
-        if a.ok() || a.error().code == "BucketAlreadyOwnedByYou" { Ok(()) } else { Err(unavailable(a.error())) }
+        if a.ok() || a.error().code == "BucketAlreadyOwnedByYou" { Ok(()) } else { Err(refused(a.error())) }
     }
 
     /// What head says of the object at S3 key `s3key`.
@@ -461,7 +470,7 @@ impl S3Blobs {
             return Err(Refusal::NotFound(key.to_owned()));
         }
         if !a.ok() {
-            return Err(unavailable(a.error()));
+            return Err(refused(a.error()));
         }
         Ok(Found {
             size: a.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -483,23 +492,22 @@ impl S3Blobs {
     }
 
     /// Takes in an object written without kiln's SHA-256 (a presigned put, another client): reads it
-    /// whole, once, and keeps its SHA-256 with it, copied onto itself while it's still what was read.
+    /// once, a piece at a time, and keeps its SHA-256 with it, copied onto itself while it's still
+    /// what was read.
     async fn adopt(&self, key: &str, s3key: &str) -> Result<(Meta, String), Refusal> {
         for _ in 0..3 {
             let f = self.found(key, s3key).await?;
             if f.size > self.limits.object {
                 return Err(Refusal::TooLarge { what: "an object to take in", size: f.size, limit: self.limits.object });
             }
-            let a = self.send(Http::Get, Some(s3key), &[], &[("if-match".to_owned(), format!("\"{}\"", f.etag))], Payload::none(self.limits.object)).await?;
-            match a.status {
-                404 => return Err(Refusal::NotFound(key.to_owned())),
-                412 => continue,
-                _ if !a.ok() => return Err(unavailable(a.error())),
-                _ => {}
-            }
-            let bytes = a.body;
-            let size = len64(bytes.len());
-            let sha = crate::rt::blocking(move || hex::encode(Sha256::digest(&bytes))).await.map_err(|e| unavailable(format!("{e:#}")))?;
+            let sha = match self.read_back(s3key, f.size, Some(&f.etag)).await {
+                Ok(sha) => sha,
+                // Changed while it was read: read again.
+                Err(Refusal::PreconditionFailed(_)) => continue,
+                Err(Refusal::NotFound(_)) => return Err(Refusal::NotFound(key.to_owned())),
+                Err(e) => return Err(e),
+            };
+            let size = f.size;
             let headers = vec![
                 ("x-amz-copy-source".to_owned(), format!("/{}/{}", self.bucket, seam::encode_key(s3key))),
                 ("x-amz-copy-source-if-match".to_owned(), format!("\"{}\"", f.etag)),
@@ -524,15 +532,26 @@ impl S3Blobs {
         Err(Refusal::Unavailable(format!("{key} kept changing while its SHA-256 was taken")))
     }
 
-    /// The SHA-256 of the object at `s3key` (`size` bytes), read back a piece at a time.
-    async fn read_back(&self, s3key: &str, size: u64) -> Result<String, Refusal> {
+    /// The SHA-256 of the object at `s3key` (`size` bytes), read back a piece at a time; each piece
+    /// of the version whose S3 ETag is `if_match`, when given (another: `PreconditionFailed`).
+    async fn read_back(&self, s3key: &str, size: u64, if_match: Option<&str>) -> Result<String, Refusal> {
         let mut sha = Sha256::new();
         let mut at = 0u64;
         while at < size {
             let end = at.saturating_add(READ_PIECE.saturating_sub(1)).min(size.saturating_sub(1));
-            let a = self.send(Http::Get, Some(s3key), &[], &[("range".into(), format!("bytes={at}-{end}"))], Payload::none(READ_PIECE)).await?;
+            let mut headers = vec![("range".to_owned(), format!("bytes={at}-{end}"))];
+            if let Some(e) = if_match {
+                headers.push(("if-match".to_owned(), format!("\"{e}\"")));
+            }
+            let a = self.send(Http::Get, Some(s3key), &[], &headers, Payload::none(READ_PIECE)).await?;
+            if a.status == 412 {
+                return Err(Refusal::PreconditionFailed(s3key.to_owned()));
+            }
+            if a.status == 404 {
+                return Err(Refusal::NotFound(s3key.to_owned()));
+            }
             if !a.ok() {
-                return Err(unavailable(a.error()));
+                return Err(refused(a.error()));
             }
             let piece = a.body;
             if piece.is_empty() {
@@ -567,7 +586,7 @@ impl S3Blobs {
         }
         let a = self.ask(Http::Post, Some(to), &[("uploads", String::new())], &[("x-amz-meta-kiln-sha256".to_owned(), sha.to_owned())]).await?;
         if a.failed() {
-            return Err(unavailable(a.error()));
+            return Err(refused(a.error()));
         }
         let id = aws::xml_text(&a.text(), "UploadId").ok_or_else(|| Refusal::Unavailable("S3 gave no upload id for the copy".into()))?;
         let mut parts = Vec::new();
@@ -606,7 +625,7 @@ impl S3Blobs {
             let a = self.ask(Http::Get, Some(&self.joined(place)), &q, &[]).await?;
             if !a.ok() {
                 let e = a.error();
-                return Err(if e.code == "NoSuchUpload" || e.status == 404 { Refusal::NoSuchUpload(id.to_owned()) } else { unavailable(e) });
+                return Err(if e.code == "NoSuchUpload" || e.status == 404 { Refusal::NoSuchUpload(id.to_owned()) } else { refused(e) });
             }
             let text = a.text();
             for p in aws::xml_all(&text, "Part") {
@@ -742,7 +761,7 @@ impl Blobs for S3Blobs {
                     (412, _, Cond::IfMatch(_)) => {}
                     (412 | 409, _, _) => return Err(Refusal::PreconditionFailed(key.to_owned())),
                     (_, "BadDigest" | "XAmzContentSHA256Mismatch" | "XAmzContentChecksumMismatch" | "InvalidDigest", _) => return Err(Refusal::BadChecksum { want: sha, got: e.message }),
-                    _ => return Err(unavailable(e)),
+                    _ => return Err(refused(e)),
                 }
             }
             Err(Refusal::PreconditionFailed(key.to_owned()))
@@ -772,7 +791,7 @@ impl Blobs for S3Blobs {
                         let (m, _) = self.meta(key).await?;
                         return Err(Refusal::InvalidRange { size: m.size });
                     }
-                    _ if !a.ok() => return Err(unavailable(a.error())),
+                    _ if !a.ok() => return Err(refused(a.error())),
                     _ => {}
                 }
                 let Some(sha) = a.header("x-amz-meta-kiln-sha256").map(str::to_ascii_lowercase).filter(|s| seam::check_sha256(s).is_ok()) else {
@@ -827,7 +846,7 @@ impl Blobs for S3Blobs {
         Box::pin(async move {
             seam::check_key(key)?;
             let a = self.ask(Http::Delete, Some(&self.object(key)), &[], &[]).await?;
-            if a.ok() || a.status == 404 { Ok(()) } else { Err(unavailable(a.error())) }
+            if a.ok() || a.status == 404 { Ok(()) } else { Err(refused(a.error())) }
         })
     }
 
@@ -842,7 +861,7 @@ impl Blobs for S3Blobs {
             }
             let a = self.ask(Http::Get, None, &q, &[]).await?;
             if !a.ok() {
-                return Err(unavailable(a.error()));
+                return Err(refused(a.error()));
             }
             let text = a.text();
             let strip = self.objects("");
@@ -869,7 +888,7 @@ impl Blobs for S3Blobs {
             let place = hex::encode(rand::random::<[u8; 16]>());
             let a = self.ask(Http::Post, Some(&self.joined(&place)), &[("uploads", String::new())], &[]).await?;
             if a.failed() {
-                return Err(unavailable(a.error()));
+                return Err(refused(a.error()));
             }
             let s3 = aws::xml_text(&a.text(), "UploadId").ok_or_else(|| Refusal::Unavailable("S3 gave no upload id".into()))?;
             let id = upload_id(key, &place, &s3);
@@ -893,7 +912,7 @@ impl Blobs for S3Blobs {
             let a = self.send(Http::Put, Some(&self.joined(&place)), &[("partNumber", part.to_string()), ("uploadId", s3id)], &[], Payload { bytes: body, sha: &sha, limit: DOCUMENT_MAX }).await?;
             if !a.ok() {
                 let e = a.error();
-                return Err(if e.code == "NoSuchUpload" || e.status == 404 { Refusal::NoSuchUpload(upload.to_owned()) } else { unavailable(e) });
+                return Err(if e.code == "NoSuchUpload" || e.status == 404 { Refusal::NoSuchUpload(upload.to_owned()) } else { refused(e) });
             }
             let etag = a.header("etag").map(bare).filter(|e| !e.is_empty()).ok_or_else(|| Refusal::Unavailable("S3 gave the part no ETag".into()))?;
             self.following.part(upload, part, bytes).await;
@@ -935,7 +954,7 @@ impl Blobs for S3Blobs {
             }
             let sha = match self.following.finish(upload, &parts) {
                 Some(s) => s,
-                None => self.read_back(&joined, size).await?,
+                None => self.read_back(&joined, size, None).await?,
             };
             let modified = self.copy_into_place(&joined, &self.object(&key), size, &sha).await?;
             if !self.ask(Http::Delete, Some(&joined), &[], &[]).await.is_ok_and(|a| a.ok()) {
@@ -956,7 +975,7 @@ impl Blobs for S3Blobs {
                 return Ok(());
             }
             let e = a.error();
-            Err(if e.code == "NoSuchUpload" || e.status == 404 { Refusal::NoSuchUpload(upload.to_owned()) } else { unavailable(e) })
+            Err(if e.code == "NoSuchUpload" || e.status == 404 { Refusal::NoSuchUpload(upload.to_owned()) } else { refused(e) })
         })
     }
 
@@ -1072,7 +1091,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The dates S3 answers, read to the millisecond and the second.
+    /// CP-T10.1, AC-T10.1.1: the dates S3 answers, read to the millisecond and the second.
     #[test]
     fn s3_s_dates_read_as_s3_writes_them() {
         assert_eq!(http_date_ms("Wed, 21 Oct 2026 07:28:00 GMT"), Some(1_792_567_680_000));
@@ -1081,7 +1100,8 @@ pub(crate) mod tests {
         assert_eq!(amz_date(1_792_567_680_999), "20261021T072800Z");
     }
 
-    /// An upload's id carries its key, where it's joined and S3's id, and nothing else passes for one.
+    /// CP-T10.1, AC-T10.1.1: an upload's id carries its key, where it's joined and S3's id, and
+    /// nothing else passes for one.
     #[test]
     fn an_upload_id_says_its_key_place_and_s3_id() {
         let id = upload_id("a/ü key", "00ff", "s3~id.with-odd_chars");
@@ -1091,8 +1111,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A space after every key keeps S3's order of the keys kiln's: a key and one that goes on from
-    /// it, and every character a key may hold after it.
+    /// CP-T10.1, AC-T10.1.1: a space after every key keeps S3's order of the keys kiln's: a key and
+    /// one that goes on from it, and every character a key may hold after it.
     #[test]
     fn a_space_after_each_key_keeps_kiln_s_order() {
         let mut keys = ["p", "p/x", "p/x/y", "pa", "p ", "p!", "a", "a/b", "a&", "a0", "é", "Z", "p  q"].map(str::to_owned).to_vec();

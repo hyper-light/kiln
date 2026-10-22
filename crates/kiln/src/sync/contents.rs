@@ -285,6 +285,25 @@ pub async fn take_in(local: &crate::blobs::local::LocalBlobs, dir: &Path) -> any
 mod tests {
     use super::*;
 
+    /// CP-T10.1, AC-T10.1.1: a listing the store can't answer leaves the index partial and says so;
+    /// listed again once it answers, what the store holds is known.
+    #[test]
+    fn contents_are_listed_again_once_the_store_answers() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let sim: Arc<dyn Blobs> = Arc::new(kiln_seams::blobs::SimBlobs::new(crate::rt::clock(), kiln_seams::blobs::SimLimits::default()));
+            let hash = crate::util::sha256_hex(b"held");
+            sim.put(&key(&hash), b"held".to_vec(), kiln_seams::blobs::Put::default()).await?;
+            let flaky = Arc::new(crate::blobs::tests::Flaky::down(Arc::clone(&sim)));
+            let c = Contents::new(Arc::clone(&flaky) as Arc<dyn Blobs>);
+            assert!(!c.load().await, "the store didn't answer");
+            assert!(c.partial.load(Ordering::Relaxed) && !c.has(&hash));
+            flaky.down.store(false, Ordering::Release);
+            assert!(c.load().await);
+            assert!(!c.partial.load(Ordering::Relaxed) && c.has(&hash));
+            Ok(())
+        })
+    }
+
     /// CP-T10.1: contents kept as files before are the store's where they lie; what's put comes
     /// into the index, and goes from it and the store when removed.
     #[test]

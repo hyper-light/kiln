@@ -65,6 +65,8 @@ const LIMITS: Limits = Limits { lines: PIECE_LINES, bytes: PIECE_BYTES };
 pub const HOLD_EXTRA: Duration = Duration::from_secs(30 * 86_400);
 /// Archives let go of, or given up, at most a look.
 const LET_GO_BATCH: i64 = 100;
+/// Pages of ended sessions a backfill reads, at most (of `convo::store::ENDED_MAX`).
+const BACKFILL_PAGES: usize = 1000;
 /// A close as the conversation store has it is its session's machine's time, not the server's: the
 /// hold starts a day before kiln's note of it, whatever the clocks say.
 const HOLD_SLACK_MS: i64 = 86_400_000;
@@ -149,8 +151,10 @@ async fn hold(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<(
 }
 
 /// Gives up the archives still failing [`HOLD_EXTRA`] past when the conversation store would have
-/// let their records go (`done_ms` 0): the hold lets them go, warned of each.
-async fn give_up(hub: &Hub) -> anyhow::Result<()> {
+/// let their records go (`done_ms` 0): the hold lets them go. Each is an event naming the session
+/// and the sources of its record (`given_up`, on `kiln.blobs`), and counted
+/// (`kiln_blobs_archives_given_up_total`), so a record lost can be found and alerted on.
+async fn give_up(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<()> {
     let Some(keep) = hub.cfg.conversations.keep_closed() else { return Ok(()) };
     let held_ms = i64::try_from(keep.saturating_add(HOLD_EXTRA).as_millis()).unwrap_or(i64::MAX);
     let before = crate::util::now_ms().saturating_sub(held_ms);
@@ -170,7 +174,13 @@ async fn give_up(hub: &Hub) -> anyhow::Result<()> {
         })
         .await?;
     for session in given {
-        tracing::warn!(target: "kiln.blobs", event = "refused", session = %session, days = HOLD_EXTRA.as_secs() / 86_400, "a closed conversation's record couldn't be archived in the days held past its keeping: given up, and the conversation store lets it go");
+        let (c, s) = (convo.clone(), session.clone());
+        let sources = match crate::rt::blocking(move || c.marks(&s)).await {
+            Ok(Ok(marks)) => marks.into_iter().map(|m| m.source).collect::<Vec<_>>().join(","),
+            _ => "unknown".to_owned(),
+        };
+        crate::metrics::blobs().archives_given_up.inc();
+        tracing::warn!(target: "kiln.blobs", event = "given_up", session = %session, sources = %sources, days = HOLD_EXTRA.as_secs() / 86_400, "a closed conversation's record couldn't be archived in the days held past its keeping: given up, and the conversation store lets it go");
     }
     Ok(())
 }
@@ -218,8 +228,59 @@ async fn let_go(hub: &Hub) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Archives what's due, every minute, for as long as the server runs (with a conversation store).
+/// Notes as due the archive of every session the conversation store has ended that kiln hasn't
+/// noted (one that closed before kiln archived closes, or while an older kiln ran), within the
+/// time its record can still be kept: `keep_closed_days` and [`HOLD_EXTRA`], never past
+/// `keep_archived_days` (so an archive let go isn't made again). Each is due at its close, so the
+/// oldest, nearest to being let go, are archived first. How many were noted.
+async fn backfill(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<usize> {
+    let c = &hub.cfg.conversations;
+    let held = c.keep_closed().map(|k| k.saturating_add(HOLD_EXTRA));
+    let archived = (c.keep_archived_days > 0).then(|| Duration::from_secs(u64::from(c.keep_archived_days).saturating_mul(86_400)));
+    let window = match (held, archived) {
+        (Some(h), Some(a)) => Some(h.min(a)),
+        (h, a) => h.or(a),
+    };
+    let since = window.map_or(i64::MIN, |w| crate::util::now_ms().saturating_sub(i64::try_from(w.as_millis()).unwrap_or(i64::MAX)));
+    let mut after = Some((since, String::new()));
+    let mut noted = 0usize;
+    for _ in 0..BACKFILL_PAGES {
+        let (c, a) = (convo.clone(), after.clone());
+        let page = crate::rt::blocking(move || c.ended(a, crate::convo::store::ENDED_MAX)).await??;
+        let Some((id, at)) = page.last().cloned() else { break };
+        let full = page.len() >= crate::convo::store::ENDED_MAX;
+        noted = noted.saturating_add(
+            hub.store
+                .call(move |c| {
+                    let tx = c.transaction()?;
+                    let mut n = 0usize;
+                    for (session, closed) in &page {
+                        n = n.saturating_add(tx.execute("INSERT OR IGNORE INTO transcript_archives (session, closed_ms, due_ms, done_ms) VALUES (?1, ?2, ?2, NULL)", params![session, closed])?);
+                    }
+                    tx.commit()?;
+                    Ok(n)
+                })
+                .await?,
+        );
+        after = Some((at, id));
+        if !full {
+            break;
+        }
+    }
+    if noted > 0 {
+        tracing::info!(target: "kiln.blobs", event = "adopt", conversations = noted, "closed conversations kiln hadn't archived are noted, to be archived");
+    }
+    Ok(noted)
+}
+
+/// Archives what's due, every minute, for as long as the server runs (with a conversation store):
+/// first, once, what ended before it noted closes ([`backfill`]).
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
+    if let Some(convo) = hub.harness.convo.clone()
+        && let Err(e) = backfill(&hub, &convo).await
+    {
+        tracing::warn!(target: "kiln.blobs", event = "adopt", error = %format!("{e:#}"), "closed conversations from before couldn't all be noted to be archived");
+    }
     loop {
         if let Some(convo) = hub.harness.convo.clone() {
             pass(&hub, &convo).await?;
@@ -232,7 +293,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
 /// archived, and the hold on the conversation store moved on as far as it may.
 async fn pass(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<()> {
     let_go(hub).await?;
-    give_up(hub).await?;
+    give_up(hub, convo).await?;
     hold(hub, convo).await?;
     let now = crate::util::now_ms();
     let due: Vec<String> = hub
@@ -548,7 +609,36 @@ mod tests {
         })
     }
 
-    /// Names that aren't plain go into keys as their SHA-256.
+    /// CP-T10.1: conversations that ended before kiln noted closes (or while an older kiln ran)
+    /// are noted due as the server starts, within the time their records can still be kept, each
+    /// once, and archived as any other.
+    #[test]
+    fn conversations_that_ended_before_are_noted_once_and_archived() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let convo = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let now = crate::util::now_ms();
+            let session = |s: &str| crate::convo::rows::Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
+            let closed = |s: &str, at: i64| crate::convo::rows::Row::Closed { session: s.into(), at };
+            let mut rows = vec![session("a"), session("b"), session("old")];
+            rows.extend(record("a", 0..2));
+            rows.extend(record("b", 0..3));
+            let c = convo.clone();
+            assert!(crate::rt::blocking(move || c.put_wait(rows)).await?);
+            let two_days = now.saturating_sub(2 * 86_400_000);
+            let rows = vec![closed("a", two_days), closed("b", two_days), closed("old", now.saturating_sub(200 * 86_400_000))];
+            let c = convo.clone();
+            assert!(crate::rt::blocking(move || c.put_wait(rows)).await?);
+            assert_eq!(backfill(&hub, &convo).await?, 2, "the two whose records can still be kept");
+            assert_eq!(backfill(&hub, &convo).await?, 0, "each once");
+            pass(&hub, &convo).await?;
+            assert_eq!(archived(&hub, "a").await?.iter().map(|p| p.lines).sum::<u64>(), 2);
+            assert_eq!(archived(&hub, "b").await?.iter().map(|p| p.lines).sum::<u64>(), 3);
+            Ok(())
+        })
+    }
+
+    /// CP-T10.1: names that aren't plain go into keys as their SHA-256.
     #[test]
     fn keys_hold_plain_names_or_their_hash() {
         assert_eq!(key("s-1", "cc", 0, 9), "transcripts/s-1/cc/0-9.jsonl.br");

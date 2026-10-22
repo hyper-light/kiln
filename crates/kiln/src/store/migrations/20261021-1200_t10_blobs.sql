@@ -52,9 +52,10 @@ INSERT OR IGNORE INTO cas_index (digest, size, created_at, last_used_at)
   SELECT digest, size, created_at, last_used_at FROM cas_objects;
 
 -- Closed conversations whose record (the harness's transcript) is archived in kiln's store of
--- bytes (crate::harness::archive): when it closed, due once its last lines are in, done once
--- written. Until it's done, the conversation store keeps the records of every session that ended
--- since it closed (convo::store::Store::hold_prune).
+-- bytes (crate::harness::archive): when it last closed, due once its last lines are in, and done
+-- (when written; 0: given up, 30 days past the conversation store's keeping). Until it's done, the
+-- conversation store keeps the records of every session that ended since it closed
+-- (convo::store::Store::hold_prune).
 CREATE TABLE transcript_archives (
   session TEXT PRIMARY KEY,
   closed_ms INTEGER NOT NULL,

@@ -208,7 +208,7 @@ impl Sync {
         if incoming.is_dir()
             && let Err(e) = std::fs::remove_dir_all(&incoming)
         {
-            tracing::warn!(target: "kiln.sync", error = %e, "contents half-sent before the server stopped couldn't be removed");
+            tracing::warn!(target: "kiln.sync", event = "sync.incoming", error = %e, "contents half-sent before the server stopped couldn't be removed");
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out) = async_channel::unbounded();

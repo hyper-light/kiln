@@ -30,6 +30,8 @@ pub const COMMIT_ROWS: usize = 2048;
 pub const QUEUE: usize = 65_536;
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
+/// The most sessions [`Store::ended`] answers a page.
+pub const ENDED_MAX: usize = 1000;
 /// While the writer has nothing else to do, record lines kept before lines were compressed are
 /// compressed this many at a time, this often.
 const SQUEEZE_BATCH: usize = 2000;
@@ -232,6 +234,9 @@ pub trait Engine: Send + 'static {
     fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
     /// The sessions not ended, heard of since `since` (unix ms), oldest first.
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
+    /// The sessions that ended after `after` (`(closed_at, id)` together), oldest first, `limit` at
+    /// most: `(id, closed_at)`.
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>>;
     /// Compress the next `limit` record lines kept before lines were compressed, if any are left:
     /// whether more are.
     fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool>;
@@ -495,6 +500,16 @@ impl Store {
     /// The sessions not ended, heard of since `since` (unix ms). Blocking.
     pub fn unended(&self, since: i64) -> anyhow::Result<Vec<Unended>> {
         self.run(move |e| e.unended(since))
+    }
+
+    /// The sessions that ended after `after` (the page before's last, `(closed_at, id)`; `None`:
+    /// from the first), oldest first, a page of `limit`, at most [`ENDED_MAX`]: `(id, closed_at)`.
+    /// Paged by close and id together, so sessions that closed in one millisecond each come once.
+    /// Blocking.
+    pub fn ended(&self, after: Option<(i64, String)>, limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        let (at, id) = after.unwrap_or((i64::MIN, String::new()));
+        let limit = limit.min(ENDED_MAX);
+        self.run(move |e| e.ended((at, &id), limit))
     }
 
     /// Wait until everything sent so far is committed. Blocking.
@@ -768,6 +783,26 @@ mod tests {
             anyhow::ensure!(Instant::now() < until, "the hold moved past it, the record was still kept");
             std::thread::sleep(LOOK_FILE + SQUEEZE_EVERY);
         }
+        Ok(())
+    }
+
+    /// CP-T10.1: sessions that ended come a page at a time by close and id together: sessions that
+    /// closed in one millisecond each come once across pages, and one not ended never.
+    #[test]
+    fn ended_sessions_page_by_close_and_id_together() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep::default())?;
+        let t = crate::util::now_ms() - 60_000;
+        let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: t };
+        let closed = |s: &str, at: i64| Row::Closed { session: s.into(), at };
+        assert!(store.put_wait(vec![session("s3"), session("s1"), session("s2"), session("s4"), session("open")]));
+        assert!(store.put_wait(vec![closed("s3", t), closed("s1", t), closed("s2", t), closed("s4", t + 1)]));
+        let first = store.ended(None, 2)?;
+        assert_eq!(first, [("s1".to_owned(), t), ("s2".to_owned(), t)]);
+        let second = store.ended(Some((t, "s2".to_owned())), 2)?;
+        assert_eq!(second, [("s3".to_owned(), t), ("s4".to_owned(), t + 1)]);
+        assert!(store.ended(Some((t + 1, "s4".to_owned())), 2)?.is_empty());
+        assert_eq!(store.ended(None, 10_000)?.len(), 4, "capped at ENDED_MAX, and every ended one");
         Ok(())
     }
 
