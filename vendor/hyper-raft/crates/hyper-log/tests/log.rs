@@ -1173,7 +1173,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
 #[test]
 fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
     let file = sim(41);
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let (device, gated) = held(file);
     let log = Log::create(device, cfg, ID).unwrap();
     for group in [1, 2] {
@@ -2049,7 +2049,7 @@ fn entries_not_in_memory_that_lie_together_are_read_at_once() {
 #[test]
 fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
     let (device, gated) = held(sim(40));
-    let cfg = config(4, 8);
+    let cfg = config_now(4, 8);
     let log = Log::create(device, cfg, ID).unwrap();
     let state = |term, vote| HardState {
         term,
@@ -2119,7 +2119,7 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
 #[test]
 fn the_queue_bounds_every_submission_not_yet_answered() {
     let (device, gated) = held(sim(41));
-    let mut cfg = config(16, 8);
+    let mut cfg = config_now(16, 8);
     cfg.queue_submissions = 2;
     let log = Log::create(device, cfg, ID).unwrap();
     let small = |term| Update {
@@ -2139,7 +2139,7 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
         p.wait().unwrap();
     }
     // A group holds two submissions at most: the one a frame takes and one for the next.
-    let mut cfg = config(16, 8);
+    let mut cfg = config_now(16, 8);
     cfg.queue_submissions = 8;
     let (device, gated) = held(sim(42));
     let log = Log::create(device, cfg, ID).unwrap();
@@ -4012,7 +4012,7 @@ fn a_waker_is_woken_once_for_each_answer() {
 #[test]
 fn a_waking_submitter_does_not_wait_for_its_admission() {
     let (device, holder) = held_telling(sim(52));
-    let mut cfg = config(16, 8);
+    let mut cfg = config_now(16, 8);
     cfg.queue_submissions = 1;
     let log = Log::create(device, cfg, ID).unwrap();
     holder.hold();
@@ -4209,7 +4209,7 @@ fn every_blocking_writer_flushes_its_own_frame() {
 #[test]
 fn a_submission_taken_while_a_frame_confirms_itself_is_written() {
     let (device, holder) = held(sim(50));
-    let log = Log::create(device, config(16, 8), ID).unwrap();
+    let log = Log::create(device, config_now(16, 8), ID).unwrap();
     let small = |term| Update {
         hard_state: Some(hard(term, 0)),
         ..Update::default()

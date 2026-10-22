@@ -13,8 +13,9 @@ The bus Quiver is built on (docs/design/focal-bus.md, kiln's CP-T2.1).
   - `crates/focal-seal` and `crates/focal-platform`: the node log's keys and the files a part's
     image is installed through;
   - `crates/focal-timing`: the bus's tests' waits (a dev-dependency).
-- **What it builds on:** hyper-raft's shared crates at `d4e8447`, the revision this commit of the bus
-  takes (Focal's `vendor/README.md`), vendored apart at `vendor/hyper-raft`. Focal's own copies of
+- **What it builds on:** hyper-raft's shared crates, vendored apart at `vendor/hyper-raft` at
+  hyper-raft's `main` (`25cf889`). This commit of the bus takes them at `d4e8447` (Focal's
+  `vendor/README.md`), and `25cf889` differs from it in tests alone (`vendor/hyper-raft/UPSTREAM.md`). Focal's own copies of
   them (its `vendor/hyper-*`) and its other vendored crates (`aws-lc-rs`, `aws-lc-sys`) are not taken:
   the bus names the shared crates as from crates.io, and Quiver's root `Cargo.toml` (kiln's, in kiln)
   points each name at its one copy with `[patch.crates-io]`.

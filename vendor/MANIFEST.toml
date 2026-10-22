@@ -75,7 +75,7 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "7ec5474c555bb17145f15f703722a6e4afb1efc5"
+commit = "3f9b396a902de2e4cb48a1b0b9f8bb7d09a415ea"
 path = "vendor/quiver"
 exclude = ["vendor"]
 
@@ -102,7 +102,7 @@ own = ["UPSTREAM.md"]
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "d4e8447117803fdb31d3a5f9079de027520e1141"
+commit = "25cf88924895ee55976caa061a48789355fb3354"
 path = "vendor/hyper-raft"
 take = [
   "Cargo.toml",

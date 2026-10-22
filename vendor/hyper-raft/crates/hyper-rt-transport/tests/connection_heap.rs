@@ -398,6 +398,16 @@ fn what_a_heap_of_its_own_costs() {
 static SERVER_ADDRESS: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
 static PLUMBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Ends the plumbing test's clients as the server's part ends, passed or failed: a server that
+/// failed and left them turning held the test's scope open until its job's time ran out.
+struct Plumbed;
+
+impl Drop for Plumbed {
+    fn drop(&mut self) {
+        PLUMBED.store(true, Ordering::Relaxed);
+    }
+}
+
 /// An endpoint whose work runs on a heap of its own learns what its connections hold there and
 /// charges it (docs/transport.md §4x): observed as it wants, its first look as it is made and the
 /// rest as its connections double, its connections' state is charged what the heap holds past what
@@ -453,6 +463,7 @@ fn an_endpoint_on_a_heap_of_its_own_charges_its_connections_what_they_hold() {
             })
             .unwrap();
         });
+        let _plumbed = Plumbed;
         let mut rt = hyper_rt::runtime::LocalRuntime::new(&runtime(CLIENTS)).unwrap();
         rt.block_on(hyper_heap::OnHeap::new(async move {
             let peers: Vec<(&[u8], u64)> = peers
@@ -478,15 +489,22 @@ fn an_endpoint_on_a_heap_of_its_own_charges_its_connections_what_they_hold() {
             let state = driver.endpoint().stats().state;
             let base = state.base.expect("observed as it was made");
             assert!(state.observations >= 2, "{state:?}");
-            // Observed once more now, settled: the charge is what the heap holds past the base and
-            // the pool, the kernel's holdings beside it.
+            // Observed once more now, settled: the charge is what the heap holds past the base, the
+            // pool and what the receive ring grew by (charged as the ring's, docs/transport.md
+            // §4aa), the kernel's holdings beside it.
             let held = hyper_heap::held_here().unwrap().in_use;
             let kernel = driver.kernel_held().unwrap_or(0);
             let pool =
                 (driver.endpoint().stats().receive_chunks * hyper_transport::RECEIVE_CHUNK) as u64;
+            let ring = driver.ring();
+            assert_eq!(
+                ring.charged,
+                ((ring.buffers - 1) * hyper_rt_transport::RECEIVE_BYTES) as u64,
+                "{ring:?}"
+            );
             driver.observe(held);
             let state = driver.endpoint().stats().state;
-            let expected = (held + kernel - pool) - base;
+            let expected = (held + kernel - pool - ring.charged) - base;
             assert_eq!((state.charged, state.unfunded), (expected, 0), "{state:?}");
             let least = hyper_transport::state_charge::<common::Mantle>(&admitting(CLIENTS));
             assert_eq!(
@@ -503,7 +521,6 @@ fn an_endpoint_on_a_heap_of_its_own_charges_its_connections_what_they_hold() {
                 hyper_transport::connection_charge::<common::Mantle>(&admitting(CLIENTS)) - least
                     + state.each
             );
-            PLUMBED.store(true, Ordering::Relaxed);
         }))
         .unwrap();
     });

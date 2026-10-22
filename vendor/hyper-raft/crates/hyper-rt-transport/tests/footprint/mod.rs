@@ -121,8 +121,12 @@ pub async fn turn(driver: &mut Drv) -> Option<hyper_transport::Event<Mantle>> {
     .await
 }
 
-/// Turns the driver until it holds `target` connections, each with its socket where the platform
-/// gives one, and has received nothing for [`QUIET`]; `turned` is told of each turn.
+/// Turns the driver until it holds `target` connections and no other, each admitted and with its
+/// socket where the platform gives one, none closing and no handshake pending, and has received
+/// nothing for [`QUIET`]; `turned` is told of each turn. A connection closed (a handshake a client's
+/// retry superseded: a copy of its first ClientHello that came after the Retry) drains for three
+/// probe timeouts (RFC 9000 §10.2) holding its state, and windows-2025 held one such 1.6 s past
+/// the quiet: a measurement then took 17 connections' state for 16.
 pub async fn settle(driver: &mut Drv, target: usize, turned: &mut impl FnMut(&mut Drv)) {
     let began = Instant::now();
     let mut last_received = 0;
@@ -131,20 +135,26 @@ pub async fn settle(driver: &mut Drv, target: usize, turned: &mut impl FnMut(&mu
         turn(driver).await;
         while driver.endpoint().poll_event().is_some() {}
         turned(driver);
-        let held = driver.endpoint().stats().connections;
+        let stats = driver.endpoint().stats();
+        let held = stats.connections;
+        let admitted = stats.admission.connections;
         let received = driver.stats().received + driver.peer_stats().received;
         if received != last_received {
             last_received = received;
             quiet_since = Instant::now();
         }
         let sockets_ready = driver.peer_sockets() >= target || !cfg!(unix);
-        if held >= target && sockets_ready && quiet_since.elapsed() >= QUIET {
+        if held == target
+            && admitted == target
+            && stats.admission.pending == 0
+            && sockets_ready
+            && quiet_since.elapsed() >= QUIET
+        {
             return;
         }
         assert!(
             began.elapsed() < GUARD,
-            "{held} of {target} connections held; endpoint {:?}",
-            driver.endpoint().stats()
+            "{held} connections held, {admitted} of {target} admitted; endpoint {stats:?}",
         );
     }
 }

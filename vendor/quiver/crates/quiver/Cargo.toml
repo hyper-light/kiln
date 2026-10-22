@@ -27,15 +27,7 @@ futures = { version = "0.3.31", default-features = false, features = ["std", "as
 # T-T2.1.2's builds (tests/ram_store.rs): hyper-durable as a program outside a test takes it.
 hyper-block = "0.1.0"
 hyper-durable = "0.1.0"
-# The bench's open loop, the process's CPU and the load average (benches/fanout.rs), as Focal's
-# benches report through it.
-hyper-measure = "0.1.0"
 trybuild = "1.0"
-
-# The ephemeral class's bench (bench/README.md): `cargo bench -p quiver --bench fanout -- <args>`.
-[[bench]]
-name = "fanout"
-harness = false
 
 [lints]
 workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "quiver-bench"
+description = "Quiver's benchmarks: the ephemeral class's fan-out and soak, and its comparison with NATS, Redis and Kafka; measurement code, never shipped"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# One program, its mode its first argument (bench/README.md):
+# `cargo bench -p quiver-bench --bench fanout -- <fanout|soak|report> <args>`.
+[[bench]]
+name = "fanout"
+path = "benches/fanout/main.rs"
+harness = false
+
+[dev-dependencies]
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await", "executor"] }
+# The open loop, the process's CPU and the load average, as Focal's benches report through it.
+hyper-measure = "0.1.0"
+quiver = { version = "0.1.0", path = "../quiver" }
+quiver-api = { version = "0.1.0", path = "../quiver-api" }
+
+# The competitors' own clients, as Focal's comparison takes them (bench/README.md, "The
+# comparison"): async-nats, redis-rs and librdkafka (built from its vendored source, without TLS,
+# SASL or compression), each on a tokio runtime of its own. On Linux, where the comparison runs, its
+# brokers in Docker.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+async-nats = { version = "0.50", default-features = false, features = ["aws-lc-rs"] }
+rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+
+[lints]
+workspace = true

@@ -124,7 +124,9 @@ python3 scripts/vendor.py check
 
 The macOS and Windows lints compile aws-lc's C (Focal's bus takes it through hyper-raft's TLS and
 QUIC), so zig is their C compiler, through cargo-zigbuild; `gates.sh` takes them from the PATH or
-installs kiln's pinned versions into a virtualenv of their own.
+installs kiln's pinned versions into a virtualenv of their own. The bench's Kafka client builds
+librdkafka from source, whose configure insists on a C++ compiler: where the machine has none,
+`gates.sh` puts zig's (`zig c++`) on the PATH.
 
 ## Working here
 

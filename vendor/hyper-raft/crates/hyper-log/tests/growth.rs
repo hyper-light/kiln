@@ -278,13 +278,25 @@ fn a_fill_ahead_holds_only_what_the_gate_admitted_and_each_slot_once() {
         ..config()
     };
     let log = Log::create_with(sim(6), measured, ID, with).unwrap();
+    // Idle as it is made, the log fills its next slot ahead: given the device's turns until it has
+    // (each a piece of a block), as a log fills only while its device has nothing else to do. Its
+    // writes back to back below may leave it no idle turn, on a busy machine none at all.
+    let looks = 2 * (SEGMENT / BLOCK as u64) + 2;
+    for _ in 0..looks {
+        if log.stats(None).unwrap().fills > 0 {
+            break;
+        }
+        log.with_file(|_| ()).unwrap();
+    }
+    assert!(
+        log.stats(None).unwrap().fills > 0,
+        "the idle log filled no slot ahead in {looks} of the device's turns"
+    );
     let mut next = 1;
     assert!(matches!(fill(&log, &mut next), LogError::Full));
     // Full, every slot admitted is open, so no fill is due, and none is under way: a frame that
     // opened the last one stopped any fill of it between two pieces.
     let len = log.with_file(|file| file.len()).unwrap().unwrap();
-    let stats = log.stats(None).unwrap();
-    assert!(stats.fills > 0, "the idle log filled no slot ahead");
     {
         let l = ledger.lock().unwrap();
         assert!(l.committed + l.pending <= budget);
