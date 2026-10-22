@@ -126,6 +126,10 @@ impl Kind {
             // Model, mode and resume go over the protocol (thread/start, turn/start).
             Protocol::CodexAppServer => {
                 p.args(super::codex::args());
+                // The most subagents it runs at once (its Agent settings), as Codex's own limit.
+                if let Some(n) = spec.max_subagents {
+                    p.arg("-c").arg(format!("agents.max_concurrent_threads_per_session={n}"));
+                }
                 #[cfg(unix)]
                 if let Some((kiln, sock, prefer)) = local_tools(spec) {
                     p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));

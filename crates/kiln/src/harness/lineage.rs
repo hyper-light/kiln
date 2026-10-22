@@ -443,13 +443,16 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
     }
     let all = hub.harness.list();
     let running = all.iter().filter(|i| i.parent.as_deref() == Some(parent.id.as_str()) && i.status != Status::Exited).count();
-    let max = usize::try_from(limits.max_children).unwrap_or(usize::MAX);
+    let kiln_max = usize::try_from(limits.max_children).unwrap_or(usize::MAX);
+    // Its own, when lower: the most subagents it runs at once (its Agent settings).
+    let own = parent.max_subagents.and_then(|m| usize::try_from(m).ok()).filter(|m| *m < kiln_max);
+    let max = own.unwrap_or(kiln_max);
     if running.saturating_add(count) > max {
-        return Err(refuse(format!(
-            "{} runs {running} agent{} it started, and one agent runs at most {max} at once ([agents] max_children): end some first",
-            parent.name,
-            if running == 1 { "" } else { "s" }
-        )));
+        let s = if running == 1 { "" } else { "s" };
+        return Err(refuse(match own {
+            Some(_) => format!("{} runs {running} agent{s} it started, and its settings let it run at most {max} at once: end some first, or raise that in its Agent settings", parent.name),
+            None => format!("{} runs {running} agent{s} it started, and one agent runs at most {max} at once ([agents] max_children): end some first", parent.name),
+        }));
     }
     let mode = child_mode(&ask.kind, ask.mode.as_deref(), ceiling(parent), !parent.no_bypass).map_err(refuse)?;
     // Its commands run only on its own machine: so do its children's, there.

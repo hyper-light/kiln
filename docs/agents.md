@@ -49,12 +49,20 @@ Every ten seconds the runner notes what runs under each harness and what else is
 its group, or carrying its mark), and keeps that in its record of its sessions (beside each one's
 harness process). What an agent started that runs on apart from its harness (a server started with
 `&` or `setsid`, a script left going) shows with its background tasks as "left running" (task id
-`left-<pid>`), until it ends; stopping that task stops it and what runs under it.
+`left-<pid>`) while its turn goes on; stopping that task stops it and what runs under it. Nothing
+outlives the turn that left it: once the agent is between turns (idle, nothing waiting on a
+person), what its commands left running apart from its harness is stopped. Its harness's own
+background tasks (a shell or a monitor it runs in the background, which run under it) are its work
+and stay until they end, it stops them, or the agent ends; a server meant to keep going runs as
+one. So does a job of the machine's own: a systemd user unit (`systemd-run --user`, a service or a
+scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
+agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
-the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short.
+the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short;
+it goes when that turn ends, as anything else left running.
 Ending the agent stops what it left running, then ends whatever else is still in its group (what
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
@@ -84,8 +92,13 @@ usage, with the workers, slots and weights the person sets there ([programs.md](
 - **The message box.** It writes to the agents selected (each named in its To line, put back with
   its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
   harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say
-  into the mic, queued, steered or sent now as an agent's own box sends it; or a command from its
-  list. It empties as it sends, and says how it went.
+  into the mic, queued, steered or sent now as an agent's own box sends it. Above it, the agent
+  page's line of settings, permissions · model · effort, each opened in place with the same
+  controls: unset, each agent keeps its own; chosen, only the agents that have it are sent to, and
+  given it first (Reset unsets them all). In the field, / lists kiln's own commands for all of them
+  first (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
+  each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
+  working. It empties as it sends, and says how it went.
 
 ## API
 
@@ -391,7 +404,7 @@ goals and plan runs are theirs alone. Agents that work for different people aren
 | Bypass | only under a parent in bypass that was itself allowed it (`allow_bypass`); a child of a parent without it can't be switched to bypass either |
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
-| Children | at most `[agents] max_children` (24) running at once per agent |
+| Children | at most `[agents] max_children` (24) running at once per agent, or fewer as its own settings say (Subagents → At once) |
 | Messages | an agent may send a queued message to any agent that works for the same person, whoever started it (`agents.send`, `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
 | Steering | an agent steers into a turn, sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
 | Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
@@ -683,6 +696,7 @@ console picks) and are answered with a `reply` update to that client.
 | `resume` | | ends a pause now (`state.pause`): the turn it cut off goes on, then the queue |
 | `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
+| `max_subagents` | `count` (null: no limit of its own) | the most subagents it runs at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, each. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it |
 | `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
 | `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too |
 

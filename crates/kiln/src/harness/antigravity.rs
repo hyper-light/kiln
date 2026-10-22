@@ -267,7 +267,7 @@ impl Agy {
             Command::Control { .. } => {}
             Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             // Its own commands and skills run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {
                 let name = name.trim().trim_start_matches('/').to_owned();

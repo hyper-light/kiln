@@ -54,6 +54,10 @@ pub struct Spec {
     /// The effort / reasoning level to start with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The most subagents it runs at once (as `State::max_subagents`): Codex takes it as its own
+    /// limit when it starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// With `resume`: continue only up to this point of that session (a message or turn id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<String>,
@@ -109,6 +113,7 @@ impl Default for Spec {
             allow_bypass: true,
             program: None,
             effort: None,
+            max_subagents: None,
             resume_at: None,
             fork: false,
             takeover_pid: None,
@@ -282,6 +287,9 @@ pub struct Info {
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The most subagents it runs at once (as `State::max_subagents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// The agent that started it (as `Spec::parent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -353,6 +361,7 @@ impl Info {
         self.move_on_limit = s.move_on_limit;
         self.move_plan.clone_from(&s.move_plan);
         self.pause_at = s.pause_at;
+        self.max_subagents = s.max_subagents;
     }
 
     /// The parts lists care about changed (activity timestamps aside, and the words of what's queued:
@@ -662,6 +671,7 @@ impl Session {
         if !core.state.model.is_empty() {
             s.model = Some(core.state.model.clone());
         }
+        s.max_subagents = core.state.max_subagents;
         s
     }
 }
@@ -803,8 +813,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
 /// previous image of this process handed over).
 #[allow(clippy::too_many_arguments)]
-fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
+    core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
     let cwd = core.state.cwd.clone();
     let info = Info {
         id: id.clone(),
@@ -852,6 +863,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
+        max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
         no_bypass: !spec.allow_bypass,
@@ -1407,7 +1419,8 @@ struct Switch {
 }
 
 /// Nothing is under way: no turn, nothing waiting for a person.
-fn settled(s: &Session) -> bool {
+/// Between turns: idle, nothing waiting on a person, no turn under way.
+pub(super) fn settled(s: &Session) -> bool {
     settled_core(&s.core.lock())
 }
 
@@ -2565,6 +2578,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 drop(core);
                                 on_change();
                             }
+                            Command::MaxSubagents { count } => {
+                                let mut core = s.core.lock();
+                                core.state.max_subagents = count.filter(|n| *n >= 1);
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
                             Command::MoveOnLimit { on, to, kind, model } => {
                                 let mut core = s.core.lock();
                                 core.state.move_on_limit = on;
@@ -3235,6 +3255,7 @@ mod tests {
             move_on_limit: false,
             move_plan: Default::default(),
             pause_at: None,
+            max_subagents: None,
             parent: None,
             plan_run: None,
             no_bypass: false,

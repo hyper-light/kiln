@@ -1534,13 +1534,17 @@ html.fills-window body {
   backdrop-filter: blur(4px);
   animation: fade-in 0.2s ease;
 }
+/* Within the screen as it shows (dvh: a phone's browser bars counted), from a little below its top;
+   on a phone or a short window, from just below its top, with the rest of its height below. */
 .dialog {
   position: fixed;
   z-index: 90;
   left: 50%;
   top: 12vh;
+  top: 12dvh;
   width: min(560px, calc(100vw - 24px));
   max-height: 80vh;
+  max-height: 80dvh;
   overflow-y: auto;
   transform: translateX(-50%);
   border: 1px solid #2a3039;
@@ -1549,6 +1553,13 @@ html.fills-window body {
   box-shadow: 0 24px 80px #000a;
   animation: dialog-in 0.35s var(--ease);
   outline: none;
+}
+@media (max-width: 640px), (max-height: 640px) {
+  .dialog {
+    top: max(12px, env(safe-area-inset-top));
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom)));
+  }
 }
 .dialog::before {
   position: absolute;
