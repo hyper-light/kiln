@@ -371,6 +371,11 @@ pub struct Targets {
     /// §4): `aws-lambda: { account: aws-prod, region: us-east-1 }`. KilnCD environments only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub platforms: BTreeMap<String, serde_json::Map<String, Value>>,
+    /// Where kiln reaches the clusters Argo CD deploys this environment to: one of KilnCD's
+    /// clusters of this server, by Argo CD's name for it (`in-cluster: argo-cluster`). An app's
+    /// secrets are written there before its release reaches Argo CD (§3.5).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kilncd: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

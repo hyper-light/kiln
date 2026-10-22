@@ -5,8 +5,14 @@
 //! what kiln wants. A service's apply creates it, or updates it to the family's newest revision
 //! and the settings kiln sets; ECS rolls the tasks out, with its circuit breaker when the
 //! service asks for one, and the service's health follows the rollout.
+//!
+//! An app's secrets (docs/deploy-api.md §3.5) are SSM SecureString parameters kiln writes before
+//! the task definition, which its containers read through `secrets`: a Parameter reads as the
+//! reference kiln applied while SSM holds the version kiln wrote; another version is drift, and
+//! its value never shows.
 
 use anyhow::{Result, bail};
+use kiln_cd::apps::{SECRET_CHANGED, SECRET_REF, SSM_GROUP};
 use kiln_cd::obj::{self, ResKey};
 use kiln_cd::providers::aws_ecs::{self as p, GROUP};
 use serde_json::{Value, json};
@@ -19,6 +25,35 @@ const TARGET: &str = "AmazonEC2ContainerServiceV20141113";
 async fn call(cx: &Cx<'_>, op: &str, body: &Value) -> Result<Value> {
     cx.conn.budget().await;
     cx.aws()?.json("ecs", &format!("{TARGET}.{op}"), body).await
+}
+
+async fn ssm(cx: &Cx<'_>, op: &str, body: &Value) -> Result<Value> {
+    cx.conn.budget().await;
+    cx.aws()?.json("ssm", &format!("AmazonSSM.{op}"), body).await
+}
+
+/// An app's secret as SSM holds it: the reference kiln applied while the parameter is at the
+/// version kiln wrote, otherwise [`SECRET_CHANGED`].
+fn parameter_object(cx: &Cx<'_>, p: &Value) -> Option<Value> {
+    let name = p.get("Name")?.as_str()?;
+    let version = p.get("Version").and_then(Value::as_i64);
+    let ours = cx.applied(SSM_GROUP, "Parameter", "", name).filter(|r| version.is_some() && r.made.get("Version").and_then(Value::as_i64) == version);
+    let value = ours.and_then(|r| r.object.pointer("/spec/value").cloned()).unwrap_or_else(|| Value::String(SECRET_CHANGED.into()));
+    let mut o = kiln_cd::providers::object(SSM_GROUP, "Parameter", name, None, json!({ "value": value }));
+    if let Value::Object(m) = &mut o {
+        m.insert("status".into(), json!({ "version": version, "type": p.get("Type"), "lastModified": p.get("LastModifiedDate") }));
+    }
+    Some(o)
+}
+
+/// Parameters by name, as GetParameters answers (10 at a time, never their values).
+async fn parameters(cx: &Cx<'_>, names: &[&str]) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for chunk in names.chunks(10) {
+        let v = ssm(cx, "GetParameters", &json!({ "Names": chunk, "WithDecryption": false })).await?;
+        out.extend(v.get("Parameters").and_then(Value::as_array).into_iter().flatten().filter_map(|p| parameter_object(cx, p)));
+    }
+    Ok(out)
 }
 
 /// ECS says a task definition or service isn't there in a `ClientException`.
@@ -76,6 +111,7 @@ async fn service(cx: &Cx<'_>, cluster: &str, name: &str) -> Result<Option<Value>
 pub async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     match kind {
+        "Parameter" => out = parameters(cx, &names.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()).await?,
         "TaskDefinition" => {
             for (_, family) in names {
                 if let Some(v) = describe_family(cx, family).await? {
@@ -167,17 +203,33 @@ pub async fn adopt(cx: &Cx<'_>, cluster: &str, name: &str) -> Result<Value> {
 
 pub async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     match obj::kind(desired) {
+        "Parameter" => apply_parameter(cx, desired).await,
         "TaskDefinition" => apply_task_definition(cx, desired).await,
         "Service" => apply_service(cx, desired).await,
         other => bail!("aws-ecs doesn't apply {other}"),
     }
 }
 
+/// Writes an app's secret, unless SSM already holds the version kiln wrote of it.
+async fn apply_parameter(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
+    let name = obj::name(desired);
+    let want = desired.pointer("/spec/value").cloned().unwrap_or(Value::Null);
+    if let Some(live) = parameters(cx, &[name]).await?.into_iter().find(|l| l.pointer("/spec/value") == Some(&want)) {
+        return Ok(live);
+    }
+    let what = want.as_str().unwrap_or_default().trim_start_matches(SECRET_REF).to_owned();
+    let body = super::resolve_secrets(cx, desired, json!({ "Name": name, "Value": want, "Type": "SecureString", "Overwrite": true, "Description": format!("set by kiln: {what}") })).await?;
+    let v = ssm(cx, "PutParameter", &body).await?;
+    cx.record(SSM_GROUP, "Parameter", "", name, Some(applied(desired, json!({ "Version": v.get("Version") })))).await?;
+    parameters(cx, &[name]).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("parameter {name} is gone"))
+}
+
 async fn apply_task_definition(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let family = obj::name(desired);
     let live = describe_family(cx, family).await?;
     let current = live.as_ref().and_then(p::live_task_definition);
-    let arn = match current.as_ref().filter(|l| p::task_matches(desired, l)) {
+    // A secret kiln put there that the app no longer has is a new revision too.
+    let arn = match current.as_ref().filter(|l| p::task_matches(desired, l) && !p::secrets_gone(desired, l)) {
         // The newest revision already is it: no new one, only kiln's tags if they're missing.
         Some(l) => {
             let arn = l.pointer("/status/taskDefinitionArn").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -236,6 +288,11 @@ async fn apply_service(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
 
 pub async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
     match &*key.kind {
+        "Parameter" => match ssm(cx, "DeleteParameter", &json!({ "Name": &*key.name })).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.downcast_ref::<AwsError>().is_some_and(|a| a.code == "ParameterNotFound") => Ok(()),
+            Err(e) => Err(e),
+        },
         "Service" => match call(cx, "DeleteService", &json!({ "cluster": &*key.namespace, "service": &*key.name, "force": true })).await {
             Ok(_) => Ok(()),
             Err(e) if missing(&e) || e.downcast_ref::<AwsError>().is_some_and(|a| a.code == "ServiceNotFoundException") => Ok(()),
@@ -292,6 +349,7 @@ mod tests {
     /// service moves to it; a service moved by hand reads as drift and moves back; then gone.
     #[test]
     fn services_run_the_newest_revision() -> anyhow::Result<()> {
+        let _one = fake::LAMBDA.lock();
         crate::rt::block_on(async {
             let fake = Arc::new(Fake::default());
             let base = fake::start(fake.clone()).await?;
@@ -350,6 +408,75 @@ mod tests {
             delete(&cx, &key_of(&td2)).await?;
             assert!(list(&cx, "Service", &names).await?.is_empty());
             assert!(list(&cx, "TaskDefinition", &[(String::new(), "api".to_owned())]).await?.is_empty());
+            Ok(())
+        })
+    }
+
+    /// An app's secrets on ECS (docs/deploy-api.md §3.5): a SecureString parameter each, whose
+    /// value goes to SSM alone, read by the task's containers through `secrets`; the parameter
+    /// reads as kiln's reference while SSM holds the version kiln wrote. A value changed by hand
+    /// is drift, never shown; a new version writes the parameter and registers a revision.
+    #[test]
+    fn secrets_reach_the_tasks_through_ssm() -> anyhow::Result<()> {
+        let _one = fake::LAMBDA.lock();
+        crate::rt::block_on(async {
+            let fake = Arc::new(Fake::default());
+            let base = fake::start(fake.clone()).await?;
+            for service in ["ecs", "ssm"] {
+                aws::override_endpoint(service, &base);
+            }
+            let target = Target::parse("aws-ecs/aws-test/us-east-1").ok_or_else(|| anyhow::anyhow!("target"))?;
+            let def = target.def().ok_or_else(|| anyhow::anyhow!("provider"))?;
+            let conn = Conn { settle_every: std::time::Duration::from_millis(5), gap: std::time::Duration::ZERO, ..Conn::new(target, def) };
+            let records = MemRecords::default();
+            let creds = Credentials { access_key_id: "AKIDFAKE".into(), secret_access_key: "s".into(), session_token: None, expires_at: None };
+            let files = fake::MemFiles::default();
+            let cx = Cx { conn: &conn, creds: Creds::Aws(Aws { creds, region: "us-east-1".into() }), records: &records, files: &files };
+            files.1.lock().insert("kiln-secret:app/api/production/DB_PASSWORD@1".into(), b"hunter2".to_vec());
+            files.1.lock().insert("kiln-secret:app/api/production/DB_PASSWORD@2".into(), b"hunter3".to_vec());
+            let with = |version: u32| -> anyhow::Result<Vec<Value>> {
+                let mut objs = desired("acme/api@sha256:aaa", 1)?;
+                kiln_cd::apps::platform_secrets(&mut objs, "app/api/production", &[("DB_PASSWORD".into(), version)]).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(objs.into_iter().map(|o| fake::tracked(o, "default/api-production")).collect())
+            };
+            let objs = with(1)?;
+            let param = objs.iter().find(|o| obj::kind(o) == "Parameter").cloned().unwrap_or_default();
+            let td = objs.iter().find(|o| obj::kind(o) == "TaskDefinition").cloned().unwrap_or_default();
+            assert_eq!(kiln_cd::sync::wave_of(&param), -1, "before the task definition");
+            let name = "/kiln/app/api/production/DB_PASSWORD";
+
+            let live = cx.with_applied(apply(&cx, &param).await?);
+            assert_eq!(fake.state.lock().parameters.get(name).map(|(v, _)| v.clone()).as_deref(), Some("hunter2"), "the value is SSM's");
+            assert_eq!(live.pointer("/spec/value"), Some(&json!("kiln-secret:app/api/production/DB_PASSWORD@1")));
+            assert!(!live.to_string().contains("hunter2") && !format!("{:?}", records.0.lock()).contains("hunter2"), "no value in what kiln shows or keeps");
+            let live_td = apply(&cx, &td).await?;
+            assert_eq!(live_td.pointer("/spec/containerDefinitions/0/secrets"), Some(&json!([{ "name": "DB_PASSWORD", "valueFrom": name }])));
+            assert!(p::task_matches(&td, &live_td));
+            apply(&cx, &param).await?;
+            assert_eq!(fake.state.lock().calls, [format!("PutParameter {name}"), "RegisterTaskDefinition api:1".to_owned()], "the same secret again changes nothing");
+
+            // Changed by hand: drift, the value unshown; kiln's apply puts its own back.
+            if let Some(p) = fake.state.lock().parameters.get_mut(name) {
+                *p = ("handmade".into(), p.1 + 1);
+            }
+            let drifted = list(&cx, "Parameter", &[(String::new(), name.to_owned())]).await?.into_iter().next().unwrap_or_default();
+            assert_eq!(drifted.pointer("/spec/value"), Some(&json!(kiln_cd::apps::SECRET_CHANGED)));
+            apply(&cx, &param).await?;
+            assert_eq!(fake.state.lock().parameters.get(name).map(|(v, _)| v.clone()).as_deref(), Some("hunter2"));
+
+            // A new version: the parameter, then (by wave) a revision whose label rolls the tasks.
+            let mut objs: Vec<Value> = with(2)?.into_iter().filter(|o| matches!(obj::kind(o), "Parameter" | "TaskDefinition")).collect();
+            objs.sort_by_key(kiln_cd::sync::wave_of);
+            for o in &objs {
+                apply(&cx, o).await?;
+            }
+            assert_eq!(fake.state.lock().parameters.get(name).map(|(v, _)| v.clone()).as_deref(), Some("hunter3"));
+            assert_eq!(fake.state.lock().calls.last().map(String::as_str), Some("RegisterTaskDefinition api:2"));
+
+            // Taken out of the app: gone from SSM.
+            delete(&cx, &key_of(&param)).await?;
+            delete(&cx, &key_of(&param)).await?;
+            assert!(list(&cx, "Parameter", &[(String::new(), name.to_owned())]).await?.is_empty());
             Ok(())
         })
     }

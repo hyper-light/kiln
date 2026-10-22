@@ -247,7 +247,7 @@ Appendix C does). Every provider gets the same treatment, whether or not it's na
 
 | Provider | Kinds | A sync | Rollouts | Health | Reads |
 | --- | --- | --- | --- | --- | --- |
-| `aws-ecs` | TaskDefinition (immutable revisions), Service | registers a task definition revision, updates the service | ECS's rolling with the circuit breaker and rollback; its blue/green, linear and canary where the account has them; or kiln's steps over weighted ALB target groups | the primary deployment's rollout state; running against desired; target health; CloudWatch alarms | task definition JSON |
+| `aws-ecs` | TaskDefinition (immutable revisions), Service, Parameter (SSM: an app's secrets) | registers a task definition revision, updates the service | ECS's rolling with the circuit breaker and rollback; its blue/green, linear and canary where the account has them; or kiln's steps over weighted ALB target groups | the primary deployment's rollout state; running against desired; target health; CloudWatch alarms | task definition JSON |
 | `aws-lambda` | Function, Version, Alias, FunctionUrl, EventSourceMapping, Permission | updates code (S3 zip or image) and configuration, publishes a version, moves the alias | alias weights: canary, linear | `State`, `LastUpdateStatus`; errors and throttles during steps | SAM `template.yaml` functions |
 | `aws-beanstalk` | Application, ApplicationVersion, Environment | puts the bundle in S3, makes a version, updates the environment | Beanstalk's own policies: all at once, rolling, rolling with an extra batch, immutable, traffic splitting | status and enhanced health (Green, Yellow, Red) | `Dockerrun.aws.json`, `.ebextensions` |
 | `aws-ec2` | LaunchTemplate (versions), AutoScalingGroup | a launch template version with the new image or user data, then an instance refresh | instance refresh: checkpoints, minimum healthy %, skip matching, rollback, alarms | refresh status, instance and target health | — |
@@ -698,10 +698,12 @@ Gateway API's types.
   Appendix C).
 - **Clusters in clouds.** EKS takes a token from STS; GKE and AKS take access tokens from their
   account. Any cluster with structured authentication can trust kiln's issuer directly.
-- **Runtime secrets.** An app's secrets are references into the platform's store: Secrets Manager,
-  Secret Manager, Key Vault, Workers secrets, Vercel environment variables. kiln manages them as
-  objects whose values come from W09 secrets. They are masked in diffs and plans, and compared by
-  hash.
+- **Runtime secrets.** An app's secrets (deploy-api.md §3.5) go to each platform its own way:
+  Lambda's environment variables, SSM SecureString parameters an ECS task reads, Workers' secret
+  bindings, Vercel's sensitive variables. The objects kiln applies hold references
+  (`kiln-secret:…`) the provider resolves from kiln's secrets service as it applies them, so no
+  value is in a desired object, a record, a plan or a view; each compares as kiln's while the
+  platform's own revision of it is the one kiln left.
 - **Least privilege.** Each provider documents the permissions it needs: read alone for shadow
   mode, write for syncs. Setup generates the policy for each.
 - **Agents (D6).** By default only people sync, roll back and approve; an agent can plan, and can

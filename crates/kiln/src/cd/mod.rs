@@ -734,6 +734,34 @@ impl Cd {
         Ok(Some(AppSecrets { name: want.name.clone(), bundle }))
     }
 
+    /// Whether kiln knows a cluster by this name.
+    pub(crate) fn has_cluster(&self, name: &str) -> bool {
+        self.clusters.read().contains_key(name)
+    }
+
+    /// Applies `object` to the cluster kiln knows as `cluster` (server-side, as `manager`): what
+    /// kiln writes there for something it doesn't render itself (an Argo CD app's secrets).
+    pub(crate) async fn apply_to(&self, cluster: &str, object: &Value, manager: &str) -> Result<Value> {
+        let c = self.clusters.read().get(cluster).cloned().with_context(|| format!("kiln isn't connected to the cluster {cluster}"))?;
+        c.apply(object, manager, false).await
+    }
+
+    /// What kiln wrote with [`Cd::apply_to`] in the cluster kiln knows as `cluster`, if it's there.
+    pub(crate) async fn get_from(&self, cluster: &str, key: &ResKey) -> Result<Option<Value>> {
+        let c = self.clusters.read().get(cluster).cloned().with_context(|| format!("kiln isn't connected to the cluster {cluster}"))?;
+        c.get(key).await
+    }
+
+    /// Deletes what kiln wrote with [`Cd::apply_to`] in the cluster kiln knows as `cluster`, if
+    /// it's there and `ours` says it is kiln's.
+    pub(crate) async fn delete_from(&self, cluster: &str, key: &ResKey, ours: impl Fn(&Value) -> bool) -> Result<()> {
+        let c = self.clusters.read().get(cluster).cloned().with_context(|| format!("kiln isn't connected to the cluster {cluster}"))?;
+        match c.get(key).await? {
+            Some(o) if ours(&o) => c.delete(key, "Background").await,
+            _ => Ok(()),
+        }
+    }
+
     /// An app's secrets for a plan, from memory alone: those it was last rendered with.
     pub(crate) fn planned_secrets(&self, def: &AppDef) -> Option<AppSecrets> {
         let want = def.secrets.as_ref()?;
@@ -927,11 +955,22 @@ impl Cd {
         for p in &inputs.pull_secrets {
             objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
-        // Its secrets: one Secret, and the pods that read it marked with their versions.
+        // Its secrets: on a cluster one Secret, and the pods that read it marked with their
+        // versions; on a platform, references its provider reads the values of as it applies.
+        let platform = kiln_cd::providers::is_target(&def.destination.cluster);
+        if platform && let Some(o) = objects.iter().find(|o| apps::holds_secret_ref(o)) {
+            anyhow::bail!("{} {} holds `{}`, which is kiln's: an app's secrets reach it from its secrets (docs/deploy-api.md §3.5)", obj::kind(o), obj::name(o), apps::SECRET_REF);
+        }
         if let Some(s) = &inputs.secrets {
-            let versions = s.bundle.versions();
-            objects.push(apps::app_secret(&s.name, &def.destination.namespace, &versions, s.bundle.items.iter().map(|(n, _, v)| (n.as_str(), v.bytes()))));
-            apps::stamp_secrets(&mut objects, &s.name, &def.destination.namespace, &versions);
+            if platform {
+                let scope = def.secrets.as_ref().map(|r| r.scope.as_str()).unwrap_or_default();
+                let versions: Vec<(String, u32)> = s.bundle.items.iter().map(|(n, v, _)| (n.clone(), *v)).collect();
+                apps::platform_secrets(&mut objects, scope, &versions).map_err(|e| anyhow::anyhow!("its secrets: {e}"))?;
+            } else {
+                let versions = s.bundle.versions();
+                objects.push(apps::app_secret(&s.name, &def.destination.namespace, &versions, s.bundle.items.iter().map(|(n, _, v)| (n.as_str(), v.bytes()))));
+                apps::stamp_secrets(&mut objects, &s.name, &def.destination.namespace, &versions);
+            }
         }
         apps::stamp_rollout(def, &mut objects);
         let _ = std::fs::remove_dir_all(&views);

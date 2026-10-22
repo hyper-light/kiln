@@ -103,6 +103,11 @@ fn p5_kiln_base_as_an_oci_chart() -> anyhow::Result<()> {
         helm(&["lint"], &web)?;
         let rendered = helm(&["template", "web"], &web)?;
         assert!(rendered.contains("kind: Deployment") && rendered.contains("image: ghcr.io/acme/web:0.1.0"), "{rendered}");
+        // Where Argo CD deploys it, a release says its secrets' versions (`kiln.secrets`), and
+        // the pods are marked with them, so new ones roll them (§3.5).
+        assert!(!rendered.contains("kiln.dev/secrets"), "{rendered}");
+        let with = helm(&["template", "web", "--set", "kiln.secrets=DB_PASSWORD@1 API_KEY@2"], &web)?;
+        assert!(with.contains("kiln.dev/secrets: \"DB_PASSWORD@1 API_KEY@2\""), "{with}");
         eprintln!("helm built kiln-base {version} from the server, and linted and rendered the app's chart");
     } else {
         eprintln!("no helm here: the chart wasn't built, linted or rendered");

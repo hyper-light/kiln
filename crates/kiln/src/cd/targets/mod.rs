@@ -486,6 +486,48 @@ pub(super) fn app_of(o: &Value) -> Option<String> {
     obj::annotation(o, kiln_cd::engine::TRACKING).and_then(|t| t.split_once(':')).map(|(app, _)| app.to_owned())
 }
 
+/// `body` with each secret reference in it ([`kiln_cd::apps::SECRET_REF`]) replaced by the value
+/// it stands for, as text, for the app `desired` is of (docs/deploy-api.md §3.5): what a provider
+/// sends the platform, and never keeps.
+pub async fn resolve_secrets(cx: &Cx<'_>, desired: &Value, mut body: Value) -> Result<Value> {
+    fn refs(v: &Value, out: &mut BTreeSet<String>) {
+        match v {
+            Value::String(s) if s.starts_with(kiln_cd::apps::SECRET_REF) => {
+                out.insert(s.clone());
+            }
+            Value::Array(a) => a.iter().for_each(|x| refs(x, out)),
+            Value::Object(m) => m.values().for_each(|x| refs(x, out)),
+            _ => {}
+        }
+    }
+    fn fill(v: &mut Value, values: &HashMap<String, String>) {
+        match v {
+            Value::String(s) => {
+                if let Some(x) = values.get(s.as_str()) {
+                    x.clone_into(s);
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| fill(x, values)),
+            Value::Object(m) => m.values_mut().for_each(|x| fill(x, values)),
+            _ => {}
+        }
+    }
+    let mut found = BTreeSet::new();
+    refs(&body, &mut found);
+    if found.is_empty() {
+        return Ok(body);
+    }
+    let app = app_of(desired).unwrap_or_default();
+    let mut values = HashMap::new();
+    for r in found {
+        let name = kiln_cd::apps::parse_secret_ref(&r).map(|(_, n, _)| n.to_owned()).unwrap_or_default();
+        let text = String::from_utf8(cx.files.secret(&app, &r).await?).map_err(|_| anyhow::anyhow!("secret {name} isn't text, and {} takes secrets as text", cx.conn.def.title))?;
+        values.insert(r, text);
+    }
+    fill(&mut body, &values);
+    Ok(body)
+}
+
 /// `owner/name` from a clone URL.
 pub fn repo_name(url: &str) -> String {
     let path = url.trim_end_matches('/').trim_end_matches(".git");

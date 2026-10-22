@@ -541,6 +541,8 @@ function EnvView({ name }: { name: string }) {
   const gates = gateLines(e.gates);
   const clusters = e.targets.kubernetes.length ? e.targets.kubernetes.join(", ") : "the cluster kiln runs in";
   const platforms = Object.keys(e.targets.platforms ?? {});
+  const reaches = Object.entries(e.targets.kilncd ?? {});
+  const secrets = reaches.length ? reaches.map(([argo, k]) => `into ${argo} through ${k}`).join(", ") : "through KilnCD's cluster of Argo CD's name for it";
   return (
     <>
       <header className="cd-head">
@@ -557,6 +559,7 @@ function EnvView({ name }: { name: string }) {
             items={[
               { label: "Kubernetes", value: clusters },
               ...(platforms.length ? [{ label: "Platforms", value: platforms.join(", ") }] : []),
+              ...(e.provider.startsWith("argocd/") ? [{ label: "Secrets", value: `kiln writes them ${secrets}` }] : []),
               { label: "Concurrency", value: e.concurrency === "queue" ? "a release waits for the one before" : "one release at a time; another is refused" },
               { label: "Agents", value: e.agents.deploy ? (e.agents.approve ? "release and approve here" : "release here") : "may not release here" },
               { label: "Owners", value: e.owners?.release ? "an app's owner teams release it here" : "release here with environments.deploy on it" },

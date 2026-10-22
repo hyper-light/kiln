@@ -251,7 +251,7 @@ mod tests {
         assert!(get("charts/web/charts/kiln-base/templates/_all.tpl").is_some_and(|t| t.contains("define \"kiln-base.all\"")));
         assert!(get("deploy/production.yaml").is_some_and(|t| t.contains("replicaCount: 3") && t.contains("enabled: true")));
         assert!(get("deploy/staging.yaml").is_some_and(|t| t.contains("replicaCount: 1")));
-        assert_eq!(base_version(), "0.1.2");
+        assert_eq!(base_version(), "0.1.3");
     }
 
     #[test]

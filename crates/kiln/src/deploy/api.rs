@@ -533,10 +533,8 @@ async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how
     if !how.release {
         return (None, format!("not released: {later}"));
     }
-    match store::environment(st, env).await {
-        Ok(Some(e)) if e.provider.starts_with("argocd/") => return (None, "kept: Argo CD can't take secrets from kiln yet".to_owned()),
-        Ok(_) => {}
-        Err(e) => return (None, format!("not released ({e:#}): {later}")),
+    if let Err(e) = store::environment(st, env).await {
+        return (None, format!("not released ({e:#}): {later}"));
     }
     match store::registration(st, app, env).await {
         Ok(Some(reg)) if reg.running.is_some() => {}
@@ -655,9 +653,10 @@ mod tests {
             let v = set(&d, "staging", "API_KEY", true).await?;
             anyhow::ensure!(v.pointer("/release/id") == Some(&json!(r.id)) && v.pointer("/release/secrets") == Some(&json!("DB_PASSWORD v2, API_KEY v2")), "{v}");
 
-            // Kept without releasing, when asked; and where Argo CD deploys, which can't take them yet.
+            // Kept without releasing, when asked; and where Argo CD deploys as anywhere: kept for its first release.
             anyhow::ensure!(next(&set(&d, "staging", "OTHER", false).await?).starts_with("not released"));
-            anyhow::ensure!(next(&set(&d, "argo", "DB_PASSWORD", true).await?).contains("Argo CD"));
+            let v = set(&d, "argo", "DB_PASSWORD", true).await?;
+            anyhow::ensure!(v.get("release") == Some(&Value::Null) && next(&v).contains("first release"), "{v}");
             Ok(())
         })
     }

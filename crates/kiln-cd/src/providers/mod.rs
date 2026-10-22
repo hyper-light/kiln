@@ -138,7 +138,12 @@ pub const CATALOG: &[ProviderDef] = &[
             s("service-spec", false, "the service's settings: a JSON file or an object (CreateService's input: desiredCount, networkConfiguration, loadBalancers, …)"),
             s("set", false, "values to set by path: {\"containerDefinitions[name=api].image\": \"${{ artifacts.image }}\"}"),
         ],
-        kinds: &[kind("ecs.aws.kiln.dev", "TaskDefinition", "Task definition"), scoped(kind("ecs.aws.kiln.dev", "Service", "Service")), child(scoped(kind("ecs.aws.kiln.dev", "Task", "Task")))],
+        kinds: &[
+            kind("ssm.aws.kiln.dev", "Parameter", "Secret parameter"),
+            kind("ecs.aws.kiln.dev", "TaskDefinition", "Task definition"),
+            scoped(kind("ecs.aws.kiln.dev", "Service", "Service")),
+            child(scoped(kind("ecs.aws.kiln.dev", "Task", "Task"))),
+        ],
         capabilities: &[Versions, Events, Logs, Drift, Adopt],
         reads: &["task definition JSON"],
         built: true,

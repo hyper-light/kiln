@@ -1759,7 +1759,18 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     let at = git::open(d, &rr).await?;
     let e = |e: anyhow::Error| format!("{e:#}");
     if let Some(pr) = r.provider.get("pull_request").filter(|p| p.is_object()) {
-        return proposed(&at, pr).await;
+        let c = proposed(&at, pr).await?;
+        // On Argo CD, its merge delivers the app's secrets, as the merge pins them, before kiln
+        // hands the merge to Argo CD (§3.5): an open pull request changes nothing that runs.
+        if let Committed::Merged { commit, .. } = &c
+            && env.provider.starts_with("argocd/")
+        {
+            let merged = at.read(commit, &repo::release_file(&rr, &a, &env.name)).await.map_err(e)?.map(|b| repo::decode(&b)).transpose().map_err(e)?;
+            if let Some(why) = super::argo_secrets::deliver(d, &a, &env, merged.as_ref().map_or("", |f| f.secrets.as_str())).await? {
+                return Err(format!("merged, and its secrets can't be delivered: {why}"));
+            }
+        }
+        return Ok(c);
     }
     if env.gates.via != Via::PullRequest
         && let Some(sha) = at.find_trailer(repo::RELEASE_TRAILER, &r.id.to_string()).await.map_err(e)?
@@ -1797,6 +1808,15 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     let found = super::preflight::check(d, &a, &env, &reg, &file, r.values.as_deref()).await;
     if let Some(why) = found.refused {
         return Ok(Committed::Refused(why));
+    }
+    // On Argo CD, the app's secrets are in place before its commit reaches Argo CD (§3.5); one
+    // proposed as a pull request delivers them as its merge is seen, so here kiln only makes sure
+    // it can.
+    if env.provider.starts_with("argocd/") {
+        let refused = if env.gates.via == Via::PullRequest { super::argo_secrets::unreachable(&a, &env, &file.secrets) } else { super::argo_secrets::deliver(d, &a, &env, &file.secrets).await? };
+        if let Some(why) = refused {
+            return Ok(Committed::Refused(why));
+        }
     }
     let mut changes = vec![
         Change { path: repo::app_file(&rr, &a), content: Some(repo::app_yaml(&a).map_err(|e| format!("{e:#}"))?) },

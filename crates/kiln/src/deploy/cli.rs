@@ -500,6 +500,10 @@ enum EnvCmd {
         /// A cluster it deploys to (KilnCD's name); none: the cluster kiln runs in.
         #[arg(long = "cluster")]
         clusters: Vec<String>,
+        /// On Argo CD, the KilnCD cluster that reaches one of Argo CD's, where kiln writes an app's
+        /// secrets (docs/deploy-api.md §3.5): `<Argo CD's name>=<KilnCD's>`, as `in-cluster=prod-k`.
+        #[arg(long = "kilncd", value_name = "ARGO=KILNCD")]
+        kilncd: Vec<String>,
         /// Don't delete what git no longer holds.
         #[arg(long)]
         no_prune: bool,
@@ -1261,7 +1265,12 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, host, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, owners_release, gates, applications } => {
+        EnvCmd::Add { env, provider, host, repo, branch, root, clusters, kilncd, no_prune, self_heal, timeout, settle, refused, queue, agents, owners_release, gates, applications } => {
+            let mut reaches = serde_json::Map::new();
+            for pair in &kilncd {
+                let (argo, ours) = pair.split_once('=').filter(|(a, k)| !a.is_empty() && !k.is_empty()).with_context(|| format!("--kilncd {pair}: <Argo CD's cluster>=<KilnCD's cluster>"))?;
+                reaches.insert(argo.to_owned(), Value::String(ours.to_owned()));
+            }
             let gates: Value = match gates {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1273,7 +1282,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 "name": env,
                 "provider": provider,
                 "release_repo": { "host": host, "repo": repo, "branch": branch, "root": root },
-                "targets": { "kubernetes": clusters },
+                "targets": { "kubernetes": clusters, "kilncd": reaches },
                 "sync": { "prune": !no_prune, "self_heal": self_heal },
                 "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },
                 "concurrency": if queue { "queue" } else { "reject" },

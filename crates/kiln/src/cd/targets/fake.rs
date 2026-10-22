@@ -39,6 +39,8 @@ pub struct State {
     pub services: BTreeMap<(String, String), Value>,
     /// S3: buckets, and their objects' bytes by key.
     pub buckets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+    /// SSM: parameters' values (as SSM decrypts them) and versions, by name.
+    pub parameters: BTreeMap<String, (String, i64)>,
     /// Every operation, in order: `CreateFunction thumbs`.
     pub calls: Vec<String>,
     /// An alias (`thumbs:live`) someone else moves right after kiln reads it.
@@ -85,6 +87,7 @@ impl srv::Handler for Fake {
         }
         let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         match target {
+            Some(t) if t.starts_with("AmazonSSM.") => ssm(&mut st, t.rsplit('.').next().unwrap_or_default(), &body),
             Some(t) => ecs(&mut st, t.rsplit('.').next().unwrap_or_default(), &body),
             None => lambda(&mut st, &method, &path, &query, &body),
         }
@@ -407,6 +410,44 @@ fn s3(st: &mut State, method: &http::Method, path: &str, body: &[u8], signed: Op
     }
 }
 
+/// SSM's parameters: values are only SecureStrings here, and never answered decrypted.
+fn ssm(st: &mut State, op: &str, body: &Value) -> Response {
+    let name = body.get("Name").and_then(Value::as_str).unwrap_or_default().to_owned();
+    match op {
+        "PutParameter" => {
+            if body.get("Type").and_then(Value::as_str) != Some("SecureString") {
+                return err(400, "ValidationException", "the fake keeps SecureStrings");
+            }
+            if st.parameters.contains_key(&name) && body.get("Overwrite").and_then(Value::as_bool) != Some(true) {
+                return err(400, "ParameterAlreadyExists", "The parameter already exists.");
+            }
+            let value = body.get("Value").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let version = st.parameters.get(&name).map_or(1, |(_, v)| v + 1);
+            st.parameters.insert(name.clone(), (value, version));
+            st.calls.push(format!("PutParameter {name}"));
+            ok(json!({ "Version": version, "Tier": "Standard" }))
+        }
+        "GetParameters" => {
+            let (mut found, mut invalid) = (Vec::new(), Vec::new());
+            for n in body.get("Names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                match st.parameters.get(n) {
+                    Some((_, v)) => found.push(json!({ "Name": n, "Type": "SecureString", "Value": "AQICAHh...encrypted", "Version": v, "ARN": format!("arn:aws:ssm:us-east-1:1:parameter{n}"), "DataType": "text" })),
+                    None => invalid.push(json!(n)),
+                }
+            }
+            ok(json!({ "Parameters": found, "InvalidParameters": invalid }))
+        }
+        "DeleteParameter" => match st.parameters.remove(&name) {
+            Some(_) => {
+                st.calls.push(format!("DeleteParameter {name}"));
+                ok(json!({}))
+            }
+            None => err(400, "ParameterNotFound", "parameter not found"),
+        },
+        other => err(400, "InvalidAction", &format!("the fake has no SSM {other}")),
+    }
+}
+
 fn td_arn(family: &str, revision: usize) -> String {
     format!("arn:aws:ecs:us-east-1:1:task-definition/{family}:{revision}")
 }
@@ -631,9 +672,9 @@ impl super::Records for MemRecords {
     }
 }
 
-/// Artifacts' content kept in memory, by SHA-256.
+/// Artifacts' content kept in memory, by SHA-256; and secrets' values, by their reference.
 #[derive(Default)]
-pub struct MemFiles(pub Mutex<BTreeMap<String, Vec<u8>>>);
+pub struct MemFiles(pub Mutex<BTreeMap<String, Vec<u8>>>, pub Mutex<BTreeMap<String, Vec<u8>>>);
 
 impl MemFiles {
     /// Keeps `data`: its SHA-256 (hex).
@@ -660,6 +701,10 @@ impl crate::cd::artifacts::Files for MemFiles {
             Ok((rx, len))
         })
     }
+
+    fn secret<'a>(&'a self, _app: &'a str, reference: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move { self.1.lock().get(reference).cloned().ok_or_else(|| anyhow::anyhow!("no secret {reference}")) })
+    }
 }
 
 /// An object as the engine sends it: tracking stamped for `app`.
@@ -684,6 +729,8 @@ pub struct Script {
     pub migration_tag: Option<String>,
     pub versions: u32,
     pub serving: String,
+    /// Its secrets' text, by name: never answered.
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// The parts of Cloudflare's API the Workers provider calls, in memory.
@@ -788,6 +835,21 @@ impl srv::Handler for FakeCf {
                 for k in ["main_module", "migrations", "tags", "keep_bindings"] {
                     settings.remove(k);
                 }
+                // Secrets are kept apart: those the upload names, and (kept) the ones it had.
+                if !meta.get("keep_bindings").and_then(Value::as_array).is_some_and(|k| k.iter().any(|t| t == "secret_text")) {
+                    s.secrets.clear();
+                }
+                let mut plain = Vec::new();
+                for b in settings.get("bindings").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    match (b.get("type").and_then(Value::as_str), b.get("name").and_then(Value::as_str)) {
+                        (Some("secret_text"), Some(n)) => {
+                            s.secrets.insert(n.to_owned(), b.get("text").and_then(Value::as_str).unwrap_or_default().to_owned());
+                        }
+                        _ => plain.push(b),
+                    }
+                }
+                plain.extend(s.secrets.keys().map(|n| json!({ "type": "secret_text", "name": n })));
+                settings.insert("bindings".into(), Value::Array(plain));
                 s.settings = Value::Object(settings);
                 s.tags = meta.get("tags").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
                 s.versions += 1;
@@ -819,6 +881,21 @@ impl srv::Handler for FakeCf {
             ("POST", ["accounts", "acct1", "workers", "scripts", name, "subdomain"]) => {
                 st.subdomains.insert((*name).to_owned(), body.get("enabled").and_then(Value::as_bool).unwrap_or(false));
                 cf_ok(json!({}))
+            }
+            // A secret deleted: a new version without it, deployed.
+            ("DELETE", ["accounts", "acct1", "workers", "scripts", name, "secrets", secret]) => {
+                st.next += 1;
+                let serving = format!("ver-{}", st.next);
+                let Some(s) = st.scripts.get_mut(*name) else { return cf_err(404, 10007, "workers.api.error.script_not_found") };
+                if s.secrets.remove(*secret).is_none() {
+                    return cf_err(404, 10056, "workers.api.error.secret_not_found");
+                }
+                if let Some(Value::Array(b)) = s.settings.get_mut("bindings") {
+                    b.retain(|x| x.get("name").and_then(Value::as_str) != Some(*secret));
+                }
+                s.versions += 1;
+                s.serving = serving;
+                cf_ok(Value::Null)
             }
             ("DELETE", ["accounts", "acct1", "workers", "scripts", name]) => match st.scripts.remove(*name) {
                 Some(_) => cf_ok(Value::Null),
@@ -889,6 +966,8 @@ pub struct VercelState {
     pub known: std::collections::BTreeSet<String>,
     pub uploads: u32,
     pub domains: BTreeMap<(String, String), Value>,
+    /// Projects' environment variables, with their values (a sensitive one's never answered).
+    pub env: BTreeMap<String, Vec<Value>>,
     next: u32,
 }
 
@@ -982,6 +1061,9 @@ impl srv::Handler for FakeVercel {
                 st.next += 1;
                 let id = format!("dpl_{}", st.next);
                 let mut d = body.as_object().cloned().unwrap_or_default();
+                // A production deployment takes the project's production variables as they are now.
+                let vars: Map<String, Value> = st.env.get(&project).into_iter().flatten().filter(|e| e.get("target").and_then(Value::as_array).is_some_and(|t| t.contains(&json!("production")))).filter_map(|e| Some((e.get("key")?.as_str()?.to_owned(), e.get("value")?.clone()))).collect();
+                d.insert("env".into(), Value::Object(vars));
                 d.insert("id".into(), json!(id));
                 d.insert("url".into(), json!(format!("site-{}.vercel.app", st.next)));
                 d.insert("readyState".into(), json!("BUILDING"));
@@ -1006,6 +1088,57 @@ impl srv::Handler for FakeVercel {
                     p.insert("targets".into(), json!({ "production": { "id": id } }));
                 }
                 ok(d)
+            }
+            ("GET", ["v9", "projects", project, "env"]) => {
+                let envs: Vec<Value> = st
+                    .env
+                    .get(*project)
+                    .into_iter()
+                    .flatten()
+                    .map(|e| {
+                        let mut e = e.clone();
+                        if let Value::Object(m) = &mut e
+                            && m.get("type") == Some(&json!("sensitive"))
+                        {
+                            m.remove("value");
+                        }
+                        e
+                    })
+                    .collect();
+                ok(json!({ "envs": envs }))
+            }
+            ("POST", ["v10", "projects", project, "env"]) => {
+                if !st.projects.contains_key(*project) {
+                    return vc_err(404, "not_found", "Project not found", json!({}));
+                }
+                let items: Vec<Value> = match &body {
+                    Value::Array(a) => a.clone(),
+                    one => vec![one.clone()],
+                };
+                let mut created = Vec::new();
+                for item in items {
+                    st.next += 1;
+                    let n = st.next;
+                    let key = item.get("key").cloned().unwrap_or(Value::Null);
+                    let list = st.env.entry((*project).to_owned()).or_default();
+                    if query.get("upsert").map(String::as_str) != Some("true") && list.iter().any(|e| e.get("key") == Some(&key)) {
+                        return vc_err(400, "ENV_ALREADY_EXISTS", "A variable with the name already exists", json!({}));
+                    }
+                    list.retain(|e| e.get("key") != Some(&key));
+                    let mut e = item.as_object().cloned().unwrap_or_default();
+                    e.insert("id".into(), json!(format!("env_{n}")));
+                    e.insert("updatedAt".into(), json!(1_760_000_000_000_u64 + u64::from(n)));
+                    list.push(Value::Object(e.clone()));
+                    e.remove("value");
+                    created.push(Value::Object(e));
+                }
+                ok(json!({ "created": created }))
+            }
+            ("DELETE", ["v9", "projects", project, "env", id]) => {
+                if let Some(list) = st.env.get_mut(*project) {
+                    list.retain(|e| e.get("id").and_then(Value::as_str) != Some(*id));
+                }
+                ok(json!({}))
             }
             ("GET", ["v9", "projects", project, "domains"]) => ok(json!({ "domains": st.domains.iter().filter(|((p, _), _)| p == project).map(|(_, d)| d.clone()).collect::<Vec<_>>() })),
             ("GET", ["v9", "projects", project, "domains", name]) => match st.domains.get(&((*project).to_owned(), (*name).to_owned())) {

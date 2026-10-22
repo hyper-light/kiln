@@ -44,6 +44,7 @@ pub mod provider;
 pub mod reads;
 pub mod remote;
 pub mod repo;
+pub mod argo_secrets;
 pub mod registries;
 pub mod scaffold;
 pub mod store;

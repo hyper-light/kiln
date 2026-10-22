@@ -139,7 +139,8 @@ export interface Environment {
   /** `kilncd`, or `argocd/<integration>`. */
   provider: string;
   release_repo: { host: string; repo: string; branch: string; root: string };
-  targets: { kubernetes: string[]; platforms?: Record<string, Record<string, unknown>> };
+  /** `kilncd`: on Argo CD, the KilnCD cluster that reaches each of Argo CD's, where kiln writes an app's secrets. */
+  targets: { kubernetes: string[]; platforms?: Record<string, Record<string, unknown>>; kilncd?: Record<string, string> };
   gates: Gates;
   concurrency: "reject" | "queue";
   agents: { deploy: boolean; approve: boolean };
