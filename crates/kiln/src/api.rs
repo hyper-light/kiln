@@ -274,6 +274,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let id = (*id).to_owned();
             return boxed(|| put_artifacts(&hub, &id, req)).await;
         }
+        // An upload in pieces (`crate::exec`): how much of it came, and its end, checked.
+        (&Method::GET, ["api", "jobs", id, "artifacts", "upload"]) => {
+            let id = (*id).to_owned();
+            return boxed(|| artifacts_had(&hub, &id, req.headers())).await;
+        }
+        (&Method::POST, ["api", "jobs", id, "artifacts", "upload"]) => {
+            let id = (*id).to_owned();
+            return boxed(|| artifacts_done(&hub, &id, req)).await;
+        }
         (&Method::POST, ["api", "hooks", "github"]) => return boxed(|| github_hook(&hub, req)).await,
         // The GitHub App's events and GitHub's return from making it (W14-R10): open, they carry
         // their own proof (a signature; a state kiln handed out).
@@ -2332,9 +2341,22 @@ pub(crate) fn artifact_path(hub: &Hub, job: &str) -> std::path::PathBuf {
     hub.cfg.data("artifacts").join(format!("{safe}.tar"))
 }
 
+/// The most one piece of an upload in pieces may be.
+const ARTIFACT_PIECE: usize = 64 << 20;
+
+/// A query's `name`, as a number.
+fn query_u64(req: &Request, name: &str) -> Option<u64> {
+    req.uri().query()?.split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))?.parse().ok()
+}
+
+/// `PUT /api/jobs/:id/artifacts/upload`: a job's artifacts (a tar), whole; or, with `?at=n`, the
+/// piece of them at byte `n` (`put_artifacts_piece`).
 async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
     if !job_token_ok(hub, req.headers(), id) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
+    }
+    if let Some(at) = query_u64(&req, "at") {
+        return put_artifacts_piece(hub, id, at, req).await;
     }
     let path = artifact_path(hub, id);
     // Kept only once all of it came: an upload that broke off leaves nothing a release would take
@@ -2368,6 +2390,94 @@ async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
     }
     std::fs::rename(&part, &path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("keep {}: {e}", path.display())))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// One piece of a job's artifacts, at byte `at`: taken only where the pieces so far end (the first
+/// starts them afresh), so a piece that broke off costs only itself. One elsewhere is refused with
+/// where they end (`409 {"have": n}`), for the upload to go on from there.
+async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
+    let part = artifact_path(hub, id).with_extension("part");
+    let piece = srv::body_bytes(req.into_body(), ARTIFACT_PIECE).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("the piece broke off: {e:#}")))?;
+    let had = crate::rt::blocking(move || -> anyhow::Result<Result<u64, u64>> {
+        if let Some(dir) = part.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if at == 0 {
+            let _ = std::fs::remove_file(&part);
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&part)?;
+        let len = f.metadata()?.len();
+        if len != at {
+            return Ok(Err(len));
+        }
+        std::io::Write::write_all(&mut f, &piece)?;
+        Ok(Ok(len.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX))))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(match had {
+        Ok(have) => srv::json(StatusCode::OK, &serde_json::json!({"have": have})),
+        Err(have) => srv::json(StatusCode::CONFLICT, &serde_json::json!({"have": have})),
+    })
+}
+
+/// `GET /api/jobs/:id/artifacts/upload`: how much of an upload in pieces has come (`{"have": n}`;
+/// a server that answers so takes them in pieces).
+async fn artifacts_had(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
+    if !job_token_ok(hub, headers, id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
+    }
+    let part = artifact_path(hub, id).with_extension("part");
+    let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({"have": have})))
+}
+
+/// `POST /api/jobs/:id/artifacts/upload?size=n&sha256=hex`: the pieces' end. They're the job's
+/// artifacts only if they come to its size and digest; else they're let go of (`409`), and nothing
+/// a release would take its binaries from is kept.
+async fn artifacts_done(hub: &Hub, id: &str, req: Request) -> R {
+    if !job_token_ok(hub, req.headers(), id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
+    }
+    let size = query_u64(&req, "size").ok_or_else(|| err(StatusCode::BAD_REQUEST, "how big? (`size`)"))?;
+    let want = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("sha256=")))
+        .map(str::to_ascii_lowercase)
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "its digest? (`sha256`, hex)"))?;
+    let path = artifact_path(hub, id);
+    let part = path.with_extension("part");
+    let checked = crate::rt::blocking(move || -> anyhow::Result<Result<(), String>> {
+        use anyhow::Context as _;
+        use sha2::Digest as _;
+        use std::io::Read as _;
+        let mut f = std::fs::File::open(&part).context("no pieces came")?;
+        let len = f.metadata()?.len();
+        let mut h = sha2::Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(buf.get(..n).unwrap_or_default());
+        }
+        let got = hex::encode(h.finalize());
+        if len != size || got != want {
+            let _ = std::fs::remove_file(&part);
+            return Ok(Err(format!("the pieces came to {len} bytes, digest {got}; the upload was {size} bytes, digest {want}")));
+        }
+        std::fs::rename(&part, &path).with_context(|| format!("keep {}", path.display()))?;
+        Ok(Ok(()))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    checked.map_err(|why| err(StatusCode::CONFLICT, why))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 

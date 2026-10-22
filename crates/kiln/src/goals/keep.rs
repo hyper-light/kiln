@@ -125,8 +125,14 @@ fn judge(info: &Info, seen: &mut Seen, now: i64) -> Next {
         seen.end = end;
         seen.end_seen = now;
     }
-    if matches!(info.status, Status::Running | Status::Waiting | Status::Starting) {
+    // A turn under way. Starting isn't one: an idle agent's harness starts again when it's
+    // switched to another harness or handed to a runner's new build, and taking that for a turn
+    // cut short sent idle agents back to work after every switch and runner upgrade.
+    if matches!(info.status, Status::Running | Status::Waiting) {
         seen.busy_at = now;
+        return Next::Wait;
+    }
+    if info.status == Status::Starting {
         return Next::Wait;
     }
     // At work after its last turn ended, and idle now with no end since: started again under it.
@@ -311,6 +317,23 @@ mod tests {
         let mut seen = Seen::default();
         decide(&agent(Status::Running, None), &mut seen, now - 30_000);
         assert!(!matches!(decide(&agent(Status::Idle, Some(ended("done", now - 3_600_000))), &mut seen, now), Next::Keep { why: Why::Restarted, .. }));
+    }
+
+    #[test]
+    fn an_idle_harness_that_starts_again_is_not_a_turn_cut_short() {
+        // Its turn ended, then its harness started again with nothing under way (a switch to
+        // another harness, a runner's new build taking it over): it stays idle.
+        let now = 1_792_000_000_000;
+        let mut seen = Seen::default();
+        decide(&agent(Status::Running, None), &mut seen, now - 60_000);
+        let mut done = agent(Status::Idle, Some(ended("done", now - 50_000)));
+        done.summary = "Done: the change is in and its tests pass.".into();
+        assert_eq!(decide(&done, &mut seen, now - 45_000), Next::Wait, "it settles first");
+        assert!(matches!(decide(&done, &mut seen, now - 30_000), Next::Leave { .. }), "nothing to go on with");
+        decide(&agent(Status::Starting, Some(ended("done", now - 50_000))), &mut seen, now - 20_000);
+        for t in [now, now + 60_000] {
+            assert_eq!(decide(&done, &mut seen, t), Next::Wait, "at {t}");
+        }
     }
 
     #[test]
