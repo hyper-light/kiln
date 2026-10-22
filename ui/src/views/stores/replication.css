@@ -210,17 +210,15 @@
   stroke-opacity: 0.75;
 }
 
-/* A light: one short dash running the cable's length, then resting, about once a batch. Only on a
-   cable batches move on; still under the motion setting and for reduced motion. */
+/* Light on a cable while batches move on it: comets flowing its length one after another, a bright
+   head in a soft glow, about one arriving a batch (`--rp-period`, from the store's batch rate). Idle
+   cables stay still. Under the motion setting and for reduced motion a comet holds halfway along. */
 .rp-light path {
   fill: none;
   stroke: #b8c9e8;
   stroke-linecap: round;
-  stroke-dasharray: 9 200;
-  stroke-dashoffset: 9;
   vector-effect: non-scaling-stroke;
-  opacity: 0;
-  animation: rp-run var(--rp-period, 2.4s) linear var(--rp-delay, 0s) infinite;
+  animation: rp-flow var(--rp-period, 2.4s) linear var(--rp-delay, 0s) infinite;
 }
 .rp-light[data-kind="out"] path {
   stroke: #b6d5c8;
@@ -228,32 +226,42 @@
 .rp-light[data-warn] path {
   stroke: #dbbd95;
 }
-.rp-light-core {
-  stroke-width: 1.5;
-}
 .rp-light-halo {
-  stroke-width: 4;
-  --rp-glow: 0.25;
+  stroke-width: 5;
+  stroke-opacity: 0.2;
+  stroke-dasharray: 16 34;
 }
-@keyframes rp-run {
-  0% {
-    stroke-dashoffset: 9;
-    opacity: 0;
+.rp-light .rp-light-core {
+  stroke-width: 1.6;
+  stroke-dasharray: 6 44;
+  animation-name: rp-flow-head;
+}
+@keyframes rp-flow {
+  from {
+    stroke-dashoffset: 0;
   }
-  4% {
-    opacity: var(--rp-glow, 1);
+  to {
+    stroke-dashoffset: -50;
   }
-  42% {
-    opacity: var(--rp-glow, 1);
+}
+@keyframes rp-flow-head {
+  from {
+    stroke-dashoffset: -10;
   }
-  48% {
-    stroke-dashoffset: -100;
-    opacity: 0;
+  to {
+    stroke-dashoffset: -60;
   }
-  100% {
-    stroke-dashoffset: -100;
-    opacity: 0;
-  }
+}
+:root[data-motion="paused"] .rp-light path {
+  animation: none;
+}
+:root[data-motion="paused"] .rp-light-halo {
+  stroke-dasharray: 16 84;
+  stroke-dashoffset: -42;
+}
+:root[data-motion="paused"] .rp-light .rp-light-core {
+  stroke-dasharray: 6 94;
+  stroke-dashoffset: -52;
 }
 
 /* A store: picked, or pickable. */
@@ -524,7 +532,14 @@
 @media (prefers-reduced-motion: reduce) {
   .rp-light path {
     animation: none;
-    opacity: 0;
+  }
+  .rp-light-halo {
+    stroke-dasharray: 16 84;
+    stroke-dashoffset: -42;
+  }
+  .rp-light .rp-light-core {
+    stroke-dasharray: 6 94;
+    stroke-dashoffset: -52;
   }
   .rp-cable,
   .rp-status,

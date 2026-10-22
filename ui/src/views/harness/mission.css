@@ -175,6 +175,13 @@
 .ms-row[data-stand="ready"] .ms-word > i {
   background: #6f8f84;
 }
+/* A subagent of its own running: its word and dot take the prism as it sweeps through them (signals.css). */
+.ms-row[data-stand] .ms-word.sg-shimmer {
+  color: #fff;
+}
+.ms-row[data-stand] .ms-word.sg-shimmer > i {
+  background: currentColor;
+}
 .ms-row[data-stand="offline"] .ms-name {
   color: #a1a4ad;
 }
@@ -567,6 +574,10 @@ a.ms-why:hover {
   }
   .ms-word {
     min-width: 0;
+  }
+  /* The sweep spans the word, not the row. */
+  .ms-word.sg-shimmer {
+    align-self: flex-start;
   }
   .ms-mark {
     display: none;

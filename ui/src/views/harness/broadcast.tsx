@@ -25,6 +25,7 @@ import { agentLabel } from "./derive";
 import { machineName } from "./parts";
 import { MicButton } from "./voice";
 import { markAnswered, unmark } from "./answered";
+import { throughSubagents } from "./tasks";
 
 const machineLabel = (m: string) => (m === "local" ? "server" : m);
 /** Enter sends with a keyboard and pointer; on a touch screen it is a new line (as in the composer). */
@@ -80,7 +81,7 @@ function findAgents(all: AgentInfo[], q: string, not: ReadonlySet<string>): Agen
 }
 
 /** What an agent is doing, in a word, beside its name in the finder. */
-const doingOf = (a: AgentInfo) => (a.approvals.length > 0 ? "needs you" : a.status === "running" ? "working" : a.status === "idle" ? "idle" : a.status);
+const doingOf = (a: AgentInfo) => (a.approvals.length > 0 ? "needs you" : a.status === "running" || throughSubagents(a) ? "working" : a.status === "idle" ? "idle" : a.status);
 
 /** What the agents of a roster ("id:status,…") understand; nothing for no agents, or when it can't be said. */
 const previewOf = (roster: string): Promise<BroadcastPreview | null> =>
