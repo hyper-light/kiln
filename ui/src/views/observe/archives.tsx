@@ -98,9 +98,9 @@ function Head() {
       <th className="num w-1">#</th>
       <th>Archive</th>
       <th className="hidden md:table-cell">Writes to</th>
-      <th>State</th>
+      <th className="hidden sm:table-cell">State</th>
       <th className="hidden sm:table-cell">Written</th>
-      <th />
+      <th className="hidden sm:table-cell" />
     </tr>
   );
 }
@@ -147,24 +147,9 @@ function List({ onAdd, onEdit, onRehydrate }: { onAdd: () => void; onEdit: (a: A
             <Head />
           </thead>
           <tbody>
-            {all.map((a, i) => (
-              <tr key={a.id}>
-                <td className="num cell-mono w-1 text-[#8c8f98]">{i + 1}</td>
-                <td className="truncate-cell">
-                  <div className="truncate text-[13px] text-[#e4e5e7]">{a.name}</div>
-                  <p className="truncate font-mono text-[11px] text-[#8c8f98]">{a.query?.trim() && a.query.trim() !== "*" ? a.query : "every record"}</p>
-                  <p className="truncate font-mono text-[11px] text-[#8c8f98] md:hidden">{where(a.destination)}</p>
-                </td>
-                <td className="hidden md:table-cell">
-                  <div className="max-w-[22rem] truncate font-mono text-[12px]" title={where(a.destination)}>
-                    {where(a.destination)}
-                  </div>
-                  <p className="text-[12px] text-[#8c8f98]">
-                    {STORES[a.destination.type]} · {a.destination.integration.cloud}
-                    {a.include_tags ? " · with tags" : ""}
-                  </p>
-                </td>
-                <td className="max-w-[20rem] sm:min-w-[13rem]">
+            {all.map((a, i) => {
+              const state = (
+                <>
                   <span className="status">
                     <i className="dot" data-status={TONE[a.status.state]} aria-hidden="true" />
                     <span className="status-text" data-status={TONE[a.status.state]}>
@@ -177,21 +162,11 @@ function List({ onAdd, onEdit, onRehydrate }: { onAdd: () => void; onEdit: (a: A
                       {count(a.status.pending)} {a.status.pending === 1 ? "file" : "files"} to write
                     </p>
                   )}
-                </td>
-                <td className="hidden whitespace-nowrap sm:table-cell">
-                  {a.status.objects > 0 ? (
-                    <>
-                      {count(a.status.events)} {a.status.events === 1 ? "record" : "records"}
-                      <div className="text-[12px] text-[#8c8f98]">
-                        {count(a.status.objects)} {a.status.objects === 1 ? "object" : "objects"}, {formatBytes(a.status.bytes)}
-                        {a.status.last_written ? `, ${relativeTime(a.status.last_written / 1000)}` : ""}
-                      </div>
-                    </>
-                  ) : (
-                    <span className="text-[#8c8f98]">None yet</span>
-                  )}
-                </td>
-                <td className="w-1 whitespace-nowrap text-right">
+                </>
+              );
+              // On a phone they go under its name, which keeps the row's width.
+              const controls = (
+                <>
                   <Button variant="ghost" size="xs" aria-label={`Move ${a.name} up`} disabled={i === 0} onClick={() => move(i, -1)}>
                     <ArrowUp />
                   </Button>
@@ -207,9 +182,45 @@ function List({ onAdd, onEdit, onRehydrate }: { onAdd: () => void; onEdit: (a: A
                   <Button variant="ghost-danger" size="xs" aria-label={`Remove ${a.name}`} onClick={() => setRemoving(a)}>
                     <Trash2 />
                   </Button>
-                </td>
-              </tr>
-            ))}
+                </>
+              );
+              return (
+                <tr key={a.id}>
+                  <td className="num cell-mono w-1 text-[#8c8f98]">{i + 1}</td>
+                  <td className="truncate-cell">
+                    <div className="truncate text-[13px] text-[#e4e5e7]">{a.name}</div>
+                    <p className="truncate font-mono text-[11px] text-[#8c8f98]">{a.query?.trim() && a.query.trim() !== "*" ? a.query : "every record"}</p>
+                    <p className="truncate font-mono text-[11px] text-[#8c8f98] md:hidden">{where(a.destination)}</p>
+                    <div className="mt-1 whitespace-normal sm:hidden">{state}</div>
+                    <div className="-ml-2 flex items-center sm:hidden">{controls}</div>
+                  </td>
+                  <td className="hidden md:table-cell">
+                    <div className="max-w-[22rem] truncate font-mono text-[12px]" title={where(a.destination)}>
+                      {where(a.destination)}
+                    </div>
+                    <p className="text-[12px] text-[#8c8f98]">
+                      {STORES[a.destination.type]} · {a.destination.integration.cloud}
+                      {a.include_tags ? " · with tags" : ""}
+                    </p>
+                  </td>
+                  <td className="hidden max-w-[20rem] sm:table-cell sm:min-w-[13rem]">{state}</td>
+                  <td className="hidden whitespace-nowrap sm:table-cell">
+                    {a.status.objects > 0 ? (
+                      <>
+                        {count(a.status.events)} {a.status.events === 1 ? "record" : "records"}
+                        <div className="text-[12px] text-[#8c8f98]">
+                          {count(a.status.objects)} {a.status.objects === 1 ? "object" : "objects"}, {formatBytes(a.status.bytes)}
+                          {a.status.last_written ? `, ${relativeTime(a.status.last_written / 1000)}` : ""}
+                        </div>
+                      </>
+                    ) : (
+                      <span className="text-[#8c8f98]">None yet</span>
+                    )}
+                  </td>
+                  <td className="hidden w-1 whitespace-nowrap text-right sm:table-cell">{controls}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -463,9 +474,9 @@ function RehydrationsHead() {
     <tr>
       <th>Rehydration</th>
       <th className="hidden md:table-cell">Range</th>
-      <th>State</th>
+      <th className="hidden sm:table-cell">State</th>
       <th className="hidden sm:table-cell">Kept</th>
-      <th />
+      <th className="hidden sm:table-cell" />
     </tr>
   );
 }
@@ -492,17 +503,9 @@ function Rehydrations({ onAdd }: { onAdd: () => void }) {
             <RehydrationsHead />
           </thead>
           <tbody>
-            {all.map((r) => (
-              <tr key={r.id}>
-                <td className="truncate-cell">
-                  <div className="truncate text-[13px] text-[#e4e5e7]">{r.name}</div>
-                  <p className="truncate font-mono text-[11px] text-[#8c8f98]">
-                    {r.query.trim() && r.query.trim() !== "*" ? r.query : "every record"} · {r.archive}
-                  </p>
-                  <p className="truncate text-[11px] text-[#8c8f98] md:hidden">{rangeSaid(r.from, r.to)}</p>
-                </td>
-                <td className="hidden text-[12.5px] whitespace-nowrap md:table-cell">{rangeSaid(r.from, r.to)}</td>
-                <td className="max-w-[22rem] sm:min-w-[13rem] md:min-w-[17rem]">
+            {all.map((r) => {
+              const state = (
+                <>
                   <span className="status">
                     <i className="dot" data-status={R_TONE[r.state]} aria-hidden="true" />
                     <span className="status-text" data-status={R_TONE[r.state]}>
@@ -516,11 +519,11 @@ function Rehydrations({ onAdd }: { onAdd: () => void }) {
                       <ReadSaid r={r} />
                     </p>
                   )}
-                </td>
-                <td className="hidden text-[12.5px] whitespace-nowrap text-[#8c8f98] sm:table-cell">
-                  {r.state === "done" || r.state === "failed" ? `until ${absoluteDate(r.expires / 1000)}` : `${r.retention_days} days once read`}
-                </td>
-                <td className="w-1 whitespace-nowrap text-right">
+                </>
+              );
+              // On a phone they go under its name, which keeps the row's width.
+              const controls = (
+                <>
                   {(r.state === "done" || r.state === "reading") && (
                     <Button variant="ghost" size="xs" asChild>
                       <Link to={`/observe/logs?rehydration=${encodeURIComponent(r.id)}`} aria-label={`Search ${r.name}`}>
@@ -531,9 +534,28 @@ function Rehydrations({ onAdd }: { onAdd: () => void }) {
                   <Button variant="ghost-danger" size="xs" aria-label={`Remove ${r.name}`} onClick={() => setRemoving(r)}>
                     <Trash2 />
                   </Button>
-                </td>
-              </tr>
-            ))}
+                </>
+              );
+              return (
+                <tr key={r.id}>
+                  <td className="truncate-cell">
+                    <div className="truncate text-[13px] text-[#e4e5e7]">{r.name}</div>
+                    <p className="truncate font-mono text-[11px] text-[#8c8f98]">
+                      {r.query.trim() && r.query.trim() !== "*" ? r.query : "every record"} · {r.archive}
+                    </p>
+                    <p className="truncate text-[11px] text-[#8c8f98] md:hidden">{rangeSaid(r.from, r.to)}</p>
+                    <div className="mt-1 whitespace-normal sm:hidden">{state}</div>
+                    <div className="-ml-2 flex items-center sm:hidden">{controls}</div>
+                  </td>
+                  <td className="hidden text-[12.5px] whitespace-nowrap md:table-cell">{rangeSaid(r.from, r.to)}</td>
+                  <td className="hidden max-w-[22rem] sm:table-cell sm:min-w-[13rem] md:min-w-[17rem]">{state}</td>
+                  <td className="hidden text-[12.5px] whitespace-nowrap text-[#8c8f98] sm:table-cell">
+                    {r.state === "done" || r.state === "failed" ? `until ${absoluteDate(r.expires / 1000)}` : `${r.retention_days} days once read`}
+                  </td>
+                  <td className="hidden w-1 whitespace-nowrap text-right sm:table-cell">{controls}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

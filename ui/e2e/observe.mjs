@@ -86,6 +86,21 @@ const fitsAcross = async (what) => {
     return `${document.documentElement.scrollWidth} px across a ${w} px screen: ${over.slice(0, 4).map(name).join(", ")}`;
   });
   expect(out === null, `${what} within the screen's width, not ${out}`);
+  // And a table's names keep their room: a row's name, cut short, shows 150 px of itself at least,
+  // not three letters beside its row's buttons.
+  const squeezed = await page.evaluate(() =>
+    [...document.querySelectorAll("table.data-table tbody td.truncate-cell")]
+      .filter((td) => {
+        const e = td.firstElementChild;
+        if (!e || td.getClientRects().length === 0) return false;
+        const s = getComputedStyle(td);
+        const room = td.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight);
+        const need = getComputedStyle(e).display === "inline" ? e.getBoundingClientRect().width : e.scrollWidth;
+        return need > room + 1 && room < 150;
+      })
+      .map((td) => `${td.firstElementChild?.textContent?.trim().slice(0, 40)} (${Math.round(td.clientWidth)} px)`),
+  );
+  expect(squeezed.length === 0, `${what}: names cut short beside their rows' buttons: ${squeezed.join(", ")}`);
 };
 
 const scenarios = {
@@ -660,6 +675,7 @@ const scenarios = {
     await dialog.getByRole("button", { name: "Add", exact: true }).click();
     const row = page.locator("tr", { hasText: name });
     await row.waitFor();
+    await fitsAcross("the integrations' page");
     const before = fs.existsSync(process.env.RECEIVED) ? fs.readFileSync(process.env.RECEIVED, "utf8").split("\n").filter(Boolean).length : 0;
     await row.getByRole("button", { name: "Test", exact: true }).click();
     const got = await until("the test notice at the receiver", () => {
@@ -696,6 +712,7 @@ const scenarios = {
     );
     const row = page.locator("tr", { hasText: name });
     await until("the row says Up", async () => (await row.textContent())?.includes("Up"), 30_000);
+    await fitsAcross("the scrape targets' page");
     const up = await api("POST", "/api/observe/v1/query", { query: `max:up{job:${name}}`, from: Date.now() - 60_000, to: Date.now() + 1000, step: 1000 });
     expect(
       up.body.series?.[0]?.values?.some((v) => v === 1),
@@ -731,6 +748,7 @@ const scenarios = {
     sock.close();
     const row = page.locator("tr", { hasText: name });
     await until("the row says it listens and counts what came", async () => /Listening/.test((await row.textContent()) ?? "") && /(^|\D)32 metrics/.test((await row.textContent()) ?? ""), 30_000);
+    await fitsAcross("the DogStatsD listeners' page");
     const sum = async () => {
       const r = await api("POST", "/api/observe/v1/query", { query: `sum:${metric}{env:e2e}.as_count()`, from, to: Date.now() + 60_000, step: 10_000 });
       return (r.body.series ?? []).flatMap((s) => s.values).reduce((a, v) => a + (v ?? 0), 0);
@@ -885,6 +903,7 @@ const scenarios = {
       expect(made.status === 204, `the cloud made, got ${made.status}`);
       const row = rowOf(name);
       await until("shown pulling, its series counted", async () => /Pulling/.test((await row.textContent()) ?? "") && /3 series/.test((await row.textContent()) ?? ""), 30_000);
+      await fitsAcross("the clouds' page");
       await row.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
       const edit = page.getByRole("dialog");
       await edit.getByText("Kept. Type a new one to replace it.").waitFor();
@@ -973,6 +992,7 @@ const scenarios = {
       await d.getByRole("button", { name: "Make it", exact: true }).click();
       const row = rowOf(name);
       await row.waitFor();
+      await fitsAcross("the synthetic tests' page");
       const kept = await test();
       expect(
         kept?.type === "http" && kept.every_s === 3600 && JSON.stringify(kept.assertions) === JSON.stringify([{ type: "status_code", operator: "is", target: 200 }]),
@@ -1192,6 +1212,7 @@ const scenarios = {
       await d.waitFor({ state: "detached" });
       const row = page.getByRole("row").filter({ hasText: name });
       await row.waitFor();
+      await fitsAcross("the log sources' page");
       // The server reads it at once: every line a record, once, masked.
       const found = await until(
         "its records stored",
@@ -1304,11 +1325,13 @@ const scenarios = {
       // kiln's own nginx pipeline: off, then on again, from its row.
       await page.goto(`${BASE}/observe/pipelines`);
       const nginx = page.getByRole("row").filter({ has: page.getByRole("link", { name: "nginx", exact: true }) });
+      await nginx.waitFor();
+      await fitsAcross("the pipelines' page");
       await nginx.getByRole("button", { name: "Turn off nginx", exact: true }).click();
-      await nginx.getByText("Off", { exact: true }).waitFor();
+      await nginx.getByText("Off", { exact: true }).filter({ visible: true }).waitFor();
       expect((await api("GET", "/api/observe/v1/pipelines/builtin:nginx")).body.is_enabled === false, "turned off on the server");
       await nginx.getByRole("button", { name: "Turn on nginx", exact: true }).click();
-      await nginx.getByText("On", { exact: true }).waitFor();
+      await nginx.getByText("On", { exact: true }).filter({ visible: true }).waitFor();
       // Removed from its row.
       const mine = page.getByRole("row").filter({ has: page.getByRole("link", { name, exact: true }) });
       await mine.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
@@ -1392,7 +1415,7 @@ const scenarios = {
       await d.getByRole("button", { name: "Make it", exact: true }).click();
       await d.waitFor({ state: "detached" });
       const row = rowOf(name);
-      await row.getByText("Waiting", { exact: true }).waitFor();
+      await row.getByText("Waiting", { exact: true }).filter({ visible: true }).waitFor();
       const kept = (await archives()).find((a) => a.name === name);
       made.push(kept.id);
       expect(
@@ -1739,6 +1762,7 @@ const scenarios = {
       await d.waitFor({ state: "detached" });
       const row = page.getByRole("row").filter({ hasText: name });
       await row.waitFor();
+      await fitsAcross("the metrics from logs' page");
       // Counted from the next ten seconds on: records stamped after that are its.
       const made = (await api("GET", `/api/observe/v1/log_metrics/${name}`)).body;
       const from = Math.ceil((made.modified + 1) / 10_000) * 10_000;
@@ -1840,6 +1864,10 @@ const scenarios = {
     const tag = `run:${run}`;
     // Two hours of minutes ending at the last five-minute edge, 0.5% of each failing: an SLI of
     // 99.5% whatever window reads them, so half a 99% target's budget left and a burn rate of 0.5.
+    // The alerts' shortest window (five minutes) holds the last minute written only until four
+    // minutes past that edge: begun in the 90 seconds before the next edge, it waits for it.
+    const into = Date.now() % 300_000;
+    if (into > 210_000) await new Promise((r) => setTimeout(r, 301_000 - into));
     const end = Math.floor(Date.now() / 300_000) * 300_000;
     const pts = (v) => Array.from({ length: 120 }, (_, i) => [(end - 120 * 60_000 + i * 60_000) / 1000, v]);
     const series = [

@@ -3583,8 +3583,17 @@ monitor of it made from the form (two CRITICAL in a row, evaluated every ten sec
 host and not the other, its page saying `2 CRITICAL in a row` and the host's value `Critical`, both
 pages within the screen's width (2026-10-20: passes in Chromium at 1,440 px and as a phone, and in
 WebKit as a phone, on fedora).
-Each makes its own records and checks through the API, not the page. 2026-10-20, after Datadog's
-boolean filters and the lexer's numbers: all 31 pass in Chromium at 1,440 px and in WebKit as a
+Each makes its own records and checks through the API, not the page. Every page a scenario checks
+for width is also checked for its tables' names: a row's name cut short must show 150 px of itself
+at least (a phone's rows put their buttons under the name). 2026-10-21, after the Sensitive Data
+Scanner: all 33 pass in Chromium and WebKit, each at 1,440 px and as a phone, on adacachy (a server
+seeded with three services' latency and 300 logs, a receiver and a logs folder). Four lists' buttons
+left a name too little room on a phone: pipelines' and archives' (seen in screenshots, laid out as
+the scanner's before the run), rehydrations' and synthetic tests' (found by the check in Chromium,
+149 and 135 px, then laid out the same). The first run also found an SLO scenario that, begun in
+the last minute of a five-minute span, found its alerts' five-minute window empty: it now waits for
+the next edge when it begins within 90 seconds of one. 2026-10-20, after Datadog's boolean filters
+and the lexer's numbers: all 31 pass in Chromium at 1,440 px and in WebKit as a
 phone, on fedora (a server seeded with three services' latency and 300 logs, a receiver and a logs
 folder of the scenarios'); after service checks, the same 31 pass again in both, and the service
 check scenario, made to wait for its runs to be stored before it opens the page, passes in both on

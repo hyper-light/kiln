@@ -50,9 +50,20 @@ function Head() {
       <th className="num w-1">#</th>
       <th>Pipeline</th>
       <th className="num hidden sm:table-cell">Processors</th>
-      <th>State</th>
-      <th />
+      <th className="hidden sm:table-cell">State</th>
+      <th className="hidden sm:table-cell" />
     </tr>
+  );
+}
+
+function State({ on }: { on: boolean }) {
+  return (
+    <span className="status">
+      <i className="dot" data-status={on ? "succeeded" : "skipped"} aria-hidden="true" />
+      <span className="status-text" data-status={on ? "succeeded" : "skipped"}>
+        {on ? "On" : "Off"}
+      </span>
+    </span>
   );
 }
 
@@ -95,6 +106,40 @@ function List() {
           <tbody>
             {all.map((p, i) => {
               const at = mine.findIndex((m) => m.id === p.id);
+              // On a phone they go under its name, which keeps the row's width.
+              const controls = (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    onClick={() =>
+                      void act(p.is_enabled ? "turn it off" : "turn it on", () =>
+                        observeApi.updatePipeline(p.id, { name: p.name, is_enabled: !p.is_enabled, filter: p.filter, processors: p.processors }),
+                      )
+                    }
+                  >
+                    {p.is_enabled ? `Turn off` : `Turn on`}
+                    <span className="sr-only"> {p.name}</span>
+                  </Button>
+                  {p.builtin ? (
+                    <Button variant="ghost" size="xs" aria-label={`Copy ${p.name} to change it`} onClick={() => void copy(p)}>
+                      <Copy />
+                    </Button>
+                  ) : (
+                    <>
+                      <Button variant="ghost" size="xs" aria-label={`Move ${p.name} up`} disabled={at <= 0} onClick={() => move(p, -1)}>
+                        <ArrowUp />
+                      </Button>
+                      <Button variant="ghost" size="xs" aria-label={`Move ${p.name} down`} disabled={at < 0 || at >= mine.length - 1} onClick={() => move(p, 1)}>
+                        <ArrowDown />
+                      </Button>
+                      <Button variant="ghost-danger" size="xs" aria-label={`Remove ${p.name}`} onClick={() => setRemoving(p)}>
+                        <Trash2 />
+                      </Button>
+                    </>
+                  )}
+                </>
+              );
               return (
                 <tr key={p.id}>
                   <td className="num cell-mono w-1 text-[#8c8f98]">{i + 1}</td>
@@ -104,47 +149,16 @@ function List() {
                     </Link>
                     {p.builtin && <span className="ml-2 font-mono text-[10.5px] text-[#8c8f98]">kiln&apos;s own</span>}
                     <p className="truncate font-mono text-[11px] text-[#8c8f98]">{p.filter.query.trim() || "every record"}</p>
+                    <div className="mt-1 flex items-center justify-between gap-2 sm:hidden">
+                      <State on={p.is_enabled} />
+                      <span className="flex items-center">{controls}</span>
+                    </div>
                   </td>
                   <td className="num cell-mono hidden sm:table-cell">{p.processors.length}</td>
-                  <td className="w-1 whitespace-nowrap">
-                    <span className="status">
-                      <i className="dot" data-status={p.is_enabled ? "succeeded" : "skipped"} aria-hidden="true" />
-                      <span className="status-text" data-status={p.is_enabled ? "succeeded" : "skipped"}>
-                        {p.is_enabled ? "On" : "Off"}
-                      </span>
-                    </span>
+                  <td className="hidden w-1 whitespace-nowrap sm:table-cell">
+                    <State on={p.is_enabled} />
                   </td>
-                  <td className="w-1 whitespace-nowrap text-right">
-                    <Button
-                      variant="ghost"
-                      size="xs"
-                      onClick={() =>
-                        void act(p.is_enabled ? "turn it off" : "turn it on", () =>
-                          observeApi.updatePipeline(p.id, { name: p.name, is_enabled: !p.is_enabled, filter: p.filter, processors: p.processors }),
-                        )
-                      }
-                    >
-                      {p.is_enabled ? `Turn off` : `Turn on`}
-                      <span className="sr-only"> {p.name}</span>
-                    </Button>
-                    {p.builtin ? (
-                      <Button variant="ghost" size="xs" aria-label={`Copy ${p.name} to change it`} onClick={() => void copy(p)}>
-                        <Copy />
-                      </Button>
-                    ) : (
-                      <>
-                        <Button variant="ghost" size="xs" aria-label={`Move ${p.name} up`} disabled={at <= 0} onClick={() => move(p, -1)}>
-                          <ArrowUp />
-                        </Button>
-                        <Button variant="ghost" size="xs" aria-label={`Move ${p.name} down`} disabled={at < 0 || at >= mine.length - 1} onClick={() => move(p, 1)}>
-                          <ArrowDown />
-                        </Button>
-                        <Button variant="ghost-danger" size="xs" aria-label={`Remove ${p.name}`} onClick={() => setRemoving(p)}>
-                          <Trash2 />
-                        </Button>
-                      </>
-                    )}
-                  </td>
+                  <td className="hidden w-1 whitespace-nowrap text-right sm:table-cell">{controls}</td>
                 </tr>
               );
             })}

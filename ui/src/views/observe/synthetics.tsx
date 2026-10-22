@@ -108,11 +108,11 @@ export default function Synthetics() {
 function Head() {
   return (
     <tr>
-      <th>State</th>
+      <th className="hidden sm:table-cell">State</th>
       <th>Test</th>
       <th className="hidden md:table-cell">Locations</th>
       <th className="hidden sm:table-cell">Last run</th>
-      <th />
+      <th className="hidden sm:table-cell" />
     </tr>
   );
 }
@@ -142,16 +142,44 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Synthetic) => 
               const o = overall(t);
               const failing = t.machines.find((m) => m.state.passed === false);
               const newest = [...t.machines].sort((a, b) => (b.state.last_ms ?? 0) - (a.state.last_ms ?? 0))[0];
+              const state = (
+                <span className="status">
+                  <i className="dot" data-status={o.tone} aria-hidden="true" />
+                  <span className="status-text" data-status={o.tone}>
+                    {o.word}
+                  </span>
+                </span>
+              );
+              // On a phone they go under its name, which keeps the row's width.
+              const controls = (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    aria-label={`Run ${t.name} now`}
+                    onClick={async () => {
+                      try {
+                        await observeApi.runSynthetic(t.name);
+                        toast({ title: `Running ${t.name} from every location`, tone: "info" });
+                        window.setTimeout(() => invalidate("observe/synthetics"), 3000);
+                      } catch (e) {
+                        toast({ title: `Couldn't run ${t.name}`, description: errorMessage(e), tone: "failed" });
+                      }
+                    }}
+                  >
+                    <Play /> <span className="hidden sm:inline">Run now</span>
+                  </Button>
+                  <Button variant="ghost" size="xs" aria-label={`Edit ${t.name}`} onClick={() => onEdit(t)}>
+                    <Pencil />
+                  </Button>
+                  <Button variant="ghost-danger" size="xs" aria-label={`Remove ${t.name}`} onClick={() => setRemoving(t)}>
+                    <Trash2 />
+                  </Button>
+                </>
+              );
               return (
                 <tr key={t.name}>
-                  <td className="w-1 whitespace-nowrap">
-                    <span className="status">
-                      <i className="dot" data-status={o.tone} aria-hidden="true" />
-                      <span className="status-text" data-status={o.tone}>
-                        {o.word}
-                      </span>
-                    </span>
-                  </td>
+                  <td className="hidden w-1 whitespace-nowrap sm:table-cell">{state}</td>
                   <td className="truncate-cell">
                     <div className="truncate text-[13px] text-[#e4e5e7]">
                       {t.name}
@@ -169,6 +197,10 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Synthetic) => 
                         {failing.machine}: {failing.state.failed[0] ?? "failing"}
                       </p>
                     )}
+                    <div className="mt-1 flex items-center justify-between gap-2 sm:hidden">
+                      {state}
+                      <span className="flex items-center">{controls}</span>
+                    </div>
                   </td>
                   <td className="hidden md:table-cell">
                     <div className="flex flex-wrap gap-x-3 gap-y-1">
@@ -193,30 +225,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Synthetic) => 
                       "—"
                     )}
                   </td>
-                  <td className="w-1 whitespace-nowrap">
-                    <Button
-                      variant="ghost"
-                      size="xs"
-                      aria-label={`Run ${t.name} now`}
-                      onClick={async () => {
-                        try {
-                          await observeApi.runSynthetic(t.name);
-                          toast({ title: `Running ${t.name} from every location`, tone: "info" });
-                          window.setTimeout(() => invalidate("observe/synthetics"), 3000);
-                        } catch (e) {
-                          toast({ title: `Couldn't run ${t.name}`, description: errorMessage(e), tone: "failed" });
-                        }
-                      }}
-                    >
-                      <Play /> <span className="hidden sm:inline">Run now</span>
-                    </Button>
-                    <Button variant="ghost" size="xs" aria-label={`Edit ${t.name}`} onClick={() => onEdit(t)}>
-                      <Pencil />
-                    </Button>
-                    <Button variant="ghost-danger" size="xs" aria-label={`Remove ${t.name}`} onClick={() => setRemoving(t)}>
-                      <Trash2 />
-                    </Button>
-                  </td>
+                  <td className="hidden w-1 whitespace-nowrap sm:table-cell">{controls}</td>
                 </tr>
               );
             })}
