@@ -20,14 +20,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use regex::Regex;
 use serde_json::Value;
 
-use super::matcher;
+use super::{matcher, spare};
 
 use kiln_obs::query::calendar::Zone;
 
 /// How deep helper rules may nest (a rule that names itself stops here).
 const DEPTH: usize = 16;
 /// Attributes a match extracts at the most.
-const ATTRS: usize = 256;
+pub(crate) const ATTRS: usize = 256;
 /// Rules a thread keeps capture locations for before it forgets them all (pipelines changed
 /// many times over: their old rules' are of rules no longer read).
 const READING: usize = 4096;
@@ -470,8 +470,25 @@ impl Grok {
     }
 }
 
+/// Attributes read and not kept: their strings handed back, their room kept for the next value's
+/// (`spare`).
+pub fn hand_back(out: &mut Vec<(String, String)>) {
+    for (k, v) in out.drain(..) {
+        spare::give(k);
+        spare::give(v);
+    }
+}
+
 fn number_text(f: f64) -> Option<String> {
-    f.is_finite().then(|| if f.fract() == 0.0 && f.abs() < 9.0e15 { format!("{}", f as i64) } else { format!("{f}") })
+    if !f.is_finite() {
+        return None;
+    }
+    if f.fract() == 0.0 && f.abs() < 9.0e15 {
+        return Some(int_text(f as i64));
+    }
+    let mut s = spare::take();
+    let _ = write!(s, "{f}");
+    Some(s)
 }
 
 /// A token's value, read and filtered, into `out` (under its name; a filter that makes fields,
@@ -483,26 +500,30 @@ fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
     {
         return;
     }
+    // Its strings taken where room was handed back (`spare`), and handed back when a filter makes
+    // another of them.
     let value: Option<String> = match &cap.conv {
-        Conv::Str => Some(raw.to_owned()),
+        Conv::Str => Some(spare::copy(raw)),
         Conv::Int => int_canonical(raw),
         Conv::Num => raw.parse::<f64>().ok().and_then(number_text),
-        Conv::Bool(t) => Some(if t.iter().any(|x| x.eq_ignore_ascii_case(raw)) { "true" } else { "false" }.to_owned()),
+        Conv::Bool(t) => Some(spare::copy(if t.iter().any(|x| x.eq_ignore_ascii_case(raw)) { "true" } else { "false" })),
         Conv::Date(d) => d.read(raw, now_ns).map(int_text),
-        Conv::Quoted => Some(raw.get(1..raw.len().saturating_sub(1)).unwrap_or_default().replace("\\\"", "\"").replace("\\'", "'")),
+        Conv::Quoted => {
+            let inner = raw.get(1..raw.len().saturating_sub(1)).unwrap_or_default();
+            Some(if inner.contains('\\') { inner.replace("\\\"", "\"").replace("\\'", "'") } else { spare::copy(inner) })
+        }
     };
     let Some(value) = value else { return };
     let key = |k: &str| match &cap.name {
         Some(n) => dotted(n, k),
-        None => k.to_owned(),
+        None => spare::copy(k),
     };
-    let named = |v: String, out: &mut Vec<(String, String)>| {
-        if let Some(n) = &cap.name {
-            out.push((n.clone(), v));
-        }
+    let named = |v: String, out: &mut Vec<(String, String)>| match &cap.name {
+        Some(n) => out.push((spare::copy(n), v)),
+        None => spare::give(v),
     };
     match &cap.filter {
-        None => named(value, out),
+        None => return named(value, out),
         Some(Filter::Number) => {
             if let Some(v) = value.parse::<f64>().ok().and_then(number_text) {
                 named(v, out);
@@ -518,10 +539,10 @@ fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
                 named(v, out);
             }
         }
-        Some(Filter::Boolean) => named(if value.eq_ignore_ascii_case("true") { "true" } else { "false" }.to_owned(), out),
+        Some(Filter::Boolean) => named(spare::copy(if value.eq_ignore_ascii_case("true") { "true" } else { "false" }), out),
         Some(Filter::NullIf(x)) => {
             if value != *x {
-                named(value, out);
+                return named(value, out);
             }
         }
         Some(Filter::Lowercase) => named(value.to_lowercase(), out),
@@ -532,27 +553,34 @@ fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
                 flatten(cap.name.as_deref(), v, 0, out);
             }
         }
-        Some(Filter::KeyValue { sep }) => {
-            for (k, v) in key_values(&value, sep) {
-                out.push((key(&k), v));
-            }
-        }
+        Some(Filter::KeyValue { sep }) => key_values(&value, sep, cap.name.as_deref(), out),
         Some(Filter::QueryString) => {
-            for (k, v) in query_pairs(value.trim_start_matches('?')) {
+            let mut pairs = Vec::new();
+            query_pairs(value.trim_start_matches('?'), &mut pairs);
+            for (k, v) in pairs {
                 out.push((key(&k), v));
+                spare::give(k);
             }
         }
         Some(Filter::Url) => {
-            for (k, v) in url_parts(&value) {
+            let mut parts = Vec::new();
+            url_parts(&value, &mut parts);
+            for (k, v) in parts {
                 out.push((key(&k), v));
+                if let Cow::Owned(k) = k {
+                    spare::give(k);
+                }
             }
         }
         Some(Filter::UserAgent) => {
-            for (k, v) in user_agent(&value) {
+            let mut parts = Vec::new();
+            user_agent(&value, &mut parts);
+            for (k, v) in parts {
                 out.push((key(k), v));
             }
         }
     }
+    spare::give(value);
 }
 
 /// JSON's fields as attributes, nested keys joined by dots, arrays as JSON.
@@ -584,10 +612,11 @@ pub(crate) fn flatten(prefix: Option<&str>, v: Value, depth: usize, out: &mut Ve
     }
 }
 
-/// `key<sep>value` pairs (a value quoted, or up to a space, a comma or a semicolon).
-fn key_values(s: &str, sep: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+/// `key<sep>value` pairs (a value quoted, or up to a space, a comma or a semicolon) into `out`, each
+/// key under `prefix` where there is one.
+fn key_values(s: &str, sep: &str, prefix: Option<&str>, out: &mut Vec<(String, String)>) {
     let mut rest = s;
+    let mut n = 0;
     while let Some(at) = rest.find(sep) {
         let before = rest.get(..at).unwrap_or_default();
         let key = before.rsplit(|c: char| c.is_whitespace() || c == ',' || c == ';').next().unwrap_or_default();
@@ -603,20 +632,29 @@ fn key_values(s: &str, sep: &str) -> Vec<(String, String)> {
                 (after.get(..end).unwrap_or_default(), end)
             }
         };
-        if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || "_.@-".contains(c)) && out.len() < ATTRS {
-            out.push((key.to_owned(), value.to_owned()));
+        if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || "_.@-".contains(c)) && n < ATTRS {
+            let key = match prefix {
+                Some(p) => dotted(p, key),
+                None => spare::copy(key),
+            };
+            out.push((key, spare::copy(value)));
+            n += 1;
         }
         rest = after.get(used..).unwrap_or_default();
         if used == 0 {
             break;
         }
     }
-    out
 }
 
+/// `s` with its `%XX` escapes and `+`s decoded.
 pub(crate) fn decode_uri(s: &str) -> String {
+    if !s.bytes().any(|b| b == b'%' || b == b'+') {
+        return spare::copy(s);
+    }
     let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
+    let mut out = spare::take().into_bytes();
+    out.reserve(b.len());
     let mut i = 0;
     while let Some(&c) = b.get(i) {
         match c {
@@ -640,23 +678,29 @@ pub(crate) fn decode_uri(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    match String::from_utf8(out) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
-pub(crate) fn query_pairs(q: &str) -> Vec<(String, String)> {
-    q.split('&').filter(|p| !p.is_empty()).take(ATTRS).map(|p| p.split_once('=').unwrap_or((p, ""))).map(|(k, v)| (decode_uri(k), decode_uri(v))).collect()
+/// A query string's pairs, decoded, into `out`.
+pub(crate) fn query_pairs(q: &str, out: &mut Vec<(String, String)>) {
+    for p in q.split('&').filter(|p| !p.is_empty()).take(ATTRS) {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        out.push((decode_uri(k), decode_uri(v)));
+    }
 }
 
-/// A URL's parts, as Datadog's URL parser names them: `scheme`, `host`, `port`, `path`,
+/// A URL's parts, as Datadog's URL parser names them, into `out`: `scheme`, `host`, `port`, `path`,
 /// `queryString.<key>` (the names but a query's key, written in once).
-pub(crate) fn url_parts(url: &str) -> Vec<(Cow<'static, str>, String)> {
-    let mut out = Vec::new();
+pub(crate) fn url_parts(url: &str, out: &mut Vec<(Cow<'static, str>, String)>) {
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) => (Some(s), r),
         _ => (None, url),
     };
     if let Some(s) = scheme {
-        out.push((Cow::Borrowed("scheme"), s.to_owned()));
+        out.push((Cow::Borrowed("scheme"), spare::copy(s)));
     }
     let (authority, path_query) = if scheme.is_some() {
         match rest.find(['/', '?', '#']) {
@@ -670,21 +714,23 @@ pub(crate) fn url_parts(url: &str) -> Vec<(Cow<'static, str>, String)> {
         let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
         match host_port.rsplit_once(':').filter(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
             Some((h, p)) => {
-                out.push((Cow::Borrowed("host"), h.trim_start_matches('[').trim_end_matches(']').to_owned()));
-                out.push((Cow::Borrowed("port"), p.to_owned()));
+                out.push((Cow::Borrowed("host"), spare::copy(h.trim_start_matches('[').trim_end_matches(']'))));
+                out.push((Cow::Borrowed("port"), spare::copy(p)));
             }
-            None => out.push((Cow::Borrowed("host"), host_port.to_owned())),
+            None => out.push((Cow::Borrowed("host"), spare::copy(host_port))),
         }
     }
     let path_query = path_query.split('#').next().unwrap_or_default();
     let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
     if !path.is_empty() {
-        out.push((Cow::Borrowed("path"), path.to_owned()));
+        out.push((Cow::Borrowed("path"), spare::copy(path)));
     }
-    for (k, v) in query_pairs(query) {
-        out.push((Cow::Owned(format!("queryString.{k}")), v));
+    for p in query.split('&').filter(|p| !p.is_empty()).take(ATTRS) {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        let k = decode_uri(k);
+        out.push((Cow::Owned(dotted("queryString", &k)), decode_uri(v)));
+        spare::give(k);
     }
-    out
 }
 
 /// The words a user agent is read by, their case as written: the first eight the keys a version
@@ -720,7 +766,7 @@ static UA_STARTS: [u32; 256] = ua_starts();
 /// A user agent's browser, operating system and device, as far as its words tell (the families
 /// Datadog's parser names, not its full database). Its words found in one pass: at each byte, the
 /// words that may begin with it (a word found is not looked for again).
-pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
+pub(crate) fn user_agent(ua: &str, out: &mut Vec<(&'static str, String)>) {
     let b = ua.as_bytes();
     let mut found = 0u32;
     let mut first = [0usize; UA_KEYS];
@@ -756,7 +802,6 @@ pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
         if run == 0 { None } else { rest.get(..major) }
     };
     let bot = found >> UA_WORDS.len() != 0;
-    let mut out = Vec::with_capacity(4);
     let browser = if has("Edg/") {
         Some(("Edge", version("Edg/")))
     } else if has("OPR/") {
@@ -773,9 +818,9 @@ pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
         None
     };
     if let Some((family, v)) = browser {
-        out.push(("browser.family", family.to_owned()));
+        out.push(("browser.family", spare::copy(family)));
         if let Some(v) = v {
-            out.push(("browser.major", v.to_owned()));
+            out.push(("browser.major", spare::copy(v)));
         }
     }
     let os = if has("Windows") {
@@ -792,7 +837,7 @@ pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
         None
     };
     if let Some(os) = os {
-        out.push(("os.family", os.to_owned()));
+        out.push(("os.family", spare::copy(os)));
     }
     let device = if bot {
         "Bot"
@@ -803,13 +848,13 @@ pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
     } else {
         "Desktop"
     };
-    out.push(("device.category", device.to_owned()));
-    out
+    out.push(("device.category", spare::copy(device)));
 }
 
 /// `{prefix}.{key}`, made with its room once.
 pub(crate) fn dotted(prefix: &str, key: &str) -> String {
-    let mut s = String::with_capacity(prefix.len() + 1 + key.len());
+    let mut s = spare::take();
+    s.reserve(prefix.len() + 1 + key.len());
     s.push_str(prefix);
     s.push('.');
     s.push_str(key);
@@ -832,7 +877,7 @@ pub(crate) fn int_text(n: i64) -> String {
         }
     }
     let digits = buf.get(at..).unwrap_or_default();
-    let mut s = String::with_capacity(digits.len() + usize::from(n < 0));
+    let mut s = spare::take();
     if n < 0 {
         s.push('-');
     }
@@ -846,7 +891,7 @@ fn int_canonical(raw: &str) -> Option<String> {
     let digits = raw.strip_prefix('-').unwrap_or(raw);
     let plain = !digits.is_empty() && digits.len() <= 18 && digits.bytes().all(|b| b.is_ascii_digit()) && (digits.len() == 1 || !digits.starts_with('0')) && raw != "-0";
     if plain {
-        return Some(raw.to_owned());
+        return Some(spare::copy(raw));
     }
     raw.trim_start_matches('+').parse::<i64>().ok().map(int_text)
 }
@@ -1408,7 +1453,9 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
             uas.push(ua);
         }
         for ua in &uas {
-            assert_eq!(user_agent(ua), user_agent_before(ua), "{ua:?}");
+            let mut ours = Vec::new();
+            user_agent(ua, &mut ours);
+            assert_eq!(ours, user_agent_before(ua), "{ua:?}");
         }
     }
 

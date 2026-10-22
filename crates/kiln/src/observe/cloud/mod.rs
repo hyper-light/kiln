@@ -658,6 +658,11 @@ pub const LEVEL_FIELDS: [&str; 5] = ["level", "severity", "levelname", "log.leve
 pub fn severity_of_words(m: &str) -> u8 {
     let m = m.trim_start();
     for word in m.split(|c: char| c.is_whitespace() || c == '|').filter(|w| !w.is_empty()).take(4) {
+        // A word without `=` is a level only in capitals: one whose first letter or digit is not
+        // one is passed at once (most words: an address, a date, a path).
+        if !word.as_bytes().contains(&b'=') && !word.bytes().find(u8::is_ascii_alphanumeric).is_some_and(|b| b.is_ascii_uppercase()) {
+            continue;
+        }
         let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '=');
         let w = w.rsplit_once('=').map_or(w, |(k, v)| if k.eq_ignore_ascii_case("level") || k.eq_ignore_ascii_case("severity") { v } else { "" });
         // Words in capitals, or a level=…'s value: "Error" in a sentence is not a level.
@@ -1123,6 +1128,66 @@ mod tests {
             ("", 9),
         ] {
             assert_eq!(severity_of(m), want, "{m:?}");
+        }
+    }
+
+    /// A word passed at once (no `=`, its first letter or digit not a capital) is one the full
+    /// reading passes too: random first words of levels, near misses and others read alike.
+    #[test]
+    fn a_line_s_words_read_as_they_did() {
+        fn before(m: &str) -> u8 {
+            let m = m.trim_start();
+            for word in m.split(|c: char| c.is_whitespace() || c == '|').filter(|w| !w.is_empty()).take(4) {
+                let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '=');
+                let w = w.rsplit_once('=').map_or(w, |(k, v)| if k.eq_ignore_ascii_case("level") || k.eq_ignore_ascii_case("severity") { v } else { "" });
+                if ((w.len() >= 4 && w.bytes().all(|b| b.is_ascii_uppercase())) || word.contains('='))
+                    && let Some(r) = kiln_obs::logs::record::severities(w)
+                {
+                    return *r.start();
+                }
+            }
+            9
+        }
+        let words = [
+            "ERROR",
+            "error",
+            "[WARN]",
+            "WARN",
+            "level=info",
+            "Level=Error",
+            "severity=warning",
+            "\tERROR\t",
+            "é",
+            "ÉRROR",
+            "1ERROR",
+            "-ERROR-",
+            "=ERROR",
+            "ERR",
+            "CRITICAL",
+            "x=y",
+            "|",
+            " ",
+            "\t",
+            "10.0.0.1",
+            "[18/Oct/2026:12:00:00",
+            "-",
+            "FATAL:",
+            "DEBUG",
+            "Debug",
+            "INFO",
+            "NOTICE",
+            "a=b=ERROR",
+            "level=",
+            "=",
+            "TRACE",
+            "(WARNING)",
+            "WARNING!",
+            "😀ERROR",
+        ];
+        let mut rng = kiln_obs::testkit::Rng::new(31);
+        for _ in 0..50_000 {
+            let line: String = (0..rng.below(7)).map(|_| words.get(rng.below(words.len() as u64) as usize).copied().unwrap_or("")).collect::<Vec<_>>().join(if rng.below(2) == 0 { " " } else { "" });
+            assert_eq!(severity_of_words(&line), before(&line), "{line:?}");
         }
     }
 

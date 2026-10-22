@@ -567,7 +567,7 @@ impl Observe {
         let statuses: Vec<(SeriesKey, Vec<(i64, f64)>)> = logs.records().filter_map(kiln_obs::monitor::checks::status_sample).map(|(key, ms, v)| (key, vec![(ms, v)])).collect();
         // The pipelines, where the records are taken. A reader's (acked) records were processed as
         // it gathered them: one refused comes back to be offered again, and is not processed twice.
-        // (Rows are of records no pipeline reads.)
+        // (A row was read by the pipelines that read it where it was written.)
         if ack.is_none() {
             for run in logs.runs_mut() {
                 super::pipeline::kept::process(run);

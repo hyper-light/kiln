@@ -2,7 +2,8 @@
 //! read lines of each kind, by grok's own matcher and by `regex` alone: a combined access line (the
 //! second rule), a common one (the first), an error line (the third), and a line none reads. For
 //! each, ns a line (the median of five rounds), allocations a line, and how many matched (both
-//! engines alike, or it says so).
+//! engines alike, or it says so). Each line's attributes are handed back once read, as the
+//! collector hands back a record's once its row is written.
 //!
 //! `cargo bench -p kiln --bench grok` (`KOBS_LINES`: lines a case, 200,000; `KOBS_CASE`: a part of
 //! the names of the cases to run; `KOBS_ENGINE=grok` or `regex`: one engine alone, for a profile).
@@ -11,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use hyper_measure::alloc;
-use kiln::observe::pipeline::grok::{Grok, Reading};
+use kiln::observe::pipeline::grok::{self, Grok, Reading};
 use kiln::observe::pipeline::{KindDef, builtin};
 
 #[global_allocator]
@@ -81,7 +82,7 @@ fn main() {
                 let t0 = Instant::now();
                 for l in &lines {
                     hits += u64::from(g.parse_with(l, now_ns, &mut reading, &mut out).is_some());
-                    out.clear();
+                    grok::hand_back(&mut out);
                 }
                 times.push(t0.elapsed());
                 if rep == 1 {

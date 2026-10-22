@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ingest::{Ack, LogPart, Logs};
+use super::pipeline::spare;
 pub use super::scrape::{EVERY, SERVER};
 
 /// Sources kept at the most.
@@ -399,6 +400,18 @@ pub(crate) struct Line {
     pub truncated: bool,
 }
 
+/// A record written as its row, its strings handed back (`pipeline::spare`): its message's string,
+/// emptied, for the next line's text.
+fn recycle(r: Record) -> String {
+    let Record { service, host, source, mut message, attrs, .. } = r;
+    for s in [service, host, source] {
+        spare::give(s);
+    }
+    spare::give_list(attrs);
+    message.clear();
+    message
+}
+
 /// What a file's records say of where they came from: its path, and its container's or pod's
 /// names.
 #[derive(Debug, Default, Clone)]
@@ -525,8 +538,10 @@ impl Compiled {
     /// A line into `b`: one no active pipeline reads as its row, written from the line as it was
     /// read (a JSON line's fields from the room its reading keeps), nothing else made of it (the
     /// row its record would write: a test holds them alike), and its text back for the next
-    /// line's; one a pipeline reads, or a service check's run, as its record
-    /// ([`Compiled::record`]).
+    /// line's. One a pipeline (or the scanner) reads, as its record read here by every pipeline
+    /// and the scanner, written as its row and its strings handed back (`pipeline::spare`), its
+    /// text back too: the row the record would have written, read where it was offered (a test
+    /// holds them alike). A service check's run, as its record ([`Compiled::record`]).
     pub(crate) fn write<M>(&self, line: Line, origin: &Origin, now_ns: i64, b: &mut Batch<M>, filters: &mut PipelineFilters) -> Option<String> {
         if self.source == kiln_obs::monitor::checks::SOURCE {
             b.push(self.record(line, origin, now_ns));
@@ -555,8 +570,17 @@ impl Compiled {
             };
             let PipelineFilters { pipelines, scratch, scanner, scan } = filters;
             if pipelines.iter().any(|p| p.reads(&view, scratch)) || (!scanner.is_empty() && scanner.reads(&view, || view.attrs(), scan)) {
-                b.push(self.record_of(text, &line, read.as_ref(), room, origin, now_ns));
-                return None;
+                let mut r = self.record_of(text, &line, read.as_ref(), room, origin, now_ns);
+                for p in pipelines.iter() {
+                    p.apply(&mut r, now_ns, scratch);
+                }
+                if !scanner.is_empty() {
+                    scanner.scan(&mut r, scan);
+                }
+                kiln_obs::errors::put_log_issue(&mut r);
+                let attrs = r.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+                b.push_row(r.ts, r.severity, [&r.service, &r.host, &r.source], &r.message, attrs, r.attrs.len(), (r.trace_id, r.span_id));
+                return Some(recycle(r));
             }
             let ts = read.as_ref().and_then(|j| j.ts).or(line.ts).unwrap_or(now_ns);
             let ts = if ts > now_ns + AHEAD_MS * 1_000_000 { now_ns } else { ts };
@@ -600,12 +624,15 @@ impl Compiled {
     /// A line's record of what its reading found (`read`, its fields in `room`; none, a text
     /// line's), `text` its message, `line` the rest of it.
     fn record_of(&self, text: String, line: &Line, read: Option<&JsonRead>, room: &JsonRoom, origin: &Origin, now_ns: i64) -> Record {
+        // Its strings where room was handed back (`pipeline::spare`): a record a pipeline reads
+        // here hands them back once its row is written.
         let mut r = Record {
             ts: read.and_then(|j| j.ts).or(line.ts).unwrap_or(now_ns),
             severity: severity(read, &text),
-            service: self.service_of(read, &room.service, origin).to_owned(),
-            host: self.host.clone(),
-            source: self.source.clone(),
+            service: spare::copy(self.service_of(read, &room.service, origin)),
+            host: spare::copy(&self.host),
+            source: spare::copy(&self.source),
+            attrs: spare::take_list(),
             trace_id: read.and_then(|j| j.trace_id),
             span_id: read.and_then(|j| j.span_id),
             ..Record::default()
@@ -616,17 +643,18 @@ impl Compiled {
         // Its attributes sized once: the line's fields, where it came from, the source's tags.
         let fields = read.map_or(0, |_| room.attrs.len());
         r.attrs.reserve_exact(fields + origin.attrs.len() + self.tags.len() + 2);
+        let pair = |(k, v): (&str, &str)| (spare::copy(k), spare::copy(v));
         if read.is_some() {
-            r.attrs.extend(room.attrs.iter().map(|(k, v)| (k.to_owned(), v.to_owned())));
+            r.attrs.extend(room.attrs.iter().map(pair));
         }
-        r.attrs.extend(origin.attrs.iter().cloned());
+        r.attrs.extend(origin.attrs.iter().map(|(k, v)| pair((k, v))));
         if let Some(s) = line.stream {
-            r.attrs.push(("log.iostream".into(), s.into()));
+            r.attrs.push(pair(("log.iostream", s)));
         }
         if line.truncated {
-            r.attrs.push(("truncated".into(), "true".into()));
+            r.attrs.push(pair(("truncated", "true")));
         }
-        r.attrs.extend(self.tags.iter().cloned());
+        r.attrs.extend(self.tags.iter().map(|(k, v)| pair((k, v))));
         r.message = super::cloud::message(text);
         r
     }
@@ -1519,8 +1547,9 @@ impl<M> InFlight<M> {
         b.seal();
         let ack = Ack::new();
         let n = b.len() as u64;
-        // Through the pipelines once, the first time they are offered (rows are of lines none
-        // reads): each run's records past those processed before.
+        // Through the pipelines once, the first time they are offered (a row was read by those
+        // that read it where it was written, `Compiled::write`): each run's records past those
+        // processed before.
         let mut seen = 0usize;
         for part in &mut b.parts {
             if let LogPart::Records(run) = part {
@@ -1637,19 +1666,132 @@ mod tests {
         let nginx = Source { source: Some("nginx".into()), ..file_source() }.compile("nginx", "web-1").map_err(anyhow::Error::msg)?;
         let mut b: Batch<()> = Batch::default();
         let access = r#"192.0.2.10 - - [18/Oct/2026:12:00:00 +0000] "GET / HTTP/1.1" 200 1 "-" "curl/8.5.0""#;
-        anyhow::ensure!(nginx.write(Line { text: access.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_none(), "a record keeps its text");
+        anyhow::ensure!(nginx.write(Line { text: access.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_some(), "a line a pipeline reads: its text comes back too");
         anyhow::ensure!(plain.write(Line { text: "an app's line".into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_some(), "a row's text comes back");
         anyhow::ensure!(
-            nginx.write(Line { text: r#"{"msg":"an app's JSON","level":"warn"}"#.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_none(),
+            nginx.write(Line { text: r#"{"msg":"an app's JSON","level":"warn"}"#.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_some(),
             "a pipeline reads it"
         );
         anyhow::ensure!(plain.write(Line { text: r#"{"msg":"an app's JSON","level":"warn"}"#.into(), ..Line::default() }, &Origin::default(), NOW, &mut b, &mut filters).is_some(), "none reads it");
         b.seal();
-        anyhow::ensure!(
-            matches!(b.parts.as_slice(), [LogPart::Records(r), LogPart::Rows { rows: 1, .. }, LogPart::Records(j), LogPart::Rows { rows: 1, .. }] if r.len() == 1 && j.len() == 1),
-            "{:?}",
-            b.parts
-        );
+        anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Rows { rows: 4, .. }]), "every one a row: {:?}", b.parts);
+        Ok(())
+    }
+
+    /// A line a pipeline (or the scanner) reads, written as its row where it is read, is the row its
+    /// record wrote when it was read where it was offered: the record made of it, every pipeline
+    /// and the scanner on it, its issue put. On kiln's own pipelines and one of every processor
+    /// beside them, and the scanner hashing an email: access and error lines, JSON lines, lines
+    /// each processor reads, levels made errors, emails, others; many in turn on one thread, so
+    /// the strings each hands back are taken again by the next.
+    #[test]
+    fn a_line_a_pipeline_reads_is_the_row_its_record_was() -> anyhow::Result<()> {
+        use crate::observe::pipeline::{PipelineDef, builtin};
+        use crate::observe::scanner::{GroupDef, Scanner};
+        const NOW: i64 = 1_792_324_800_000_000_000;
+        let mut defs: Vec<PipelineDef> = builtin::all().into_iter().map(|(_, d)| d).collect();
+        defs.push(serde_json::from_value(serde_json::json!({
+            "name": "app", "filter": { "query": "service:app" },
+            "processors": [
+                { "type": "grok-parser", "name": "paid", "source": "message", "grok": { "support_rules": "", "match_rules": "paid %{word:user} paid %{number:amount} for order %{integer:order} lvl=%{word:level} trace=%{notSpace:trace} url=%{notSpace:link} ua=\"%{data:agent}\"%{data:rest}\nother %{data::keyvalue}" } },
+                { "type": "status-remapper", "sources": ["level"] },
+                { "type": "arithmetic-processor", "expression": "amount * 100", "target": "cents" },
+                { "type": "string-builder-processor", "template": "%{user} #%{order}", "target": "who" },
+                { "type": "lookup-processor", "source": "user", "target": "team", "lookup_table": ["ada,payments", "bob,checkout"], "default_lookup": "web" },
+                { "type": "url-parser", "sources": ["link"], "target": "link_details", "normalize_ending_slashes": true },
+                { "type": "user-agent-parser", "sources": ["agent"], "target": "agent_details", "is_encoded": true },
+                { "type": "trace-id-remapper", "sources": ["trace"] },
+                { "type": "attribute-remapper", "sources": ["user"], "target": "usr.name", "preserve_source": false, "override_on_conflict": true },
+                { "type": "attribute-remapper", "sources": ["cents"], "target": "amount", "target_format": "integer", "override_on_conflict": true },
+                { "type": "category-processor", "target": "size", "categories": [{ "filter": { "query": "@cents:>1000" }, "name": "big" }, { "filter": { "query": "*" }, "name": "small" }] },
+                { "type": "service-remapper", "sources": ["team"] },
+                { "type": "message-remapper", "sources": ["who"] },
+                { "type": "date-remapper", "sources": ["at"] }
+            ]
+        }))?);
+        let pipelines: Vec<_> = defs.iter().map(PipelineDef::compile).collect::<Result<_, _>>().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let group: GroupDef =
+            serde_json::from_value(serde_json::json!({ "name": "pii", "rules": [{ "name": "email", "standard_pattern_id": "email_address", "text_replacement": { "type": "hash" } }] }))?;
+        let scanner = Arc::new(Scanner::compile(&[group], b"a key"));
+        let mut filters = PipelineFilters { pipelines: Arc::new(pipelines), scanner: scanner.clone(), ..PipelineFilters::default() };
+        let nginx = Source { source: Some("nginx".into()), tags: vec!["env:prod".into(), "team:edge".into()], ..file_source() }.compile("nginx", "web-1").map_err(anyhow::Error::msg)?;
+        let app = file_source().compile("app", "web-1").map_err(anyhow::Error::msg)?;
+        let mut rng = kiln_obs::testkit::Rng::new(29);
+        let (mut read, mut issues) = (0, 0);
+        for i in 0..6_000u64 {
+            let (c, text) = match rng.below(8) {
+                0 => (
+                    &nginx,
+                    format!(
+                        r#"10.0.{}.{} - {} [18/Oct/2026:12:00:{:02} +0000] "{} /api/v1/orders/{i}?q={} HTTP/1.1" {} {} "-" "{}""#,
+                        i % 250,
+                        i % 7,
+                        pick(&mut rng, &["-", "bob"]),
+                        i % 60,
+                        pick(&mut rng, &["GET", "POST"]),
+                        pick(&mut rng, &["1", "a%20b", "é"]),
+                        pick(&mut rng, &["200", "404", "502"]),
+                        i % 900,
+                        pick(&mut rng, &["curl/8.5.0", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Version/17.0 Mobile Safari/604.1", "Googlebot/2.1", "-"])
+                    ),
+                ),
+                1 => (
+                    &nginx,
+                    format!(
+                        r#"2026/10/18 12:00:{:02} [{}] 8409#8409: *{i} open() "/x" failed, client: 192.0.2.{}, server: localhost, request: "GET /favicon.ico HTTP/1.1""#,
+                        i % 60,
+                        pick(&mut rng, &["error", "warn", "crit"]),
+                        i % 250
+                    ),
+                ),
+                2 => (&nginx, log_line(&mut rng)),
+                3 | 4 => (
+                    &app,
+                    format!(
+                        r#"paid {} paid {}.5 for order {i} lvl={} trace={} url={} ua="{}"{}"#,
+                        pick(&mut rng, &["ada", "bob", "cy"]),
+                        i % 40,
+                        pick(&mut rng, &["error", "info", "warn"]),
+                        pick(&mut rng, &["0af7651916cd43dd8448eb211c80319c", "12345", "x"]),
+                        pick(&mut rng, &["https://shop.example:8443/cart/?x=1&y=a%20b", "/path//", "http://[::1]:80/a"]),
+                        pick(&mut rng, &["Mozilla%2F5.0%20(iPhone)%20Version%2F17.0%20Mobile%20Safari%2F604.1", "curl%2F8", ""]),
+                        pick(&mut rng, &["", " tail", " email=a.b@example.com"])
+                    ),
+                ),
+                5 => (
+                    &app,
+                    format!(
+                        "other a={i} b='two words' email=user{i}@example.com at={} level={} error.kind={} c=x",
+                        1_792_324_800 + i,
+                        pick(&mut rng, &["error", "info"]),
+                        pick(&mut rng, &["Timeout", "IOError"])
+                    ),
+                ),
+                6 => (&app, format!("user{i}@example.com wrote {i} lines")),
+                _ => (&app, log_line(&mut rng)),
+            };
+            let origin = Origin { attrs: vec![("log.file.path".into(), "/var/log/app/a.log".into())], service: None };
+            let line = || Line { text: text.clone(), ts: None, stream: (i % 3 == 0).then_some("stdout"), truncated: i % 7 == 0 };
+            // As it was: its record, read where it was offered.
+            let mut r = c.record(line(), &origin, NOW);
+            let mut s = crate::observe::pipeline::Scratch::default();
+            for p in filters.pipelines.iter() {
+                p.apply(&mut r, NOW, &mut s);
+            }
+            scanner.scan(&mut r, &mut crate::observe::scanner::Scratch::default());
+            kiln_obs::errors::put_log_issue(&mut r);
+            let mut want = Vec::new();
+            kiln_obs::logs::record::put_row(&mut want, &r, 0);
+            read += usize::from(r.attrs.len() > 3);
+            issues += usize::from(r.attrs.iter().any(|(k, _)| k == "issue.id"));
+            // As it is: written as its row where it is read.
+            let mut b: Batch<()> = Batch::default();
+            let back = c.write(line(), &origin, NOW, &mut b, &mut filters);
+            b.seal();
+            anyhow::ensure!(back.is_some(), "its text comes back: {text:?}");
+            anyhow::ensure!(matches!(b.parts.as_slice(), [LogPart::Rows { raw, rows: 1, .. }] if *raw == want), "{text:?}");
+        }
+        anyhow::ensure!(read > 3_000 && issues > 250, "{read} read by a pipeline, {issues} issues");
         Ok(())
     }
 

@@ -9,9 +9,11 @@ pub mod expr;
 pub mod grok;
 pub mod kept;
 mod matcher;
+pub(crate) mod spare;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -330,7 +332,8 @@ fn set(r: &mut Record, key: &str, value: String) {
     put(r, Cow::Borrowed(key), value);
 }
 
-/// [`set`], its name moved in when it comes owned (copied only when it is borrowed and new).
+/// [`set`], its name moved in when it comes owned (copied only when it is borrowed and new). What
+/// it replaces, and a name it does not keep, are handed back (`spare`).
 fn put(r: &mut Record, key: Cow<'_, str>, value: String) {
     let slot = match key.as_ref() {
         "message" => &mut r.message,
@@ -343,17 +346,26 @@ fn put(r: &mut Record, key: Cow<'_, str>, value: String) {
                 None => return,
             },
             None => {
-                r.attrs.push((key.into_owned(), value));
+                let key = match key {
+                    Cow::Owned(k) => k,
+                    Cow::Borrowed(k) => spare::copy(k),
+                };
+                r.attrs.push((key, value));
                 return;
             }
         },
     };
-    *slot = value;
+    spare::give(std::mem::replace(slot, value));
+    if let Cow::Owned(k) = key {
+        spare::give(k);
+    }
 }
 
 fn remove(r: &mut Record, key: &str) {
     if let Some(i) = r.attrs.iter().position(|(k, _)| k == key) {
-        r.attrs.remove(i);
+        let (k, v) = r.attrs.remove(i);
+        spare::give(k);
+        spare::give(v);
     }
 }
 
@@ -468,6 +480,9 @@ pub struct Scratch {
     search: RowScratch,
     attrs: Vec<(String, String)>,
     grok: grok::Reading,
+    /// A URL's parts, and a user agent's, as each parser reads them.
+    url: Vec<(Cow<'static, str>, String)>,
+    agent: Vec<(&'static str, String)>,
 }
 
 impl Pipeline {
@@ -517,12 +532,14 @@ fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
         }
         Proc::Service(sources) => {
             if let Some((_, v)) = first(r, sources) {
-                r.service = v.to_owned();
+                let v = spare::copy(v);
+                spare::give(std::mem::replace(&mut r.service, v));
             }
         }
         Proc::Message(sources) => {
             if let Some((_, v)) = first(r, sources) {
-                r.message = v.to_owned();
+                let v = spare::copy(v);
+                spare::give(std::mem::replace(&mut r.message, v));
             }
         }
         Proc::TraceId(sources) => {
@@ -536,67 +553,87 @@ fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
                 return;
             }
             let value = match format {
-                Format::Auto | Format::String => Some(v.to_owned()),
-                Format::Integer => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| (f as i64).to_string()),
-                Format::Double => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| f.to_string()),
+                Format::Auto | Format::String => Some(spare::copy(v)),
+                Format::Integer => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| grok::int_text(f as i64)),
+                Format::Double => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| {
+                    let mut s = spare::take();
+                    let _ = write!(s, "{f}");
+                    s
+                }),
             };
-            let source = sources.get(i).cloned().unwrap_or_default();
+            let source = sources.get(i).map_or("", String::as_str);
             if let Some(value) = value {
                 set(r, target, value);
-                if !preserve && source != *target {
-                    remove(r, &source);
+                if !preserve && source != target {
+                    remove(r, source);
                 }
             }
         }
         Proc::Url { sources, target, trim_slashes } => {
             let Some((_, v)) = first(r, sources) else { return };
-            let mut parts = grok::url_parts(v);
+            s.url.clear();
+            grok::url_parts(v, &mut s.url);
             if *trim_slashes {
-                for (k, v) in &mut parts {
+                for (k, v) in &mut s.url {
                     if k == "path" && v.len() > 1 {
-                        *v = v.trim_end_matches('/').to_owned();
+                        let kept = v.trim_end_matches('/').len();
+                        v.truncate(kept);
                     }
                 }
             }
-            r.attrs.reserve(parts.len());
-            for (k, v) in parts {
+            r.attrs.reserve(s.url.len());
+            for (k, v) in s.url.drain(..) {
                 put(r, Cow::Owned(grok::dotted(target, &k)), v);
+                if let Cow::Owned(k) = k {
+                    spare::give(k);
+                }
             }
         }
         Proc::UserAgent { sources, target, encoded } => {
             // Read where it is (decoded first when it says): its parts are their own strings.
-            let parts = match first(r, sources) {
-                Some((_, v)) if *encoded => grok::user_agent(&grok::decode_uri(v)),
-                Some((_, v)) => grok::user_agent(v),
+            s.agent.clear();
+            match first(r, sources) {
+                Some((_, v)) if *encoded => {
+                    let decoded = grok::decode_uri(v);
+                    grok::user_agent(&decoded, &mut s.agent);
+                    spare::give(decoded);
+                }
+                Some((_, v)) => grok::user_agent(v, &mut s.agent),
                 None => return,
-            };
-            r.attrs.reserve(parts.len());
-            for (k, v) in parts {
+            }
+            r.attrs.reserve(s.agent.len());
+            for (k, v) in s.agent.drain(..) {
                 put(r, Cow::Owned(grok::dotted(target, k)), v);
             }
         }
         Proc::Category { target, categories } => {
             if let Some((_, name)) = categories.iter().find(|(f, _)| f.record(r, &mut s.search)) {
-                set(r, target, name.clone());
+                set(r, target, spare::copy(name));
             }
         }
         Proc::Arithmetic { expr, target, replace_missing } => {
             if let Some(v) = expr.eval(&|k| get(r, k).and_then(|v| v.trim().parse::<f64>().ok()), *replace_missing)
                 && v.is_finite()
             {
-                let text = if v.fract() == 0.0 && v.abs() < 9.0e15 { format!("{}", v as i64) } else { format!("{v}") };
+                let text = if v.fract() == 0.0 && v.abs() < 9.0e15 {
+                    grok::int_text(v as i64)
+                } else {
+                    let mut s = spare::take();
+                    let _ = write!(s, "{v}");
+                    s
+                };
                 set(r, target, text);
             }
         }
         Proc::Builder { template, target, replace_missing } => {
-            let mut out = String::new();
+            let mut out = spare::take();
             for piece in template {
                 match piece {
                     Piece::Text(t) => out.push_str(t),
                     Piece::Attr(k) => match get(r, k) {
                         Some(v) => out.push_str(v),
                         None if *replace_missing => {}
-                        None => return,
+                        None => return spare::give(out),
                     },
                 }
             }
@@ -604,7 +641,8 @@ fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
         }
         Proc::Lookup { source, target, table, default } => {
             let Some(v) = get(r, source) else { return };
-            if let Some(found) = table.get(v.trim()).cloned().or_else(|| default.clone()) {
+            if let Some(found) = table.get(v.trim()).or(default.as_ref()) {
+                let found = spare::copy(found);
                 set(r, target, found);
             }
         }

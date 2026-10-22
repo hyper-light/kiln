@@ -23,7 +23,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-11 | Service level objectives (§9.2): ratio and time-slice SLIs over rolling timeframes, the standing (SLI, budget left, day by day, burn rates), burn-rate and budget alerts as monitors; checked live (§13); their pages (§11): the list, each one's standing and days, the workbook's alerts for its timeframe in a click, made and edited in a form; checked in Chromium and WebKit (§13) | done |
 | O-12 | Logs collected on every machine (§8.1): files by their globs (renamed, truncated, copied, deleted while read), Kubernetes' pods' and Docker's containers' logs with what they name, the systemd journal by its cursor, syslog received over UDP and TCP (RFC 5424 and 3164, RFC 6587's framings); Datadog's processing rules; macOS's unified log (`log stream`, and `log show` from its place after a restart) and the Windows Event Log's channels (`wevtutil`, each channel's record id its place); each line's place kept only once its record is written, so a stop repeats nothing and a kill at most the last second; checked live (a Mac's unified log; the Event Log against a stand-in for `wevtutil`, and on a Windows machine) and in browsers (§13), measured (§12.17); a JSON line read in place, no tree of it made (36 allocations a line to 18, 40% more lines a second); a line no pipeline reads, text or JSON, handed over as its row, in the order read beside records, a write's rows one item (a JSON line 18 allocations to 0.01, a text line 9 to 0.01; 50–100% more lines a second through the batcher, §12.17) | done |
-| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). Next: a matcher of grok's own, its groups in one pass | in progress |
+| O-13 | Log pipelines (§8.2): Datadog's, its JSON read as it is: a filter and processors in order (the grok parser with Datadog's matchers, filters and date patterns; the date, status, service, message, trace id and attribute remappers; the URL and user-agent parsers; category, arithmetic, string builder and lookup processors; a pipeline nested in one), applied where records are taken on every machine; kiln's own for nginx and Apache (Datadog's rules); kept by the server and told to runners; their page with a record tried before a pipeline is kept; checked live and in browsers (§13), measured (§12.17). Allocations a record through kiln's nginx pipeline 75 to 49, a date read without a second expression, a date past 2262 no longer overflowing (§12.17). grok's own matcher, its groups in one pass (held to `regex` by differential tests), a line a pipeline reads written as its row where it is read with its strings' room kept: through kiln's nginx pipeline 282–292 k to 585–615 k lines a second, 48 allocations a line to 0.02 (§12.17). Next: a record of one buffer | in progress |
 | O-14 | Metrics from logs (§8.3): Datadog's definitions (a count, or a distribution with or without percentiles, by facets), counted on the server, the one writer, each window whole once its records have come (the 99th percentile of how late they come) and again when more come within twenty minutes; OpenTelemetry's cardinality limit; their page, a definition tried on the last fifteen minutes before it is kept; checked live and in browsers (§13). Next: counting measured at a fleet's rates | in progress |
 | O-15 | Downtimes (§9.3): Datadog's, once or recurring (RFC 5545's rules in a timezone, their offsets' changes as RFC 5545 has them), for monitors by id or tags and the groups a scope holds; held groups' changes still events; as one ends, what is still wrong told once, a first recovery kept quiet when asked; their page and a monitor's line; checked live and in browsers (§13) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, Opsgenie, email through an SMTP relay (checked live against Mailpit: STARTTLS, a login, a CA of its own), signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); the clouds' logs (CloudWatch Logs, Cloud Logging, Log Analytics), each record once though every pull reads its lookback (§10.1); their pushes: Firehose (CloudWatch Metric Streams in JSON and in OpenTelemetry 1.0.0 and 0.7.0, Logs' subscriptions) and Pub/Sub (Cloud Logging's sinks), each delivery taken once (§10.2); Azure's event hubs read as they come over Kafka's protocol (a consumer of its own, offsets kept by kiln, each record once through restarts and a broker's), checked live against Apache Kafka's broker (§10.3) | in progress |
@@ -798,9 +798,11 @@ handed over as the row its record would write, written where it is read: a text 
 as it is (its message, the source's names, its file's or container's attributes, its tags, an
 error's issue), a JSON line from its fields as its reading flattens them into room kept from line
 to line. No record is made of it, and a test holds the row and the record's alike over every kind
-of line, JSON lines of every shape among them. A line a pipeline reads, and a service check's run,
-go as records. What a machine reads goes in the order it was read, rows beside records, and the
-batcher writes it so: a write's records and rows one item, compressed whole (§12.17).
+of line, JSON lines of every shape among them. A line a pipeline (or the scanner) reads is made its
+record where it is read, run through them, and written as its row there too, the record's strings
+handed back for the next line's (§8.2); a service check's run goes as a record. What a machine reads
+goes in the order it was read, rows beside records, and the batcher writes it so: a write's records
+and rows one item, compressed whole (§12.17).
 
 **Each line once.** A line's place (a file's offset, the journal's cursor) is kept only once the
 write that holds its record is applied by the group (`crate::observe::ingest::Ack`: the batcher
@@ -891,8 +893,12 @@ exported from Datadog reads here as it is: each pipeline a filter (a log search;
 record) and processors run in order on each record it matches, the pipelines in order, each reading
 what those before it made. The server keeps them (`<observe>/pipelines.json`) and tells every runner
 the list; each node applies it where it takes a record (a request's, a log source's, a cloud's), so
-what is stored is read already, on the machine that took it. A source's records are run through
-once, as they are gathered: an offer refused comes back and is not run again.
+what is stored is read already, on the machine that took it. A log source's line a pipeline (or the
+scanner, §8.9) reads is run through where it is read and written as its row then, the strings its
+record took handed back for the next line's (`pipeline::spare`: a line costs no allocation once a
+few are read); the row is the one its record wrote when records were run through as they were
+offered (a test holds 6,000 lines of every kind to it, byte for byte). Other records are run
+through once, as they are gathered: an offer refused comes back and is not run again.
 
 The processors are Datadog's: the **grok parser** (rules of literal text, a regular expression, and
 `%{matcher(args):attribute:filter(args)}` tokens, matching a value whole, the first rule that
@@ -909,6 +915,20 @@ matches names the record); the **arithmetic processor** (`+ - * / %`, `abs`, `ce
 `round`, `min`, `max`); the **string builder**; the **lookup processor**; and a **pipeline** nested
 in one, one deep. Rust's regular expressions do not backtrack: an atomic group `(?>…)` reads as a
 group, which matches the same wherever the atomic one would not have to give anything back.
+
+A rule is the value whole (`^(?:…)$`: its alternatives each the whole of it), read by grok's own
+matcher (`pipeline::matcher`): the rule's expression as regex's own parser reads it, compiled into a
+program a backtracking machine runs from the value's start, reading the rule's groups in that one
+pass (`regex` makes two: its lazy DFA finds the match, then its backtracker reads the groups after
+clearing a table of every state at every byte). A run of a class (`\S+`, `[^"]*`, `.*?`) is read as a
+run: one nothing after it may begin with what it holds gives nothing back, one that may gives back
+only where what follows may begin; of two ways on, one that cannot begin where the value is, is
+not tried; a value is refused by its last byte, or by a byte every match holds that it does not
+(`memchr`); and past a first stretch of work, a table of where the search has been keeps it to
+`regex`'s bound (each instruction at each byte once). It finds what `regex` finds, the leftmost-first
+match and every group where `regex` puts it (differential tests, §12.17); what it leaves to
+`regex`, `regex` reads: a loop that may match nothing each round (its empty rounds are `regex`'s to
+tell), and a search past its bound.
 
 kiln carries pipelines for nginx's and Apache's access and error logs (Datadog's own rules, then the
 time, the HTTP status's category as its status, the URL and the user agent read), applied to records
@@ -3083,6 +3103,69 @@ Two things the runs found beside it. Metrics from logs learned how late records 
 write's first item alone (a write held one item before): a write's records are one batch again,
 whatever items hold them (§13, metrics from logs). And the full disk's scenario assumed the machine it
 ran on (§13, a full disk).
+
+Then a matcher of grok's own (2026-10-22). The profile of a line through kiln's nginx pipeline
+(the collector's whole read, one core of adacachy): regex's backtracker 16.5%, its lazy DFA 9.9%,
+the user agent read 9% (a substring search for each of some twenty words, each making its
+searcher), attributes set 4% (`put`), their keys made by `format!` 3.5%, the rest allocation, 48 a
+line. Each step below measured on the collect bench's pipeline case, the binaries before and after
+built alike and run in turn on one core (the machine's load 10 to 37 through it; instructions and
+allocations hold, rates less so):
+
+| | lines a second | allocations a line | page faults a read |
+| --- | --- | --- | --- |
+| before | 282–292 k | 48.01 | 13.9 k |
+| grok's own matcher (§8.2) | 403–421 k | 48.00 | 49 k |
+| and a line refused by a byte every match holds | 445–450 k | 48.00 | 49 k |
+| the user agent's words found in one pass, keys joined without `format!` | 542–544 k | 43.00 | 47 k |
+| a line a pipeline reads written as its row where it is read, its strings' room kept | 585–615 k | 0.02 | 15.2–16.0 k |
+
+grok alone (`cargo bench -p kiln --bench grok`: kiln's nginx rules, Datadog's, on 100,000 lines of
+each kind, each line's attributes handed back once read, the median of five rounds):
+
+| | ns a line, grok's own | ns a line, `regex` | allocations a line |
+| --- | --- | --- | --- |
+| a combined access line (the second rule) | 605–610 | 1,807–1,834 | 0 |
+| a common one (the first) | 535–540 | 1,008–1,029 | 0 |
+| an error line (the third) | 894–896 | 2,821–2,863 | 0 |
+| a line no rule reads | 12 | 85 | 0 |
+
+How it is held to `regex`: 3,000 random patterns of what rules are made of (literal text, classes
+Unicode's and ASCII's, greedy and lazy runs, counted repetitions, alternatives, groups optional and
+nested, word boundaries and anchors), each on texts it would match, those changed a character, and
+random texts of the characters they name (Unicode's spaces, digits and letters among them): 89,344
+values, 28,371 matching, every group where `regex` puts it (208 patterns of the 3,000 are
+`regex`'s: a loop that may match nothing). Datadog's access rule on lines cut short, changed and
+doubled; kiln's access and error rules on 18,000 lines of every part's shapes, by grok's own and by
+`regex` alone: the same rule, the same attributes. Searches that would take a value's square (`(?:a+)+b.`
+on 20,000 `a`s) fail in milliseconds. The user agent's one pass against the twenty searches on
+20,000 random agents; integers' text against `parse` and `to_string`; the severity of a line's first
+words (below) against its reading before on 50,000 lines.
+
+Page faults rose with the matcher, 13.9 k to 49 k a read: with glibc's trimming off
+(`GLIBC_TUNABLES=glibc.malloc.trim_threshold=1073741824`) they are 5.5 k and 5.3 k, and the matcher's
+gain +60% (291 k to 467 k): `regex`'s lazy DFAs' caches, long-lived, had held the heap's top, which
+glibc now handed back between batches and faulted in again. With no allocation a line, 15–16 k.
+
+The row where the line is read: a line a pipeline (or the scanner) reads was a record, carried in its
+batch to the offer, run through there, written as its row by the batcher, and dropped. It is made
+where it is read now (its strings taken from those the thread's records handed back), run through
+every pipeline and the scanner, given its issue, written as its row into the batch's segment, and
+its strings handed back (a thread keeps 1,024 at the most, 1 MiB of room, none longer than 4 KiB).
+The processors take theirs there too (grok's names and values, the URL's and the user agent's parts,
+a category's name, a builder's text); what one replaces is handed back. A JSON line the scanner reads
+for an email each: 20 allocations a line to 5.
+
+A line's level read from its first words passes a word with no `=` whose first letter or digit is
+not a capital at once (only capitals are a level there): plain text lines (an nginx access log, no
+pipeline) 5.54 M to 6.15 M lines a second, the access log with an exclude and a mask 3.27 M to
+3.57 M. JSON and CRI lines run 2% more cycles at 0.15% fewer instructions (fewer branch and
+instruction-cache misses): the code's layout, nothing they do.
+
+What is left through the pipeline: the matcher 18% (an interpreter's dispatch, spread across its
+instructions), a record's ~47 strings each copied in and handed back 25% (the time falls on the string's
+reload as its copy returns: some 20 cycles a string), the row's encoding 5%. Next: a record of one buffer, its
+attributes' text side by side (the processors, the search's filters and the scanner reading it).
 
 ### 12.18 Metrics from logs
 
