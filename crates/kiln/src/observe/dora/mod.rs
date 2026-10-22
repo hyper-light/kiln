@@ -109,12 +109,13 @@ fn load(path: &Path, keep_from: i64) -> (Ledger, usize) {
         tracing::warn!(lines = bad, file = %path.display(), "DORA's ledger: lines that do not read passed over");
     }
     l.expire(keep_from);
+    l.shrink();
     (l, lines)
 }
 
 /// Every entry of `l` as a line.
 fn lines_of(l: &Ledger) -> Vec<Line> {
-    let mut out: Vec<Line> = l.deployments().map(|d| Line::Deployment(Box::new(d.clone()))).collect();
+    let mut out: Vec<Line> = l.deployments().map(|d| Line::Deployment(Box::new(d))).collect();
     out.extend(l.failures().map(|f| Line::Failure(Box::new(f.clone()))));
     out
 }
@@ -243,8 +244,8 @@ impl Dora {
         let turn = self.turn(&d.service, &d.env);
         let _t = turn.lock().await;
         let (prev, next, existed) = self.read(|l| {
-            let prev = l.before(&d.service, &d.env, d.finished_at, &d.id).cloned();
-            let next = l.after(&d.service, &d.env, d.finished_at, &d.id).cloned();
+            let prev = l.before(&d.service, &d.env, d.finished_at, &d.id);
+            let next = l.after(&d.service, &d.env, d.finished_at, &d.id);
             (prev, next, l.deployment(&d.id).is_some())
         });
         if unless_running && prev.as_ref().is_some_and(|p| same_deploy(p, &d)) {
@@ -262,10 +263,10 @@ impl Dora {
                     if l.mark(&m.failed, m.found, Some((&id, m.kind)))
                         && let Some(f) = l.deployment(&m.failed)
                     {
-                        marked.push(f.clone());
+                        marked.push(f);
                     }
                 }
-                let kept = l.deployment(&id).cloned();
+                let kept = l.deployment(&id);
                 let mut lines: Vec<Line> = marked.iter().map(|f| Line::Deployment(Box::new(f.clone()))).collect();
                 lines.extend(kept.iter().map(|k| Line::Deployment(Box::new(k.clone()))));
                 ((kept, marked), lines)
@@ -291,11 +292,8 @@ impl Dora {
         let commits = self.commits(Some(prev), next).await;
         let (lead, _, shas, titles) = commits.as_deref().map(|c| ledger::read_commits(next.finished_at, c)).unwrap_or_default();
         let id = next.id.clone();
-        self.change(|l| match l.deployment_mut(&id) {
-            Some(n) => {
-                (n.lead, n.shas, n.titles) = (lead, shas, titles);
-                ((), vec![Line::Deployment(Box::new(n.clone()))])
-            }
+        self.change(|l| match l.set_commits(&id, lead, &shas, &titles) {
+            Some(n) => ((), vec![Line::Deployment(Box::new(n))]),
             None => ((), Vec::new()),
         })
         .await;
@@ -323,7 +321,7 @@ impl Dora {
         let _t = turn.lock().await;
         let (changed, now) = self
             .change(|l| {
-                let Some(d) = l.deployment(id).cloned() else { return (Err(PatchError::NoDeployment), Vec::new()) };
+                let Some(d) = l.deployment(id) else { return (Err(PatchError::NoDeployment), Vec::new()) };
                 let remedy = match &remedy {
                     None => None,
                     Some(r) => match r.find(l, &d) {
@@ -334,13 +332,13 @@ impl Dora {
                 };
                 let changed = if failed { l.mark(id, Found::Manual, remedy.as_ref().map(|(r, k)| (r.as_str(), *k))) } else { l.unmark(id) };
                 let mut lines = Vec::new();
-                let now = l.deployment(id).cloned();
+                let now = l.deployment(id);
                 if changed {
                     if let Some(r) = remedy.as_ref().and_then(|(r, _)| l.deployment(r)) {
-                        lines.push(Line::Deployment(Box::new(r.clone())));
+                        lines.push(Line::Deployment(Box::new(r)));
                     }
                     if let Some(old) = d.change_failure.as_ref().and_then(|cf| cf.remedy.as_ref()).and_then(|r| l.deployment(&r.id)) {
-                        lines.push(Line::Deployment(Box::new(old.clone())));
+                        lines.push(Line::Deployment(Box::new(old)));
                     }
                     lines.extend(now.iter().map(|n| Line::Deployment(Box::new(n.clone()))));
                 }
@@ -359,9 +357,9 @@ impl Dora {
         let id = id.to_owned();
         self.change(|l| match l.remove(&id) {
             Some(d) => {
-                let mut lines: Vec<Line> = d.remedies.iter().filter_map(|f| l.deployment(f)).map(|f| Line::Deployment(Box::new(f.clone()))).collect();
+                let mut lines: Vec<Line> = d.remedies.iter().filter_map(|f| l.deployment(f)).map(|f| Line::Deployment(Box::new(f))).collect();
                 if let Some(r) = d.change_failure.as_ref().and_then(|cf| cf.remedy.as_ref()).and_then(|r| l.deployment(&r.id)) {
-                    lines.push(Line::Deployment(Box::new(r.clone())));
+                    lines.push(Line::Deployment(Box::new(r)));
                 }
                 lines.push(Line::DeploymentGone(id.clone()));
                 (true, lines)
@@ -419,7 +417,7 @@ impl RemedyBy {
     /// service and environment's.
     fn find(&self, l: &Ledger, failed: &Deployment) -> Option<String> {
         if let Some(id) = &self.id {
-            return l.deployment(id).filter(|d| d.service == failed.service && d.env == failed.env).map(|d| d.id.clone());
+            return l.deployment(id).filter(|d| d.service == failed.service && d.env == failed.env).map(|d| d.id);
         }
         let version = self.version.as_deref()?;
         let mut at = (failed.finished_at, failed.id.clone());
@@ -620,8 +618,8 @@ mod tests {
 
     const H: i64 = 3_600 * ledger::NS_PER_S;
 
-    fn dep(id: &str, h: i64, c: char) -> Deployment {
-        let t0 = now_ns() - 100 * H;
+    /// A deployment `h` hours after `t0` (the test's, taken once: the clock moves as it runs).
+    fn dep(t0: i64, id: &str, h: i64, c: char) -> Deployment {
         Deployment {
             id: id.into(),
             service: "shop".into(),
@@ -653,13 +651,14 @@ mod tests {
     /// passed over; the file is rewritten once it holds twice what stands.
     #[test]
     fn the_ledger_is_read_back_as_it_was_kept() {
+        let t0 = now_ns() - 100 * H;
         let dir = tempfile::tempdir().unwrap();
         let d = Dora::open(dir.path(), None);
         let taking = d.clone();
         crate::rt::block_on(async move {
             let d = taking;
             for (id, h, c) in [("a", 0, '1'), ("b", 1, '2'), ("c", 2, '3'), ("back", 3, '1'), ("e", 4, '4'), ("f", 5, '5')] {
-                d.deploy(dep(id, h, c), false).await.unwrap();
+                d.deploy(dep(t0, id, h, c), false).await.unwrap();
             }
             d.patch("e", true, Some(RemedyBy { id: Some("f".into()), version: None, kind: RemedyKind::Rollforward })).await.unwrap();
             assert_eq!(d.patch("e", true, Some(RemedyBy { id: Some("e".into()), version: None, kind: RemedyKind::Rollback })).await.unwrap_err(), PatchError::OwnRemedy);
@@ -698,7 +697,7 @@ mod tests {
         let taking = again.clone();
         crate::rt::block_on(async move {
             for _ in 0..200 {
-                taking.deploy(dep("f", 5, '5'), false).await.unwrap();
+                taking.deploy(dep(t0, "f", 5, '5'), false).await.unwrap();
             }
             anyhow::Ok(())
         })
@@ -746,18 +745,19 @@ mod tests {
     /// none, when asked so (kiln CD's self-heals).
     #[test]
     fn deployments_go_in_their_place_whatever_order_they_come_in() {
+        let t0 = now_ns() - 100 * H;
         let dir = tempfile::tempdir().unwrap();
         let d = Dora::open(dir.path(), None);
         crate::rt::block_on(async move {
-            d.deploy(dep("one", 0, '1'), false).await.unwrap();
-            d.deploy(dep("three", 2, '3'), false).await.unwrap();
+            d.deploy(dep(t0, "one", 0, '1'), false).await.unwrap();
+            d.deploy(dep(t0, "three", 2, '3'), false).await.unwrap();
             // Late: between them.
-            d.deploy(dep("two", 1, '2'), false).await.unwrap();
-            assert_eq!(d.read(|l| l.before("shop", "prod", dep("three", 2, '3').finished_at, "three").map(|x| x.id.clone())), Some("two".into()));
-            d.deploy(dep("back", 3, '1'), false).await.unwrap();
+            d.deploy(dep(t0, "two", 1, '2'), false).await.unwrap();
+            assert_eq!(d.read(|l| l.before("shop", "prod", dep(t0, "three", 2, '3').finished_at, "three").map(|x| x.id.clone())), Some("two".into()));
+            d.deploy(dep(t0, "back", 3, '1'), false).await.unwrap();
             assert_eq!(d.read(|l| l.deployment("two").and_then(|x| x.change_failure.clone()).map(|cf| cf.found)), Some(Found::Rollback));
-            assert!(d.deploy(dep("same", 4, '1'), true).await.is_none(), "a redeploy of what runs");
-            assert!(d.deploy(dep("new", 5, '9'), true).await.is_some());
+            assert!(d.deploy(dep(t0, "same", 4, '1'), true).await.is_none(), "a redeploy of what runs");
+            assert!(d.deploy(dep(t0, "new", 5, '9'), true).await.is_some());
             anyhow::Ok(())
         })
         .unwrap();

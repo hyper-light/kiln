@@ -2,7 +2,8 @@
 //! environment's deployments in the order they finished; what a deployment's coming marks failed
 //! (a rollback, a revert, a hotfix, as Datadog finds them); the four keys over a range.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -199,14 +200,28 @@ pub fn sha_key(sha: &str) -> Option<u64> {
     ((7..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| fnv_lower(s))
 }
 
-/// A title's key.
-pub fn title_key(title: &str) -> u64 {
-    fnv(title.trim())
+/// A title as two are compared: trimmed, without a squashed pull request's number at its end
+/// (GitHub's ` (#123)`).
+fn title_text(title: &str) -> &str {
+    let t = title.trim();
+    if let Some(open) = t.rfind(" (#")
+        && t.ends_with(')')
+        && t.get(open + 3..t.len() - 1).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return t.get(..open).unwrap_or(t).trim_end();
+    }
+    t
 }
 
-/// The title a revert's names: `Revert "<title>"`.
+/// A title's key.
+pub fn title_key(title: &str) -> u64 {
+    fnv(title_text(title))
+}
+
+/// The title a revert's names: `Revert "<title>"` (a squashed pull request's, `Revert "<title>"
+/// (#123)`).
 pub fn reverted_title(title: &str) -> Option<&str> {
-    title.trim().strip_prefix("Revert \"")?.strip_suffix('"')
+    title_text(title).strip_prefix("Revert \"")?.strip_suffix('"')
 }
 
 /// Whether a commit's title says it is a hotfix (a squashed pull request's title, a merge's branch).
@@ -251,12 +266,6 @@ pub fn median(mut v: Vec<f64>) -> Option<f64> {
     Some(if n % 2 == 1 { hi } else { (v.get(n / 2 - 1).copied()? + hi) / 2.0 })
 }
 
-type Key = (String, String);
-
-fn key_of(service: &str, env: &str) -> Key {
-    (service.to_owned(), env.to_owned())
-}
-
 /// What the four keys are taken over: a range of finish times (ns, `[from, to)`), and a service,
 /// an environment and a team when given.
 #[derive(Debug, Clone, Default)]
@@ -269,10 +278,6 @@ pub struct Query {
 }
 
 impl Query {
-    fn picks(&self, service: &str, env: &str, team: &str) -> bool {
-        self.service.as_deref().is_none_or(|s| s == service) && self.env.as_deref().is_none_or(|e| e == env) && self.team.as_deref().is_none_or(|t| t == team)
-    }
-
     fn picks_failure(&self, f: &Failure) -> bool {
         self.service.as_deref().is_none_or(|s| f.services.iter().any(|x| x == s)) && self.env.as_deref().is_none_or(|e| e == f.env) && self.team.as_deref().is_none_or(|t| t == f.team)
     }
@@ -319,23 +324,226 @@ pub fn week_of(t: i64) -> i64 {
     t.saturating_sub(monday).div_euclid(WEEK_NS).saturating_mul(WEEK_NS).saturating_add(monday)
 }
 
+/// Names many deployments share (their services, environments, teams, sources and repositories),
+/// each held once and told by its number. They are few (an organization's), and kept.
+#[derive(Debug, Default)]
+struct Names {
+    all: Vec<Arc<str>>,
+    of: HashMap<Arc<str>, u32>,
+}
+
+impl Names {
+    /// `s`'s number, given it when it has none.
+    fn put(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.of.get(s) {
+            return i;
+        }
+        let i = u32::try_from(self.all.len()).unwrap_or(u32::MAX);
+        let a: Arc<str> = Arc::from(s);
+        self.all.push(a.clone());
+        self.of.insert(a, i);
+        i
+    }
+
+    /// `s`'s number, if it has one.
+    fn get(&self, s: &str) -> Option<u32> {
+        self.of.get(s).copied()
+    }
+
+    fn str(&self, i: u32) -> &str {
+        self.all.get(i as usize).map_or("", |s| s)
+    }
+}
+
+/// A deployment as the ledger holds it: what many share by its number, the rest as small as it goes
+/// (a busy kiln keeps a million).
+#[derive(Debug)]
+struct Row {
+    id: Arc<str>,
+    service: u32,
+    env: u32,
+    team: u32,
+    source: u32,
+    /// Its repository (by number) and commit; an empty commit, none.
+    repo: u32,
+    sha: Box<str>,
+    version: Box<str>,
+    started_at: i64,
+    finished_at: i64,
+    tags: Box<[Box<str>]>,
+    lead: Option<Lead>,
+    change_failure: Option<Box<ChangeFailure>>,
+    remedies: Vec<Arc<str>>,
+    /// Its commits' keys: their shas' (the first `shas`), then their titles'.
+    commits: Box<[u64]>,
+    shas: u32,
+    /// What it deploys, hashed: what a rollback is told by.
+    ident: Option<u64>,
+    /// Its place among deployments finished at the same instant: its id's hash (another's, nudged).
+    tie: u64,
+}
+
+impl Row {
+    fn shas(&self) -> &[u64] {
+        self.commits.get(..self.shas as usize).unwrap_or(&[])
+    }
+
+    fn titles(&self) -> &[u64] {
+        self.commits.get(self.shas as usize..).unwrap_or(&[])
+    }
+
+    fn recovery_ns(&self) -> Option<i64> {
+        let r = self.change_failure.as_ref()?.remedy.as_ref()?;
+        Some(r.finished_at.saturating_sub(self.finished_at).max(0))
+    }
+}
+
+/// A kept deployment, read where it is held.
+#[derive(Debug, Clone, Copy)]
+pub struct RowRef<'a> {
+    r: &'a Row,
+    n: &'a Names,
+}
+
+impl<'a> RowRef<'a> {
+    pub fn id(&self) -> &'a str {
+        &self.r.id
+    }
+
+    pub fn service_name(&self) -> &'a str {
+        self.n.str(self.r.service)
+    }
+
+    pub fn env(&self) -> &'a str {
+        self.n.str(self.r.env)
+    }
+
+    pub fn version(&self) -> &'a str {
+        &self.r.version
+    }
+
+    pub fn started_at(&self) -> i64 {
+        self.r.started_at
+    }
+
+    pub fn finished_at(&self) -> i64 {
+        self.r.finished_at
+    }
+
+    pub fn change_failure(&self) -> Option<&'a ChangeFailure> {
+        self.r.change_failure.as_deref()
+    }
+
+    /// It as the API and the ledger's file say it.
+    pub fn to_deployment(&self) -> Deployment {
+        let r = self.r;
+        Deployment {
+            id: r.id.to_string(),
+            service: self.n.str(r.service).to_owned(),
+            env: self.n.str(r.env).to_owned(),
+            team: self.n.str(r.team).to_owned(),
+            version: r.version.to_string(),
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            git: (!r.sha.is_empty()).then(|| Git { commit_sha: r.sha.to_string(), repository_url: self.n.str(r.repo).to_owned() }),
+            custom_tags: r.tags.iter().map(|t| t.to_string()).collect(),
+            source: self.n.str(r.source).to_owned(),
+            lead: r.lead,
+            change_failure: r.change_failure.as_deref().cloned(),
+            remedies: r.remedies.iter().map(|x| x.to_string()).collect(),
+            shas: r.shas().to_vec(),
+            titles: r.titles().to_vec(),
+        }
+    }
+}
+
+/// A kept deployment as a log search reads it: its service, its `env`, `team`, `version`, `id`,
+/// `git.commit_sha` and `git.repository_url`, its tags, `change_failure` (`true` when marked).
+impl kiln_obs::logs::search::Fields for RowRef<'_> {
+    fn message(&self) -> &str {
+        ""
+    }
+    fn service(&self) -> &str {
+        self.n.str(self.r.service)
+    }
+    fn host(&self) -> &str {
+        ""
+    }
+    fn source(&self) -> &str {
+        "dora"
+    }
+    fn severity(&self) -> u8 {
+        if self.r.change_failure.is_some() { 17 } else { 9 }
+    }
+    fn attr(&self, key: &str) -> Option<&str> {
+        let r = self.r;
+        match key {
+            "env" => Some(self.n.str(r.env)),
+            "team" => Some(self.n.str(r.team)),
+            "version" => Some(&*r.version),
+            "id" => Some(&*r.id),
+            "git.commit_sha" => Some(&*r.sha),
+            "git.repository_url" => (!r.sha.is_empty()).then(|| self.n.str(r.repo)),
+            "change_failure" => Some(if r.change_failure.is_some() { "true" } else { "false" }),
+            other => r.tags.iter().find_map(|t| t.split_once(':').filter(|(k, _)| *k == other).map(|(_, v)| v)),
+        }
+        .filter(|v| !v.is_empty())
+    }
+    fn trace_id(&self) -> Option<[u8; 16]> {
+        None
+    }
+    fn span_id(&self) -> Option<[u8; 8]> {
+        None
+    }
+}
+
+type Key = (u32, u32);
+
 /// Every deployment and failure kept.
 #[derive(Debug, Default)]
 pub struct Ledger {
-    deployments: HashMap<String, Deployment>,
-    /// Each service and environment's deployments by finish (then id).
-    order: HashMap<Key, BTreeSet<(i64, String)>>,
+    names: Names,
+    /// The deployments, in no order (a slab: a removed one's place taken by the last), and where
+    /// each id's is. A map of rows would round its table up to a power of two of them.
+    rows: Vec<Row>,
+    at: HashMap<Arc<str>, u32>,
+    /// Each service and environment's deployments by finish (then a hash of the id), each its row's
+    /// place: a range read in order without a lookup by id.
+    order: HashMap<Key, BTreeMap<(i64, u64), u32>>,
     /// Each service and environment's deployments by what they deploy, how many: a rollback's target
     /// is looked for only when what a deployment deploys was deployed before.
     deployed: HashMap<Key, HashMap<u64, u32>>,
     /// The teams the deployments name, how many each.
-    teams: HashMap<String, u32>,
+    teams: HashMap<u32, u32>,
     failures: HashMap<String, Failure>,
 }
 
 impl Ledger {
-    pub fn deployment(&self, id: &str) -> Option<&Deployment> {
-        self.deployments.get(id)
+    fn view<'a>(&'a self, r: &'a Row) -> RowRef<'a> {
+        RowRef { r, n: &self.names }
+    }
+
+    fn get(&self, id: &str) -> Option<&Row> {
+        self.at.get(id).and_then(|&i| self.rows.get(i as usize))
+    }
+
+    fn get_mut(&mut self, id: &str) -> Option<&mut Row> {
+        let i = *self.at.get(id)?;
+        self.rows.get_mut(i as usize)
+    }
+
+    /// A service and environment's key, if either is known.
+    fn key(&self, service: &str, env: &str) -> Option<Key> {
+        Some((self.names.get(service)?, self.names.get(env)?))
+    }
+
+    pub fn deployment(&self, id: &str) -> Option<Deployment> {
+        self.get(id).map(|r| self.view(r).to_deployment())
+    }
+
+    /// A kept deployment, read where it is held.
+    pub fn row(&self, id: &str) -> Option<RowRef<'_>> {
+        self.get(id).map(|r| self.view(r))
     }
 
     pub fn failure(&self, id: &str) -> Option<&Failure> {
@@ -344,73 +552,146 @@ impl Ledger {
 
     /// How many deployments and failures it keeps.
     pub fn len(&self) -> (usize, usize) {
-        (self.deployments.len(), self.failures.len())
+        (self.rows.len(), self.failures.len())
     }
 
-    pub fn deployments(&self) -> impl Iterator<Item = &Deployment> {
-        self.deployments.values()
+    /// Every deployment, read where it is held.
+    pub fn rows(&self) -> impl Iterator<Item = RowRef<'_>> {
+        self.rows.iter().map(|r| self.view(r))
+    }
+
+    /// Every deployment, as the ledger's file says them.
+    pub fn deployments(&self) -> impl Iterator<Item = Deployment> + '_ {
+        self.rows().map(|r| r.to_deployment())
     }
 
     pub fn failures(&self) -> impl Iterator<Item = &Failure> {
         self.failures.values()
     }
 
-    /// The deployment of `service` in `env` just before `(at, id)`.
-    pub fn before(&self, service: &str, env: &str, at: i64, id: &str) -> Option<&Deployment> {
-        let set = self.order.get(&key_of(service, env))?;
-        let (_, prev) = set.range(..(at, id.to_owned())).next_back()?;
-        self.deployments.get(prev)
+    /// The row just before (or after) `(at, tie)` of `key`.
+    fn next_to(&self, key: Key, at: i64, tie: u64, before: bool) -> Option<&Row> {
+        let set = self.order.get(&key)?;
+        let found = if before { set.range(..(at, tie)).next_back() } else { set.range((std::ops::Bound::Excluded((at, tie)), std::ops::Bound::Unbounded)).next() };
+        found.and_then(|(_, &i)| self.rows.get(i as usize))
     }
 
-    /// The deployment of `service` in `env` just after `(at, id)`.
-    pub fn after(&self, service: &str, env: &str, at: i64, id: &str) -> Option<&Deployment> {
-        let set = self.order.get(&key_of(service, env))?;
-        let start = (at, id.to_owned());
-        let (_, next) = set.range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded)).next()?;
-        self.deployments.get(next)
+    /// A deployment's tiebreak: its own, when it is kept; its id's hash else.
+    fn tie_of(&self, id: &str) -> u64 {
+        self.get(id).map_or_else(|| fnv(id), |r| r.tie)
     }
 
-    /// A kept deployment, to change what it says of its commits (not its service, environment or
-    /// finish: [`Ledger::put`] those).
-    pub fn deployment_mut(&mut self, id: &str) -> Option<&mut Deployment> {
-        self.deployments.get_mut(id)
+    /// The deployment of `service` in `env` just before `(at, id)`, `id` itself passed over (kept
+    /// at another time, it is said again).
+    pub fn before(&self, service: &str, env: &str, at: i64, id: &str) -> Option<Deployment> {
+        let set = self.order.get(&self.key(service, env)?)?;
+        set.range(..(at, self.tie_of(id))).rev().filter_map(|(_, &i)| self.rows.get(i as usize)).find(|r| &*r.id != id).map(|r| self.view(r).to_deployment())
     }
 
-    /// `d` kept, replacing one of its id (which comes back): the marks that one had and `d` does
-    /// not say stay (it was found failed, or remedied one).
-    pub fn put(&mut self, mut d: Deployment) -> Option<Deployment> {
+    /// The deployment of `service` in `env` just after `(at, id)`, `id` itself passed over.
+    pub fn after(&self, service: &str, env: &str, at: i64, id: &str) -> Option<Deployment> {
+        let set = self.order.get(&self.key(service, env)?)?;
+        set.range((std::ops::Bound::Excluded((at, self.tie_of(id))), std::ops::Bound::Unbounded))
+            .filter_map(|(_, &i)| self.rows.get(i as usize))
+            .find(|r| &*r.id != id)
+            .map(|r| self.view(r).to_deployment())
+    }
+
+    /// The latest deployment of `service` in `env` at `version`.
+    pub fn find_version(&self, service: &str, env: &str, version: &str) -> Option<String> {
+        let set = self.order.get(&self.key(service, env)?)?;
+        set.values().rev().filter_map(|&i| self.rows.get(i as usize)).find(|r| &*r.version == version).map(|r| r.id.to_string())
+    }
+
+    /// What a kept deployment's commits say of it (its lead, its commits' keys): it as it is now.
+    pub fn set_commits(&mut self, id: &str, lead: Option<Lead>, shas: &[u64], titles: &[u64]) -> Option<Deployment> {
+        let r = self.get_mut(id)?;
+        r.lead = lead;
+        r.commits = shas.iter().chain(titles).copied().collect();
+        r.shas = u32::try_from(shas.len()).unwrap_or(u32::MAX);
+        self.deployment(id)
+    }
+
+    /// `d` kept, replacing one of its id: the marks that one had and `d` does not say stay (it was
+    /// found failed, or remedied one). Whether one was replaced.
+    pub fn put(&mut self, d: Deployment) -> bool {
         let old = self.unlink(&d.id);
-        if let Some(o) = &old {
-            if d.change_failure.is_none() {
-                d.change_failure.clone_from(&o.change_failure);
+        let ident = d.ident();
+        let mut commits: Vec<u64> = d.shas;
+        let shas = u32::try_from(commits.len()).unwrap_or(u32::MAX);
+        commits.extend(d.titles);
+        let id: Arc<str> = Arc::from(d.id.as_str());
+        let mut row = Row {
+            id: id.clone(),
+            service: self.names.put(&d.service),
+            env: self.names.put(&d.env),
+            team: self.names.put(&d.team),
+            source: self.names.put(&d.source),
+            repo: d.git.as_ref().map_or(u32::MAX, |g| self.names.put(&g.repository_url)),
+            sha: d.git.map(|g| g.commit_sha.into_boxed_str()).unwrap_or_default(),
+            version: d.version.into_boxed_str(),
+            started_at: d.started_at,
+            finished_at: d.finished_at,
+            tags: d.custom_tags.into_iter().map(String::into_boxed_str).collect(),
+            lead: d.lead,
+            change_failure: d.change_failure.map(Box::new),
+            remedies: d.remedies.iter().map(|x| Arc::from(x.as_str())).collect(),
+            commits: commits.into_boxed_slice(),
+            shas,
+            ident,
+            tie: fnv(&id),
+        };
+        let existed = old.is_some();
+        if let Some(o) = old {
+            if row.change_failure.is_none() {
+                row.change_failure = o.change_failure;
             }
-            if d.remedies.is_empty() {
-                d.remedies.clone_from(&o.remedies);
+            if row.remedies.is_empty() {
+                row.remedies = o.remedies;
             }
         }
-        let key = key_of(&d.service, &d.env);
-        if let Some(i) = d.ident() {
-            *self.deployed.entry(key.clone()).or_default().entry(i).or_default() += 1;
+        let key = (row.service, row.env);
+        if let Some(i) = row.ident {
+            *self.deployed.entry(key).or_default().entry(i).or_default() += 1;
         }
-        if !d.team.is_empty() {
-            *self.teams.entry(d.team.clone()).or_default() += 1;
+        *self.teams.entry(row.team).or_default() += 1;
+        let place = u32::try_from(self.rows.len()).unwrap_or(u32::MAX);
+        let set = self.order.entry(key).or_default();
+        // Two ids of one hash, finished at one instant: the later nudged past it.
+        while set.contains_key(&(row.finished_at, row.tie)) {
+            row.tie = row.tie.wrapping_add(1);
         }
-        self.order.entry(key).or_default().insert((d.finished_at, d.id.clone()));
-        self.deployments.insert(d.id.clone(), d);
-        old
+        set.insert((row.finished_at, row.tie), place);
+        self.at.insert(id, place);
+        self.rows.push(row);
+        existed
     }
 
     /// The deployment `id` out of the maps, its marks and those naming it untouched.
-    fn unlink(&mut self, id: &str) -> Option<Deployment> {
-        let d = self.deployments.remove(id)?;
-        let key = key_of(&d.service, &d.env);
+    fn unlink(&mut self, id: &str) -> Option<Row> {
+        let i = self.at.remove(id)? as usize;
+        if i >= self.rows.len() {
+            return None;
+        }
+        let r = self.rows.swap_remove(i);
+        let key = (r.service, r.env);
         if let Some(set) = self.order.get_mut(&key) {
-            set.remove(&(d.finished_at, d.id.clone()));
+            set.remove(&(r.finished_at, r.tie));
             if set.is_empty() {
                 self.order.remove(&key);
             }
         }
-        if let Some(i) = d.ident()
+        // The last row is in its place now: where it is said to be, there.
+        if let Some(moved) = self.rows.get(i) {
+            let place = u32::try_from(i).unwrap_or(u32::MAX);
+            if let Some(x) = self.at.get_mut(&*moved.id) {
+                *x = place;
+            }
+            if let Some(x) = self.order.get_mut(&(moved.service, moved.env)).and_then(|set| set.get_mut(&(moved.finished_at, moved.tie))) {
+                *x = place;
+            }
+        }
+        if let Some(i) = r.ident
             && let Some(m) = self.deployed.get_mut(&key)
         {
             if let Some(n) = m.get_mut(&i) {
@@ -423,33 +704,33 @@ impl Ledger {
                 self.deployed.remove(&key);
             }
         }
-        if let Some(n) = self.teams.get_mut(&d.team) {
+        if let Some(n) = self.teams.get_mut(&r.team) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                self.teams.remove(&d.team);
+                self.teams.remove(&r.team);
             }
         }
-        Some(d)
+        Some(r)
     }
 
     /// The deployment `id` gone, and every mark naming it: what it remedied is failed still (the
-    /// failure was found), without its remedy; what remedied it no longer names it.
+    /// failure was found), without its remedy; what remedied it no longer names it. It, as it was.
     pub fn remove(&mut self, id: &str) -> Option<Deployment> {
-        let d = self.unlink(id)?;
-        for failed in &d.remedies {
-            if let Some(f) = self.deployments.get_mut(failed)
+        let r = self.unlink(id)?;
+        for failed in &r.remedies {
+            if let Some(f) = self.get_mut(failed)
                 && let Some(cf) = f.change_failure.as_mut()
-                && cf.remedy.as_ref().is_some_and(|r| r.id == d.id)
+                && cf.remedy.as_ref().is_some_and(|x| *x.id == *r.id)
             {
                 cf.remedy = None;
             }
         }
-        if let Some(r) = d.change_failure.as_ref().and_then(|cf| cf.remedy.as_ref())
-            && let Some(by) = self.deployments.get_mut(&r.id)
+        if let Some(x) = r.change_failure.as_ref().and_then(|cf| cf.remedy.as_ref())
+            && let Some(by) = self.get_mut(x.id.as_str())
         {
-            by.remedies.retain(|x| *x != d.id);
+            by.remedies.retain(|f| *f != r.id);
         }
-        Some(d)
+        Some(self.view(&r).to_deployment())
     }
 
     pub fn put_failure(&mut self, f: Failure) -> Option<Failure> {
@@ -462,7 +743,7 @@ impl Ledger {
 
     /// Every deployment finished and failure begun before `before` (ns) gone: how many.
     pub fn expire(&mut self, before: i64) -> usize {
-        let old: Vec<String> = self.deployments.values().filter(|d| d.finished_at < before).map(|d| d.id.clone()).collect();
+        let old: Vec<Arc<str>> = self.rows.iter().filter(|r| r.finished_at < before).map(|r| r.id.clone()).collect();
         let gone_failures: Vec<String> = self.failures.values().filter(|f| f.started_at < before).map(|f| f.id.clone()).collect();
         for id in &old {
             self.remove(id);
@@ -473,26 +754,39 @@ impl Ledger {
         old.len() + gone_failures.len()
     }
 
+    /// Its maps no larger than what they hold (once it is read at the start).
+    pub fn shrink(&mut self) {
+        self.rows.shrink_to_fit();
+        self.at.shrink_to_fit();
+        self.order.shrink_to_fit();
+        self.deployed.shrink_to_fit();
+        for m in self.deployed.values_mut() {
+            m.shrink_to_fit();
+        }
+        self.failures.shrink_to_fit();
+    }
+
     /// What the deployment `id` (kept) marks failed, its commits those `commits` (newest first, as
     /// git's log gives them): a rollback's, a revert's and a hotfix's (Datadog's rules), each failed
     /// deployment once (the first rule that finds it).
     pub fn detect(&self, id: &str, commits: &[Commit]) -> Vec<Mark> {
-        let Some(d) = self.deployments.get(id) else { return Vec::new() };
+        let Some(d) = self.get(id) else { return Vec::new() };
+        let key = (d.service, d.env);
         let mut out: Vec<Mark> = Vec::new();
-        let mut push = |failed: &Deployment, found: Found, kind: RemedyKind| {
-            if failed.id != d.id && !out.iter().any(|m| m.failed == failed.id) {
-                out.push(Mark { failed: failed.id.clone(), found, kind });
+        let mut push = |failed: &Row, found: Found, kind: RemedyKind| {
+            if failed.id != d.id && !out.iter().any(|m| *m.failed == *failed.id) {
+                out.push(Mark { failed: failed.id.to_string(), found, kind });
             }
         };
-        let prev = self.before(&d.service, &d.env, d.finished_at, &d.id);
+        let prev = self.next_to(key, d.finished_at, d.tie, true);
         // A rollback: what it deploys was deployed before, but not just before; the deployment
         // after that earlier one failed (V1 → V2 → V3 → V1: V2). Looked for only when another
         // deployment of it is kept.
-        if let Some(what) = d.ident()
-            && prev.is_some_and(|p| p.ident() != Some(what))
-            && self.deployed.get(&key_of(&d.service, &d.env)).and_then(|m| m.get(&what)).is_some_and(|n| *n > 1)
-            && let Some(target) = self.earlier(d, |e| e.ident() == Some(what))
-            && let Some(failed) = self.after(&target.service, &target.env, target.finished_at, &target.id)
+        if let Some(what) = d.ident
+            && prev.is_some_and(|p| p.ident != Some(what))
+            && self.deployed.get(&key).and_then(|m| m.get(&what)).is_some_and(|n| *n > 1)
+            && let Some(target) = self.earlier(d, |e| e.ident == Some(what))
+            && let Some(failed) = self.next_to(key, target.finished_at, target.tie, false)
         {
             push(failed, Found::Rollback, RemedyKind::Rollback);
         }
@@ -507,7 +801,7 @@ impl Ledger {
             if here || (sha.is_none() && here_titles.contains(&title_k)) {
                 continue;
             }
-            let brought = sha.and_then(|s| self.earlier(d, |e| e.shas.contains(&s))).or_else(|| self.earlier(d, |e| e.titles.contains(&title_k)));
+            let brought = sha.and_then(|s| self.earlier(d, |e| e.shas().contains(&s))).or_else(|| self.earlier(d, |e| e.titles().contains(&title_k)));
             if let Some(e) = brought {
                 push(e, Found::Revert, RemedyKind::Rollforward);
             }
@@ -523,18 +817,18 @@ impl Ledger {
 
     /// The latest deployment before `d` (its service and environment, among the [`LOOKBACK`] before
     /// it) that `f` picks.
-    fn earlier(&self, d: &Deployment, f: impl Fn(&Deployment) -> bool) -> Option<&Deployment> {
-        let set = self.order.get(&key_of(&d.service, &d.env))?;
-        set.range(..(d.finished_at, d.id.clone())).rev().take(LOOKBACK).filter_map(|(_, id)| self.deployments.get(id)).find(|e| f(e))
+    fn earlier(&self, d: &Row, f: impl Fn(&Row) -> bool) -> Option<&Row> {
+        let set = self.order.get(&(d.service, d.env))?;
+        set.range(..(d.finished_at, d.tie)).rev().take(LOOKBACK).filter_map(|(_, &i)| self.rows.get(i as usize)).find(|e| f(e))
     }
 
     /// `failed` marked failed, found so, remedied by `remedy` (a kept deployment's id) when one did:
     /// whether that changed it. A mark found stands against one found later; one said by hand gives
     /// it its remedy (none given, the one found stays).
     pub fn mark(&mut self, failed: &str, found: Found, remedy: Option<(&str, RemedyKind)>) -> bool {
-        let remedy = remedy.and_then(|(id, kind)| self.deployments.get(id).map(|r| Remedy { id: r.id.clone(), kind, finished_at: r.finished_at }));
-        let Some(f) = self.deployments.get_mut(failed) else { return false };
-        let next = match &f.change_failure {
+        let remedy = remedy.and_then(|(id, kind)| self.get(id).map(|r| Remedy { id: r.id.to_string(), kind, finished_at: r.finished_at }));
+        let Some(f) = self.get_mut(failed) else { return false };
+        let next = match f.change_failure.as_deref() {
             None => ChangeFailure { found, remedy },
             Some(cf) if found == Found::Manual => {
                 let remedy = remedy.or_else(|| cf.remedy.clone());
@@ -546,16 +840,16 @@ impl Ledger {
             Some(_) => return false,
         };
         let remedy = next.remedy.clone();
-        let old = f.change_failure.replace(next);
+        let old = f.change_failure.replace(Box::new(next));
         let failed_id = f.id.clone();
         // The remedies it names, kept both ways.
         if let Some(r) = old.and_then(|cf| cf.remedy)
-            && let Some(was) = self.deployments.get_mut(&r.id)
+            && let Some(was) = self.get_mut(r.id.as_str())
         {
             was.remedies.retain(|x| *x != failed_id);
         }
         if let Some(r) = remedy
-            && let Some(by) = self.deployments.get_mut(&r.id)
+            && let Some(by) = self.get_mut(r.id.as_str())
             && !by.remedies.contains(&failed_id)
         {
             by.remedies.push(failed_id);
@@ -565,11 +859,11 @@ impl Ledger {
 
     /// `failed` no longer marked: whether it was.
     pub fn unmark(&mut self, failed: &str) -> bool {
-        let Some(f) = self.deployments.get_mut(failed) else { return false };
+        let Some(f) = self.get_mut(failed) else { return false };
         let Some(old) = f.change_failure.take() else { return false };
         let failed_id = f.id.clone();
         if let Some(r) = old.remedy
-            && let Some(by) = self.deployments.get_mut(&r.id)
+            && let Some(by) = self.get_mut(r.id.as_str())
         {
             by.remedies.retain(|x| *x != failed_id);
         }
@@ -579,9 +873,9 @@ impl Ledger {
     /// The services, environments and teams it holds, each sorted: from what it keeps of them, not
     /// a look at every deployment.
     pub fn facets(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let mut services: BTreeSet<&str> = self.order.keys().map(|(s, _)| s.as_str()).collect();
-        let mut envs: BTreeSet<&str> = self.order.keys().map(|(_, e)| e.as_str()).collect();
-        let mut teams: BTreeSet<&str> = self.teams.keys().map(String::as_str).collect();
+        let mut services: BTreeSet<&str> = self.order.keys().map(|(s, _)| self.names.str(*s)).collect();
+        let mut envs: BTreeSet<&str> = self.order.keys().map(|(_, e)| self.names.str(*e)).collect();
+        let mut teams: BTreeSet<&str> = self.teams.keys().map(|t| self.names.str(*t)).collect();
         for f in self.failures.values() {
             services.extend(f.services.iter().map(String::as_str));
             envs.insert(&f.env);
@@ -593,38 +887,49 @@ impl Ledger {
 
     /// The deployments finished in `from..to` (ns), each service and environment's in their order:
     /// what a list searches, never every deployment.
-    pub fn finished_between(&self, from: i64, to: i64) -> impl Iterator<Item = &Deployment> + '_ {
-        self.order.values().filter(move |_| from < to).flat_map(move |set| set.range((from, String::new())..(to, String::new()))).filter_map(|(_, id)| self.deployments.get(id))
+    pub fn finished_between(&self, from: i64, to: i64) -> impl Iterator<Item = RowRef<'_>> + '_ {
+        self.order.values().filter(move |_| from < to).flat_map(move |set| set.range((from, 0)..(to, 0))).filter_map(|(_, &i)| self.rows.get(i as usize)).map(|r| self.view(r))
     }
 
     /// The deployments `q` picks, in finish order (a range backwards picks none).
-    fn picked<'a>(&'a self, q: &'a Query) -> impl Iterator<Item = &'a Deployment> + 'a {
-        let mut keys: Vec<&Key> = self.order.keys().filter(|(s, e)| q.from < q.to && q.service.as_deref().is_none_or(|x| x == s) && q.env.as_deref().is_none_or(|x| x == e)).collect();
+    fn picked<'a>(&'a self, q: &'a Query) -> Vec<&'a Row> {
+        if q.from >= q.to {
+            return Vec::new();
+        }
+        let named = |want: &Option<String>| want.as_deref().map(|w| self.names.get(w));
+        let (service, env, team) = (named(&q.service), named(&q.env), named(&q.team));
+        // A name no deployment has: none.
+        if [service, env, team].iter().any(|x| matches!(x, Some(None))) {
+            return Vec::new();
+        }
+        let (service, env, team) = (service.flatten(), env.flatten(), team.flatten());
+        let mut keys: Vec<&Key> = self.order.keys().filter(|(s, e)| service.is_none_or(|x| x == *s) && env.is_none_or(|x| x == *e)).collect();
         keys.sort();
         keys.into_iter()
             .filter_map(|k| self.order.get(k))
-            .flat_map(move |set| set.range((q.from, String::new())..(q.to, String::new())))
-            .filter_map(|(_, id)| self.deployments.get(id))
-            .filter(|d| q.picks(&d.service, &d.env, &d.team))
+            .flat_map(|set| set.range((q.from, 0)..(q.to, 0)))
+            .filter_map(|(_, &i)| self.rows.get(i as usize))
+            .filter(|r| team.is_none_or(|t| t == r.team))
+            .collect()
     }
 
     /// The four keys over `q`'s range, and week by week.
     pub fn summary(&self, q: &Query) -> Summary {
-        let mut weeks: Vec<(i64, Vec<&Deployment>)> = Vec::new();
+        let mut weeks: Vec<(i64, Vec<&Row>)> = Vec::new();
         let mut first = q.from;
         while first < q.to {
             let next = week_of(first).saturating_add(WEEK_NS);
             weeks.push((first, Vec::new()));
             first = next;
         }
-        let all: Vec<&Deployment> = self.picked(q).collect();
+        let all: Vec<&Row> = self.picked(q);
         for d in &all {
             let at = weeks.partition_point(|(start, _)| *start <= d.finished_at);
             if let Some((_, w)) = at.checked_sub(1).and_then(|i| weeks.get_mut(i)) {
                 w.push(d);
             }
         }
-        let figures = |ds: &[&Deployment]| {
+        let figures = |ds: &[&Row]| {
             let lead = median(ds.iter().filter_map(|d| d.lead.map(|l| l.mean_s)).collect());
             let recovery = median(ds.iter().filter_map(|d| d.recovery_ns()).map(|ns| ns as f64 / 1e9).collect());
             let failed = ds.iter().filter(|d| d.change_failure.is_some()).count() as u64;
@@ -845,6 +1150,17 @@ mod tests {
             ],
         );
         assert_eq!(marked, vec![("b".into(), Found::Revert, "c".into())]);
+        // GitHub's revert of a squashed pull request: no sha said, both titles numbered.
+        let mut l = Ledger::default();
+        let marked = run(
+            &mut l,
+            vec![
+                (dep("a", "shop", 0, Some('1')), vec![]),
+                (dep("b", "shop", 1, Some('2')), vec![commit('b', 0, "Add search (#122)")]),
+                (dep("c", "shop", 2, Some('3')), vec![commit('c', 1, "Revert \"Add search (#122)\" (#123)")]),
+            ],
+        );
+        assert_eq!(marked, vec![("b".into(), Found::Revert, "c".into())]);
         // Both in one deployment: nothing failed.
         let mut l = Ledger::default();
         let mut r = commit('c', 1, "Revert \"Add search\"");
@@ -953,6 +1269,60 @@ mod tests {
         assert!(l.detect("new", &[]).is_empty());
     }
 
+    /// Puts, removals (each moving the last row into the removed one's place) and puts again, in a
+    /// random order, against a list of what should be kept: every id finds its own deployment, none
+    /// removed is found, and each deployment's neighbours are the list's.
+    #[test]
+    fn rows_stay_found_through_removals() {
+        let mut seed = 0x5eed_u64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) % n
+        };
+        let mut l = Ledger::default();
+        let mut kept: Vec<(i64, String)> = Vec::new();
+        for round in 0..3_000 {
+            let i = next(400) as i64;
+            let id = format!("d{i:04}");
+            if next(3) == 0 {
+                let had = kept.iter().any(|(_, x)| *x == id);
+                assert_eq!(l.remove(&id).is_some(), had, "round {round}: removing {id}");
+                kept.retain(|(_, x)| *x != id);
+            } else {
+                l.put(dep(&id, "shop", i, Some('a')));
+                kept.retain(|(_, x)| *x != id);
+                kept.push((T0 + i * H, id));
+            }
+        }
+        kept.sort();
+        assert_eq!(l.len().0, kept.len());
+        for (k, (at, id)) in kept.iter().enumerate() {
+            assert_eq!(l.deployment(id).map(|d| d.id), Some(id.clone()));
+            let before = k.checked_sub(1).and_then(|j| kept.get(j)).map(|(_, x)| x.clone());
+            assert_eq!(l.before("shop", "prod", *at, id).map(|d| d.id), before, "{id}'s previous");
+            assert_eq!(l.after("shop", "prod", *at, id).map(|d| d.id), kept.get(k + 1).map(|(_, x)| x.clone()), "{id}'s next");
+        }
+        for i in 0..400 {
+            let id = format!("d{i:04}");
+            assert_eq!(l.deployment(&id).is_some(), kept.iter().any(|(_, x)| *x == id), "{id}");
+        }
+    }
+
+    /// A deployment said again with a later finish: what comes before its new time is another, not
+    /// itself as it was.
+    #[test]
+    fn a_deployment_said_again_is_not_its_own_previous() {
+        let mut l = Ledger::default();
+        l.put(dep("a", "shop", 0, Some('1')));
+        l.put(dep("b", "shop", 1, Some('2')));
+        let later = T0 + 5 * H;
+        assert_eq!(l.before("shop", "prod", later, "b").map(|d| d.id), Some("a".to_owned()));
+        assert_eq!(l.after("shop", "prod", T0 - H, "a").map(|d| d.id), Some("b".to_owned()), "a passed over");
+    }
+
     #[test]
     fn medians_weeks_and_keys_are_what_they_say() {
         assert_eq!(median(vec![]), None);
@@ -968,6 +1338,10 @@ mod tests {
         assert_eq!(sha_key("xyz"), None);
         assert_eq!(sha_key("abc"), None);
         assert_eq!(reverted_title("Revert \"Add \"quoted\" search\""), Some("Add \"quoted\" search"));
+        // GitHub's squashed revert of a squashed pull request: both titles carry their numbers.
+        assert_eq!(reverted_title("Revert \"Add search (#122)\" (#123)"), Some("Add search (#122)"));
+        assert_eq!(title_key("Add search (#122)"), title_key("Add search"));
+        assert_ne!(title_key("Add search (#x)"), title_key("Add search"), "only a number is a pull request's");
         assert!(says_hotfix("Merge branch 'HOTFIX/x'") && !says_hotfix("hot fix"));
     }
 }

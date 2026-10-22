@@ -6,7 +6,9 @@
 //! ledger read from its file as the server starts; and a deployment taken whole, its line written and
 //! synced. The median of five passes; allocations of one.
 //!
-//! `cargo bench -p kiln --bench dora` (`KOBS_DORA_SERVICES` and `KOBS_DORA_DAYS` to change its size)
+//! `KOBS_DORA_DIR=<a folder on the disk the server's would be> cargo bench -p kiln --bench dora`
+//! (`KOBS_DORA_SERVICES` and `KOBS_DORA_DAYS` to change its size). Its files go there: a temporary
+//! folder is often a tmpfs, where a sync costs nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use std::io::Write as _;
@@ -160,12 +162,17 @@ fn main() {
         marked += take(&mut l, d.clone(), c);
     }
     let took = t.elapsed().as_nanos() as f64 / all.len() as f64;
-    let a = alloc::end().calls() as f64 / all.len() as f64;
-    let found = |f: Found| l.deployments().filter(|d| d.change_failure.as_ref().is_some_and(|cf| cf.found == f)).count();
+    // As the server holds it once read: its maps no larger than what they hold.
+    l.shrink();
+    let counts = alloc::end();
+    let a = counts.calls() as f64 / all.len() as f64;
+    let found = |f: Found| l.rows().filter(|d| d.change_failure().is_some_and(|cf| cf.found == f)).count();
     println!("taken: {took:.0} ns and {a:.1} allocations a deployment (its clone's included); {marked} marked: {} rollbacks, {} reverts", found(Found::Rollback), found(Found::Revert));
-    if let (Some(b), Some(a)) = (before, rss()) {
-        println!("held: {:.0} MB, {:.0} bytes a deployment", a.saturating_sub(b) as f64 / 1e6, a.saturating_sub(b) as f64 / all.len() as f64);
-    }
+    let rss_said = match (before, rss()) {
+        (Some(b), Some(a)) => format!(" (the process's resident memory {:.0} MB more)", a.saturating_sub(b) as f64 / 1e6),
+        _ => String::new(),
+    };
+    println!("held: {:.0} MB, {:.0} bytes a deployment{rss_said}", counts.live as f64 / 1e6, counts.live as f64 / all.len() as f64);
 
     let month = Query { from: now - 30 * DAY_NS, to: now, ..Query::default() };
     let in_month = l.summary(&month).deployments;
@@ -181,15 +188,16 @@ fn main() {
     println!("facets: {:.2} ms", ns / 1e6);
     let search = kiln_obs::logs::search::parse("service:service-017 @env:prod @change_failure:true").unwrap();
     let mut s = kiln_obs::logs::search::RowScratch::default();
-    let (ns, _) = time(5, || l.deployments().filter(|d| search.fields(*d, &mut s)).count());
+    let (ns, _) = time(5, || l.rows().filter(|d| search.fields(d, &mut s)).count());
     println!("a list's search over every deployment ({}): {:.2} ms ({:.0} ns a deployment)", l.len().0, ns / 1e6, ns / l.len().0 as f64);
 
     // The ledger's file read as the server starts (a line each, as `Dora` writes them).
-    let dir = tempfile::tempdir().unwrap();
+    let disk = std::env::var("KOBS_DORA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+    let dir = tempfile::tempdir_in(&disk).unwrap();
     let path = dir.path().join("dora.jsonl");
     let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
     for d in l.deployments() {
-        writeln!(f, "{{\"deployment\":{}}}", serde_json::to_string(d).unwrap()).unwrap();
+        writeln!(f, "{{\"deployment\":{}}}", serde_json::to_string(&d).unwrap()).unwrap();
     }
     drop(f);
     let bytes = std::fs::metadata(&path).unwrap().len();
@@ -203,7 +211,7 @@ fn main() {
     println!("read at start: {} lines, {:.1} MB: {:.0} ms", l.len().0, bytes as f64 / 1e6, median(opened));
 
     // A deployment taken whole: its line appended and synced.
-    let fresh = tempfile::tempdir().unwrap();
+    let fresh = tempfile::tempdir_in(&disk).unwrap();
     let dora = Dora::open(fresh.path(), None);
     let n = 500;
     let mine: Vec<Deployment> = all.iter().filter(|(d, _)| d.service == "service-000" && d.env == "prod").take(n).map(|(d, _)| d.clone()).collect();

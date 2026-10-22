@@ -36,7 +36,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-22 | Log archives (§10.5): Datadog's, to S3 (and S3-compatible stores), Cloud Storage and Azure Blob Storage with the cloud integrations' credentials (S3's requests signed with SigV4, the path once and the payload's hash), each record to the first archive whose search takes it; Datadog's objects (an hour's events a folder) and events; each record once through failures, restarts, installs and changes (each archive its place, a file kept to the archives it was begun with, a part written not written again); the store cut within 15 minutes when records come slowly; checked live against RustFS and stand-ins for Google's and Microsoft's stores and token services (§13) | done |
 | O-23 | Rehydration from archives (§10.6): an archive's records of a range that a search takes read back from S3, Cloud Storage or Blob Storage (Datadog's format: what Datadog wrote reads alike) into a view of their own, searched, counted, faceted and patterned as the live logs are (`view`); objects read as they come off the wire (none whole in memory), a read cut short taken up where it stopped; each event read into its record in place (400 ns, nothing allocated; 1.8 million events a second a core as objects come, §12.27); a scan's bound; a view kept for its retention, read again whole when the server stopped in it; checked live against RustFS and the stand-ins, every read cut short (§13) | done |
 | O-24 | Sensitive Data Scanner (§8.9): Datadog's scanning groups and rules, run on every machine where records are taken, after the pipelines, before anything is kept; the standard library (cards with their Luhn digits, IBANs with their checksums, SSNs in their ranges, personal data, network addresses, credentials of a dozen services, private keys, passwords in URLs and assignments), patterns of one's own; what a match becomes (a string, partly hidden, a keyed hash, or tags alone), keywords near, namespaces; the fast path kept for lines no rule may touch; the API, OpenAPI, its pages | done |
-| O-25 | Delivery: DORA metrics (§10.7), Datadog's: deployment frequency, change lead time (each commit's, from kiln's mirrors), change failure rate (rollbacks, reverts and hotfixes found as Datadog finds them, or marked by hand) and failed deployment recovery time, from kiln CD's deploys and Datadog's DORA API; failures; levels from DORA's 2024 report; metrics and events of each; the API, OpenAPI, its page | in progress |
+| O-25 | Delivery: DORA metrics (§10.7), Datadog's: deployment frequency, change lead time (each commit's, from kiln's mirrors), change failure rate (rollbacks, reverts and hotfixes found as Datadog finds them, or marked by hand) and failed deployment recovery time, from kiln CD's deploys and Datadog's DORA API; failures; levels from DORA's 2024 report; metrics and events of each; the API, OpenAPI, its page | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -2014,12 +2014,18 @@ written as a deployment comes is not taken back if an earlier one comes after it
   (`<observe>/dora.jsonl`, an entry a line, the last for an id standing; rewritten whole once it
   holds twice what stands), and reads it as it starts. A service and environment's deployments go in
   one at a time, so each finds the one before it; one that comes after a later one is put in its
-  place, and the one after it read again.
-- **The API**: Datadog's (`/api/v2/dora/deployment`, `/failure` and `/incident`, the lists
-  `POST /api/v2/dora/deployments` and `/failures` with `from`, `to`, a search of their fields and a
-  `limit` of 1,000, `GET` one, `DELETE`, and `PATCH` to mark one); an id given again replaces what
-  it said (a failure's end sent later). And `GET /api/observe/v1/dora/summary` for the page: the
-  four keys over a range by service, environment and team, week by week.
+  place, and the one after it read again. It holds a deployment in some 500 bytes (§12.29): the
+  names many share (services, environments, teams, repositories) as numbers, its commits' keys in
+  one slice, the deployments in a slab and each service and environment's in finish order by their
+  place in it.
+- **The API**: Datadog's at its paths for what a CD system sends, with the ingest token
+  (`POST /api/v2/dora/deployment`, `/failure` and its earlier name `/incident`, `PATCH
+  /api/v2/dora/deployments/{id}` or by service, environment and version to mark one, `DELETE`); an
+  id given again replaces what it said (a failure's end sent later). The reading is kiln's, with a
+  session (`/api/observe/v1/dora/...`): the lists (`POST deployments` and `failures`: a range, a
+  search of their fields as logs are searched, 1,000 at the most, either order), one of each, the
+  same writes, and `GET summary` for the page: the four keys over a range by service, environment
+  and team, week by week. Datadog's list paths answer that they are read through kiln's.
 
 ## 11. UI
 
@@ -3513,6 +3519,42 @@ place) and its record tagged: 20 allocations, of which the scan's are its two ne
 the set's list of which patterns matched; the rest are the record's own, as a pipeline's (48 a line,
 kiln's nginx pipeline). A busy machine's 10,000 lines a second cost the library's check 0.3% of a
 core (nginx's lines) to 0.5% (the journal's).
+
+### 12.29 DORA's ledger
+
+`KOBS_DORA_DIR=<a folder on disk> cargo bench -p kiln --bench dora` (adacachy, 2026-10-22, a
+release build pinned to one core, the machine's load some 50 on 32 cores): a large kiln's history,
+200 services in two environments, a deployment of each every two to six hours for 400 days
+(957,452 deployments, 3.1 million commits), one in fifteen a rollback to an earlier commit, one in
+thirty reverting an earlier deployment's commit (63,643 rollbacks and 25,516 reverts found).
+
+| | first cut | now |
+| --- | --- | --- |
+| a deployment taken: kept, what it marks found and marked | 591,570 ns, 1,150 allocations | 3,048 ns, 20 allocations |
+| held, a deployment | 1,509 bytes (resident) | 500 bytes (live) |
+| the four keys, 30 days, every service (72,081 deployments) | 22.3 ms | 2.5 ms |
+| the four keys, 30 days, one service (355) | 20.2 µs | 9.9 µs |
+| the four keys, a year, every service (875,845) | 314 ms | 164 ms |
+| its services, environments and teams | 734 ms | 0.02 ms |
+| a list's search, a deployment | 246 ns | 29 ns |
+| the ledger read as the server starts (539 MB, a line each) | | 2.3 s |
+| a deployment taken whole, its line synced (NVMe, btrfs) | | 5.5 ms |
+
+The first cut looked for a rollback's target through the whole of a service and environment's
+history, comparing what each deployment deployed as a new lowercase string: 1,150 allocations and
+0.6 ms a deployment, growing with the history. A count is now kept of each commit (or version) a
+service and environment deployed, so the target is looked for only when what a deployment deploys
+was deployed before, among the latest 1,000, comparing hashes. The page's services, environments
+and teams were a sorted set of every deployment's names each time it asked: they are now what the
+ledger keeps of them. A deployment was a struct of a dozen strings in a hash map, its id held three
+times: its shared names are numbers now, its id one allocation, its commits' keys one slice, the
+rows in a slab (a map of rows reserved twice their room, rounded to a power of two), and each
+service and environment's in finish order by their place in it, so that a range is read without a
+lookup by id. The bench's commits first had shas that began alike, and every commit's key (its
+first 16 hex digits) was the same: a key is now its whole sha's hash, and a revert found by its
+title compares titles without a squashed pull request's number (GitHub's `Revert "Add search
+(#122)" (#123)`). A sync costs what the disk takes (a temporary folder is often a tmpfs, where it
+costs nothing: the first measure said 0.02 ms).
 
 ## 13. Scenarios
 

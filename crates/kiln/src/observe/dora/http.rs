@@ -10,7 +10,7 @@ use http::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::ledger::{DAY_NS, Query};
+use super::ledger::{DAY_NS, Query, RowRef};
 use super::{Deployment, Dora, Failure, Git, PatchError, RemedyBy, RemedyKind, git, levels};
 use crate::http::server::{self as srv, Request, Response};
 use crate::observe::api::{Fail, fail, read_json};
@@ -323,8 +323,7 @@ pub async fn mark(id: Option<&str>, req: Request) -> Result<Response, Fail> {
                 return Err(fail(StatusCode::BAD_REQUEST, "a deployment by its id, or its service and version"));
             }
             let env = p.env.as_deref().map(str::trim).unwrap_or_default();
-            d.read(|l| l.deployments().filter(|x| x.service == service && x.env == env && x.version == version).max_by_key(|x| (x.finished_at, x.id.clone())).map(|x| x.id.clone()))
-                .ok_or_else(|| fail(StatusCode::NOT_FOUND, "no deployment of that service, environment and version"))?
+            d.read(|l| l.find_version(service, env, version)).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no deployment of that service, environment and version"))?
         }
     };
     let remedy = match p.remediation {
@@ -417,12 +416,12 @@ fn list_deployments(d: &Dora, l: ListIn) -> Result<Response, Fail> {
     let (from, to, search, limit, desc, by_start) = list_of(l)?;
     let mut s = kiln_obs::logs::search::RowScratch::default();
     let data: Vec<Value> = d.read(|l| {
-        let mut picked: Vec<&Deployment> = l.finished_between(from, to).filter(|x| search.as_ref().is_none_or(|q| q.fields(*x, &mut s))).collect();
-        picked.sort_by_key(|x| (if by_start { x.started_at } else { x.finished_at }, x.id.clone()));
+        let mut picked: Vec<RowRef<'_>> = l.finished_between(from, to).filter(|x| search.as_ref().is_none_or(|q| q.fields(x, &mut s))).collect();
+        picked.sort_by_key(|x| (if by_start { x.started_at() } else { x.finished_at() }, x.id()));
         if desc {
             picked.reverse();
         }
-        picked.into_iter().take(limit).map(deployment_json).collect()
+        picked.into_iter().take(limit).map(|x| deployment_json(&x.to_deployment())).collect()
     });
     Ok(srv::json(StatusCode::OK, &json!({ "data": data })))
 }
@@ -506,7 +505,7 @@ pub async fn failures(req: Request) -> Result<Response, Fail> {
 
 /// `GET dora/deployments/{id}`.
 pub fn deployment(id: &str) -> Result<Response, Fail> {
-    dora()?.read(|l| l.deployment(id).map(deployment_json)).map(|d| srv::json(StatusCode::OK, &json!({ "data": d }))).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such deployment"))
+    dora()?.read(|l| l.deployment(id).map(|d| deployment_json(&d))).map(|d| srv::json(StatusCode::OK, &json!({ "data": d }))).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such deployment"))
 }
 
 /// `GET dora/failures/{id}`.
