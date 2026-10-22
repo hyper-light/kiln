@@ -465,6 +465,51 @@ impl Remote {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ the repository itself
+
+    /// Whether the host has it, as it shows it to kiln.
+    pub async fn exists(&self) -> anyhow::Result<bool> {
+        Ok(match &self.host {
+            Host::Github(app) => app.repository(&self.name).await?.is_some(),
+            Host::Gitlab(g) => g.project(&self.name).await?.is_some(),
+            Host::Bitbucket(b) => b.repository(&self.name).await?.is_some(),
+        })
+    }
+
+    /// Makes it there, private and empty.
+    pub async fn make(&self, description: &str) -> anyhow::Result<()> {
+        match &self.host {
+            Host::Github(app) => app.create_repository(&self.name, description).await,
+            Host::Gitlab(g) => g.create_project(&self.name, description).await,
+            Host::Bitbucket(b) => b.create_repository(&self.name, description).await,
+        }
+    }
+
+    /// Deletes it there: one kiln made and couldn't fill.
+    pub async fn delete(&self) -> anyhow::Result<()> {
+        match &self.host {
+            Host::Github(app) => app.delete_repository(&self.name).await,
+            Host::Gitlab(g) => g.delete_project(&self.name).await,
+            Host::Bitbucket(b) => b.delete_repository(&self.name).await,
+        }
+    }
+
+    /// Pushes `refspec` of the git repository at `dir` to it, with credentials that write it (in
+    /// git's environment, as every call to the host is).
+    pub async fn push_from(&self, dir: &Path, refspec: &str) -> anyhow::Result<()> {
+        let mut cmd = std::process::Command::new("git");
+        crate::os::git_no_prompts(&mut cmd);
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+        let url = self.url();
+        cmd.arg("-C").arg(dir).args(["push", "--quiet", "--", &url, refspec]).stdin(std::process::Stdio::null());
+        for (k, v) in self.auth(true).await? {
+            cmd.env(k, v);
+        }
+        let out = crate::proc::output(cmd, NETWORK).await.context("git push")?;
+        anyhow::ensure!(out.status.success(), "git push to {url}: {}", said(&out));
+        Ok(())
+    }
+
     /// A release's branch, gone once its pull request is merged or closed.
     pub async fn drop_branch(&self, branch: &str) {
         let gone = match &self.host {
@@ -499,20 +544,10 @@ fn said(out: &std::process::Output) -> String {
 pub async fn ensure(d: &Deploy, rr: &RepoRef) -> Result<(), String> {
     let r = open(d, rr).await?;
     let e = |e: anyhow::Error| format!("{e:#}");
-    const WHAT: &str = "kiln's release repository: what each environment runs, one release a commit";
-    let there = match &r.host {
-        Host::Github(app) => app.repository(&rr.repo).await.map_err(e)?.is_some(),
-        Host::Gitlab(g) => g.project(&rr.repo).await.map_err(e)?.is_some(),
-        Host::Bitbucket(b) => b.repository(&rr.repo).await.map_err(e)?.is_some(),
-    };
-    if there {
+    if r.exists().await.map_err(e)? {
         return Ok(());
     }
-    match &r.host {
-        Host::Github(app) => app.create_repository(&rr.repo, WHAT).await.map_err(e)?,
-        Host::Gitlab(g) => g.create_project(&rr.repo, WHAT).await.map_err(e)?,
-        Host::Bitbucket(b) => b.create_repository(&rr.repo, WHAT).await.map_err(e)?,
-    }
+    r.make("kiln's release repository: what each environment runs, one release a commit").await.map_err(e)?;
     d.hub.store.audit("kiln".into(), "repo.create".into(), format!("{} on {} (a release repository, docs/deploy-api.md §6)", rr.repo, r.host.label())).await;
     Ok(())
 }

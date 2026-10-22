@@ -435,6 +435,16 @@ impl App {
         }
     }
 
+    /// Deletes `owner/name` (a repository kiln made and couldn't fill; gone already is fine).
+    pub async fn delete_repository(&self, name: &str) -> anyhow::Result<()> {
+        let (owner, _) = name.split_once('/').ok_or_else(|| anyhow!("`{name}`: owner/name"))?;
+        let p: BTreeMap<String, String> = [("administration".to_owned(), "write".to_owned()), ("metadata".to_owned(), "read".to_owned())].into();
+        let t = self.token(owner, &p).await?;
+        let (st, v) = self.call(Method::Delete, &format!("/repos/{name}"), Auth::Token(&t), None).await?;
+        anyhow::ensure!(matches!(st, 204 | 404), "GitHub didn't delete {name} ({st}): {}", said(&v));
+        Ok(())
+    }
+
     pub async fn status(&self, repo: &Repo, sha: &str, s: &CommitStatus) -> anyhow::Result<()> {
         let (name, t) = self.token_for(repo, &[("statuses", "write"), ("metadata", "read")]).await?;
         let (st, v) = self.call(Method::Post, &format!("/repos/{name}/statuses/{sha}"), Auth::Token(&t), Some(&json!({ "state": s.state, "context": s.context, "description": crate::util::truncate(&s.description, 140), "target_url": s.url }))).await?;

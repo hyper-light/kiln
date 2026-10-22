@@ -38,6 +38,8 @@ struct Gitlab {
     deployments: Vec<Value>,
     /// Each commit status: (project, sha, its body).
     statuses: Vec<(String, String, Value)>,
+    /// Projects made besides the release repository (apps' sources), by name.
+    sources: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Gitlab>>;
@@ -208,6 +210,26 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
             } else {
                 (404, json!({ "message": "404 Project Not Found" }))
             }
+        }
+        ("POST", ["projects"]) if body.get("namespace_id") == Some(&json!(5)) && body.get("path") != Some(&json!("releases")) => {
+            let path = body.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let made = !path.is_empty() && !g.sources.contains(&path) && git(root, &["init", "-q", "--bare", &format!("acme/{path}.git")]).is_ok();
+            if made {
+                g.sources.push(path.clone());
+                (201, json!({ "id": 50 + g.sources.len(), "path_with_namespace": format!("acme/{path}") }))
+            } else {
+                (400, json!({ "message": "has already been taken" }))
+            }
+        }
+        ("GET", ["projects", project]) if decode(project).starts_with("acme/") && decode(project) != "acme/releases" => {
+            let name = decode(project).trim_start_matches("acme/").to_owned();
+            if g.sources.contains(&name) { (200, json!({ "path_with_namespace": format!("acme/{name}") })) } else { (404, json!({ "message": "404 Project Not Found" })) }
+        }
+        ("DELETE", ["projects", project]) if g.sources.contains(&decode(project).trim_start_matches("acme/").to_owned()) => {
+            let name = decode(project).trim_start_matches("acme/").to_owned();
+            let _ = std::fs::remove_dir_all(root.join(format!("acme/{name}.git")));
+            g.sources.retain(|s| *s != name);
+            (202, json!({ "message": "202 Accepted" }))
         }
         ("POST", ["projects"]) if body.get("namespace_id") == Some(&json!(5)) && body.get("path") == Some(&json!("releases")) => {
             let made = git(root, &["init", "-q", "--bare", "acme/releases.git"]).is_ok();
@@ -522,5 +544,8 @@ fn p3_gitlab_release_repositories_and_ci() -> anyhow::Result<()> {
         let found = v.get("releases").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("origin") == Some(&json!("git")) && r.get("commit") == Some(&json!(c))));
         Ok((!found).then(|| format!("{body}\n{}", s.log())))
     })?;
+
+    // An app's source repository made on the GitLab with its token, from a starter there.
+    common::source_on_host(&s, "gitlab", &gl_root, &format!("http://127.0.0.1:{port}/acme/ci.git"), (".kiln/ci.yaml", "built on kiln"), true)?;
     Ok(())
 }

@@ -545,6 +545,15 @@ pub struct RepoTemplate {
     /// The new repository's default branch.
     #[serde(default = "main_branch")]
     pub branch: String,
+    /// Where it's made (§3.1, §7): `kiln` (one of kiln's own repositories, the default), `github`
+    /// (through kiln's GitHub App), `gitlab` (the `[[ci.gitlab]]` whose token covers its group)
+    /// or `bitbucket` (`[ci.bitbucket]`).
+    #[serde(default = "kiln_host", skip_serializing_if = "is_kiln_host")]
+    pub host: String,
+}
+
+fn is_kiln_host(h: &str) -> bool {
+    h == KILN_HOST
 }
 
 fn default_repo_name() -> String {

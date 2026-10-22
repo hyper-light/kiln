@@ -37,6 +37,8 @@ struct Bitbucket {
     prs: Vec<Value>,
     /// Each build status: (repository, commit, its body), the newest of a key in its place.
     statuses: Vec<(String, String, Value)>,
+    /// Repositories made besides the release repository (apps' sources), by slug.
+    sources: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Bitbucket>>;
@@ -138,6 +140,11 @@ fn serve(stream: std::net::TcpStream, root: &Path, shared: &Shared, port: u16) -
         .and_then(|a| a.strip_prefix("Basic ").and_then(|b| B64.decode(b).ok()))
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .filter(|up| up == &format!("x-token-auth:{TOKEN}"));
+    // A repository whose pushes this Bitbucket refuses: what kiln does with one it made and couldn't fill.
+    if path.starts_with("/acme/broken-") && (path.ends_with("/git-receive-pack") || query.contains("service=git-receive-pack")) {
+        write!(w, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return Ok(());
+    }
     if !path.starts_with("/acme/app.git") && token.is_none() {
         write!(w, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Bitbucket\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
         return Ok(());
@@ -201,6 +208,23 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
     let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let error = |m: &str| json!({ "type": "error", "error": { "message": m } });
     match (method, seg.as_slice()) {
+        ("GET", ["repositories", "acme", slug]) if *slug != "releases" => {
+            if b.sources.iter().any(|s| s == slug) { (200, json!({ "full_name": format!("acme/{slug}"), "is_private": true })) } else { (404, error("Repository not found")) }
+        }
+        ("POST", ["repositories", "acme", slug]) if *slug != "releases" && body.get("is_private") == Some(&json!(true)) => {
+            let made = !b.sources.iter().any(|s| s == slug) && git(root, &["init", "-q", "--bare", &format!("acme/{slug}.git")]).is_ok();
+            if made {
+                b.sources.push((*slug).to_owned());
+                (200, json!({ "full_name": format!("acme/{slug}"), "is_private": true }))
+            } else {
+                (400, error("Repository with this Slug and Owner already exists."))
+            }
+        }
+        ("DELETE", ["repositories", "acme", slug]) if b.sources.iter().any(|s| s == slug) => {
+            let _ = std::fs::remove_dir_all(root.join(format!("acme/{slug}.git")));
+            b.sources.retain(|s| s != slug);
+            (204, Value::Null)
+        }
         ("GET", ["repositories", "acme", "releases"]) => {
             if b.made {
                 (200, json!({ "full_name": "acme/releases", "is_private": true, "mainbranch": { "name": "main" }, "links": { "html": { "href": format!("{web}/acme/releases") } } }))
@@ -522,5 +546,16 @@ fn p3_bitbucket_release_repositories_and_ci() -> anyhow::Result<()> {
         let found = v.get("releases").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("origin") == Some(&json!("git")) && r.get("commit") == Some(&json!(c))));
         Ok((!found).then(|| format!("{body}\n{}", s.log())))
     })?;
+
+    // An app's source repository made on Bitbucket with kiln's access token, from a starter there.
+    common::source_on_host(&s, "bitbucket", &bb_root, &format!("http://127.0.0.1:{port}/acme/ci.git"), (".kiln/ci.yaml", "built on kiln"), true)?;
+    // One made whose first commit Bitbucket refuses: deleted again, and no app made.
+    let t = json!({ "name": "broken-src", "package": { "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "{app}" }, "repository": { "host": "bitbucket", "name": "acme/broken-{app}", "starter": format!("http://127.0.0.1:{port}/acme/app.git") } });
+    let (st, body) = http(s.port, "POST", "/api/deploy/templates", &s.admin, Some(&t))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/deploy/apps", &s.admin, Some(&json!({ "name": "shop", "template": "broken-src" })))?;
+    assert!(st == 502 && body.contains("deleted again"), "{st} {body}");
+    assert!(!bb_root.join("acme/broken-shop.git").exists() && saw("DELETE", "/repositories/acme/broken-shop") == 1, "nothing half made stays");
+    assert_eq!(http(s.port, "GET", "/api/deploy/apps/shop", &s.admin, None)?.0, 404, "no app");
     Ok(())
 }

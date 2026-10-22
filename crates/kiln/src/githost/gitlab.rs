@@ -256,6 +256,13 @@ impl Gitlab {
         Ok(())
     }
 
+    /// Deletes the project `name` (one kiln made and couldn't fill; gone already is fine).
+    pub async fn delete_project(&self, name: &str) -> anyhow::Result<()> {
+        let (st, v) = self.call(Method::Delete, &format!("/projects/{}", id(name)), None).await?;
+        anyhow::ensure!(matches!(st, 202 | 204 | 404), "GitLab didn't delete {name} ({st}): {}", said(&v));
+        Ok(())
+    }
+
     /// A deploy token of the project `name` that reads its repository and nothing else: its id,
     /// its username and the token (GitLab shows a token once, as it's made).
     pub async fn deploy_token(&self, name: &str, label: &str) -> anyhow::Result<(u64, String, String)> {

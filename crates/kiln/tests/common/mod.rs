@@ -184,3 +184,54 @@ pub fn concrete(pattern: &str) -> String {
         .collect::<Vec<_>>()
         .join("/")
 }
+
+/// An app whose template makes its source repository on another host (`host`: `github`, `gitlab`
+/// or `bitbucket`; docs/deploy-api.md §3.1, step 4), from `starter` (a repository there holding
+/// `file`, with `text` in it): `acme/<host>-web` is made there with the starter's files as its one
+/// commit, kiln has it as one of its repositories (with `builds`, its first commit's KilnCI run
+/// starts), and a name the host has already is refused. `git_root` is where the fake host keeps
+/// its repositories.
+pub fn source_on_host(s: &Server, host: &str, git_root: &Path, starter: &str, (file, text): (&str, &str), builds: bool) -> anyhow::Result<()> {
+    let template = |name: &str, repo: &str| serde_json::json!({ "name": name, "package": { "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "{app}" }, "repository": { "host": host, "name": repo, "starter": starter, "branch": "main" } });
+    let (st, body) = http(s.port, "POST", "/api/deploy/templates", &s.admin, Some(&template(&format!("{host}-src"), "acme/{app}")))?;
+    anyhow::ensure!((200..300).contains(&st), "the template: {st} {body}");
+    let name = format!("{host}-web");
+    let (st, body) = http(s.port, "POST", "/api/deploy/apps", &s.admin, Some(&serde_json::json!({ "name": name, "project": "shop", "template": format!("{host}-src") })))?;
+    anyhow::ensure!(st == 201, "{name}: {st} {body}\n{}", s.log());
+    let made: Value = serde_json::from_str(&body)?;
+    anyhow::ensure!(made.get("source") == Some(&Value::String(format!("acme/{name}"))), "its source: {made}");
+    // On the host: the starter's files, one commit.
+    let bare = git_root.join(format!("acme/{name}.git"));
+    let git = |args: &[&str]| -> anyhow::Result<String> {
+        let o = Command::new("git").arg("-C").arg(&bare).args(args).env("GIT_CONFIG_NOSYSTEM", "1").output()?;
+        anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    anyhow::ensure!(git(&["rev-list", "--count", "main"])? == "1", "one commit");
+    anyhow::ensure!(git(&["show", &format!("main:{file}")])?.contains(text), "the starter's files");
+    // One of kiln's repositories, as it is on the host.
+    let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+    let repos: Value = serde_json::from_str(&body)?;
+    let repo = repos.as_array().and_then(|l| l.iter().find(|r| r.get("name") == Some(&Value::String(format!("acme/{name}"))))).cloned().unwrap_or_default();
+    anyhow::ensure!(repo.get("clone_url").and_then(Value::as_str).is_some_and(|u| u.ends_with(&format!("/acme/{name}.git")) && u.starts_with("http://127.0.0.1:")), "kiln's repository: {repo}");
+    // Its first commit builds, as a push of it would.
+    if builds {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, body) = http(s.port, "GET", "/api/runs", &s.admin, None)?;
+            let runs: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let list = runs.get("runs").and_then(Value::as_array).or_else(|| runs.as_array()).cloned().unwrap_or_default();
+            if list.iter().any(|r| r.get("repo_name") == Some(&Value::String(format!("acme/{name}")))) {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "no run of acme/{name}: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    // A name the host has already: refused, nothing made.
+    let (st, body) = http(s.port, "POST", "/api/deploy/templates", &s.admin, Some(&template(&format!("{host}-fixed"), &format!("acme/{name}"))))?;
+    anyhow::ensure!((200..300).contains(&st), "the second template: {st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/deploy/apps", &s.admin, Some(&serde_json::json!({ "name": format!("{host}-other"), "project": "shop", "template": format!("{host}-fixed") })))?;
+    anyhow::ensure!(st == 409 && body.contains("already"), "a name taken: {st} {body}");
+    Ok(())
+}
