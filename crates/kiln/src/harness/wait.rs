@@ -77,6 +77,9 @@ pub fn stand(info: &Info) -> &'static str {
         _ if info.pause.is_some() && info.status != Status::Running => "paused",
         Status::Running | Status::Starting | Status::Waiting => "working",
         Status::Idle if info.queued > 0 => "working",
+        // Its turn is over but a subagent it sent off still works: it isn't done, and it goes on
+        // when the subagent reports back.
+        Status::Idle if info.subagents.iter().any(|s| matches!(s.status.as_str(), "running" | "pending" | "paused")) => "working",
         Status::Idle => "idle",
     }
 }
@@ -206,6 +209,10 @@ mod tests {
         assert_eq!(stand(&info("w2", Status::Starting)), "working");
         assert_eq!(stand(&info("w3", Status::Idle)), "idle");
         assert_eq!(stand(&Info { queued: 1, ..info("w4", Status::Idle) }), "working", "a message waits in its queue");
+        let sub =
+            |status: &str| crate::harness::session::SubagentBrief { id: "s".into(), tool_id: None, description: "audit".into(), status: status.into(), parent_task: None, started: 1, ended: None };
+        assert_eq!(stand(&Info { subagents: vec![sub("running")], ..info("w4b", Status::Idle) }), "working", "a subagent it sent off still works");
+        assert_eq!(stand(&Info { subagents: vec![sub("completed")], ..info("w4c", Status::Idle) }), "idle", "its subagents are done");
         assert_eq!(stand(&info("w5", Status::Waiting)), "needs_you");
         let asking = Info { approvals: vec![ApprovalBrief { id: "p".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "rm".into(), at: 1 }], ..info("w6", Status::Running) };
         assert_eq!(stand(&asking), "needs_you");
