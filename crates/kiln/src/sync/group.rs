@@ -385,6 +385,11 @@ impl Feed {
         (self.reached.index, self.queue.len() + usize::from(self.install.is_some()))
     }
 
+    /// Through where the folder's saved state holds the log: where a power loss leaves it.
+    pub fn saved_through(&self) -> u64 {
+        self.durable.index
+    }
+
     /// Whether the folder has taken everything the log committed so far.
     pub fn idle(&self) -> bool {
         self.queue.is_empty() && self.install.is_none()

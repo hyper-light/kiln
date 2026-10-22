@@ -99,6 +99,9 @@ pub struct Standing {
     /// Through where its folder has taken the log, and what it hasn't taken yet.
     pub reached: u64,
     pub behind: usize,
+    /// Through where its saved state holds what the folder took: what a power loss can't put it
+    /// back behind.
+    pub saved: u64,
     /// Its own changes the log hasn't brought back yet, and contents it waits for.
     pub unsent: usize,
     pub waiting: usize,
@@ -149,7 +152,7 @@ pub fn to_send<'a>(feed: &'a Feed, uploaded: impl Fn(&str) -> bool, sent: u64, a
 /// yet, its own changes the log hasn't brought back, and what its last look left out.
 pub fn stand(feed: &Feed) -> Standing {
     let (reached, behind) = feed.progress();
-    Standing { skipped: feed.copy.skipped.iter().map(|s| s.path.clone()).collect(), reached, behind, unsent: feed.copy.state.sent.len(), ..Standing::default() }
+    Standing { skipped: feed.copy.skipped.iter().map(|s| s.path.clone()).collect(), reached, behind, saved: feed.saved_through(), unsent: feed.copy.state.sent.len(), ..Standing::default() }
 }
 
 /// Where a session leaving a copy leaves its folder's log from: once a look at it now found
@@ -160,10 +163,12 @@ pub fn left_at(looked: &Looked, st: &Standing) -> Option<Mark> {
 }
 
 /// Whether a session that moved to a copy may go on there: the copy is of the repo it left, and
-/// its folder has taken the log as far as the folder it left had (`harness::session`'s
-/// `files_in`).
+/// its saved state holds the log as far as the folder it left had (`harness::session`'s
+/// `files_in`). Its folder alone isn't enough: a power loss would put the copy's state back
+/// behind it, and the session's next writes there would meet the log as changes to an older
+/// version of their files.
 pub fn arrived(st: &Standing, mark: &Mark) -> bool {
-    st.repo == mark.repo && st.reached >= mark.index
+    st.repo == mark.repo && st.saved >= mark.index
 }
 
 static GLOBAL: std::sync::OnceLock<Runner> = std::sync::OnceLock::new();

@@ -21,7 +21,7 @@
 //! The moves model ([`Mode::Moves`]) runs the same, with an agent session working in the repo on
 //! one machine at a time and moving between them as `harness::session` moves one: on the machine
 //! it leaves, kiln's look-now and `left_at` (its last changes in the log); on the one it goes to,
-//! `arrived` (the folder has taken the log that far). It checks, at each move, that the session
+//! `arrived` (the copy's saved state holds the log that far). It checks, at each move, that the session
 //! leaves no write of its own behind and goes on with every one of them in its folder.
 //!
 //! The checker, once the nemesis has stopped and everything settled:
@@ -1770,6 +1770,40 @@ mod tests {
             if got != bytes {
                 return Err(format!("seed {seed}: after a power loss src/util/x.rs holds {} bytes, not the {} sync wrote", got.len(), bytes.len()));
             }
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, AC-T6.1.3: the eighth bug kiln-sim found, by its seed: a moving session went on on
+    /// a copy whose folder had taken its files but whose state saves were failing (fsync errors).
+    /// A power loss put the copy's state back behind them, so the session's next writes there went
+    /// to the log as new files against its own older versions: conflicts, the log keeping the older
+    /// version at the name, and the session went on elsewhere without its latest (moves seed
+    /// 1000807).
+    #[test]
+    fn the_seed_where_a_session_went_on_before_its_files_were_saved_converges() -> Result<(), String> {
+        run(1_000_807, 0, Plant::default(), Mode::Moves).map(|_| ())
+    }
+
+    /// CP-T6.1, AC-T6.1.3: the eighth bug's contract: a session that moved goes on on a copy only
+    /// once the copy's saved state holds the log through the index it left at, not only its
+    /// folder; and a copy reports what its saved state holds.
+    #[test]
+    fn a_session_goes_on_only_once_the_copy_s_saved_state_holds_its_files() -> Result<(), String> {
+        let mark = Mark { repo: REPO.to_owned(), index: 11 };
+        let st = |reached, saved| Standing { repo: REPO.to_owned(), reached, saved, ..Standing::default() };
+        if arrived(&st(11, 10), &mark) {
+            return Err("the session went on where only the folder had its files: a power loss would put the copy back behind them".into());
+        }
+        if !arrived(&st(11, 11), &mark) || !arrived(&st(12, 12), &mark) || arrived(&Standing { repo: "another".to_owned(), ..st(12, 12) }, &mark) {
+            return Err("the session didn't go on where the copy's saved state holds its files".into());
+        }
+        let disk = Disk::new(SimClock::new(), Rng::new(1), DiskFaults::none());
+        let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk));
+        let feed = Feed::open_on(Arc::clone(&fs), &PathBuf::from("/home/m2/repo"), "m2", 2, Limits::default(), PathBuf::from("/state/m2/copy.json")).map_err(e)?;
+        let s = stand(&feed);
+        if (s.saved, s.reached) != (feed.saved_through(), feed.progress().0) {
+            return Err(format!("the copy stands saved through {}, reached {}: not its feed's", s.saved, s.reached));
         }
         Ok(())
     }
