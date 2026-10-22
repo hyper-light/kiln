@@ -1,11 +1,31 @@
 /**
  * What the goal stack panel (goals.tsx) works out, kept apart to be tested: the goals its edit box
- * covers and how the box's lines go back to them, and which reads of a stack came back too late to
- * show.
+ * covers and how the box's lines go back to them, which reads of a stack came back too late to
+ * show, which goals can become plans, and where a planned goal's steps stand.
  */
 import type { GoalItem, GoalStack } from "@/api/harness";
+import type { Stand } from "@/views/plans/status";
 
 /** The goal that stopped a paused stack with none under way (the last to end, not met or skipped), to try again first. */
+/** One of its own goals still to go, not a part, a plan's step or planned already: it can become a plan (Make a plan). */
+export function canPlan(g: GoalItem): boolean {
+  return (g.status === "pending" || g.status === "active") && !g.part_of && !g.planned_as && !g.step && !g.waits_on;
+}
+
+const PART_STAND = { pending: "waiting", active: "working", met: "met", unmet: "unmet", skipped: "skipped" } as const;
+
+/**
+ * Where step `n` of the plan `goal` became stands, as its part on the stack says: under way while it
+ * is, or while one of its own parts (its criteria and tests) is; none when it isn't on the stack.
+ */
+export function stepStand(goal: GoalItem, items: readonly GoalItem[], n: number, paused: boolean): Stand | undefined {
+  const part = items.find((i) => i.part_of === goal.id && i.part_kind === "plan" && i.step?.n === n);
+  if (!part) return undefined;
+  const busy = part.status === "active" || (part.status === "pending" && items.some((i) => i.part_of === part.id && i.status === "active"));
+  if (busy) return paused ? "paused" : "working";
+  return PART_STAND[part.status];
+}
+
 export function stoppedBy(stack: GoalStack | null): GoalItem | undefined {
   if (stack?.state !== "paused" || stack.items.some((i) => i.status === "active")) return undefined;
   const last = stack.items.filter((i) => i.status !== "pending").at(-1);

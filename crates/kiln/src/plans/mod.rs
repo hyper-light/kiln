@@ -323,6 +323,39 @@ pub struct Ran {
     pub session: String,
     pub sent: usize,
     pub run: String,
+    /// As goals, split into its acceptance criteria and tests: how many steps were.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub split: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Which of a plan's steps a run takes, and how.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pick {
+    /// Only these steps, by their number from 0 (none: all of them); each keeps its number.
+    pub only: Option<Vec<usize>>,
+    /// As goals, each step splits into its acceptance criteria and tests at once (the goal stack
+    /// a step is), rather than when its agent splits it (`goals_split`).
+    pub split: bool,
+}
+
+impl Pick {
+    /// Of `n` steps, the ones it takes, in order.
+    pub fn of(&self, n: usize) -> Vec<usize> {
+        match &self.only {
+            Some(o) => {
+                let mut v: Vec<usize> = o.iter().copied().filter(|&i| i < n).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            }
+            None => (0..n).collect(),
+        }
+    }
 }
 
 /// A failure the caller can act on.
@@ -746,14 +779,17 @@ async fn start_for(hub: &Hub, by: &crate::harness::lineage::Starter, target: Str
 }
 
 /// Runs a plan on an agent: an existing one, or a new one started with it (as `by` starts agents).
-pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &crate::harness::lineage::Starter) -> R<Ran> {
+pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, pick: &Pick, by: &crate::harness::lineage::Starter) -> R<Ran> {
     let p = get(hub, id).await?;
     ready_to_run(&p)?;
     if mode == Mode::Goals {
-        return run_goals(hub, &p, target, by).await;
+        return run_goals(hub, &p, target, pick, by).await;
     }
     if mode == Mode::Agents {
         return Err(Error::Bad("one agent per step starts agents of its own: run it with `new` (agents::start)".into()));
+    }
+    if pick.only.is_some() && mode == Mode::Message {
+        return Err(Error::Bad("`only` picks steps: run them as steps, goals or agents".into()));
     }
     let messages: Vec<String> = match mode {
         Mode::Message | Mode::Goals | Mode::Agents => vec![message(&p)],
@@ -763,7 +799,11 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &crate::ha
                 return Err(Error::Bad("this plan has no steps (no list in it): run it as one message".into()));
             }
             let n = steps.len();
-            steps.iter().enumerate().map(|(i, s)| step_message(&p, i, n, s)).collect()
+            let picked = pick.of(n);
+            if picked.is_empty() {
+                return Err(Error::Bad(format!("none of those steps is in this plan: it has {n}")));
+            }
+            picked.iter().filter_map(|&i| Some(step_message(&p, i, n, steps.get(i)?))).collect()
         }
     };
     let (session, rest) = match target {
@@ -793,7 +833,7 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &crate::ha
             Ok(())
         })
         .await?;
-    Ok(Ran { session, sent, run })
+    Ok(Ran { session, sent, run, split: 0 })
 }
 
 /// Notes plan `p` run on agent `session` in `mode` (`goals`: its steps on that agent's stack),
@@ -908,11 +948,17 @@ fn goals_error(e: crate::goals::Error) -> Error {
 
 /// A plan's steps as goals, after the agent's others (a new agent is started for them), and the
 /// stack running.
-async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &crate::harness::lineage::Starter) -> R<Ran> {
-    let texts: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
-    if texts.is_empty() {
+async fn run_goals(hub: &Hub, p: &Plan, target: Target, pick: &Pick, by: &crate::harness::lineage::Starter) -> R<Ran> {
+    let all: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
+    if all.is_empty() {
         return Err(Error::Bad("this plan has no steps (no list in it) to make goals of".into()));
     }
+    let picked = pick.of(all.len());
+    if picked.is_empty() {
+        return Err(Error::Bad(format!("none of those steps is in this plan: it has {}", all.len())));
+    }
+    // Each keeps its number in the plan.
+    let texts: Vec<(usize, String)> = picked.iter().filter_map(|&i| Some((i, all.get(i)?.clone()))).collect();
     let session = match target {
         Target::Session(s) => s,
         Target::New { target, kind, cwd } => start_for(hub, by, target, kind, cwd, None, p.title.clone()).await?,
@@ -923,14 +969,24 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &crate::harness::lin
     // tests (`crate::goals::split`).
     let goals = texts
         .into_iter()
-        .enumerate()
         .map(|(i, text)| crate::goals::NewGoal {
             text,
             step: Some(crate::goals::StepRef { plan: p.id.clone(), version: p.version, n: i + 1, run: Some(run.clone()) }),
             ..crate::goals::NewGoal::default()
         })
         .collect();
-    crate::goals::add_at(hub, &session, goals, true, &crate::goals::At::End).await.map_err(goals_error)?;
+    let stack = crate::goals::add_at(hub, &session, goals, true, &crate::goals::At::End).await.map_err(goals_error)?;
+    // Each step its goal stack: its acceptance criteria and tests, a goal each, before it (one
+    // without either stays as it is).
+    let mut split = 0;
+    if pick.split {
+        let made: Vec<String> = stack.items.iter().filter(|i| i.step.as_ref().is_some_and(|s| s.run.as_deref() == Some(run.as_str())) && i.part_of.is_none()).map(|i| i.id.clone()).collect();
+        for id in made {
+            if crate::goals::split(hub, &session, Some(&id), Vec::new()).await.is_ok() {
+                split += 1;
+            }
+        }
+    }
     let (now, by_s, version, plan_id, session_c) = (crate::util::now_unix(), by.actor.clone(), p.version, p.id.clone(), session.clone());
     let run_c = run.clone();
     hub.store
@@ -942,7 +998,7 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &crate::harness::lin
             Ok(())
         })
         .await?;
-    Ok(Ran { session, sent, run })
+    Ok(Ran { session, sent, run, split })
 }
 
 #[cfg(test)]

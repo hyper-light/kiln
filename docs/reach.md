@@ -188,6 +188,14 @@ on its own machine, with its own tools. Its tools:
 | `research_*`, `conversations_search` | research it records, each finding graded by kiln from its sources (docs/research.md), and every agent's conversations kiln keeps |
 | `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
 
+The `agents_*`, `goals_*`, `research_*` and `plans_*` tools are the ones the kiln server says agents
+have (its answer for the operations names them), each as the server describes it, so a server
+deployed with new ones offers them to agents on runners not yet upgraded. Every minute the MCP
+server looks again: when they've changed it tells the harness (`notifications/tools/list_changed`;
+Claude Code asks for them again at once), so agents at work get them mid-conversation. From a
+server that doesn't say, or while it's out of reach, it offers its own (those it last had from the
+server, else this binary's).
+
 **Code mode.** A program runs in the same bounded QuickJS sandbox as the server's code mode
 (`mcp/code.rs`), here on the runner. `kiln.machines.run({on, command})` runs a command as `run` does
 and resolves when it ends with `{runner, exit_code, output}` (a command that fails resolves with its

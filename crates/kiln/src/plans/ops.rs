@@ -224,7 +224,19 @@ pub fn agents_config(v: &Value, caller: &crate::authz::Caller) -> Result<super::
         Some(m) => Some(m.as_u64().filter(|m| *m > 0).and_then(|m| usize::try_from(m).ok()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`max_parallel` is a number of steps, 1 or more".to_owned()))?),
     };
     let main = v.get("session").and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).or_else(|| caller.agent.clone());
-    Ok(super::agents::Config { place, steps, parallel, max_parallel, main, parent: caller.agent.clone(), opener: caller.opener(), actor: caller.name.clone() })
+    Ok(super::agents::Config { place, steps, parallel, max_parallel, main, parent: caller.agent.clone(), opener: caller.opener(), actor: caller.name.clone(), only: only_of(v)? })
+}
+
+/// `only`: the steps a run takes, by their numbers from 1 (as from 0).
+fn only_of(v: &Value) -> Result<Option<Vec<usize>>, Fail> {
+    let Some(o) = v.get("only").filter(|o| !o.is_null()) else { return Ok(None) };
+    let bad = || (StatusCode::BAD_REQUEST, "`only` is a list of step numbers, from 1".to_owned());
+    let list = o.as_array().ok_or_else(bad)?;
+    let n: Vec<usize> = list.iter().map(|n| n.as_u64().filter(|n| *n >= 1).and_then(|n| usize::try_from(n - 1).ok()).ok_or_else(bad)).collect::<Result<_, _>>()?;
+    if n.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "`only` names no steps: leave it out to run every step".into()));
+    }
+    Ok(Some(n))
 }
 
 async fn run(cx: Cx, v: Value) -> Out {
@@ -270,7 +282,8 @@ async fn run(cx: Cx, v: Value) -> Out {
             None => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {target, kind, cwd}".into())),
         },
     };
-    let ran = super::run(&cx.hub, &id, target, mode, &crate::harness::ops::starter(&cx)?).await.map_err(fail)?;
+    let pick = super::Pick { only: only_of(&v)?, split: v.get("split").and_then(Value::as_bool).unwrap_or(false) };
+    let ran = super::run(&cx.hub, &id, target, mode, &pick, &crate::harness::ops::starter(&cx)?).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
     json_of(&ran)
 }
@@ -354,7 +367,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "plans.run",
-            summary: "Run a plan on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (each step a goal), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead.",
+            summary: "Run a plan, or some of its steps (`only`), on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (its steps become goals on that agent's goal stack; `split`: each step a goal stack of its acceptance criteria and tests), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead.",
             read_only: false,
             destructive: false,
             input: || {
@@ -366,7 +379,9 @@ pub fn list_ops() -> Vec<Op> {
                         "mode": {"type": "string", "enum": ["message", "steps", "goals", "agents"], "description": "message: the whole plan at once; steps: a message a turn; goals: each step a goal in the agent's goal stack; agents: each step held to as a goal by an agent of its own (with `new`: on, kind, cwd, model, effort, mode) or by the main agent, each starting once the steps it waits for are met."},
                         "steps": {"type": "array", "description": "agents: where and how each step runs, over `new` (by its place in the list): {on, kind, cwd, model, effort, mode}, or {agent: \"main\"} (or an agent's id) to give the step to that agent: its goal goes on that agent's goal stack, and no agent is started for it.", "items": {"type": "object"}},
                         "parallel": {"type": "boolean", "description": "agents: in a plan whose steps don't say what they wait for (`needs`), run them all side by side rather than each once the one before is met. Side by side in one folder, each step's agent keeps to its own files; give steps folders or machines of their own with `steps`."},
-                        "max_parallel": {"type": "integer", "minimum": 1, "description": "agents: steps at work at once, at the most (left out: every step that's ready)."}
+                        "max_parallel": {"type": "integer", "minimum": 1, "description": "agents: steps at work at once, at the most (left out: every step that's ready)."},
+                        "only": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "Only these steps, by their numbers from 1 (left out: every step); each keeps its number. The steps they wait for outside them are taken as done."},
+                        "split": {"type": "boolean", "description": "goals: each step goes on the stack as a goal stack of its own: its acceptance criteria and tests, a goal each, before it."}
                     }),
                     &["id"],
                 )

@@ -3289,6 +3289,40 @@ mod stack_tests {
         })
     }
 
+    /// A plan's step put on an agent's goal stack by itself (`only`), as a goal stack of its own
+    /// (`split`): its acceptance criteria and tests, a goal each, before it; it keeps its number.
+    #[test]
+    fn a_plan_step_goes_on_a_stack_as_a_goal_stack_of_its_own() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["keep the docs current"]).await?;
+            let id = id.as_str();
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let crit = |t: &str| crate::plans::Criterion::Qualitative { text: t.into() };
+            let parser = crate::plans::Item {
+                title: "Parser".into(),
+                acceptance: vec![crit("expressions parse"), crit("errors say where")],
+                testing: vec![crate::plans::Test { scenario: "nested".into(), criteria: vec![crit("((1)) is 1")] }],
+                ..crate::plans::Item::default()
+            };
+            let items = vec![crate::plans::Item { title: "Lexer".into(), ..crate::plans::Item::default() }, parser];
+            let p = crate::plans::create(&hub, crate::plans::New { title: "Compiler".into(), items, ..Default::default() }, "admin").await?;
+            settled(&hub, id).await;
+            let ran = call_ok(crate::ops::call(cx.clone(), "plans.run", serde_json::json!({"id": p.id, "session": id, "mode": "goals", "only": [2], "split": true})).await)?;
+            assert_eq!(ran.get("split"), Some(&serde_json::json!(1)), "{ran}");
+            let s = get(&hub, id).await?;
+            let step = s.items.iter().find(|i| i.step.as_ref().is_some_and(|st| st.plan == p.id) && i.part_of.is_none()).cloned().unwrap_or_default();
+            assert_eq!(step.step.as_ref().map(|st| st.n), Some(2), "it keeps its number: {:?}", words(&s));
+            let parts: Vec<&str> = s.items.iter().filter(|i| i.part_of.as_deref() == Some(step.id.as_str())).map(|i| i.part_kind.as_deref().unwrap_or("")).collect();
+            assert_eq!(parts, ["checks", "checks", "checks"], "{:?}", words(&s));
+            assert!(!s.items.iter().any(|i| i.text.contains("Lexer")), "only the step asked for: {:?}", words(&s));
+            // Steps numbered from 1: 0 isn't one.
+            let code = |r: Result<serde_json::Value, crate::ops::Fail>| r.err().map(|(c, m)| (c.as_u16(), m));
+            let refused = code(crate::ops::call(cx.clone(), "plans.run", serde_json::json!({"id": p.id, "session": id, "mode": "goals", "only": [0]})).await);
+            assert!(refused.as_ref().is_some_and(|(c, m)| *c == 400 && m.contains("from 1")), "{refused:?}");
+            Ok(())
+        })
+    }
+
     /// The text at `path` in `v`, if there's text there.
     fn at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
         path.iter().try_fold(v, |v, k| v.get(*k)).and_then(serde_json::Value::as_str)
