@@ -1489,8 +1489,8 @@ pub enum Command {
         #[serde(default)]
         model: Option<String>,
     },
-    /// Another session on the same account reached a usage limit: wait for its reset too (the
-    /// server sends it).
+    /// Another session on the same account reached a usage limit: wait for its reset too, if its
+    /// own usage says the limit is its own as well (the server sends it; `pause::account_hold`).
     LimitHold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window: Option<String>,

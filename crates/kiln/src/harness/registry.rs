@@ -825,7 +825,8 @@ impl Registry {
         let mut save_names = false;
         // The account's other sessions, which pause too (`hold_account`).
         let mut hold: Option<(Command, Vec<(String, Location)>)> = None;
-        let mut hold_for: Option<String> = None;
+        // Its account, and the window reached and when that starts over.
+        let mut hold_for: Option<(String, Option<String>, Option<i64>)> = None;
         // Where it runs, and the name given here, are the server's to say: to the mirror and to
         // viewers alike (a session announced again — a switch of harness, a reconnect — keeps its
         // machine and its name). The machine's own name is kept aside: it counts once it changes it.
@@ -922,7 +923,7 @@ impl Registry {
                         let c = Command::LimitHold { window: p.window.clone(), label: p.label.clone(), until: p.until, said: p.said.clone() };
                         hold = Some((c, Vec::new()));
                         // Collected below, once this mirror is let go.
-                        hold_for = Some(account);
+                        hold_for = Some((account, p.window.clone(), p.until));
                     }
                 }
                 Update::Meta { meta } => m.meta = serde_json::to_value(meta).unwrap_or(Value::Null),
@@ -952,10 +953,14 @@ impl Registry {
                 g.remove(id);
                 save_names = self.names.lock().remove(id).is_some() || save_names;
             }
-            if let (Some(account), Some((_, targets))) = (hold_for.as_ref(), hold.as_mut()) {
+            if let (Some((account, window, until)), Some((_, targets))) = (hold_for.as_ref(), hold.as_mut()) {
+                let now = crate::util::now_ms();
                 *targets = g
                     .iter()
                     .filter(|(other, o)| other.as_str() != id && o.info.account.as_deref() == Some(account.as_str()) && o.info.pause.is_none() && o.info.status != Status::Exited)
+                    // Not one whose own limits show the limit isn't its own: another account's
+                    // (an account id gone stale), another model's.
+                    .filter(|(_, o)| super::pause::shares(&o.info.limits, &o.info.model, window.as_deref(), *until, now) != Some(false))
                     .map(|(other, o)| (other.clone(), o.location.clone()))
                     .collect();
             }
@@ -981,7 +986,8 @@ impl Registry {
     }
 
     /// A session reached its account's usage limit: the account's other sessions, on every machine,
-    /// pause until it resets too, rather than each finding out by failing.
+    /// pause until it resets too, rather than each finding out by failing; each one whose own usage
+    /// says the limit is its own as well (`pause::account_hold`).
     fn hold_account(&self, hub: &Hub, c: &Command, targets: Vec<(String, Location)>) {
         let Ok(json) = serde_json::to_string(c) else { return };
         for (id, loc) in targets {

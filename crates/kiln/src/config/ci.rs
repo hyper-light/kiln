@@ -88,6 +88,7 @@ pub struct Ci {
     /// # or: username = "kiln-bot", password_file = "/etc/kiln/bitbucket-app-password"
     /// webhook_secret_file = "/etc/kiln/bitbucket-webhook-secret"
     /// workspaces = ["acme"]
+    /// # ssh_url = "ssh://git@bitbucket.org"   # where git reads over SSH (Argo CD, with a deploy key)
     /// ```
     pub bitbucket: Option<BitbucketHost>,
     /// `[ci.registry]`: kiln's own OCI registry at `/v2/` (docs/ci.md W12-R01).
@@ -176,6 +177,9 @@ pub struct BitbucketHost {
     pub webhook_secret_file: Option<std::path::PathBuf>,
     /// The workspaces it covers; none: every one.
     pub workspaces: Vec<String>,
+    /// Where git reads its repositories over SSH (`ssh://git@<web_url's host>` unless set): Argo
+    /// CD reads a release repository there with a deploy key kiln makes.
+    pub ssh_url: Option<String>,
 }
 
 impl Default for BitbucketHost {
@@ -188,6 +192,7 @@ impl Default for BitbucketHost {
             password_file: None,
             webhook_secret_file: None,
             workspaces: Vec::new(),
+            ssh_url: None,
         }
     }
 }

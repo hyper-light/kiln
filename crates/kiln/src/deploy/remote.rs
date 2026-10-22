@@ -1,17 +1,17 @@
 //! Release repositories on another git host (docs/deploy-api.md §7): GitHub, through kiln's GitHub
-//! App, or a GitLab `[[ci.gitlab]]` names, with its token:
-//! - **Made** in an organization or group when one isn't there yet.
+//! App; a GitLab `[[ci.gitlab]]` names, with its token; or Bitbucket, with `[ci.bitbucket]`'s:
+//! - **Made** in an organization, group or workspace when one isn't there yet.
 //! - **Read** through a mirror of kiln's, fetched with credentials that read that repository;
 //!   KilnCD reads the mirror, Argo CD reads the host with credentials of its own that read that one
 //!   repository (on GitHub an installation token kiln replaces before it ends, on GitLab a deploy
-//!   token).
+//!   token, on Bitbucket a deploy key over SSH).
 //! - **Written** by a push of a commit made in the mirror, with a lease on the head it was made
 //!   on: a commit someone made beside it is never lost.
 //! - **Pull requests** (GitLab's merge requests), where an environment says `via: pull-request`: a
 //!   release is proposed from a branch of its own (`kiln/release-<id>-<when it was asked for>`);
 //!   merged, its merge is delivered; closed unmerged, it's cancelled.
 //! - **Deployments**: each release is a deployment of its commit to `<environment>/<app>`, its
-//!   status following the release.
+//!   status following the release (on Bitbucket, a build status of its commit).
 //! - **Webhooks**: a push has the mirror fetched at once, a pull or merge request moves its release
 //!   at once; without them kiln polls.
 //!
@@ -30,7 +30,8 @@ use serde_json::{Value, json};
 use super::Deploy;
 use super::argocd::{self, Argo};
 use super::host::{Author, Change, CommitError, Committed, Hosted, LoggedCommit};
-use super::model::{Environment, GITHUB_HOST, GITLAB_HOST, Release, RepoRef, State as ReleaseState};
+use super::model::{BITBUCKET_HOST, Environment, GITHUB_HOST, GITLAB_HOST, Release, RepoRef, State as ReleaseState};
+use crate::githost::bitbucket::Bitbucket;
 use crate::githost::github::{App, Deployed};
 use crate::githost::gitlab::Gitlab;
 use crate::githost::{ChangeRef, ChangeState};
@@ -74,8 +75,8 @@ impl Mirrors {
     }
 }
 
-/// How a host calls a change proposed to a branch, and its number: GitHub's pull request #3,
-/// GitLab's merge request !3 (`kind`: a release repository's `host`).
+/// How a host calls a change proposed to a branch, and its number: GitHub's and Bitbucket's pull
+/// request #3, GitLab's merge request !3 (`kind`: a release repository's `host`).
 pub fn change_name(kind: &str, number: u64) -> String {
     if kind == GITLAB_HOST { format!("merge request !{number}") } else { format!("pull request #{number}") }
 }
@@ -85,6 +86,7 @@ pub fn host_label(kind: &str) -> &'static str {
     match kind {
         GITLAB_HOST => "GitLab",
         GITHUB_HOST => "GitHub",
+        BITBUCKET_HOST => "Bitbucket",
         _ => "its host",
     }
 }
@@ -94,6 +96,7 @@ pub fn host_label(kind: &str) -> &'static str {
 pub enum Host {
     Github(Arc<App>),
     Gitlab(Arc<Gitlab>),
+    Bitbucket(Arc<Bitbucket>),
 }
 
 impl Host {
@@ -102,6 +105,7 @@ impl Host {
         match self {
             Host::Github(a) => &a.web,
             Host::Gitlab(g) => &g.web,
+            Host::Bitbucket(b) => &b.web,
         }
     }
 
@@ -110,6 +114,7 @@ impl Host {
         match self {
             Host::Github(_) => "GitHub",
             Host::Gitlab(_) => "GitLab",
+            Host::Bitbucket(_) => "Bitbucket",
         }
     }
 
@@ -118,6 +123,7 @@ impl Host {
         match self {
             Host::Github(_) => GITHUB_HOST,
             Host::Gitlab(_) => GITLAB_HOST,
+            Host::Bitbucket(_) => BITBUCKET_HOST,
         }
     }
 }
@@ -125,7 +131,7 @@ impl Host {
 /// A release repository on another host, as an environment names it.
 pub struct Remote {
     pub host: Host,
-    /// `owner/name` (GitLab's `group/…/name`) on the host.
+    /// `owner/name` (GitLab's `group/…/name`, Bitbucket's `workspace/name`) on the host.
     pub name: String,
     pub branch: String,
     /// kiln's mirror: `<data>/deploy/<host kind>/<host>/<owner>/<name>.git` (a GitLab subgroup's
@@ -134,14 +140,15 @@ pub struct Remote {
     mirrors: Arc<Mirrors>,
 }
 
-/// The release repository `rr` names on its host: GitHub through kiln's GitHub App, or the GitLab
-/// whose token covers it.
+/// The release repository `rr` names on its host: GitHub through kiln's GitHub App, the GitLab
+/// whose token covers it, or Bitbucket.
 pub async fn open(d: &Deploy, rr: &RepoRef) -> Result<Remote, String> {
     name_ok(&rr.host, &rr.repo)?;
     let host = match rr.host.as_str() {
         GITHUB_HOST => Host::Github(crate::githost::github::app(&d.hub).await.ok_or("kiln has no GitHub App: make one in Settings (GitHub), or give `[ci.github]` its id and key")?),
         GITLAB_HOST => Host::Gitlab(gitlab_for(&d.hub, &rr.repo).await?),
-        other => return Err(format!("{other}: kiln reaches release repositories on github and gitlab")),
+        BITBUCKET_HOST => Host::Bitbucket(bitbucket_for(&d.hub, &rr.repo).await?),
+        other => return Err(format!("{other}: kiln reaches release repositories on github, gitlab and bitbucket")),
     };
     let root = d.hub.cfg.data("deploy").join(host.kind()).join(crate::githost::host_of(host.web()).replace([':', '/'], "_"));
     Ok(Remote { host, name: rr.repo.clone(), branch: rr.branch.clone(), mirror: Hosted::new(&root), mirrors: Arc::clone(&d.remote) })
@@ -159,8 +166,17 @@ async fn gitlab_for(hub: &Hub, path: &str) -> Result<Arc<Gitlab>, String> {
         .ok_or_else(|| format!("{path}: no GitLab of kiln's (`[[ci.gitlab]]`) has a token for its group"))
 }
 
-/// A repository's name on its host: `owner/name` on GitHub, `group/…/name` on GitLab, each part of
-/// letters, digits, `-`, `_` and `.`.
+/// Bitbucket, where `[ci.bitbucket]`'s credentials cover the repository `path`.
+async fn bitbucket_for(hub: &Hub, path: &str) -> Result<Arc<Bitbucket>, String> {
+    let b = crate::githost::bitbucket::host(hub).await.ok_or("kiln knows no Bitbucket: give `[ci.bitbucket]` an access token, or a user and an app password")?;
+    if b.name_of(&row_of(&b.web, path, None)).as_deref() != Some(path) {
+        return Err(format!("{path}: `[ci.bitbucket]`'s credentials don't cover its workspace"));
+    }
+    Ok(b)
+}
+
+/// A repository's name on its host: `owner/name` on GitHub, `group/…/name` on GitLab,
+/// `workspace/name` on Bitbucket, each part of letters, digits, `-`, `_` and `.`.
 pub fn name_ok(host: &str, name: &str) -> Result<(), String> {
     let seg = |s: &str| !s.is_empty() && s != "." && s != ".." && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     let parts: Vec<&str> = name.split('/').collect();
@@ -169,6 +185,8 @@ pub fn name_ok(host: &str, name: &str) -> Result<(), String> {
         Ok(())
     } else if host == GITLAB_HOST {
         Err(format!("{name:?}: a project on GitLab is `group/name` (or `group/subgroup/name`)"))
+    } else if host == BITBUCKET_HOST {
+        Err(format!("{name:?}: a repository on Bitbucket is `workspace/name`"))
     } else {
         Err(format!("{name:?}: a repository on GitHub is `owner/name`"))
     }
@@ -193,9 +211,17 @@ fn row_of(web: &str, name: &str, branch: Option<&str>) -> crate::store::Repo {
 }
 
 impl Remote {
-    /// Where the host serves it (Argo CD reads it there).
+    /// Where the host serves it over HTTPS (kiln fetches and pushes there).
     pub fn url(&self) -> String {
         format!("{}/{}.git", self.host.web(), self.name)
+    }
+
+    /// Where Argo CD reads it: there, or on Bitbucket over SSH (its deploy key reads there).
+    pub fn reader_url(&self) -> String {
+        match &self.host {
+            Host::Bitbucket(b) => b.ssh_url(&self.name),
+            _ => self.url(),
+        }
     }
 
     /// Where KilnCD reads it: kiln's mirror, on this machine.
@@ -232,6 +258,11 @@ impl Remote {
             Host::Gitlab(g) => {
                 let reader = g.reader(&self.row())?;
                 let (k, v) = reader.header.ok_or_else(|| anyhow!("GitLab's reader has no credentials"))?;
+                format!("{k}: {v}")
+            }
+            Host::Bitbucket(b) => {
+                let reader = b.reader(&self.row())?;
+                let (k, v) = reader.header.ok_or_else(|| anyhow!("Bitbucket's reader has no credentials"))?;
                 format!("{k}: {v}")
             }
         };
@@ -386,6 +417,7 @@ impl Remote {
         let found = match &self.host {
             Host::Github(app) => app.find_change(&row, &branch).await?,
             Host::Gitlab(g) => g.find_change(&row, &branch).await?,
+            Host::Bitbucket(b) => b.find_change(&row, &branch).await?,
         };
         if let Some((pr, state)) = found {
             return Ok(Proposal { number: pr.number, url: pr.url, branch, state });
@@ -408,6 +440,7 @@ impl Remote {
         let pr: ChangeRef = match &self.host {
             Host::Github(app) => app.open_change(&row, &branch, &self.branch, &title, body).await?,
             Host::Gitlab(g) => g.open_change(&row, &branch, &self.branch, &title, body).await?,
+            Host::Bitbucket(b) => b.open_change(&row, &branch, &self.branch, &title, body).await?,
         };
         Ok(Proposal { number: pr.number, url: pr.url, branch, state: ChangeState::Open })
     }
@@ -417,6 +450,7 @@ impl Remote {
         match &self.host {
             Host::Github(app) => app.change(&self.row(), number).await,
             Host::Gitlab(g) => g.change(&self.row(), number).await,
+            Host::Bitbucket(b) => b.change(&self.row(), number).await,
         }
     }
 
@@ -425,6 +459,7 @@ impl Remote {
         match &self.host {
             Host::Github(app) => app.close_change(&self.row(), number, why).await?,
             Host::Gitlab(g) => g.close_change(&self.row(), number, why).await?,
+            Host::Bitbucket(b) => b.close_change(&self.row(), number, why).await?,
         }
         self.drop_branch(branch).await;
         Ok(())
@@ -435,6 +470,7 @@ impl Remote {
         let gone = match &self.host {
             Host::Github(app) => app.delete_branch(&self.row(), branch).await,
             Host::Gitlab(g) => g.delete_branch(&self.row(), branch).await,
+            Host::Bitbucket(b) => b.delete_branch(&self.row(), branch).await,
         };
         if let Err(e) = gone {
             tracing::debug!(repo = %self.name, branch, error = %format!("{e:#}"), "deploy: a release's branch stays");
@@ -459,7 +495,7 @@ fn said(out: &std::process::Output) -> String {
 }
 
 /// A release repository that isn't there yet on its host, made: private and empty, in its owner's
-/// organization or group (docs/deploy-api.md §7). One that is there is left as it is.
+/// organization, group or workspace (docs/deploy-api.md §7). One that is there is left as it is.
 pub async fn ensure(d: &Deploy, rr: &RepoRef) -> Result<(), String> {
     let r = open(d, rr).await?;
     let e = |e: anyhow::Error| format!("{e:#}");
@@ -467,6 +503,7 @@ pub async fn ensure(d: &Deploy, rr: &RepoRef) -> Result<(), String> {
     let there = match &r.host {
         Host::Github(app) => app.repository(&rr.repo).await.map_err(e)?.is_some(),
         Host::Gitlab(g) => g.project(&rr.repo).await.map_err(e)?.is_some(),
+        Host::Bitbucket(b) => b.repository(&rr.repo).await.map_err(e)?.is_some(),
     };
     if there {
         return Ok(());
@@ -474,6 +511,7 @@ pub async fn ensure(d: &Deploy, rr: &RepoRef) -> Result<(), String> {
     match &r.host {
         Host::Github(app) => app.create_repository(&rr.repo, WHAT).await.map_err(e)?,
         Host::Gitlab(g) => g.create_project(&rr.repo, WHAT).await.map_err(e)?,
+        Host::Bitbucket(b) => b.create_repository(&rr.repo, WHAT).await.map_err(e)?,
     }
     d.hub.store.audit("kiln".into(), "repo.create".into(), format!("{} on {} (a release repository, docs/deploy-api.md §6)", rr.repo, r.host.label())).await;
     Ok(())
@@ -487,8 +525,8 @@ pub fn environment_name(app: &str, env: &str) -> String {
     format!("{env}/{app}")
 }
 
-/// What the host hears of a release in `state` (GitHub's words, GitLab's from them; `None`:
-/// nothing, the host retires one superseded or rolled back itself).
+/// What the host hears of a release in `state` (GitHub's words, GitLab's and Bitbucket's from
+/// them; `None`: nothing, the host retires one superseded or rolled back itself).
 pub fn deployment_state(state: ReleaseState) -> Option<&'static str> {
     match state {
         ReleaseState::Delivering => Some("in_progress"),
@@ -504,9 +542,9 @@ fn settled(state: &str) -> bool {
 }
 
 /// Reports a release that moved to `r.state` to its release repository's host, as a deployment of
-/// its commit, where that host is GitHub or GitLab: in the background, one report of a release at
-/// a time, never one that took it back from where it settled; tried again for a few minutes while
-/// the host doesn't take it.
+/// its commit (Bitbucket's: a build status of it), where that host is GitHub, a GitLab or
+/// Bitbucket: in the background, one report of a release at a time, never one that took it back
+/// from where it settled; tried again for a few minutes while the host doesn't take it.
 pub fn report(d: &Deploy, r: &Release) {
     let (Some(state), Some(_)) = (deployment_state(r.state), r.commit.as_ref()) else { return };
     let (deploy, id, environment, app, at) = (DeployRef { hub: Arc::clone(&d.hub), mirrors: Arc::clone(&d.remote) }, r.id, r.environment.clone(), r.app.clone(), r.state);
@@ -535,6 +573,7 @@ async fn report_now(d: &DeployRef, id: i64, environment: &str, app: &str, at: Re
     let host = match rr.host.as_str() {
         GITHUB_HOST => Host::Github(crate::githost::github::app(&d.hub).await.ok_or_else(|| anyhow!("kiln has no GitHub App any more"))?),
         GITLAB_HOST => Host::Gitlab(gitlab_for(&d.hub, &rr.repo).await.map_err(anyhow::Error::msg)?),
+        BITBUCKET_HOST => Host::Bitbucket(bitbucket_for(&d.hub, &rr.repo).await.map_err(anyhow::Error::msg)?),
         _ => return Ok(()),
     };
     let lock = Arc::clone(d.mirrors.reports.lock().entry(id).or_default());
@@ -552,14 +591,19 @@ async fn report_now(d: &DeployRef, id: i64, environment: &str, app: &str, at: Re
     let base = d.hub.cfg.server.public_url.trim_end_matches('/');
     let page = format!("{base}/deployments/releases/{id}");
     let environment_name = environment_name(app, environment);
+    let what = format!("release {id}: {} {}{}", r.kind.as_str(), r.version.as_deref().unwrap_or(""), r.message.as_deref().filter(|_| at != ReleaseState::Delivering).map(|m| format!(" · {m}")).unwrap_or_default());
     match &host {
         Host::Github(app_obj) => {
-            let what = format!("release {id}: {} {}{}", r.kind.as_str(), r.version.as_deref().unwrap_or(""), r.message.as_deref().filter(|_| at != ReleaseState::Delivering).map(|m| format!(" · {m}")).unwrap_or_default());
             let s = Deployed { state, description: what.trim(), environment_url: None, log_url: Some(&page) };
             app_obj.deployment_status(&repo, &commit, &environment_name, &s).await?;
         }
         // GitLab's deployments say no more than their status; one cancelled is `canceled`.
         Host::Gitlab(g) => g.deployment(&repo, &commit, &environment_name, if state == "inactive" { "cancelled" } else { state }, Some(&page)).await?,
+        // Bitbucket's is a build status of the commit, `deploy/<environment>/<app>`.
+        Host::Bitbucket(b) => {
+            let s = crate::githost::CommitStatus { context: format!("deploy/{environment_name}"), state: state.to_owned(), description: what.trim().to_owned(), url: Some(page.clone()) };
+            b.status(&d.hub, &repo, &commit, &s).await?;
+        }
     }
     st.kv_set(key, state.to_owned()).await?;
     Ok(())
@@ -611,6 +655,27 @@ pub async fn on_github_event(d: &Deploy, event: &str, v: &Value) {
     }
 }
 
+/// Bitbucket's `repo:push` and `pullrequest:*` events (created, updated, fulfilled: merged,
+/// rejected: declined).
+pub async fn on_bitbucket_event(d: &Deploy, event: &str, v: &Value) {
+    let full = v.pointer("/repository/full_name").and_then(Value::as_str).unwrap_or_default();
+    match event {
+        "repo:push" => {
+            let changes = v.pointer("/push/changes").and_then(Value::as_array).cloned().unwrap_or_default();
+            let branches = changes.iter().filter_map(|c| c.get("new").filter(|n| n.get("type").and_then(Value::as_str) == Some("branch")).and_then(|n| n.get("name")).and_then(Value::as_str));
+            for branch in branches {
+                on_event(d, BITBUCKET_HOST, full, Some(branch), None).await;
+            }
+        }
+        "pullrequest:created" | "pullrequest:updated" | "pullrequest:fulfilled" | "pullrequest:rejected" => {
+            let head = v.pointer("/pullrequest/source/branch/name").and_then(Value::as_str).unwrap_or_default();
+            let merged = event == "pullrequest:fulfilled" || v.pointer("/pullrequest/state").and_then(Value::as_str) == Some("MERGED");
+            on_event(d, BITBUCKET_HOST, full, None, Some((head, merged))).await;
+        }
+        _ => {}
+    }
+}
+
 /// A GitLab's `Push Hook` and `Merge Request Hook` events.
 pub async fn on_gitlab_event(d: &Deploy, event: &str, v: &Value) {
     let full = v.pointer("/project/path_with_namespace").and_then(Value::as_str).unwrap_or_default();
@@ -634,8 +699,9 @@ const READER_LASTS: i64 = 45 * 60;
 
 /// Argo CD reads a release repository on its host with credentials that read that one repository:
 /// on GitHub an installation token, put in its place every half hour; on GitLab a deploy token of
-/// the project, made again (the one before revoked) only when Argo CD can't read with it. Either
-/// is put in place at once when Argo CD can't read.
+/// the project, and on Bitbucket a deploy key (over SSH: its API makes no token that only reads),
+/// each made again (the one before revoked) only when Argo CD can't read with it. Any is put in
+/// place at once when Argo CD can't read.
 pub async fn argo_reader(d: &Deploy, argo: &Argo, env: &Environment, url: &str) -> Result<(), String> {
     let key = format!("deploy/{}/argo-reader/{}/{}", env.release_repo.host, argo.integration, env.release_repo.repo);
     let now = crate::util::now_unix();
@@ -644,7 +710,7 @@ pub async fn argo_reader(d: &Deploy, argo: &Argo, env: &Environment, url: &str) 
     let r = open(d, &env.release_repo).await?;
     let due = match &r.host {
         Host::Github(_) => put.is_none_or(|at| now - at >= READER_SECS),
-        Host::Gitlab(_) => put.is_none(),
+        Host::Gitlab(_) | Host::Bitbucket(_) => put.is_none(),
     };
     if !due {
         let reads = argo.repository(url).await?.is_some_and(|r| r.pointer("/connectionState/status").and_then(Value::as_str) != Some("Failed"));
@@ -653,32 +719,71 @@ pub async fn argo_reader(d: &Deploy, argo: &Argo, env: &Environment, url: &str) 
         }
     }
     let e = |e: anyhow::Error| format!("{e:#}");
-    let (user, token, made) = match &r.host {
+    let label = format!("kiln: Argo CD {}", argo.integration);
+    let (reads, made) = match &r.host {
         Host::Github(app) => {
             let perms: BTreeMap<String, String> = [("contents".to_owned(), "read".to_owned()), ("metadata".to_owned(), "read".to_owned())].into();
-            ("x-access-token".to_owned(), app.token_lasting(&r.name, &perms, READER_LASTS).await.map_err(e)?, None)
+            (Reads::Login("x-access-token".to_owned(), app.token_lasting(&r.name, &perms, READER_LASTS).await.map_err(e)?), None)
         }
         Host::Gitlab(g) => {
-            let (id, user, token) = g.deploy_token(&r.name, &format!("kiln: Argo CD {}", argo.integration)).await.map_err(e)?;
-            (user, token, Some(id))
+            let (id, user, token) = g.deploy_token(&r.name, &label).await.map_err(e)?;
+            (Reads::Login(user, token), Some(id))
+        }
+        Host::Bitbucket(b) => {
+            let (id, key) = b.deploy_key(&r.name, &label).await.map_err(e)?;
+            (Reads::Key(key), Some(id))
         }
     };
-    argo.put_repository(url, &argocd::release_repo_name(&env.release_repo.repo), &user, &token).await.map_err(|why| format!("Argo CD can't read the release repository at {url}: {why}"))?;
-    // The deploy token it replaces, revoked.
-    if let (Host::Gitlab(g), Some(old)) = (&r.host, kept.get("token_id").and_then(Value::as_u64))
-        && let Err(e) = g.revoke_deploy_token(&r.name, old).await
+    let name = argocd::release_repo_name(&env.release_repo.repo);
+    let put = match &reads {
+        Reads::Login(user, token) => argo.put_repository(url, &name, user, token).await,
+        Reads::Key(key) => argo.put_repository_ssh(url, &name, key).await,
+    };
+    if let Err(why) = put {
+        // The credential Argo CD didn't take goes, not to be left behind on the host.
+        if let Some(id) = made {
+            revoke_reader(&r, id).await;
+        }
+        let known = if matches!(reads, Reads::Key(_)) { " (Argo CD checks the server's SSH host key against the ones it knows: argocd-ssh-known-hosts-cm)" } else { "" };
+        return Err(format!("Argo CD can't read the release repository at {url}: {why}{known}"));
+    }
+    // The deploy token or key it replaces, revoked (never the one just made, should the host
+    // give it the same id).
+    if let Some(old) = kept.get("token_id").and_then(Value::as_u64)
+        && Some(old) != made
     {
-        tracing::warn!(repo = %r.name, error = %format!("{e:#}"), "deploy: Argo CD's deploy token before stays on GitLab");
+        revoke_reader(&r, old).await;
     }
     d.hub.store.kv_set(key, json!({ "at": now, "token_id": made }).to_string()).await.map_err(e)?;
     Ok(())
+}
+
+/// What Argo CD reads a release repository with.
+enum Reads {
+    /// A user and a token, over HTTPS.
+    Login(String, String),
+    /// An SSH private key.
+    Key(String),
+}
+
+/// A deploy token (GitLab) or deploy key (Bitbucket) of Argo CD's, revoked: one that's been
+/// replaced, or one Argo CD didn't take.
+async fn revoke_reader(r: &Remote, id: u64) {
+    let gone = match &r.host {
+        Host::Github(_) => Ok(()),
+        Host::Gitlab(g) => g.revoke_deploy_token(&r.name, id).await,
+        Host::Bitbucket(b) => b.revoke_deploy_key(&r.name, id).await,
+    };
+    if let Err(e) = gone {
+        tracing::warn!(repo = %r.name, host = r.host.label(), error = %format!("{e:#}"), "deploy: a credential of Argo CD's stays on the release repository's host");
+    }
 }
 
 /// Every Argo CD environment's credentials for its release repository on another host, put again
 /// where they're due (the worker, every few minutes).
 pub async fn refresh_readers(d: &Deploy) {
     let Ok(envs) = super::store::environments(&d.hub.store).await else { return };
-    for env in envs.iter().filter(|e| matches!(e.release_repo.host.as_str(), GITHUB_HOST | GITLAB_HOST)) {
+    for env in envs.iter().filter(|e| super::model::remote_host(&e.release_repo.host)) {
         let Some(integration) = super::appset::integration_of(env) else { continue };
         let done = match argocd::Argo::of(&d.hub, integration).await {
             Ok(argo) => {
@@ -693,9 +798,9 @@ pub async fn refresh_readers(d: &Deploy) {
     }
 }
 
-/// Where Argo CD reads a release repository on another host (its web origin's `<name>.git`).
+/// Where Argo CD reads a release repository on another host ([`Remote::reader_url`]).
 pub async fn release_url(d: &Deploy, rr: &RepoRef) -> Option<String> {
-    open(d, rr).await.ok().map(|r| r.url())
+    open(d, rr).await.ok().map(|r| r.reader_url())
 }
 
 #[cfg(test)]
@@ -713,6 +818,12 @@ mod tests {
         for bad in ["releases", "acme/../x", "acme//r", "acme/r.git"] {
             assert!(name_ok(GITLAB_HOST, bad).is_err(), "{bad}");
         }
+        assert!(name_ok(BITBUCKET_HOST, "acme/releases").is_ok());
+        for bad in ["releases", "acme/platform/releases", "acme/r.git"] {
+            assert!(name_ok(BITBUCKET_HOST, bad).is_err(), "{bad}");
+        }
+        assert_eq!(host_label(BITBUCKET_HOST), "Bitbucket");
+        assert_eq!(change_name(BITBUCKET_HOST, 3), "pull request #3");
         assert_eq!(environment_name("web", "production"), "production/web");
         assert_eq!(deployment_state(ReleaseState::Delivering), Some("in_progress"));
         assert_eq!(deployment_state(ReleaseState::Superseded), None);
