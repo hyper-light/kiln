@@ -50,6 +50,11 @@ pub struct Plan {
     pub steps: Vec<String>,
     /// How many times it was run.
     pub runs: i64,
+    /// `planning` (made from a goal: its agent researches it and writes its steps, then says it's
+    /// ready; it isn't run until then) or `ready`.
+    pub phase: String,
+    /// Its research: what its steps rest on (`crate::research`).
+    pub research: Option<String>,
 }
 
 /// One step of a plan: a piece of the work, what it's like, what makes it done, and how it's
@@ -74,6 +79,9 @@ pub struct Item {
     /// plan: each step waits for the one before.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<usize>,
+    /// The findings of its plan's research it rests on (their ids: `f1`, …).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub basis: Vec<String>,
 }
 
 /// Criteria and tests a step has at the most.
@@ -128,6 +136,9 @@ impl Item {
         }
         if self.title.chars().count() > TITLE {
             return Some(format!("step {n}'s title is {TITLE} characters at the most"));
+        }
+        if self.basis.len() > CRITERIA || self.basis.iter().any(|b| b.trim().is_empty() || b.chars().count() > 40) {
+            return Some(format!("step {n}'s basis is the ids of up to {CRITERIA} findings of its research (f1, f2 …)"));
         }
         if self.acceptance.len() > CRITERIA || self.testing.len() > CRITERIA || self.testing.iter().any(|t| t.criteria.len() > CRITERIA) {
             return Some(format!("step {n} has {CRITERIA} criteria and {CRITERIA} tests at the most"));
@@ -206,6 +217,18 @@ pub struct Source {
     pub machine: Option<String>,
     pub cwd: Option<String>,
     pub agent: Option<String>,
+    /// The goal it was made from (`goals_plan`): once every step is met, so is the goal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalOf>,
+}
+
+/// A goal a plan was made from: its agent's, by id, in the words it had.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalOf {
+    pub agent: String,
+    pub id: String,
+    pub text: String,
 }
 
 /// One version of a plan.
@@ -502,7 +525,7 @@ fn title_for(body: &str, items: &[Item]) -> String {
     }
 }
 
-const COLUMNS: &str = "p.id, p.title, p.body, p.tags, p.source, p.share, p.version, p.created_at, p.updated_at, (SELECT COUNT(*) FROM plan_runs r WHERE r.plan_id = p.id), p.items";
+const COLUMNS: &str = "p.id, p.title, p.body, p.tags, p.source, p.share, p.version, p.created_at, p.updated_at, (SELECT COUNT(*) FROM plan_runs r WHERE r.plan_id = p.id), p.items, p.phase, (SELECT x.id FROM research x WHERE x.plan_id = p.id ORDER BY x.created_at DESC LIMIT 1)";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
     let tags: String = r.get(3)?;
@@ -522,6 +545,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
         runs: r.get(9)?,
+        phase: r.get(11)?,
+        research: r.get(12)?,
     })
 }
 
@@ -562,6 +587,11 @@ pub async fn shared(hub: &Hub, token: &str) -> R<Plan> {
 }
 
 pub async fn create(hub: &Hub, n: New, by: &str) -> R<Plan> {
+    create_in(hub, n, by, "ready").await
+}
+
+/// A new plan in `phase` (`planning`: made from a goal, `crate::goals::plan`).
+pub async fn create_in(hub: &Hub, n: New, by: &str, phase: &'static str) -> R<Plan> {
     let title = if n.title.trim().is_empty() { title_for(&n.body, &n.items) } else { n.title.trim().to_owned() };
     check(&title, &n.body, &n.items)?;
     let items = serde_json::to_string(&n.items).map_err(anyhow::Error::from)?;
@@ -574,8 +604,8 @@ pub async fn create(hub: &Hub, n: New, by: &str) -> R<Plan> {
         .call(move |c| {
             let tx = c.transaction()?;
             tx.execute(
-                "INSERT INTO plans (id, title, body, items, tags, source, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
-                params![id, title, body, items, tags, source, now],
+                "INSERT INTO plans (id, title, body, items, tags, source, version, created_at, updated_at, phase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8)",
+                params![id, title, body, items, tags, source, now, phase],
             )?;
             tx.execute("INSERT INTO plan_versions (plan_id, version, title, body, items, at, by) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)", params![id, title, body, items, now, by])?;
             let p = get_in(&tx, &id)?;
@@ -597,6 +627,7 @@ fn fill_source(hub: &Hub, s: Source) -> Source {
         cwd: s.cwd.or(Some(i.cwd)),
         agent: s.agent.or(Some(i.name)),
         session: s.session,
+        goal: s.goal,
     }
 }
 
@@ -717,6 +748,7 @@ async fn start_for(hub: &Hub, by: &crate::harness::lineage::Starter, target: Str
 /// Runs a plan on an agent: an existing one, or a new one started with it (as `by` starts agents).
 pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &crate::harness::lineage::Starter) -> R<Ran> {
     let p = get(hub, id).await?;
+    ready_to_run(&p)?;
     if mode == Mode::Goals {
         return run_goals(hub, &p, target, by).await;
     }
@@ -764,6 +796,107 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &crate::ha
     Ok(Ran { session, sent, run })
 }
 
+/// Notes plan `p` run on agent `session` in `mode` (`goals`: its steps on that agent's stack),
+/// by `by`: the run's id.
+pub async fn note_run(hub: &Hub, p: &Plan, session: &str, mode: &'static str, by: &str) -> R<String> {
+    let (run, now, version, plan_id, session, by) = (crate::util::new_id(), crate::util::now_unix(), p.version, p.id.clone(), session.to_owned(), by.to_owned());
+    let run_c = run.clone();
+    hub.store
+        .call(move |c| {
+            c.execute("INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![run_c, plan_id, version, session, mode, now, by])?;
+            Ok(())
+        })
+        .await?;
+    Ok(run)
+}
+
+/// A plan in its planning phase isn't run: its agent says it's ready first (`plans.ready`).
+pub fn ready_to_run(p: &Plan) -> R<()> {
+    if p.phase == "planning" {
+        return Err(Error::Bad(format!("\"{}\" is still being planned: its agent researches it and writes its steps, then says it's ready (plans_ready)", p.title)));
+    }
+    Ok(())
+}
+
+/// What saying a plan is ready came to: what its steps rest on that's weak, said so.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Ready {
+    pub warnings: Vec<String>,
+}
+
+fn research_error(e: crate::research::Error) -> Error {
+    match e {
+        crate::research::Error::Bad(m) => Error::Bad(m),
+        crate::research::Error::Missing => Error::Bad("its research is gone".into()),
+        crate::research::Error::Other(e) => Error::Other(e),
+    }
+}
+
+/// Ends plan `id`'s planning phase: it has steps, its research has sources inside and out (or says
+/// why not: `skipped`), and each step rests only on findings of its research. What's weak (a step
+/// resting on nothing, or on findings graded D or F; quotes still being checked) comes back as
+/// warnings, for the agent to say. A plan ready already stays as it is.
+pub async fn ready(hub: &Hub, id: &str, skipped: Option<crate::research::Skipped>) -> R<(Plan, Ready)> {
+    let p = get(hub, id).await?;
+    if p.phase != "planning" {
+        return Ok((p, Ready::default()));
+    }
+    if p.steps.is_empty() {
+        return Err(Error::Bad("it has no steps yet: write them (plans_update with `items`, each with its acceptance criteria, tests and the findings it rests on), then say it's ready".into()));
+    }
+    let mut warnings = Vec::new();
+    if let Some(rid) = p.research.clone() {
+        if let Some(k) = skipped {
+            crate::research::skip(hub, &rid, k).await.map_err(research_error)?;
+        }
+        let r = crate::research::get(hub, &rid).await.map_err(research_error)?;
+        let v = crate::research::view(&r, false);
+        if v.summary.internal == 0 && r.skipped.internal.is_none() {
+            return Err(Error::Bad(
+                "its research has no internal sources: look inside first (files on your machine and others: code, docs, data, pictures, video; kiln's records: conversations_search, plans, CI runs, deployments) and add what you find (research_add), or say why there are none (`skipped.internal`)".into(),
+            ));
+        }
+        if v.summary.external == 0 && r.skipped.external.is_none() {
+            return Err(Error::Bad(
+                "its research has no external sources: look outside too (the web, official docs and standards, papers, blogs, forums) and add what you find (research_add), or say why there are none (`skipped.external`)".into(),
+            ));
+        }
+        let ids: Vec<&str> = r.findings.iter().map(|f| f.id.as_str()).collect();
+        for (i, it) in p.items.iter().enumerate() {
+            if let Some(b) = it.basis.iter().find(|b| !ids.contains(&b.as_str())) {
+                return Err(Error::Bad(format!("step {} rests on {b}, which isn't a finding of its research", i + 1)));
+            }
+        }
+        for (i, it) in p.items.iter().enumerate() {
+            if it.basis.is_empty() {
+                warnings.push(format!("step {} rests on no finding of its research", i + 1));
+                continue;
+            }
+            let weak: Vec<String> = it
+                .basis
+                .iter()
+                .filter_map(|b| v.findings.iter().find(|g| &g.finding.id == b))
+                .filter(|g| matches!(g.confidence.grade, "D" | "F"))
+                .map(|g| format!("{} ({} · {})", g.finding.id, g.confidence.grade, g.confidence.score))
+                .collect();
+            if !weak.is_empty() {
+                warnings.push(format!("step {} rests on weak findings: {}", i + 1, weak.join(", ")));
+            }
+        }
+        if v.summary.checking > 0 {
+            warnings.push(format!("{} quotes are still being checked: grades may change", v.summary.checking));
+        }
+    }
+    let (pid, now) = (p.id.clone(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            c.execute("UPDATE plans SET phase = 'ready', updated_at = ?2 WHERE id = ?1", params![pid, now])?;
+            Ok(())
+        })
+        .await?;
+    Ok((get(hub, id).await?, Ready { warnings }))
+}
+
 /// A goal stack's failure as a plan's.
 fn goals_error(e: crate::goals::Error) -> Error {
     match e {
@@ -791,7 +924,11 @@ async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &crate::harness::lin
     let goals = texts
         .into_iter()
         .enumerate()
-        .map(|(i, text)| crate::goals::NewGoal { text, step: Some(crate::goals::StepRef { plan: p.id.clone(), version: p.version, n: i + 1, run: Some(run.clone()) }) })
+        .map(|(i, text)| crate::goals::NewGoal {
+            text,
+            step: Some(crate::goals::StepRef { plan: p.id.clone(), version: p.version, n: i + 1, run: Some(run.clone()) }),
+            ..crate::goals::NewGoal::default()
+        })
         .collect();
     crate::goals::add_at(hub, &session, goals, true, &crate::goals::At::End).await.map_err(goals_error)?;
     let (now, by_s, version, plan_id, session_c) = (crate::util::now_unix(), by.actor.clone(), p.version, p.id.clone(), session.clone());
@@ -836,7 +973,22 @@ mod tests {
 
     #[test]
     fn messages_hand_over_the_plan_or_one_step() {
-        let p = Plan { id: "p".into(), title: "T".into(), body: "- a\n- b".into(), items: vec![], tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps: vec!["a".into(), "b".into()], runs: 0 };
+        let p = Plan {
+            id: "p".into(),
+            title: "T".into(),
+            body: "- a\n- b".into(),
+            items: vec![],
+            tags: vec![],
+            source: None,
+            share: None,
+            version: 1,
+            created_at: 0,
+            updated_at: 0,
+            steps: vec!["a".into(), "b".into()],
+            runs: 0,
+            phase: "ready".into(),
+            research: None,
+        };
         assert!(message(&p).contains("# T\n\n- a\n- b"));
         let headed = Plan { body: "# T\n\n- a\n- b".into(), ..p.clone() };
         assert_eq!(message(&headed).matches("# T").count(), 1);
@@ -853,8 +1005,24 @@ mod tests {
             acceptance: vec![Criterion::Qualitative { text: "scan_number exists".into() }, le],
             testing: vec![Test { scenario: "hex literals".into(), criteria: vec![Criterion::Qualitative { text: "0x1F reads as 31".into() }] }],
             needs: vec![],
+            basis: vec![],
         };
-        let p = Plan { id: "p".into(), title: "Lexer".into(), body: "Why: the scanner grew.".into(), items: vec![it.clone(), Item { title: "Ship it".into(), ..Item::default() }], tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps: vec![], runs: 0 };
+        let p = Plan {
+            id: "p".into(),
+            title: "Lexer".into(),
+            body: "Why: the scanner grew.".into(),
+            items: vec![it.clone(), Item { title: "Ship it".into(), ..Item::default() }],
+            tags: vec![],
+            source: None,
+            share: None,
+            version: 1,
+            created_at: 0,
+            updated_at: 0,
+            steps: vec![],
+            runs: 0,
+            phase: "ready".into(),
+            research: None,
+        };
         let md = markdown(&p);
         assert!(md.starts_with("Why: the scanner grew.\n\n## 1. Split the scanner\n\nMove number scanning"), "{md}");
         assert!(md.contains("**Acceptance criteria**\n\n- scan_number exists\n- scan time is at most 2 ms") && md.contains("**Tests**\n\n- hex literals — passes when 0x1F reads as 31") && md.contains("## 2. Ship it"), "{md}");

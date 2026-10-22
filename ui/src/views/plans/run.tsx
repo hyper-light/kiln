@@ -19,6 +19,8 @@ import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { ChangeLink, Quiet } from "@/views/harness/change-bar";
+import { PlanGraph, StepBar } from "./graph";
+import { StepGlyph } from "./status";
 import "./plans.css";
 
 const WORD: Record<StepStand, string> = {
@@ -96,6 +98,20 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       <p className="plan-dim plan-meta">
         One agent per step · v{v.version} · {STATE[v.state]} · {v.met} of {v.total} met · started {relativeTime(v.at)} by {v.by}
       </p>
+      <StepBar stands={v.steps.map((s) => s.stand)} />
+      {v.steps.length > 1 && (
+        <PlanGraph
+          label="Its steps, as they run"
+          steps={v.steps.map((s) => ({
+            n: s.n,
+            title: s.title,
+            needs: s.needs ?? [],
+            stand: s.stand,
+            who: s.agent ? `${s.agent.name} · ${s.agent.kind}` : undefined,
+            href: s.agent ? `/agents/${encodeURIComponent(s.agent.id)}` : undefined,
+          }))}
+        />
+      )}
       {v.note && <p className="plan-dim run-note">{v.note}</p>}
       {v.stack && <StackLine stack={v.stack} />}
       {v.state === "stopped" && v.reason && <p className="run-reason">Stopped: {v.reason}.</p>}
@@ -170,7 +186,7 @@ function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; b
         <span className="run-n">{s.n}</span>
         <span className="run-step-title">{s.title}</span>
         <span className="run-word">
-          <i aria-hidden="true" />
+          <StepGlyph stand={s.stand} />
           {WORD[s.stand]}
         </span>
       </div>

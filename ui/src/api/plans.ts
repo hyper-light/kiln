@@ -8,6 +8,8 @@ export interface PlanSource {
   machine?: string | null;
   cwd?: string | null;
   agent?: string | null;
+  /** The goal it was made from: once every step is met, so is the goal. */
+  goal?: { agent: string; id: string; text: string } | null;
 }
 
 /** How a measure compares with its threshold (crates/kiln/src/plans/criteria.rs `Op`). */
@@ -50,6 +52,8 @@ export interface PlanItem {
   testing: PlanTest[];
   /** The steps it waits for, by number (from 1): run with an agent per step, it starts once each is met. */
   needs?: number[];
+  /** The findings of its plan's research it rests on (`f1`, …). */
+  basis?: string[];
 }
 
 export const emptyItem = (): PlanItem => ({ title: "", description: "", examples: "", acceptance: [], testing: [] });
@@ -70,6 +74,10 @@ export interface Plan {
   updated_at: number;
   steps: string[];
   runs: number;
+  /** `planning`: made from a goal, its agent researching it and writing its steps; not run until it says it's ready. */
+  phase: "planning" | "ready";
+  /** Its research: what its steps rest on. */
+  research: string | null;
 }
 
 export interface PlanVersion {

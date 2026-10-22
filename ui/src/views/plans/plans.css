@@ -674,36 +674,16 @@ a.plan-row-main:hover {
   color: var(--color-meta);
   font-size: 12.5px;
 }
-.run-word > i {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #7e818a;
-}
-.run-step[data-stand="working"] .run-word > i {
-  background: var(--color-accent);
-}
 .run-step[data-stand="needs_you"] .run-word,
 .run-step[data-stand="yours"] .run-word {
   color: var(--color-warn);
 }
-.run-step[data-stand="needs_you"] .run-word > i,
-.run-step[data-stand="yours"] .run-word > i {
-  background: var(--color-warn-dot);
-}
 .run-step[data-stand="met"] .run-word {
   color: var(--color-ok);
-}
-.run-step[data-stand="met"] .run-word > i {
-  background: var(--color-ok-dot);
 }
 .run-step[data-stand="unmet"] .run-word,
 .run-step[data-stand="stopped"] .run-word {
   color: var(--color-fail);
-}
-.run-step[data-stand="unmet"] .run-word > i,
-.run-step[data-stand="stopped"] .run-word > i {
-  background: var(--color-fail);
 }
 .run-agent,
 .run-what,
@@ -752,4 +732,159 @@ a.plan-row-main:hover {
 }
 .plan-meta-line {
   margin: 0;
+}
+
+/* A plan's steps as their graph (graph.tsx): rounds across (down, narrow), a line from each step a
+   step waits for; where each stands drawn as the console draws work (status.tsx). Only a step at
+   work moves (its mark's light, its title's shimmer: transforms the GPU moves); waiting steps are
+   sketched and still; the lines never move. */
+.pg {
+  position: relative;
+  container-type: inline-size;
+  margin: 12px 0 4px;
+}
+.pg-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+.pg-lines path {
+  fill: none;
+  stroke: #343a45;
+  stroke-width: 1.2;
+  stroke-dasharray: 3 4;
+}
+.pg-lines path[data-s="met"] {
+  stroke: #5d7a74;
+  stroke-dasharray: none;
+}
+.pg-lines path[data-s="live"] {
+  stroke-dasharray: none;
+}
+.pg-rounds {
+  position: relative;
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  align-items: center;
+  gap: 34px;
+}
+.pg-round {
+  display: grid;
+  gap: 10px;
+}
+@container (max-width: 560px) {
+  .pg-rounds {
+    grid-auto-flow: row;
+    gap: 22px;
+  }
+  .pg-round {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+}
+.pg-node {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #262a31;
+  border-radius: 9px;
+  background: #0d0f12;
+  color: var(--color-bright);
+  text-decoration: none;
+}
+a.pg-node:hover {
+  border-color: #353b46;
+}
+.pg-node[data-stand="working"] {
+  border-color: #3a3f5a;
+}
+.pg-node[data-stand="needs_you"],
+.pg-node[data-stand="yours"] {
+  border-color: #5a4c37;
+}
+.pg-node .sg-beam,
+.pg-node .sg-optic {
+  margin-top: 2px;
+}
+.pg .sg-beam[data-status="pending"] {
+  animation: none;
+}
+.pg-text {
+  display: grid;
+  min-width: 0;
+}
+.pg-title {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  font-size: 12.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.pg-node[data-stand="waiting"] .pg-title,
+.pg-node[data-stand="stopped"] .pg-title {
+  color: #9a9ca3;
+}
+.pg-n {
+  margin-right: 5px;
+  color: #7d818b;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.pg-word {
+  margin-top: 2px;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pg-node[data-stand="met"] .pg-word {
+  color: #a8c9bc;
+}
+.pg-node[data-stand="needs_you"] .pg-word,
+.pg-node[data-stand="yours"] .pg-word,
+.pg-node[data-stand="unmet"] .pg-word {
+  color: #d8bb95;
+}
+.pg-who {
+  overflow: hidden;
+  color: #7d818b;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg-bar {
+  display: flex;
+  gap: 2px;
+  height: 4px;
+  margin: 10px 0 2px;
+}
+.pg-bar i {
+  flex: 1;
+  border-radius: 2px;
+  background: #2a3039;
+}
+.pg-bar i[data-s="met"] {
+  background: #a8c9bc;
+}
+.pg-bar i[data-s="working"] {
+  background: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+}
+.pg-bar i[data-s="needs_you"],
+.pg-bar i[data-s="yours"] {
+  background: #d8bb95;
+}
+.pg-bar i[data-s="unmet"] {
+  background: repeating-linear-gradient(90deg, #d8bb95 0 6px, transparent 6px 8px);
+}
+.pg-bar i[data-s="stopped"] {
+  background: #4a4f58;
 }

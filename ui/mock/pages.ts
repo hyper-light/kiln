@@ -661,6 +661,36 @@ const PLANS = [
     updated_at: T0 - 3_600 * 5,
     steps: ["Freeze main", "Run the full bench", "Tag and publish"],
     runs: 2,
+    phase: "ready",
+    research: null,
+  },
+  {
+    id: "pl_quic",
+    title: "QUIC replication",
+    body: "Goal: Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    items: [
+      { title: "Replicate over QUIC", description: "Carry the metadata store's raft log over hyper-quic.", examples: "", acceptance: [{ kind: "qualitative", text: "The replication suite passes on three nodes." }], testing: [], basis: ["f1", "f2"] },
+      {
+        title: "Bench with replication on",
+        description: "",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "Fills stay at least 4x ahead of RocksDB." }, { kind: "qualitative", text: "Gets and seeks stay at least 4x ahead of Splinter." }],
+        testing: [],
+        needs: [1],
+        basis: ["f3"],
+      },
+      { title: "Document the replication protocol", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: ["f1"] },
+    ],
+    tags: ["from a goal"],
+    source: { session: "fam-orch", agent: "Release prep", goal: { agent: "fam-orch", id: "g-quic", text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB" } },
+    share: null,
+    version: 1,
+    created_at: T0 - 3 * 3600,
+    updated_at: T0 - 2 * 3600,
+    steps: ["Replicate over QUIC", "Bench with replication on", "Document the replication protocol"],
+    runs: 1,
+    phase: "planning",
+    research: "rs_quic",
   },
   {
     id: "pl_parser",
@@ -675,6 +705,8 @@ const PLANS = [
     updated_at: T0 - 86_400 * 2,
     steps: ["Read the failing test", "Fix the parser", "Run the suite"],
     runs: 0,
+    phase: "ready",
+    research: null,
   },
   {
     id: "pl_docs",
@@ -689,8 +721,72 @@ const PLANS = [
     updated_at: T0 - 86_400 * 3,
     steps: [],
     runs: 1,
+    phase: "ready",
+    research: null,
   },
 ];
+
+const conf = (score: number, why: string, extra: Record<string, number> = {}) => {
+  const grade = score >= 85 ? "A" : score >= 70 ? "B" : score >= 50 ? "C" : score >= 30 ? "D" : "F";
+  const words = { A: "high", B: "good", C: "moderate", D: "low", F: "very low" }[grade];
+  return { score, grade, words, support: score / 100, against: 0, reliability: 0.9, citation: 1, independent: 2, cites: 2, found: 2, failed: 0, why, ...extra };
+};
+
+/** Research (docs/research.md), as the server answers it: a plan's planning, its findings graded. */
+const RESEARCH = {
+  rs_quic: {
+    id: "rs_quic",
+    question: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    agent: "fam-orch",
+    by: "agent:Release prep",
+    plan: "pl_quic",
+    sources: [
+      { id: "s1", type: "code", title: "hyper-raft's log transport", locator: "crates/hyper-raft/src/transport.rs:88-140", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s2", type: "measurement", title: "the replication suite", locator: "cargo test -p meta-store --test replication", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s3", type: "standard", title: "RFC 9000: QUIC", locator: "https://www.rfc-editor.org/rfc/rfc9000#section-2.2", published: "2021-05", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s4", type: "blog", title: "QUIC under load", locator: "https://example.dev/quic-under-load", published: "2023", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s5", type: "forum", title: "a thread on QUIC and head-of-line blocking", locator: "https://forum.example.org/t/4812", published: "2022", retrieved_at: Date.now() - 3 * 3600_000 },
+    ],
+    findings: [
+      {
+        id: "f1",
+        claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is.",
+        cites: [
+          { source: "s1", quote: "pub trait LogStream: AsyncRead + AsyncWrite + Unpin + Send", at: "line 88", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+          { source: "s3", quote: "Streams in QUIC provide a lightweight, ordered byte-stream abstraction", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+        ],
+        against: [],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(98, "2 independent sources (code, a standard); 2 of 2 quotes found where cited"),
+        against_weights: [],
+      },
+      {
+        id: "f2",
+        claim: "The replication suite passes over QUIC on three nodes today.",
+        cites: [{ source: "s2", quote: "test result: ok. 48 passed; 0 failed", check: { state: "found", at: Date.now() - 2 * 3600_000, said: "in the agent's own tool output" } }],
+        against: [],
+        at: Date.now() - 2 * 3600_000,
+        confidence: conf(95, "1 independent source (a measurement); 1 of 1 quotes found where cited", { independent: 1, cites: 1, found: 1, reliability: 0.95 }),
+        against_weights: [],
+      },
+      {
+        id: "f3",
+        claim: "QUIC's per-stream ordering keeps tail latency within 10% of TCP under load.",
+        cites: [
+          { source: "s4", quote: "p99 stayed within 8% of TCP at 40k req/s", check: { state: "not_found", at: Date.now() - 3 * 3600_000, said: "the page doesn't hold those words" } },
+        ],
+        against: [{ claim: "Head-of-line blocking returns when one stream carries everything.", cites: [{ source: "s5", check: { state: "found", at: Date.now() - 3 * 3600_000 } }] }],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(13, "1 independent source (a blog); 0 of 1 quotes found where cited, 1 not; 1 counterclaim, the strongest moderate", { independent: 1, cites: 1, found: 0, failed: 1, reliability: 0.5, citation: 0.3, against: 0.2, support: 0.15 }),
+        against_weights: [0.2],
+      },
+    ],
+    skipped: {},
+    summary: { findings: 3, grades: { A: 2, F: 1 }, sources: 5, internal: 2, external: 3, checking: 0 },
+    created_at: Date.now() - 3 * 3600_000,
+    updated_at: Date.now() - 2 * 3600_000,
+  },
+} as Record<string, unknown>;
 
 /* ------------------------------------------------------------------ the rest */
 
@@ -1256,6 +1352,12 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     return (err(res, 404, `no route for ${p}`), true);
   }
 
+  // Research
+  if (p === "/api/research" && m === "GET") return (void json(res, 200, { research: Object.values(RESEARCH) }), true);
+  if ((mm = p.match(/^\/api\/research\/([^/]+)$/)) && m === "GET") {
+    const r = RESEARCH[decodeURIComponent(mm[1]!)];
+    return (r ? json(res, 200, r) : err(res, 404, "no such research"), true);
+  }
   // Plans
   if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {

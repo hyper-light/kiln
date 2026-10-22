@@ -236,6 +236,7 @@ fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<S
 
 /// Runs plan `p` as one agent per step, as `cfg` says. The steps that wait for none start at once.
 pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
+    super::ready_to_run(p)?;
     let n = p.steps.len().min(STEPS);
     if n == 0 {
         return Err(Error::Bad("this plan has no steps (no list in it) to give agents".into()));
@@ -514,7 +515,7 @@ async fn mark_started(hub: &Hub, run: &str, idx: i64, agent: &str) -> R<()> {
 async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     let at = usize::try_from(row.idx).unwrap_or(0);
     let step = StepRef { plan: head.plan.clone(), version: head.version, n: at + 1, run: Some(run.to_owned()) };
-    let goal = vec![NewGoal { text: row.goal.clone(), step: Some(step) }];
+    let goal = vec![NewGoal { text: row.goal.clone(), step: Some(step), ..NewGoal::default() }];
     if let Some(to) = row.given_to.as_deref() {
         if hub.harness.info(to).is_none() {
             return Err(Error::Bad("the agent it was given to has ended".into()));
@@ -1106,7 +1107,22 @@ mod tests {
     }
 
     fn plan(items: Vec<Item>, steps: Vec<String>) -> Plan {
-        Plan { id: "p".into(), title: "Retry rework".into(), body: String::new(), tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps, items, runs: 0 }
+        Plan {
+            id: "p".into(),
+            title: "Retry rework".into(),
+            body: String::new(),
+            tags: vec![],
+            source: None,
+            share: None,
+            version: 1,
+            created_at: 0,
+            updated_at: 0,
+            steps,
+            items,
+            runs: 0,
+            phase: "ready".into(),
+            research: None,
+        }
     }
 
     #[test]
