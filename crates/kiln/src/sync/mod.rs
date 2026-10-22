@@ -299,13 +299,13 @@ impl Copy {
         Ok(())
     }
 
-    /// Notes that the names in the folder holding `path` changed (and, for a folder made just now,
-    /// in each folder above it, up to the copy's root).
-    fn touch(&mut self, path: &Path, made: bool) {
+    /// Notes that the names in the folder holding `path` changed (and, with `above`, that each
+    /// folder above it, up to the copy's root, is to be synced too).
+    fn touch(&mut self, path: &Path, above: bool) {
         let mut dir = path.parent();
         while let Some(d) = dir.filter(|d| d.starts_with(&self.root)) {
             self.touched.insert(d.to_owned());
-            if !made || *d == self.root {
+            if !above || *d == self.root {
                 break;
             }
             dir = d.parent();
@@ -640,17 +640,19 @@ impl Copy {
         Ok(Outcome::Applied { path: path.to_owned() })
     }
 
-    /// Makes the folders `full` goes in: whether any was missing.
-    fn make_parents(&self, full: &Path) -> io::Result<bool> {
-        let Some(parent) = full.parent() else { return Ok(false) };
-        let missing = self.fs.meta(parent).is_err();
-        self.fs.create_dir_all(parent)?;
-        Ok(missing)
+    /// Makes the folders `full` goes in.
+    fn make_parents(&self, full: &Path) -> io::Result<()> {
+        match full.parent() {
+            Some(parent) => self.fs.create_dir_all(parent),
+            None => Ok(()),
+        }
     }
 
     /// Makes this copy's `path` hold `v` (none: removes it), atomically for a file: its bytes
     /// durable before its name, and the folders whose names changed noted to be synced before the
-    /// copy's state says the folder holds it ([`Copy::sync_dirs`]).
+    /// copy's state says the folder holds it ([`Copy::sync_dirs`]). For a file or a link, that's
+    /// its folder and each above it: one made for it, by this write, by a try that failed, or by a
+    /// process before a crash, may not be durable in its own folder yet.
     fn write(&mut self, path: &str, v: Option<&Version>, blobs: &Blobs) -> io::Result<()> {
         let full = self.root.join(path);
         let gone = |r: io::Result<()>| match r {
@@ -674,7 +676,7 @@ impl Copy {
             }
             Some(Version::File { hash, exec }) => {
                 let src = blobs.path(hash).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a SHA-256"))?;
-                let made_dirs = self.make_parents(&full)?;
+                self.make_parents(&full)?;
                 let tmp = full.with_file_name(format!("{}{}.tmp", scan::TEMP_PREFIX, self.fs.temp_id()));
                 self.fs.copy(&src, &tmp)?;
                 // Its bytes durable before its name: renamed in unsynced, a power loss can leave the
@@ -689,15 +691,15 @@ impl Copy {
                 if made.is_err() {
                     let _ = self.fs.remove_file(&tmp);
                 } else if !planted {
-                    self.touch(&full, made_dirs);
+                    self.touch(&full, true);
                 }
                 made
             }
             Some(Version::Link { target }) => {
-                let made_dirs = self.make_parents(&full)?;
+                self.make_parents(&full)?;
                 gone(self.fs.remove_file(&full))?;
                 self.fs.symlink(target, &full)?;
-                self.touch(&full, made_dirs);
+                self.touch(&full, true);
                 Ok(())
             }
         }

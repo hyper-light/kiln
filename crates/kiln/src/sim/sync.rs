@@ -1720,6 +1720,60 @@ mod tests {
         Ok(())
     }
 
+    /// CP-T6.1, AC-T6.1.3: the seventh bug kiln-sim found, by its seeds: a file sync wrote into
+    /// folders made for it, its first try failing after it made them (an fsync error), was
+    /// renamed in on the next try, which found the folders there and noted only the file's own to
+    /// sync, not their places in the folders above. A power loss took the folders and the file,
+    /// the state saying the folder held it; the next look proposed it deleted, and a person's last
+    /// write was lost (sync seed 3277), or a moving session went on without its files (moves 385).
+    #[test]
+    fn the_seeds_where_a_file_s_new_folders_were_never_synced_converge() -> Result<(), String> {
+        run(3277, 0, Plant::default(), Mode::Sync)?;
+        run(385, 0, Plant::default(), Mode::Moves).map(|_| ())
+    }
+
+    /// CP-T6.1, AC-T6.1.3: the seventh bug's contract: a file sync wrote into folders made for it
+    /// holds what it wrote after a power loss once the copy's folders are synced: made by a try
+    /// that failed at its next write, or by a process before a crash; on either way of journaling
+    /// names.
+    #[test]
+    fn a_file_in_folders_made_for_it_holds_after_a_power_loss_whoever_made_them() -> Result<(), String> {
+        use crate::sync::{Change, Copy, State};
+        for seed in 0..200u64 {
+            let disk = Disk::new(SimClock::new(), Rng::new(seed), DiskFaults { fsync_commits_names: seed % 2 == 0, ..DiskFaults::none() });
+            let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+            let root = PathBuf::from("/home/m2/repo");
+            fs.create_dir_all(&root).map_err(e)?;
+            disk.make_durable("/home/m2/repo");
+            let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
+            let bytes = filled("another machine's file\n", 3000);
+            let hash = blobs.put_bytes(&bytes).map_err(e)?;
+            let change = Change { path: "src/util/x.rs".into(), to: Some(Version::File { hash, exec: false }), base: None };
+            let step = Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] };
+            if seed % 4 >= 2 {
+                // A process before a crash made them.
+                fs.create_dir_all(&root.join("src/util")).map_err(e)?;
+            } else {
+                // A try that made them failed at its next write (the file's copy).
+                let mut first = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
+                disk.freeze_after(2);
+                if first.apply(&step, &blobs).is_ok() {
+                    return Err(format!("seed {seed}: the first try was to fail"));
+                }
+                disk.thaw();
+            }
+            let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
+            copy.apply(&step, &blobs).map_err(e)?;
+            copy.sync_dirs().map_err(e)?;
+            disk.power_loss();
+            let got = disk.read("/home/m2/repo/src/util/x.rs").map_err(|err| format!("seed {seed}: after a power loss src/util/x.rs: {err}"))?;
+            if got != bytes {
+                return Err(format!("seed {seed}: after a power loss src/util/x.rs holds {} bytes, not the {} sync wrote", got.len(), bytes.len()));
+            }
+        }
+        Ok(())
+    }
+
     /// CP-T6.1, T-T6.1.1: a planted bug, a lost write after a torn page, is found within the CI
     /// seed budget. What sync writes into a folder is renamed in unsynced (as before the first
     /// bug's fix); a power loss tears, zeroes or loses it; and the checker finds what comes of it
