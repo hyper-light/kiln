@@ -7,6 +7,10 @@
 //!
 //! Rust's regular expressions do not backtrack: an atomic group `(?>…)` is read as `(?:…)`, which
 //! matches the same where an atomic group would not have to give anything back.
+//!
+//! A rule is read by grok's own matcher (`super::matcher`), its groups in one pass: `regex` reads
+//! what that leaves to it (a loop that may match nothing, a search past the matcher's bound), and
+//! finds the same.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -15,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex::Regex;
 use serde_json::Value;
+
+use super::matcher;
 
 use kiln_obs::query::calendar::Zone;
 
@@ -82,14 +88,17 @@ struct Rule {
     id: u64,
     name: String,
     re: Regex,
+    /// Its program, grok's own matcher's (none: `regex` reads it).
+    prog: Option<matcher::Program>,
     caps: Vec<Cap>,
 }
 
-/// What reading values keeps on one thread: each rule's capture locations, made once, a value's
-/// groups read into them with nothing allocated.
+/// What reading values keeps on one thread: the matcher's room, and each rule's capture locations
+/// for what `regex` reads, made once, a value's groups read into them with nothing allocated.
 #[derive(Debug, Default)]
 pub struct Reading {
     locs: HashMap<u64, regex::CaptureLocations>,
+    matcher: matcher::Scratch,
 }
 
 /// Rules compiled.
@@ -240,7 +249,7 @@ fn matcher(name: &str, args: &[String]) -> Result<Option<(String, Conv)>, String
         "ipOrHost" => (format!("(?:{IPV4}|{IPV6}|{HOSTNAME})"), Conv::Str),
         "port" => (r"\d{1,5}".into(), Conv::Str),
         "regex" => match args {
-            [r] => (atomic(r), Conv::Str),
+            [r] => (atomic(r).into_owned(), Conv::Str),
             _ => return Err("regex(\"…\"): one pattern".into()),
         },
         "date" => match args {
@@ -262,9 +271,38 @@ const IPV4: &str = r"(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?
 const IPV6: &str = r"(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{0,4}|(?:\d{1,3}\.){3}\d{1,3})";
 const HOSTNAME: &str = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?";
 
-/// A regular expression of Java's, as Rust's reads it: atomic groups as plain ones.
-fn atomic(r: &str) -> String {
-    r.replace("(?>", "(?:")
+/// A regular expression of Java's, as Rust's reads it: atomic groups as plain ones (a `(?>`
+/// escaped, or in a class, is left as it is).
+fn atomic(r: &str) -> Cow<'_, str> {
+    if !r.contains("(?>") {
+        return Cow::Borrowed(r);
+    }
+    let b = r.as_bytes();
+    let mut out = String::with_capacity(r.len());
+    // How deep in classes, and where the one open began its members (a `]` there is one).
+    let (mut depth, mut members) = (0usize, 0usize);
+    let (mut i, mut from) = (0usize, 0usize);
+    while let Some(&c) = b.get(i) {
+        match c {
+            b'\\' => i += 1,
+            b'[' => {
+                depth += 1;
+                members = i + 1 + usize::from(b.get(i + 1) == Some(&b'^'));
+                i = members - 1;
+            }
+            b']' if depth > 0 && i != members => depth -= 1,
+            b'(' if depth == 0 && b.get(i + 1..i + 3) == Some(b"?>") => {
+                out.push_str(r.get(from..i).unwrap_or_default());
+                out.push_str("(?:");
+                from = i + 3;
+                i += 2;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(r.get(from..).unwrap_or_default());
+    Cow::Owned(out)
 }
 
 fn filter_of(name: &str, args: &[String]) -> Result<Filter, String> {
@@ -359,16 +397,28 @@ impl Grok {
         for (i, (name, pattern)) in matches.iter().enumerate() {
             // Its helpers: the support rules, and the match rules given before it.
             let helpers: Vec<(String, String)> = support.iter().chain(matches.get(..i).unwrap_or_default()).cloned().collect();
-            let (mut out, mut caps) = (String::from("^"), Vec::new());
+            // The value whole: `^(?:…)$` (a rule's alternatives each the whole of it).
+            let (mut out, mut caps) = (String::from("^(?:"), Vec::new());
             Compiler { helpers, out: &mut out, caps: &mut caps, next: 0 }.pattern(pattern, 0).map_err(|e| GrokError::In(name.clone(), e))?;
-            out.push('$');
+            out.push_str(")$");
             let re = regex::RegexBuilder::new(&out).size_limit(4 << 20).build().map_err(|e| GrokError::In(name.clone(), format!("{e}")))?;
             for cap in &mut caps {
                 cap.index = re.capture_names().position(|n| n == Some(cap.group.as_str())).unwrap_or(0);
             }
-            rules.push(Rule { id: RULES.fetch_add(1, Ordering::Relaxed), name: name.clone(), re, caps });
+            // The same expression as regex's own parser reads it (as `regex` read it above), and a
+            // program of it that keeps the groups the rule reads.
+            let prog = regex_syntax::ParserBuilder::new().build().parse(&out).ok().and_then(|hir| matcher::Program::compile(&hir, &|i| caps.iter().any(|c| c.index == i as usize)));
+            rules.push(Rule { id: RULES.fetch_add(1, Ordering::Relaxed), name: name.clone(), re, prog, caps });
         }
         Ok(Self { rules })
+    }
+
+    /// The same rules read by `regex` alone: what the matcher is compared with.
+    pub fn regex_only(mut self) -> Self {
+        for r in &mut self.rules {
+            r.prog = None;
+        }
+        self
     }
 
     /// The first rule that matches `value` whole: its name, and its attributes appended to `out`.
@@ -381,22 +431,38 @@ impl Grok {
         if reading.locs.len() > READING {
             reading.locs.clear();
         }
-        // Each rule asked for its groups at once: its expression finds a match with its lazy DFA
-        // first and reads the groups of that match alone, so a rule that does not match costs that
-        // pass, and one that does no second one (asking `is_match` first scanned a matching value
-        // twice; measured, docs/observe.md §12.17; a set of the rules, one pass for all, was no
-        // faster).
+        // Each rule's program reads its groups as it matches, in one pass; what it leaves to
+        // `regex`, `regex` asks for its groups at once (its lazy DFA finds the match, its
+        // backtracker reads the groups of that match alone).
         for rule in &self.rules {
-            let locs = reading.locs.entry(rule.id).or_insert_with(|| rule.re.capture_locations());
-            if rule.re.captures_read(locs, value).is_none() {
-                continue;
-            }
-            for cap in &rule.caps {
-                let Some(text) = locs.get(cap.index).and_then(|(a, b)| value.get(a..b)) else { continue };
-                if out.len() >= ATTRS {
-                    break;
+            let found = match &rule.prog {
+                Some(p) => p.search(value, &mut reading.matcher),
+                None => matcher::Found::Unsure,
+            };
+            match found {
+                matcher::Found::No => continue,
+                matcher::Found::Yes => {
+                    for cap in &rule.caps {
+                        let Some(text) = reading.matcher.group(cap.index).and_then(|(a, b)| value.get(a..b)) else { continue };
+                        if out.len() >= ATTRS {
+                            break;
+                        }
+                        extract(cap, text, now_ns, out);
+                    }
                 }
-                extract(cap, text, now_ns, out);
+                matcher::Found::Unsure => {
+                    let locs = reading.locs.entry(rule.id).or_insert_with(|| rule.re.capture_locations());
+                    if rule.re.captures_read(locs, value).is_none() {
+                        continue;
+                    }
+                    for cap in &rule.caps {
+                        let Some(text) = locs.get(cap.index).and_then(|(a, b)| value.get(a..b)) else { continue };
+                        if out.len() >= ATTRS {
+                            break;
+                        }
+                        extract(cap, text, now_ns, out);
+                    }
+                }
             }
             return Some(&rule.name);
         }
@@ -419,15 +485,15 @@ fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
     }
     let value: Option<String> = match &cap.conv {
         Conv::Str => Some(raw.to_owned()),
-        Conv::Int => raw.trim_start_matches('+').parse::<i64>().ok().map(|i| i.to_string()),
+        Conv::Int => int_canonical(raw),
         Conv::Num => raw.parse::<f64>().ok().and_then(number_text),
         Conv::Bool(t) => Some(if t.iter().any(|x| x.eq_ignore_ascii_case(raw)) { "true" } else { "false" }.to_owned()),
-        Conv::Date(d) => d.read(raw, now_ns).map(|ms| ms.to_string()),
+        Conv::Date(d) => d.read(raw, now_ns).map(int_text),
         Conv::Quoted => Some(raw.get(1..raw.len().saturating_sub(1)).unwrap_or_default().replace("\\\"", "\"").replace("\\'", "'")),
     };
     let Some(value) = value else { return };
     let key = |k: &str| match &cap.name {
-        Some(n) => format!("{n}.{k}"),
+        Some(n) => dotted(n, k),
         None => k.to_owned(),
     };
     let named = |v: String, out: &mut Vec<(String, String)>| {
@@ -443,7 +509,7 @@ fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
             }
         }
         Some(Filter::Integer) => {
-            if let Some(v) = value.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| (f as i64).to_string()) {
+            if let Some(v) = value.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| int_text(f as i64)) {
                 named(v, out);
             }
         }
@@ -621,28 +687,76 @@ pub(crate) fn url_parts(url: &str) -> Vec<(Cow<'static, str>, String)> {
     out
 }
 
-/// Whether `hay` holds `needle` (lowercase ASCII), whatever its case: as a lowered copy's
-/// `contains` would say, with no copy.
-fn holds_any_case(hay: &str, needle: &str) -> bool {
-    let n = needle.as_bytes();
-    n.is_empty() || hay.as_bytes().windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+/// The words a user agent is read by, their case as written: the first eight the keys a version
+/// follows (their first places kept).
+const UA_WORDS: [&str; 18] =
+    ["Edg/", "OPR/", "Firefox/", "Chrome/", "Version/", "curl/", "Chromium/", "Safari/", "Windows", "iPhone", "iPad", "iOS", "Mac OS X", "Macintosh", "Android", "Linux", "Mobile", "Tablet"];
+/// A bot's words, whatever their case.
+const BOT_WORDS: [&str; 9] = ["bot", "crawler", "spider", "slurp", "curl/", "wget/", "python-requests", "go-http-client", "okhttp"];
+/// The keys a version follows: the first of [`UA_WORDS`].
+const UA_KEYS: usize = 6;
+
+/// For each byte, the words (bits: [`UA_WORDS`]'s, then [`BOT_WORDS`]'s) that may begin with it.
+#[allow(clippy::indexing_slicing)]
+const fn ua_starts() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut k = 0;
+    while k < UA_WORDS.len() {
+        t[UA_WORDS[k].as_bytes()[0] as usize] |= 1 << k;
+        k += 1;
+    }
+    let mut j = 0;
+    while j < BOT_WORDS.len() {
+        let b = BOT_WORDS[j].as_bytes()[0];
+        t[b as usize] |= 1 << (UA_WORDS.len() + j);
+        t[b.to_ascii_uppercase() as usize] |= 1 << (UA_WORDS.len() + j);
+        j += 1;
+    }
+    t
 }
 
+static UA_STARTS: [u32; 256] = ua_starts();
+
 /// A user agent's browser, operating system and device, as far as its words tell (the families
-/// Datadog's parser names, not its full database).
+/// Datadog's parser names, not its full database). Its words found in one pass: at each byte, the
+/// words that may begin with it (a word found is not looked for again).
 pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
-    let mut out = Vec::new();
-    let has = |s: &str| ua.contains(s);
+    let b = ua.as_bytes();
+    let mut found = 0u32;
+    let mut first = [0usize; UA_KEYS];
+    for (i, &c) in b.iter().enumerate() {
+        let mut m = UA_STARTS.get(usize::from(c)).copied().unwrap_or(0) & !found;
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let rest = b.get(i..).unwrap_or_default();
+            let hit = match UA_WORDS.get(k) {
+                Some(w) => rest.starts_with(w.as_bytes()),
+                None => BOT_WORDS.get(k - UA_WORDS.len()).is_some_and(|w| rest.get(..w.len()).is_some_and(|r| r.eq_ignore_ascii_case(w.as_bytes()))),
+            };
+            if hit {
+                found |= 1 << k;
+                if let Some(f) = first.get_mut(k) {
+                    *f = i;
+                }
+            }
+        }
+    }
+    let has = |w: &str| UA_WORDS.iter().position(|x| *x == w).is_some_and(|k| found & (1 << k) != 0);
     // A version's major part: of its digits and dots, those before the first dot (none where
     // neither follows its key).
     let version = |key: &str| -> Option<&str> {
-        let at = ua.find(key)? + key.len();
-        let rest = ua.get(at..)?;
+        let k = UA_WORDS.iter().position(|x| *x == key)?;
+        if found & (1 << k) == 0 {
+            return None;
+        }
+        let rest = ua.get(first.get(k)? + key.len()..)?;
         let run = rest.bytes().take_while(|c| c.is_ascii_digit() || *c == b'.').count();
         let major = rest.bytes().take_while(u8::is_ascii_digit).count();
         if run == 0 { None } else { rest.get(..major) }
     };
-    let bot = ["bot", "crawler", "spider", "slurp", "curl/", "wget/", "python-requests", "go-http-client", "okhttp"].iter().any(|b| holds_any_case(ua, b));
+    let bot = found >> UA_WORDS.len() != 0;
+    let mut out = Vec::with_capacity(4);
     let browser = if has("Edg/") {
         Some(("Edge", version("Edg/")))
     } else if has("OPR/") {
@@ -691,6 +805,50 @@ pub(crate) fn user_agent(ua: &str) -> Vec<(&'static str, String)> {
     };
     out.push(("device.category", device.to_owned()));
     out
+}
+
+/// `{prefix}.{key}`, made with its room once.
+pub(crate) fn dotted(prefix: &str, key: &str) -> String {
+    let mut s = String::with_capacity(prefix.len() + 1 + key.len());
+    s.push_str(prefix);
+    s.push('.');
+    s.push_str(key);
+    s
+}
+
+/// An integer's decimal text, without the formatter's machinery.
+pub(crate) fn int_text(n: i64) -> String {
+    let mut buf = [0u8; 20];
+    let mut at = buf.len();
+    let mut m = n.unsigned_abs();
+    loop {
+        at -= 1;
+        if let Some(d) = buf.get_mut(at) {
+            *d = b'0' + (m % 10) as u8;
+        }
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    let digits = buf.get(at..).unwrap_or_default();
+    let mut s = String::with_capacity(digits.len() + usize::from(n < 0));
+    if n < 0 {
+        s.push('-');
+    }
+    s.extend(digits.iter().map(|&d| char::from(d)));
+    s
+}
+
+/// An integer's text as `i64`'s parse and its text say it (a `+` and leading zeros gone): the text
+/// as it is when that is already it.
+fn int_canonical(raw: &str) -> Option<String> {
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    let plain = !digits.is_empty() && digits.len() <= 18 && digits.bytes().all(|b| b.is_ascii_digit()) && (digits.len() == 1 || !digits.starts_with('0')) && raw != "-0";
+    if plain {
+        return Some(raw.to_owned());
+    }
+    raw.trim_start_matches('+').parse::<i64>().ok().map(int_text)
 }
 
 // ------------------------------------------------------------------------------------- dates
@@ -1071,6 +1229,235 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
         assert_eq!(g.parse(r#"10.0.0.2 - bob [06/Jan/2017:16:16:37 -0500] "POST /api HTTP/2.0" 404 -"#, 0, &mut out), Some("access.common"));
         assert_eq!((get(&out, "http.auth"), get(&out, "date_access"), get(&out, "network.bytes_written")), (Some("bob"), Some("1483737397000"), None));
         assert_eq!(g.parse("not an access line", 0, &mut Vec::new()), None);
+    }
+
+    /// kiln's access and error rules read by grok's own matcher and by `regex` alone: the same rule
+    /// and the same attributes, on access lines of every part's shapes (addresses of both kinds and
+    /// names, dates whole and not, requests with and without a method or version, Unicode in them),
+    /// error lines, and those cut short or changed.
+    #[test]
+    fn the_matcher_reads_what_regex_reads() {
+        const APACHE_ERROR: &str = r#"error.format \[%{date("EEE MMM dd HH:mm:ss.SSSSSS yyyy"):date_access}\] \[(%{word:apache.module}:)?%{word:level}\] \[pid %{integer:process.pid}(:tid %{integer:process.thread_id})?\]( \[client %{ipOrHost:network.client.ip}(:%{port:network.client.port})?\])? %{data:error.message}"#;
+        const NGINX_ERROR: &str = r#"error.format %{date("yyyy/MM/dd HH:mm:ss"):date_access} \[%{word:level}\] %{data:error.message}(, %{data::keyvalue(": ",",")})?"#;
+        let rules = format!("{NGINX_MATCH}\n{NGINX_ERROR}\n{}", APACHE_ERROR.replace("error.format", "apache.error"));
+        let ours = Grok::compile(&rules, NGINX_SUPPORT).unwrap();
+        let theirs = Grok::compile(&rules, NGINX_SUPPORT).unwrap().regex_only();
+        assert!(ours.rules.iter().all(|r| r.prog.is_some()), "every rule its own program");
+        let mut rng = kiln_obs::testkit::Rng::new(21);
+        let mut pick = |xs: &[&str]| xs[rng.below(xs.len() as u64) as usize].to_owned();
+        let mut lines = Vec::new();
+        for _ in 0..3_000 {
+            let client = pick(&["172.17.0.1", "10.0.0.255", "256.1.1.1", "2001:db8::1", "::1", "fe80::1:2:3:4", "web-1.example.com", "localhost", "a..b", "-"]);
+            let date = pick(&["06/Jan/2017:16:16:37 +0000", "18/Oct/2026:12:00:00 -0700", "1/Feb/2026:1:2:3 Z", "32/Foo/2026:99:99:99 +05", "06/Jan/2017:16:16:37"]);
+            let request =
+                pick(&["GET /a?b=c HTTP/1.1", "POST /api/v1 HTTP/2.0", "-", "GET /é?q=日本 HTTP/1.1", "/no-method HTTP/1.0", "GET /no-version", "GET /a\"b HTTP/1.1", "OPTIONS * HTTP/1.1", ""]);
+            let tail = pick(&[
+                "",
+                " \"-\" \"curl/8.5.0\"",
+                " 0.004 \"http://x/\" \"Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0\"",
+                " \"-\" \"-\" \"203.0.113.9, 10.0.0.1\"",
+                " \"-\" \"agent\" \"-\" rest of it",
+                " \"ref\" \"ua with é\" extra",
+            ]);
+            let status = pick(&["200", "404", "-1", "+5", "x"]);
+            let bytes = pick(&["612", "-", "0", "1e3"]);
+            lines.push(format!("{client} - {} [{date}] \"{request}\" {status} {bytes}{tail}", pick(&["-", "bob", "é"])));
+            lines.push(format!(
+                "{} [{}] {}{}",
+                pick(&["2026/10/18 12:00:00", "2026/13/18 12:00:00", "18/10/2026"]),
+                pick(&["error", "warn", "crit", "x y"]),
+                pick(&["open() \"/x\" failed (2: No such file or directory)", "upstream timed out", "", "a, b"]),
+                pick(&[", client: 192.0.2.10, server: localhost, request: \"GET / HTTP/1.1\"", "", ", host: \"example.com\"", ", odd"])
+            ));
+            lines.push(format!(
+                "[{}] [{}{}] [pid {}{}]{} {}",
+                pick(&["Sun Oct 18 12:00:00.123456 2026", "Mon Jan 01 00:00:00.000000 2024", "Xyz Oct 18 12:00:00 2026"]),
+                pick(&["", "core:", "ssl:"]),
+                pick(&["error", "notice", "warn"]),
+                pick(&["1234", "x"]),
+                pick(&["", ":tid 5678"]),
+                pick(&["", " [client 203.0.113.5:51234]", " [client ::1]", " [client host.example:8]"]),
+                pick(&["AH00128: File does not exist: /var/www/html/favicon.ico", "", "é"])
+            ));
+        }
+        // And each cut short at a random place.
+        let cut: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let mut i = rng.below(l.len() as u64 + 1) as usize;
+                while !l.is_char_boundary(i) {
+                    i -= 1;
+                }
+                l[..i].to_owned()
+            })
+            .collect();
+        let (mut reading, mut matched) = (Reading::default(), 0);
+        for line in lines.iter().chain(&cut) {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let ra = ours.parse_with(line, 1_792_324_800_000_000_000, &mut reading, &mut a).map(str::to_owned);
+            let rb = theirs.parse(line, 1_792_324_800_000_000_000, &mut b).map(str::to_owned);
+            assert_eq!((&ra, &a), (&rb, &b), "{line}");
+            matched += usize::from(ra.is_some());
+        }
+        assert!(matched > 4_000, "{matched} of {} matched", lines.len() * 2);
+    }
+
+    /// The user agent's words read in one pass say what they said looked for one by one: on real
+    /// agents, and on random ones of their words (in any case, cut, run together) and other text.
+    #[test]
+    fn a_user_agent_reads_as_it_did() {
+        /// Whether `hay` holds `needle` (lowercase ASCII), whatever its case: as a lowered copy's
+        /// `contains` would say, with no copy.
+        fn holds_any_case(hay: &str, needle: &str) -> bool {
+            let n = needle.as_bytes();
+            n.is_empty() || hay.as_bytes().windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+        }
+
+        /// A user agent's browser, operating system and device, as far as its words tell (the families
+        /// Datadog's parser names, not its full database).
+        fn user_agent_before(ua: &str) -> Vec<(&'static str, String)> {
+            let mut out = Vec::new();
+            let has = |s: &str| ua.contains(s);
+            // A version's major part: of its digits and dots, those before the first dot (none where
+            // neither follows its key).
+            let version = |key: &str| -> Option<&str> {
+                let at = ua.find(key)? + key.len();
+                let rest = ua.get(at..)?;
+                let run = rest.bytes().take_while(|c| c.is_ascii_digit() || *c == b'.').count();
+                let major = rest.bytes().take_while(u8::is_ascii_digit).count();
+                if run == 0 { None } else { rest.get(..major) }
+            };
+            let bot = ["bot", "crawler", "spider", "slurp", "curl/", "wget/", "python-requests", "go-http-client", "okhttp"].iter().any(|b| holds_any_case(ua, b));
+            let browser = if has("Edg/") {
+                Some(("Edge", version("Edg/")))
+            } else if has("OPR/") {
+                Some(("Opera", version("OPR/")))
+            } else if has("Firefox/") {
+                Some(("Firefox", version("Firefox/")))
+            } else if has("Chrome/") && !has("Chromium/") {
+                Some(("Chrome", version("Chrome/")))
+            } else if has("Safari/") && has("Version/") {
+                Some(("Safari", version("Version/")))
+            } else if ua.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("curl/")) {
+                Some(("curl", version("curl/")))
+            } else {
+                None
+            };
+            if let Some((family, v)) = browser {
+                out.push(("browser.family", family.to_owned()));
+                if let Some(v) = v {
+                    out.push(("browser.major", v.to_owned()));
+                }
+            }
+            let os = if has("Windows") {
+                Some("Windows")
+            } else if has("iPhone") || has("iPad") || has("iOS") {
+                Some("iOS")
+            } else if has("Mac OS X") || has("Macintosh") {
+                Some("Mac OS X")
+            } else if has("Android") {
+                Some("Android")
+            } else if has("Linux") {
+                Some("Linux")
+            } else {
+                None
+            };
+            if let Some(os) = os {
+                out.push(("os.family", os.to_owned()));
+            }
+            let device = if bot {
+                "Bot"
+            } else if has("Mobile") || has("iPhone") || has("Android") {
+                "Mobile"
+            } else if has("iPad") || has("Tablet") {
+                "Tablet"
+            } else {
+                "Desktop"
+            };
+            out.push(("device.category", device.to_owned()));
+            out
+        }
+
+        let real = [
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            "curl/8.5.0",
+            "CURL/7.1",
+            "python-requests/2.31.0",
+            "Mozilla/5.0 (Linux; Android 14) Firefox/.5",
+            "",
+        ];
+        let words: Vec<&str> = UA_WORDS.iter().chain(BOT_WORDS.iter()).copied().chain(["Mozilla/5.0 ", "(", "; ", ") ", "1", "2.0", ".", "x", "BOT", "Bot", "Curl/", "é", " "]).collect();
+        let mut rng = kiln_obs::testkit::Rng::new(17);
+        let mut uas: Vec<String> = real.iter().map(|s| (*s).to_owned()).collect();
+        for _ in 0..20_000 {
+            let mut ua = String::new();
+            for _ in 0..rng.below(9) {
+                let w = words[rng.below(words.len() as u64) as usize];
+                match rng.below(5) {
+                    0 => ua.push_str(&w.to_ascii_uppercase()),
+                    1 => ua.push_str(&w[..w.floor_char_boundary(w.len() / 2)]),
+                    _ => ua.push_str(w),
+                }
+                if rng.below(2) == 0 {
+                    ua.push_str(["1", "17.0", "/", ".", "x"][rng.below(5) as usize]);
+                }
+            }
+            uas.push(ua);
+        }
+        for ua in &uas {
+            assert_eq!(user_agent(ua), user_agent_before(ua), "{ua:?}");
+        }
+    }
+
+    #[test]
+    fn integers_read_as_parse_and_text_say() {
+        for raw in [
+            "0",
+            "7",
+            "-7",
+            "+7",
+            "007",
+            "-0",
+            "+0",
+            "-007",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "9223372036854775808",
+            "123456789012345678",
+            "1234567890123456789",
+            "",
+            "-",
+            "+",
+            "1a",
+            "٣",
+        ] {
+            assert_eq!(int_canonical(raw), raw.trim_start_matches('+').parse::<i64>().ok().map(|i| i.to_string()), "{raw}");
+        }
+        for n in [0, 1, -1, 9, 10, -10, i64::MAX, i64::MIN, 1_483_719_397_000] {
+            assert_eq!(int_text(n), n.to_string());
+        }
+    }
+
+    /// An atomic group read as a plain one only where it opens one: one escaped, or in a class, is
+    /// left as it is.
+    #[test]
+    fn only_atomic_groups_are_read_as_plain_ones() {
+        for (java, rust) in [
+            ("(?>a|b)c", "(?:a|b)c"),
+            (r"\(?>", r"\(?>"),
+            ("[(?>]", "[(?>]"),
+            ("[]](?>x)", "[]](?:x)"),
+            ("[^]](?>x)", "[^]](?:x)"),
+            (r"[\]](?>x)", r"[\]](?:x)"),
+            ("[a[b]](?>x)", "[a[b]](?:x)"),
+            (r"\\(?>x)", r"\\(?:x)"),
+            ("abc", "abc"),
+        ] {
+            assert_eq!(atomic(java), rust, "{java}");
+        }
     }
 
     #[test]

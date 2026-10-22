@@ -8,6 +8,7 @@ pub mod builtin;
 pub mod expr;
 pub mod grok;
 pub mod kept;
+mod matcher;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -559,7 +560,7 @@ fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
             }
             r.attrs.reserve(parts.len());
             for (k, v) in parts {
-                put(r, Cow::Owned(format!("{target}.{k}")), v);
+                put(r, Cow::Owned(grok::dotted(target, &k)), v);
             }
         }
         Proc::UserAgent { sources, target, encoded } => {
@@ -571,7 +572,7 @@ fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
             };
             r.attrs.reserve(parts.len());
             for (k, v) in parts {
-                put(r, Cow::Owned(format!("{target}.{k}")), v);
+                put(r, Cow::Owned(grok::dotted(target, k)), v);
             }
         }
         Proc::Category { target, categories } => {

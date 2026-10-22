@@ -188,10 +188,16 @@ pub fn process(records: &mut [Record]) {
         return;
     }
     let now_ns = crate::observe::clock_ms().saturating_mul(1_000_000);
-    let mut s = Scratch::default();
-    for r in records {
-        super::apply_all(&pipelines, r, now_ns, &mut s);
+    thread_local! {
+        /// What applying pipelines keeps between records, kept between batches too (made afresh
+        /// each batch, its room was handed back to the system and faulted in again).
+        static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
     }
+    SCRATCH.with_borrow_mut(|s| {
+        for r in records {
+            super::apply_all(&pipelines, r, now_ns, s);
+        }
+    });
 }
 
 /// What `def` (or, none given, every active pipeline) makes of `records`: a test, nothing kept.
