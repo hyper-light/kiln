@@ -79,21 +79,36 @@ function StoresBody() {
   );
 }
 
+/** The table's columns, of fixed widths (stores.css), so values changing never move one; each is
+ * left out below the width its cells are. */
 function StoresHead() {
   return (
-    <thead>
-      <tr>
-        <th className="w-6" aria-label="State" />
-        <th>Store</th>
-        <th>State</th>
-        <th className="num">File</th>
-        <th className="num hidden sm:table-cell">Free</th>
-        <th className="hidden md:table-cell">Writes</th>
-        <th className="num hidden lg:table-cell">Rows to come</th>
-        <th className="hidden md:table-cell">Heard</th>
-        <th className="hidden xl:table-cell">Kiln</th>
-      </tr>
-    </thead>
+    <>
+      <colgroup>
+        <col className="cv-c-dot" />
+        <col />
+        <col className="cv-c-state" />
+        <col className="cv-c-file" />
+        <col className="cv-c-free" />
+        <col className="cv-c-writes" />
+        <col className="cv-c-rows" />
+        <col className="cv-c-heard" />
+        <col className="cv-c-kiln" />
+      </colgroup>
+      <thead>
+        <tr>
+          <th aria-label="State" />
+          <th>Store</th>
+          <th>State</th>
+          <th className="num">File</th>
+          <th className="num hidden sm:table-cell">Free</th>
+          <th className="hidden md:table-cell">Writes</th>
+          <th className="num hidden lg:table-cell">Rows to come</th>
+          <th className="hidden md:table-cell">Heard</th>
+          <th className="hidden xl:table-cell">Kiln</th>
+        </tr>
+      </thead>
+    </>
   );
 }
 
@@ -107,10 +122,11 @@ function StoresTable({ status, selected, onSelect }: { status: ConvoStatus; sele
             const f = s.report?.file;
             const behind = s.feed?.behind ?? s.mirror?.behind ?? null;
             const spark = s.spark.map((v) => v ?? 0);
+            const state = stateText(s, status.at);
             return (
               <tr key={s.key} data-selected={s.key === selected} onClick={() => onSelect(s.key)} className="cursor-pointer">
                 <td>
-                  <StatusDot status={DOT[s.state]} title={stateText(s, status.at)} />
+                  <StatusDot status={DOT[s.state]} title={state} />
                 </td>
                 <td className="cv-key">
                   <button type="button" className="cv-row" aria-pressed={s.key === selected} onClick={() => onSelect(s.key)}>
@@ -119,18 +135,22 @@ function StoresTable({ status, selected, onSelect }: { status: ConvoStatus; sele
                     {s.id && <span className="ml-2 hidden font-mono text-[10px] text-[#7b7e88] sm:inline">{s.id.slice(0, 8)}</span>}
                   </button>
                 </td>
-                <td className="cell-mono min-w-[96px] sm:whitespace-nowrap">{stateText(s, status.at)}</td>
-                <td className="num cell-mono whitespace-nowrap">{f ? sizeText(f.bytes) : "—"}</td>
+                <td className="cell-mono" title={state}>
+                  {state}
+                </td>
+                <td className="num cell-mono">{f ? sizeText(f.bytes) : "—"}</td>
                 <td className="num cell-mono hidden sm:table-cell">{f && f.bytes ? `${Math.round((f.free / f.bytes) * 100)}%` : "—"}</td>
                 <td className="hidden md:table-cell">
-                  <span className="inline-flex items-center gap-2">
+                  <span className="cv-writes">
                     <Sparkline values={spark} width={84} height={20} />
-                    <span className="cell-mono">{perSec(s.rates.writes)}</span>
+                    <span className="cell-mono cv-rate">{perSec(s.rates.writes)}</span>
                   </span>
                 </td>
                 <td className={`num cell-mono hidden lg:table-cell ${behind ? "!text-[#aab8d2]" : ""}`}>{behind == null ? "—" : countText(behind)}</td>
-                <td className="cell-mono hidden whitespace-nowrap md:table-cell">{s.heard ? <RelTime ts={Math.floor(s.heard / 1000)} /> : "—"}</td>
-                <td className="cell-mono hidden xl:table-cell">{s.version ?? "—"}</td>
+                <td className="cell-mono hidden md:table-cell">{s.heard ? <RelTime ts={Math.floor(s.heard / 1000)} /> : "—"}</td>
+                <td className="cell-mono hidden xl:table-cell" title={s.version ?? undefined}>
+                  {s.version ?? "—"}
+                </td>
               </tr>
             );
           })}

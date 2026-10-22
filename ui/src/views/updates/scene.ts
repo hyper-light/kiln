@@ -3,8 +3,9 @@
  * wafers, the server in the middle as a box with kiln's mark on its top, each runner on the right
  * as a small machine; a cable from each build into the server and one from the server to each
  * runner. On a phone: the server at the top, a trunk down from it and a branch to each runner (the
- * builds are listed under it instead). A cable lights only while something moves on it: a runner's
- * upgrade, the release pipeline building a platform. Pure: what to draw and where, not how.
+ * builds are listed under it instead). Light flows along a cable while something moves on it: a
+ * runner's upgrade, the release pipeline building a platform; a connected runner's cable carries a
+ * faint pulse now and then, an offline one's nothing. Pure: what to draw and where, not how.
  */
 import type { CableTone, Tone } from "./words";
 
@@ -64,6 +65,8 @@ export interface Label {
   x: number;
   y: number;
   anchor: "start" | "middle";
+  /** Set after it, smaller: a build's arch and ABI after its OS. */
+  tail?: string;
 }
 
 export interface Hit {
@@ -112,6 +115,8 @@ export interface RunnerNode {
   tone: Tone;
   switching: boolean;
   offline: boolean;
+  /** Connected with nothing moving on its cable: a faint pulse runs it now and then, the link live. */
+  pulse: boolean;
   name: Label;
   sub: Label;
   hit: Hit;
@@ -144,7 +149,9 @@ export interface RolloutScene {
 
 export interface SceneBuild {
   key: string;
-  label: string;
+  /** Its OS, named beside its chip, and its arch and ABI after it: its target in words. */
+  os: string;
+  arch: string;
   line: string;
   tone: Tone;
   cable: CableTone;
@@ -243,6 +250,7 @@ function runnerNode(r: SceneRunner, cx: number, cy: number, name: Label, sub: La
     tone: r.tone,
     switching: r.switching,
     offline: r.offline,
+    pulse: !r.offline && !r.lit,
     name,
     sub,
     hit,
@@ -264,7 +272,8 @@ export function rolloutScene(input: { builds: SceneBuild[]; server: SceneServer;
       height,
       portrait,
       halo: { cx: sx + 40, cy: sy, rx: 150, ry: 110 },
-      headings: [{ text: "SERVER", x: 20, y: 20, anchor: "start" as const }, ...(m ? [{ text: "RUNNERS", x: lx, y: 146, anchor: "start" as const }] : [])],
+      // Over the server's box, just clear of the far corner of its top (49.5 above where it stands).
+      headings: [{ text: "SERVER", x: sx, y: sy - 58.5, anchor: "middle" as const }, ...(m ? [{ text: "RUNNERS", x: lx, y: 146, anchor: "start" as const }] : [])],
       builds: [],
       server: serverNode(
         sx,
@@ -313,7 +322,8 @@ export function rolloutScene(input: { builds: SceneBuild[]; server: SceneServer;
     halo: { cx: sx, cy: sy - 6, rx: 210, ry: 150 },
     headings: [
       ...(n ? [{ text: "BUILDS", x: 30, y: 24, anchor: "start" as const }] : []),
-      { text: "SERVER", x: sx, y: 24, anchor: "middle" as const },
+      // Just above the server's box, whose top's far corner stands 79.5 above where it stands.
+      { text: "SERVER", x: sx, y: sy - 93, anchor: "middle" as const },
       ...(m ? [{ text: "RUNNERS", x: 712, y: 24, anchor: "start" as const }] : []),
     ],
     builds: input.builds.map((b, i) => {
@@ -322,12 +332,12 @@ export function rolloutScene(input: { builds: SceneBuild[]; server: SceneServer;
       const q = (x: number, z: number) => iso(236, y, x, z, 4);
       return {
         key: b.key,
-        title: `${b.label} build: ${b.line}`,
+        title: `${b.os} ${b.arch} build: ${b.line}`,
         chip,
         die: polyOf([q(-6, -6), q(6, -6), q(6, 6), q(-6, 6)]),
         building: b.building,
         tone: b.tone,
-        name: { text: clip(b.label, 26), x: 30, y: y - 3, anchor: "start" as const },
+        name: { text: clip(b.os, 10), tail: clip(b.arch, 16), x: 30, y: y - 3, anchor: "start" as const },
         sub: { text: clip(b.line, 30), x: 30, y: y + 15, anchor: "start" as const },
         hit: { x: 20, y: y - 26, w: 262, h: 52 },
         cable: curve([255, y - 2], [sx - reach + 2, sy - 14 - spread(i, n, 22.5)], 86, 70, 0.62, b.cable, b.lit),
