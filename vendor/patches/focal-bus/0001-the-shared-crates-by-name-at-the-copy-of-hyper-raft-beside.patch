@@ -1,0 +1,55 @@
+Subject: The shared crates by name, at the copy of hyper-raft beside the bus
+Why: Focal builds its bus against its own snapshots of hyper-raft's crates (vendor/hyper-* in Focal's tree). Quiver takes hyper-raft once, at the revision the bus takes (vendor/hyper-raft), and kiln holds one copy of each hyper-light product: the bus names the shared crates as from crates.io, and the root manifest of whoever builds it (Quiver's, or kiln's) points each name at its one copy with [patch.crates-io].
+
+diff --git a/Cargo.toml b/Cargo.toml
+index dd7457b7f3ddd99b6d70deb09a0885a9ca31bfd7..bd971f67815c3ae1c4d754d96cef974fb87a1c2a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -44,33 +44,33 @@ postcard = { version = "1.1", features = ["alloc", "use-std"] }
+ pin-project-lite = "0.2.17"
+ # The durable shell around the core, vendored from hyper-raft with the log and
+ # block layers and the liveness stream it builds on (vendor/*/SNAPSHOT; 27 §15).
+-hyper-block = { version = "0.1.0", path = "vendor/hyper-block" }
+-hyper-durable = { version = "0.1.0", path = "vendor/hyper-durable" }
+-hyper-log = { version = "0.1.0", path = "vendor/hyper-log" }
+-hyper-liveness = { version = "0.1.0", path = "vendor/hyper-liveness" }
+-hyper-timing = { version = "0.1.0", path = "vendor/hyper-timing" }
++hyper-block = { version = "0.1.0" }
++hyper-durable = { version = "0.1.0" }
++hyper-log = { version = "0.1.0" }
++hyper-liveness = { version = "0.1.0" }
++hyper-timing = { version = "0.1.0" }
+ # Sealing at rest, vendored from hyper-raft (vendor/hyper-seal/SNAPSHOT;
+ # docs/archictecutre/29-sealing-at-rest.md).
+-hyper-seal = { version = "0.1.0", path = "vendor/hyper-seal" }
++hyper-seal = { version = "0.1.0" }
+ # The consensus core, vendored from hyper-raft (vendor/hyper-raft/SNAPSHOT;
+ # 27 §4.2): focal's core moved there and is shared with mantle and slates.
+-hyper-raft = { version = "0.1.0", path = "vendor/hyper-raft" }
++hyper-raft = { version = "0.1.0" }
+ # The runtime and the transport, vendored from hyper-raft (vendor/*/SNAPSHOT): the
+ # thread-per-core runtime every async task runs on (hyper-rt), the sans-io
+ # application layer over QUIC (hyper-transport over hyper-quic and hyper-tls),
+ # the sealed datagram plane (hyper-datagram), and the driver that runs the
+ # endpoint and the plane on a hyper-rt shard (hyper-rt-transport).
+-hyper-datagram = { version = "0.1.0", path = "vendor/hyper-datagram" }
+-hyper-quic = { version = "0.1.0", path = "vendor/hyper-quic" }
+-hyper-rt = { version = "0.1.0", path = "vendor/hyper-rt" }
+-hyper-rt-transport = { version = "0.1.0", path = "vendor/hyper-rt-transport" }
+-hyper-tls = { version = "0.1.0", path = "vendor/hyper-tls" }
+-hyper-transport = { version = "0.1.0", path = "vendor/hyper-transport" }
++hyper-datagram = { version = "0.1.0" }
++hyper-quic = { version = "0.1.0" }
++hyper-rt = { version = "0.1.0" }
++hyper-rt-transport = { version = "0.1.0" }
++hyper-tls = { version = "0.1.0" }
++hyper-transport = { version = "0.1.0" }
+ # Measurement only, vendored from hyper-raft (vendor/hyper-measure/SNAPSHOT): the
+ # counting allocator, the OS's page-fault and CPU accounts, the open-loop schedule
+ # and quantile intervals every benchmark of the event bus reports through. A
+ # dev-dependency; no shipped crate takes it.
+-hyper-measure = { version = "0.1.0", path = "vendor/hyper-measure" }
++hyper-measure = { version = "0.1.0" }
+ # raft-rs 0.7's message and log types, for focal-consensus's tests alone: the
+ # oracle its envelope codec is held to byte for byte, since focal's WAL and
+ # wire keep raft-rs's protobuf encoding (focal-consensus/src/envelope.rs).

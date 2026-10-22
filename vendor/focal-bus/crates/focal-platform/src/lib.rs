@@ -1,0 +1,393 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
+//! The one place platform-specific filesystem behaviour lives (decisions 10
+//! and 11, docs 03 §12, 20): advisory file locks on the stable
+//! `std::fs::File` primitives (replacing `fs2`), the free space of a volume,
+//! and — on Windows — protected files and directories behind a single
+//! audited FFI file. Business logic uses these types, never a platform call
+//! of its own; `scripts/check-contracts.py` enforces that the `unsafe` token
+//! appears nowhere else under `crates/`.
+//!
+//! Locks are advisory, and a lock is held by an open file, not by the
+//! descriptor that took it: every copy of the descriptor holds it, and it is
+//! released when the last of them closes. A process that starts another
+//! copies its descriptors to the child for the moment before the child runs
+//! its program, so a lock released only by closing its file is still held,
+//! for that moment, by a child that never knew of it — and whoever asks for
+//! it then is told it is locked. A lock therefore has one owner
+//! ([`FileLock`]), `!Clone`, which unlocks the file itself when it ends,
+//! whatever copies of the descriptor there are.
+use std::{fs::File, io};
+
+/// The owner of a whole-file lock: the lock is released when the owner
+/// ends, by unlocking the file, not by closing it (the module's header says
+/// why that is not the same). A lock held by a bare `File` and released by
+/// its close was found held after its owner had let it go: the catalog a
+/// command line had just written was `Locked` to its next line, in a test
+/// process that started other processes meanwhile.
+#[derive(Debug)]
+pub struct FileLock {
+    file: File,
+}
+impl FileLock {
+    /// Take an exclusive lock on `file` without blocking, and own it. A
+    /// lock another owner holds is `io::ErrorKind::WouldBlock`.
+    pub fn exclusive(file: File) -> io::Result<Self> {
+        try_lock_exclusive(&file)?;
+        Ok(Self { file })
+    }
+    /// Take an exclusive lock on `file`, waiting while another owner holds
+    /// it, and own it. The wait is the holder's: the operating system wakes
+    /// this owner when the holder releases the lock or its process ends,
+    /// however long either takes, with no clock and no guess of how long a
+    /// holder may hold it. Only for a lock whose every holder holds it for
+    /// its own bounded work, never across a wait on another lock it does not
+    /// already hold, another process or the network.
+    pub fn exclusive_waiting(file: File) -> io::Result<Self> {
+        File::lock(&file)?;
+        Ok(Self { file })
+    }
+    /// Take a shared lock on `file` without blocking, and own it;
+    /// `WouldBlock` when an exclusive lock is held.
+    pub fn shared(file: File) -> io::Result<Self> {
+        try_lock_shared(&file)?;
+        Ok(Self { file })
+    }
+    /// Own the lock `file` holds: one taken on it just before
+    /// ([`try_lock_exclusive`], [`try_lock_shared`]) by an owner that asks
+    /// more than once for a lock it waits for.
+    pub fn owning(file: File) -> Self {
+        Self { file }
+    }
+    /// The locked file, for what its owner reads or writes of it.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        loop {
+            match unlock(&self.file) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // A drop reports nothing: the file's close is what is left.
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Take an exclusive whole-file lock without blocking. A lock another owner
+/// holds returns `io::ErrorKind::WouldBlock`, mapped from the standard
+/// library's `TryLockError` so callers keep their existing classification.
+/// Free functions, not an extension trait, so they never collide with the
+/// standard library's inherent `File` lock methods.
+pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
+    map_try(File::try_lock(file))
+}
+/// Take a shared whole-file lock without blocking; `WouldBlock` when an
+/// exclusive lock is held.
+pub fn try_lock_shared(file: &File) -> io::Result<()> {
+    map_try(File::try_lock_shared(file))
+}
+/// Release `file`'s lock.
+pub fn unlock(file: &File) -> io::Result<()> {
+    File::unlock(file)
+}
+fn map_try(result: Result<(), std::fs::TryLockError>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Bytes free on the volume that holds `path`, or `None` when it cannot be
+/// determined (the caller treats an unknown free space as no headroom).
+#[cfg(unix)]
+pub fn available_space(path: &std::path::Path) -> Option<u64> {
+    // rustix wraps `statvfs` safely; no `unsafe` on the Unix path.
+    let stat = rustix::fs::statvfs(path).ok()?;
+    stat.f_bavail.checked_mul(stat.f_frsize)
+}
+
+#[cfg(windows)]
+pub fn available_space(path: &std::path::Path) -> Option<u64> {
+    windows::available_space(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn available_space(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// Bytes the volume that holds `path` holds in all, used or not, or `None` when it cannot be
+/// determined: what a file on it may at most take, which a node's start reads as its log's
+/// bound and which, unlike the free space, does not change between starts.
+#[cfg(unix)]
+pub fn total_space(path: &std::path::Path) -> Option<u64> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    stat.f_blocks.checked_mul(stat.f_frsize)
+}
+
+#[cfg(windows)]
+pub fn total_space(path: &std::path::Path) -> Option<u64> {
+    windows::total_space(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn total_space(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// The operating system's memory page: the unit its virtual memory maps, faults in and reclaims. `None` where
+/// it is not known, and the caller keeps its own bound.
+#[cfg(unix)]
+pub fn memory_page_bytes() -> Option<usize> {
+    // rustix reads it from the auxiliary vector or `sysconf(_SC_PAGESIZE)`, safely.
+    Some(rustix::param::page_size())
+}
+
+/// Windows pages are 4 KiB on every architecture it runs on: x86, x64 and ARM64 (Microsoft, *Memory
+/// Management: Large-Page Support*, which names the small page beside the large one).
+#[cfg(windows)]
+pub fn memory_page_bytes() -> Option<usize> {
+    Some(4096)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn memory_page_bytes() -> Option<usize> {
+    None
+}
+
+/// A path's bytes in a form that round-trips back through [path_from_bytes] on
+/// the same platform: the operating system's own byte encoding on Unix, and
+/// UTF-16LE on Windows (where a path is a sequence of 16-bit code units).
+/// Callers journal a path the OS handed them and rebuild it verbatim later;
+/// the bytes are opaque and are never interpreted across platforms. Both
+/// directions are safe standard-library conversions — no `unsafe`, no FFI.
+pub fn path_to_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.as_os_str().as_encoded_bytes().to_vec()
+    }
+}
+
+/// Rebuild a path from bytes [path_to_bytes] produced on this platform.
+/// Returns `None` when the bytes cannot name a path here: they contain an
+/// interior NUL (invalid in every path), or, on Windows, they are not a whole
+/// number of 16-bit code units.
+pub fn path_from_bytes(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        if bytes.contains(&0) {
+            return None;
+        }
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::ffi::OsString::from_vec(bytes.to_vec()).into())
+    }
+    #[cfg(windows)]
+    {
+        // Pairs of bytes, and an odd one left over is no wide string.
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        if !rest.is_empty() {
+            return None;
+        }
+        use std::os::windows::ffi::OsStringExt;
+        let wide: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
+        if wide.contains(&0) {
+            return None;
+        }
+        Some(std::ffi::OsString::from_wide(&wide).into())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        if bytes.contains(&0) {
+            return None;
+        }
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
+}
+
+/// Make a directory entry (a create, rename or delete within it) durable. On
+/// Unix this opens the directory and fsyncs it. On Windows a directory handle
+/// cannot be flushed (opening one for `sync_all` fails with access-denied);
+/// durability there comes from write-through file writes and `MoveFileExW`
+/// (`atomic_replace`), so this is a no-op (decision 10, doc 20 §3).
+pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+mod files;
+pub mod fs;
+mod memory;
+pub use files::{open_files_limit, raise_open_files};
+pub use memory::{
+    disable_transparent_huge_pages, memory_envelope, memory_limit, transparent_huge_pages_disabled,
+};
+#[cfg(windows)]
+mod windows;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn path_bytes_round_trip_on_this_platform() {
+        let path = std::path::Path::new("some/dir/with a space/leaf.bin");
+        let bytes = path_to_bytes(path);
+        assert_eq!(path_from_bytes(&bytes).as_deref(), Some(path));
+    }
+
+    #[test]
+    fn an_exclusive_lock_excludes_a_second_owner_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("LOCK");
+        let owner = File::create(&path).unwrap();
+        try_lock_exclusive(&owner).unwrap();
+        let other = File::options().read(true).write(true).open(&path).unwrap();
+        assert_eq!(
+            try_lock_exclusive(&other).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        unlock(&owner).unwrap();
+        try_lock_exclusive(&other).unwrap();
+    }
+
+    /// A waiting owner takes the lock once its holder lets it go: never
+    /// before, and never refused for how long the holder kept it. Do: hold
+    /// the lock; start a waiting owner on another thread, which says when it
+    /// asks; mark the release, then let go. Expect: the waiter takes the
+    /// lock, and finds the release marked when it holds it; a third owner is
+    /// then refused.
+    #[test]
+    fn a_waiting_owner_takes_the_lock_once_its_holder_lets_go() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("LOCK");
+        File::create(&path).unwrap();
+        let open = || File::options().read(true).write(true).open(&path).unwrap();
+        let holder = FileLock::exclusive(open()).unwrap();
+        let released = AtomicBool::new(false);
+        let (asking, asked) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let file = open();
+                asking.send(()).unwrap();
+                let lock = FileLock::exclusive_waiting(file).unwrap();
+                (released.load(Ordering::SeqCst), lock)
+            });
+            asked.recv().unwrap();
+            released.store(true, Ordering::SeqCst);
+            drop(holder);
+            let (after_release, lock) = waiter.join().unwrap();
+            assert!(
+                after_release,
+                "the waiter held the lock before it was let go"
+            );
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(lock);
+        });
+    }
+
+    /// A lock its owner let go is free at once, though a copy of the
+    /// owner's descriptor is still open — which is what a process holds, for
+    /// a moment, of every file its parent had open when it was started. A
+    /// lock held by a bare file and released by its close stays held for as
+    /// long as the copy lives: the catalog of a command line was `Locked` to
+    /// the line after the one that wrote it.
+    #[test]
+    fn a_lock_its_owner_let_go_is_free_while_a_copy_of_its_descriptor_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("LOCK");
+        File::create(&path).unwrap();
+        let open = || File::options().read(true).write(true).open(&path).unwrap();
+        // Released by its close alone, it is held while the copy lives:
+        // where a lock is the open file's, which is every Unix.
+        #[cfg(unix)]
+        {
+            let bare = open();
+            try_lock_exclusive(&bare).unwrap();
+            let copy = bare.try_clone().unwrap();
+            drop(bare);
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(copy);
+        }
+        // Released by its owner, it is free whatever copies there are.
+        for shared in [false, true] {
+            let owner = if shared {
+                FileLock::shared(open()).unwrap()
+            } else {
+                FileLock::exclusive(open()).unwrap()
+            };
+            let copy = owner.file().try_clone().unwrap();
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(owner);
+            drop(FileLock::exclusive(open()).unwrap());
+            drop(copy);
+        }
+        // One that is refused a lock takes nothing from the one that holds it.
+        let owner = FileLock::exclusive(open()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        drop(owner);
+        drop(FileLock::owning({
+            let file = open();
+            try_lock_exclusive(&file).unwrap();
+            file
+        }));
+        FileLock::exclusive(open()).unwrap();
+    }
+
+    #[test]
+    fn available_space_reports_a_positive_figure_for_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(available_space(dir.path()).is_some_and(|free| free > 0));
+    }
+}

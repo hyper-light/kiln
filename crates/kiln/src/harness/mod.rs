@@ -36,6 +36,7 @@ pub mod host;
 pub mod kept;
 pub mod kinds;
 pub mod lineage;
+pub mod live;
 pub mod model;
 pub mod moving;
 pub mod opened;

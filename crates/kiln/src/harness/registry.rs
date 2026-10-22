@@ -1,6 +1,7 @@
 //! The server's view of every agent session, wherever it runs: its own (`local`) and each
 //! runner's. A mirror per session (the latest state, meta and timeline, as JSON) serves any number
-//! of viewers on any device; their commands go to the machine that runs the session.
+//! of viewers on any device, its live frames on kiln's bus (`super::live`, docs/bus.md); their
+//! commands go to the machine that runs the session.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,12 +16,9 @@ use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
 use super::session::{Info, MAX_NAME, Spec, SubagentBrief};
+use super::live::{Feed, Viewer};
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
-use crate::rt::Broadcast;
-
-/// Frames buffered per viewer before a slow one is resynced.
-const FANOUT: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
@@ -56,11 +54,13 @@ struct Mirror {
     changes: Value,
     events: Vec<Value>,
     index: HashMap<String, usize>,
-    out: Broadcast<Frame>,
+    /// Its live frames, on a topic of its own on the bus.
+    feed: Feed,
 }
 
 impl Mirror {
-    fn new(info: Info, location: Location) -> Self {
+    fn new(info: Info, location: Location, bus: Arc<dyn kiln_seams::Bus>) -> Self {
+        let feed = Feed::open(bus, &info.id);
         Self {
             info,
             reported: String::new(),
@@ -71,13 +71,13 @@ impl Mirror {
             changes: Value::Null,
             events: Vec::new(),
             index: HashMap::new(),
-            out: Broadcast::new(FANOUT),
+            feed,
         }
     }
 
     /// The state as a frame for its viewers, with what changed in it since the last one.
     fn state_frame(&mut self) -> Option<Frame> {
-        if self.out.receiver_count() == 0 {
+        if self.feed.viewers() == 0 {
             // The next viewer starts from a snapshot, not the last viewer's patch baseline.
             self.sent = Value::Null;
             return None;
@@ -157,10 +157,14 @@ pub enum Sent {
     Unreachable,
 }
 
-/// What a viewer gets on attach: the catch-up frames and the live ones after them.
+/// What a viewer gets on attach: the catch-up frames, and where on the session's topic the live
+/// ones after them start (none while the bus can't hold its feed: snapshots alone, then).
 pub struct Attachment {
     pub frames: Vec<String>,
-    pub live: async_broadcast::Receiver<Frame>,
+    pub topic: String,
+    pub at: Option<kiln_seams::bus::Offset>,
+    /// Its place among the session's viewers, while it watches.
+    pub viewer: Viewer,
 }
 
 /// A live frame for a session's viewers. A state comes as well as only what changed since the
@@ -229,6 +233,8 @@ const RESTORE_ANSWER_MS: i64 = 120_000;
 
 pub struct Registry {
     mirrors: Mutex<HashMap<String, Mirror>>,
+    /// The bus each session's live feed rides (`super::live`).
+    bus: Arc<dyn kiln_seams::Bus>,
     uploads: Mutex<HashMap<String, Upload>>,
     /// What each machine offers ("local" included).
     kinds: Mutex<HashMap<String, Vec<KindInfo>>>,
@@ -313,13 +319,15 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
 }
 
 impl Registry {
+    /// A registry of tests: its store in `dir`, its feeds on the bus's simulator.
+    #[cfg(test)]
     pub fn new(dir: std::path::PathBuf) -> Self {
-        Self::with(dir, &crate::config::Conversations::default(), crate::rt::clock())
+        Self::with(dir, &crate::config::Conversations::default(), crate::rt::clock(), Arc::new(kiln_seams::bus::SimBus::default()))
     }
 
     /// The registry, its store in `dir`, its mirrors as `conversations` says, the server's own
-    /// sessions' host on `clock` (the hub's).
-    pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>) -> Self {
+    /// sessions' host on `clock` (the hub's), its sessions' live feeds on `bus`.
+    pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>, bus: Arc<dyn kiln_seams::Bus>) -> Self {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
@@ -361,6 +369,7 @@ impl Registry {
         let visuals = super::visuals::Visuals::new(&dir);
         Self {
             mirrors: Mutex::new(HashMap::new()),
+            bus,
             uploads: Mutex::new(HashMap::new()),
             kinds: Mutex::new(HashMap::new()),
             local,
@@ -547,7 +556,7 @@ impl Registry {
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
                 if let Some(frame) = m.state_frame() {
-                    m.out.send(frame);
+                    m.feed.publish(&frame);
                 }
             }
             m.info.clone()
@@ -599,7 +608,7 @@ impl Registry {
                 if let Some(tasks) = state.get("tasks").and_then(|v| serde_json::from_value::<Vec<super::model::Task>>(v.clone()).ok()) {
                     info.subagents = SubagentBrief::of(&tasks);
                 }
-                let mut m = Mirror::new(info.clone(), Location::Machine(machine));
+                let mut m = Mirror::new(info.clone(), Location::Machine(machine), Arc::clone(&self.bus));
                 m.meta = u.meta.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
                 m.state = state;
                 if let Some(o) = m.state.as_object_mut() {
@@ -841,7 +850,7 @@ impl Registry {
             let mut g = self.mirrors.lock();
             if let Update::Open { info } = &u {
                 let info = (**info).clone();
-                let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone()));
+                let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone(), Arc::clone(&self.bus)));
                 m.info = info.clone();
                 m.reported = reported;
                 m.location = from.clone();
@@ -921,11 +930,11 @@ impl Registry {
             // A state goes out with the name given here in it (the machine's may lack it).
             let frame = match &u {
                 Update::State { .. } => m.state_frame(),
-                _ if m.out.receiver_count() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
+                _ if m.feed.viewers() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
                 _ => None,
             };
             if let Some(frame) = frame {
-                m.out.send(frame);
+                m.feed.publish(&frame);
             }
             if gone {
                 g.remove(id);
@@ -1005,8 +1014,9 @@ impl Registry {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &gone {
-                if let Some(m) = g.remove(id) {
-                    m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
+                if let Some(mut m) = g.remove(id) {
+                    // Its feed's topic goes with it once its viewers are told.
+                    m.feed.publish(&Frame::of(json!({"t": "closed"}).to_string()));
                 }
             }
             gone
@@ -1031,7 +1041,7 @@ impl Registry {
                     o.insert("status".into(), json!("disconnected"));
                 }
                 if let Some(frame) = m.state_frame() {
-                    m.out.send(frame);
+                    m.feed.publish(&frame);
                 }
                 infos.push(m.info.clone());
             }
@@ -1055,7 +1065,7 @@ impl Registry {
                     o.insert("status".into(), json!("disconnected"));
                 }
                 if let Some(frame) = m.state_frame() {
-                    m.out.send(frame);
+                    m.feed.publish(&frame);
                 }
                 infos.push(m.info.clone());
             }
@@ -1069,21 +1079,24 @@ impl Registry {
     pub fn attach(&self, id: &str) -> Option<Attachment> {
         // What's kept is read before the mirrors are locked: the first time, off disk.
         let files = self.keeper.frame(id);
-        let g = self.mirrors.lock();
-        let m = g.get(id)?;
-        Some(Attachment { frames: m.snapshot(files), live: m.out.subscribe() })
+        let mut g = self.mirrors.lock();
+        let m = g.get_mut(id)?;
+        // The offset under the same lock as the snapshot: every publish takes it too.
+        let (viewer, at) = m.feed.attach();
+        Some(Attachment { frames: m.snapshot(files), topic: m.feed.topic().to_owned(), at, viewer })
     }
 
-    /// Catch-up frames for a viewer that fell behind.
-    pub fn frames(&self, id: &str) -> Option<Vec<String>> {
+    /// Catch-up frames for a viewer that fell behind, and where on the session's topic it reads
+    /// on from: none when the session is gone.
+    pub fn frames(&self, id: &str) -> Option<(Vec<String>, Option<kiln_seams::bus::Offset>)> {
         let files = self.keeper.frame(id);
-        self.mirrors.lock().get(id).map(|m| m.snapshot(files))
+        self.mirrors.lock().get_mut(id).map(|m| (m.snapshot(files), m.feed.position()))
     }
 
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
     pub fn files_added(&self, id: &str, added: &[Kept]) {
-        if let Some(m) = self.mirrors.lock().get(id) {
-            m.out.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
+        if let Some(m) = self.mirrors.lock().get_mut(id) {
+            m.feed.publish(&Frame::of(json!({"t": "files", "files": added}).to_string()));
         }
     }
 
@@ -1139,7 +1152,7 @@ impl Registry {
                     let mut info = s.info();
                     info.target = loc.target();
                     // Seed the mirror so the session lists before its first update arrives.
-                    self.mirrors.lock().entry(info.id.clone()).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
+                    self.mirrors.lock().entry(info.id.clone()).or_insert_with(|| Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus)));
                     out.push(info);
                 }
                 Location::Machine(machine) => {
@@ -1200,7 +1213,7 @@ impl Registry {
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };
-                    self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
+                    self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus)));
                     out.push(info);
                 }
             }
@@ -1436,8 +1449,9 @@ impl Registry {
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
         // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
-            if let Some(m) = self.mirrors.lock().remove(id) {
-                m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
+            if let Some(mut m) = self.mirrors.lock().remove(id) {
+                // Its feed's topic goes with it once its viewers are told.
+                m.feed.publish(&Frame::of(json!({"t": "closed"}).to_string()));
             }
             self.keeper.forget(id);
             self.visuals.forget(id);
@@ -1513,22 +1527,35 @@ mod tests {
         assert_eq!(naming("slates-6d", "slates-6d", "Claude Code", true), Naming::Keep);
     }
 
+    fn sim_bus() -> Arc<dyn kiln_seams::Bus> {
+        Arc::new(kiln_seams::bus::SimBus::default())
+    }
+
+    /// The frames on a mirror's feed from `from`, as a viewer that takes patches reads them, and
+    /// as one that doesn't.
+    fn on_feed(bus: &Arc<dyn kiln_seams::Bus>, m: &Mirror, from: u64) -> anyhow::Result<Vec<Frame>> {
+        let read = futures::executor::block_on(bus.read(m.feed.topic(), from, 100))?;
+        read.messages.iter().map(|msg| super::super::live::decode(&msg.payload).ok_or_else(|| anyhow::anyhow!("a frame the feed didn't make"))).collect()
+    }
+
     #[test]
     fn a_state_goes_out_whole_and_as_what_changed_in_it() -> anyhow::Result<()> {
-        let mut m = Mirror::new(Info::default(), Location::Local);
-        let mut live = m.out.subscribe();
+        let bus = sim_bus();
+        let mut m = Mirror::new(Info::default(), Location::Local, Arc::clone(&bus));
+        let (_viewer, at) = m.feed.attach();
+        let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
         let skills = json!([{"name": "deploy", "description": "Ship it. ".repeat(200)}]);
         m.state = json!({"status": "running", "activity": "reading", "skills": skills, "pause": {"reason": "limit"}});
         let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
         // The first goes whole: there is nothing before it to patch.
         assert!(f.patch.is_none());
         assert_eq!(f.for_viewer(true), f.for_viewer(false));
-        m.out.send(f);
+        m.feed.publish(&f);
         m.state = json!({"status": "running", "activity": "editing", "skills": skills});
         let f = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;
-        m.out.send(f);
-        let first = live.try_recv()?;
-        let second = live.try_recv()?;
+        m.feed.publish(&f);
+        let frames = on_feed(&bus, &m, at)?;
+        let [first, second] = frames.as_slice() else { anyhow::bail!("{} frames on the feed", frames.len()) };
         let whole: Value = serde_json::from_str(second.for_viewer(false))?;
         assert_eq!(whole, json!({"t": "state", "state": m.state}));
         // As what changed: the activity set, the pause gone, the skills (most of it) left out.
@@ -1550,15 +1577,15 @@ mod tests {
 
     #[test]
     fn states_without_viewers_do_not_serialize_or_keep_a_patch_baseline() -> anyhow::Result<()> {
-        let mut m = Mirror::new(Info::default(), Location::Local);
-        let viewer = m.out.subscribe();
+        let mut m = Mirror::new(Info::default(), Location::Local, sim_bus());
+        let (viewer, _) = m.feed.attach();
         m.state = json!({"status": "running"});
         assert!(m.state_frame().is_some());
         drop(viewer);
         m.state = json!({"status": "running", "activity": "editing"});
         assert!(m.state_frame().is_none());
         assert!(m.sent.is_null());
-        let _viewer = m.out.subscribe();
+        let (_viewer, _) = m.feed.attach();
         let snapshot = m.snapshot(None);
         assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": m.state}))));
         m.state = json!({"status": "idle"});

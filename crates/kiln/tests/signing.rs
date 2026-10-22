@@ -41,7 +41,7 @@ fn attested(dir: &std::path::Path, ci: &str, extra: &str) -> anyhow::Result<(com
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "start"])?;
     let extra = format!("{extra}\n[[repos]]\nname = \"acme/sig\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir, &Options { agent: true, ci: &format!("kiln_workflows = true\n{ci}"), extra: &extra })?;
+    let s = start(dir, &Options { agent: true, ci: &format!("kiln_workflows = true\n{ci}"), extra: &extra, terminal: false })?;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;

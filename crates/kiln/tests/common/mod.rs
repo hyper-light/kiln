@@ -76,6 +76,8 @@ pub struct Options<'a> {
     pub ci: &'a str,
     /// More sections: `[[repos]]`, ….
     pub extra: &'a str,
+    /// Terminals, and so agents, on (the server's and its runner's).
+    pub terminal: bool,
 }
 
 /// A server of its own under `dir`, up and answering.
@@ -114,7 +116,7 @@ work_dir = "{work}"
 enabled = false
 
 [terminal]
-enabled = false
+enabled = {terminal}
 
 [discovery]
 enabled = false
@@ -136,6 +138,7 @@ enabled = true
         work = work.display(),
         agent = o.agent,
         cd = cd,
+        terminal = o.terminal,
         ci = o.ci,
         extra = o.extra,
     );

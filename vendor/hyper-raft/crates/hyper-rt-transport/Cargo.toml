@@ -1,0 +1,32 @@
+[package]
+name = "hyper-rt-transport"
+description = "The hyper-rt adapter: drives a hyper-transport endpoint and a hyper-datagram plane on a hyper-rt shard, owning their batched UDP sockets and timers, with the API of hyper-tokio's driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# hyper-transport's scheduling-core oracle (its src/tally.rs), which the transport's shared test harness
+# checks where this feature is on (as hyper-tokio's); off unless asked for.
+oracle = ["hyper-transport/oracle"]
+
+[dependencies]
+hyper-rt = { path = "../hyper-rt" }
+hyper-transport = { path = "../hyper-transport" }
+hyper-datagram = { path = "../hyper-datagram" }
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+# The transport tests' common helpers take their Instant epoch from simulated time (docs/sim.md §3.2).
+hyper-sim = { path = "../hyper-sim" }
+# Certificates for the tests' mutual TLS (hyper-transport's own dev-dependency).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+[[bench]]
+name = "connections"
+harness = false
+
+[lints]
+workspace = true

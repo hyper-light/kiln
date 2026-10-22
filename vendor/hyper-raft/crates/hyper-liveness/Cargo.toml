@@ -1,0 +1,40 @@
+[package]
+name = "hyper-liveness"
+description = "Node-pair liveness, sans-io: one heartbeat stream per pair of nodes sharing a consensus group, shared by every group they share, each heartbeat proving a recent durable flush, each pair judged by an NFD-E detector configured from measurement (docs/timing.md L-3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hyper-timing = { path = "../hyper-timing" }
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+# The baselines of the cost benchmark: the Raft core mantle and focal run their per-group
+# heartbeats on, and slates' detector.
+hyper-raft = { path = "../hyper-raft" }
+hyper-swim = { path = "../hyper-swim" }
+# The real-process test drives the crate as mantle and focal do: the sealed plane on hyper-tokio's
+# socket, its kernel receive stamps and the host's clock, on a current-thread runtime.
+hyper-datagram = { path = "../hyper-datagram" }
+hyper-tokio = { path = "../hyper-tokio" }
+# The real-process test's members keep their run as an owner does, a record kept whole.
+hyper-block = { path = "../hyper-block" }
+# The simulation's draws: SplitMix64 with an unbiased `below`, a named stream a source.
+hyper-sim = { path = "../hyper-sim" }
+tokio = { version = "1.48", default-features = false, features = ["net", "time", "rt"] }
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "allocs"
+harness = false
+
+[[bench]]
+name = "cost"
+harness = false

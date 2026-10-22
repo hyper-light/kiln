@@ -191,7 +191,7 @@ fn ci_lab(store: Store) -> anyhow::Result<()> {
     git(&repo, &["commit", "-qm", "start"])?;
     let (blobs, prefix) = blobs_config(store, "ci")?;
     let extra = format!("{blobs}\n[[repos]]\nname = \"acme/lab\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra, terminal: false })?;
     let port = s.port;
     wait_for("the repository polled", Duration::from_secs(60), || {
         let (_, body) = common::http(port, "GET", "/api/repos", &s.admin, None)?;
@@ -323,7 +323,7 @@ fn sync_lab(store: Store) -> anyhow::Result<()> {
     std::fs::create_dir_all(&a)?;
     std::fs::create_dir_all(&b)?;
     let (blobs, prefix) = blobs_config(store, "sync")?;
-    let s = start(dir.path(), &Options { agent: true, ci: "", extra: &blobs })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "", extra: &blobs, terminal: false })?;
     let port = s.port;
     let mut machine = String::new();
     wait_for("the server's runner", Duration::from_secs(60), || {
@@ -400,7 +400,7 @@ fn upgrade_lab(store: Store) -> anyhow::Result<()> {
         let meta = json!({ "target": old_target, "sha256": sha256(&old), "size": old.len(), "origin": "upload", "at": 1, "build": sha256(&old).get(..12).unwrap_or_default() });
         std::fs::write(bin.join(format!("kiln-{old_target}.json")), meta.to_string())?;
     }
-    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &blobs })?;
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &blobs, terminal: false })?;
     let auth = format!("Bearer {}", s.admin);
     if store == Store::Local && kiln::api::TARGET != old_target {
         let got = send(s.port, "GET", &format!("/dl/kiln/{old_target}"), &[], b"")?;
@@ -420,7 +420,7 @@ fn upgrade_lab(store: Store) -> anyhow::Result<()> {
     anyhow::ensure!(held(store, &data, prefix.as_deref(), &format!("binaries/kiln-{target}"), &digest)?, "the binary isn't in the {store:?} store");
     // The server again: the binary is still kept, read from the store.
     drop(s);
-    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &blobs })?;
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &blobs, terminal: false })?;
     let auth = format!("Bearer {}", s.admin);
     // Read from the store as the server starts (an S3 store's in the background).
     wait_for("the binary listed after a restart", Duration::from_secs(30), || Ok(listed_build(s.port, &s.admin, target)?.as_deref() == Some(build.as_str())))?;
@@ -457,7 +457,7 @@ fn upgrade_lab_on_an_s3_store() -> anyhow::Result<()> {
 fn presigned_urls_grant_exactly_what_they_say_and_nothing_else() -> anyhow::Result<()> {
     use kiln_seams::blobs::{Access, Blobs as _};
     let dir = tempfile::tempdir()?;
-    let s = start(dir.path(), &Options { agent: false, ci: "", extra: "" })?;
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: "", terminal: false })?;
     // The server's own key: what its presigned URLs are signed with (`<data>/blobs.key`).
     let data = dir.path().join("data");
     let key: [u8; 32] = std::fs::read(data.join("blobs.key"))?.try_into().map_err(|_| anyhow::anyhow!("blobs.key isn't 32 bytes"))?;
@@ -523,7 +523,7 @@ fn a_server_moves_its_bytes_to_s3() -> anyhow::Result<()> {
     let (target, binary) = other_platform();
     let contents = noise(5 << 20, 7);
     let digest = sha256(&contents);
-    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &s3_section("local", &prefix)? })?;
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &s3_section("local", &prefix)?, terminal: false })?;
     let auth = format!("Bearer {}", s.admin);
     let r = send(s.port, "POST", &format!("/api/updates/binaries?target={target}"), &[("Authorization", &auth)], &binary)?;
     anyhow::ensure!(r.status == 200, "the upload: {}", r.status);
@@ -541,7 +541,7 @@ fn a_server_moves_its_bytes_to_s3() -> anyhow::Result<()> {
     anyhow::ensure!(first.contains(&format!("sync/{digest}")) && first.contains(&format!("binaries/kiln-{target}")), "{first}");
     let again = copy()?;
     anyhow::ensure!(again.contains("copied 0 objects"), "a second copy: {again}");
-    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &s3_section("s3", &prefix)? })?;
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: &s3_section("s3", &prefix)?, terminal: false })?;
     let auth = format!("Bearer {}", s.admin);
     wait_for("the binary, listed from S3", Duration::from_secs(30), || Ok(listed_build(s.port, &s.admin, target)?.as_deref() == Some(build.as_str())))?;
     let got = send(s.port, "GET", &format!("/dl/kiln/{target}/{build}"), &[], b"")?;

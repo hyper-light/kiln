@@ -1,0 +1,61 @@
+[package]
+name = "hyper-rt"
+description = "The shared thread-per-core runtime: shards with arena tasks and Copy wakers, a hierarchical timing wheel, readiness drivers per OS behind one seam, sockets, signals, stdio, synchronization without shared ownership, and a deterministic simulation driver (docs/runtime.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The calibration record's checksum (docs/runtime.md §10.2), the workspace's CRC-32C.
+crc32c.workspace = true
+# The combinators and `within` are named futures that hold what they are given in place (docs/runtime.md §3.8).
+pin-project-lite.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# sysctl, mach and the per-thread CPU clocks that rustix does not cover (the OS-interface files of
+# scripts/check-contracts.py).
+libc = "0.2.189"
+rustix = { workspace = true, features = ["event", "net", "pipe", "thread", "process", "param", "system", "time", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Power",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+
+# loom builds only under `RUSTFLAGS="--cfg loom"`, for the park and kick protocol's interleavings.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "echo"
+harness = false
+
+[[bench]]
+name = "calibration_drift"
+harness = false
+
+[[bench]]
+name = "wake_lines"
+harness = false
+
+[[bench]]
+name = "rearm"
+harness = false

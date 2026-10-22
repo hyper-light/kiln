@@ -4354,28 +4354,111 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
     Ok(())
 }
 
+/// Live frames a viewer reads from its session's feed at once: at most this many of the bus's
+/// largest messages (1 MiB) held for it at a time.
+const FEED_READ: usize = 16;
+
+/// How long a viewer of a session whose feed the bus can't hold waits between snapshots.
+const FEEDLESS: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a viewer's wait on its session's feed came to.
+enum Live {
+    /// A frame or more to read.
+    Ready,
+    Refused(kiln_seams::bus::Refusal),
+    /// The session has no feed on the bus: time for another snapshot.
+    Feedless,
+}
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
 /// so a viewer can swap it in at once instead of clearing what it shows.
+///
+/// The live updates come from the session's feed on kiln's bus (docs/bus.md), read from the
+/// offset the snapshot was taken at, so none is missed or seen twice. A viewer that falls behind
+/// what the feed keeps is refused `Behind` (the bus's lag notice) and starts over from a snapshot,
+/// as it does at the feed's resync marker; nothing it does holds up the session or another viewer.
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes) -> anyhow::Result<()> {
     use futures::FutureExt as _;
+    use kiln_seams::Bus as _;
+    use kiln_seams::bus::Refusal;
     let (mut tx, mut rx) = socket.split();
     let Some(att) = hub.harness.attach(&id) else {
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
     send_snapshot(&mut tx, att.frames, takes.packed).await?;
-    let mut live = att.live;
+    // Its place among the session's viewers, given back as it goes.
+    let _viewer = att.viewer;
+    let topic = att.topic;
+    let mut at = att.at;
+    let closed = || ws::text(json!({"t": "closed"}).to_string());
     loop {
-        futures::select_biased! {
-            f = live.recv().fuse() => match f {
-                Ok(frame) => tx.send(ws::text(frame.for_viewer(takes.patches))).await?,
-                Err(async_broadcast::RecvError::Overflowed(_)) => {
-                    // Fell behind: start over from the current state (it begins with "open").
-                    send_snapshot(&mut tx, hub.harness.frames(&id).unwrap_or_default(), takes.packed).await?;
+        let live = {
+            let (bus, topic, from) = (&hub.bus, &topic, at);
+            async move {
+                match from {
+                    Some(from) => match bus.wait(topic, from).await {
+                        Ok(()) => Live::Ready,
+                        Err(e) => Live::Refused(e),
+                    },
+                    None => {
+                        crate::rt::sleep(FEEDLESS).await;
+                        Live::Feedless
+                    }
                 }
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            }
+        };
+        // Set when what the feed holds for this viewer isn't what it should take next.
+        let mut start_over = false;
+        futures::select_biased! {
+            w = live.fuse() => match w {
+                Live::Ready => match hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ).await {
+                    Ok(batch) => {
+                        let now = crate::util::now_ms();
+                        for m in &batch.messages {
+                            match crate::harness::live::decode(&m.payload) {
+                                Some(frame) if frame.text.as_ref() == crate::harness::live::RESYNC => {
+                                    start_over = true;
+                                    break;
+                                }
+                                Some(frame) => {
+                                    let ms = now.saturating_sub(m.at_ms).max(0);
+                                    crate::metrics::bus().deliver_seconds.observe(ms as f64 / 1000.0);
+                                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+                                }
+                                None => {
+                                    tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
+                                    start_over = true;
+                                    break;
+                                }
+                            }
+                        }
+                        at = Some(batch.next);
+                    }
+                    Err(Refusal::Behind { .. }) => {
+                        crate::metrics::bus().lag_notices.inc();
+                        start_over = true;
+                    }
+                    Err(Refusal::NoTopic(_)) => {
+                        tx.send(closed()).await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's read of its session's feed was refused: it starts over");
+                        start_over = true;
+                    }
+                },
+                Live::Refused(Refusal::NoTopic(_)) => {
+                    tx.send(closed()).await?;
+                    return Ok(());
+                }
+                Live::Refused(e) => {
+                    tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's wait on its session's feed was refused: it starts over");
+                    start_over = true;
+                }
+                Live::Feedless => start_over = true,
             },
             m = rx.next().fuse() => match m {
                 Some(Ok(Message::Text(t))) => match serde_json::from_str::<crate::harness::model::Command>(t.as_str()) {
@@ -4391,6 +4474,15 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
                 _ => {}
             },
+        }
+        if start_over {
+            // From the current state (it begins with "open"), and the feed from where that is.
+            let Some((frames, from)) = hub.harness.frames(&id) else {
+                tx.send(closed()).await?;
+                return Ok(());
+            };
+            send_snapshot(&mut tx, frames, takes.packed).await?;
+            at = from;
         }
     }
 }
@@ -4433,6 +4525,8 @@ fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
     if !hub.cfg.server.metrics_public && !authed(hub, headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
+    // The bus's figures as its node states them now.
+    hub.bus.observe();
     srv::response(StatusCode::OK, "text/plain; version=0.0.4", srv::full(crate::metrics::render()))
 }
 

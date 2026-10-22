@@ -9,14 +9,19 @@ kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }
 # The seams kiln reaches every product through, with their simulators (docs/seams.md).
 kiln-seams = { path = "../kiln-seams" }
-hyper-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-rt = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-rt-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-quic = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1", default-features = false }
-hyper-raft = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-durable = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-log = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
-hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+# hyper-raft's shared crates, vendored at vendor/hyper-raft at the revision Focal's bus takes (the
+# root manifest's [patch.crates-io] points each name there; docs/vendoring.md).
+hyper-transport = "0.1.0"
+hyper-rt = "0.1.0"
+hyper-rt-transport = "0.1.0"
+hyper-quic = { version = "0.1.0", default-features = false }
+hyper-raft = "0.1.0"
+hyper-durable = "0.1.0"
+hyper-log = "0.1.0"
+hyper-block = "0.1.0"
+# The bus kiln's events ride (docs/bus.md): Quiver, vendored at vendor/quiver.
+quiver = "0.1.0"
+quiver-api = "0.1.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"
@@ -96,3 +101,6 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# hyper-durable's RamStore, for sync's tests alone: kiln's copy compiles it only where a test asks
+# (vendor/hyper-raft/UPSTREAM.md).
+hyper-durable = { version = "0.1.0", features = ["test-store"] }

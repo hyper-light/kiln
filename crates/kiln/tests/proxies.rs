@@ -378,7 +378,7 @@ fn w12_r04_jobs_use_proxies() -> anyhow::Result<()> {
          [[ci.registry.proxies]]\necosystem = \"go\"\nupstream = \"{u}/go\"\njobs = true\n\n[[repos]]\nname = \"acme/px\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n",
         repo.display()
     );
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra, terminal: false })?;
     let port = s.port;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -501,7 +501,7 @@ fn w12_r04_publish() -> anyhow::Result<()> {
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "start"])?;
     let extra = format!("[[repos]]\nname = \"acme/pub\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra, terminal: false })?;
     let port = s.port;
     let body = serde_json::json!({ "kind": "package", "name": "npmreg", "config": { "ecosystem": "npm", "registry": format!("http://127.0.0.1:{reg}") }, "secret": "npm_fake_token", "scope": "server" });
     let (st, b) = common::http(port, "POST", "/api/ci/integrations", &s.admin, Some(&body))?;
