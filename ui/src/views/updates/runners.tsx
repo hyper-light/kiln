@@ -7,7 +7,7 @@
  * kiln waits on an upgrade before it calls it failed.
  */
 import * as React from "react";
-import { Bot, ChevronDown, RefreshCw } from "lucide-react";
+import { Bot, ChevronDown, CircleArrowUp, Hammer, RefreshCw, RotateCcw, Stethoscope, Terminal, Upload } from "lucide-react";
 import { attachApi, type IncidentBrief } from "@/api/attach";
 import { api } from "@/api/client";
 import type { FleetTarget, ReleaseWait, RunnerDiagnosis, RunnerFinding, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "@/api/types";
@@ -229,13 +229,14 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
           <p>{summary}</p>
           {data.follow === false && <p>Automatic upgrades are disabled on this server. Runners can still be upgraded here.</p>}
         </div>
-        <div className="up-panel-actions">
-          <Button size="xs" variant="ghost" disabled={checking || data.server.checking} onClick={() => void check()}>
+        <div className="up-panel-actions up-fleet-actions">
+          <Button size="xs" variant="ghost" className="up-check-updates" disabled={checking || data.server.checking} onClick={() => void check()}>
             <RefreshCw className={cn((checking || data.server.checking) && "animate-spin motion-reduce:animate-none")} /> Check for updates
           </Button>
           <Button
             size="xs"
             variant="secondary"
+            className="up-upgrade-all"
             disabled={starting || fleet.ready.length === 0 || fleet.ready.every((r) => runningRunners.has(r.name))}
             onClick={() =>
               setConfirm({
@@ -374,7 +375,7 @@ export function MachinesHead({ box }: { box?: React.ReactNode }) {
           Updates
         </th>
         <th className="up-c-act" scope="col">
-          <span className="sr-only">Actions</span>
+          Actions
         </th>
       </tr>
     </thead>
@@ -514,25 +515,25 @@ function ServerRows({
           <span className="up-sub up-policy-words">{view.policy}</span>
         </td>
         <td className="up-c-act">
-          <span className="up-acts">
+          <span className="up-acts" data-lead={(s.action === "restart" && s.newer) || (s.action === "replace" && s.replacement) ? "pill" : undefined}>
             {s.action === "restart" && (s.newer || !!s.image?.error) && (
               <Button size="xs" variant={s.newer ? "secondary" : "ghost"} disabled={busy} onClick={() => onAction("restart")}>
-                {s.newer ? "Upgrade server" : "Restart anyway"}
+                {s.newer ? <CircleArrowUp /> : <RotateCcw />} {s.newer ? "Upgrade server" : "Restart anyway"}
               </Button>
             )}
             {s.action === "replace" && s.replacement && (
               <Button size="xs" variant="secondary" disabled={busy} onClick={() => onAction("replace")}>
-                {s.replacement.origin === "upload" ? `Install build ${s.replacement.build ?? ""}` : `Install kiln ${s.replacement.version ?? ""}`}
+                <CircleArrowUp /> {s.replacement.origin === "upload" ? `Install build ${s.replacement.build ?? ""}` : `Install kiln ${s.replacement.version ?? ""}`}
               </Button>
             )}
             {s.mode !== "kubernetes" && (
               <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
-                {uploading === s.target ? "Uploading…" : "Upload a build"}
+                <Upload /> {uploading === s.target ? "Uploading…" : "Upload a build"}
               </Button>
             )}
             {job && (
               <Button size="xs" variant="ghost" aria-expanded={output} onClick={onOutput}>
-                Output
+                <Terminal /> Output
               </Button>
             )}
           </span>
@@ -733,25 +734,26 @@ function RunnerRows({
           )}
         </td>
         <td className="up-c-act">
-          <span className="up-acts">
+          {/* In one order on every row: its upgrade first, then a build to upload, its output, Diagnose. */}
+          <span className="up-acts" data-lead={primary ? "pill" : undefined}>
             {primary && (
               <Button size="xs" variant="secondary" disabled={saving || starting} title={sentence(primary.why)} onClick={() => onUpgrade(primary.way)}>
-                {wayLabel(primary.way, true, failedWay === primary.way)}
+                {failedWay === primary.way ? <RotateCcw /> : primary.way === "build" ? <Hammer /> : <CircleArrowUp />} {wayLabel(primary.way, true, failedWay === primary.way)}
               </Button>
             )}
             {offer.missing && (
               <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
-                {uploading === r.target ? "Uploading…" : "Upload a build"}
+                <Upload /> {uploading === r.target ? "Uploading…" : "Upload a build"}
               </Button>
             )}
             {job && (
               <Button size="xs" variant="ghost" aria-expanded={output} onClick={onOutput}>
-                Output
+                <Terminal /> Output
               </Button>
             )}
             {r.connected && !plan && (
               <Button size="xs" variant="ghost" aria-expanded={diag !== null} onClick={() => (diag ? setDiag(null) : void look())}>
-                Diagnose
+                <Stethoscope /> Diagnose
               </Button>
             )}
           </span>
