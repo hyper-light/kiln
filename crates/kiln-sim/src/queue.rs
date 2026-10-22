@@ -93,7 +93,7 @@ impl<E> Queue<E> {
 mod tests {
     use super::*;
 
-    /// CP-T6.1: earliest first, ties in the order put in, bounded and saying so.
+    /// CP-T6.1, AC-T6.1.4: earliest first, ties in the order put in, bounded and saying so.
     #[test]
     fn events_come_earliest_first_ties_in_order_and_a_full_queue_refuses() {
         let mut q = Queue::with_max(4);

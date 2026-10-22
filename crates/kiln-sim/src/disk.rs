@@ -5,9 +5,11 @@
 //!   leaves each file written since its last fsync as it was written, as it was before, torn (the
 //!   new bytes up to a page, the old after), or zeroed, by the seed's draws.
 //! - **Names** (making, removing and renaming files, links and folders) go into a journal, in
-//!   order, durable once their folder is fsynced (or, on a filesystem with one journal, as
-//!   ext4's, once any file is: [`DiskFaults::fsync_commits_names`]). A power loss keeps a prefix
-//!   of what wasn't durable yet: never a later change of names without the ones before it.
+//!   order. On a filesystem with one journal, as ext4's and XFS's, any fsync makes every change
+//!   before it durable ([`DiskFaults::fsync_commits_names`]); else, as POSIX says, an fsync of a
+//!   folder makes the changes of names in it durable, and no other folder's. A power loss keeps
+//!   those, and a prefix of the rest: never a later change without the ones before it, and nothing
+//!   in a folder whose own name didn't survive.
 //! - **Faults**, while the nemesis lasts: fsyncs and writes that fail (EIO, nothing done),
 //!   writes refused past the disk's room (ENOSPC), and a crash at a chosen write
 //!   ([`Disk::freeze_after`]): that write and every one after fail until the model has crashed
@@ -41,9 +43,14 @@ pub struct DiskFaults {
     pub capacity: Option<u64>,
     /// How fine files' modification times are.
     pub mtime_step: Duration,
-    /// Whether an fsync of a file makes every change of names before it durable too (one journal
-    /// for the filesystem, as ext4 has); else only an fsync of their folder does, as POSIX says.
+    /// Whether any fsync, of a file or a folder, makes every change of names before it durable (one
+    /// journal for the filesystem, as ext4 and XFS have); else an fsync of a folder makes the
+    /// changes of names in that folder durable, and no other's, as POSIX says.
     pub fsync_commits_names: bool,
+    /// Names as kiln-sim kept them when the first bugs' seeds found them: an fsync of a folder made
+    /// every change before the last of its own durable too, in any folder. Those seeds replay those
+    /// runs with it; no seed draws it.
+    pub names_in_order: bool,
     /// When the faults stop (fsync, write and room faults; crashes and power losses are the
     /// model's to make).
     pub until: Duration,
@@ -52,7 +59,7 @@ pub struct DiskFaults {
 impl DiskFaults {
     /// A disk that never fails, with nanosecond times and POSIX's names.
     pub fn none() -> Self {
-        Self { fsync_fail: 0, write_fail: 0, capacity: None, mtime_step: Duration::from_nanos(1), fsync_commits_names: false, until: Duration::ZERO }
+        Self { fsync_fail: 0, write_fail: 0, capacity: None, mtime_step: Duration::from_nanos(1), fsync_commits_names: false, names_in_order: false, until: Duration::ZERO }
     }
 
     /// A seed's own disk: its filesystem's time step (a nanosecond, a millisecond, a 4 ms tick, a
@@ -60,7 +67,7 @@ impl DiskFaults {
     pub fn draw(rng: &mut Rng, until: Duration) -> Self {
         let steps = [Duration::from_nanos(1), Duration::from_millis(1), Duration::from_millis(4), Duration::from_secs(1), Duration::from_secs(2)];
         let mtime_step = rng.pick(&steps).copied().unwrap_or(Duration::from_nanos(1));
-        Self { fsync_fail: rng.range(0, 30), write_fail: rng.range(0, 10), capacity: None, mtime_step, fsync_commits_names: rng.chance(500), until }
+        Self { fsync_fail: rng.range(0, 30), write_fail: rng.range(0, 10), capacity: None, mtime_step, fsync_commits_names: rng.chance(500), names_in_order: false, until }
     }
 }
 
@@ -156,7 +163,8 @@ struct Inode {
 enum NameOp {
     Put(String, Entry),
     Remove(String),
-    Rename { from: String, to: String },
+    /// What was at `from` (`entry`) now at `to`: made durable by either folder's fsync, whole.
+    Rename { from: String, to: String, entry: Entry },
 }
 
 impl NameOp {
@@ -164,7 +172,7 @@ impl NameOp {
     fn touches(&self, dir: &str) -> bool {
         match self {
             Self::Put(p, _) | Self::Remove(p) => parent(p) == dir,
-            Self::Rename { from, to } => parent(from) == dir || parent(to) == dir,
+            Self::Rename { from, to, .. } => parent(from) == dir || parent(to) == dir,
         }
     }
 
@@ -176,13 +184,25 @@ impl NameOp {
             Self::Remove(p) => {
                 names.remove(p);
             }
-            Self::Rename { from, to } => {
-                if let Some(e) = names.remove(from) {
-                    names.insert(to.clone(), e);
-                }
+            Self::Rename { from, to, entry } => {
+                names.remove(from);
+                names.insert(to.clone(), *entry);
             }
         }
     }
+}
+
+/// `names` without what's in a folder that isn't among them: what a power loss leaves of names
+/// made durable in a folder whose own name wasn't.
+fn without_orphans(names: BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
+    // A folder sorts before what's in it (its path is a prefix of theirs): one pass, in order.
+    let mut kept = BTreeMap::new();
+    for (p, e) in names {
+        if p == "/" || kept.get(parent(&p)) == Some(&Entry::Dir) {
+            kept.insert(p, e);
+        }
+    }
+    kept
 }
 
 struct State {
@@ -551,7 +571,7 @@ impl Disk {
         }
         st.live.remove(&f);
         let replaced = st.live.insert(t.clone(), entry);
-        st.journal.push(NameOp::Rename { from: f, to: t });
+        st.journal.push(NameOp::Rename { from: f, to: t, entry });
         if let Some(Entry::Ino(old)) = replaced {
             st.forget_if_unnamed(old);
         }
@@ -585,8 +605,8 @@ impl Disk {
         Ok(())
     }
 
-    /// Makes the changes of names in folder `dir` durable (and every change before the last of
-    /// them: the journal is kept in order).
+    /// Makes the changes of names in folder `dir` durable (every change before it too, on a
+    /// filesystem with one journal).
     pub fn fsync_dir(&self, dir: &str) -> io::Result<()> {
         {
             let mut st = self.inner.lock();
@@ -605,15 +625,24 @@ impl Disk {
             st.counts.fsync_errors = st.counts.fsync_errors.saturating_add(1);
             return Err(io::Error::other(format!("fsync failed (EIO): {d} (kiln-sim)")));
         }
-        if let Some(last) = st.journal.iter().rposition(|op| op.touches(d)) {
-            st.commit(last.saturating_add(1));
+        if st.faults.names_in_order {
+            if let Some(last) = st.journal.iter().rposition(|op| op.touches(d)) {
+                st.commit(last.saturating_add(1));
+            }
+        } else if st.faults.fsync_commits_names {
+            let all = st.journal.len();
+            st.commit(all);
+        } else {
+            st.commit_folder(d);
         }
         Ok(())
     }
 
-    /// Makes `path` (a file's bytes, or a folder) and every change of names so far durable, with
-    /// no fault and no crash point: a model's own act, as a person's editor saving a file whole.
-    /// What a power loss tears after that is then what the code under test left unsynced.
+    /// Makes `path` durable, with no fault and no crash point: a model's own act, as a person's
+    /// editor saving a file whole. Its bytes (a file's) and the changes of names in each folder
+    /// from the root down to it (every change of names, on a filesystem with one journal, or with
+    /// names kept in order). What a power loss tears after that is then what the code under test
+    /// left unsynced.
     pub fn make_durable(&self, path: &str) {
         let mut st = self.inner.lock();
         let p = normal(path);
@@ -623,8 +652,21 @@ impl Disk {
             n.durable = n.live.clone();
             n.dirty = false;
         }
-        let all = st.journal.len();
-        st.commit(all);
+        if st.faults.fsync_commits_names || st.faults.names_in_order {
+            let all = st.journal.len();
+            st.commit(all);
+            return;
+        }
+        let mut dirs = Vec::new();
+        let mut d = if st.live.get(&p) == Some(&Entry::Dir) { p.clone() } else { parent(&p).to_owned() };
+        loop {
+            dirs.push(d.clone());
+            if d == "/" {
+                break;
+            }
+            d = parent(&d).to_owned();
+        }
+        st.commit_where(|op| dirs.iter().any(|f| op.touches(f)));
     }
 
     // ---------------------------------------------------------------------------- the nemesis
@@ -784,6 +826,20 @@ impl State {
         }
     }
 
+    /// The changes of names in folder `d` made durable, in their order; the others' wait.
+    fn commit_folder(&mut self, d: &str) {
+        self.commit_where(|op| op.touches(d));
+    }
+
+    /// The changes of names `which` picks made durable, in their order; the others' wait.
+    fn commit_where(&mut self, which: impl Fn(&NameOp) -> bool) {
+        let (done, rest): (Vec<NameOp>, Vec<NameOp>) = std::mem::take(&mut self.journal).into_iter().partition(which);
+        self.journal = rest;
+        for op in &done {
+            op.apply(&mut self.durable);
+        }
+    }
+
     fn power_loss(&mut self) {
         self.counts.power_losses = self.counts.power_losses.saturating_add(1);
         let pending = self.journal.len();
@@ -792,6 +848,7 @@ impl State {
         let lost = self.journal.len();
         self.counts.names_lost = self.counts.names_lost.saturating_add(u64::try_from(lost).unwrap_or(0));
         self.journal.clear();
+        self.durable = without_orphans(std::mem::take(&mut self.durable));
         let dirty: Vec<u64> = self.inodes.iter().filter(|(_, n)| n.dirty).map(|(i, _)| *i).collect();
         for i in dirty {
             let roll = self.rng.below(100);
@@ -845,7 +902,8 @@ mod tests {
         (clock.clone(), Disk::new(clock, Rng::new(seed), faults))
     }
 
-    /// CP-T6.1: what the processes see: folders, files, links, renames over a file, exec bits.
+    /// CP-T6.1, the goal's nemesis (the disk it strikes): what the processes see: folders, files,
+    /// links, renames over a file, exec bits.
     #[test]
     fn a_disk_holds_folders_files_and_links_as_a_process_sees_them() -> io::Result<()> {
         let (_, d) = disk(1, DiskFaults::none());
@@ -871,9 +929,9 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1: a power loss keeps what was made durable: a file written, fsynced and its folder
-    /// fsynced survives whatever the draws; a rename over a file is the old or the new, never
-    /// neither, once the new file's bytes were fsynced.
+    /// CP-T6.1, T-T6.1.1 (torn writes): a power loss keeps what was made durable: a file written,
+    /// fsynced and its folder fsynced survives whatever the draws; a rename over a file is the old
+    /// or the new, never neither, once the new file's bytes were fsynced.
     #[test]
     fn what_was_made_durable_survives_a_power_loss() -> io::Result<()> {
         for seed in 0..200 {
@@ -893,10 +951,10 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1: what wasn't made durable is torn, zeroed, lost or kept, by the seed: a file
-    /// renamed in without its bytes fsynced comes back empty, zeroed or torn (the bug every
-    /// "write a temporary file and rename it" without an fsync has), and a seed does the same
-    /// every time.
+    /// CP-T6.1, T-T6.1.1 (torn writes): what wasn't made durable is torn, zeroed, lost or kept, by
+    /// the seed: a file renamed in without its bytes fsynced comes back empty, zeroed or torn (the
+    /// bug every "write a temporary file and rename it" without an fsync has), and a seed does the
+    /// same every time.
     #[test]
     fn what_wasnt_made_durable_is_torn_lost_or_kept() -> io::Result<()> {
         let run = |seed| -> io::Result<(Vec<u8>, DiskCounts)> {
@@ -925,7 +983,57 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1: changes of names survive in order: never a later one without those before it.
+    /// CP-T6.1, T-T6.1.1 (torn writes): POSIX's names. An fsync of a folder makes
+    /// the changes of names in it durable, and no other folder's: a name made in a folder never
+    /// synced is lost by some power loss, while what's in the synced ones stays. And nothing
+    /// survives in a folder whose own name didn't.
+    #[test]
+    fn a_folder_s_fsync_makes_its_own_names_durable_and_no_other_s() -> io::Result<()> {
+        let mut lost = false;
+        for seed in 0..200 {
+            let (_, d) = disk(seed, DiskFaults::none());
+            d.create_dir_all("/a")?;
+            d.create_dir_all("/b")?;
+            d.make_durable("/");
+            d.write("/a/x", b"x")?;
+            d.fsync("/a/x")?;
+            d.write("/b/y", b"y")?;
+            d.fsync("/b/y")?;
+            d.create_dir_all("/b/new")?;
+            d.write("/b/new/z", b"z")?;
+            d.fsync("/b/new/z")?;
+            d.fsync_dir("/b/new")?;
+            d.fsync_dir("/b")?;
+            d.power_loss();
+            assert_eq!(d.read("/b/y")?, b"y", "seed {seed}: /b was synced");
+            assert_eq!(d.read("/b/new/z")?, b"z", "seed {seed}: /b/new was synced, and its name in /b");
+            match d.read("/a/x") {
+                Ok(x) => assert_eq!(x, b"x", "seed {seed}: its bytes were synced"),
+                Err(_) => lost = true,
+            }
+        }
+        assert!(lost, "no power loss lost a name in a folder never synced");
+        let mut orphaned = false;
+        for seed in 0..200 {
+            let (_, d) = disk(seed, DiskFaults::none());
+            d.create_dir_all("/n")?;
+            d.write("/n/f", b"f")?;
+            d.fsync("/n/f")?;
+            d.fsync_dir("/n")?;
+            d.power_loss();
+            if d.exists("/n") {
+                assert_eq!(d.read("/n/f")?, b"f", "seed {seed}");
+            } else {
+                assert!(!d.exists("/n/f") && d.list("/")?.is_empty(), "seed {seed}: /n/f outlived its folder");
+                orphaned = true;
+            }
+        }
+        assert!(orphaned, "no power loss lost a folder whose name was never synced");
+        Ok(())
+    }
+
+    /// CP-T6.1, T-T6.1.1 (torn writes): changes of names survive in order: never a later one
+    /// without those before it.
     #[test]
     fn names_survive_a_power_loss_as_a_prefix() -> io::Result<()> {
         for seed in 0..200 {
@@ -941,8 +1049,9 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1: a crash at a chosen write: it and every change after fail until thawed; faults
-    /// strike only while they last; a full disk refuses typed.
+    /// CP-T6.1, the goal's nemesis (crashes at every write, fsync errors, ENOSPC): a crash at a
+    /// chosen write: it and every change after fail until thawed; faults strike only while they
+    /// last; a full disk refuses typed.
     #[test]
     fn a_crash_comes_at_its_write_and_faults_fail_typed() -> io::Result<()> {
         let (clock, d) = disk(3, DiskFaults { fsync_fail: 1000, until: Duration::from_secs(10), ..DiskFaults::none() });
@@ -961,8 +1070,8 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1: times as fine as the seed's filesystem keeps them: two writes within one step
-    /// leave the time as it was.
+    /// CP-T6.1, AC-T6.1.3 (the third bug's coarse times): times as fine as the seed's filesystem
+    /// keeps them: two writes within one step leave the time as it was.
     #[test]
     fn modification_times_are_as_coarse_as_the_filesystem() -> io::Result<()> {
         let (clock, d) = disk(4, DiskFaults { mtime_step: Duration::from_secs(1), ..DiskFaults::none() });

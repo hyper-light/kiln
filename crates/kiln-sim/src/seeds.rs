@@ -36,7 +36,9 @@ pub struct Report {
     pub model: &'static str,
     pub first: u64,
     pub seeds: u64,
-    /// Each seed that failed, and why.
+    /// How many seeds failed.
+    pub failed: u64,
+    /// The first of them that failed ([`FAILURES_KEPT`] at most), and why.
     pub failures: Vec<(u64, String)>,
     pub elapsed: Duration,
 }
@@ -53,7 +55,7 @@ impl Report {
 
     /// Every seed passed.
     pub fn passed(&self) -> bool {
-        self.failures.is_empty()
+        self.failed == 0
     }
 
     /// One line: what ran, how fast, and what failed.
@@ -66,8 +68,11 @@ impl Report {
             self.seeds,
             self.elapsed.as_secs_f64(),
             self.per_minute(),
-            self.failures.len()
+            self.failed
         );
+        if self.failed > u64::try_from(self.failures.len()).unwrap_or(u64::MAX) {
+            s.push_str(&format!(" (the first {} below)", self.failures.len()));
+        }
         for (seed, why) in &self.failures {
             s.push_str(&format!("\n  seed {seed}: {why}\n    replay: KILN_SIM_SEED={seed}"));
         }
@@ -94,10 +99,7 @@ pub fn run(model: &'static str, first: u64, seeds: u64, mut run_one: impl FnMut(
             }
         }
     }
-    if failed > u64::try_from(failures.len()).unwrap_or(u64::MAX) {
-        failures.push((u64::MAX, format!("{failed} seeds failed in all; the first {FAILURES_KEPT} are above")));
-    }
-    Report { model, first, seeds, failures, elapsed: started.elapsed() }
+    Report { model, first, seeds, failed, failures, elapsed: started.elapsed() }
 }
 
 /// Runs the budget a test asks for (or the one seed `KILN_SIM_SEED` names): the report.
@@ -123,14 +125,18 @@ pub fn twice(seed: u64, mut run_one: impl FnMut(u64) -> Outcome) -> Outcome {
 mod tests {
     use super::*;
 
-    /// CP-T6.1: a report says how fast, what failed and how to replay it; twice catches a seed
-    /// that runs two ways.
+    /// CP-T6.1, AC-T6.1.2 and AC-T6.1.4: a report says how fast, what failed and how to replay it;
+    /// twice catches a seed that runs two ways.
     #[test]
     fn a_report_names_each_failed_seed_and_twice_catches_one_that_runs_two_ways() {
         let r = run("toy", 10, 5, |s| if s == 12 { Err("a planted failure".into()) } else { Ok(s) });
         assert_eq!(r.failures, [(12, "a planted failure".to_owned())]);
         let line = r.line();
-        assert!(line.contains("seeds 10..=14 (5)") && line.contains("KILN_SIM_SEED=12"), "{line}");
+        assert!(line.contains("seeds 10..=14 (5)") && line.contains("1 failed") && line.contains("KILN_SIM_SEED=12"), "{line}");
+        // More failed than it keeps: all counted, the first of them shown.
+        let many = run("toy", 0, 50, |s| if s % 2 == 0 { Err(format!("failure {s}")) } else { Ok(s) });
+        assert_eq!((many.failed, many.failures.len()), (25, FAILURES_KEPT));
+        assert!(!many.passed() && many.line().contains(&format!("25 failed (the first {FAILURES_KEPT} below)")), "{}", many.line());
         assert_eq!(twice(3, Ok), Ok(3));
         let mut n = 0;
         let two_ways = twice(3, |_| {

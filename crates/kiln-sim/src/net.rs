@@ -227,8 +227,9 @@ impl Net {
 mod tests {
     use super::*;
 
-    /// CP-T6.1: while the nemesis lasts, frames are lost, doubled, cut off and reordered; after
-    /// it, every frame arrives once, soon; and a seed's network does the same every time.
+    /// CP-T6.1, the goal's nemesis (network drops, duplication, reordering, partitions): while the
+    /// nemesis lasts, frames are lost, doubled, cut off and reordered; after it, every frame
+    /// arrives once, soon; and a seed's network does the same every time.
     #[test]
     fn the_nemesis_loses_doubles_cuts_and_reorders_until_it_stops() {
         let ms = Duration::from_millis;
@@ -259,8 +260,8 @@ mod tests {
         }
     }
 
-    /// CP-T6.1: on an ordered lane, frames are lost but never overtake one another or come twice;
-    /// a request is lost or late, never doubled.
+    /// CP-T6.1, the goal's nemesis (network drops): on an ordered lane, frames are lost but never
+    /// overtake one another or come twice; a request is lost or late, never doubled.
     #[test]
     fn an_ordered_lane_loses_frames_but_never_reorders_or_doubles_them() {
         let ms = Duration::from_millis;
@@ -282,7 +283,8 @@ mod tests {
         assert!(lost > 0);
     }
 
-    /// CP-T6.1: a frame that's only ever late arrives once the cut it met heals.
+    /// CP-T6.1, the goal's nemesis (partitions): a frame that's only ever late arrives once the cut
+    /// it met heals.
     #[test]
     fn a_late_frame_waits_out_its_cut() {
         let ms = Duration::from_millis;

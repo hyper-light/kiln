@@ -75,7 +75,8 @@ impl Trace {
 mod tests {
     use super::*;
 
-    /// CP-T6.1: the same steps fold alike, others don't; words are kept only when asked, bounded.
+    /// CP-T6.1, AC-T6.1.4: the same steps fold alike, others don't; words are kept only when asked,
+    /// bounded.
     #[test]
     fn the_same_steps_fold_alike_and_words_are_kept_only_when_asked() {
         let (mut a, mut b, mut c) = (Trace::new(1, 0), Trace::new(1, 0), Trace::new(1, 2));

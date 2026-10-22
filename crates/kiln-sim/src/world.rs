@@ -169,8 +169,8 @@ mod tests {
         log.lock().clone()
     }
 
-    /// CP-T6.1: the seed picks the interleaving, one poll at a time, and a seed's is the same
-    /// every time.
+    /// CP-T6.1, AC-T6.1.4: the seed picks the interleaving, one poll at a time, and a seed's is the
+    /// same every time.
     #[test]
     fn the_seed_picks_the_interleaving_and_a_seed_replays_it() {
         assert_eq!(run(1), run(1));
@@ -178,8 +178,9 @@ mod tests {
         assert!(orders.len() > 1, "different seeds interleave differently");
     }
 
-    /// CP-T6.1: a crash drops every task of its node where it waits; what comes after the wait
-    /// never runs; the node starts its next life with an executor of its own.
+    /// CP-T6.1, the goal's nemesis (a crash at every await): a crash drops every task of its node
+    /// where it waits; what comes after the wait never runs; the node starts its next life with an
+    /// executor of its own.
     #[test]
     fn a_crash_drops_a_node_s_tasks_where_they_wait() {
         let clock = SimClock::new();

@@ -223,9 +223,10 @@ mod tests {
         Ok(out)
     }
 
-    /// CP-T6.1 (for CP-T3.1's crash test): a crash at every commit, before it takes effect and
-    /// after: what was acknowledged is always kept, recovery is the committed prefix (the crash's
-    /// own commit at most besides), and nothing goes through a crashed store.
+    /// CP-T6.1, the goal's nemesis (a crash at every write), for CP-T3.1's crash test: a crash at
+    /// every commit, before it takes effect and after: what was acknowledged is always kept,
+    /// recovery is the committed prefix (the crash's own commit at most besides), and nothing goes
+    /// through a crashed store.
     #[test]
     fn a_crash_at_every_commit_keeps_what_was_acknowledged() -> Result<(), Refusal> {
         for at in 0..10u64 {
@@ -252,8 +253,8 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1 (for CP-T3.1): a commit refused, typed, with no crash: nothing committed, the calls
-    /// after it go through, and every call is counted by its kind.
+    /// CP-T6.1, for CP-T3.1's journal: a commit refused, typed, with no crash: nothing committed,
+    /// the calls after it go through, and every call is counted by its kind.
     #[test]
     fn a_refused_commit_commits_nothing_and_the_store_goes_on() -> Result<(), Refusal> {
         let store = Crashing::new(SimRecords::new());

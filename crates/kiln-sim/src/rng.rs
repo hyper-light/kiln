@@ -86,7 +86,7 @@ impl Rng {
 mod tests {
     use super::*;
 
-    /// CP-T6.1: a seed is one sequence, the same every time.
+    /// CP-T6.1, AC-T6.1.4: a seed is one sequence, the same every time.
     #[test]
     fn a_seed_draws_the_same_numbers_every_time() {
         let (mut a, mut b) = (Rng::new(42), Rng::new(42));
@@ -96,8 +96,8 @@ mod tests {
         assert_ne!(Some(Rng::new(43).next_u64()), xs.first().copied());
     }
 
-    /// CP-T6.1: SplitMix64 as the sends simulation draws it (seed 0's first draw is SplitMix64's
-    /// known first output), so its seeds keep their meaning on kiln-sim.
+    /// CP-T6.1, AC-T6.1.4: SplitMix64 as the sends simulation draws it (seed 0's first draw is
+    /// SplitMix64's known first output), so its seeds keep their meaning on kiln-sim.
     #[test]
     fn it_is_splitmix64() {
         assert_eq!(Rng::new(0).next_u64(), 0xE220_A839_7B1D_CDAF);
@@ -111,7 +111,7 @@ mod tests {
         assert_eq!(r.range(9, 5), 9);
     }
 
-    /// CP-T6.1: a stream's draws don't move when another source draws more.
+    /// CP-T6.1, AC-T6.1.4: a stream's draws don't move when another source draws more.
     #[test]
     fn a_stream_is_the_same_however_much_its_parent_drew() {
         let a = Rng::new(9);
