@@ -16,16 +16,31 @@ import * as React from "react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
+import { harnessSessionsRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { Link } from "@/lib/router";
 import { planHref, runHref } from "@/api/plans";
 import { StandTitle, StepGlyph, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { Link } from "@/lib/router";
 import { fromLines, stackReads, startWords, stoppedBy, toGo } from "./goal-stack";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
+
+/** An agent's name, from the agents kiln knows (its id's start until they're in). */
+function AgentLabel({ id }: { id: string }) {
+  return (
+    <React.Suspense fallback={<>agent {id.slice(0, 8)}</>}>
+      <AgentName id={id} />
+    </React.Suspense>
+  );
+}
+
+function AgentName({ id }: { id: string }) {
+  const name = useRes(harnessSessionsRes).data.find((a) => a.id === id)?.name;
+  return <>{name || `agent ${id.slice(0, 8)}`}</>;
+}
 
 /** When the goal under way last went to the agent: sent, or sent again (how many times in a row). */
 function sentWords(g: GoalItem): string {
@@ -247,8 +262,10 @@ function GoalPanel({
               {shown.map((g) => {
                 // The goal under way while you've paused the stack: paused, not under way.
                 const held = g.status === "active" && stack?.state === "paused";
+                // One handed to another agent (a program's track's worker): under way there.
+                const away = g.status === "pending" ? g.on : undefined;
                 return (
-                  <li key={g.id} className="gs-link" data-status={held ? "paused" : g.status} data-part={g.part_of ? "" : undefined} data-depth={g.part_of ? depthOf(g, items) : undefined}>
+                  <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : g.status} data-part={g.part_of ? "" : undefined} data-depth={g.part_of ? depthOf(g, items) : undefined}>
                     <span className="gs-node" title={WORD[g.status]}>
                       <StepGlyph stand={standOf(g, held, working && !g.waits_on)} />
                     </span>
@@ -257,7 +274,16 @@ function GoalPanel({
                       <StandTitle stand={standOf(g, held, working && !g.waits_on)}>{g.text.split(" — ")[0] ?? g.text}</StandTitle>
                       {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
                       <span className="gs-word">
-                        {held ? "paused" : WORD[g.status]}
+                        {held ? "paused" : away ? (
+                          <>
+                            under way on{" "}
+                            <Link to={`/agents/${encodeURIComponent(away)}`}>
+                              <AgentLabel id={away} />
+                            </Link>
+                          </>
+                        ) : (
+                          WORD[g.status]
+                        )}
                         {g.status === "active" && !held && !g.waits_on ? sentWords(g) : ""}
                         {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
                         {g.planned_as && (

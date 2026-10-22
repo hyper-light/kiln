@@ -457,6 +457,9 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/incidents/*", "runs.read", At::Anywhere),
     any("/api/plans", "agents.run", At::Server),
     any("/api/plans/**", "agents.run", At::Server),
+    // Multi-stack programs (docs/programs.md): the handler keeps their settings to a person.
+    any("/api/programs", "agents.run", At::Server),
+    any("/api/programs/**", "agents.run", At::Server),
     // Research (docs/research.md): agents' and people's, each finding graded.
     any("/api/research", "agents.run", At::Server),
     any("/api/research/**", "agents.run", At::Server),

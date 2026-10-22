@@ -11,7 +11,7 @@ import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
 import { harnessApi, type AgentInfo } from "@/api/harness";
 import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
-import { preload, useSuspenseResource, type ResourceOptions } from "./resource";
+import { loaded, preload, useSuspenseResource, type ResourceOptions } from "./resource";
 
 /** What a key loads, and how. */
 export interface Res<T> {
@@ -23,6 +23,11 @@ export interface Res<T> {
 /** Start loading these now, without waiting (a section's keys, before it reads the first). */
 export function warm(...list: Res<unknown>[]) {
   for (const r of list) preload(r.key, r.fetch, r.opts);
+}
+
+/** Settles once one has its first data: a route's loader, so its page shows no fallback. */
+export function ready<T>(r: Res<T>) {
+  return loaded(r.key, r.fetch, r.opts);
 }
 
 /** Read one (suspends until its first data is in). */
