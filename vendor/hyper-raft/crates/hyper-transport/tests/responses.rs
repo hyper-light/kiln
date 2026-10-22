@@ -47,6 +47,11 @@ fn listener_limits(max_responses: usize) -> Limits {
 
 /// The listener and `dialers` dialers, each knowing every other, made at `now`.
 fn nodes(dialers: PeerId, max_responses: usize, now: std::time::Instant) -> Vec<Node<Mantle>> {
+    nodes_with(dialers, listener_limits(max_responses), now)
+}
+
+/// [`nodes`], the listener's bounds `listener`.
+fn nodes_with(dialers: PeerId, listener: Limits, now: std::time::Instant) -> Vec<Node<Mantle>> {
     let issued = Issued::new(dialers + 1);
     issued
         .issued
@@ -61,11 +66,7 @@ fn nodes(dialers: PeerId, max_responses: usize, now: std::time::Instant) -> Vec<
                 )
                 .unwrap(),
                 role: Role::Node,
-                limits: if peer == LISTENER {
-                    listener_limits(max_responses)
-                } else {
-                    limits()
-                },
+                limits: if peer == LISTENER { listener } else { limits() },
                 congestion: Default::default(),
             };
             Endpoint::new_seeded(
@@ -387,4 +388,54 @@ fn a_copy_of_a_refused_attempt_holds_no_place() {
         Some(Ok(())),
         "C was refused the place the copy took"
     );
+}
+
+/// Whether `datagram` is a Retry: a long-header packet of type 3 (RFC 9000 §17.2.5), its fixed
+/// bit not read, which a peer may grease (RFC 9287).
+fn is_retry(datagram: &[u8]) -> bool {
+    datagram
+        .first()
+        .is_some_and(|first| first & 0x80 != 0 && (first >> 4) & 0x3 == 0x3)
+}
+
+/// Do: a listener whose handshakes in progress may hold nothing before one from an unproven
+/// address is answered with a Retry (`Limits::retry_bytes` zero), dialed by one node; then one
+/// that allows them more than any handshake holds. Expect: the first answers the ClientHello with a
+/// Retry, and the dialer comes back with its token and is up; the second admits it outright, no
+/// Retry sent. The handshakes in progress are counted at what a connection is charged as it is
+/// made, against what the owner allows them, as msquic counts its handshakes' memory against its
+/// `RetryMemoryLimit`: a rule of half the places tracked a count, which an owner deriving its
+/// places from its memory made tens of thousands.
+#[test]
+fn a_retry_comes_once_the_handshakes_hold_what_the_owner_allows_them() {
+    const DIALER: PeerId = 2;
+    for (retry_bytes, retried) in [(0u64, true), (u64::MAX, false)] {
+        let now = hyper_sim::Anchor::new().instant(0).unwrap();
+        let listener = Limits {
+            retry_bytes: Some(retry_bytes),
+            ..listener_limits(16)
+        };
+        let mut nodes = nodes_with(1, listener, now);
+        nodes[(DIALER - 1) as usize]
+            .connect(now, LISTENER, mesh_address(LISTENER))
+            .unwrap();
+        let mut retries = 0;
+        route(&mut nodes, now, |from, _, bytes| {
+            if from == LISTENER && is_retry(bytes) {
+                retries += 1;
+            }
+            false
+        });
+        assert_eq!(
+            outcome(&mut nodes[(DIALER - 1) as usize], LISTENER),
+            Some(Ok(())),
+            "the dialer is up (allowance {retry_bytes})"
+        );
+        assert_eq!(
+            retries > 0,
+            retried,
+            "{retries} retries under an allowance of {retry_bytes}"
+        );
+        assert_eq!(nodes[0].stats().admission.pending, 0);
+    }
 }

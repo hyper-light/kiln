@@ -2,10 +2,10 @@ Subject: The shared crates by name, at the copy of hyper-raft beside the bus
 Why: Focal builds its bus against its own snapshots of hyper-raft's crates (vendor/hyper-* in Focal's tree). Quiver takes hyper-raft once, at the revision the bus takes (vendor/hyper-raft), and kiln holds one copy of each hyper-light product: the bus names the shared crates as from crates.io, and the root manifest of whoever builds it (Quiver's, or kiln's) points each name at its one copy with [patch.crates-io].
 
 diff --git a/Cargo.toml b/Cargo.toml
-index dd7457b7f3ddd99b6d70deb09a0885a9ca31bfd7..bd971f67815c3ae1c4d754d96cef974fb87a1c2a 100644
+index ee16a970797537669206569f13ee74a34598a6bb..5e5475eb89b35946531620ad6e24694ed51db546 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -44,33 +44,33 @@ postcard = { version = "1.1", features = ["alloc", "use-std"] }
+@@ -45,36 +45,36 @@ postcard = { version = "1.1", features = ["alloc", "use-std"] }
  pin-project-lite = "0.2.17"
  # The durable shell around the core, vendored from hyper-raft with the log and
  # block layers and the liveness stream it builds on (vendor/*/SNAPSHOT; 27 §15).
@@ -19,6 +19,10 @@ index dd7457b7f3ddd99b6d70deb09a0885a9ca31bfd7..bd971f67815c3ae1c4d754d96cef974f
 +hyper-log = { version = "0.1.0" }
 +hyper-liveness = { version = "0.1.0" }
 +hyper-timing = { version = "0.1.0" }
+ # A node's endpoints run on heaps of their own, which say what their connections hold
+ # (vendor/hyper-heap/SNAPSHOT; hyper-raft docs/transport.md §4x).
+-hyper-heap = { version = "0.1.0", path = "vendor/hyper-heap" }
++hyper-heap = { version = "0.1.0" }
  # Sealing at rest, vendored from hyper-raft (vendor/hyper-seal/SNAPSHOT;
  # docs/archictecutre/29-sealing-at-rest.md).
 -hyper-seal = { version = "0.1.0", path = "vendor/hyper-seal" }

@@ -218,6 +218,10 @@ pub fn limits(server: bool) -> Limits {
         // handshake, and the exchange table alone bounds what would wait for one.
         stream_credit: StreamCredit::Fixed,
         ask_queue: AskQueue::Table,
+        // A handshake from an address not yet proven is answered with a Retry once half the
+        // pending places are taken (RFC 9000 §8.1.2), as before: kiln's places are a count, not
+        // derived from its memory.
+        retry_bytes: None,
         exchanges: if server { 4096 } else { 256 },
         // Eight lanes kiln has always had, and `proto::LANE_STREAM` and `proto::LANE_PORTS` past
         // them (a peer opens one only when the other side announced it takes it).

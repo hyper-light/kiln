@@ -18,5 +18,9 @@ hyper-measure = { path = "../hyper-measure" }
 name = "allocs"
 harness = false
 
+[[bench]]
+name = "round"
+harness = false
+
 [lints]
 workspace = true

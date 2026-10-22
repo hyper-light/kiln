@@ -70,8 +70,8 @@ them.
 ## Vendoring
 
 kiln vendors Quiver (`vendor/quiver`), Focal's bus (`vendor/focal-bus`, branch `bus-replicated` at
-`b408a3b`) and hyper-raft (`vendor/hyper-raft`, at `1af65f7`, the revision Focal's bus takes) at the
+`52d17cb`) and hyper-raft (`vendor/hyper-raft`, at `d4e8447`, the revision Focal's bus takes) at the
 revisions Quiver takes them, with Quiver's recorded changes (vendor/MANIFEST.toml,
 docs/vendoring.md). kiln's own transport, runtime and replicated stores (sync, CD) moved with it from
-hyper-raft `767627f` to `1af65f7`, so kiln links one revision of each. In kiln's copy, hyper-durable's
+hyper-raft `767627f` to `d4e8447`, so kiln links one revision of each. In kiln's copy, hyper-durable's
 `RamStore` is compiled only for tests: kiln's sync tests ask for it through a dev-dependency.

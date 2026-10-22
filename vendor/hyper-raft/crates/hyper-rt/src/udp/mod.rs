@@ -85,6 +85,12 @@ pub struct QueueCharge {
     /// mbuf limit `charged` does not read, a datagram's mbufs over `sb_efficiency`; nothing where
     /// `charged` is the kernel's whole account.
     pub message_floor: u64,
+    /// What the kernel holds for the socket's buffers and charges to the process's memory: on Linux
+    /// the queue's charge and the memory reserved ahead of it (`SK_MEMINFO_FWD_ALLOC`), which a
+    /// container's memory limit counts (cgroup v2's `memory.stat` `sock`) though no process's
+    /// footprint holds it. None where the kernel charges the process for no socket buffer (macOS's
+    /// mbufs are the system's), and on the simulation fabric.
+    pub held: Option<u64>,
 }
 
 /// An async UDP socket: a real OS datagram socket, or a port on the simulation's in-memory fabric.
@@ -161,9 +167,13 @@ impl UdpSocket {
     /// held, whatever process held it (the kernel's choice of a free port passes over a port held by
     /// a socket it may share with), and the two then split one port's datagrams: of 256 clients
     /// bound so, one to three never heard their server in four runs of five, each sharing its port
-    /// with another client. Refused `BadConfig` on Windows, where a shared port hands a connected
-    /// socket no peer's datagrams of its own, and on the simulation fabric, whose ports are one
-    /// socket's each.
+    /// with another client: Linux's search for a free port leaves out of the ports in use those held
+    /// by a socket that shares its port with the binder's user (`udp_lib_lport_inuse`,
+    /// net/ipv4/udp.c). Shared after its bind, the port still takes the sockets that join it, as each
+    /// kernel checks the held socket's flag when another binds (Linux `udp_lib_lport_inuse` and
+    /// `udp_reuseport_add_sock`, XNU `in_pcbbind`). Refused `BadConfig` on Windows, where a shared
+    /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
+    /// whose ports are one socket's each.
     pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
@@ -342,12 +352,10 @@ impl UdpSocket {
         match &self.inner {
             #[cfg(target_os = "linux")]
             Inner::Real { socket } => {
-                let (charged, buffer, drops) =
-                    linux::queue_charge(socket.raw_id()).map_err(|error| {
-                        RtError::DriverRefused {
-                            call: "getsockopt(SO_MEMINFO)",
-                            code: error.raw_os_error(),
-                        }
+                let (charged, buffer, drops, reserved) = linux::queue_charge(socket.raw_id())
+                    .map_err(|error| RtError::DriverRefused {
+                        call: "getsockopt(SO_MEMINFO)",
+                        code: error.raw_os_error(),
                     })?;
                 Ok(Some(QueueCharge {
                     charged: u64::from(charged),
@@ -355,6 +363,8 @@ impl UdpSocket {
                     drops: drops.map(u64::from),
                     release_lag: u64::from(buffer >> 2),
                     message_floor: 0,
+                    held: reserved
+                        .map(|reserved| u64::from(charged).saturating_add(u64::from(reserved))),
                 }))
             }
             // XNU's byte limit counts each datagram's payload, address and control (`sbappendaddr`)
@@ -367,6 +377,7 @@ impl UdpSocket {
                 drops: None,
                 release_lag: 0,
                 message_floor: macos::message_floor(),
+                held: None,
             })),
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Inner::Real { .. } => Ok(None),
@@ -378,6 +389,7 @@ impl UdpSocket {
                     drops: None,
                     release_lag: 0,
                     message_floor: 0,
+                    held: None,
                 }))
             }
             Inner::Moved => Err(moved()),

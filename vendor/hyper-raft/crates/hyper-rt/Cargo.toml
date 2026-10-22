@@ -59,3 +59,7 @@ harness = false
 [[bench]]
 name = "rearm"
 harness = false
+
+[[bench]]
+name = "stamped_receive"
+harness = false

@@ -62,6 +62,10 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Threading",
   "Win32_System_WindowsProgramming",
 ] }
+# mimalloc (Leijen, Zorn and de Moura, APLAS 2019) at the version focal's binary allocates through: its heap
+# API for hyper-heap, and its global allocator for the tests and measurements that run under it.
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["v2", "extended"] }
+mimalloc = { version = "=0.1.52", default-features = false, features = ["v2"] }
 proptest = "1.11"
 tempfile = "3.20"
 # Pin projection for hyper-rt's named futures (its combinators and `within`): each holds the futures it is

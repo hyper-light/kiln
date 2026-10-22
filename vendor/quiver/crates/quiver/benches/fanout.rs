@@ -312,6 +312,8 @@ struct Run {
     kept_up: usize,
     subscriptions: usize,
     cpu_s: f64,
+    /// The publisher's own thread's CPU: its open loop's pacing spins, which isn't Quiver's work.
+    publisher_cpu_s: f64,
     load_before: Option<f64>,
     load_after: Option<f64>,
 }
@@ -383,6 +385,7 @@ fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, &Shared, u64)) -> Run {
     let (mut published, mut refused) = (0u64, 0u64);
     let mut last_minute = 0u64;
     let began = Instant::now();
+    let publisher_before = thread_cpu_s();
     loop {
         let at = arrivals.next_arrival().unwrap();
         if at >= end {
@@ -404,6 +407,10 @@ fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, &Shared, u64)) -> Run {
         }
     }
     let seconds = began.elapsed().as_secs_f64();
+    let publisher_cpu_s = match (publisher_before, thread_cpu_s()) {
+        (Some(b), Some(a)) => a - b,
+        _ => f64::NAN,
+    };
     // Every worker takes what was published (the fact waited on), then the topic ends.
     let deadline = Instant::now() + Duration::from_secs(60);
     while shared
@@ -454,9 +461,18 @@ fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, &Shared, u64)) -> Run {
         kept_up: total.kept_up,
         subscriptions: total.subscriptions,
         cpu_s,
+        publisher_cpu_s,
         load_before,
         load_after: hyper_measure::usage::load(),
     }
+}
+
+/// This thread's CPU so far, seconds: the scheduler's own count of its time on a CPU
+/// (`/proc/thread-self/schedstat`, Linux), none where it isn't kept.
+fn thread_cpu_s() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let ns: u64 = text.split_whitespace().next()?.parse().ok()?;
+    Some(ns as f64 / 1e9)
 }
 
 fn us(ns: u64) -> String {
@@ -466,7 +482,7 @@ fn us(ns: u64) -> String {
 fn row(i: &str, r: &Run) -> String {
     let l = &r.latency;
     format!(
-        "| {i} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} | {:.1} | {:.0} | {} / {} |",
+        "| {i} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} | {:.1} | {:.1} | {:.0} | {} / {} |",
         r.published,
         r.published as f64 / r.seconds,
         r.publish_refused,
@@ -482,8 +498,9 @@ fn row(i: &str, r: &Run) -> String {
         r.kept_up,
         r.subscriptions,
         r.cpu_s,
+        r.publisher_cpu_s,
         if r.deliveries > 0 {
-            r.cpu_s * 1e9 / r.deliveries as f64
+            (r.cpu_s - r.publisher_cpu_s) * 1e9 / r.deliveries as f64
         } else {
             f64::NAN
         },
@@ -495,7 +512,7 @@ fn row(i: &str, r: &Run) -> String {
 }
 
 fn header() -> &'static str {
-    "| run | published | /s achieved | refused | deliveries | measured | p50 µs | p90 µs | p99 µs | p99.9 µs | max µs | lag notices | lost | kept up | CPU s | CPU ns a delivery | load before / after |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+    "| run | published | /s achieved | refused | deliveries | measured | p50 µs | p90 µs | p99 µs | p99.9 µs | max µs | lag notices | lost | kept up | CPU s | publisher's CPU s | CPU ns a delivery, the publisher's left out | load before / after |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
 }
 
 /// The machine, as the record states it.

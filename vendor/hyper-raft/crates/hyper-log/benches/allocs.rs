@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::scratch::Scratch;
-use hyper_log::{Config, Entries, Entry, GroupLog, Log, Update, Waits};
+use hyper_log::{Config, Entries, Entry, GroupLog, Log, Page, Update, Waits};
 use hyper_measure::{alloc, faults};
 
 #[global_allocator]
@@ -119,7 +119,12 @@ fn through_handles(dir: &Path, replicas: usize, size: usize) {
     let mut into = Some(hyper_log::Fetched::new());
     let mut fetch = |h: &GroupLog<DeviceFile>| {
         let got = h
-            .fetch(last, last + 1, u64::MAX, into.take().unwrap())
+            .fetch(
+                last,
+                last + 1,
+                Page::payload(u64::MAX),
+                into.take().unwrap(),
+            )
             .unwrap();
         assert_eq!(got.len(), 1);
         into = Some(got);
@@ -186,7 +191,12 @@ fn through_marked_handles(dir: &Path, replicas: usize, size: usize) {
     let mut into = Some(hyper_log::Fetched::new());
     let mut fetch = |h: &GroupLog<DeviceFile>| {
         let got = h
-            .fetch(last, last + 1, u64::MAX, into.take().unwrap())
+            .fetch(
+                last,
+                last + 1,
+                Page::payload(u64::MAX),
+                into.take().unwrap(),
+            )
             .unwrap();
         assert_eq!(got.len(), 1);
         into = Some(got);
@@ -268,7 +278,13 @@ fn point(dir: &Path, replicas: usize, size: usize) {
     let mut into = Some(hyper_log::Fetched::new());
     let mut fetch = |log: &Log<DeviceFile>, g: usize| {
         let got = log
-            .fetch(g as u128, last, last + 1, u64::MAX, into.take().unwrap())
+            .fetch(
+                g as u128,
+                last,
+                last + 1,
+                Page::payload(u64::MAX),
+                into.take().unwrap(),
+            )
             .unwrap();
         assert_eq!(got.len(), 1);
         into = Some(got);
@@ -305,7 +321,13 @@ fn point(dir: &Path, replicas: usize, size: usize) {
     let mut into = Some(hyper_log::Fetched::new());
     let mut fetch = |log: &Log<DeviceFile>, g: usize| {
         let got = log
-            .fetch(g as u128, last, last + 1, u64::MAX, into.take().unwrap())
+            .fetch(
+                g as u128,
+                last,
+                last + 1,
+                Page::payload(u64::MAX),
+                into.take().unwrap(),
+            )
             .unwrap();
         assert_eq!(got.len(), 1);
         into = Some(got);

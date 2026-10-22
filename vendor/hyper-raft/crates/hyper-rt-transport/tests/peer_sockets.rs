@@ -89,17 +89,33 @@ struct Seen {
     connected: u32,
     frames: u32,
     closed: bool,
+    /// Steps taken: which driver a step asks first alternates with it.
+    steps: u64,
 }
 
-/// Takes the next event of either driver, or a tick's worth of nothing, and acts on it.
+/// Takes the next event of either driver, or a tick's worth of nothing, and acts on it. The driver
+/// asked first alternates from one step to the next: asked first always, one side flooding the
+/// other had an event at every step, the other's were not taken, the frames it was sent held
+/// unreleased, its own lane full, and its connection, sending nothing, never grew a window its MTU
+/// probe fits (`a_connections_mtu_search_...`, 60 s at 1,200 bytes on Linux CI, 2026-10-22).
 async fn step(server: &mut Drv, client: &mut Drv, seen: &mut Seen) {
     let mut tick = pin!(hyper_rt::futures::sleep(1_000_000));
+    let server_first = seen.steps.is_multiple_of(2);
+    seen.steps = seen.steps.wrapping_add(1);
     let next = poll_fn(|context| {
-        if let Poll::Ready(event) = server.poll_event(context) {
-            return Poll::Ready(Some((SERVER, event.unwrap())));
-        }
-        if let Poll::Ready(event) = client.poll_event(context) {
-            return Poll::Ready(Some((CLIENT, event.unwrap())));
+        for side in if server_first {
+            [SERVER, CLIENT]
+        } else {
+            [CLIENT, SERVER]
+        } {
+            let driver = if side == SERVER {
+                &mut *server
+            } else {
+                &mut *client
+            };
+            if let Poll::Ready(event) = driver.poll_event(context) {
+                return Poll::Ready(Some((side, event.unwrap())));
+            }
         }
         if tick.as_mut().poll(context).is_ready() {
             return Poll::Ready(None);
@@ -260,9 +276,9 @@ fn a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own() 
                 socket => socket.unwrap(),
             };
             assert_eq!(socket.shares_port().unwrap(), apart == 1);
-            let batched = hyper_rt::udp::Batched::new(socket, IO, false).unwrap();
+            let batched = hyper_rt::udp::Batched::lent(socket, false).unwrap();
             let mut server: Drv =
-                Driver::new(endpoint(&pki, &two, &one.0, CLIENT, true), batched).unwrap();
+                Driver::new(endpoint(&pki, &two, &one.0, CLIENT, true), batched, IO).unwrap();
             let server_addr = server.local_addr().unwrap();
             let mut client: Drv =
                 Driver::bind(endpoint(&pki, &one, &two.0, SERVER, false), loopback, IO).unwrap();

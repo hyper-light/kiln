@@ -630,14 +630,20 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
     // a frame's or a flushed confirmation's.
     let durable = after.durable_writes - before.durable_writes;
     let flushed = after.flushed_confirmations - before.flushed_confirmations;
+    // And a slot filled ahead while the device idled is flushed once (`LogStats::fills`): whether
+    // one comes between two frames is the device thread's timing.
+    let fills = after.fills - before.fills;
     assert_eq!(durable + flushed, n, "{durable} durable, {flushed} flushed");
-    assert_eq!(after.flushes - before.flushes, n + flushed);
+    assert_eq!(after.flushes - before.flushes, n + flushed + fills);
     assert_eq!(after.durable_fallbacks - before.durable_fallbacks, 0);
     assert_eq!(
         after.bytes - before.bytes,
         (writes_after - writes) * BLOCK as u64
     );
-    assert_eq!(after.flush.count() - before.flush.count(), n + flushed);
+    assert_eq!(
+        after.flush.count() - before.flush.count(),
+        n + flushed + fills
+    );
     assert_eq!(after.write.count() - before.write.count(), n);
     assert_eq!(after.commit_wait.count() - before.commit_wait.count(), n);
     // Each wait runs from its submission past its frame's writes and flush and its
@@ -1050,9 +1056,11 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
         stats.durable_writes + stats.flushed_confirmations >= 4,
         "{stats:?}"
     );
+    // And a slot filled ahead while the device idled is flushed once (`LogStats::fills`): whether
+    // one comes between two frames is the device thread's timing (Linux CI, 2026-10-22: one did).
     assert_eq!(
         stats.flushes,
-        stats.frames + stats.flushed_confirmations,
+        stats.frames + stats.flushed_confirmations + stats.fills,
         "{stats:?}"
     );
     log.with_file(|f| f.crash(Crash::LoseAll).unwrap()).unwrap();

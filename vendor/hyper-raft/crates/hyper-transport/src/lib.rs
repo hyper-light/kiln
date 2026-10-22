@@ -48,6 +48,7 @@ mod pool;
 mod progress;
 mod receive;
 mod round;
+mod state;
 mod tally;
 mod timing;
 pub mod tls;
@@ -60,8 +61,8 @@ pub use credit::{
     socket_buffer_ask, stream_window_ceiling,
 };
 pub use endpoint::{
-    AskQueue, CONNECTION_STATE, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit,
-    connection_charge, state_charge,
+    AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit, connection_charge,
+    state_charge,
 };
 pub use error::Refusal;
 pub use frame::Embedded;
@@ -75,6 +76,7 @@ pub use pool::PoolStats;
 pub use progress::{LEAST_PROGRESS, Progress};
 pub use receive::RECEIVE_CHUNK;
 pub use round::{Round, RoundEnd};
+pub use state::StateStats;
 pub use timing::spread;
 
 use std::fmt::Debug;
@@ -120,6 +122,16 @@ pub trait Classes {
     /// may. None is, unless a side says so.
     fn pooled(role: Self::Role) -> bool {
         let _ = role;
+        false
+    }
+    /// Whether an exchange of `kind` waits on an event its owner awaits rather than on the
+    /// endpoint's service: a read held until something arrives for it or its wait ends (a long
+    /// poll). One a pooled peer opens is parked as its head arrives, holding none of the pool's
+    /// credit while it waits: its connection is granted a stream of its own for it, within the
+    /// streams one connection may hold (`crate::pool`, docs/transport.md §4ab). None does, unless a
+    /// side says so.
+    fn waits(kind: Self::Kind) -> bool {
+        let _ = kind;
         false
     }
     /// Whether a lane frame of `class` is never skipped. A frame whose class bound or budget cannot
@@ -273,7 +285,9 @@ pub enum Event<C: Classes> {
         /// admission replaced closes with its bound ([`Refusal::Connections`]).
         refusal: Option<Refusal>,
     },
-    /// A dial to `peer` ended before it authenticated, or authenticated as someone else.
+    /// A dial to `peer` ended before it authenticated, or authenticated as someone else. Told for
+    /// every dial that ends so with no connection to the peer up, even when the last event the
+    /// owner polled said the same: an owner that dials again on it hears of each dial's end.
     Unreachable {
         /// The peer.
         peer: PeerId,

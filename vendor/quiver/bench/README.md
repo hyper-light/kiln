@@ -25,7 +25,9 @@ QUIVER_COMMIT=$(git rev-parse HEAD) cargo bench -p quiver --bench fanout -- \
   every delivery of a message scheduled in the `--seconds` window after `--warmup` (a log-linear
   histogram, within 1.6%); deliveries, lag notices, and every subscriber's sequence check: a gap
   with no lag notice before it is a frame lost, a number taken again a frame doubled. CPU is the
-  process's, the publisher's spin included (one CPU, its pacing).
+  process's, and the publisher's own thread's beside it: its open loop paces by spinning, a CPU
+  that isn't Quiver's work (`/proc/thread-self/schedstat`), so a delivery's CPU leaves it out.
+  `--spin-us` has each worker keep looking that long before it waits on the topic.
 - **Its bar** (kiln's plan `01a157fdefc37396957ea10adb51a19f`): AC-T2.1.2, publish-to-deliver p99
   at most 300 µs at 100,000 messages a second on one node; AC-T2.1.3, kept with at least 1,000
   subscribers; AC-T2.1.4, no frame lost to a subscriber that keeps up over an hour (`soak`).

@@ -3,8 +3,9 @@
 The crates Focal's bus is built on (`vendor/focal-bus`), at the revision it takes.
 
 - **Upstream:** https://github.com/hyper-light/hyper-raft, commit
-  `1af65f7b9564c9ba296993dd30bdda27bc97fa03` (2026-10-20), MIT (`LICENSE`): the revision Focal's
-  `bus-replicated` at `b408a3b` takes all fifteen shared crates at (Focal's `vendor/README.md`).
+  `d4e8447117803fdb31d3a5f9079de027520e1141` (2026-10-22), MIT (`LICENSE`): the revision Focal's
+  `bus-replicated` at `52d17cb` takes its shared crates at (Focal's `vendor/README.md`), on the line
+  where hyper-raft's `main` and `fate-commit` met (`7d5e536`).
 - **What is here:** upstream's root manifest and the fifteen crates, whole, at upstream's paths:
   `hyper-block`, `hyper-datagram`, `hyper-durable`, `hyper-liveness`, `hyper-log`, `hyper-measure`,
   `hyper-quic`, `hyper-raft`, `hyper-rt`, `hyper-rt-transport`, `hyper-seal`, `hyper-sim`,

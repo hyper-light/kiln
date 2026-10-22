@@ -661,7 +661,7 @@ fn refusals() -> String {
         ("HT_CLASSES", "strict".into()),
         (
             "HT_BUDGET",
-            (window + hyper_transport::state_charge(&limits()) + 4_000).to_string(),
+            (window + hyper_transport::state_charge::<Mantle>(&limits()) + 4_000).to_string(),
         ),
         ("HT_REFUSALS", record.0.display().to_string()),
     ]);
