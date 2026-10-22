@@ -358,7 +358,7 @@ impl Adapter {
             Self::Claude(a) => a.tick(core),
             Self::Codex(a) => a.tick(core),
             Self::Agy(a) => a.tick(core),
-            Self::Acp(_) => {}
+            Self::Acp(a) => a.tick(core),
         }
     }
 

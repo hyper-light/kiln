@@ -5,7 +5,7 @@
 //! (with diffs) and plan, answers its permission requests, switches modes and cancels turns.
 //!
 //! kiln advertises no file-system or terminal capabilities, so agents use their own tools.
-//! ACP has no way into a running turn: a "steer" waits for the turn like a queued message.
+//! Steering waits for the turn unless Devin advertises its mid-turn prompt extension.
 //!
 //! Devin CLI (`devin acp`) uses this adapter too, including ACP's session config options.
 
@@ -80,6 +80,7 @@ fn status_rows(init: &Value) -> Vec<StatusItem> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
+    Capabilities,
     Session,
     Refresh,
     RefreshNew,
@@ -107,6 +108,11 @@ pub struct Acp {
     resume: Option<String>,
     /// The prompt in flight (its client id).
     prompting: Option<String>,
+    /// Devin's injected prompts share the original turn's result and usage.
+    #[serde(default)]
+    prompt_result: Option<Value>,
+    #[serde(default)]
+    steering: Option<bool>,
     /// Messages to send once the session exists or the turn has been cancelled.
     waiting: Vec<QueueItem>,
     can_load: bool,
@@ -196,6 +202,8 @@ impl Acp {
             session: None,
             resume,
             prompting: None,
+            prompt_result: None,
+            steering: None,
             waiting: Vec::new(),
             can_load: false,
             images: false,
@@ -302,9 +310,13 @@ impl Acp {
         // ACP has no way to report MCP servers, skills, plugins or plan limits.
         core.state.inventory = Inventory { mcp: Known::Unsupported, skills: Known::Unsupported, plugins: Known::Unsupported, limits: Known::Unsupported };
         core.touch_state();
+        self.initialize(core, Pending::Initialize);
+    }
+
+    fn initialize(&mut self, core: &mut Core, kind: Pending) {
         self.request(
             core,
-            Pending::Initialize,
+            kind,
             "initialize",
             json!({
                 "protocolVersion": 1,
@@ -314,9 +326,28 @@ impl Acp {
         );
     }
 
+    fn capabilities(&mut self, core: &mut Core, result: &Value) {
+        let steering = self.account && result.pointer("/agentCapabilities/_meta/cognition.ai~1midTurnPrompts").and_then(Value::as_bool) == Some(true);
+        self.steering = Some(steering);
+        core.meta.features.retain(|f| f != "steer" && f != "queue_steer");
+        if steering {
+            core.meta.features.extend(["steer".into(), "queue_steer".into()]);
+        }
+        core.touch_meta();
+    }
+
+    pub fn tick(&mut self, core: &mut Core) {
+        if self.account && self.steering.is_none() && self.session.is_some() && !self.pending.values().any(|p| matches!(p, Pending::Initialize)) && core.state.status != Status::Exited {
+            // Older images did not retain this capability; initialize leaves Devin's session intact.
+            self.steering = Some(false);
+            self.initialize(core, Pending::Capabilities);
+        }
+    }
+
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
         self.close_streams(core);
         self.prompting = None;
+        self.prompt_result = None;
         self.pending.clear();
         self.asks.clear();
         core.state.approvals.clear();
@@ -357,8 +388,15 @@ impl Acp {
                     self.send(core, item, SendMode::Now);
                 }
             }
-            // ACP cannot steer a turn: it stays queued.
-            Command::QueueSteer { .. } => {}
+            Command::QueueSteer { id } => {
+                if self.steering == Some(true)
+                    && let Some(pos) = core.state.queue.iter().position(|q| q.id == id)
+                {
+                    let item = core.state.queue.remove(pos);
+                    core.touch_state();
+                    self.send(core, item, SendMode::Steer);
+                }
+            }
             Command::Approve { id, decision, message, always, .. } => self.answer(core, &id, decision, message, always),
             Command::Interrupt => self.cancel(core),
             Command::SetMode { mode } => self.change(core, "mode".into(), json!(mode)),
@@ -739,12 +777,13 @@ impl Acp {
             return;
         }
         if self.busy(core) {
-            if mode == SendMode::Now {
+            if mode == SendMode::Steer && self.steering == Some(true) && self.prompting.is_some() && self.prompt_result.is_none() {
+                self.prompt(core, m);
+            } else if mode == SendMode::Now {
                 self.show(core, &m, Delivery::Queued);
                 self.waiting.insert(0, m);
                 self.cancel(core);
             } else {
-                // No way into a running ACP turn: steering waits for it too.
                 core.state.queue.push(m);
                 core.touch_state();
             }
@@ -774,10 +813,12 @@ impl Acp {
             }
         }
         self.request(core, Pending::Prompt(m.id.clone()), "session/prompt", json!({"sessionId": s, "prompt": blocks}));
-        self.prompting = Some(m.id.clone());
+        if self.prompting.is_none() {
+            self.prompting = Some(m.id.clone());
+            core.state.turn_started = Some(Core::now());
+            core.state.doing = Some("Thinking".to_owned());
+        }
         self.show(core, &m, Delivery::Started);
-        core.state.turn_started = Some(Core::now());
-        core.state.doing = Some("Thinking".to_owned());
         self.settle(core);
     }
 
@@ -891,15 +932,32 @@ impl Acp {
 
     fn response(&mut self, core: &mut Core, id: &Value, v: &Value) {
         let Some(kind) = id.as_u64().and_then(|n| self.pending.remove(&n)) else { return };
+        let response;
+        let v = if let Pending::Prompt(client) = &kind {
+            let cancelled = v.get("error").is_some() || v.pointer("/result/stopReason").and_then(Value::as_str) == Some("cancelled");
+            core.state.delivery.insert(client.clone(), if cancelled { Delivery::Cancelled } else { Delivery::Completed });
+            core.touch_state();
+            if self.prompting.as_deref() == Some(client.as_str()) {
+                self.prompt_result = Some(v.clone());
+            } else if let Some(err) = v.get("error") {
+                self.notice(core, Level::Error, err.get("message").and_then(Value::as_str).unwrap_or("request failed"));
+            }
+            if self.pending.values().any(|p| matches!(p, Pending::Prompt(_))) {
+                return;
+            }
+            response = self.prompt_result.take().unwrap_or_else(|| v.clone());
+            &response
+        } else {
+            v
+        };
         let refreshed = matches!(&kind, Pending::Refresh | Pending::RefreshNew);
         let new_session = matches!(&kind, Pending::RefreshNew) || (matches!(&kind, Pending::Session) && self.resume.is_none());
         let result = v.get("result").cloned().unwrap_or(Value::Null);
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("request failed").to_owned();
             match kind {
-                Pending::Prompt(id) => {
+                Pending::Prompt(_) => {
                     self.prompting = None;
-                    core.state.delivery.insert(id, Delivery::Cancelled);
                     if super::pause::says_limit(&msg) {
                         // The account's usage limit: pause until it resets (the agent can't say
                         // when; kiln checks back now and then).
@@ -932,6 +990,7 @@ impl Acp {
                     core.set_status(Status::Idle);
                 }
                 Pending::Initialize => self.notice(core, Level::Error, format!("The agent did not start: {msg}")),
+                Pending::Capabilities => {}
                 Pending::SetMode(_) => self.setting_failed(core, id, Some("mode"), &msg),
                 Pending::SetModel(_) => self.setting_failed(core, id, Some("model"), &msg),
                 Pending::SetConfig(category, _) => self.setting_failed(core, id, category.as_deref(), &msg),
@@ -941,6 +1000,7 @@ impl Acp {
         match kind {
             Pending::Initialize => {
                 self.ready = false;
+                self.capabilities(core, &result);
                 self.can_load = result.pointer("/agentCapabilities/loadSession").and_then(Value::as_bool).unwrap_or(false);
                 self.images = result.pointer("/agentCapabilities/promptCapabilities/image").and_then(Value::as_bool).unwrap_or(false);
                 if let Some(info) = result.get("agentInfo") {
@@ -964,6 +1024,7 @@ impl Acp {
                     }
                 }
             }
+            Pending::Capabilities => self.capabilities(core, &result),
             Pending::Session | Pending::Refresh | Pending::RefreshNew => {
                 self.close_streams(core);
                 self.replaying = false;
@@ -1060,11 +1121,10 @@ impl Acp {
                 }
                 self.configured(core);
             }
-            Pending::Prompt(id) => {
+            Pending::Prompt(_) => {
                 self.close_streams(core);
                 self.prompting = None;
                 let stop = result.get("stopReason").and_then(Value::as_str).unwrap_or("end_turn");
-                core.state.delivery.insert(id, if stop == "cancelled" { Delivery::Cancelled } else { Delivery::Completed });
                 match stop {
                     "cancelled" => self.notice(core, Level::Info, "Interrupted"),
                     "refusal" => self.notice(core, Level::Warn, "The agent refused to continue."),
@@ -1807,5 +1867,198 @@ mod tests {
         let w = written(&mut core);
         assert!(w.iter().any(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str) == Some("stop, do this")));
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));
+    }
+
+    fn steering_session(capability: Option<Value>, devin: bool) -> (Acp, Core) {
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut a = Acp::from_spec(&super::super::session::Spec { kind: if devin { "devin" } else { "gemini" }.into(), ..Default::default() });
+        a.start(&mut core);
+        let mut capabilities = serde_json::Map::new();
+        if let Some(value) = capability {
+            capabilities.insert("_meta".into(), json!({"cognition.ai/midTurnPrompts": value}));
+        }
+        feed(&mut a, &mut core, &[json!({"id": 1, "result": {"agentCapabilities": capabilities}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
+        core.take_writes();
+        (a, core)
+    }
+
+    fn message(a: &mut Acp, core: &mut Core, id: &str, mode: SendMode) {
+        a.command(core, Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None });
+    }
+
+    #[test]
+    fn steering_requires_devins_explicit_mid_turn_capability() {
+        for (capability, devin) in [(None, true), (Some(json!(false)), true), (Some(json!("true")), true), (Some(json!(true)), false)] {
+            let (mut a, mut core) = steering_session(capability, devin);
+            assert!(!core.meta.features.iter().any(|f| matches!(f.as_str(), "steer" | "queue_steer")));
+            message(&mut a, &mut core, "main", SendMode::Queue);
+            core.take_writes();
+            message(&mut a, &mut core, "later", SendMode::Steer);
+            a.command(&mut core, Command::QueueSteer { id: "later".into() });
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["later"]);
+            assert!(written(&mut core).is_empty());
+        }
+    }
+
+    #[test]
+    fn devin_steers_and_promotes_queued_work_without_ending_the_shared_turn_twice() -> anyhow::Result<()> {
+        for replies in [[4, 3, 5], [3, 5, 4]] {
+            let (mut a, mut core) = steering_session(Some(json!(true)), true);
+            assert!(core.meta.features.iter().any(|f| f == "steer"));
+            assert!(core.meta.features.iter().any(|f| f == "queue_steer"));
+            message(&mut a, &mut core, "main", SendMode::Queue);
+            let started = core.state.turn_started;
+            message(&mut a, &mut core, "queued-steer", SendMode::Queue);
+            message(&mut a, &mut core, "steer", SendMode::Steer);
+            a.command(&mut core, Command::QueueSteer { id: "queued-steer".into() });
+            a.command(&mut core, Command::QueueSteer { id: "absent".into() });
+            message(&mut a, &mut core, "later", SendMode::Queue);
+            let writes = written(&mut core);
+            assert_eq!(writes.len(), 3);
+            assert!(writes.iter().all(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt") && v.pointer("/params/sessionId").and_then(Value::as_str) == Some("s1")));
+            assert_eq!(writes.iter().filter_map(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str)).collect::<Vec<_>>(), ["main", "steer", "queued-steer"]);
+            assert_eq!(a.prompting.as_deref(), Some("main"));
+            assert_eq!(core.state.turn_started, started);
+            for id in ["main", "steer", "queued-steer"] {
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Started));
+                assert_eq!(core.events().filter(|e| matches!(&e.body, Body::User { client_id: Some(client), .. } if client == id)).count(), 1);
+            }
+            a.update(&mut core, &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "answer"}}));
+            for (i, id) in replies.into_iter().enumerate() {
+                feed(&mut a, &mut core, &[json!({"id": id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 100, "outputTokens": 20, "cachedReadTokens": 30}}})]);
+                if i < 2 {
+                    assert_eq!(core.state.status, Status::Running);
+                    assert_eq!(core.state.turn_started, started);
+                    assert_eq!(core.state.usage.turns, 0);
+                    assert!(core.state.last_turn.is_none());
+                    assert_eq!(core.state.queue.len(), 1);
+                    assert!(written(&mut core).is_empty());
+                    assert!(core.events().any(|e| matches!(&e.body, Body::Assistant { streaming: true, .. })));
+                    a = serde_json::from_value(serde_json::to_value(&a)?)?;
+                }
+            }
+            assert_eq!((core.state.usage.turns, core.state.usage.input_tokens, core.state.usage.output_tokens, core.state.usage.cache_read_tokens), (1, 100, 20, 30));
+            assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("done"));
+            assert!(core.state.queue.is_empty());
+            assert_eq!(a.prompting.as_deref(), Some("later"));
+            assert_eq!(written(&mut core).iter().filter_map(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str)).collect::<Vec<_>>(), ["later"]);
+            for id in ["main", "steer", "queued-steer"] {
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Completed));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_steer_does_not_cancel_the_original_turn_or_count_its_usage_again() {
+        for replies in [[4, 3], [3, 4]] {
+            let (mut a, mut core) = steering_session(Some(json!(true)), true);
+            message(&mut a, &mut core, "main", SendMode::Queue);
+            message(&mut a, &mut core, "steer", SendMode::Steer);
+            message(&mut a, &mut core, "later", SendMode::Queue);
+            core.take_writes();
+            for (i, id) in replies.into_iter().enumerate() {
+                let reply = if id == 4 { json!({"id": id, "error": {"code": -32602, "message": "Steering rejected"}}) } else { json!({"id": id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 12}}}) };
+                feed(&mut a, &mut core, &[reply]);
+                if i == 0 {
+                    assert_eq!(core.state.status, Status::Running);
+                    assert_eq!(core.state.usage.turns, 0);
+                    assert_eq!(core.state.queue.len(), 1);
+                    assert!(written(&mut core).is_empty());
+                }
+            }
+            assert_eq!(core.state.delivery.get("main"), Some(&Delivery::Completed));
+            assert_eq!(core.state.delivery.get("steer"), Some(&Delivery::Cancelled));
+            assert!(core.events().any(|e| matches!(&e.body, Body::Notice { level: Level::Error, text } if text == "Steering rejected")));
+            assert_eq!((core.state.usage.turns, core.state.usage.input_tokens), (1, 12));
+            assert_eq!(a.prompting.as_deref(), Some("later"));
+        }
+    }
+
+    #[test]
+    fn steering_after_the_original_reply_starts_a_separate_turn_after_outstanding_replies() {
+        let (mut a, mut core) = steering_session(Some(json!(true)), true);
+        message(&mut a, &mut core, "main", SendMode::Queue);
+        message(&mut a, &mut core, "steer", SendMode::Steer);
+        core.take_writes();
+        feed(&mut a, &mut core, &[json!({"id": 3, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 12}}})]);
+        message(&mut a, &mut core, "next", SendMode::Steer);
+        assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["next"]);
+        assert!(written(&mut core).is_empty());
+        feed(&mut a, &mut core, &[json!({"id": 4, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 12}}})]);
+        assert_eq!(a.prompting.as_deref(), Some("next"));
+        assert_eq!(written(&mut core).iter().filter_map(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str)).collect::<Vec<_>>(), ["next"]);
+        feed(&mut a, &mut core, &[json!({"id": 5, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 20}}})]);
+        assert_eq!((core.state.usage.turns, core.state.usage.input_tokens), (2, 32));
+        assert_eq!(core.state.status, Status::Idle);
+    }
+
+    #[test]
+    fn cancelling_devins_shared_turn_waits_for_every_prompt_before_sending_now() {
+        let (mut a, mut core) = steering_session(Some(json!(true)), true);
+        message(&mut a, &mut core, "main", SendMode::Queue);
+        message(&mut a, &mut core, "steer", SendMode::Steer);
+        core.take_writes();
+        message(&mut a, &mut core, "now", SendMode::Now);
+        assert_eq!(written(&mut core).iter().filter_map(|v| v.get("method").and_then(Value::as_str)).collect::<Vec<_>>(), ["session/cancel"]);
+        for (i, id) in [3, 4].into_iter().enumerate() {
+            feed(&mut a, &mut core, &[json!({"id": id, "result": {"stopReason": "cancelled", "usage": {"inputTokens": 12}}})]);
+            if i == 0 {
+                assert_eq!(core.state.status, Status::Running);
+                assert!(written(&mut core).is_empty());
+            }
+        }
+        assert_eq!(core.state.delivery.get("main"), Some(&Delivery::Cancelled));
+        assert_eq!(core.state.delivery.get("steer"), Some(&Delivery::Cancelled));
+        assert_eq!((core.state.usage.turns, core.state.usage.input_tokens), (1, 12));
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("stopped"));
+        assert_eq!(a.prompting.as_deref(), Some("now"));
+        assert_eq!(written(&mut core).iter().filter_map(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str)).collect::<Vec<_>>(), ["now"]);
+    }
+
+    #[test]
+    fn adopted_devin_sessions_learn_steering_once_without_reopening_or_interrupting() -> anyhow::Result<()> {
+        for busy in [false, true] {
+            let (mut a, mut core) = steering_session(None, true);
+            if busy {
+                message(&mut a, &mut core, "main", SendMode::Queue);
+            }
+            core.take_writes();
+            let mut frozen = serde_json::to_value(&a)?;
+            let object = frozen.as_object_mut().ok_or_else(|| anyhow::anyhow!("the frozen adapter is not an object"))?;
+            object.remove("steering");
+            object.remove("prompt_result");
+            let mut a: Acp = serde_json::from_value(frozen)?;
+            let started = core.state.turn_started;
+            a.tick(&mut core);
+            a.tick(&mut core);
+            let writes = written(&mut core);
+            assert_eq!(writes.len(), 1);
+            let request = writes.first().ok_or_else(|| anyhow::anyhow!("no capabilities request"))?;
+            assert_eq!(request.get("method").and_then(Value::as_str), Some("initialize"));
+            assert_eq!(a.steering, Some(false));
+            let id = request.get("id").cloned().ok_or_else(|| anyhow::anyhow!("no capabilities request id"))?;
+            feed(&mut a, &mut core, &[json!({"id": id, "result": {"agentCapabilities": {"_meta": {"cognition.ai/midTurnPrompts": true}}}})]);
+            assert!(a.ready);
+            assert_eq!(a.session.as_deref(), Some("s1"));
+            assert_eq!(a.prompting.as_deref(), busy.then_some("main"));
+            assert_eq!(core.state.turn_started, started);
+            assert_eq!(a.steering, Some(true));
+            assert!(core.meta.features.iter().any(|f| f == "steer"));
+            a.tick(&mut core);
+            assert!(written(&mut core).is_empty());
+        }
+        let (mut a, mut core) = steering_session(None, true);
+        a.steering = None;
+        a.tick(&mut core);
+        let id = written(&mut core).first().and_then(|v| v.get("id")).cloned().ok_or_else(|| anyhow::anyhow!("no capabilities request id"))?;
+        feed(&mut a, &mut core, &[json!({"id": id, "error": {"code": -32601, "message": "Unsupported"}})]);
+        a.tick(&mut core);
+        assert_eq!(a.steering, Some(false));
+        assert!(a.ready);
+        assert!(written(&mut core).is_empty());
+        assert!(!core.meta.features.iter().any(|f| f == "steer"));
+        Ok(())
     }
 }

@@ -17,14 +17,19 @@ Devin runs as `devin acp`, with its modes, models and effort announced by the ha
 include Code (`accept-edits`, its own default), Ask, Plan, Smart and Bypass; a child starts in Ask or Plan
 when its parent's permissions require it. The same session controls, approvals, messages, MCP
 tools and conversation resumption run over ACP. Its own terminal interface is `devin`. Live
-settings, interruption, queueing, resume and native terminal discovery were tested against
+settings, steering, interruption, queueing, resume and native terminal discovery were tested against
 Devin CLI 3000.11.92.
+
+Devin's advertised `cognition.ai/midTurnPrompts` capability enables Steer and queued-message
+steering without cancellation. Concurrent prompts share a turn; kiln records their completion
+and usage once. A runner upgrade refreshes this capability on existing Devin sessions without
+restarting their processes. Other ACP agents keep steering queued.
 
 Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
 in a temporary configuration that keeps its native default model, with imports, MCP servers and
-automatic updates off. It sends no
-prompts. Each model's effort choices are read from the agent and kept in the existing model
-cache for the start dialog. Shared effort choices are offered only when every listed model
+automatic updates off. It sends no prompts. Each model's effort choices are read from the agent
+and kept in the existing model cache for the start dialog. Shared effort choices are offered only
+when every listed model
 supports them. The start dialog uses the native default model's levels before a model is chosen,
 then the chosen model's own levels. Resuming keeps the conversation's model and sends a selected
 effort only if that model supports it. The native permission modes are available before discovery
@@ -731,7 +736,7 @@ console picks) and are answered with a `reply` update to that client.
 |---|---|---|
 | `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
-| `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex; ACP cannot steer) |
+| `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex, Devin when advertised) |
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
@@ -1137,7 +1142,7 @@ the code's (`metrics::AGENTS`): a test holds the two together.
 Checked end to end against the real CLIs with scripted model APIs and isolated configuration
 homes, on the server and through a runner: Claude Code 2.1.296 and Codex 0.162.1; ACP through
 Zed's Claude agent adapter (claude-agent-acp). Devin has separate installed-CLI smoke tests for
-settings, interruption, queueing, resumption, native history and terminal ownership.
+settings, steering, interruption, queueing, resumption, native history and terminal ownership.
 
 ✓ verified end to end · unit: covered by the adapter's tests (fed the harness's real message
 shapes), not end to end · — the protocol has no way · ? not run against a real install.

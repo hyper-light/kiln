@@ -105,6 +105,62 @@ fn installed_devin_uses_the_existing_session_controls_and_resumes() -> anyhow::R
     })
 }
 
+#[test]
+#[ignore = "requires an installed, signed-in Devin CLI with mid-turn prompts"]
+fn installed_devin_steers_running_and_queued_messages_into_one_turn() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config/devin");
+        std::fs::create_dir_all(&config)?;
+        std::fs::write(
+            config.join("config.json"),
+            serde_json::json!({
+                "auto_update": false, "notify": "never",
+                "read_config_from": {"agents_standard": false, "cursor": false, "windsurf": false, "claude": false, "copilot": false, "opencode": false, "zed": false}
+            })
+            .to_string(),
+        )?;
+        let spec = Spec {
+            kind: "devin".into(),
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            mode: Some("ask".into()),
+            env: vec![("XDG_CONFIG_HOME".into(), dir.path().join("config").to_string_lossy().into_owned())],
+            reach: Some("off".into()),
+            ..Spec::default()
+        };
+        let running = open(spec, dir.path())?;
+        let s = &running.0;
+        until(s, "opening a session with native steering", |c| c.state.status == Status::Idle && c.meta.features.iter().any(|f| f == "steer") && c.meta.features.iter().any(|f| f == "queue_steer")).await?;
+        send(s, "main", "This is a small live steering test. Write the numbers 1 through 80, each on its own line. Do not use tools or access files.");
+        until(s, "streaming the original turn", |c| {
+            c.state.delivery.get("main") == Some(&Delivery::Started) && c.events().any(|e| matches!(&e.body, Body::Assistant { streaming: true, .. } | Body::Thinking { streaming: true, .. }))
+        })
+        .await?;
+        assert!(s.command(Command::Send {
+            id: "steer".into(),
+            text: "Steering update: stop listing numbers and reply KILN_NATIVE_STEERING_OK. Do not use tools or access files.".into(),
+            mode: SendMode::Steer,
+            attachments: Vec::new(),
+            overrides: None
+        }));
+        send(s, "queued-steer", "Another steering update for the same test: your final reply must end with KILN_NATIVE_STEERING_OK. Do not use tools or access files.");
+        assert!(s.command(Command::QueueSteer { id: "queued-steer".into() }));
+        until(s, "finishing the shared steered turn", |c| ["main", "steer", "queued-steer"].iter().all(|id| c.state.delivery.get(*id) == Some(&Delivery::Completed)) && c.state.status == Status::Idle).await?;
+        {
+            let core = s.core.lock();
+            assert_eq!(core.state.usage.turns, 1);
+            assert!(core.state.queue.is_empty());
+            assert!(core.events().any(|e| matches!(&e.body, Body::Assistant { text, streaming: false } if text.trim().ends_with("KILN_NATIVE_STEERING_OK"))));
+            for id in ["main", "steer", "queued-steer"] {
+                assert_eq!(core.events().filter(|e| matches!(&e.body, Body::User { client_id: Some(client), .. } if client == id)).count(), 1);
+            }
+        }
+        s.close();
+        until(s, "closing the steered session", |c| c.state.status == Status::Exited).await?;
+        Ok(())
+    })
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "requires an installed, signed-in Devin CLI"]
