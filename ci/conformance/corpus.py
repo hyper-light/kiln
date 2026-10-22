@@ -114,10 +114,13 @@ def git(cwd, *args, check=True, env=None):
 
 
 def snapshot(work, repo, commit):
-    """The tree at `commit` as a repository of one commit, on the upstream's default branch."""
+    """The tree at `commit` as a repository of one commit, on the upstream's default branch, its
+    submodules as the upstream has them (their commits; a checkout fetches them from their URLs,
+    as on GitHub). One made before submodules were kept is made again."""
     key = repo.replace("/", "_")
     fetched, dest = os.path.join(work, "fetch", key), os.path.join(work, "repos", key)
-    if os.path.isdir(dest) and git(dest, "rev-parse", "--verify", "-q", "HEAD", check=False):
+    mark = os.path.join(dest, ".git", "kiln-snapshot-submodules")
+    if os.path.isdir(dest) and os.path.exists(mark) and git(dest, "rev-parse", "--verify", "-q", "HEAD", check=False):
         return dest, git(dest, "symbolic-ref", "--short", "HEAD")
     shutil.rmtree(fetched, ignore_errors=True)
     shutil.rmtree(dest, ignore_errors=True)
@@ -142,7 +145,15 @@ def snapshot(work, repo, commit):
         else:
             shutil.copy2(src, dst, follow_symlinks=False)
     git(dest, "add", "-A", "-f")
+    # A submodule is a commit in the tree, not files a copy carries.
+    for line in git(fetched, "ls-tree", "-r", "FETCH_HEAD").splitlines():
+        meta, _, path = line.partition("\t")
+        mode, kind, sha = (meta.split() + ["", "", ""])[:3]
+        if mode == "160000" and kind == "commit":
+            git(dest, "update-index", "--add", "--cacheinfo", f"160000,{sha},{path}")
     git(dest, "commit", "-q", "-m", f"F-03: {repo} at {commit}")
+    with open(mark, "w") as f:
+        f.write("submodules kept\n")
     shutil.rmtree(fetched, ignore_errors=True)
     return dest, branch
 

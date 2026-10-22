@@ -3875,7 +3875,12 @@ enforcement points to W18, agent isolation to W20.
   it restores in any other. What's only in the image (its Rust toolchain) isn't the host's to
   mount, so `cross`, which mounts it, runs in its remote mode there (`CROSS_REMOTE=1`): it copies
   what it needs into Docker volumes. Its in-container mode wants Docker's `overlay2` driver, and
-  an engine with the containerd image store has `overlayfs` (the corpus's ripgrep and bat).
+  an engine with the containerd image store has `overlayfs` (the corpus's ripgrep and bat). In
+  ripgrep's legs `cross` builds and tests that way now. Not every step: remote,
+  `cross test --manifest-path crates/cli/Cargo.toml` can't make its target directory (permission
+  denied; a workspace of two crates doesn't reproduce it), and a step can lose cross's own
+  container ("is not running"). The lasting fix is the image's toolchains at paths the host has
+  (as a hosted runner's are), so `cross` mounts them as it does there; that's left.
 - *Done.* What a runner leaves behind goes:
   - A runner's legs' networks and containers and its pools' executors carry its label. The label
     comes from its work directory, so each runner on an engine has its own.
