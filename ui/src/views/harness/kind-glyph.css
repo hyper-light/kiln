@@ -16,6 +16,10 @@
   color: #cdc6ea;
   animation: kg-breathe 2.4s ease-in-out infinite alternate;
 }
+/* In a running subagent's shimmer (signals.css): drawn white, it takes the prism with its words. */
+.sg-shimmer .kg {
+  color: inherit;
+}
 /* Waiting to start: only sketched. */
 .kg[data-pending] {
   stroke-dasharray: 1.6 2;

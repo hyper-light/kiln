@@ -1517,8 +1517,86 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .al-item .bg-out {
   padding: 0 4px 10px;
 }
+/* A subagent running: its mark and words take the prism's sweep (signals.css). */
+.al-mark,
+.al-glyph {
+  display: inline-flex;
+  align-items: center;
+}
+.al-mark {
+  gap: 6px;
+}
+.al-row > .al-glyph {
+  grid-area: glyph;
+}
+/* A row and its stop side by side; what either opens goes under both. */
+.al-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+.al-head > .al-row {
+  flex: 1;
+  min-width: 0;
+  padding-right: 8px;
+}
+/* A row whose output opens under it says so. */
+.al-row[aria-expanded] {
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas: "glyph what time open";
+}
+.al-open {
+  grid-area: open;
+  color: #6d7078;
+  transition: transform 0.15s;
+}
+.al-stop {
+  flex: none;
+  min-height: 28px;
+  margin-right: max(12px, env(safe-area-inset-right));
+  padding: 0 8px;
+  border-radius: 5px;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.al-stop:hover,
+.al-stop[aria-expanded="true"] {
+  background: rgb(255 255 255 / 4%);
+  color: #ecc9cc;
+}
+.al-stop[data-off] {
+  color: #6d7078;
+}
+.al-stop[data-off]:hover,
+.al-stop[data-off][aria-expanded="true"] {
+  color: #a1a4ad;
+}
+.al-stop[data-busy] {
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  color: #8f929b;
+}
+.al-note {
+  margin: 0 max(16px, env(safe-area-inset-right)) 10px 28px;
+  color: #8f929b;
+  font-size: 12px;
+}
+.al-confirm {
+  margin: 0 max(16px, env(safe-area-inset-right)) 10px 28px;
+}
+@media (pointer: coarse) {
+  .al-stop {
+    min-height: 36px;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
-  .al-chev {
+  .al-chev,
+  .al-open {
     transition: none;
   }
 }
