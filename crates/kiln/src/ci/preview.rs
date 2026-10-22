@@ -25,7 +25,7 @@ use super::{events, load};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 
-pub async fn route(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, body: hyper::body::Incoming) -> Result<Response, Fail> {
+pub async fn route(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, body: kiln_http::Incoming) -> Result<Response, Fail> {
     let b: Value = srv::body_json(body, 4 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     of(hub, caller, b).await
 }

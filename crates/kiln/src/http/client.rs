@@ -1,4 +1,4 @@
-//! HTTP/1.1 client over hyper-rt TCP, with HTTPS from hyper-tls (hyper-raft's rustls fork):
+//! HTTP/1.1 client (kiln-http's) over hyper-rt TCP, with HTTPS from hyper-tls (hyper-raft's rustls fork):
 //! GitHub's API, the Kubernetes API, and agent⇄server HTTP (enrollment, source archives,
 //! artifacts). One connection per request: the volumes are small and it keeps failure handling
 //! trivial (no pool to poison).
@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, header};
 use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 
 use super::server::{Body, channel_body, empty, full};
 

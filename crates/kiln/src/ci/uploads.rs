@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use http::StatusCode;
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 use serde::Deserialize;
 use serde_json::{Value, json};
 

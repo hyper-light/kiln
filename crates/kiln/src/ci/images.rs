@@ -24,7 +24,7 @@ use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 
 /// `POST /api/ci/images/validate`: a definition's diagnostics (W13-R11).
-pub async fn validate(body: hyper::body::Incoming) -> Result<Response, Fail> {
+pub async fn validate(body: kiln_http::Incoming) -> Result<Response, Fail> {
     let v: Value = srv::body_json(body, 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     validate_value(&v).await
 }

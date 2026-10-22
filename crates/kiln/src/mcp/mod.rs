@@ -367,7 +367,7 @@ pub fn caller(hub: &Hub, headers: &HeaderMap, authed: bool) -> Option<String> {
 }
 
 /// `POST /api/mcp`: one JSON-RPC message or a batch, each operation as `caller` may (W20-R06).
-pub async fn http(hub: &Arc<Hub>, caller: Caller, body: hyper::body::Incoming) -> Result<Response, (StatusCode, String)> {
+pub async fn http(hub: &Arc<Hub>, caller: Caller, body: kiln_http::Incoming) -> Result<Response, (StatusCode, String)> {
     let bytes = srv::body_bytes(body, 16 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let msg: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,

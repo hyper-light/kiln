@@ -14,8 +14,8 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http::{HeaderValue, Method, header};
 use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
-use hyper::client::conn::http1::SendRequest;
+use kiln_http::Incoming;
+use kiln_http::client::http1::SendRequest;
 use kiln_cd::kube::{self as k, Auth, Discovery, Endpoint, Resource};
 use kiln_cd::obj::{self, GroupKind, ResKey};
 use parking_lot::Mutex;
@@ -151,14 +151,14 @@ impl Cluster {
             let stream = TlsStream::connect(RtFuturesIo::new(tcp), self.tls.config()?, name)
                 .await
                 .map_err(|e| anyhow::anyhow!("TLS to cluster {}: {e}", self.name))?;
-            let (sender, conn) = hyper::client::conn::http1::handshake::<_, Body>(stream).await?;
+            let (sender, conn) = kiln_http::client::http1::handshake::<_, Body>(stream).await?;
             crate::rt::spawn_local(async move {
                 let _ = conn.await;
             })
             .map_err(|e| anyhow::anyhow!("spawn connection task: {e}"))?;
             Ok(sender)
         } else {
-            let (sender, conn) = hyper::client::conn::http1::handshake::<_, Body>(RtIo::new(tcp)).await?;
+            let (sender, conn) = kiln_http::client::http1::handshake::<_, Body>(RtIo::new(tcp)).await?;
             crate::rt::spawn_local(async move {
                 let _ = conn.await;
             })

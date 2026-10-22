@@ -426,7 +426,7 @@ async fn trunks(hub: &Hub, path: &str) -> (Vec<String>, Review) {
 
 /// Reads what's left of a refused push and drops it: at most 4 GiB, for ten minutes, and nothing
 /// once the client pauses for a minute.
-async fn drain(body: &mut hyper::body::Incoming) {
+async fn drain(body: &mut kiln_http::Incoming) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     let mut read = 0u64;
     while read < 4 << 30 && std::time::Instant::now() < deadline {
@@ -438,7 +438,7 @@ async fn drain(body: &mut hyper::body::Incoming) {
 }
 
 /// More of a push's start: its next chunk, into `head`.
-async fn more(head: &mut Vec<u8>, body: &mut hyper::body::Incoming) -> Result<(), Fail> {
+async fn more(head: &mut Vec<u8>, body: &mut kiln_http::Incoming) -> Result<(), Fail> {
     if head.len() >= 1 << 20 {
         return Err((StatusCode::PAYLOAD_TOO_LARGE, "too many ref updates in one push".into()));
     }

@@ -773,7 +773,7 @@ struct Patch {
 }
 
 /// `/api/ci/integrations…`.
-pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap<String, String>, body: hyper::body::Incoming) -> Result<Response, Fail> {
+pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap<String, String>, body: kiln_http::Incoming) -> Result<Response, Fail> {
     use http::Method;
     let internal = |e: anyhow::Error| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     match (method, rest) {

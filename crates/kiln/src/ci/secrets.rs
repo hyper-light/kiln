@@ -541,7 +541,7 @@ async fn scope_of(hub: &Hub, q: &std::collections::HashMap<String, String>) -> R
 
 /// `/api/ci/secrets…` and `/api/ci/variables…`, behind the console's auth. Reads never carry a
 /// secret's value.
-pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: hyper::body::Incoming) -> Result<crate::http::server::Response, super::Fail> {
+pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: kiln_http::Incoming) -> Result<crate::http::server::Response, super::Fail> {
     use crate::http::server as srv;
     use http::{Method, StatusCode};
     let internal = |e: anyhow::Error| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));

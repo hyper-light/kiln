@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use http::StatusCode;
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 use kiln_ci::expr::Dialect;
 use kiln_ci::policy::Policy;
 use kiln_ci::sched::routing::{self, LegRoute};
