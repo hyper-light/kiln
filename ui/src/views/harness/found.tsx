@@ -220,7 +220,7 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
           <ChevronRight size={13} className={cn("ms-chev", reading && "rotate-90")} aria-hidden="true" />
         </button>
         {can.update ? (
-          <Link to="/settings#updates.runners" className="ms-why">
+          <Link to="/system#system.updates" className="ms-why">
             {can.why}
           </Link>
         ) : (

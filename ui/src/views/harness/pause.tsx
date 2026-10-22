@@ -88,7 +88,7 @@ export function PausedLine({ store, send, onLogin }: { store: SessionStore; send
         {stuck && (
           <p className="hx-paused-stuck">
             {pause.since === tried.since ? "It hasn't gone on" : "It stopped again at its stop point"}: its runner{machine ? ` on ${machine}` : ""} runs an older kiln.{" "}
-            <Link to="/settings#updates.runners">Upgrade it</Link>
+            <Link to="/system#system.updates">Upgrade it</Link>
             {pause.reason === "threshold" && (
               <>
                 , or{" "}

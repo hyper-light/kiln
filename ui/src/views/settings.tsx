@@ -1,7 +1,8 @@
 /**
- * Settings: sections that open and close (this device, updates, deployments, integrations,
- * sign-in), each in groups of rows, and a search that narrows the page to what matches. A link to a
- * section or a group (`/settings#updates`, `/settings#updates.waits`) opens it.
+ * Settings: sections that open and close (this device, deployments, integrations, sign-in), each
+ * in groups of rows, and a search that narrows the page to what matches. A link to a section or a
+ * group (`/settings#deployments`, `/settings#deployments.accounts`) opens it. Updates are on the
+ * System page: a line here says so.
  */
 import * as React from "react";
 import { Check, LoaderCircle, LogOut } from "lucide-react";
@@ -10,15 +11,14 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Facts, PageIntro, TextField } from "@/components/ui/misc";
-import { SettingRow, SettingsGroup, SettingsSearch, SettingsSection, SettingsSections, openHash } from "@/components/ui/settings";
+import { SettingRow, SettingsGroup, SettingsSearch, SettingsSection, SettingsSections, matches, openHash, wordsOf } from "@/components/ui/settings";
 import { useMotionPreference } from "@/components/shell/motion";
 import { Link, useLocation } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { useAuth } from "@/lib/auth";
 import { usePref } from "@/lib/prefs";
-import { updatesRes, useRes, warm, type Res } from "@/lib/data";
+import { useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
-import { UpdatesHold, UpdatesPanel, UpdatesStatus } from "@/views/settings-updates";
 import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
 import { DeliveriesGroup, DeliveriesHold, MyNotificationsGroup, MyNotificationsHold, myNotificationsRes } from "@/views/settings-ci-notifications";
@@ -31,6 +31,9 @@ import { OidcGroups, OidcHold } from "@/views/settings-oidc";
 import { ActionsGroup, ActionsHold } from "@/views/settings-actions";
 import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
 
+/** What finds the line saying Updates are on the System page, in a search of Settings. */
+const ELSEWHERE_WORDS = "updates upgrade upgrades version server runners policy builds binaries platform waits";
+
 const methodsRes: Res<{ password: boolean; token: boolean }> = {
   key: "auth/methods",
   fetch: (sig) => api.authMethods(sig),
@@ -42,7 +45,7 @@ export default function Settings() {
   // A person (not the owner): their own password beside their passkeys.
   const person = useAuth((s) => s.kind === "authed" && s.me?.kind === "user");
   const may = (c: string, server = true) => !can || can[c] === "server" || (!server && can[c] === "some");
-  const [pushes, updates, deployments, server, manages] = [may("agents.run"), may("runners.read"), may("integrations.manage"), may("settings.manage"), may("users.manage")];
+  const [pushes, deployments, server, manages] = [may("agents.run"), may("integrations.manage"), may("settings.manage"), may("users.manage")];
   // The owner and people keep tokens; others reach Settings through one.
   const signedIn = useAuth((s) => s.kind === "authed" && (s.me?.kind === "owner" || s.me?.kind === "user" || !s.me?.kind));
   warm(
@@ -53,7 +56,6 @@ export default function Settings() {
     ...(signedIn ? [tokensRes, rolesRes] : []),
     ...(manages ? [peopleRes] : []),
     ...(person ? [myPasswordRes] : []),
-    ...(updates ? [updatesRes] : []),
     ...(pushes ? [pushStateRes, pushDevicesRes] : []),
   );
   // The sections shown, numbered in order.
@@ -82,19 +84,10 @@ export default function Settings() {
           )}
           <MotionGroup />
         </SettingsSection>
-        {updates && (
-          <SettingsSection
-            id="updates"
-            index={next()}
-            title="Updates"
-            about="Upgrade kiln and its runners; a runner keeps what it runs while it's upgraded"
-            words="upgrade version"
-            status={<UpdatesStatus />}
-          >
-            <Loadable label="the updates" fallback={<UpdatesHold />}>
-              <UpdatesPanel />
-            </Loadable>
-          </SettingsSection>
+        {(!query.trim() || matches(wordsOf(query), ELSEWHERE_WORDS)) && (
+          <p className="st-elsewhere">
+            Updates and builds are on the System page. <Link to="/system#system.updates">System → Updates</Link>
+          </p>
         )}
         {deployments && (
           <SettingsSection id="deployments" index={next()} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">

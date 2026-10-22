@@ -104,7 +104,7 @@ export function lastSamples(h: MetricsHistory, name: string, n: number): HostSam
   return all.length > n ? all.slice(-n) : all;
 }
 
-/** Settings → Updates: the server's build, each runner's, the binaries handed out. */
+/** System → Updates: the server's build, each runner's, the binaries handed out. */
 export const updatesRes: Res<UpdatesOverview> = { key: "updates", fetch: (s) => api.updates(s), opts: { pollMs: 30_000, on: ["updates"] } };
 
 /** The fuller of two snapshots of one job (events and refetches can cross). */
@@ -117,7 +117,7 @@ export function fuller(a: UpdateJob | undefined, b: UpdateJob): UpdateJob {
 /**
  * Upgrades as they go (their output, their end), from `update_job` events: kept outside any page,
  * so a page opened mid-upgrade shows all of it, and its output doesn't make every page read
- * Settings → Updates again.
+ * System → Updates again.
  */
 export const useUpdateJobs = create<Record<string, UpdateJob>>(() => ({}));
 events.on((ev) => {

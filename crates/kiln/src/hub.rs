@@ -197,7 +197,7 @@ pub struct Hub {
     /// Runner processes that went away while their machine stayed connected through another
     /// one, with when and the jobs they held (requeued if they do not come back in time).
     lost_instances: Mutex<HashMap<PeerId, (String, Instant, Vec<String>)>>,
-    /// Upgrades of runners and of this server, started from Settings → Updates.
+    /// Upgrades of runners and of this server, started from System → Updates.
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
@@ -1619,7 +1619,7 @@ impl Hub {
         self.runner_processes(name)
     }
 
-    /// Every runner process of a machine and what each one holds (Settings → Updates lists
+    /// Every runner process of a machine and what each one holds (System → Updates lists
     /// them always; agent views only while a machine has more than one).
     /// What a machine's newest runner process says it can do ([`crate::proto::CAP_UPGRADE`] …);
     /// 0 for runners from before builds were announced.
