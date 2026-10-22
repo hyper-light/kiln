@@ -1581,11 +1581,13 @@ mod tests {
     }
 
     /// CP-T6.1, T-T6.1.1: a planted bug (a copy's state written in place, unsynced: a lost write
-    /// after a torn page) is found within the CI seed budget.
+    /// after a torn page) is found within the CI seed budget, by a seed that passes without it.
     #[test]
     fn the_planted_lost_write_after_a_torn_page_is_found() -> Result<(), String> {
         for seed in 0..200 {
             if run(seed, 0, Plant { state_in_place: true, ..Plant::default() }, Mode::Sync).is_err() {
+                // The plant is what failed it.
+                run(seed, 0, Plant::default(), Mode::Sync).map_err(|why| format!("seed {seed} fails without the plant too: {why}"))?;
                 return Ok(());
             }
         }
