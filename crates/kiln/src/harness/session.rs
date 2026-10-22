@@ -2595,7 +2595,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             Command::LimitHold { window, until, said, .. } => {
                                 let mut core = s.core.lock();
-                                super::pause::hold(&mut core, super::pause::LIMIT, "account", super::pause::Hit { window, until, said }, None);
+                                super::pause::account_hold(&mut core, super::pause::Hit { window, until, said });
                                 drop(core);
                                 on_change();
                             }
