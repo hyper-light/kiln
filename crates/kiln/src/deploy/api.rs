@@ -21,7 +21,8 @@
 //! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
 //! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
 //! | `POST /releases/{id}/approve`, `/releases/{id}/reject` | a person's answer to a release waiting for approval (`{note}`) |
-//! | `POST /fleets`, `GET /fleets/{id}` | a fleet change: one version, or values set, across many apps of an environment |
+//! | `POST /fleets`, `GET /fleets/{id}` | a fleet change: one version, or values set, across many apps of an environment; or (`source`) a kiln-base version or values set in each app's source repository, one pull request per repository |
+//! | `POST /fleets/{id}/merge` (`{repo}`), `DELETE /fleets/{id}` | a source change's proposals on kiln's own git server merged; its open proposals withdrawn |
 //! | `GET /apps/{app}/environments/{env}/secrets`; `PUT`, `DELETE …/secrets/{name}` (`?release=false`) | an app's secrets there (§3.5): names and versions; a value is set (`{value}` or `{base64}`), never read back; a change is released |
 //! | `GET …/secrets/{name}/versions`, `GET …/secret-uses?limit` | a secret's versions; each read of the secrets for a delivery |
 //! | `POST /secret-keys/rotate` | every app's secrets re-sealed under a new data key |
@@ -75,6 +76,14 @@ fn created(v: &impl serde::Serialize) -> Result<Response, Fail> {
 struct Note {
     #[serde(default)]
     note: Option<String>,
+}
+
+/// Which of a fleet change's proposals on kiln's own git server to merge (none named: each open).
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeAsk {
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// An app and an environment it's registered in.
@@ -305,6 +314,11 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             created(&boxed(|| flow::fleet(&d, &who, f)).await?)
         }
         (&Method::GET, ["fleets", id]) => ok(&boxed(|| flow::fleet_status(&d, id)).await?),
+        (&Method::POST, ["fleets", id, "merge"]) => {
+            let ask: MergeAsk = body(req.into_body()).await?;
+            ok(&boxed(|| super::sources::merge(&d, &who, id, ask.repo.as_deref())).await?)
+        }
+        (&Method::DELETE, ["fleets", id]) => ok(&boxed(|| super::sources::withdraw(&d, &who, id)).await?),
         (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
         (&Method::POST, ["releases", id, verdict @ ("approve" | "reject")]) => {
             let (id, note) = (release_id(id)?, body::<Note>(req.into_body()).await?.note);

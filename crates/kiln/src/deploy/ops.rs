@@ -398,23 +398,32 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"id": {"type": "integer", "description": RELEASE}, "note": {"type": "string", "description": "Why."}}), &["id"]),
                 route: |v| Ok((Method::POST, path(&["releases", &id(v)?.to_string(), "reject"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(flow::answer(&*service()?, &Who::of(&cx.caller), id(&v)?, false, opt_text(&v, "note")).await?) }),
-            op!("deploy.fleets.create", "A fleet change: one `version`, or values to `set` (by path: `image.pullPolicy`), released to many apps of an environment at once (the `apps` given, or those of a `template`, `project` or `owner`; every app registered there when none is), each through the environment's gates as any release. The fleet's id, and each app's release or why it has none.", ro: false, destructive: false,
+            op!("deploy.fleets.create", "A fleet change: one `version`, or values to `set` (by path: `image.pullPolicy`), released to many apps of an environment at once (the `apps` given, or those of a `template`, `project` or `owner`; every app registered there when none is), each through the environment's gates as any release. Or, with `source`, a kiln-base version (`base`) or values `set` in each selected app's chart in its source repository, proposed as one pull request per repository (on kiln's own git server, a branch and its diff, merged with deploy.fleets.merge). The fleet's id, and each app's release or each repository's proposal.", ro: false, destructive: false,
                 input: || schema(json!({
-                    "environment": {"type": "string", "description": ENV},
+                    "environment": {"type": "string", "description": "The environment its releases go to; with `source`, only its apps are selected (any app, without it)."},
                     "apps": {"type": "array", "items": {"type": "string"}}, "template": {"type": "string"}, "project": {"type": "string"}, "owner": {"type": "string"},
                     "version": {"type": "string", "description": "A deploy of this version to each."},
                     "set": {"type": "object", "description": "Values set in each app's own, by path: `{\"replicaCount\": \"2\"}`.", "additionalProperties": {"type": "string"}},
+                    "source": {"type": "object", "description": "The change in each app's source repository instead: `{base: \"0.1.4\"}` (kiln-base's version in its chart) or `{set: {\"replicaCount\": \"2\"}}` (in its values file); `chart` (`charts/{app}`) and `values` (`<chart>/values.yaml`) say where they are.", "properties": {"base": {"type": "string"}, "set": {"type": "object", "additionalProperties": {"type": "string"}}, "chart": {"type": "string"}, "values": {"type": "string"}}},
                     "idempotency_key": {"type": "string", "description": KEY}
-                }), &["environment"]),
+                }), &[]),
                 route: |_| Ok((Method::POST, path(&["fleets"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let f: flow::FleetAsk = serde_json::from_value(v).map_err(|e| bad(format!("the request doesn't read: {e}")))?;
                     answer(flow::fleet(&*service()?, &Who::of(&cx.caller), f).await?)
                 }),
-            op!("deploy.fleets.get", "A fleet change as it stands: each of its releases, how many are in each state, and whether all have finished.", ro: true, destructive: false,
+            op!("deploy.fleets.get", "A fleet change as it stands: each of its releases, how many are in each state, and whether all have finished; one in apps' sources, each repository's proposal (open, merged, closed, unchanged or failed; on kiln's own git server, with its diff).", ro: true, destructive: false,
                 input: || schema(json!({"id": {"type": "string", "description": "The fleet change's id."}}), &["id"]),
                 route: |v| Ok((Method::GET, path(&["fleets", &text(v, "id")?]), HashMap::new())),
                 run: |_cx: Cx, v: Value| async move { answer(flow::fleet_status(&*service()?, &text(&v, "id")?).await?) }),
+            op!("deploy.fleets.merge", "Merge a source change's proposals on kiln's own git server (`repo`: one of them; each open one, without it): kiln's own has no pull requests, so kiln merges the branch as git would, refusing one that conflicts. Another host's are merged there.", ro: false, destructive: false,
+                input: || schema(json!({"id": {"type": "string", "description": "The fleet change's id."}, "repo": {"type": "string", "description": "kiln's name for the repository."}}), &["id"]),
+                route: |v| Ok((Method::POST, path(&["fleets", &text(v, "id")?, "merge"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::sources::merge(&*service()?, &Who::of(&cx.caller), &text(&v, "id")?, opt_text(&v, "repo").as_deref()).await?) }),
+            op!("deploy.fleets.withdraw", "Withdraw a source change's open proposals: each pull request closed, saying so, and each branch on kiln's own git server deleted.", ro: false, destructive: true,
+                input: || schema(json!({"id": {"type": "string", "description": "The fleet change's id."}}), &["id"]),
+                route: |v| Ok((Method::DELETE, path(&["fleets", &text(v, "id")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::sources::withdraw(&*service()?, &Who::of(&cx.caller), &text(&v, "id")?).await?) }),
             op!("deploy.releases.wait", "Wait for a release to finish (`until: done`, the default) or to move at all (`until: any`), for at most `timeout_s` seconds (600 at most): the release as it is then, whether it is done, and whether the time ran out.", ro: true, destructive: false,
                 input: || schema(json!({
                     "id": {"type": "integer", "description": RELEASE}, "until": {"type": "string", "enum": ["done", "any"]},
@@ -526,7 +535,7 @@ mod tests {
                 "deploy.environments.put" => json!({ "environment": { "name": "staging" } }),
                 "deploy.apps.put" => json!({ "app": { "name": "web" } }),
                 "deploy.templates.put" => json!({ "template": { "name": "service" } }),
-                "deploy.fleets.get" => json!({ "id": "f1" }),
+                "deploy.fleets.get" | "deploy.fleets.merge" | "deploy.fleets.withdraw" => json!({ "id": "f1" }),
                 "deploy.environments.move" => json!({ "environment": "staging", "to": "kilncd" }),
                 _ => input.clone(),
             };

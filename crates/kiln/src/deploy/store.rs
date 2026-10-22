@@ -359,3 +359,33 @@ pub async fn done(store: &Store, release: i64) -> anyhow::Result<()> {
         })
         .await
 }
+
+// ------------------------------------------------------------------ fleet changes in sources
+
+/// Keeps a fleet change's proposal in one source repository (§3.3).
+pub async fn put_proposal(store: &Store, p: &super::sources::Proposal) -> anyhow::Result<()> {
+    let (fleet, repo, spec) = (p.fleet.clone(), p.repo.clone(), to_json(p)?);
+    store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO deploy_fleet_proposals (fleet, repo, spec) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(fleet, repo) DO UPDATE SET spec = excluded.spec",
+                params![fleet, repo, spec],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// A fleet change's proposals, by repository.
+pub async fn proposals(store: &Store, fleet: &str) -> anyhow::Result<Vec<super::sources::Proposal>> {
+    let fleet = fleet.to_owned();
+    let specs: Vec<String> = store
+        .call(move |c| {
+            let mut s = c.prepare("SELECT spec FROM deploy_fleet_proposals WHERE fleet = ?1 ORDER BY repo")?;
+            let rows = s.query_map([fleet], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    specs.iter().map(|s| from_json(s)).collect()
+}

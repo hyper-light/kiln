@@ -26,19 +26,19 @@ use super::{Deploy, repo, store};
 /// An error and the status that says what went wrong.
 pub type Fail = (StatusCode, String);
 
-fn bad(msg: impl Into<String>) -> Fail {
+pub(super) fn bad(msg: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, msg.into())
 }
 
-fn missing(msg: impl Into<String>) -> Fail {
+pub(super) fn missing(msg: impl Into<String>) -> Fail {
     (StatusCode::NOT_FOUND, msg.into())
 }
 
-fn conflict(msg: impl Into<String>) -> Fail {
+pub(super) fn conflict(msg: impl Into<String>) -> Fail {
     (StatusCode::CONFLICT, msg.into())
 }
 
-fn internal(e: anyhow::Error) -> Fail {
+pub(super) fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
 
@@ -192,12 +192,12 @@ fn agents_may(who: &Who, env: &Environment, what: &str) -> Result<(), Fail> {
     ))
 }
 
-async fn audit(d: &Deploy, actor: &str, action: &str, detail: String) {
+pub(super) async fn audit(d: &Deploy, actor: &str, action: &str, detail: String) {
     d.hub.store.audit(actor.to_owned(), action.to_owned(), detail).await;
 }
 
 /// The author of a commit made for `who`.
-fn author(who: &str) -> Author {
+pub(super) fn author(who: &str) -> Author {
     let name = if who.is_empty() { "kiln" } else { who };
     let local: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
     Author { name: name.to_owned(), email: format!("{local}@kiln") }
@@ -995,12 +995,16 @@ pub struct RollbackAsk {
     pub to: Option<i64>,
 }
 
-/// A change to many apps of an environment at once (docs/deploy-api.md §3.3): each app selected is
-/// released, at one version, or with values set in its own (a config release each). Each passes
-/// the environment's gates as any release does.
-#[derive(Debug, Clone, Deserialize)]
+/// A change to many apps at once (docs/deploy-api.md §3.3): in an environment, each app selected is
+/// released, at one version, or with values set in its own (a config release each), each through
+/// the environment's gates as any release; or, with `source`, the change is proposed in each app's
+/// source repository (one pull request per repository, [`super::sources`]).
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FleetAsk {
+    /// Where the apps are released; with `source`, only apps registered there are selected (any
+    /// app, without it).
+    #[serde(default)]
     pub environment: String,
     /// The apps: these, or those made from `template`, in `project`, owned by `owner` (each given
     /// must hold); every app registered in the environment when none is given.
@@ -1019,6 +1023,10 @@ pub struct FleetAsk {
     /// numbers and `true`/`false` as such, the rest as text.
     #[serde(default)]
     pub set: BTreeMap<String, String>,
+    /// The change made in each app's source repository instead (a kiln-base version, or values
+    /// set in its chart), proposed as one pull request per repository.
+    #[serde(default)]
+    pub source: Option<super::sources::SourceChange>,
     /// Asked for again with the same key, it is the same fleet: the same releases.
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -1057,6 +1065,12 @@ pub fn merge_values(text: &str, set: &BTreeMap<String, String>) -> Result<String
 /// Releases each selected app of a fleet change (see [`FleetAsk`]): its id, and each app's release,
 /// or why it has none.
 pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
+    if let Some(s) = &f.source {
+        if f.version.is_some() || !f.set.is_empty() {
+            return Err(bad("a fleet change releases (a version, or values to set) or changes apps' sources (`source`): one of them"));
+        }
+        return super::sources::propose(d, who, &f, s).await;
+    }
     if f.version.is_some() == !f.set.is_empty() {
         return Err(bad("a fleet change is a version to deploy, or values to set: one of them"));
     }
@@ -1064,20 +1078,7 @@ pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
     agents_may(who, &env, "release apps")?;
     may_deploy(who, &env, "release apps across")?;
     let id = f.idempotency_key.clone().unwrap_or_else(crate::util::new_id);
-    let registered: Vec<String> = store::registrations(&d.hub.store, None, Some(&env.name)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
-    let apps: Vec<App> = store::apps(&d.hub.store)
-        .await
-        .map_err(internal)?
-        .into_iter()
-        .filter(|a| registered.contains(&a.name))
-        .filter(|a| f.apps.is_empty() || f.apps.contains(&a.name))
-        .filter(|a| f.template.as_ref().is_none_or(|t| a.template.as_ref() == Some(t)))
-        .filter(|a| f.project.as_ref().is_none_or(|p| &a.project == p))
-        .filter(|a| f.owner.as_ref().is_none_or(|o| a.owners.contains(o)))
-        .collect();
-    if apps.is_empty() {
-        return Err(bad(format!("no app registered in {} is selected", env.name)));
-    }
+    let apps = selected(d, &f).await?;
     let mut out = Vec::new();
     for a in &apps {
         let key = Some(format!("fleet:{id}:{}", a.name));
@@ -1103,8 +1104,41 @@ pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
     Ok(json!({ "fleet": id, "environment": env.name, "releases": out }))
 }
 
-/// A fleet change's releases as they stand, and whether each has finished.
+/// The apps a fleet change selects: those named, or made from its template, in its project, owned
+/// by its owner (each given must hold); of those registered in its environment, when it names one.
+pub(super) async fn selected(d: &Deploy, f: &FleetAsk) -> Result<Vec<App>, Fail> {
+    let registered: Option<Vec<String>> = match f.environment.as_str() {
+        "" => None,
+        env => {
+            store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {env}")))?;
+            Some(store::registrations(&d.hub.store, None, Some(env)).await.map_err(internal)?.into_iter().map(|r| r.app).collect())
+        }
+    };
+    let apps: Vec<App> = store::apps(&d.hub.store)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|a| registered.as_ref().is_none_or(|r| r.contains(&a.name)))
+        .filter(|a| f.apps.is_empty() || f.apps.contains(&a.name))
+        .filter(|a| f.template.as_ref().is_none_or(|t| a.template.as_ref() == Some(t)))
+        .filter(|a| f.project.as_ref().is_none_or(|p| &a.project == p))
+        .filter(|a| f.owner.as_ref().is_none_or(|o| a.owners.contains(o)))
+        .collect();
+    if apps.is_empty() {
+        return Err(bad(match f.environment.as_str() {
+            "" => "no app is selected".to_owned(),
+            env => format!("no app registered in {env} is selected"),
+        }));
+    }
+    Ok(apps)
+}
+
+/// A fleet change as it stands: its releases, and whether each has finished; or, one in apps'
+/// sources, its proposals (§3.3).
 pub async fn fleet_status(d: &Deploy, id: &str) -> Result<Value, Fail> {
+    if let Some(v) = super::sources::status(d, id).await? {
+        return Ok(v);
+    }
     let list = store::releases_keyed(&d.hub.store, &format!("fleet:{id}:")).await.map_err(internal)?;
     if list.is_empty() {
         return Err(missing(format!("no fleet change {id}")));
@@ -2859,7 +2893,7 @@ mod tests {
             anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "bob cancels nothing of web: {r:?}");
             let gone = cancel(&d, &carol, made.id, false).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             anyhow::ensure!(gone.state == State::Cancelled, "a co-owner cancels: {gone:?}");
-            let fleet_ask = FleetAsk { environment: "staging".into(), apps: vec![], template: None, project: None, owner: None, version: None, set: [("replicaCount".to_owned(), "3".to_owned())].into(), idempotency_key: None };
+            let fleet_ask = FleetAsk { environment: "staging".into(), set: [("replicaCount".to_owned(), "3".to_owned())].into(), ..FleetAsk::default() };
             let r = fleet(&d, &ada, fleet_ask).await;
             anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "{r:?}");
 

@@ -97,8 +97,33 @@ pub fn files(i: &Init<'_>) -> Vec<(PathBuf, String)> {
 
 /// kiln-base's files vendored in an app's chart (`charts/<app>/charts/kiln-base/…`).
 pub fn vendored(app: &str) -> Vec<(PathBuf, String)> {
-    let dir = Path::new("charts").join(app).join("charts/kiln-base");
+    vendored_in(&Path::new("charts").join(app))
+}
+
+/// kiln-base's files vendored in the chart at `chart` (`<chart>/charts/kiln-base/…`).
+pub fn vendored_in(chart: &Path) -> Vec<(PathBuf, String)> {
+    let dir = chart.join("charts/kiln-base");
     BASE.iter().map(|(path, text)| (dir.join(path), (*text).to_owned())).collect()
+}
+
+/// An app chart's `Chart.yaml` with its kiln-base dependency at `version` (its version line
+/// changed in place, the rest as it was), and whether it vendors kiln-base (no `repository`).
+/// `None`: it doesn't depend on kiln-base.
+pub fn with_base(text: &str, version: &str) -> Option<(String, bool)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| l.trim_start().strip_prefix("- ").map(str::trim_start) == Some("name: kiln-base"))?;
+    let item = lines.get(start).map_or(0, |l| l.len() - l.trim_start().len());
+    let end = lines.iter().enumerate().skip(start + 1).find(|(_, l)| !l.trim().is_empty() && l.len() - l.trim_start().len() <= item).map_or(lines.len(), |(i, _)| i);
+    let pad = " ".repeat(item + 2);
+    let entry = lines.get(start + 1..end).unwrap_or_default();
+    let vendored = !entry.iter().any(|l| l.trim_start().starts_with("repository:"));
+    let mut out: Vec<String> = lines.iter().take(start + 1).map(|l| (*l).to_owned()).collect();
+    if !entry.iter().any(|l| l.trim_start().starts_with("version:")) {
+        out.push(format!("{pad}version: {version}"));
+    }
+    out.extend(entry.iter().map(|l| if l.trim_start().starts_with("version:") { format!("{pad}version: {version}") } else { (*l).to_owned() }));
+    out.extend(lines.iter().skip(end).map(|l| (*l).to_owned()));
+    Some((out.join("\n") + if text.ends_with('\n') || text.is_empty() { "\n" } else { "" }, vendored))
 }
 
 /// An app chart's `Chart.yaml` with its kiln-base dependency at the version this kiln ships, from

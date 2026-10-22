@@ -47,6 +47,7 @@ pub mod repo;
 pub mod argo_secrets;
 pub mod registries;
 pub mod scaffold;
+pub mod sources;
 pub mod store;
 
 use std::sync::Arc;

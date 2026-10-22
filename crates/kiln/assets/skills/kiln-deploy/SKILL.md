@@ -125,6 +125,15 @@ release that succeeded before what runs (`to: <release id>` picks one of
 version, artifacts and values. `kiln.deploy.releases.cancel({ id })` stops one still waiting or
 being delivered (a delivery is reverted).
 
+**Fleet changes.** `kiln.deploy.fleets.create({ environment, apps | template | project | owner,
+version | set, idempotency_key })` releases many apps of an environment at once, each through its
+gates. With `source: { base: "0.1.4" }` (kiln-base in each chart) or `source: { set: {...} }`
+(values in each chart) instead, it proposes the change in each app's source repository: one pull
+request per repository, and on kiln's own git server a branch and its diff. Follow it with
+`kiln.deploy.fleets.get({ id })`. Merging a pull request is a person's, on its host; on kiln's own,
+`kiln.deploy.fleets.merge({ id })` merges what a person asked you to merge.
+`kiln.deploy.fleets.withdraw({ id })` closes what's open.
+
 **Rules for agents.**
 - You release only where the environment lets agents (its `agents.deploy`); approve only where
   `agents.approve` says so, and never your own request. You act for your person, so an app's

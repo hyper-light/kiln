@@ -172,29 +172,11 @@ enum DeployCmd {
     },
     /// A fleet change: one version, or values set (`--set path=value`), released to many apps of
     /// an environment at once (those given, or of a template, a project or an owner; all registered
-    /// there when none is), each through its gates. With `--show <id>`, how one stands.
-    Fleet {
-        #[arg(long, visible_alias = "to")]
-        env: Option<String>,
-        #[arg(long = "app")]
-        apps: Vec<String>,
-        #[arg(long)]
-        template: Option<String>,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long, conflicts_with = "set")]
-        version: Option<String>,
-        /// `path=value` in each app's values: `image.pullPolicy=Always`, `replicaCount=2`.
-        #[arg(long = "set")]
-        set: Vec<String>,
-        /// Asked again with the same key, the same fleet change.
-        #[arg(long)]
-        key: Option<String>,
-        #[arg(long, conflicts_with_all = ["env", "version", "set"])]
-        show: Option<String>,
-    },
+    /// there when none is), each through its gates. Or a change in each app's source repository,
+    /// one pull request per repository: a kiln-base version (`--base`), or values set in its chart
+    /// (`--set … --in-source`); on kiln's own git server a branch and its diff, merged with
+    /// `--merge <id>`. With `--show <id>`, how one stands; `--withdraw <id>` closes what's open.
+    Fleet(Box<FleetArgs>),
     /// Delivery metrics (DORA's four keys) from the releases: of an app, an environment, or all.
     Metrics {
         #[arg(long)]
@@ -424,6 +406,52 @@ enum SecretCmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+}
+
+/// `kiln deploy fleet`'s arguments (see [`DeployCmd::Fleet`]).
+#[derive(clap::Args)]
+struct FleetArgs {
+    #[arg(long, visible_alias = "to")]
+    env: Option<String>,
+    #[arg(long = "app")]
+    apps: Vec<String>,
+    #[arg(long)]
+    template: Option<String>,
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long)]
+    owner: Option<String>,
+    #[arg(long, conflicts_with_all = ["set", "base"])]
+    version: Option<String>,
+    /// `path=value` in each app's values: `image.pullPolicy=Always`, `replicaCount=2`.
+    #[arg(long = "set")]
+    set: Vec<String>,
+    /// kiln-base at this version in each app's chart, proposed in its source repository.
+    #[arg(long, conflicts_with = "set")]
+    base: Option<String>,
+    /// `--set` in each app's chart in its source repository, proposed there, rather than
+    /// released.
+    #[arg(long)]
+    in_source: bool,
+    /// Where each app's chart is in its repository (`charts/{app}`), for a change there.
+    #[arg(long)]
+    chart: Option<String>,
+    /// Its values file (`<chart>/values.yaml`), for a change there.
+    #[arg(long)]
+    values_file: Option<String>,
+    /// Asked again with the same key, the same fleet change.
+    #[arg(long)]
+    key: Option<String>,
+    #[arg(long, conflicts_with_all = ["env", "version", "set", "base"])]
+    show: Option<String>,
+    /// Merges a source change's proposals on kiln's own git server (`--repo`: one of them).
+    #[arg(long, conflicts_with_all = ["env", "version", "set", "base", "show"])]
+    merge: Option<String>,
+    #[arg(long, requires = "merge")]
+    repo: Option<String>,
+    /// Withdraws a source change's open proposals.
+    #[arg(long, conflicts_with_all = ["env", "version", "set", "base", "show", "merge"])]
+    withdraw: Option<String>,
 }
 
 /// `kiln app create`: an app and how it is deployed.
@@ -854,21 +882,51 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
         Some(DeployCmd::Env { cmd }) => return env(&api, cmd).await,
-        Some(DeployCmd::Fleet { env, apps, template, project, owner, version, set, key, show }) => {
-            let v = match show {
-                Some(id) => api.call(Method::Get, &format!("/fleets/{}", enc(&id)), None).await?,
-                None => {
-                    let env = env.context("--env: the environment the fleet change goes to")?;
+        Some(DeployCmd::Fleet(f)) => {
+            let FleetArgs { env, apps, template, project, owner, version, set, base, in_source, chart, values_file, key, show, merge, repo, withdraw } = *f;
+            let v = match (show, merge, withdraw) {
+                (Some(id), _, _) => api.call(Method::Get, &format!("/fleets/{}", enc(&id)), None).await?,
+                (_, Some(id), _) => api.call(Method::Post, &format!("/fleets/{}/merge", enc(&id)), Some(json!({ "repo": repo }))).await?,
+                (_, _, Some(id)) => api.call(Method::Delete, &format!("/fleets/{}", enc(&id)), None).await?,
+                _ => {
                     let mut sets = serde_json::Map::new();
                     for kv in &set {
                         let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: --set path=value"))?;
                         sets.insert(k.to_owned(), json!(v));
                     }
-                    let body = json!({ "environment": env, "apps": apps, "template": template, "project": project, "owner": owner, "version": version, "set": sets, "idempotency_key": key });
+                    let body = if base.is_some() || in_source {
+                        let source = json!({ "base": base, "set": if in_source { Value::Object(sets) } else { json!({}) }, "chart": chart, "values": values_file });
+                        json!({ "environment": env.unwrap_or_default(), "apps": apps, "template": template, "project": project, "owner": owner, "source": source, "idempotency_key": key })
+                    } else {
+                        let env = env.context("--env: the environment the fleet change goes to (or --base, --in-source: a change in the apps' sources)")?;
+                        json!({ "environment": env, "apps": apps, "template": template, "project": project, "owner": owner, "version": version, "set": sets, "idempotency_key": key })
+                    };
                     api.call(Method::Post, "/fleets", Some(body)).await?
                 }
             };
             api.print(&v, |v| {
+                if v.get("source").and_then(Value::as_bool) == Some(true) {
+                    println!("fleet change {} in apps' sources", s(v, "fleet"));
+                    for p in v.get("proposals").and_then(Value::as_array).into_iter().flatten() {
+                        let at = p.get("url").and_then(Value::as_str).map_or_else(|| format!("branch {}", s(p, "branch")), str::to_owned);
+                        let apps: Vec<&str> = p.get("apps").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+                        println!("{:<28} {:<10} {}  ({})", s(p, "repo"), s(p, "state"), at, apps.join(", "));
+                        if let Some(note) = p.get("note").and_then(Value::as_str) {
+                            println!("    {note}");
+                        }
+                        if let Some(diff) = p.get("diff").and_then(Value::as_str) {
+                            println!("{diff}");
+                        }
+                    }
+                    for k in v.get("skipped").and_then(Value::as_array).into_iter().flatten() {
+                        println!("{}  not changed: {}", s(k, "app"), s(k, "error"));
+                    }
+                    if let Some(states) = v.get("states").and_then(Value::as_object) {
+                        let parts: Vec<String> = states.iter().map(|(k, n)| format!("{n} {k}")).collect();
+                        println!("{}{}", parts.join(", "), if v.get("done").and_then(Value::as_bool) == Some(true) { " · done" } else { "" });
+                    }
+                    return;
+                }
                 println!("fleet change {} in {}", s(v, "fleet"), s(v, "environment"));
                 for r in v.get("releases").and_then(Value::as_array).into_iter().flatten() {
                     match r.get("release") {

@@ -305,6 +305,90 @@ impl Hosted {
     }
 }
 
+/// What merging a branch's commit into another came to ([`Hosted::merge_into`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merged {
+    /// The branch held it already.
+    Already,
+    /// The branch moved on to it.
+    FastForward(String),
+    /// A merge commit of the two.
+    Merge(String),
+    /// They change the same lines: what git said.
+    Conflict(String),
+}
+
+impl Hosted {
+    /// A new `branch` holding `changes` on `parent` (a proposal: no other branch moves);
+    /// `Unchanged` (the parent) when the parent holds them already. A branch of that name already
+    /// there is an error.
+    pub fn branch_from(&self, repo: &str, branch: &str, parent: &str, changes: &[Change], message: &str, author: &Author) -> anyhow::Result<Committed> {
+        let made = self.make(repo, Some(parent), changes, message, author)?;
+        if let Committed::New(sha) = &made {
+            git(&self.path(repo)?, &["update-ref", &format!("refs/heads/{branch}"), sha, NO_COMMIT], None, &[]).with_context(|| format!("{repo} has a branch {branch} already"))?;
+        }
+        Ok(made)
+    }
+
+    /// What `to` changes of `from`, as a unified diff.
+    pub fn diff(&self, repo: &str, from: &str, to: &str) -> anyhow::Result<String> {
+        Ok(String::from_utf8_lossy(&git(&self.path(repo)?, &["diff", "--no-color", "--no-ext-diff", from, to, "--"], None, &[])?).into_owned())
+    }
+
+    /// Whether `branch` holds `commit` (it is the branch's head or an ancestor of it).
+    pub fn contains(&self, repo: &str, branch: &str, commit: &str) -> anyhow::Result<bool> {
+        let Some(head) = self.head(repo, branch)? else { return Ok(false) };
+        let out = Command::new("git").arg("-C").arg(self.path(repo)?).args(["merge-base", "--is-ancestor", commit, &head]).env("GIT_TERMINAL_PROMPT", "0").output().context("run git")?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => bail!("git merge-base: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        }
+    }
+
+    /// Merges `commit` into `into`, as git merges two branches without a working tree: a
+    /// fast-forward where `into` hasn't moved since, a merge commit where it has and nothing
+    /// conflicts. `into` moves with a compare-and-swap.
+    pub fn merge_into(&self, repo: &str, into: &str, commit: &str, message: &str, author: &Author) -> Result<Merged, CommitError> {
+        let dir = self.path(repo)?;
+        let head = self.head(repo, into)?.with_context(|| format!("{repo} has no {into}"))?;
+        if self.contains(repo, into, commit)? {
+            return Ok(Merged::Already);
+        }
+        let behind = Command::new("git").arg("-C").arg(&dir).args(["merge-base", "--is-ancestor", &head, commit]).env("GIT_TERMINAL_PROMPT", "0").status().context("run git")?;
+        let (made, merged) = if behind.success() {
+            (commit.to_owned(), Merged::FastForward(commit.to_owned()))
+        } else {
+            let out = Command::new("git").arg("-C").arg(&dir).args(["merge-tree", "--write-tree", "--name-only", "--no-messages", &head, commit]).env("GIT_TERMINAL_PROMPT", "0").output().context("run git")?;
+            let said = String::from_utf8_lossy(&out.stdout).into_owned();
+            match out.status.code() {
+                Some(0) => {}
+                Some(1) => return Ok(Merged::Conflict(said.lines().skip(1).map(str::trim).filter(|l| !l.is_empty()).take(20).collect::<Vec<_>>().join(", "))),
+                _ => return Err(CommitError::Other(anyhow::anyhow!("git merge-tree: {}", String::from_utf8_lossy(&out.stderr).trim()))),
+            }
+            let tree = said.lines().next().unwrap_or_default().trim().to_owned();
+            let ident = [("GIT_AUTHOR_NAME", author.name.as_str()), ("GIT_AUTHOR_EMAIL", author.email.as_str()), ("GIT_COMMITTER_NAME", "kiln"), ("GIT_COMMITTER_EMAIL", "kiln@localhost")];
+            let ident: Vec<(&str, &std::ffi::OsStr)> = ident.iter().map(|(k, v)| (*k, std::ffi::OsStr::new(*v))).collect();
+            let sha = text(git(&dir, &["commit-tree", &tree, "-p", &head, "-p", commit], Some(message.as_bytes()), &ident)?);
+            (sha.clone(), Merged::Merge(sha))
+        };
+        // The compare-and-swap: only if `into` is still where it was read.
+        let swap = Command::new("git").arg("-C").arg(&dir).args(["update-ref", &format!("refs/heads/{into}"), &made, &head]).env("GIT_TERMINAL_PROMPT", "0").output().context("run git")?;
+        if !swap.status.success() {
+            return Err(CommitError::Moved);
+        }
+        Ok(merged)
+    }
+
+    /// Deletes a branch, if it's there.
+    pub fn delete_branch(&self, repo: &str, branch: &str) -> anyhow::Result<()> {
+        if self.head(repo, branch)?.is_some() {
+            git(&self.path(repo)?, &["update-ref", "-d", &format!("refs/heads/{branch}")], None, &[])?;
+        }
+        Ok(())
+    }
+}
+
 /// A commit, as [`Hosted::commits_since`] lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggedCommit {
@@ -366,6 +450,41 @@ mod tests {
 
     fn file(path: &str, content: &str) -> Change {
         Change { path: path.to_owned(), content: Some(content.as_bytes().to_vec()) }
+    }
+
+    /// A proposal on kiln's own git (a fleet change, docs/deploy-api.md §3.3): a branch on main's
+    /// head, its diff, then merged: a fast-forward where main stayed, a merge commit where it moved,
+    /// refused where both change the same lines.
+    #[test]
+    fn a_branch_of_kiln_s_proposes_and_merges() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let h = Hosted::new(tmp.path());
+        let who = Author::default();
+        let base = h.commit("acme/web", "main", None, &[file("charts/web/values.yaml", "replicaCount: 1\n"), file("README", "web\n")], "start", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let b1 = h.branch_from("acme/web", "kiln/fleet/f1", base.sha(), &[file("charts/web/values.yaml", "replicaCount: 2\n")], "two replicas", &who)?;
+        assert!(matches!(b1, Committed::New(_)) && h.head("acme/web", "main")?.as_deref() == Some(base.sha()), "only the branch moves");
+        assert!(h.branch_from("acme/web", "kiln/fleet/f1", base.sha(), &[file("x", "y")], "again", &who).is_err(), "a branch of that name is there");
+        assert_eq!(h.branch_from("acme/web", "kiln/fleet/same", base.sha(), &[file("README", "web\n")], "nothing", &who)?, Committed::Unchanged(base.sha().to_owned()));
+        let d = h.diff("acme/web", base.sha(), b1.sha())?;
+        assert!(d.contains("-replicaCount: 1") && d.contains("+replicaCount: 2"), "{d}");
+        assert!(!h.contains("acme/web", "main", b1.sha())?);
+        assert_eq!(h.merge_into("acme/web", "main", b1.sha(), "merge f1", &who).map_err(|e| anyhow::anyhow!("{e}"))?, Merged::FastForward(b1.sha().to_owned()));
+        assert!(h.contains("acme/web", "main", b1.sha())?);
+        assert_eq!(h.merge_into("acme/web", "main", b1.sha(), "again", &who).map_err(|e| anyhow::anyhow!("{e}"))?, Merged::Already);
+        // Main moved on another file: a merge commit with both.
+        let b2 = h.branch_from("acme/web", "kiln/fleet/f2", b1.sha(), &[file("charts/web/values.yaml", "replicaCount: 3\n")], "three", &who)?;
+        let moved = h.commit("acme/web", "main", Some(b1.sha()), &[file("README", "web, moved\n")], "readme", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let Merged::Merge(m) = h.merge_into("acme/web", "main", b2.sha(), "merge f2", &who).map_err(|e| anyhow::anyhow!("{e}"))? else { anyhow::bail!("a merge commit") };
+        assert_eq!((h.read("acme/web", &m, "README")?, h.read("acme/web", &m, "charts/web/values.yaml")?), (Some(b"web, moved\n".to_vec()), Some(b"replicaCount: 3\n".to_vec())));
+        assert!(h.contains("acme/web", "main", moved.sha())? && h.contains("acme/web", "main", b2.sha())?);
+        // Both change the same line: refused, and main stays.
+        let b3 = h.branch_from("acme/web", "kiln/fleet/f3", &m, &[file("charts/web/values.yaml", "replicaCount: 4\n")], "four", &who)?;
+        let theirs = h.commit("acme/web", "main", Some(&m), &[file("charts/web/values.yaml", "replicaCount: 5\n")], "five", &who).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(h.merge_into("acme/web", "main", b3.sha(), "merge f3", &who).map_err(|e| anyhow::anyhow!("{e}"))?, Merged::Conflict("charts/web/values.yaml".into()));
+        assert_eq!(h.head("acme/web", "main")?.as_deref(), Some(theirs.sha()));
+        h.delete_branch("acme/web", "kiln/fleet/f3")?;
+        assert_eq!(h.head("acme/web", "kiln/fleet/f3")?, None);
+        Ok(())
     }
 
     #[test]

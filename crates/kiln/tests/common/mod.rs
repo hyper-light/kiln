@@ -235,3 +235,87 @@ pub fn source_on_host(s: &Server, host: &str, git_root: &Path, starter: &str, (f
     anyhow::ensure!(st == 409 && body.contains("already"), "a name taken: {st} {body}");
     Ok(())
 }
+
+/// git in `dir`, as a person (ada) runs it: its output.
+#[allow(dead_code)]
+pub fn git_as_ada(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let o = Command::new("git")
+        .args(["-c", "user.name=ada", "-c", "user.email=ada@example.com", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()?;
+    anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
+/// Lays a chart on kiln-base 0.1.2 into the repository at `bare` on its main, as `kiln app init`
+/// lays one out for `app`, a person's commit.
+#[allow(dead_code)]
+pub fn lay_chart(bare: &Path, app: &str) -> anyhow::Result<()> {
+    let work = tempfile::tempdir()?;
+    git_as_ada(work.path(), &["clone", "-q", &bare.to_string_lossy(), "."])?;
+    let chart = work.path().join(format!("charts/{app}"));
+    std::fs::create_dir_all(&chart)?;
+    std::fs::write(chart.join("Chart.yaml"), format!("apiVersion: v2\nname: {app}\nversion: 0.1.0\ndependencies:\n  # kiln's base chart.\n  - name: kiln-base\n    version: 0.1.2\n    repository: oci://kiln.example.com/kiln/charts\n"))?;
+    std::fs::write(chart.join("values.yaml"), "replicaCount: 1\nimage:\n  repository: ghcr.io/acme/web\n")?;
+    git_as_ada(work.path(), &["add", "."])?;
+    git_as_ada(work.path(), &["commit", "-qm", "a chart on kiln-base"])?;
+    git_as_ada(work.path(), &["push", "-q", "origin", "HEAD:main"])?;
+    Ok(())
+}
+
+/// A fleet change in the source repository [`source_on_host`] made (docs/deploy-api.md §3.3):
+/// `acme/<host>-web` given a chart on kiln-base, kiln-base moved in it by a fleet change is one
+/// pull request there (a merge request on GitLab) of only that change, on the change's branch;
+/// asked again, the same one; merged there (`merged`: the fake host told its number was merged
+/// into the commit, as a person merging it would make it so), it reads as merged and the change
+/// as done; one the repository holds already proposes nothing; values set by another, withdrawn,
+/// are closed there.
+#[allow(dead_code)]
+pub fn fleet_on_host(s: &Server, host: &str, git_root: &Path, merged: impl Fn(u64, &str) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let app = format!("{host}-web");
+    let bare = git_root.join(format!("acme/{app}.git"));
+    lay_chart(&bare, &app)?;
+    let ask = |key: &str, source: Value| -> anyhow::Result<Value> {
+        let (st, body) = http(s.port, "POST", "/api/deploy/fleets", &s.admin, Some(&serde_json::json!({ "apps": [app], "source": source, "idempotency_key": key })))?;
+        anyhow::ensure!(st == 201, "a fleet change {key}: {st} {body}\n{}", s.log());
+        Ok(serde_json::from_str(&body)?)
+    };
+    let one = |v: &Value| v.pointer("/proposals/0").cloned().unwrap_or_default();
+    let base = format!("{host}-base");
+    let v = ask(&base, serde_json::json!({ "base": "0.1.9" }))?;
+    let p = one(&v);
+    anyhow::ensure!(
+        p.get("state") == Some(&Value::from("open")) && p.get("host") == Some(&Value::from(host)) && p.get("number") == Some(&Value::from(1)) && p.get("files") == Some(&serde_json::json!([format!("charts/{app}/Chart.yaml")])),
+        "kiln-base moved: {v}"
+    );
+    let branch = format!("kiln/fleet/{base}");
+    let proposed = git_as_ada(&bare, &["show", &format!("{branch}:charts/{app}/Chart.yaml")])?;
+    anyhow::ensure!(proposed.contains("version: 0.1.9") && proposed.contains("repository: oci://kiln.example.com/kiln/charts") && proposed.contains("# kiln's base chart.") && !proposed.contains("0.1.2"), "only its version moves: {proposed}");
+    anyhow::ensure!(git_as_ada(&bare, &["log", "-1", "--format=%B", &branch])?.contains(&format!("Kiln-Fleet: {base}")));
+    let again = ask(&base, serde_json::json!({ "base": "0.1.9" }))?;
+    anyhow::ensure!(one(&again).get("number") == Some(&Value::from(1)), "the same pull request: {again}");
+    // Merged there: merged, and the change done.
+    let (main, head) = (git_as_ada(&bare, &["rev-parse", "main"])?, git_as_ada(&bare, &["rev-parse", &branch])?);
+    let tree = git_as_ada(&bare, &["rev-parse", &format!("{head}^{{tree}}")])?;
+    let merge = git_as_ada(&bare, &["commit-tree", &tree, "-p", &main, "-p", &head, "-m", "Merge kiln's fleet change"])?;
+    git_as_ada(&bare, &["update-ref", "refs/heads/main", &merge])?;
+    merged(1, &merge)?;
+    let (st, body) = http(s.port, "GET", &format!("/api/deploy/fleets/{base}"), &s.admin, None)?;
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    anyhow::ensure!(st == 200 && one(&v).get("state") == Some(&Value::from("merged")) && v.get("done") == Some(&Value::from(true)), "merged: {st} {body}\n{}", s.log());
+    let v = ask(&format!("{host}-base-again"), serde_json::json!({ "base": "0.1.9" }))?;
+    anyhow::ensure!(one(&v).get("state") == Some(&Value::from("unchanged")), "held already: {v}");
+    // Values set, then withdrawn: closed there.
+    let set = format!("{host}-replicas");
+    let v = ask(&set, serde_json::json!({ "set": { "replicaCount": "3" } }))?;
+    anyhow::ensure!(one(&v).get("state") == Some(&Value::from("open")) && one(&v).get("number") == Some(&Value::from(2)), "values set: {v}");
+    let values = git_as_ada(&bare, &["show", &format!("kiln/fleet/{set}:charts/{app}/values.yaml")])?;
+    anyhow::ensure!(values.contains("replicaCount: 3") && values.contains("repository: ghcr.io/acme/web"), "{values}");
+    let (st, body) = http(s.port, "DELETE", &format!("/api/deploy/fleets/{set}"), &s.admin, None)?;
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    anyhow::ensure!(st == 200 && one(&v).get("state") == Some(&Value::from("closed")), "withdrawn: {st} {body}");
+    Ok(())
+}
