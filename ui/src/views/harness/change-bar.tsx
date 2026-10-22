@@ -10,6 +10,7 @@ import { changesApi, changesRes, changeWords, type AgentChange } from "@/api/cha
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
+import { changeState } from "./change-state";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 
@@ -105,46 +106,57 @@ export function ChangeBar({ agentId }: { agentId: string }) {
       toast({ title: r.change ? `${r.change} version ${r.version} is up for review` : `Pushed ${r.branch}: open its pull request from its link`, tone: "running" });
       invalidate("agents/changes");
     } catch (e) {
-      toast.error(c ? "Couldn't push a new version" : "Couldn't open a change request", errorMessage(e));
+      toast.error(c ? "Couldn't push a new version" : "Couldn't open a pull request", errorMessage(e));
     } finally {
       setBusy(false);
     }
   };
-  if (!c) {
-    return (
-      <div className="hx-change-bar hx-change-new">
-        <div className="hx-change-grid">
-          <GitPullRequestArrow size={14} aria-hidden="true" className="hx-dim hx-change-icon" />
-          <span className="hx-change-what">Its work isn&apos;t up for review yet.</span>
-          <div className="hx-change-do">
-            <label className="hx-change-opt">
-              <input type="checkbox" className="check" checked={fix} onChange={(e) => setFix(e.target.checked)} />
-              Fix failing checks by itself
-            </label>
-            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void push()}>
-              {busy ? "Opening…" : "Open change request"}
-            </Button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-  const open = c.state === "open";
+  const s = changeState(c);
+  // Its state, what it is, and what to do: one line on a wide card, a line each on a narrow one.
   return (
-    <div className="hx-change-bar" data-state={c.state}>
-      <GitPullRequestArrow size={14} aria-hidden="true" className="hx-dim" />
-      <span className="hx-change-what">
-        <ChangeLink c={c}>{changeWords(c)}</ChangeLink>
-        <span className="hx-change-sub">
-          version {c.version}
-          {c.repo ? ` · ${c.repo}` : ""} · {c.branch}
+    <div className="hx-cr" data-state={s.key}>
+      <div className="hx-cr-in">
+        <span className="hx-cr-head">
+          <GitPullRequestArrow size={14} aria-hidden="true" className="hx-dim" />
+          <span className="status hx-cr-state" title={c ? changeWords(c) : "Its work isn't up for review yet"}>
+            <i className="dot" data-status={s.dot} aria-hidden="true" />
+            <span className="status-text" data-status={s.dot}>
+              {s.word}
+            </span>
+          </span>
         </span>
-      </span>
-      {open && (
-        <Button size="xs" variant="ghost" disabled={busy} onClick={() => void push()}>
-          {busy ? "Pushing…" : "Push a new version"}
-        </Button>
-      )}
+        {c ? (
+          <span className="hx-cr-what">
+            <ChangeLink c={c}>{c.change ?? c.branch}</ChangeLink>
+            <span className="hx-cr-sub">
+              v{c.version}
+              {c.repo ? ` · ${c.repo}` : ""}
+              {c.change ? ` · ${c.branch}` : ""}
+            </span>
+          </span>
+        ) : (
+          <span className="hx-cr-fill" />
+        )}
+        {!c ? (
+          <span className="hx-cr-do">
+            <label className="hx-cr-opt" title="Failing checks go to the agent to fix">
+              <input type="checkbox" className="check" checked={fix} onChange={(e) => setFix(e.target.checked)} />
+              Auto-Fix
+            </label>
+            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void push()} title="Commit its work beside the folder and push it for review">
+              {busy ? "Opening…" : "Open PR"}
+            </Button>
+          </span>
+        ) : (
+          c.state === "open" && (
+            <span className="hx-cr-do">
+              <Button size="xs" variant="secondary" disabled={busy} onClick={() => void push()} title="Push its work as a new version">
+                {busy ? "Pushing…" : "Push update"}
+              </Button>
+            </span>
+          )
+        )}
+      </div>
     </div>
   );
 }

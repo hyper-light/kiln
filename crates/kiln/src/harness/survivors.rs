@@ -58,6 +58,26 @@ fn helper(command: &str) -> bool {
     program == "kiln" || program == "kiln.exe" || lower.contains("mcp") || lower.contains("modelcontextprotocol")
 }
 
+/// An `ssh-agent` as a shell's startup file starts it (`eval "$(ssh-agent -s)"`, fish's
+/// `eval (ssh-agent -c)`): one more for every shell that reads the file (a harness's shell
+/// snapshots, its tools' login shells), each running on after its shell, so a session left dozens.
+/// No work of the agent's: never left running, and stopped once [`AGENT_KEPT`] old.
+pub fn login_agent(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let program = words.next().map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p)).unwrap_or("");
+    program == "ssh-agent" && words.all(|w| matches!(w, "-s" | "-c"))
+}
+
+/// How long a shell's `ssh-agent` in a session is left alone: a command that started one on purpose
+/// (`eval "$(ssh-agent -s)" && ssh-add … && git push`) has had its use of it by then.
+pub const AGENT_KEPT: Duration = Duration::from_secs(30 * 60);
+
+/// Of the shells' ssh-agents a look found, the ones to stop at `now_s` (seconds since the epoch):
+/// those [`AGENT_KEPT`] old.
+pub fn agents_to_stop(seen: &HashMap<String, Seen>, now_s: u64) -> Vec<u32> {
+    seen.values().flat_map(|s| &s.agents).filter(|r| now_s.saturating_sub(r.started) >= AGENT_KEPT.as_secs()).map(|r| r.pid).collect()
+}
+
 fn system(pids: Option<&[u32]>) -> sysinfo::System {
     refreshed(pids, false)
 }
@@ -137,6 +157,8 @@ pub struct Seen {
     pub under: Vec<Ran>,
     /// What it started that runs apart from it (marked as its, not under it): left running.
     pub apart: Vec<Ran>,
+    /// The `ssh-agent`s shells' startup files started for it, apart from it ([`login_agent`]).
+    pub agents: Vec<Ran>,
 }
 
 /// One look at the sessions' processes (blocking): for each session (its id, and its harness's
@@ -204,11 +226,13 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
             }
             let me = harness.map(Pid::from_u32);
             for pid in marked.get(id).into_iter().flatten() {
-                if Some(*pid) == me || below.contains(pid) || skip(*pid) || seen.apart.len() >= MAX_RAN {
+                if Some(*pid) == me || below.contains(pid) || skip(*pid) {
                     continue;
                 }
-                if let Some(r) = ran_of(&sys, *pid) {
-                    seen.apart.push(r);
+                let Some(r) = ran_of(&sys, *pid) else { continue };
+                let into = if login_agent(&r.command) { &mut seen.agents } else { &mut seen.apart };
+                if into.len() < MAX_RAN {
+                    into.push(r);
                 }
             }
             (id.clone(), seen)
@@ -397,6 +421,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_ssh_agents_shells_start_are_no_work_of_the_agents() {
+        assert!(login_agent("ssh-agent -s") && login_agent("ssh-agent -c") && login_agent("/usr/bin/ssh-agent"));
+        assert!(!login_agent("ssh-agent -a /run/user/1000/agent.sock") && !login_agent("ssh-agent -D") && !login_agent("ssh-agent bash") && !login_agent("ssh-add -l"));
+        let agent = |pid, started| Ran { pid, ppid: 1, started, command: "ssh-agent -s".into() };
+        let kept = AGENT_KEPT.as_secs();
+        let seen = HashMap::from([("s".to_owned(), Seen { agents: vec![agent(7, 1_000), agent(8, 1_001)], ..Seen::default() })]);
+        assert_eq!(agents_to_stop(&seen, 1_000 + kept), vec![7], "only those kept long enough");
+    }
+
+    #[test]
     fn helpers_are_left_out_and_wrappers_give_way() {
         assert!(helper("/Users/a/.local/bin/kiln reach mcp"));
         assert!(helper("npx -y @modelcontextprotocol/server-filesystem /w"));
@@ -440,7 +474,15 @@ mod tests {
         let out = std::process::Command::new("sh").arg("-c").arg(format!("{sleep_32} >/dev/null 2>&1 & echo $!")).env(MARK, "s1").output()?;
         let apart: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
         let me = std::process::id();
-        let seen = scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
+        let look = || scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
+        // Its shell forked it: looked at again until it runs as the sleeper (a process caught
+        // between fork and exec shows no environment on macOS, so no mark).
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = look();
+        while !seen.get("s1").is_some_and(|s| s.apart.iter().any(|r| r.pid == apart)) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            seen = look();
+        }
         let s1 = seen.get("s1").cloned().unwrap_or_default();
         let sleep = s1.under.iter().find(|r| r.pid == child.id()).cloned().ok_or_else(|| anyhow::anyhow!("the child isn't seen under its harness: {:?}", s1.under))?;
         assert!(sleep.command.contains("sleep 31"));
