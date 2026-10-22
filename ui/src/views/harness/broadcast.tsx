@@ -3,13 +3,14 @@
  * picked (checked in the list, or found by typing @ and part of a name, machine or harness) or,
  * with none picked, every one the list shows. A prompt, with files and what you say into the mic,
  * queued after the current turn, steered into it, or sent now; a slash command read in their own
- * catalogs; or a command: interrupt, restart, a mode, model or effort, an answer to everything
- * waiting on you. Commands are asked once, in a line under the field; the same line then says how
- * it went, and opens to each agent's outcome.
+ * catalogs; or one of kiln's own, typed after / like theirs and listed first (interrupt, restart,
+ * allow or deny everything waiting on you, end those picked), or Stop beside Send. Their mode,
+ * model and effort are the agent page's line of settings, above the box. Commands are asked once,
+ * in a line under the field; the same line then says how it went, and opens to each agent's outcome.
  */
 import * as React from "react";
 import "./console.css";
-import { ArrowUp, ChevronRight, CornerDownLeft, Paperclip, SlidersHorizontal, X } from "lucide-react";
+import { ArrowUp, ChevronRight, CornerDownLeft, Paperclip, Square, X } from "lucide-react";
 import { harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -24,6 +25,7 @@ import { useAttachments } from "./controls";
 import { agentLabel } from "./derive";
 import { machineName } from "./parts";
 import { MicButton } from "./voice";
+import { RunSettings } from "./run-settings";
 import { markAnswered, unmark } from "./answered";
 
 const machineLabel = (m: string) => (m === "local" ? "server" : m);
@@ -87,35 +89,6 @@ const previewOf = (roster: string): Promise<BroadcastPreview | null> =>
   roster ? harnessApi.broadcastPreview({ ids: roster.split(",").map((r) => r.slice(0, r.lastIndexOf(":"))) }).catch(() => null) : Promise.resolve(null);
 
 /** One of the settings the agents are held to: Any, or a value some or all of them have. */
-function TuneSelect({
-  label,
-  any,
-  value,
-  options,
-  total,
-  onChange,
-}: {
-  label: string;
-  any: string;
-  value: string;
-  options: { id: string; label: string; count: number }[];
-  total: number;
-  onChange: (v: string) => void;
-}) {
-  if (options.length === 0) return null;
-  return (
-    <select className="ms-tune-select" aria-label={label} value={value} data-set={value ? "" : undefined} onChange={(e) => onChange(e.target.value)}>
-      <option value="">{any}</option>
-      {options.map((o) => (
-        <option key={o.id} value={o.id}>
-          {o.label}
-          {o.count < total ? ` (${o.count} of ${total})` : ""}
-        </option>
-      ))}
-    </select>
-  );
-}
-
 export function MessageBar(props: BarProps) {
   // What they understand (commands, modes, models, efforts, and how many have each): again as
   // the agents picked change, come or go. Meanwhile the bar keeps what it knew; before the first
@@ -156,7 +129,6 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
   const attachments = useAttachments("any");
   const { files, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
-  const [choice, setChoice] = React.useState("");
   const [ask, setAsk] = React.useState<Ask | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [report, setReport] = React.useState<BroadcastReport | null>(null);
@@ -174,7 +146,6 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
   if (askedOf !== key) {
     setAskedOf(key);
     setAsk(null);
-    setChoice("");
     setTune(ANY);
   }
 
@@ -198,7 +169,6 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
     } finally {
       setBusy(false);
       setAsk(null);
-      setChoice("");
     }
   };
   const command = (c: Command) => send({ command: c });
@@ -209,9 +179,18 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
     if (!(await send({ approvals: decision }))) unmark(asked);
   };
 
-  // The slash palette: what the agents understand, marked where only some do.
+  // kiln's own, for all of them at once: asked in the line under the field, as any command.
+  const kiln: SlashCommand[] = [
+    { name: "interrupt", group: "Kiln", args: "none", description: working > 0 ? `Stop the turn of ${count(working, "working agent")}` : "Stop their turns (none is working)" },
+    { name: "restart", group: "Kiln", args: "none", description: `Restart ${count(n, "agent")}` },
+    { name: "allow", group: "Kiln", args: "none", description: waiting > 0 ? `Allow ${count(waiting, "tool call")} waiting on you` : "Allow what waits on you (nothing does)" },
+    { name: "deny", group: "Kiln", args: "none", description: waiting > 0 ? `Deny ${count(waiting, "tool call")} waiting on you` : "Deny what waits on you (nothing does)" },
+    ...(reach === "selected" ? [{ name: "end", group: "Kiln", args: "none" as const, description: `End ${count(n, "agent")}: their processes stop` }] : []),
+  ];
+  const kilns = (name: string) => kiln.some((c) => c.name === name);
+  // The slash palette: kiln's own first, then what the agents understand, marked where only some do.
   const slash = parseSlash(text);
-  const items = focused && slash?.typingName ? matchCommands(preview?.commands ?? [], slash.name) : [];
+  const items = focused && slash?.typingName ? [...matchCommands(kiln, slash.name), ...matchCommands(preview?.commands ?? [], slash.name).filter((c) => !kilns(c.name))] : [];
   // The finder: agents to add, for "@" and what's typed after it.
   const at = focused && onPick ? atOf(text) : undefined;
   const pickedIds = React.useMemo(() => new Set(reach === "selected" ? ids : []), [reach, ids]);
@@ -227,12 +206,24 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
     return k !== undefined && k < n ? `${k} of ${n}` : undefined;
   };
   const pick = (c: SlashCommand) => {
-    setText(`/${c.name} `);
     setIndex(0);
+    if (kilns(c.name)) {
+      setText("");
+      choose(c.name);
+      return;
+    }
+    setText(`/${c.name} `);
   };
   const sendText = () => {
     const body = text.trim();
     if ((!body && files.length === 0) || pending > 0 || n === 0 || busy) return;
+    // One of kiln's own: asked in the line under the field, not sent.
+    const typed = parseSlash(body);
+    if (typed && kilns(typed.name) && !typed.args && files.length === 0) {
+      setText("");
+      choose(typed.name);
+      return;
+    }
     // The field empties at once (the line under it says it's on its way); the words come back
     // if it didn't go and nothing new was typed meanwhile.
     const go = async () => {
@@ -269,15 +260,15 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
   const modes = preview?.modes ?? [];
   const models = preview?.models ?? [];
   const efforts = preview?.efforts ?? [];
-  /** A command picked from the select: asked in the line under the field, run from there. */
-  const choose = (v: string) => {
-    setChoice(v);
-    if (!v) {
-      setAsk(null);
+  const counted = <T extends { description?: string; count: number }>(o: T): T =>
+    o.count < total ? { ...o, description: [o.description, `${o.count} of ${total} agents`].filter(Boolean).join(" · ") } : o;
+  /** One of kiln's own commands (typed, picked, or Stop): asked in the line under the field, run from there. */
+  const choose = (what: string) => {
+    const many = count(n, "agent");
+    if ((what === "interrupt" && working === 0) || ((what === "allow" || what === "deny") && waiting === 0)) {
+      setNote(what === "interrupt" ? "None of them is working: there's no turn to stop." : "Nothing of theirs waits on you.");
       return;
     }
-    const [what] = v.split(":");
-    const many = count(n, "agent");
     if (what === "interrupt")
       setAsk({
         ask: `Stop the turn of ${count(working, "working agent")}?`,
@@ -310,7 +301,6 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
         run: async () => {
           await Promise.allSettled(ids.map((id) => harnessApi.stop(id)));
           setAsk(null);
-          setChoice("");
           onEnded?.();
         },
       });
@@ -348,6 +338,28 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
 
   return (
     <section className="ms-msg cp" aria-label="Message agents">
+      {/* What they're held to, as the agent page's line: each its own (unset) or one chosen, with which have it. */}
+      {(modes.length > 0 || models.length > 0 || efforts.length > 0) && (
+        <RunSettings
+          className="ms-tuner"
+          modes={modes.map(counted)}
+          mode={tune.mode}
+          onMode={(mode) => setTune((t) => ({ ...t, mode }))}
+          models={models.map(counted)}
+          model={tune.model}
+          onModel={(model) => setTune((t) => ({ ...t, model }))}
+          efforts={efforts.map(counted)}
+          effort={tune.effort}
+          onEffort={(effort) => setTune((t) => ({ ...t, effort }))}
+          trailing={
+            tune.mode || tune.model || tune.effort ? (
+              <button type="button" className="rs-more" aria-label="Leave each agent's own permissions, model and effort" onClick={() => setTune(ANY)}>
+                Reset
+              </button>
+            ) : undefined
+          }
+        />
+      )}
       <div
         className="ms-msg-field"
         onDragOver={(e) => {
@@ -379,13 +391,6 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
               </>
             ) : (
               <span className="ms-to-all">{held ? `${n} of ${total} agents` : reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
-            )}
-            {(modes.length > 0 || models.length > 0 || efforts.length > 0) && (
-              <span className="ms-tune">
-                <TuneSelect label="Permissions" any="Any permissions" value={tune.mode} options={modes} total={total} onChange={(mode) => setTune((t) => ({ ...t, mode }))} />
-                <TuneSelect label="Model" any="Any model" value={tune.model} options={models} total={total} onChange={(model) => setTune((t) => ({ ...t, model }))} />
-                <TuneSelect label="Effort" any="Any effort" value={tune.effort} options={efforts} total={total} onChange={(effort) => setTune((t) => ({ ...t, effort }))} />
-              </span>
             )}
           </div>
           {attachments.chips}
@@ -451,27 +456,15 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
             </Tip>
             <MicButton field={field} setText={(t) => setText(t)} onNote={setNote} disabled={n === 0} />
             {working > 0 && <SendModes modes={MODES} mode={mode} onMode={setMode} />}
-            {/* On a phone, an icon with the select over it: a tap opens the phone's own list. */}
-            <label className="ms-cmd">
-              <SlidersHorizontal size={15} className="ms-cmd-icon" aria-hidden="true" />
-              <select className="ms-msg-select" aria-label="Command" value={choice} disabled={n === 0 || busy} onChange={(e) => choose(e.target.value)}>
-                <option value="">Command…</option>
-                <option value="interrupt" disabled={working === 0}>
-                  Interrupt{working > 0 ? ` (${working} working)` : ""}
-                </option>
-                <option value="restart">Restart</option>
-                <optgroup label="Waiting on you">
-                  <option value="allow" disabled={waiting === 0}>
-                    Allow {waiting > 0 ? `${waiting} ` : ""}waiting
-                  </option>
-                  <option value="deny" disabled={waiting === 0}>
-                    Deny {waiting > 0 ? `${waiting} ` : ""}waiting
-                  </option>
-                </optgroup>
-                {reach === "selected" && <option value="end">End {count(n, "agent")}</option>}
-              </select>
-            </label>
             <span className="cp-gap" />
+            {working > 0 && (
+              <Tip content={`Stop the turn of ${count(working, "working agent")}`}>
+                <button type="button" className="cp-stop" disabled={busy || n === 0} onClick={() => choose("interrupt")} aria-label={`Stop ${count(working, "working agent")}`}>
+                  <Square size={10} fill="currentColor" />
+                  <span className="cp-label">Stop</span>
+                </button>
+              </Tip>
+            )}
             <button
               type="button"
               className="cp-send"
@@ -540,10 +533,7 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview }: Ba
             size="xs"
             variant="ghost"
             disabled={busy}
-            onClick={() => {
-              setAsk(null);
-              setChoice("");
-            }}
+            onClick={() => setAsk(null)}
           >
             Cancel
           </Button>

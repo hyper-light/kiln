@@ -669,43 +669,10 @@ a.ms-why:hover {
   max-height: 200px;
   field-sizing: content;
 }
-.ms-msg-select {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 190px;
-  height: 30px;
-  padding: 0 26px 0 9px;
-  border: 1px solid #303239;
-  border-radius: 5px;
-  background: #0b0c0e
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E") right 9px
-    center / 10px no-repeat;
-  color: #c8cad0;
-  font-size: 12.5px;
-  text-overflow: ellipsis;
-  appearance: none;
-  cursor: pointer;
-}
-/* Three short words: it never gives way; the command select does. */
-.ms-msg-mode {
-  flex: none;
-}
-.ms-msg-select:hover:not(:disabled) {
-  border-color: #47464f;
-}
-.ms-msg-select:focus-visible {
-  border-color: #a5a0bf;
-  outline: 2px solid rgb(165 160 191 / 25%);
-  outline-offset: 1px;
-}
-.ms-msg-select:disabled {
-  color: #63666e;
-  cursor: default;
-}
-@media (pointer: coarse) {
-  .ms-msg-select {
-    height: 36px;
-  }
+/* What the agents are held to (permissions, model, effort), as the agent page's line above its
+   composer: each its own until one is chosen; then only those that have it are sent to, given it. */
+.ms-tuner {
+  margin: 0 0 10px 2px;
 }
 .ms-msg-field {
   position: relative;
@@ -986,49 +953,6 @@ html[data-motion="paused"] .ms-pick {
   padding: 8px 12px 0;
   font-size: 12px;
 }
-/* The settings the agents are held to, after who they are: Any until one is chosen, then only the
-   agents that have it are sent to, and given it. */
-.ms-tune {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 6px;
-}
-.ms-tune-select {
-  height: 28px;
-  max-width: 190px;
-  padding: 0 24px 0 10px;
-  border: 1px solid #26282e;
-  border-radius: 999px;
-  background: transparent
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E") right 9px
-    center / 9px no-repeat;
-  color: #9a9da6;
-  font-size: 12px;
-  text-overflow: ellipsis;
-  appearance: none;
-  cursor: pointer;
-  transition:
-    border-color 0.15s,
-    color 0.15s;
-}
-.ms-tune-select:hover {
-  border-color: #3a3d45;
-  color: #e3e4e9;
-}
-.ms-tune-select[data-set] {
-  border-color: rgb(186 176 227 / 45%);
-  color: #e3dcfb;
-}
-.ms-tune-select:focus-visible {
-  outline: 2px solid rgb(165 160 191 / 35%);
-  outline-offset: 2px;
-}
-@media (pointer: coarse) {
-  .ms-tune-select {
-    height: 34px;
-  }
-}
 .ms-to-label {
   margin-right: 2px;
   font-family: var(--font-mono);
@@ -1077,38 +1001,6 @@ html[data-motion="paused"] .ms-pick {
     height: 24px;
   }
 }
-/* The command select: as it is where there's room; on a phone an icon, the select over it unseen. */
-.ms-cmd {
-  display: contents;
-}
-.ms-cmd-icon {
-  display: none;
-}
-@container (max-width: 520px) {
-  .ms-cmd {
-    position: relative;
-    display: inline-grid;
-    flex: none;
-    place-items: center;
-    width: 36px;
-    height: 36px;
-    border: 1px solid #303239;
-    border-radius: 999px;
-    color: #a1a4ad;
-  }
-  .ms-cmd-icon {
-    display: block;
-  }
-  .ms-cmd .ms-msg-select {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    max-width: none;
-    height: 100%;
-    opacity: 0;
-  }
-}
-
 /* Before the agents are known (RowsLoading): the bar and a few rows, in their own sizes. */
 .ms-loading-bar {
   height: 40px;

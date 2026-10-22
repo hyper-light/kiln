@@ -80,8 +80,13 @@ counted.
 - **The message box.** It writes to the agents selected (each named in its To line, put back with
   its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
   harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say
-  into the mic, queued, steered or sent now as an agent's own box sends it; or a command from its
-  list. It empties as it sends, and says how it went.
+  into the mic, queued, steered or sent now as an agent's own box sends it. Above it, the agent
+  page's line of settings, permissions · model · effort, each opened in place with the same
+  controls: unset, each agent keeps its own; chosen, only the agents that have it are sent to, and
+  given it first (Reset unsets them all). In the field, / lists kiln's own commands for all of them
+  first (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
+  each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
+  working. It empties as it sends, and says how it went.
 
 ## API
 
