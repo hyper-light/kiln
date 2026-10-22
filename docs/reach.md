@@ -5,7 +5,7 @@ from a Mac, a test on the machine with the GPU, `uptime` on a box by name — ov
 encrypted link the kiln server only relays.
 
 ```text
-kiln run --on linux/amd64 -- cargo test      # the idlest Linux x86-64 runner; this repo synced over first
+kiln run --on linux/amd64 -- cargo test      # this machine if it is one, else the idlest; this repo synced over first
 kiln run --on adacachy --no-sync -- uptime   # a runner by name, in its home folder
 kiln runners linux                           # the Linux runners, best first, and why others don't suit
 ```
@@ -36,9 +36,12 @@ on their own lane (`LANE_REACH`, interactive class, so output never queues behin
 separated by commas or spaces. Aliases are understood (`amd64`, `x64` → `x86_64`; `arm64` →
 `aarch64`; `darwin`, `mac` → `macos`).
 
-Of the connected runners that take reach links and suit, the one with the most idle cores wins,
-then free memory; CI work on it and a tunnelled path (HTTP instead of UDP) count against it, and
-the asking machine itself wins a tie (nothing crosses the network — it then runs locally). The
+Of the connected runners that take reach links and suit, the asking machine itself comes first
+while it has 4 GiB of memory free (nothing crosses the network — it then runs locally — and
+another machine's resources stay its own): work goes elsewhere only when it asks for what this
+machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others, the one
+with the most idle cores wins, then free memory; CI work on it and a tunnelled path (HTTP instead
+of UDP) count against it, and the asking machine wins a tie when it's short of memory. The
 directory comes from the server (cached 30 s, refreshed after every reconnect); the choice is the
 asking runner's. `GET /api/reach/runners?want=…` shows the same ranking.
 
@@ -168,15 +171,16 @@ starts), tell the agent who it is (its id in kiln) and how its goal stack and pl
 the model when reach helps. When a step has to happen on another machine, such as
 the person's Mac, the agent runs it there itself rather than handing the person a command to type.
 When the step needs a person at that machine (a password, a system dialog to allow), the agent
-starts it and says what will appear. Reach also serves builds and tests that need another platform
-or more power. Its tools:
+starts it and says what will appear. Reach also serves builds and tests that need another platform,
+a GPU, or more memory, disk or cores than the agent's machine has; everything else the agent runs
+on its own machine, with its own tools. Its tools:
 
 | tool | does |
 | --- | --- |
 | `code_run` | a JavaScript program against kiln (below); only what it returns comes back |
 | `code_search` | a program over the operations a program may call, and kiln's skills |
 | `runners` | the machines, best first for `want` |
-| `run` | a command on `on` (default: the session's preference, else the best), synced first; returns exit code and output (the middle cut past 30k characters), or an id with `background` |
+| `run` | a command on `on` (default: the session's preference, else this machine), synced first; returns exit code and output (the middle cut past 30k characters), or an id with `background` |
 | `output` | a background run's new output, and whether it ended |
 | `stop` | stop a background run |
 | `agents_*` | kiln's agents operations (docs/agents.md, "Agents that run agents"): what it starts is its child |
