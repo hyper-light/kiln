@@ -160,6 +160,10 @@ struct Streamed {
     finals: u64,
 }
 
+/// The hook kiln registers on Claude Code's Agent tool (`initialize`): its subagents held to the
+/// most the agent may run at once (`State::max_subagents`).
+const SUBAGENTS_HOOK: &str = "kiln-subagents";
+
 /// Its whole state is plain data, written out when this process re-executes itself (an in-place
 /// upgrade) and read back by the next image, which goes on with the same CLI process.
 #[derive(Serialize, Deserialize)]
@@ -176,6 +180,10 @@ pub struct Claude {
     turn: bool,
     /// Tool calls we denied (their error result reads as a denial, not a failure).
     denied: BTreeSet<String>,
+    /// Subagents the Agent tool's hook let start that haven't yet (their tool_use ids): counted
+    /// with those running, so calls made together can't all start past the most it may run.
+    #[serde(default)]
+    agents_allowed: BTreeSet<String>,
     /// This run's tag, in the ids of the notices it makes ([`super::core::run_tag`]).
     #[serde(default = "super::core::run_tag")]
     run: String,
@@ -250,6 +258,7 @@ impl Claude {
             inflight: BTreeSet::new(),
             turn: false,
             denied: BTreeSet::new(),
+            agents_allowed: BTreeSet::new(),
             run: super::core::run_tag(),
             notice_seq: 0,
             allow_bypass,
@@ -564,7 +573,8 @@ impl Claude {
             .map(|s| (*s).to_owned())
             .collect();
         core.touch_meta();
-        self.request(core, Pending::Initialize, json!({"subtype": "initialize"}));
+        // Its Agent tool asks kiln first (whatever its permissions): the most subagents it runs.
+        self.request(core, Pending::Initialize, json!({"subtype": "initialize", "hooks": {"PreToolUse": [{"matcher": "Agent|Task", "hookCallbackIds": [SUBAGENTS_HOOK]}]}}));
     }
 
     /// The process ended: nothing in flight survives it.
@@ -664,7 +674,7 @@ impl Claude {
                 }
             }
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             Command::SetEffort { effort } => {
                 self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
                 core.state.effort = effort;
@@ -1802,8 +1812,7 @@ impl Claude {
         let req = v.get("request").cloned().unwrap_or(Value::Null);
         match str_of(&req, "subtype").unwrap_or("") {
             "can_use_tool" => self.can_use_tool(core, id, &req),
-            // kiln registers no hooks or in-process MCP servers; answer so nothing hangs.
-            "hook_callback" => core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {}}})),
+            "hook_callback" => self.hook_callback(core, &id, &req),
             "elicitation" => self.elicitation(core, id, &req),
             other => core.write(&json!({"type": "control_response", "response": {"subtype": "error", "request_id": id, "error": format!("kiln does not handle {other}")}})),
         }
@@ -1836,6 +1845,34 @@ impl Claude {
         core.touch_state();
         self.asks.insert(id, Ask { input: req.clone(), elicitation: true });
         core.add_approval(approval);
+    }
+
+    /// A hook kiln registered fired: the Agent tool's holds the agent to the most subagents it
+    /// may run at once (`State::max_subagents`), counting those running and those it let start
+    /// that haven't yet. Anything else goes on as asked.
+    fn hook_callback(&mut self, core: &mut Core, id: &str, req: &Value) {
+        let mut out = json!({});
+        if str_of(req, "callback_id") == Some(SUBAGENTS_HOOK) {
+            let running = core.state.tasks.iter().filter(|t| t.live() && t.class.as_deref() == Some("agent") && !t.id.starts_with(super::survivors::LEFT)).count();
+            let under_way = running + self.agents_allowed.len();
+            let tool_id = str_of(req, "tool_use_id").or_else(|| req.get("input").and_then(|i| str_of(i, "tool_use_id")));
+            match core.state.max_subagents.and_then(|m| usize::try_from(m).ok()) {
+                Some(max) if under_way >= max => {
+                    let why = format!(
+                        "This agent runs at most {max} subagent{} at once (its Agent settings), and {under_way} {} running or starting. Wait for one to finish, or do this part yourself, then start another.",
+                        if max == 1 { "" } else { "s" },
+                        if under_way == 1 { "is" } else { "are" },
+                    );
+                    out = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": why}});
+                }
+                _ => {
+                    if let Some(t) = tool_id {
+                        self.agents_allowed.insert(t.to_owned());
+                    }
+                }
+            }
+        }
+        core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": out}}));
     }
 
     fn can_use_tool(&mut self, core: &mut Core, id: String, req: &Value) {
@@ -2027,6 +2064,10 @@ impl Claude {
             "task_started" => {
                 let Some(id) = str_of(v, "task_id") else { return };
                 let tool_id = str_of(v, "tool_use_id").map(str::to_owned);
+                // A subagent its hook let start has: it counts as running from here.
+                if let Some(t) = &tool_id {
+                    self.agents_allowed.remove(t);
+                }
                 let (tool_name, tool_input) = tool_id.as_deref().and_then(|t| self.tools.get(t).cloned()).unwrap_or_default();
                 let class = task_class(str_of(v, "task_type"), &tool_name, str_of(v, "subagent_type").is_some());
                 let output = tool_id.as_deref().and_then(|t| self.bg_files.remove(t)).map(|(_, f)| f);
@@ -2437,6 +2478,7 @@ impl Claude {
     }
 
     fn tool_result(&mut self, core: &mut Core, tid: &str, block: &Value, structured: &Value) {
+        self.agents_allowed.remove(tid);
         let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let mut text = content_text(block.get("content"));
         let (name, input) = self.tools.get(tid).cloned().unwrap_or_default();
@@ -2588,6 +2630,7 @@ impl Claude {
 
     fn result(&mut self, core: &mut Core, v: &Value) {
         self.turn = false;
+        self.agents_allowed.clear();
         let started = core.state.turn_started;
         core.state.turn_started = None;
         core.state.doing = None;
@@ -3922,6 +3965,47 @@ mod tests {
         // The next message goes to the new session.
         c.command(&mut core, Command::Send { id: "m2".into(), text: "now the docs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         assert!(core.take_writes().last().is_some_and(|w| w.contains("\"session_id\":\"new-2\"")));
+        Ok(())
+    }
+
+    /// Its Agent tool's hook (`hook_callback`): Claude Code's answer to the hook for tool call `tool`.
+    fn agent_hook(c: &mut Claude, core: &mut Core, req: &str, tool: &str) -> anyhow::Result<Option<String>> {
+        let ask = json!({"type": "control_request", "request_id": req, "request": {"subtype": "hook_callback", "callback_id": SUBAGENTS_HOOK, "tool_use_id": tool, "input": {"hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_input": {"description": "look"}}}});
+        c.line(core, &ask.to_string());
+        let v: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        anyhow::ensure!(v.pointer("/response/request_id").and_then(Value::as_str) == Some(req), "{v}");
+        Ok(v.pointer("/response/response/hookSpecificOutput/permissionDecision").and_then(Value::as_str).map(str::to_owned))
+    }
+
+    #[test]
+    fn its_agent_tool_waits_once_it_runs_as_many_subagents_as_it_may() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let init: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(init.pointer("/request/hooks/PreToolUse/0/matcher").and_then(Value::as_str), Some("Agent|Task"));
+        assert_eq!(init.pointer("/request/hooks/PreToolUse/0/hookCallbackIds/0").and_then(Value::as_str), Some(SUBAGENTS_HOOK));
+        // No limit of its own: each goes.
+        assert_eq!(agent_hook(&mut c, &mut core, "h0", "t0")?, None);
+        // Two at once: one let start (not started yet) and another; a third waits.
+        core.state.max_subagents = Some(2);
+        assert_eq!(agent_hook(&mut c, &mut core, "h1", "t1")?, None);
+        assert_eq!(agent_hook(&mut c, &mut core, "h2", "t2")?.as_deref(), Some("deny"));
+        // One that started counts as running, no longer as let start: still two.
+        c.line(&mut core, &json!({"type": "system", "subtype": "task_started", "task_id": "a0", "tool_use_id": "t0", "description": "look", "task_type": "local_agent", "uuid": "u", "session_id": "s"}).to_string());
+        assert_eq!(agent_hook(&mut c, &mut core, "h3", "t3")?.as_deref(), Some("deny"));
+        // It ends: room for one.
+        c.line(&mut core, &json!({"type": "system", "subtype": "task_notification", "task_id": "a0", "status": "completed", "uuid": "u", "session_id": "s"}).to_string());
+        assert_eq!(agent_hook(&mut c, &mut core, "h4", "t4")?, None);
+        assert_eq!(agent_hook(&mut c, &mut core, "h5", "t5")?.as_deref(), Some("deny"));
+        // The turn's end lets go of those let start that never did.
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "", "session_id": "s", "uuid": "r"}).to_string());
+        core.take_writes();
+        assert_eq!(agent_hook(&mut c, &mut core, "h6", "t6")?, None);
+        // Another hook goes on as asked.
+        c.line(&mut core, &json!({"type": "control_request", "request_id": "h7", "request": {"subtype": "hook_callback", "callback_id": "other", "input": {}}}).to_string());
+        let v: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(v.pointer("/response/response"), Some(&json!({})));
         Ok(())
     }
 

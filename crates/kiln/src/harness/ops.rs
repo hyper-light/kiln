@@ -715,6 +715,35 @@ mod end_to_end {
     }
 
     #[test]
+    fn an_agent_held_to_fewer_subagents_starts_no_more_through_kiln() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let dir = tempfile::tempdir()?.keep();
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.to_string_lossy().into_owned()),
+                mode: Some("plan".into()),
+                program: Some(dir.join("no-claude").to_string_lossy().into_owned()),
+                max_subagents: Some(1),
+                ..Spec::default()
+            };
+            let infos = hub.harness.open(&hub, "local", spec, 1).await?;
+            let id = infos.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no parent"))?;
+            for _ in 0..200 {
+                if hub.harness.info(&id).is_some_and(|i| i.max_subagents == Some(1)) {
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            let cx = as_agent(&hub, &id).await?;
+            // Under kiln's own 24, its settings say one at once.
+            let two = call(cx, "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE, "count": 2})).await;
+            anyhow::ensure!(two.as_ref().is_err_and(|(_, m)| m.contains("its settings")), "{two:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
     fn bypass_needs_the_parent_s_own_and_chains_and_children_are_bounded() -> anyhow::Result<()> {
         run(async {
             let hub = hub_with(|c| {
