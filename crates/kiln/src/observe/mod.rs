@@ -28,6 +28,7 @@ pub mod owner;
 pub mod pipeline;
 pub mod rehydrate;
 pub mod remote;
+pub mod scanner;
 pub mod scrape;
 pub mod slos;
 pub mod smtp;

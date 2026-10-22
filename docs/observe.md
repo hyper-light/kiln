@@ -35,6 +35,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-21 | Service checks (§9.4): each run, the Agent's (`/api/v1/check_run`) or DogStatsD's (`_sc`), a record and a sample of its status, read from its check's series; Datadog's service check monitor (`"check".over(...).by(...).last(n).count_by_status()`, its thresholds runs in a row, `{{check_message}}`); the check status widget, `POST checks/status`, Datadog's `check_status` imported and given back; the monitor form and page; checked live (a host alerting on its second failure in a row, not its first, its notice the run's message, recovering on its first OK) and in browsers (§13) | done |
 | O-22 | Log archives (§10.5): Datadog's, to S3 (and S3-compatible stores), Cloud Storage and Azure Blob Storage with the cloud integrations' credentials (S3's requests signed with SigV4, the path once and the payload's hash), each record to the first archive whose search takes it; Datadog's objects (an hour's events a folder) and events; each record once through failures, restarts, installs and changes (each archive its place, a file kept to the archives it was begun with, a part written not written again); the store cut within 15 minutes when records come slowly; checked live against RustFS and stand-ins for Google's and Microsoft's stores and token services (§13) | done |
 | O-23 | Rehydration from archives (§10.6): an archive's records of a range that a search takes read back from S3, Cloud Storage or Blob Storage (Datadog's format: what Datadog wrote reads alike) into a view of their own, searched, counted, faceted and patterned as the live logs are (`view`); objects read as they come off the wire (none whole in memory), a read cut short taken up where it stopped; each event read into its record in place (400 ns, nothing allocated; 1.8 million events a second a core as objects come, §12.27); a scan's bound; a view kept for its retention, read again whole when the server stopped in it; checked live against RustFS and the stand-ins, every read cut short (§13) | done |
+| O-24 | Sensitive Data Scanner (§8.9): Datadog's scanning groups and rules, run on every machine where records are taken, after the pipelines, before anything is kept; the standard library (cards with their Luhn digits, IBANs with their checksums, SSNs in their ranges, personal data, network addresses, credentials of a dozen services, private keys, passwords in URLs and assignments), patterns of one's own; what a match becomes (a string, partly hidden, a keyed hash, or tags alone), keywords near, namespaces; the fast path kept for lines no rule may touch; the API, OpenAPI, its pages | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -620,6 +621,7 @@ its schema (§13). Built:
 | `GET/POST span_metrics`, `GET/PUT/DELETE span_metrics/{name}`, `POST span_metric_test` | metrics from spans, as `log_metrics` are; the list says kiln's trace metrics too (`builtin`) |
 | `GET log_sources`, `PUT/DELETE log_sources/{name}`, `POST log_sources/{name}/test` | logs machines collect (§8.1), each with how each machine that reads it goes (files open, records written and in flight, bytes behind; a syslog source's connections and datagrams dropped; the last error; counts since `since_ms`, when its process began reading); `test` reads a source on the server and writes nothing: the files it matches and the records of the newest one's last lines, or whether it may listen where it says |
 | `GET/POST archives`, `GET/PUT/DELETE archives/{id}`, `GET/PUT archive_order` | log archives (§10.5), in the order records are matched against them, Datadog's shape (plain or in its API's envelope), each with Datadog's `state` and what it wrote, failed with and has yet to write; a change applies to the log files cut after it |
+| `GET/POST scanner/groups`, `GET/PUT/DELETE scanner/groups/{id}`, `PUT scanner/group_order`, `GET scanner/standard_patterns`, `POST scanner/test` | the Sensitive Data Scanner (§8.9): its groups in the order they run (Datadog's shape, each rule within, each rule's id given by the server and kept), the standard library, and what a group (or every one that runs) makes of records given, hashing with the kiln's key, nothing kept: reading them an observer's, changing them and the test (an oracle of the kiln's hashes) a maintainer's |
 | `GET/POST rehydrations`, `GET/DELETE rehydrations/{id}` | rehydrations from archives (§10.6): `{name, archive_id, query, from, to, retention_days, max_scan_size_in_gb}`, each with its state, what it read and kept, whether its bound stopped it, and when its view goes; removed, its view goes with it (one being read stops) |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
@@ -1314,6 +1316,51 @@ ignored goes, else the one longest without an error.
 Issues are told as Datadog tells them, by Error Tracking monitors (§9): one of new issues tells each
 as it comes and as it regresses, one of impact each past a number of errors, to the integrations
 their messages name.
+
+### 8.9 Sensitive Data Scanner
+
+What records hold that should never be kept (`crate::observe::scanner`), Datadog's Sensitive Data
+Scanner for logs: scanning groups in order, each a filter (a log search; empty, every record) and
+rules (50 a group, 20 groups); each rule a pattern, one of the standard library's or a regular
+expression of its own. It scans log records, kiln's own events among them, wherever they come from
+(the API, OTLP, Datadog's Agent, a cloud's pull, a log source); spans are not scanned. The server
+keeps them (`<observe>/scanner.json`) and a key made once (`<observe>/scanner.key`, never shown),
+and tells every runner both; each node runs them where it takes a record, after the pipelines (a
+rule reads what they parsed: a JSON line's fields, a grok rule's attributes), so what a rule
+replaces is never stored, replicated, archived or sent anywhere.
+
+- **The library** (`GET scanner/standard_patterns`): credit cards (Visa, Mastercard, American
+  Express, Discover, JCB, Diners Club; each its Luhn digit checked), IBANs (their country's length
+  and mod-97 checksum, ISO 13616), US Social Security numbers (in the ranges the SSA assigns), email
+  addresses, international and North American phone numbers, IPv4, IPv6 and MAC addresses, and
+  credentials: AWS access key IDs and secret keys, GitHub, GitLab, Slack, Stripe, npm, SendGrid,
+  OpenAI and Anthropic keys and tokens, Google API keys, Slack webhooks, JSON Web Tokens, private
+  keys in PEM's armor (whole), a URL's password, a bearer token, a password, secret, API key or token
+  given its value (`password=…`, `"api_key": "…"`), Azure storage account keys and Datadog API keys.
+  A pattern too loose alone (a 40-character AWS secret, a 32-hex Datadog key) counts only with one
+  of its keywords near; a match's tags are `sensitive_data:<id>` and
+  `sensitive_data_category:<category>`.
+- **A rule**: what it finds; where it looks (`message` and attributes by path, an attribute's own
+  beneath it too; none, everywhere) and where it does not; keywords one of which (case aside) must be
+  within `character_count` characters before a match (30; 50 at the most), its own or its pattern's;
+  what replaces a match: a string (`[sensitive_data]` unless said), its first or last N characters
+  hidden (`*` each), a hash, or nothing (the record tagged alone); its tags; its priority (1, critical,
+  to 5). A pattern of its own is Rust's regular expression (linear time: no look-around); a group
+  named `v` in it names what of a match is replaced (`user=(?P<v>\w+)`), as the library's do for a
+  URL's password or a token after `Bearer`. One that matches the empty string is refused.
+- **Hashes** are HMAC-SHA256 under the kiln's key (its first 8 bytes in hex): the same value hashes
+  alike on every machine of a kiln, so records still group by it; with no key, no value is found
+  again by hashing candidates (an unkeyed hash of an SSN or a card number is undone by trying them).
+- **Matches**: every rule of a group whose filter picks a record looks through its message and
+  attributes; of matches that overlap, the one that starts first (then the rule of higher priority,
+  then the longer) is replaced; a rule that only tags never keeps another from replacing. A record's
+  tags are its attributes, so a key several matched rules tag holds their values joined by commas
+  (`sensitive_data:email_address,visa_card`), after any it held. Scanning again changes nothing.
+- **Fast**: a group's rules without keywords are one set (one alone, a single expression, which
+  looks for its literal first), its keywords one pattern (one pass each, which says whether any rule
+  may match); a line no group may find anything in keeps the collector's and OTLP's fast path (its
+  row written from the line, no record made), and that is checked against every scan in tests:
+  whatever the check passes over, no rule would have touched.
 
 ## 9. Monitors
 
@@ -2024,6 +2071,15 @@ time range and the search in the address (a page is a link).
   integration of its cloud that writes there (the only one taken unless chosen), a bucket or account
   and container, a path (its objects' keys shown as it is typed), an S3's region, storage class and
   encryption, another store's endpoint, and whether its events carry tags.
+- **Sensitive data** (a link from the logs explorer, §8.9): the scanning groups in the order they
+  run, each its filter, the rules it has on, and whether it is on; turned on and off, moved and
+  removed from its row. A group's page: its name and filter, its rules in order (each what it finds,
+  what becomes of a match, where it looks; moved, edited and removed from its row), a rule edited in
+  a dialog (what it finds, a standard pattern by its category or a pattern of one's own; what
+  becomes of each match, a string, its first or last characters hidden, a hash, or the record tagged;
+  where it looks and where not; keywords near and how near, a pattern's own when it suggests them;
+  its tags, its priority, whether it is on), and a message tried on the group's rules as they are,
+  saved or not, whatever its filter picks, showing what it becomes and the tags it gets.
 - **Rehydrations** (the Archives page's second part, §10.6): each rehydration, its search and its
   archive, its range, how its reading goes (waiting, listing, objects read of its range's), what it
   kept of what it read (records, objects, bytes; whether its bound stopped it) or why it failed, and
@@ -3335,6 +3391,55 @@ gzip'd objects come (568 MB/s of their JSON, 278 MB/s of the lines they were); t
 106 MB/s of lines at its most (§12.8), so what bounds a rehydration is its view's store and the bytes
 its store sends, not its reading.
 
+### 12.28 The Sensitive Data Scanner
+
+`KOBS_LOGS=<journal> cargo bench -p kiln --bench scanner` and `cargo bench -p kiln --bench
+collect` (fedora, 2026-10-21, a release build, one thread pinned to a core). The scanner's own bench
+reads the journal of §12.8 as 367,666 records (89.5 MB of lines) through one group of every standard
+pattern but the network addresses (28 rules, emails hashed), of those without keywords alone, of
+those with keywords alone, and of one pattern of one's own (`order-(?P<v>[0-9]{6})`): the check a
+reader makes of a line before it makes a record of it (`Scanner::reads`), and a scan of a copy of
+each record (the copy's time taken out); 0.41% of the records may hold something, 0.07% are changed.
+
+| | check, ns a record | allocations a record | scan, ns a record | allocations a record |
+| --- | --- | --- | --- | --- |
+| the library: first cut (bounded runs from any word) | 2,689 | 0.51 | 2,670 | |
+| the library | 513 | 0.003 | 514 | 0.013 |
+| its patterns without keywords | 369 | 0.003 | 358 | 0.011 |
+| its patterns with keywords | 134 | 0.0002 | 103 | 0 |
+| one pattern of one's own: first cut (a set of one) | 394 | 0 | 338 | 0 |
+| one pattern of one's own | 77 | 0 | 43 | 0 |
+
+The first cut's set thrashed `regex`'s lazy DFA: an email's local part (`{0,63}`), its labels
+(`{0,61}`), an IBAN's body (`{11,30}`) and a URL's scheme (`{1,20}`) are runs that may begin at any
+word, every count a state of every word's, and a cache cleared over and over is a cache allocated
+over and over (the 0.51). Unbounded, with `\b` and `\d` ASCII's (a Unicode word boundary sends the
+lazy DFA to a slower engine on the first byte past ASCII), the set runs at some 2 ns a byte of a
+record's texts, with no allocation; its cache made larger (8 MiB) took the rest. A text shorter than
+any match of a group's rules is not looked through (`regex-syntax`'s minimum length). A set has no
+prefilter: a set of one pattern ran its automaton over every byte, so a group's one rule without
+keywords runs as a single `Regex`, whose literal (`order-`) is looked for first, by `memchr`: a
+record without it is passed in 77 ns. A rule's captures are asked for only where its
+pattern (or the set) has found a match: a `captures_iter` over every text made its captures' room
+each time.
+
+Through the collector (300,000 lines, the median of three reads; §12.17's bench):
+
+| | lines a second | MB a second | allocations a line |
+| --- | --- | --- | --- |
+| an nginx access log | 4,202,730 | 594 | 0.01 |
+| … scanned by the library, nothing found | 1,946,209 | 275 | 0.01 |
+| JSON lines, an email each | 1,703,532 | 249 | 0.00 |
+| … scanned, each email hashed | 644,251 | 94 | 20.00 |
+
+A line the scanner finds nothing in keeps the collector's fast path (its row written from the line,
+no record made: 0.01 allocations a line): the check costs some 276 ns of a 141-byte line. A line it
+changes is made a record, scanned, its email hashed (HMAC-SHA256 under the kiln's key, written in
+place) and its record tagged: 20 allocations, of which the scan's are its two new tags' strings and
+the set's list of which patterns matched; the rest are the record's own, as a pipeline's (48 a line,
+kiln's nginx pipeline). A busy machine's 10,000 lines a second cost the library's check 0.3% of a
+core (nginx's lines) to 0.5% (the journal's).
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -3903,6 +4008,26 @@ the last day rehydrated from its row (that archive chosen, the last day the rang
 it kept 2 of the 4 records it read; its view searched in the logs explorer (picked there, over its
 own range, no live tail) holding those two, a search within it finding one; the live logs picked
 again; removed from its row, and from the server. 2026-10-21: passes in all four (9 s each).
+
+**Sensitive Data Scanner** (`crates/kiln/tests/observe_scanner.rs`): a kiln server and a runner as
+processes of their own; a scanning group made through the API before the runner joins (it is told
+the group as it connects): cards replaced, emails hashed, AWS key IDs replaced, a password given its
+value replaced, an order number of a pattern of its own partly hidden (its group `v`, its own tags).
+What is refused, saying why: a pattern that does not compile, a standard pattern not there, a name
+taken. Records through the server's API, the runner's OTLP receiver (decoded on the runner) and a
+file the runner collects (a text line, a JSON line, a line with nothing in it) are stored as the
+rules make them: the email's hash the same on both machines and the one the scanner's test answers;
+each record tagged with what matched (`sensitive_data` holding every matching rule's, joined), a
+rule's own tags; the line with nothing in it as it came. No raw value is found by searching for it,
+in a message or an attribute. A rule turned off: the runner keeps cards after it; the group removed:
+an email after it is stored as it came. 2026-10-21: passes (67 s; fedora). In a browser
+(`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): a group made from its
+page, its filter a service, a rule of the library's Visa cards put in a dialog (a string in its
+place, `[card]`) and one hashing emails; a message tried on its rules before it is kept, coming back
+with its card replaced, its email's hash and both rules' tags; the group as the API keeps it; a
+record of that service taken after it stored with its card replaced, one of another service as it
+came; its row in the list (its rules, on); removed from its row, and from the server. Nothing on
+either page wider than a phone. 2026-10-21: passes in all four (4–6 s each; adacachy).
 
 **SLOs** (`observe_live.rs`): requests counted a minute for three hours ending at a five-minute
 edge, a thousandth failing but in the last 70 minutes, when half do, and a latency high then; a

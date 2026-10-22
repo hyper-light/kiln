@@ -188,6 +188,9 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
               <Button variant="secondary" asChild>
                 <Link to="/observe/archives">Archives</Link>
               </Button>
+              <Button variant="secondary" asChild>
+                <Link to="/observe/scanner">Sensitive data</Link>
+              </Button>
             </div>
           ) : undefined
         }

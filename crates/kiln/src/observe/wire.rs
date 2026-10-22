@@ -71,6 +71,12 @@ pub enum Msg {
     LogSources { sources: Vec<(String, super::collect::Source)> },
     /// Server → runner: the log pipelines every node applies (`super::pipeline`), in order.
     Pipelines { pipelines: Vec<super::pipeline::PipelineDef> },
+    /// Server → runner: the scanning groups every node runs (`super::scanner`), in order, and the
+    /// key their hashes are made with.
+    Scanner {
+        groups: Vec<super::scanner::GroupDef>,
+        key: String,
+    },
     /// Server → runner: the synthetic tests this machine runs (`super::synthetics`), as scrape
     /// targets; and one of them to run now.
     Synthetics { tests: Vec<(String, super::synthetics::Test)> },

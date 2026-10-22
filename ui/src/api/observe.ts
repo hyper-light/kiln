@@ -668,6 +668,49 @@ export interface PipelineIn {
 /** A pipeline as the API shows it; kiln's own (`builtin`) read-only but for whether it is on. */
 export type Pipeline = PipelineIn & { id: string; builtin: boolean; created?: number; modified?: number };
 
+/** What replaces what a scanning rule matches (docs/observe.md §8.9): nothing (its record tagged alone), a keyed hash, a string, or its first or last characters hidden. */
+export type ScanReplacement = "none" | "hash" | "replacement_string" | "partial_replacement_from_beginning" | "partial_replacement_from_end";
+
+/** A sensitive data scanning rule (Datadog's): a standard pattern or one of its own, where it looks, what replaces a match, the tags a match puts on its record. */
+export interface ScanningRule {
+  id?: string;
+  name: string;
+  description?: string;
+  standard_pattern_id?: string;
+  pattern?: string;
+  namespaces: string[];
+  excluded_namespaces: string[];
+  tags: string[];
+  is_enabled: boolean;
+  text_replacement: { type: ScanReplacement; replacement_string?: string; number_of_chars?: number };
+  included_keyword_configuration?: { keywords: string[]; character_count: number; use_recommended_keywords: boolean };
+  priority: number;
+}
+
+/** A scanning group as it is sent: the records it scans (a log search) and its rules. */
+export interface ScanningGroupIn {
+  name: string;
+  description?: string;
+  filter: { query: string };
+  is_enabled: boolean;
+  rules: ScanningRule[];
+}
+
+export type ScanningGroup = ScanningGroupIn & { id: string; created: number; modified: number };
+
+/** A standard pattern a rule may name: what it finds, its tags, and the keywords it suggests (or needs). */
+export interface StandardPattern {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  pattern: string;
+  tags: string[];
+  keywords: string[];
+  keywords_required: boolean;
+  priority: number;
+}
+
 /** The kiln cloud integration whose credentials write an archive's objects (`cloud`, its name); Datadog's own fields beside it kept as given. */
 export type ArchiveIntegration = { cloud: string } & Record<string, unknown>;
 
@@ -1197,6 +1240,15 @@ export const observeApi = {
   updatePipeline: (id: string, p: PipelineIn) => request<Pipeline>("PUT", `${BASE}/pipelines/${enc(id)}`, p),
   deletePipeline: (id: string) => request<void>("DELETE", `${BASE}/pipelines/${enc(id)}`),
   orderPipelines: (ids: string[]) => request<void>("PUT", `${BASE}/pipeline_order`, { pipeline_ids: ids }),
+  scanningGroups: (signal?: AbortSignal) => request<{ groups: ScanningGroup[] }>("GET", `${BASE}/scanner/groups`, undefined, { signal }).then((r) => r.groups),
+  scanningGroup: (id: string, signal?: AbortSignal) => request<ScanningGroup>("GET", `${BASE}/scanner/groups/${enc(id)}`, undefined, { signal }),
+  createScanningGroup: (g: ScanningGroupIn) => request<ScanningGroup>("POST", `${BASE}/scanner/groups`, g),
+  updateScanningGroup: (id: string, g: ScanningGroupIn) => request<ScanningGroup>("PUT", `${BASE}/scanner/groups/${enc(id)}`, g),
+  deleteScanningGroup: (id: string) => request<void>("DELETE", `${BASE}/scanner/groups/${enc(id)}`),
+  orderScanningGroups: (ids: string[]) => request<void>("PUT", `${BASE}/scanner/group_order`, { group_ids: ids }),
+  standardPatterns: (signal?: AbortSignal) => request<{ standard_patterns: StandardPattern[] }>("GET", `${BASE}/scanner/standard_patterns`, undefined, { signal }).then((r) => r.standard_patterns),
+  tryScanner: (group: ScanningGroupIn | null, records: PipelineSample[]) =>
+    request<{ records: PipelineResult[] }>("POST", `${BASE}/scanner/test`, { ...(group ? { group } : {}), records }).then((r) => r.records),
   archives: (signal?: AbortSignal) => request<{ archives: Archive[] }>("GET", `${BASE}/archives`, undefined, { signal }).then((r) => r.archives),
   createArchive: (a: ArchiveIn) => request<Archive>("POST", `${BASE}/archives`, a),
   updateArchive: (id: string, a: ArchiveIn) => request<Archive>("PUT", `${BASE}/archives/${enc(id)}`, a),

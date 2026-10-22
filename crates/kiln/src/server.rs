@@ -243,6 +243,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             o.set_pipelines(pipelines.defs());
         }
         crate::observe::api::set_pipelines(pipelines);
+        // The sensitive data scanner's groups and key: kept here, run here and by every runner.
+        let scanning = std::sync::Arc::new(crate::observe::scanner::kept::Groups::open(&cfg.data("observe")));
+        let (groups, key) = scanning.defs();
+        crate::observe::scanner::kept::activate(&groups, &key);
+        if let Some(o) = crate::observe::api::get() {
+            o.set_scanner(groups, key);
+        }
+        crate::observe::api::set_scanner(scanning);
         // Logs collected: the sources kept here, the server's own read here, each runner told its
         // own.
         let sources = std::sync::Arc::new(crate::observe::collect::Sources::open(&cfg.data("observe")));

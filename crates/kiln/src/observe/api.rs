@@ -158,6 +158,25 @@ fn pipelines() -> Result<&'static std::sync::Arc<super::pipeline::kept::Pipeline
     PIPELINES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "log pipelines are kept by the server"))
 }
 
+static SCANNER: OnceLock<std::sync::Arc<super::scanner::kept::Groups>> = OnceLock::new();
+
+pub fn set_scanner(g: std::sync::Arc<super::scanner::kept::Groups>) {
+    let _ = SCANNER.set(g);
+}
+
+fn scanning() -> Result<&'static std::sync::Arc<super::scanner::kept::Groups>, Fail> {
+    SCANNER.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "the sensitive data scanner's groups are kept by the server"))
+}
+
+/// The scanning groups now, run: here from the next record, every runner told.
+fn apply_scanner(g: &super::scanner::kept::Groups) {
+    let (defs, key) = g.defs();
+    super::scanner::kept::activate(&defs, &key);
+    if let Some(o) = get() {
+        o.set_scanner(defs, key);
+    }
+}
+
 /// The server's log archives, once it started.
 static ARCHIVES: OnceLock<std::sync::Arc<super::archives::Archives>> = OnceLock::new();
 
@@ -385,6 +404,42 @@ struct Sample {
     status: Option<String>,
     #[serde(default)]
     attributes: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScannerTest {
+    /// The group to try; none: every one that runs now, in order.
+    #[serde(default)]
+    group: Option<super::scanner::GroupDef>,
+    records: Vec<Sample>,
+}
+
+/// A sample as the record it stands for (at `now_ns`).
+fn sample_record(s: Sample, now_ns: i64) -> Record {
+    Record {
+        ts: now_ns,
+        severity: s.status.as_deref().map_or(9, super::pipeline::status_of),
+        service: s.service,
+        host: s.host,
+        source: s.source,
+        message: s.message,
+        attrs: s.attributes.into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect(),
+        ..Record::default()
+    }
+}
+
+/// A record as a test answers it.
+fn sample_json(r: &Record) -> Value {
+    json!({
+        "ts_ns": r.ts,
+        "status": kiln_obs::logs::record::level(r.severity),
+        "service": r.service,
+        "host": r.host,
+        "source": r.source,
+        "message": r.message,
+        "attributes": r.attrs.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
+        "trace_id": r.trace_id.map(|t| t.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1230,6 +1285,65 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             apply_pipelines(store);
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
+        (&Method::GET, ["scanner", "groups"]) => Ok(srv::json(StatusCode::OK, &json!({ "groups": scanning()?.list() }))),
+        (&Method::POST, ["scanner", "groups"]) => {
+            let def: super::scanner::GroupDef = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = scanning()?;
+            let kept = store.create(def).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            apply_scanner(store);
+            Ok(srv::json(StatusCode::CREATED, &kept))
+        }
+        (&Method::GET, ["scanner", "groups", id]) => scanning()?.get(id).map(|g| srv::json(StatusCode::OK, &g)).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such scanning group")),
+        (&Method::PUT, ["scanner", "groups", id]) => {
+            let id = (*id).to_owned();
+            let def: super::scanner::GroupDef = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = scanning()?;
+            let kept = store.put(&id, def).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such scanning group"))?;
+            apply_scanner(store);
+            Ok(srv::json(StatusCode::OK, &kept))
+        }
+        (&Method::DELETE, ["scanner", "groups", id]) => {
+            let store = scanning()?;
+            match store.delete(id).map_err(|e| fail(StatusCode::BAD_REQUEST, e))? {
+                true => {
+                    apply_scanner(store);
+                    Ok(srv::status(StatusCode::NO_CONTENT))
+                }
+                false => Err(fail(StatusCode::NOT_FOUND, "no such scanning group")),
+            }
+        }
+        (&Method::PUT, ["scanner", "group_order"]) => {
+            #[derive(Deserialize)]
+            struct Order {
+                group_ids: Vec<String>,
+            }
+            let o: Order = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = scanning()?;
+            store.order(&o.group_ids).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            apply_scanner(store);
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::GET, ["scanner", "standard_patterns"]) => {
+            let all: Vec<Value> = super::scanner::patterns::STANDARD
+                .iter()
+                .map(|p| {
+                    json!({ "id": p.id, "name": p.name, "category": p.category, "description": p.description, "pattern": p.pattern, "tags": p.tags(), "keywords": p.keywords, "keywords_required": p.keywords_required, "priority": p.priority })
+                })
+                .collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "standard_patterns": all })))
+        }
+        (&Method::POST, ["scanner", "test"]) => {
+            // What a group (or every one that runs) makes of records given: nothing kept.
+            let t: ScannerTest = read_json(req.into_body(), QUERY_BODY).await?;
+            if t.records.len() > 100 {
+                return Err(fail(StatusCode::BAD_REQUEST, "100 records at the most"));
+            }
+            let now_ns = super::clock_ms().saturating_mul(1_000_000);
+            let mut records: Vec<Record> = t.records.into_iter().map(|s| sample_record(s, now_ns)).collect();
+            let (_, key) = scanning()?.defs();
+            super::scanner::kept::try_on(t.group.as_ref(), &key, &mut records).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "records": records.iter().map(sample_json).collect::<Vec<Value>>() })))
+        }
         (&Method::GET, ["archives"]) => {
             let list: Vec<Value> = archives()?.list().iter().map(|(a, s)| archive_json(a, s)).collect();
             Ok(srv::json(StatusCode::OK, &json!({ "archives": list })))
@@ -1299,37 +1413,9 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 return Err(fail(StatusCode::BAD_REQUEST, "100 records at the most"));
             }
             let now_ns = super::clock_ms().saturating_mul(1_000_000);
-            let mut records: Vec<Record> = t
-                .records
-                .into_iter()
-                .map(|s| Record {
-                    ts: now_ns,
-                    severity: s.status.as_deref().map_or(9, super::pipeline::status_of),
-                    service: s.service,
-                    host: s.host,
-                    source: s.source,
-                    message: s.message,
-                    attrs: s.attributes.into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect(),
-                    ..Record::default()
-                })
-                .collect();
+            let mut records: Vec<Record> = t.records.into_iter().map(|s| sample_record(s, now_ns)).collect();
             super::pipeline::kept::try_on(t.pipeline.as_ref(), &mut records).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
-            let out: Vec<Value> = records
-                .iter()
-                .map(|r| {
-                    json!({
-                        "ts_ns": r.ts,
-                        "status": kiln_obs::logs::record::level(r.severity),
-                        "service": r.service,
-                        "host": r.host,
-                        "source": r.source,
-                        "message": r.message,
-                        "attributes": r.attrs.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
-                        "trace_id": r.trace_id.map(|t| t.iter().map(|b| format!("{b:02x}")).collect::<String>()),
-                    })
-                })
-                .collect();
-            Ok(srv::json(StatusCode::OK, &json!({ "records": out })))
+            Ok(srv::json(StatusCode::OK, &json!({ "records": records.iter().map(sample_json).collect::<Vec<Value>>() })))
         }
         (&Method::GET, ["clouds"]) => Ok(srv::json(StatusCode::OK, &json!({ "clouds": clouds()?.list() }))),
         (&Method::PUT, ["clouds", name]) => {

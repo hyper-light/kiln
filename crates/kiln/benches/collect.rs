@@ -3,7 +3,10 @@
 //! code (its writes answered at once): an nginx access log (text), JSON lines, a pod's CRI log
 //! (JSON in it), Java stack traces made one record each by a `multi_line` rule, and the access log
 //! again through an exclude and a mask, and through kiln's nginx pipeline (§8.2: grok, the date,
-//! a category, the status, the URL and the user agent read). For each: lines a second and MB a
+//! a category, the status, the URL and the user agent read); and both through the Sensitive Data
+//! Scanner (§8.9: every standard pattern but the network addresses), the access log finding nothing
+//! (what the scanner's check costs a line that keeps its fast path) and JSON lines each with an email
+//! it hashes (a record made, scanned and changed each line). For each: lines a second and MB a
 //! second (the median of three reads), records, and per line the allocations and bytes allocated,
 //! and the page faults.
 //!
@@ -76,6 +79,28 @@ fn json_line(i: u64) -> String {
     )
 }
 
+/// JSON lines as [`json_line`]'s, each with its user's email.
+fn pii_line(i: u64) -> String {
+    format!(
+        "{{\"ts\":\"2026-10-18T12:00:{:02}.{:06}Z\",\"level\":\"info\",\"msg\":\"order {i} paid\",\"order_id\":{i},\"user\":{{\"id\":\"u{}\",\"email\":\"user{}@example.com\"}}}}\n",
+        i % 60,
+        i % 1_000_000,
+        i % 1000,
+        i % 1000
+    )
+}
+
+/// A scanning group of every standard pattern but the network addresses, an email hashed and the
+/// rest replaced.
+fn library() -> Vec<kiln::observe::scanner::GroupDef> {
+    let rules: Vec<serde_json::Value> = kiln::observe::scanner::patterns::STANDARD
+        .iter()
+        .filter(|p| p.category != "network")
+        .map(|p| serde_json::json!({ "name": p.id, "standard_pattern_id": p.id, "text_replacement": { "type": if p.id == "email_address" { "hash" } else { "replacement_string" } } }))
+        .collect();
+    vec![serde_json::from_value(serde_json::json!({ "name": "library", "rules": rules })).unwrap()]
+}
+
 fn main() {
     let n: u64 = std::env::var("KOBS_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(300_000);
     let dir = tempfile::tempdir().expect("a folder");
@@ -103,6 +128,10 @@ fn main() {
         n,
     ));
     cases.push(("text, kiln's nginx pipeline", Source { source: Some("nginx".into()), ..source(d, "access.log", Format::Auto, Vec::new()) }, n));
+    cases.push(("text, scanned: none found", source(d, "access.log", Format::Auto, Vec::new()), n));
+    let lines = write(&d.join("pii.json"), (0..n).map(pii_line)).unwrap();
+    cases.push(("JSON, an email each", source(d, "pii.json", Format::Auto, Vec::new()), lines));
+    cases.push(("JSON, scanned: an email each", source(d, "pii.json", Format::Auto, Vec::new()), lines));
     let written = std::env::var("KOBS_WRITTEN").is_ok_and(|v| v == "1");
     println!("{n} lines a file; the median of 3 reads; allocations and faults of one{}", if written { "; through a batcher into its writes" } else { "" });
     println!("{:<26} {:>9} {:>9} {:>12} {:>9} {:>11} {:>11} {:>8} {:>13}", "case", "MB", "records", "lines/s", "MB/s", "allocs/line", "bytes/line", "faults", "written B/line");
@@ -111,6 +140,8 @@ fn main() {
         // kiln's own pipelines on for the case that names one (they read `source:nginx` alone).
         let pipelines: Vec<_> = if name.contains("pipeline") { kiln::observe::pipeline::builtin::all().into_iter().map(|(_, p)| p).collect() } else { Vec::new() };
         kiln::observe::pipeline::kept::activate(&pipelines);
+        // The scanner on for the cases that say so.
+        kiln::observe::scanner::kept::activate(&if name.contains("scanned") { library() } else { Vec::new() }, "bench-key");
         let mut times: Vec<Duration> = Vec::new();
         let mut out = (0, 0, 0);
         let mut counted = alloc::Counts::default();

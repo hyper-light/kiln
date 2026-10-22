@@ -895,6 +895,7 @@ impl<'a> Files<'a> {
         }
         self.sink.now_ns = crate::observe::clock_ms().saturating_mul(1_000_000);
         self.sink.filters.pipelines = crate::observe::pipeline::kept::snapshot();
+        self.sink.filters.scanner = crate::observe::scanner::kept::snapshot();
         let mut busy = false;
         let mut i = 0;
         while i < self.tails.len() {

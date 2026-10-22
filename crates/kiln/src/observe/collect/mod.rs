@@ -413,6 +413,9 @@ pub(crate) struct Origin {
 pub(crate) struct PipelineFilters {
     pub pipelines: Arc<Vec<super::pipeline::Pipeline>>,
     pub scratch: super::pipeline::Scratch,
+    /// The sensitive data scanner, and its room: a line it may find something in is made a record.
+    pub scanner: Arc<super::scanner::Scanner>,
+    pub scan: super::scanner::Scratch,
 }
 
 /// A line's fields as its record would hold them ([`Compiled::record`]), borrowed (a JSON line's
@@ -550,8 +553,8 @@ impl Compiled {
                 trace_id: read.as_ref().and_then(|j| j.trace_id),
                 span_id: read.as_ref().and_then(|j| j.span_id),
             };
-            let PipelineFilters { pipelines, scratch } = filters;
-            if pipelines.iter().any(|p| p.reads(&view, scratch)) {
+            let PipelineFilters { pipelines, scratch, scanner, scan } = filters;
+            if pipelines.iter().any(|p| p.reads(&view, scratch)) || (!scanner.is_empty() && scanner.reads(&view, || view.attrs(), scan)) {
                 b.push(self.record_of(text, &line, read.as_ref(), room, origin, now_ns));
                 return None;
             }
@@ -1523,6 +1526,7 @@ impl<M> InFlight<M> {
             if let LogPart::Records(run) = part {
                 if let Some(fresh) = run.get_mut(b.processed.saturating_sub(seen)..) {
                     super::pipeline::kept::process(fresh);
+                    super::scanner::kept::process(fresh);
                 }
                 seen += run.len();
             }

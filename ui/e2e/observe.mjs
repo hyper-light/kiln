@@ -1628,6 +1628,77 @@ const scenarios = {
     }
   },
 
+  /**
+   * A scanning group made on its page (docs/observe.md §8.9): two rules added in their dialog (a
+   * card number replaced, an email hashed), a message tried on it before it is kept, the group
+   * made; records taken after it stored as its rules make them; its row in the list, it removed. On
+   * a phone, both pages fit across.
+   */
+  async "a scanning group is made with its rules, tried, and keeps what it finds out of the store"() {
+    const name = `E2E pii ${run}`;
+    const service = `e2e-sds-${run}`;
+    const card = "4111 1111 1111 1111";
+    let made = null;
+    try {
+      await page.goto(`${BASE}/observe/scanner`);
+      await page.getByRole("link", { name: "New group", exact: true }).click();
+      await page.waitForURL(/\/observe\/scanner\/new/);
+      await fillIn(page.getByLabel("Name", { exact: true }), name);
+      await fillIn(page.getByLabel("Filter", { exact: true }), `service:${service}`);
+      const addRule = async (finds, each, text) => {
+        await page.getByRole("button", { name: "Add a rule", exact: true }).click();
+        const d = page.getByRole("dialog");
+        await d.getByLabel("Finds", { exact: true }).selectOption({ label: finds });
+        await d.getByLabel("Each match", { exact: true }).selectOption({ label: each });
+        if (text !== undefined) await fillIn(d.getByLabel("Replaced with", { exact: true }), text);
+        await d.getByRole("button", { name: "Add it", exact: true }).click();
+        await d.waitFor({ state: "detached" });
+      };
+      await addRule("Credit card · Visa card", "A string in its place", "[card]");
+      await addRule("Personal · Email address", "A hash of it");
+      // Tried before it is kept.
+      await fillIn(page.getByLabel("Message", { exact: true }), `paid with ${card} by jane@example.com`);
+      await page.getByRole("button", { name: "Try it", exact: true }).click();
+      const tried = page.getByRole("status");
+      let shown = "";
+      await until("the tried record", async () => /paid with \[card\] by [0-9a-f]{16}/.test((shown = (await tried.textContent()) ?? ""))).catch((e) => {
+        throw new Error(`${e.message} (it showed: ${shown})`);
+      });
+      expect(/visa_card/.test((await tried.textContent()) ?? "") && /email_address/.test((await tried.textContent()) ?? ""), `its tags shown: ${await tried.textContent()}`);
+      await fitsAcross("a scanning group's page");
+      await page.getByRole("button", { name: "Make the group", exact: true }).click();
+      await page.waitForURL(/\/observe\/scanner\/(?!new)[^/?#]+$/);
+      made = (await api("GET", "/api/observe/v1/scanner/groups")).body.groups.find((g) => g.name === name);
+      expect(
+        made && made.filter.query === `service:${service}` && made.rules.length === 2 && made.rules[0].standard_pattern_id === "visa_card" && made.rules[1].text_replacement.type === "hash",
+        `made as said: ${JSON.stringify(made)}`,
+      );
+      // Records taken after it: as its rules make them those its filter picks, the rest as they came.
+      const other = `${service}-other`;
+      const posted = await api("POST", "/api/observe/v1/logs", [
+        { message: `order paid with ${card}`, service, hostname: "e2e", source: "app" },
+        { message: `order paid with ${card}`, service: other, hostname: "e2e", source: "app" },
+      ]);
+      expect(posted.status === 202, "posting the records");
+      const stored = async (s) =>
+        (await api("POST", "/api/observe/v1/logs/search", { query: `service:${s}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 10 })).body?.records?.[0]?.message;
+      await until("the record stored with its card replaced", async () => (await stored(service)) === "order paid with [card]");
+      await until("another service's record stored as it came", async () => (await stored(other)) === `order paid with ${card}`);
+      // Its row; it removed.
+      await page.goto(`${BASE}/observe/scanner`);
+      const row = page.locator("table.data-table tbody tr").filter({ has: page.getByText(name, { exact: true }) });
+      await until("its row", async () => /Visa card/.test((await row.textContent()) ?? "") && /On/.test((await row.textContent()) ?? ""));
+      await fitsAcross("the scanning groups' page");
+      await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+      await until(`${name} gone`, async () => (await row.count()) === 0);
+      expect((await api("GET", `/api/observe/v1/scanner/groups/${made.id}`)).status === 404, "removed on the server");
+      made = null;
+    } finally {
+      if (made) await api("DELETE", `/api/observe/v1/scanner/groups/${made.id}`);
+    }
+  },
+
   /** A metric from logs tried on the records of the last fifteen minutes, made, counting the
    * records that come after (as the API's query says), charted, and removed. */
   async "a metric from logs is tried, made, counts what comes after, and is removed"() {

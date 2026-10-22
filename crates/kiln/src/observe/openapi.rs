@@ -961,6 +961,88 @@ fn schemas() -> Map<String, Value> {
             &["records"],
         ),
     );
+    // The sensitive data scanner (§8.9): Datadog's scanning groups, their rules within.
+    let rule_fields = [
+        ("id", describe(string(), "given by the server; kept as the group is changed")),
+        ("name", string()),
+        ("description", string()),
+        ("standard_pattern_id", describe(string(), "a standard pattern's id (GET scanner/standard_patterns); else pattern")),
+        ("pattern", describe(string(), "a regular expression (Rust's regex: no look-around); a group named v names what of a match is replaced")),
+        ("namespaces", describe(array(string()), "where it looks: message and attributes by path (beneath them too); none, everywhere")),
+        ("excluded_namespaces", describe(array(string()), "where it does not")),
+        ("tags", describe(array(string()), "key:value tags a match puts on its record; a standard pattern's unless said")),
+        ("is_enabled", boolean()),
+        (
+            "text_replacement",
+            object(
+                &[
+                    ("type", one_of(&["none", "hash", "replacement_string", "partial_replacement_from_beginning", "partial_replacement_from_end"])),
+                    ("replacement_string", describe(string(), "replacement_string's: [sensitive_data] unless said")),
+                    ("number_of_chars", describe(integer(), "a partial replacement's: characters hidden")),
+                ],
+                &["type"],
+            ),
+        ),
+        (
+            "included_keyword_configuration",
+            describe(
+                object(
+                    &[
+                        ("keywords", array(string())),
+                        ("character_count", describe(integer(), "how far before a match a keyword is looked for (30; 50 at the most)")),
+                        ("use_recommended_keywords", boolean()),
+                    ],
+                    &[],
+                ),
+                "keywords one of which must be near a match for it to count",
+            ),
+        ),
+        ("priority", describe(integer(), "1 (critical) to 5 (info): of overlapping matches, the higher's is replaced")),
+    ];
+    put("ScanningRule", object(&rule_fields, &["name"]));
+    let group_fields = [
+        ("name", string()),
+        ("description", string()),
+        ("filter", object(&[("query", describe(string(), "a log search: the records it scans; empty: every record"))], &[])),
+        ("is_enabled", boolean()),
+        ("rules", array(schema("ScanningRule"))),
+    ];
+    put("ScanningGroupIn", object(&group_fields, &["name"]));
+    let mut kept_group: Vec<(&str, Value)> = group_fields.to_vec();
+    kept_group.push(("id", string()));
+    kept_group.push(("created", integer()));
+    kept_group.push(("modified", integer()));
+    put("ScanningGroup", object(&kept_group, &["id", "name", "filter", "is_enabled", "rules"]));
+    put(
+        "StandardPattern",
+        object(
+            &[
+                ("id", string()),
+                ("name", string()),
+                ("category", string()),
+                ("description", string()),
+                ("pattern", string()),
+                ("tags", array(string())),
+                ("keywords", array(string())),
+                ("keywords_required", describe(boolean(), "too loose alone: a match counts only with one of its keywords near")),
+                ("priority", integer()),
+            ],
+            &["id", "name", "category", "pattern", "tags", "priority"],
+        ),
+    );
+    put(
+        "ScannerTest",
+        object(
+            &[
+                ("group", describe(schema("ScanningGroupIn"), "the group tried; none: every one that runs now, in order")),
+                (
+                    "records",
+                    array(object(&[("message", string()), ("service", string()), ("host", string()), ("source", string()), ("status", string()), ("attributes", map_of(string()))], &["message"])),
+                ),
+            ],
+            &["records"],
+        ),
+    );
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
@@ -1802,6 +1884,76 @@ fn ops() -> Vec<Op<'static>> {
             "observe.read",
             Some(body("PipelineTest")),
             vec![("200", answer_of("the records processed", object(&[("records", array(object(&[("ts_ns", integer()), ("status", string()), ("service", string()), ("host", string()), ("source", string()), ("message", string()), ("attributes", map_of(string())), ("trace_id", nullable(string()))], &["message", "attributes"])))], &["records"])))],
+        ),
+        op(
+            "get",
+            "/scanner/groups",
+            "Lists the sensitive data scanner's groups in the order they run",
+            "observe.read",
+            None,
+            vec![("200", answer_of("the groups", object(&[("groups", array(schema("ScanningGroup")))], &["groups"])))],
+        ),
+        op(
+            "post",
+            "/scanner/groups",
+            "Makes a scanning group, last (checked: its filter and rules compile)",
+            "observe.manage",
+            Some(body("ScanningGroupIn")),
+            vec![("201", answer("made", Some("ScanningGroup")))],
+        ),
+        Op { params: vec![id()], ..op("get", "/scanner/groups/{id}", "A scanning group", "observe.read", None, vec![ok("ScanningGroup")]) },
+        Op {
+            params: vec![id()],
+            ..op("put", "/scanner/groups/{id}", "Changes a scanning group whole (its rules' ids kept)", "observe.manage", Some(body("ScanningGroupIn")), vec![ok("ScanningGroup")])
+        },
+        Op { params: vec![id()], ..op("delete", "/scanner/groups/{id}", "Removes a scanning group", "observe.manage", None, vec![no_content()]) },
+        op(
+            "put",
+            "/scanner/group_order",
+            "Puts the scanning groups in an order (every one, each once)",
+            "observe.manage",
+            Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("group_ids", array(string()))], &["group_ids"]) } } })),
+            vec![no_content()],
+        ),
+        op(
+            "get",
+            "/scanner/standard_patterns",
+            "The standard patterns a rule may name",
+            "observe.read",
+            None,
+            vec![("200", answer_of("the patterns", object(&[("standard_patterns", array(schema("StandardPattern")))], &["standard_patterns"])))],
+        ),
+        op(
+            "post",
+            "/scanner/test",
+            "What a scanning group (or every one that runs, in order) makes of records given, hashing with this kiln's key: nothing kept",
+            "observe.manage",
+            Some(body("ScannerTest")),
+            vec![(
+                "200",
+                answer_of(
+                    "the records scanned",
+                    object(
+                        &[(
+                            "records",
+                            array(object(
+                                &[
+                                    ("ts_ns", integer()),
+                                    ("status", string()),
+                                    ("service", string()),
+                                    ("host", string()),
+                                    ("source", string()),
+                                    ("message", string()),
+                                    ("attributes", map_of(string())),
+                                    ("trace_id", nullable(string())),
+                                ],
+                                &["message", "attributes"],
+                            )),
+                        )],
+                        &["records"],
+                    ),
+                ),
+            )],
         ),
         op("get", "/slos", "Lists SLOs, each its standing", "observe.read", None, vec![("200", answer_of("the SLOs", object(&[("slos", array(schema("Slo")))], &["slos"])))]),
         op("post", "/slos", "Makes an SLO", "observe.write", Some(body("SloIn")), vec![("201", answer("made", Some("SloKept")))]),

@@ -498,8 +498,9 @@ fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body:
                 }
                 // A record a pipeline reads is made a record, for it to be processed where taken.
                 filters.pipelines = super::pipeline::kept::snapshot();
-                let super::collect::PipelineFilters { pipelines, scratch } = filters;
-                d.decode(pb, now_ns, &mut |v| pipelines.iter().any(|p| p.reads(v, scratch)), &mut out)
+                filters.scanner = super::scanner::kept::snapshot();
+                let super::collect::PipelineFilters { pipelines, scratch, scanner, scan } = filters;
+                d.decode(pb, now_ns, &mut |v| pipelines.iter().any(|p| p.reads(v, scratch)) || (!scanner.is_empty() && scanner.reads(v, || v.attrs(), scan)), &mut out)
             });
             let give = |parts: Vec<super::ingest::LogPart>| {
                 for part in parts {

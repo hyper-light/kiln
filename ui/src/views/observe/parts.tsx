@@ -25,6 +25,8 @@ import {
   type Pipeline,
   type Archive,
   type Rehydration,
+  type ScanningGroup,
+  type StandardPattern,
   type LogMetric,
   type Downtime,
   type LogMetricCounting,
@@ -464,6 +466,9 @@ export const logSourcesRes: Res<LogSource[]> = { key: "observe/log_sources", fet
 export const pipelinesRes: Res<Pipeline[]> = { key: "observe/pipelines", fetch: (s) => observeApi.pipelines(s) };
 export const archivesRes: Res<Archive[]> = { key: "observe/archives", fetch: (s) => observeApi.archives(s), opts: { pollMs: 10_000 } };
 export const rehydrationsRes: Res<Rehydration[]> = { key: "observe/rehydrations", fetch: (s) => observeApi.rehydrations(s), opts: { pollMs: 5_000 } };
+export const scanningGroupsRes: Res<ScanningGroup[]> = { key: "observe/scanner/groups", fetch: (s) => observeApi.scanningGroups(s) };
+export const scanningGroupRes = (id: string): Res<ScanningGroup> => ({ key: `observe/scanner/group/${id}`, fetch: (s) => observeApi.scanningGroup(id, s) });
+export const standardPatternsRes: Res<StandardPattern[]> = { key: "observe/scanner/standard_patterns", fetch: (s) => observeApi.standardPatterns(s) };
 export const logMetricsRes: Res<{ log_metrics: LogMetric[]; counting: LogMetricCounting }> = { key: "observe/log_metrics", fetch: (s) => observeApi.logMetrics(s), opts: { pollMs: 10_000 } };
 export const pipelineRes = (id: string): Res<Pipeline> => ({ key: `observe/pipeline/${id}`, fetch: (s) => observeApi.pipeline(id, s) });
 export const dashboardsRes: Res<DashboardSummary[]> = { key: "observe/dashboards", fetch: (s) => observeApi.dashboards(s) };

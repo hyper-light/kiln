@@ -200,6 +200,8 @@ enum Input {
     LogSources(Vec<(String, super::collect::Source)>),
     /// The server's log pipelines, in order: every runner is told them all.
     Pipelines(Vec<super::pipeline::PipelineDef>),
+    /// The server's scanning groups, in order, and their key: every runner is told them.
+    Scanner(Vec<super::scanner::GroupDef>, String),
     /// The server's synthetic tests, all of them: each runner is told those it runs; and one of
     /// them to run now everywhere.
     Synthetics(Vec<(String, super::synthetics::Test)>),
@@ -465,6 +467,12 @@ impl Observe {
         let _ = self.tx.send(Input::Pipelines(all));
     }
 
+    /// The server's scanning groups now, and their key: every runner is told them, now and when it
+    /// connects.
+    pub fn set_scanner(&self, groups: Vec<super::scanner::GroupDef>, key: String) {
+        let _ = self.tx.send(Input::Scanner(groups, key));
+    }
+
     /// The server's synthetic tests now: each runner is told those it runs, now and when it
     /// connects.
     pub fn set_synthetics(&self, all: Vec<(String, super::synthetics::Test)>) {
@@ -563,6 +571,7 @@ impl Observe {
         if ack.is_none() {
             for run in logs.runs_mut() {
                 super::pipeline::kept::process(run);
+                super::scanner::kept::process(run);
             }
         }
         // Each error's issue (`kiln_obs::errors`), after the pipelines that name its parts.
@@ -783,6 +792,7 @@ struct Owner {
     statsd: Vec<(String, super::statsd::Listener)>,
     log_sources: Vec<(String, super::collect::Source)>,
     pipelines: Vec<super::pipeline::PipelineDef>,
+    scanner: (Vec<super::scanner::GroupDef>, String),
     joiner: Joiner,
     part: u64,
     error: Option<String>,
@@ -860,6 +870,7 @@ impl Owner {
             statsd: Vec::new(),
             log_sources: Vec::new(),
             pipelines: Vec::new(),
+            scanner: (Vec::new(), String::new()),
             joiner: Joiner::default(),
             part: 0,
             error: None,
@@ -1108,6 +1119,13 @@ impl Owner {
                     self.send(&machine, Msg::Pipelines { pipelines: self.pipelines.clone() }, Vec::new());
                 }
             }
+            Input::Scanner(groups, key) => {
+                self.scanner = (groups, key);
+                let up: Vec<String> = self.up.iter().cloned().collect();
+                for machine in up {
+                    self.send(&machine, Msg::Scanner { groups: self.scanner.0.clone(), key: self.scanner.1.clone() }, Vec::new());
+                }
+            }
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::LogsAcked(records, ack) => self.batcher.logs_acked(records, ack, Instant::now()),
             Input::Spans(segments) => self.batcher.spans(segments, Instant::now()),
@@ -1184,6 +1202,7 @@ impl Owner {
         self.send_statsd(machine);
         self.send_log_sources(machine);
         self.send(machine, Msg::Pipelines { pipelines: self.pipelines.clone() }, Vec::new());
+        self.send(machine, Msg::Scanner { groups: self.scanner.0.clone(), key: self.scanner.1.clone() }, Vec::new());
     }
 
     /// Tells `machine` the scrape targets it reads.
@@ -1255,7 +1274,17 @@ impl Owner {
             Msg::Status(s) => {
                 self.statuses.insert(machine.to_owned(), s);
             }
-            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } | Msg::LogSources { .. } | Msg::Pipelines { .. } | Msg::Synthetics { .. } | Msg::RunSynthetic { .. } | Msg::Statsd { .. } => {}
+            Msg::Written { .. }
+            | Msg::Member { .. }
+            | Msg::Release
+            | Msg::Verify
+            | Msg::Scrapes { .. }
+            | Msg::LogSources { .. }
+            | Msg::Pipelines { .. }
+            | Msg::Scanner { .. }
+            | Msg::Synthetics { .. }
+            | Msg::RunSynthetic { .. }
+            | Msg::Statsd { .. } => {}
         }
     }
 
@@ -1383,6 +1412,7 @@ impl Owner {
                 }
             }
             Msg::Pipelines { pipelines } => super::pipeline::kept::activate(&pipelines),
+            Msg::Scanner { groups, key } => super::scanner::kept::activate(&groups, &key),
             Msg::Synthetics { tests } => {
                 if let Some(r) = super::synthetics::runner() {
                     r.set(&tests);

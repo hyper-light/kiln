@@ -2030,6 +2030,7 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "regex",
+ "regex-syntax",
  "rpassword",
  "rquickjs",
  "rusqlite",

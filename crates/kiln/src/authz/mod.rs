@@ -424,6 +424,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/observe/v1/pipelines", "observe.manage", At::Server),
     any("/api/observe/v1/pipelines/**", "observe.manage", At::Server),
     any("/api/observe/v1/pipeline_order", "observe.manage", At::Server),
+    // The sensitive data scanner changes every record stored from then on, and its test hashes
+    // with this kiln's key: a maintainer's.
+    any("/api/observe/v1/scanner/**", "observe.manage", At::Server),
     // Archives write every record they take to a store outside, with a cloud integration's
     // credentials: a maintainer's.
     any("/api/observe/v1/archives", "observe.manage", At::Server),
