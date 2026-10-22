@@ -399,13 +399,12 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .cp-mirror[data-off] {
   opacity: 0.5;
 }
-/* iOS sets a field's text in from where a box's is: there it stays plain. */
+/* iOS breaks a field's lines as its own stylesheet says (WebKit's html.css: spaces end a line, a
+   no-break space is a space); the copy under it does the same, so both break in the same places. */
 @supports (-webkit-touch-callout: none) {
   .cp .hx-compose-input.cp-mirror {
-    display: none;
-  }
-  .cp .cp-input {
-    color: var(--color-foreground);
+    -webkit-nbsp-mode: space;
+    line-break: after-white-space;
   }
 }
 .cp-mirror .md-m {
