@@ -918,6 +918,70 @@ pub fn local_name(hub: &Hub, reference: &str) -> Option<String> {
     valid_name(name).then(|| name.to_owned())
 }
 
+/// Bytes put into kiln's repository `name` as a blob (into the content store, linked there): their
+/// digest and size.
+async fn put_bytes(hub: &Hub, name: &str, bytes: &[u8]) -> anyhow::Result<(String, u64)> {
+    let path = crate::ci::services::cas::staging(hub).join(format!("put-{}", crate::util::new_id()));
+    let (p, b) = (path.clone(), bytes.to_vec());
+    crate::rt::blocking(move || -> std::io::Result<()> {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&p, b)
+    })
+    .await??;
+    let obj = crate::ci::services::cas::put_file(hub, &path).await;
+    let _ = crate::rt::blocking(move || std::fs::remove_file(path)).await;
+    let obj = obj?;
+    let digest = format!("sha256:{}", obj.digest);
+    link(hub, name, &digest, obj.size).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    Ok((digest, obj.size))
+}
+
+/// Helm's media types for a chart in an OCI registry, as `helm push` writes them.
+pub const HELM_CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
+pub const HELM_CHART: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
+
+/// A Helm chart (its packaged `.tgz`, and its `Chart.yaml` as JSON) published in kiln's repository
+/// `name` under the tag `version`, as `helm push` does; one there under that tag already is kept.
+/// The manifest's digest.
+pub async fn put_chart(hub: &Hub, name: &str, version: &str, tgz: &[u8], meta: &Value) -> anyhow::Result<String> {
+    anyhow::ensure!(valid_name(name) && valid_tag(version), "{name}:{version} isn't a repository and a tag");
+    if let Some(m) = find_manifest(hub, name, version).await.map_err(|e| anyhow::anyhow!("{}", e.message))? {
+        return Ok(m.digest);
+    }
+    let (cd, cs) = put_bytes(hub, name, &serde_json::to_vec(meta)?).await?;
+    let (ld, ls) = put_bytes(hub, name, tgz).await?;
+    let chart = meta.get("name").and_then(Value::as_str).unwrap_or(name);
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "config": { "mediaType": HELM_CONFIG, "digest": cd, "size": cs },
+        "layers": [{ "mediaType": HELM_CHART, "digest": ld, "size": ls }],
+        "annotations": { "org.opencontainers.image.title": chart, "org.opencontainers.image.version": version },
+    });
+    let body = serde_json::to_vec(&manifest)?;
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+    let annotations = manifest.get("annotations").map(Value::to_string);
+    let (n, d, t, len) = (name.to_owned(), digest.clone(), version.to_owned(), i64::try_from(body.len()).unwrap_or(i64::MAX));
+    hub.store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let now = crate::util::now_unix();
+            tx.execute("INSERT INTO registry_repos (name, created_at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING", params![n, now])?;
+            tx.execute(
+                "INSERT INTO registry_manifests (repo, digest, media_type, artifact_type, subject, annotations, body, size, created_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (repo, digest) DO NOTHING",
+                params![n, d, OCI_MANIFEST, HELM_CONFIG, annotations, body, len, now],
+            )?;
+            tx.execute("INSERT INTO registry_tags (repo, tag, digest, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (repo, tag) DO NOTHING", params![n, t, d, now])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(digest)
+}
+
 /// Attaches `bundle` (a Sigstore bundle about `subject`, its predicate `predicate_type`) to that
 /// image in kiln's repository `name` through the referrers API: an artifact manifest whose
 /// subject is the image (W18). `None` when the image isn't there.
@@ -927,21 +991,7 @@ pub async fn attach(hub: &Hub, name: &str, subject: &str, bundle: &[u8], predica
     let Some((media_type, size)) = target else { return Ok(None) };
     let mut blobs = Vec::new();
     for bytes in [b"{}".as_slice(), bundle] {
-        let path = crate::ci::services::cas::staging(hub).join(format!("attach-{}", crate::util::new_id()));
-        let (p, b) = (path.clone(), bytes.to_vec());
-        crate::rt::blocking(move || -> std::io::Result<()> {
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&p, b)
-        })
-        .await??;
-        let obj = crate::ci::services::cas::put_file(hub, &path).await;
-        let _ = crate::rt::blocking(move || std::fs::remove_file(path)).await;
-        let obj = obj?;
-        let digest = format!("sha256:{}", obj.digest);
-        link(hub, name, &digest, obj.size).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
-        blobs.push((digest, obj.size));
+        blobs.push(put_bytes(hub, name, bytes).await?);
     }
     let ((cd, cs), (bd, bs)) = match (blobs.first(), blobs.get(1)) {
         (Some(c), Some(b)) => (c.clone(), b.clone()),

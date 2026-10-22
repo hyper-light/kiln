@@ -324,9 +324,10 @@ enum AppCmd {
     /// Add (or replace) a template from a YAML or JSON file.
     TemplateAdd { file: PathBuf },
     TemplateRm { name: String },
-    /// An app's chart on kiln's base chart, written into a repository: charts/<app> (kiln-base
-    /// vendored in it) and deploy/<env>.yaml, each environment's values to start from. What's
-    /// there is kept unless `--force`; `--base` writes only kiln-base, as this kiln ships it.
+    /// An app's chart on kiln's base chart, written into a repository: charts/<app> (depending on
+    /// kiln-base in kiln's registry, or with it vendored) and deploy/<env>.yaml, each environment's
+    /// values to start from. What's there is kept unless `--force`; `--base` moves only kiln-base
+    /// to the version this kiln ships.
     Init {
         app: String,
         /// The repository to write into.
@@ -344,6 +345,14 @@ enum AppCmd {
         force: bool,
         #[arg(long, conflicts_with = "force")]
         base: bool,
+        /// The kiln whose registry kiln-base comes from (`kiln.example.com`); the server's URL
+        /// (`--url`, KILN_URL) by default.
+        #[arg(long)]
+        registry: Option<String>,
+        /// Copy kiln-base into the chart rather than depend on it in a registry (no kiln needed to
+        /// build it).
+        #[arg(long, conflicts_with = "registry")]
+        vendor: bool,
     },
 }
 
@@ -1069,9 +1078,16 @@ pub async fn deploy(args: DeployArgs, cfg: &Config) -> Result<()> {
 
 /// Runs `kiln app`.
 pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
-    // Writes files where it's run: no server is asked.
-    if let AppCmd::Init { app, dir, image, port, environments, force, base } = &args.cmd {
-        return init(app, dir, image.as_deref(), *port, environments, *force, *base);
+    // Writes files where it's run: no server is asked. kiln-base comes from the registry of the
+    // kiln named, or is vendored when none is.
+    if let AppCmd::Init { app, dir, image, port, environments, force, base, registry, vendor } = &args.cmd {
+        let host = match (vendor, registry, &args.conn.url) {
+            (true, _, _) => None,
+            (false, Some(r), _) => Some(r.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_owned()),
+            (false, None, Some(url)) => Some(crate::githost::host_of(url)),
+            (false, None, None) => None,
+        };
+        return init(app, dir, image.as_deref(), *port, environments, *force, *base, host.as_deref());
     }
     let api = Api::new(cfg, &args.conn).await?;
     match args.cmd {
@@ -1329,21 +1345,50 @@ fn print_move(v: &Value) {
 }
 
 /// `kiln app init`: an app's chart on kiln's base chart, written into the repository at `dir`.
-fn init(app: &str, dir: &std::path::Path, image: Option<&str>, port: u16, environments: &[String], force: bool, base: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn init(app: &str, dir: &std::path::Path, image: Option<&str>, port: u16, environments: &[String], force: bool, base: bool, registry: Option<&str>) -> Result<()> {
     let label = !app.is_empty() && app.len() <= 63 && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !app.starts_with('-') && !app.ends_with('-');
     if !label {
         bail!("{app:?}: an app's name is lowercase letters, digits and '-', as Kubernetes names things");
     }
     let image = image.map_or_else(|| format!("registry.example.com/{app}"), str::to_owned);
-    let files = super::init::files(&super::init::Init { app, image: &image, port, environments });
-    let base_dir = std::path::Path::new("charts").join(app).join("charts/kiln-base");
-    let chosen: Vec<(PathBuf, String)> = if base { files.into_iter().filter(|(p, _)| p.starts_with(&base_dir)).collect() } else { files };
-    let (wrote, kept) = super::init::write(dir, &chosen, force || base).with_context(|| format!("write into {}", dir.display()))?;
+    let chart = std::path::Path::new("charts").join(app);
+    let (wrote, kept) = if base {
+        // Only kiln-base moves: its dependency in Chart.yaml, and (vendored) its files.
+        let path = dir.join(&chart).join("Chart.yaml");
+        let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let repository = registry.map(super::init::charts_repository);
+        let moved = super::init::rebase(&text, repository.as_deref()).with_context(|| format!("{} doesn't depend on kiln-base", path.display()))?;
+        let mut files = vec![(chart.join("Chart.yaml"), moved)];
+        let vendored = dir.join(&chart).join("charts/kiln-base");
+        match registry {
+            None => files.extend(super::init::vendored(app)),
+            // From the registry now: the copy vendored before goes.
+            Some(_) if vendored.is_dir() => {
+                std::fs::remove_dir_all(&vendored).with_context(|| format!("remove {}", vendored.display()))?;
+                println!("removed {} (kiln-base comes from kiln's registry now)", vendored.display());
+            }
+            Some(_) => {}
+        }
+        super::init::write(dir, &files, true).with_context(|| format!("write into {}", dir.display()))?
+    } else {
+        let files = super::init::files(&super::init::Init { app, image: &image, port, environments, registry });
+        super::init::write(dir, &files, force).with_context(|| format!("write into {}", dir.display()))?
+    };
     for p in &wrote {
         println!("wrote {}", p.display());
     }
     for p in &kept {
         println!("kept {} (it was there: --force writes over it)", p.display());
+    }
+    match registry {
+        Some(host) if !base => println!(
+            "\nkiln-base comes from {} (anyone may pull it): `helm dependency build charts/{app}` fetches it{}.",
+            super::init::charts_repository(host),
+            if host.starts_with("127.") || host.starts_with("localhost") { " (`--plain-http` for a kiln without TLS)" } else { "" }
+        ),
+        None if !base => println!("\nkiln-base is vendored in charts/{app}/charts/kiln-base (no kiln named: --url, KILN_URL or --registry depends on it in kiln's registry instead)."),
+        _ => {}
     }
     if !base {
         println!(

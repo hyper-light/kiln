@@ -1478,6 +1478,11 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         kustomize_options: cfg.kustomize_options.clone(),
         timeout: Duration::from_secs(cfg.render_timeout_seconds.max(5)),
         helm_home: Some(dir.join("helm")),
+        // kiln's own charts (kiln-base), under every name its registry goes by: laid in, not pulled.
+        local_charts: std::iter::once(crate::githost::host_of(&hub.cfg.server.public_url))
+            .chain(hub.cfg.ci.registry.hosts.iter().cloned())
+            .map(|host| (crate::deploy::init::charts_repository(&host), crate::deploy::init::local_charts(&hub.cfg)))
+            .collect(),
         ..Tools::default()
     };
     let cd = Arc::new(Cd {
