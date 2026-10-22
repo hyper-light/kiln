@@ -187,7 +187,7 @@ fn w22_ac07_secrets_never_leak() -> anyhow::Result<()> {
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "start"])?;
     let extra = format!("[[repos]]\nname = \"acme/leak\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir.path(), &Options { agent: true, ci: "github_workflows = \"on\"", extra: &extra, terminal: false })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "github_workflows = \"on\"", extra: &extra })?;
     let (st, body) = http(s.port, "PUT", "/api/ci/secrets/LEAKY?scope=repo:acme/leak", &s.admin, Some(&json!({ "value": CANARY })))?;
     anyhow::ensure!((200..300).contains(&st), "secret: {st} {body}");
     // Its first poll takes the branch as it is; the workflow comes after, as a push.

@@ -440,7 +440,7 @@ fn w12_r07_registry_package() -> anyhow::Result<()> {
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "start"])?;
     let extra = format!("[[repos]]\nname = \"acme/pkg\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir.path(), &Options { agent: true, ci: "github_workflows = \"on\"", extra: &extra, terminal: false })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "github_workflows = \"on\"", extra: &extra })?;
     let port = s.port;
     // The repository known (its first poll adopts what it has), then an image pushed under its name.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -503,7 +503,7 @@ fn w12_r03_job_credentials() -> anyhow::Result<()> {
     git(&repo, &["commit", "-qm", "start"])?;
     let extra = format!("[[repos]]\nname = \"acme/creds\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
     // The engine runs `.kiln/` workflows (v1 keeps them otherwise).
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra, terminal: false })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
     let port = s.port;
     let (st, body) = common::http(port, "POST", "/api/ci/integrations", &s.admin, Some(&json!({ "kind": "oci", "name": "ghcr", "config": { "registry": "ghcr.io", "username": "bot" }, "secret": "ghp_fake_secret", "scope": "server" })))?;
     anyhow::ensure!((200..300).contains(&st), "the integration: {st} {body}");
@@ -579,7 +579,7 @@ fn w18_attestation_on_image() -> anyhow::Result<()> {
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "start"])?;
     let extra = format!("[ci.registry]\nanonymous_pull = [\"acme/app\"]\n\n[[repos]]\nname = \"acme/app\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra, terminal: false })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
     let port = s.port;
     let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("admin:{}", s.admin)));
     let a = [("Authorization", basic.as_str())];
@@ -666,7 +666,7 @@ fn build_image(file: &str, content: &str) -> anyhow::Result<Built> {
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "start"])?;
     let extra = format!("[[repos]]\nname = \"acme/images\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra, terminal: false })?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
     let port = s.port;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {

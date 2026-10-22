@@ -21,9 +21,11 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 |---|---|---|---|
 | `crates/hyper-durable/src/lib.rs`, `crates/hyper-durable/Cargo.toml` | `RamStore` compiled only for the crate's own tests or under the `test-store` feature, which a dev-dependency asks for (the crate's own tests ask through one on itself) | the write-ahead log is mandatory in Quiver and kiln: `GroupStore` on a real device, `RamStore` test-only, and a build that names it outside a test fails (kiln's CP-T2.1, T-T2.1.2; Quiver's `crates/quiver/tests/ram_store.rs`) | `0001-ramstore-for-tests-alone-the-write-ahead-log-mandatory.patch` |
 
-The change is Quiver's and kiln's policy, not hyper-raft's: slates' store has `RamStore`'s shape
-(upstream's `docs/durable.md`), so upstream keeps it in every build. It's offered to hyper-raft as
-an opt-in feature, on the person's go-ahead.
+The change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
+calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
+would reach slates. Focal's agent agrees (2026-10-22), and notes that Focal names `RamStore` only in a
+test module (`focal-consensus`'s `shell_tests.rs`): sharing this copy, it would ask for `test-store`
+as a dev-dependency, as kiln's sync tests do.
 
 ## Taking a newer upstream
 

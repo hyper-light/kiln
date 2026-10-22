@@ -105,6 +105,14 @@ checked against Focal's tree:
      `state_charge::<C>(limits)` and a charge learned at runtime) and adds a crate, `hyper-heap`.
      Focal and hyper-raft always move together, hyper-raft at the revision the Focal commit's
      `vendor/*/SNAPSHOT` names. Focal's agent says when that landing is pushed.
+   - **Landed** (Focal's agent, 2026-10-22): `bus-replicated` at `1f36e0e` (all six of Focal's gates
+     green), vendoring hyper-raft `64acd86`; next, hyper-rt's receive ring grows with use
+     (`hyper_rt_transport::Driver::new` gains an `io: Io`). Quiver stays at `b408a3b` for CP-T2.1,
+     gated and integrated, and moves deliberately.
+   - **One hyper-raft in kiln.** `1af65f7` and `64acd86` are on hyper-raft's `fate-commit` line;
+     hyper-raft's `main` is `2b13b15` (2026-10-22), which Mantle vendors (kiln's docs/mantle.md), and
+     neither line contains the other. Kiln holds one copy, so Quiver's bus and Mantle meet on one
+     revision before both are in kiln: asked of Focal's agent and kiln's coordinator.
 2. **The API.** `focal_bus::part::Part`, `focal_bus::log::{SegmentPool, Position}`,
    `focal_bus::batch::{Batch, BatchBuilder, Producing}` and `focal_memory::MemoryBudget` exist, are
    public and reasonable to build on, but Focal publishes no stable API: they are internal surfaces

@@ -25,7 +25,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{Options, start};
+use common::Options;
 use serde_json::{Value, json};
 
 /// Messages the stand-in streams.
@@ -358,7 +358,7 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     let program = stand_in(dir.path())?;
-    let s = start(dir.path(), &Options { terminal: true, ..Options::default() })?;
+    let s = common::start_with_agents(dir.path(), &Options::default())?;
     let (port, admin) = (s.port, s.admin.clone());
     let (target, _runner) = match runner {
         None => ("local".to_owned(), None),

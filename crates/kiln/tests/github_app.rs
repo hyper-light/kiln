@@ -301,7 +301,7 @@ jobs:
         secret.display()
     );
     let extra = format!("[[repos]]\nname = \"acme/app\"\nclone_url = \"http://127.0.0.1:{port}/acme/app.git\"\n\n[[repos]]\nname = \"acme/gha\"\nclone_url = \"http://127.0.0.1:{port}/acme/gha.git\"\n");
-    let s = start(dir.path(), &Options { agent: true, ci: &ci, extra: &extra, terminal: false })?;
+    let s = start(dir.path(), &Options { agent: true, ci: &ci, extra: &extra })?;
     let (st, app) = http(s.port, "GET", "/api/ci/github/app", &s.admin, None)?;
     assert!(st == 200 && app.contains("\"configured\":true") && app.contains("\"source\":\"config\""), "{st} {app}");
     // kiln adopts what the repository has on its first look; the next commit is built.

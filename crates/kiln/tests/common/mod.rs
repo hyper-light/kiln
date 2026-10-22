@@ -81,21 +81,25 @@ pub struct Options<'a> {
     pub ci: &'a str,
     /// More sections: `[[repos]]`, ….
     pub extra: &'a str,
-    /// Terminals, and so agents, on (the server's and its runner's).
-    pub terminal: bool,
 }
 
 /// A server of its own under `dir`, up and answering.
 pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
-    start_with(dir, o, false)
+    start_with(dir, o, false, false)
 }
 
 /// [`start`], with KilnCD and deploying by API running (no cluster of its own).
 pub fn start_cd(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
-    start_with(dir, o, true)
+    start_with(dir, o, true, false)
 }
 
-fn start_with(dir: &Path, o: &Options<'_>, cd: bool) -> anyhow::Result<Server> {
+/// [`start`], with terminals, and so agent sessions, on: the server's own.
+#[allow(dead_code)]
+pub fn start_with_agents(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
+    start_with(dir, o, false, true)
+}
+
+fn start_with(dir: &Path, o: &Options<'_>, cd: bool, terminal: bool) -> anyhow::Result<Server> {
     let (port, quic) = (free_port()?, free_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
@@ -143,7 +147,7 @@ enabled = true
         work = work.display(),
         agent = o.agent,
         cd = cd,
-        terminal = o.terminal,
+        terminal = terminal,
         ci = o.ci,
         extra = o.extra,
     );
