@@ -1411,7 +1411,8 @@ struct Switch {
 }
 
 /// Nothing is under way: no turn, nothing waiting for a person.
-fn settled(s: &Session) -> bool {
+/// Between turns: idle, nothing waiting on a person, no turn under way.
+pub(super) fn settled(s: &Session) -> bool {
     settled_core(&s.core.lock())
 }
 

@@ -49,12 +49,20 @@ Every ten seconds the runner notes what runs under each harness and what else is
 its group, or carrying its mark), and keeps that in its record of its sessions (beside each one's
 harness process). What an agent started that runs on apart from its harness (a server started with
 `&` or `setsid`, a script left going) shows with its background tasks as "left running" (task id
-`left-<pid>`), until it ends; stopping that task stops it and what runs under it.
+`left-<pid>`) while its turn goes on; stopping that task stops it and what runs under it. Nothing
+outlives the turn that left it: once the agent is between turns (idle, nothing waiting on a
+person), what its commands left running apart from its harness is stopped. Its harness's own
+background tasks (a shell or a monitor it runs in the background, which run under it) are its work
+and stay until they end, it stops them, or the agent ends; a server meant to keep going runs as
+one. So does a job of the machine's own: a systemd user unit (`systemd-run --user`, a service or a
+scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
+agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
-the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short.
+the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short;
+it goes when that turn ends, as anything else left running.
 Ending the agent stops what it left running, then ends whatever else is still in its group (what
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.

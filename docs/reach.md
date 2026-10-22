@@ -180,7 +180,7 @@ on its own machine, with its own tools. Its tools:
 | `code_run` | a JavaScript program against kiln (below); only what it returns comes back |
 | `code_search` | a program over the operations a program may call, and kiln's skills |
 | `runners` | the machines, best first for `want` |
-| `run` | a command on `on` (default: the session's preference, else this machine), synced first; returns exit code and output (the middle cut past 30k characters), or an id with `background` |
+| `run` | a command on `on` (default: the session's preference, else this machine), synced first; returns exit code and output (the middle cut past 30k characters), or an id with `background`. What it leaves running (`nohup … &`, a daemon) ends with it: everything in its own group of processes where the machine holds them (a cgroup on Linux, however parented), else its process group. A server runs as a background run; a job meant to outlive it, as a systemd user unit (`systemd-run --user`), which leaves the run's cgroup and is left alone |
 | `output` | a background run's new output, and whether it ended |
 | `stop` | stop a background run |
 | `agents_*` | kiln's agents operations (docs/agents.md, "Agents that run agents"): what it starts is its child |

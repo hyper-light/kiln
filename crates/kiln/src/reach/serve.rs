@@ -266,6 +266,82 @@ pub fn signal_group(pid: u32, signal: Signal) {
     }
 }
 
+/// How long what a finished run left running gets to end, once asked, before it's killed.
+const LEFTOVER_GRACE: Duration = Duration::from_millis(500);
+
+/// What a finished run left running ends: asked to, then killed if it hasn't within
+/// [`LEFTOVER_GRACE`]. Where the machine holds the run's processes together, that's everything in
+/// its group, however parented (a daemon, `setsid`), and nothing moved out of it: a unit of the
+/// machine's own (`systemd-run --user`) is a job, and stays. Elsewhere, its process group. A run
+/// that left nothing ends at once.
+fn end_leftovers(pgid: u32, group: Option<crate::os::contain::Group>) {
+    match group {
+        Some(g) => {
+            if g.pids().is_empty() {
+                g.remove();
+                return;
+            }
+            #[cfg(unix)]
+            for p in g.pids() {
+                if let Ok(p) = i32::try_from(p) {
+                    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGTERM);
+                }
+            }
+            let until = Instant::now() + LEFTOVER_GRACE;
+            while !g.pids().is_empty() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            g.kill();
+            for _ in 0..20 {
+                if g.pids().is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            g.remove();
+        }
+        None => {
+            if !group_alive(pgid) {
+                return;
+            }
+            signal_group(pgid, Signal::Terminate);
+            let until = Instant::now() + LEFTOVER_GRACE;
+            while group_alive(pgid) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            signal_group(pgid, Signal::Kill);
+        }
+    }
+}
+
+/// Whether anything is still in process group `pgid`.
+fn group_alive(pgid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        i32::try_from(pgid).is_ok_and(|p| p > 0 && nix::sys::signal::killpg(nix::unistd::Pid::from_raw(p), None).is_ok())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        false
+    }
+}
+
+/// A run its asker went away from: all of it ends at once.
+fn end_now(pgid: u32, group: Option<crate::os::contain::Group>) {
+    signal_group(pgid, Signal::Kill);
+    if let Some(g) = group {
+        crate::rt::spawn(async move {
+            let _ = crate::rt::blocking(move || {
+                g.kill();
+                std::thread::sleep(Duration::from_millis(200));
+                g.remove();
+            })
+            .await;
+        });
+    }
+}
+
 /// Start `spec`; its events go to `events` in order, ending with Exit. `extra_env` comes last
 /// (who asked, the shell's state folder). Returns at once; a failure to start is an Exit with
 /// an error.
@@ -298,9 +374,15 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         if let Some(dir) = &shell_state {
             cmd.env("KILN_REACH_SHELL", dir);
         }
-        let duplex = match crate::os::proc::spawn_duplex(cmd) {
+        // A group of its own where this machine holds processes together (`crate::os::contain`):
+        // what it leaves running ends with it, however that's parented (a daemon, `setsid`).
+        let group = crate::os::contain::Group::of(&format!("run-{}", uuid::Uuid::now_v7().simple()));
+        let duplex = match crate::os::proc::spawn_duplex_in(cmd, group.as_ref()) {
             Ok(d) => d,
             Err(e) => {
+                if let Some(g) = group {
+                    g.remove();
+                }
                 let _ = events.send(Event::Exit { code: None, error: Some(format!("{e:#}")) }).await;
                 return;
             }
@@ -308,7 +390,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         // (Windows' has more: its job object.)
         let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit, .. } = duplex;
         if events.send(Event::Started { pid, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
-            signal_group(pid, Signal::Kill);
+            end_now(pid, group);
             return;
         }
         // Input from the asker until it says the end (or the run ends).
@@ -338,7 +420,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     if err_open {
                         while let Ok(data) = stderr.recv().await {
                             if events.send(Event::Output { stream: Stream::Err, data }).await.is_err() {
-                                signal_group(pid, Signal::Kill);
+                                end_now(pid, group);
                                 return;
                             }
                         }
@@ -350,7 +432,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     if out_open {
                         while let Ok(data) = stdout.recv().await {
                             if events.send(Event::Output { stream: Stream::Out, data }).await.is_err() {
-                                signal_group(pid, Signal::Kill);
+                                end_now(pid, group);
                                 return;
                             }
                         }
@@ -359,13 +441,15 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                 }
                 (stream, Some(data)) => {
                     if events.send(Event::Output { stream, data }).await.is_err() {
-                        signal_group(pid, Signal::Kill);
+                        end_now(pid, group);
                         return;
                     }
                 }
             }
         }
         let code = exit.await.ok().flatten();
+        // What it left running (`nohup … &`, a daemon) ends with it, before it's said to have ended.
+        let _ = crate::rt::blocking(move || end_leftovers(pid, group)).await;
         let _ = events.send(Event::Exit { code, error: None }).await;
     });
     stdin_tx
@@ -374,6 +458,27 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_run_leaves_running_ends_with_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pid_file = dir.path().join("left.pid");
+            let spec = RunSpec { id: 9, command: format!("sleep 300 >/dev/null 2>&1 & echo $! > {}; echo started", pid_file.display()), ..RunSpec::default() };
+            let (out, _, code, error) = run(spec, dir.path(), None).await?;
+            assert_eq!((String::from_utf8_lossy(&out).trim(), code, error), ("started", Some(0), None));
+            let left: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+            // Gone by the time the run is said to have ended (or a moment after, reaped).
+            for _ in 0..50 {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(left), None).is_err() {
+                    return Ok(());
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            anyhow::bail!("the run left {left} running")
+        })
+    }
 
     #[cfg(unix)]
     #[test]

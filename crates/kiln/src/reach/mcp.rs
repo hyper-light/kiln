@@ -59,7 +59,9 @@ once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.
 the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
 folder, so you edit here and it builds or tests there; for a command that isn't about this repository, pass sync: false (it runs \
 in that machine's home folder). `runners` lists the machines, this one first when it suits. Long commands can run in the background \
-(background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
+(background: true), then `output` and `stop`. Nothing a command leaves running outlives it: what a run leaves behind \
+(`nohup … &`, a daemon) ends when it does, and what your own shell commands leave running on their own ends when your \
+turn does; run a server or anything that must keep going as a background task of your shell tool, or a background run. To hand parts of the work to other agents (any harness, any machine), \
 `agents_start` them with a clear brief, then carry on or end your turn: kiln tells you when each is done (`agents_wait` \
 when you can't go on without one), and `agents_result` reads what it concluded: \
 they get no more permissions than you have, and what they ask a person stays a person's to answer (the kiln-agents \
@@ -208,7 +210,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`): this machine when it suits and has memory to spare, else the idlest that suits. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
+            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`): this machine when it suits and has memory to spare, else the idlest that suits. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
             "inputSchema": command_schema(true),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
