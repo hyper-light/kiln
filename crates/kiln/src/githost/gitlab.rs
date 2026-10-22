@@ -192,7 +192,7 @@ impl Gitlab {
             bail!("merge request !{number} ({st}): {}", said(&v));
         }
         Ok(match v.get("state").and_then(Value::as_str).unwrap_or_default() {
-            "merged" => ChangeState::Merged { commit: v.get("merge_commit_sha").and_then(Value::as_str).or_else(|| v.get("squash_commit_sha").and_then(Value::as_str)).map(str::to_owned) },
+            "merged" => ChangeState::Merged { commit: v.get("merge_commit_sha").and_then(Value::as_str).or_else(|| v.get("squash_commit_sha").and_then(Value::as_str)).map(str::to_owned), by: v.pointer("/merged_by/username").and_then(Value::as_str).map(str::to_owned) },
             "closed" => ChangeState::Closed,
             _ => ChangeState::Open,
         })

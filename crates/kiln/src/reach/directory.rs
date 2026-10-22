@@ -238,6 +238,13 @@ pub fn human_bytes(n: u64) -> String {
     if gib >= 1.0 { format!("{gib:.0} GB") } else { format!("{:.0} MB", n as f64 / (1024.0 * 1024.0)) }
 }
 
+/// Free memory below which the asking machine gives way to the idlest other one, even for work it
+/// suits: what it has left is for what already runs on it.
+const ROOM: u64 = 4 << 30;
+/// What suiting and having room counts for the asking machine: more than any other's idle cores and
+/// memory can.
+const HOME: f32 = 1.0e6;
+
 /// A runner that suits, ranked.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Choice {
@@ -249,7 +256,9 @@ pub struct Choice {
 }
 
 /// Every runner that suits `want` and can be reached from `me`, best first, and why each other one
-/// was passed over.
+/// was passed over. `me` comes first whenever it suits and has memory to spare ([`ROOM`]): work goes
+/// to another machine only for what this one isn't or hasn't (another platform, a GPU, more cores
+/// or memory than it has).
 pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<(String, String)>) {
     let mut ok = Vec::new();
     let mut passed = Vec::new();
@@ -273,21 +282,23 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
         let free_gb = r.mem_free() as f32 / (1024.0 * 1024.0 * 1024.0);
         let ci = if r.slots > 0 { r.busy as f32 / r.slots as f32 } else { 0.0 };
         // Idle cores count most, free memory next; CI work on it and a tunnelled path count against
-        // it. This machine itself wins a tie: nothing crosses the network.
+        // it. This machine itself comes first while it has room (nothing crosses the network, and
+        // another machine's resources stay its own), and wins a tie when it hasn't.
         let mut score = idle * 4.0 + free_gb.min(64.0) - ci * 8.0;
         if r.via == "tunnel" {
             score -= 2.0;
         }
         if r.name == me {
-            score += 0.5;
+            score += if r.mem_total == 0 || r.mem_free() >= ROOM { HOME } else { 0.5 };
         }
         let why = format!(
-            "{} · {:.0} of {} cores idle · {} free{}",
+            "{} · {:.0} of {} cores idle · {} free{}{}",
             r.platform(),
             idle,
             r.cpus,
             human_bytes(r.mem_free()),
-            if r.busy > 0 { format!(" · {} CI jobs", r.busy) } else { String::new() }
+            if r.busy > 0 { format!(" · {} CI jobs", r.busy) } else { String::new() },
+            if r.name == me { " · this machine" } else { "" }
         );
         ok.push(Choice { runner: r.clone(), score, why });
     }
@@ -375,10 +386,23 @@ mod tests {
     }
 
     #[test]
-    fn this_machine_wins_a_tie() -> anyhow::Result<()> {
-        let runners = vec![runner("a", "linux", "x86_64", 8, 0.0, 16), runner("b", "linux", "x86_64", 8, 0.0, 16)];
+    fn this_machine_comes_first_when_it_suits_and_has_room() -> anyhow::Result<()> {
+        // Busier and smaller than the other, and still first: it suits and has memory to spare.
+        let runners = vec![runner("a", "linux", "x86_64", 32, 0.0, 48), runner("b", "linux", "x86_64", 8, 90.0, 16)];
         assert_eq!(pick(&runners, &Want::default(), "b")?.runner.name, "b");
-        assert_eq!(pick(&runners, &Want::default(), "c")?.runner.name, "a");
+        let first = pick(&runners, &Want::parse("linux/amd64")?, "b")?;
+        assert!(first.runner.name == "b" && first.why.ends_with(" · this machine"), "{first:?}");
+        // What it isn't or hasn't goes elsewhere: another platform, more cores, more memory.
+        let mac = vec![runner("mac", "macos", "aarch64", 12, 0.0, 32), runner("a", "linux", "x86_64", 32, 0.0, 48)];
+        assert_eq!(pick(&mac, &Want::parse("linux/amd64")?, "mac")?.runner.name, "a");
+        assert_eq!(pick(&runners, &Want::parse("cpus>=16")?, "b")?.runner.name, "a");
+        assert_eq!(pick(&runners, &Want::parse("mem>=32g")?, "b")?.runner.name, "a");
+        // Short of memory: the idlest; only a tie is still its.
+        let short = vec![runner("a", "linux", "x86_64", 32, 0.0, 48), runner("b", "linux", "x86_64", 8, 0.0, 1)];
+        assert_eq!(pick(&short, &Want::default(), "b")?.runner.name, "a");
+        let even = vec![runner("a", "linux", "x86_64", 8, 0.0, 1), runner("b", "linux", "x86_64", 8, 0.0, 1)];
+        assert_eq!(pick(&even, &Want::default(), "b")?.runner.name, "b");
+        assert_eq!(pick(&even, &Want::default(), "c")?.runner.name, "a");
         Ok(())
     }
 }

@@ -48,16 +48,17 @@ fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
     let mut s = "This is kiln's own MCP server: the machines of this kiln (its runners), and kiln itself (CI, deployments). \
 When a step has to happen on another machine (the person's Mac, a server, the box with the GPU), run it there yourself: \
 don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
-allow, something physical), start it yourself and tell them exactly what will appear and what to do. Use another machine \
-too when work needs another platform or more power than this one: build and test for Linux x86-64 from a Mac (on: \
-\"linux/amd64\"), use the machine with the GPU (on: \"+gpu\"). `run` runs one command on one machine. `code_run` runs a \
+allow, something physical), start it yourself and tell them exactly what will appear and what to do. Everything else \
+runs on this machine, with your own tools: use another only when this one can't do the step, because it needs another \
+platform (build and test for Linux x86-64 from a Mac: on: \"linux/amd64\"), a GPU (on: \"+gpu\"), or more memory, disk \
+or cores than this machine has (on: \"mem>=32g\", \"cpus>=16\"). `run` runs one command on one machine. `code_run` runs a \
 JavaScript program against kiln, and only what it returns comes back to you: the same build or test on several machines at \
 once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.machines.run({on: \"macos\", command: \
 \"cargo test\"}), kiln.machines.run({on: \"linux/amd64\", command: \"cargo test\"})])`), or CI runs and deployments \
 (`kiln.ci.*`, `kiln.cd.*`; `code_search` lists every operation and its input). The repository you are in is synced to \
 the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
-folder, so edit here and build or test there; for a command that isn't about this repository, pass sync: false (it runs \
-in that machine's home folder). `runners` lists the machines, best first. Long commands can run in the background \
+folder, so you edit here and it builds or tests there; for a command that isn't about this repository, pass sync: false (it runs \
+in that machine's home folder). `runners` lists the machines, this one first when it suits. Long commands can run in the background \
 (background: true), then `output` and `stop`. To hand parts of the work to other agents (any harness, any machine), \
 `agents_start` them with a clear brief, then carry on or end your turn: kiln tells you when each is done (`agents_wait` \
 when you can't go on without one), and `agents_result` reads what it concluded: \
@@ -127,7 +128,7 @@ const WANT: &str = "What the machine must be (optional): a runner's name, or `li
 fn command_schema(waits: bool) -> Value {
     let mut props = json!({
         "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
-        "on": {"type": "string", "description": "Where: a runner's name or what it must be (`linux/amd64`). Default: the session's preferred runner, else the best of all."},
+        "on": {"type": "string", "description": "Where: a runner's name or what it must be (`linux/amd64`). Default: the session's preferred runner, else this machine. What it must be picks this machine when it suits and has memory to spare, else the idlest that suits."},
         "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
         "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
         "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
@@ -201,13 +202,13 @@ fn base_tools() -> Value {
         },
         {
             "name": "runners",
-            "description": "The machines (kiln runners) commands can run on, best first for `want`: platform, idle cores, free memory, installed agents, and why others don't suit. `want` is a runner's name or what it must be: `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.",
+            "description": "The machines (kiln runners) commands can run on, best first for `want` (this one first when it suits and has memory to spare): platform, idle cores, free memory, installed agents, and why others don't suit. `want` is a runner's name or what it must be: `linux/amd64`, `macos`, `arm64`, `linux,+gpu`, `cpus>=16`, `mem>=32g`.",
             "inputSchema": {"type": "object", "properties": {"want": {"type": "string", "description": "What the machine must be (optional)."}}},
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine. `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`); the idlest that suits is used. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
+            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `on` picks it: a runner's name, or what it must be (`linux/amd64`, `macos/arm64`, `+gpu`, `cpus>=16`): this machine when it suits and has memory to spare, else the idlest that suits. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
             "inputSchema": command_schema(true),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -1006,6 +1007,7 @@ mod tests {
         assert!(instructions(Some("adacachy"), "", "").contains("prefers commands to run on adacachy"));
         let i = instructions(None, "", "");
         assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type") && i.contains("code_run"));
+        assert!(i.contains("Everything else runs on this machine") && !i.contains("build or test there"), "{i}");
         assert!(i.contains("goals_add") && i.contains("plans_run") && !i.contains("You are kiln agent"), "{i}");
         assert!(instructions(None, "", "01a14ab9").contains("You are kiln agent 01a14ab9"), "an agent is told who it is");
         let v = json!({"me": "adacachy", "runners": [{"runner": {"name": "adacachy", "os": "linux", "arch": "x86_64"}}, {"runner": {"name": "mac", "os": "macos", "arch": "aarch64"}}], "passed": [{"runner": {"name": "box", "os": "windows", "arch": "x86_64"}}]});

@@ -362,6 +362,48 @@ pub fn sync() -> &'static SyncMetrics {
     })
 }
 
+/// kiln's bytes behind kiln-seams' `Blobs` (docs/blobs.md), by `store` (`local`, `s3`): requests by
+/// `op` and `outcome` (`ok`, `refused`: a typed refusal, `unavailable`: the store couldn't answer);
+/// how long each took; the bytes `written` and `read`; objects let go by what keeps them (`kind`:
+/// `cas`, `sync`, `recordings`, `transcripts`); and closed conversations whose record couldn't be
+/// archived before the conversation store let it go (`crate::harness::archive`).
+pub struct BlobsMetrics {
+    pub requests: CounterVec,
+    pub seconds: HistogramVec,
+    pub bytes: CounterVec,
+    pub collected: CounterVec,
+    pub archives_given_up: Counter,
+}
+
+pub fn blobs() -> &'static BlobsMetrics {
+    static M: OnceLock<BlobsMetrics> = OnceLock::new();
+    M.get_or_init(|| BlobsMetrics {
+        requests: CounterVec::new(&["store", "op", "outcome"]),
+        seconds: HistogramVec::new(&["store", "op"], LATENCY_BUCKETS),
+        bytes: CounterVec::new(&["store", "direction"]),
+        collected: CounterVec::new(&["kind"]),
+        archives_given_up: Counter::default(),
+    })
+}
+
+/// The `kiln_blobs_*` families, in the exposition.
+fn render_blobs(o: &mut String) {
+    let m = blobs();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    help(o, "kiln_blobs_requests_total", "counter", "Requests to the store kiln keeps its bytes in, by store, operation and outcome (ok, refused, unavailable).");
+    m.requests.render(o, "kiln_blobs_requests_total");
+    help(o, "kiln_blobs_bytes_total", "counter", "Bytes written to and read from the store kiln keeps its bytes in.");
+    m.bytes.render(o, "kiln_blobs_bytes_total");
+    help(o, "kiln_blobs_collected_total", "counter", "Objects kiln let go that nothing refers to, by what kept them.");
+    m.collected.render(o, "kiln_blobs_collected_total");
+    help(o, "kiln_blobs_archives_given_up_total", "counter", "Closed conversations whose record couldn't be archived in the days held past the conversation store's keeping: given up, and let go by the store.");
+    let _ = writeln!(o, "kiln_blobs_archives_given_up_total {}", m.archives_given_up.get());
+    help(o, "kiln_blobs_request_seconds", "histogram", "How long requests to the store kiln keeps its bytes in took, by store and operation.");
+    m.seconds.render(o, "kiln_blobs_request_seconds");
+}
+
 /// Repo sync's families, in the exposition.
 fn render_sync(o: &mut String) {
     let m = sync();
@@ -593,6 +635,7 @@ pub fn render() -> String {
     help(&mut o, "kiln_queue_wait_seconds", "histogram", "Time from queued to started.");
     m.queue_wait.render(&mut o, "kiln_queue_wait_seconds", "");
     render_sync(&mut o);
+    render_blobs(&mut o);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {

@@ -62,6 +62,11 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Its process group with it: what it started (its UI server) is never left running.
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -80,6 +85,15 @@ pub struct Options<'a> {
 
 /// A server of its own under `dir`, up and answering.
 pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
+    start_with(dir, o, false)
+}
+
+/// [`start`], with KilnCD and deploying by API running (no cluster of its own).
+pub fn start_cd(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
+    start_with(dir, o, true)
+}
+
+fn start_with(dir: &Path, o: &Options<'_>, cd: bool) -> anyhow::Result<Server> {
     let (port, quic) = (free_port()?, free_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
@@ -115,7 +129,7 @@ join_requests = false
 tailscale = false
 
 [cd]
-enabled = false
+enabled = {cd}
 
 [ci]
 enabled = true
@@ -126,6 +140,7 @@ enabled = true
         data = data.display(),
         work = work.display(),
         agent = o.agent,
+        cd = cd,
         ci = o.ci,
         extra = o.extra,
     );
@@ -140,6 +155,8 @@ enabled = true
     for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG"] {
         cmd.env_remove(var);
     }
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let child = cmd.spawn()?;
     let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf() };
     let deadline = Instant::now() + Duration::from_secs(60);

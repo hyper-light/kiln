@@ -53,7 +53,7 @@ pub async fn maintain(hub: &Hub) -> anyhow::Result<()> {
     crate::ci::oidc::publish(hub).await?;
     let collected = cas::collect(hub).await?;
     if expired + stale + evicted + collected.objects > 0 {
-        tracing::info!(expired, stale, evicted, objects = collected.objects, chunks = collected.chunks, bytes = collected.bytes, "CI store upkeep");
+        tracing::info!(expired, stale, evicted, objects = collected.objects, bytes = collected.bytes, "CI store upkeep");
     }
     Ok(())
 }

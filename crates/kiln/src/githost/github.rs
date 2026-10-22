@@ -55,15 +55,19 @@ pub fn key_from_pem(pem: &str) -> anyhow::Result<KeyPair> {
     }
 }
 
-fn cache() -> &'static parking_lot::Mutex<Option<(Instant, Option<Arc<App>>)>> {
-    static C: OnceLock<parking_lot::Mutex<Option<(Instant, Option<Arc<App>>)>>> = OnceLock::new();
+/// The App each server read last (by its data directory: a test's servers share a process), and when.
+type Apps = HashMap<std::path::PathBuf, (Instant, Option<Arc<App>>)>;
+
+fn cache() -> &'static parking_lot::Mutex<Apps> {
+    static C: OnceLock<parking_lot::Mutex<Apps>> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
 /// The App kiln acts through: `[ci.github]`'s, else the one the manifest flow made; read again at
 /// most every minute.
 pub async fn app(hub: &Hub) -> Option<Arc<App>> {
-    if let Some((at, a)) = cache().lock().as_ref()
+    let key = hub.cfg.server.data_dir.clone();
+    if let Some((at, a)) = cache().lock().get(&key)
         && at.elapsed() < Duration::from_secs(60)
     {
         return a.clone();
@@ -75,13 +79,13 @@ pub async fn app(hub: &Hub) -> Option<Arc<App>> {
             None
         }
     };
-    *cache().lock() = Some((Instant::now(), a.clone()));
+    cache().lock().insert(key, (Instant::now(), a.clone()));
     a
 }
 
 /// Forgets the App read last (the manifest flow made one).
 pub fn forget() {
-    *cache().lock() = None;
+    cache().lock().clear();
 }
 
 const KEY_AAD: &[u8] = b"github-app-key";
@@ -209,35 +213,46 @@ impl App {
     pub async fn installation(&self, name: &str) -> anyhow::Result<u64> {
         static C: OnceLock<parking_lot::Mutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
         let cache = C.get_or_init(Default::default);
-        if let Some((at, id)) = cache.lock().get(name)
+        let key = format!("{}|{}|{name}", self.api, self.id);
+        if let Some((at, id)) = cache.lock().get(&key)
             && at.elapsed() < Duration::from_secs(600)
         {
             return Ok(*id);
         }
-        let path = match name.split_once('/') {
-            Some(_) => format!("/repos/{name}/installation"),
-            None => format!("/users/{name}/installation"),
+        // An owner is an organization or a person.
+        let paths = match name.split_once('/') {
+            Some(_) => vec![format!("/repos/{name}/installation")],
+            None => vec![format!("/orgs/{name}/installation"), format!("/users/{name}/installation")],
         };
-        let (st, v) = self.call(Method::Get, &path, Auth::App, None).await?;
-        if st != 200 {
-            let install = self.html_url.as_deref().map(|u| format!(": install it at {u}/installations/new")).unwrap_or_default();
-            bail!("the GitHub App isn't installed for {name} ({st}){install}");
+        let mut said = 0;
+        for path in paths {
+            let (st, v) = self.call(Method::Get, &path, Auth::App, None).await?;
+            if st == 200 {
+                let id = v.get("id").and_then(Value::as_u64).ok_or_else(|| anyhow!("GitHub's installation has no id"))?;
+                cache.lock().insert(key, (Instant::now(), id));
+                return Ok(id);
+            }
+            said = st;
         }
-        let id = v.get("id").and_then(Value::as_u64).ok_or_else(|| anyhow!("GitHub's installation has no id"))?;
-        cache.lock().insert(name.to_owned(), (Instant::now(), id));
-        Ok(id)
+        let install = self.html_url.as_deref().map(|u| format!(": install it at {u}/installations/new")).unwrap_or_default();
+        bail!("the GitHub App isn't installed for {name} ({said}){install}");
     }
 
     /// A token of the installation for `name` (one repository, `owner/repo`, or every one an
     /// owner's installation covers) with `permissions` (GitHub's names, `read` or `write`), kept
     /// until five minutes before it expires.
     pub async fn token(&self, name: &str, permissions: &BTreeMap<String, String>) -> anyhow::Result<String> {
+        self.token_lasting(name, permissions, 300).await
+    }
+
+    /// [`App::token`], one that lasts `secs` more at least (for a reader that keeps it: Argo CD).
+    pub async fn token_lasting(&self, name: &str, permissions: &BTreeMap<String, String>, secs: i64) -> anyhow::Result<String> {
         static C: OnceLock<parking_lot::Mutex<HashMap<String, (i64, String)>>> = OnceLock::new();
         let cache = C.get_or_init(Default::default);
-        let key = format!("{}|{name}|{}", self.id, serde_json::to_string(permissions).unwrap_or_default());
+        let key = format!("{}|{}|{name}|{}", self.api, self.id, serde_json::to_string(permissions).unwrap_or_default());
         let now = crate::util::now_unix();
         if let Some((until, t)) = cache.lock().get(&key)
-            && *until > now + 300
+            && *until > now + secs
         {
             return Ok(t.clone());
         }
@@ -354,13 +369,70 @@ impl App {
         if st != 200 {
             bail!("pull request {number} ({st}): {}", said(&v));
         }
-        Ok(if v.get("merged").and_then(Value::as_bool) == Some(true) || v.get("merged_at").is_some_and(|m| !m.is_null()) {
-            ChangeState::Merged { commit: v.get("merge_commit_sha").and_then(Value::as_str).map(str::to_owned) }
-        } else if v.get("state").and_then(Value::as_str) == Some("closed") {
-            ChangeState::Closed
-        } else {
-            ChangeState::Open
-        })
+        Ok(pull_state(&v))
+    }
+
+    /// The pull request from the branch `head` of the repository, open or not, if there is one
+    /// (the newest).
+    pub async fn find_change(&self, repo: &Repo, head: &str) -> anyhow::Result<Option<(ChangeRef, ChangeState)>> {
+        let (name, t) = self.token_for(repo, &[("pull_requests", "read"), ("metadata", "read")]).await?;
+        let owner = name.split_once('/').map_or(name.as_str(), |(o, _)| o);
+        let query = crate::ci::cli::enc(&format!("{owner}:{head}"));
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}/pulls?head={query}&state=all&per_page=5"), Auth::Token(&t), None).await?;
+        if st != 200 {
+            bail!("the pull requests from {head} ({st}): {}", said(&v));
+        }
+        let newest = v.as_array().and_then(|l| l.iter().max_by_key(|p| p.get("number").and_then(Value::as_u64).unwrap_or(0)));
+        Ok(newest.map(|p| (ChangeRef { number: p.get("number").and_then(Value::as_u64).unwrap_or(0), url: p.get("html_url").and_then(Value::as_str).unwrap_or_default().to_owned() }, pull_state(p))))
+    }
+
+    /// Closes pull request `number` unmerged, saying why (a comment) first.
+    pub async fn close_change(&self, repo: &Repo, number: u64, why: &str) -> anyhow::Result<()> {
+        let (name, t) = self.token_for(repo, &[("pull_requests", "write"), ("metadata", "read")]).await?;
+        if !why.is_empty() {
+            let (st, v) = self.call(Method::Post, &format!("/repos/{name}/issues/{number}/comments"), Auth::Token(&t), Some(&json!({ "body": why }))).await?;
+            if st != 201 {
+                tracing::debug!(pull = number, status = st, said = %said(&v), "GitHub took no comment on a pull request kiln closes");
+            }
+        }
+        let (st, v) = self.call(Method::Patch, &format!("/repos/{name}/pulls/{number}"), Auth::Token(&t), Some(&json!({ "state": "closed" }))).await?;
+        anyhow::ensure!(st == 200, "GitHub didn't close pull request {number} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// Deletes a branch (gone already is fine).
+    pub async fn delete_branch(&self, repo: &Repo, branch: &str) -> anyhow::Result<()> {
+        let (name, t) = self.token_for(repo, &[("contents", "write"), ("metadata", "read")]).await?;
+        let (st, v) = self.call(Method::Delete, &format!("/repos/{name}/git/refs/heads/{branch}"), Auth::Token(&t), None).await?;
+        anyhow::ensure!(matches!(st, 204 | 404 | 422), "GitHub didn't delete {branch} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// `owner/name` as GitHub shows it to the App (`None`: there's no such repository, or the App's
+    /// installation for its owner doesn't reach it).
+    pub async fn repository(&self, name: &str) -> anyhow::Result<Option<Value>> {
+        let (owner, _) = name.split_once('/').ok_or_else(|| anyhow!("`{name}`: owner/name"))?;
+        let t = self.token(owner, &[("metadata".to_owned(), "read".to_owned())].into()).await?;
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}"), Auth::Token(&t), None).await?;
+        match st {
+            200 => Ok(Some(v)),
+            404 => Ok(None),
+            _ => bail!("GitHub didn't say whether {name} is there ({st}): {}", said(&v)),
+        }
+    }
+
+    /// Makes `owner/name`, private and empty, in the organization `owner` (GitHub makes repositories
+    /// of a person's account only for that person).
+    pub async fn create_repository(&self, name: &str, description: &str) -> anyhow::Result<()> {
+        let (owner, repo) = name.split_once('/').ok_or_else(|| anyhow!("`{name}`: owner/name"))?;
+        let p: BTreeMap<String, String> = [("administration".to_owned(), "write".to_owned()), ("metadata".to_owned(), "read".to_owned())].into();
+        let t = self.token(owner, &p).await.map_err(|e| anyhow!("{e:#} (kiln's GitHub App makes repositories with Administration: write, on the organization's installation)"))?;
+        let (st, v) = self.call(Method::Post, &format!("/orgs/{owner}/repos"), Auth::Token(&t), Some(&json!({ "name": repo, "private": true, "auto_init": false, "description": description }))).await?;
+        match st {
+            201 => Ok(()),
+            404 => bail!("{owner} isn't an organization the App can make repositories in: make {name} on GitHub (empty is fine) and give the App access to it"),
+            _ => bail!("GitHub made no repository {name} ({st}): {}", said(&v)),
+        }
     }
 
     pub async fn status(&self, repo: &Repo, sha: &str, s: &CommitStatus) -> anyhow::Result<()> {
@@ -372,20 +444,32 @@ impl App {
 
     /// A deployment of `sha` to `environment` (the latest one there is, else a new one), and its state.
     pub async fn deployment(&self, repo: &Repo, sha: &str, environment: &str, state: &str, url: Option<&str>) -> anyhow::Result<()> {
+        self.deployment_status(repo, sha, environment, &Deployed { state, description: "kiln", environment_url: url, log_url: None }).await
+    }
+
+    /// [`App::deployment`], said in full: what it is (GitHub keeps 140 characters), where it runs,
+    /// and where to read about it.
+    pub async fn deployment_status(&self, repo: &Repo, sha: &str, environment: &str, s: &Deployed<'_>) -> anyhow::Result<()> {
         let (name, t) = self.token_for(repo, &[("deployments", "write"), ("metadata", "read")]).await?;
         let (st, list) = self.call(Method::Get, &format!("/repos/{name}/deployments?sha={sha}&environment={}", crate::ci::cli::enc(environment)), Auth::Token(&t), None).await?;
         let found = (st == 200).then(|| list.as_array().and_then(|l| l.first()).and_then(|d| d.get("id")).and_then(Value::as_u64)).flatten();
+        let description = crate::util::truncate(s.description, 140);
         let id = match found {
             Some(id) => id,
             None => {
-                let (st, v) = self.call(Method::Post, &format!("/repos/{name}/deployments"), Auth::Token(&t), Some(&json!({ "ref": sha, "environment": environment, "auto_merge": false, "required_contexts": [], "description": "kiln" }))).await?;
+                let (st, v) = self.call(Method::Post, &format!("/repos/{name}/deployments"), Auth::Token(&t), Some(&json!({ "ref": sha, "environment": environment, "auto_merge": false, "required_contexts": [], "description": description }))).await?;
                 anyhow::ensure!(st == 201, "GitHub made no deployment ({st}): {}", said(&v));
                 v.get("id").and_then(Value::as_u64).ok_or_else(|| anyhow!("GitHub's deployment has no id"))?
             }
         };
-        let mut body = json!({ "state": state, "environment": environment, "description": "kiln" });
-        if let (Some(u), Some(o)) = (url, body.as_object_mut()) {
-            o.insert("environment_url".into(), json!(u));
+        let mut body = json!({ "state": s.state, "environment": environment, "description": description });
+        if let Some(o) = body.as_object_mut() {
+            if let Some(u) = s.environment_url {
+                o.insert("environment_url".into(), json!(u));
+            }
+            if let Some(u) = s.log_url {
+                o.insert("log_url".into(), json!(u));
+            }
         }
         let (st, v) = self.call(Method::Post, &format!("/repos/{name}/deployments/{id}/statuses"), Auth::Token(&t), Some(&body)).await?;
         anyhow::ensure!(st == 201, "GitHub took no deployment status ({st}): {}", said(&v));
@@ -400,6 +484,26 @@ impl App {
         let (st, v) = self.call(Method::Post, &format!("/repos/{template}/generate"), Auth::Token(&t), Some(&json!({ "owner": owner, "name": repo, "private": private }))).await?;
         anyhow::ensure!(st == 201, "GitHub made no repository ({st}): {}", said(&v));
         Ok(())
+    }
+}
+
+/// A deployment's state, as [`App::deployment_status`] reports it.
+pub struct Deployed<'a> {
+    /// `queued`, `in_progress`, `success`, `failure`, `error` or `inactive`.
+    pub state: &'a str,
+    pub description: &'a str,
+    pub environment_url: Option<&'a str>,
+    pub log_url: Option<&'a str>,
+}
+
+/// Where a pull request (GitHub's JSON for one) is.
+fn pull_state(v: &Value) -> ChangeState {
+    if v.get("merged").and_then(Value::as_bool) == Some(true) || v.get("merged_at").is_some_and(|m| !m.is_null()) {
+        ChangeState::Merged { commit: v.get("merge_commit_sha").and_then(Value::as_str).map(str::to_owned), by: v.pointer("/merged_by/login").and_then(Value::as_str).map(str::to_owned) }
+    } else if v.get("state").and_then(Value::as_str) == Some("closed") {
+        ChangeState::Closed
+    } else {
+        ChangeState::Open
     }
 }
 

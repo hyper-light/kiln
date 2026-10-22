@@ -1769,53 +1769,102 @@ textarea.hx-input {
   font-size: 11px;
   color: var(--color-subtle);
 }
-.hx-change-opt {
+/* An agent's change request: its state, what it is, and what to do. On a card 400px wide or more,
+   one line, what to do at its end; on a narrower one, each on a line of its own, all from the same
+   left edge. Which, the card's width says, not how long its words are: a state changing never
+   moves the rest. */
+.hx-cr {
+  margin-bottom: 10px;
+  border: 1px solid #1f2126;
+  border-radius: 12px;
+  container-type: inline-size;
+  font-size: 12px;
+  color: #dfe3ea;
+}
+.hx-cr[aria-busy="true"] {
+  min-height: 46px;
+}
+.hx-cr[data-state="merged"] {
+  border-color: rgb(166 205 180 / 24%);
+}
+.hx-cr-in {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 44px;
+  padding: 8px 8px 8px 12px;
+}
+.hx-cr-head {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+.hx-cr-state {
+  font-size: 12px;
+}
+.hx-cr-what {
+  display: flex;
+  flex: 1 1 0;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+}
+/* Its name is cut last: what's after it gives way first. */
+.hx-cr-what > a {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hx-cr-what a:hover {
+  text-decoration: underline;
+}
+.hx-cr-sub {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--color-subtle);
+}
+/* Before a change request: what puts what to do at the end of the line. */
+.hx-cr-fill {
+  flex: 1 1 0;
+}
+.hx-cr-do {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px 14px;
+  min-height: 28px;
+}
+.hx-cr-opt {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   color: #b4b5ba;
+  white-space: nowrap;
+  cursor: pointer;
 }
-/* No change request yet: what it is on one line; below it, under the words, the option and then
-   the action at the end (on a line of its own when both don't fit). With room, one line. */
-.hx-change-new {
-  display: block;
-  padding: 10px 10px 10px 12px;
-  container-type: inline-size;
-}
-.hx-change-grid {
-  display: grid;
-  grid-template-columns: 14px minmax(0, 1fr);
-  grid-template-areas:
-    "icon what"
-    ". do";
-  align-items: center;
-  gap: 10px;
-}
-.hx-change-icon {
-  grid-area: icon;
-}
-.hx-change-grid > .hx-change-what {
-  grid-area: what;
-  min-width: 0;
-}
-.hx-change-do {
-  display: flex;
-  flex-wrap: wrap;
-  grid-area: do;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px 16px;
-  min-width: 0;
-}
-@container (min-width: 600px) {
-  .hx-change-grid {
-    grid-template-columns: 14px minmax(0, 1fr) auto;
-    grid-template-areas: "icon what do";
-    column-gap: 14px;
+@container (max-width: 399px) {
+  .hx-cr-in {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 12px;
   }
-  .hx-change-do {
-    flex-wrap: nowrap;
-    gap: 14px;
+  .hx-cr-what {
+    flex: none;
+    width: 100%;
+  }
+  .hx-cr-fill {
+    display: none;
+  }
+  .hx-cr-do {
+    flex-wrap: wrap;
   }
 }
 .hx-files {

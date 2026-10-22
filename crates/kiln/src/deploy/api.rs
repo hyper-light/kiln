@@ -593,7 +593,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
-            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), hub: Arc::clone(&hub) };
+            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), github: Default::default(), hub: Arc::clone(&hub) };
             let st = &hub.store;
             store::put_environment(st, &env("staging", KILNCD)).await?;
             store::put_environment(st, &env("argo", "argocd/prod")).await?;

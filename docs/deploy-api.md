@@ -309,7 +309,12 @@ production:
   { applications: true }` has kiln write each one instead, for an Argo CD that doesn't allow
   ApplicationSets. Its provider changes by a move once apps are registered there (§8.4).
 - `via: pull-request` makes every release in the environment a pull request (a merge request on
-  GitLab) on the release repository: the approval is the merge, made on the git host.
+  GitLab) on the release repository: the approval is the merge, made on the git host. Built on
+  GitHub: a release is proposed from a branch of its own (`kiln/release-<id>-<asked at>`) once its gates
+  pass, and waits in `committing`; merged, its merge is its commit (delivered, who merged it kept
+  as its approval); closed unmerged, it's cancelled; cancelled in kiln, its pull request is
+  closed. Who may merge is the branch's protection on GitHub, so `approvals` isn't set beside it.
+  kiln's own commits (registrations, reverts) still go to the branch.
 - `agents` says what agents may do there: release (`deploy`: every kind of release, a cancel, a
   deregistration) and answer approvals (`approve`). Neither by default; elsewhere an agent's change
   is refused (`403`) and a person makes it. Only a person changes `agents`.
@@ -409,7 +414,7 @@ for apps' source repositories.
 | Change requests (`via: pull-request`) | kiln's own diffs (review.md) | pull requests | merge requests | pull requests |
 | Report a release | kiln's UI | Deployments and deployment statuses | Environments and Deployments | commit build statuses |
 | Notice commits | in process | webhooks, then polling | webhooks, then polling | webhooks, then polling |
-| Create repositories | yes | from template repositories | from project templates | yes |
+| Create repositories | yes | in an organization, through the App; from template repositories | from project templates | yes |
 | Pull request heads for CI | — | `refs/pull/<n>/head` (as today) | `refs/merge-requests/<iid>/head` | Data Center: `refs/pull-requests/<id>/from`; Cloud: read from the API |
 
 - **kiln's own git server** is CI's native hosting (ci.md W14), one server for both: release
@@ -423,6 +428,24 @@ for apps' source repositories.
 - **GitHub stays as it is**: discovery, `ls-remote` polling, webhook hints, mirrors, pull request
   heads, the Actions-compatible CI. A GitHub App joins the token kiln reads today, for writes,
   statuses and repository creation.
+- **Release repositories on GitHub** (`release_repo: { host: github, repo: owner/name }`) go
+  through kiln's GitHub App (`[ci.github]`, or the one its manifest flow made), with an
+  installation token for each call that reaches that one repository with what the call needs:
+  - **Made** in the owner's organization when it isn't there (private, empty: the App needs
+    `administration: write` there); on a person's account, made by them and given to the App.
+  - **Read** through a mirror of kiln's, fetched with a token that reads it (`contents: read`),
+    once a minute, or at once when the App's webhook says it moved. KilnCD reads kiln's mirror;
+    Argo CD reads GitHub with a token of its own, which kiln puts in place every half hour (one
+    lasts an hour).
+  - **Written** by a push of a commit made in kiln's mirror, with a lease on the head it was made
+    on (`contents: write`): a commit someone pushed meanwhile makes it try again on theirs, never
+    lose it.
+  - **Reported**: each release is a deployment of its commit to `<environment>/<app>` (so one
+    app's don't mark another's inactive), its status following the release (`in_progress`
+    delivering, `success`, `failure`, `inactive` once cancelled), linking to the release on kiln.
+  - **Webhooks**: the App's `push` and `pull_request` events (`POST /api/hooks/github/app`, signed
+    with its secret) have a release repository looked at, and a release's pull request followed,
+    at once.
 - **GitLab and Bitbucket** get the same: discovery, webhooks, polling, mirrors, change-request heads
   and statuses for CI, and everything above for release repositories. GitLab.com and self-managed
   GitLab; Bitbucket Cloud and Data Center.
@@ -975,4 +998,6 @@ deployments, and aren't carried over.
 | P8: environments made and set in the UI: New environment on the Releases board (its name, its provider, KilnCD or one of kiln's Argo CD integrations, its release repository, made if it isn't there, its clusters), and on its page how releases go there (upstream environments and soak, approvals with reviewers and the requester's own, the built-in checks, allow and deny windows with time zones, whether a second release is refused or waits, what agents may do) | built. In a browser against the test server: `qa` made from the board with a release repository of its own and `e2e-mk`; its gates set on its page held a release of a version `e2e` runs for ada's approval, and refused one `e2e` doesn't run ("6.11.1 doesn't run in e2e (6.11.2 does): release it there first") |
 | P8: how an app deploys, changed on its page: its template, and its package (a Helm chart with its repository and a pinned chart version or each release's, or a path in git) with the values each release sets; a platform's definition still by API or `kiln app set` | built. In a browser against the test server: `ui.message=hello from kiln` set on `ui-web`'s page reached its Deployment (`PODINFO_UI_MESSAGE`) with its next release, and was taken off again there |
 | P8, the rest: chat commands and a message that updates in place (Slack); a platform's definition edited in the UI | not yet |
-| P3, P6 | not yet |
+| P3, GitHub: release repositories on GitHub through kiln's GitHub App (`release_repo.host: github`, by API, `kiln deploy env add --host github` and the New environment form): made in the owner's organization when they aren't there, read through a mirror of kiln's (KilnCD reads the mirror; Argo CD reads GitHub with an installation token that reads that repository only, which kiln puts in place every half hour), written by a push with a lease on the head the commit was made on; releases as pull requests (`gates.via: pull-request`, on the environment's page too): proposed from a branch of its own (`kiln/release-<id>-<asked at>`, so another kiln's release of the same id is never taken for it) once the gates pass; merged, the merge is delivered and who merged it kept as the approval; closed unmerged, cancelled; cancelled in kiln, closed there saying why (refused beside `approvals`, or on kiln's own git server); each release a deployment of its commit to `<environment>/<app>`, its status following the release (`in_progress`, `success`, `failure`, `inactive`) and linking to it on kiln; the App's `push` and `pull_request` webhooks have a release repository looked at, and a release's pull request followed, at once, with polling once a minute without them; the release page shows its pull request | built. Against a fake GitHub API and a smart HTTP git server that answers only installation tokens (`tests/deploy_github.rs`): the repository made once through the App; registrations and releases pushed with tokens for that one repository; a deployment `in_progress` for a release delivering, `inactive` once it was cancelled and its commit reverted on GitHub; a pull request merged (a merge commit, delivered, its merger the approval; the merge reverted when that release was cancelled), one closed unmerged (cancelled), one cancelled in kiln (closed there, with a comment); signed `pull_request` and `push` webhooks moving it at once, and a commit kiln didn't make recorded as a release of origin `git`. On GitHub itself, with kiln's GitHub App made by its manifest flow for the hyper-light organization (from a browser on another machine, GitHub's answer carried back to the test server) and installed there: kiln made `hyper-light/kiln-p3-releases` through the App, private and empty, and pushed its first commit and each registration through it; on KilnCD (the kilncd-e2e test cluster, reading kiln's mirror) release 2, podinfo 6.10.2, landed; on Argo CD (the deploy-argo test cluster, its ApplicationSet reading GitHub with kiln's installation token) releases 3, 5 and 6 were each a pull request a person merged on GitHub, delivered as the merge (the Application Synced and Healthy at the merge commit), the merger kept as the approval; release 4, cancelled in kiln, had its pull request closed there; release 7's pull request, closed unmerged on GitHub, cancelled it; GitHub took each landed release's deployment status (`success`). The App's webhook was off there (the test server's address isn't one GitHub reaches): kiln saw each merge and close by polling, within a minute |
+| P3, the rest: release repositories on GitLab and Bitbucket (merge requests and pull requests for `via: pull-request`), and `via: pull-request` on kiln's own git server (its diffs) | not yet |
+| P6 | not yet |

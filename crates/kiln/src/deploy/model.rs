@@ -12,6 +12,9 @@ pub const KILNCD: &str = "kilncd";
 /// kiln's own git server, the git host every kiln has (docs/deploy-api.md §7).
 pub const KILN_HOST: &str = "kiln";
 
+/// GitHub, through kiln's GitHub App (docs/deploy-api.md §7).
+pub const GITHUB_HOST: &str = "github";
+
 /// A stage apps are released to (docs/deploy-api.md §4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +110,26 @@ pub struct Gates {
     /// `manual`, the default: someone releases it.
     #[serde(default, skip_serializing_if = "Promote::is_manual")]
     pub promote: Promote,
+    /// How a release reaches the release repository: its commit (`commit`, the default), or a pull
+    /// request a person merges (`pull-request`): the merge is the approval, and a pull request
+    /// closed unmerged cancels the release.
+    #[serde(default, skip_serializing_if = "Via::is_commit")]
+    pub via: Via,
+}
+
+/// How a release reaches the release repository (docs/deploy-api.md §4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Via {
+    #[default]
+    Commit,
+    PullRequest,
+}
+
+impl Via {
+    pub fn is_commit(&self) -> bool {
+        *self == Via::Commit
+    }
 }
 
 /// Whether a version moves on from the environments before by itself.
