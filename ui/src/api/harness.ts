@@ -418,6 +418,7 @@ export interface ModelOption {
   id: string;
   label: string;
   description?: string;
+  default?: boolean;
   /** The effort levels it takes, lowest first (when the harness says). */
   efforts?: string[];
 }

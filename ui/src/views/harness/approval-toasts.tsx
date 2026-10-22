@@ -2,9 +2,9 @@
  * What waits on you, wherever you are in kiln: a card for each agent with something to show
  * (cards.ts), acted on right there: a tool call allowed or denied, or its agent opened to answer
  * its question or review its plan; the plan its goals wait on reviewed, and its goals resumed; an
- * agent that stopped by itself restarted. One at a usage limit is only said. At the bottom right,
- * above any passing notifications; on a phone at the top, under kiln's header (the bottom is the
- * message box's). Not on Mission control, nor on the agent's own page: those show it themselves.
+ * agent that stopped by itself restarted. One at a usage limit is only said. Where kiln's other
+ * notifications are, on every screen: at the bottom, above any passing ones. Not on Mission
+ * control, nor on the agent's own page (where the message box is): those show it themselves.
  * × (or a swipe, on a touch screen) puts one away until there's something new.
  */
 import * as React from "react";

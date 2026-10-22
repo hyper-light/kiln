@@ -39,7 +39,11 @@ export function StepGlyph({ stand, className }: { stand: Stand; className?: stri
   return <Beam status={BEAM[stand]} className={className} />;
 }
 
-/** A step's title: in the holographic shimmer while it's worked on, painted into its own letters as a running subagent's are. */
-export function StandTitle({ stand, children }: { stand: Stand; children: string }) {
-  return <Shimmer on={stand === "working"}>{children}</Shimmer>;
+/** A step's title: in the holographic shimmer while it's worked on, its own way (`flow`: the step's id), painted into its own letters as a working agent's are. */
+export function StandTitle({ stand, children, flow }: { stand: Stand; children: string; flow?: string }) {
+  return (
+    <Shimmer on={stand === "working"} flow={flow}>
+      {children}
+    </Shimmer>
+  );
 }

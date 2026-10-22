@@ -39,7 +39,7 @@ import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
 import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
-import { subagentRunning, subagentsAtWork, throughSubagents } from "./tasks";
+import { subagentsAtWork, throughSubagents } from "./tasks";
 
 /** A phone: the page's head is one line, and the message box folds. */
 const PHONE = "(max-width: 640px)";
@@ -145,8 +145,8 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
   const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
   const line = (
     <span className="ms-line">
-      {/* A subagent of its own running: the prism sweeps through its word. */}
-      <Shimmer on={stand === "working" && subagentRunning(a.subagents)} className="ms-word">
+      {/* Working: the prism flows through its word, each agent's its own way, so the list moves as one field. */}
+      <Shimmer on={stand === "working"} flow={a.id} className="ms-word">
         <i aria-hidden="true" />
         {WORD[stand]}
       </Shimmer>

@@ -10,8 +10,49 @@ browsers watching it.
 |---|---|---|
 | Claude Code | `claude -p` stream-json + control protocol | `harness/claude.rs` |
 | Codex | `codex app-server` (JSON-RPC v2) | `harness/codex.rs` |
-| Gemini CLI, opencode, Goose, Amp | Agent Client Protocol | `harness/acp.rs` |
+| Devin, Gemini CLI, opencode, Goose, Amp | Agent Client Protocol | `harness/acp.rs` |
 | Antigravity CLI | `agy` headless stream-json, one turn per message on stdin (agy 1.4 or newer) | `harness/antigravity.rs` |
+
+Devin runs as `devin acp`, with its modes, models and effort announced by the harness. Its modes
+include Code (`accept-edits`, its own default), Ask, Plan, Smart and Bypass; a child starts in Ask or Plan
+when its parent's permissions require it. The same session controls, approvals, messages, MCP
+tools and conversation resumption run over ACP. Its own terminal interface is `devin`. Live
+settings, steering, interruption, queueing, resume and native terminal discovery were tested against
+Devin CLI 3000.11.92.
+
+Devin's advertised `cognition.ai/midTurnPrompts` capability enables Steer and queued-message
+steering without cancellation. Concurrent prompts share a turn; kiln records their completion
+and usage once. A runner upgrade refreshes this capability on existing Devin sessions without
+restarting their processes. Other ACP agents keep steering queued.
+
+Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
+in a temporary configuration that keeps its native default model, with imports, MCP servers and
+automatic updates off. It sends no prompts. Each model's effort choices are read from the agent
+and kept in the existing model cache for the start dialog. Shared effort choices are offered only
+when every listed model
+supports them. The start dialog uses the native default model's levels before a model is chosen,
+then the chosen model's own levels. Resuming keeps the conversation's model and sends a selected
+effort only if that model supports it. The native permission modes are available before discovery
+finishes.
+
+ACP sessions prefer [config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
+(`configOptions`) over the older `modes` and `models` fields. The first select
+in the `mode`, `model` and `thought_level` categories drives kiln's existing permission, model
+and effort selectors; additional options, including ones with no category or an unknown
+category, are ordinary session controls. Grouped choices keep their group names in the labels.
+Boolean options use the existing toggles, advertised with `session.configOptions.boolean`.
+Unrecognized option types are kept with the adapter's state but have no control. The agent's
+order is retained within each selector and control group.
+
+Every `config_option_update` and `session/set_config_option` reply replaces the full option
+list, including current values and choices that depend on another setting. Requested startup
+settings are applied before the first prompt, mode first and model before effort; a failed
+setting holds the prompt. Later changes also run one at a time, so a model's updated effort
+choices are loaded before applying effort. Agents without config options retain the legacy
+setters. ACP resume
+loads the harness's saved conversation; a replay already in kiln's timeline is not appended
+again. Context occupancy comes from `usage_update`; token totals use the prompt's reported
+usage, and costs are displayed only when denominated in USD.
 
 The Antigravity CLI runs as `agy --input-format stream-json --output-format stream-json`: kiln
 writes `{"event":"user","message":{"content":…}}` for each turn and reads `init` (its conversation,
@@ -85,9 +126,9 @@ usage, with the workers, slots and weights the person sets there ([programs.md](
   allowed or denied there, a question or plan opens the agent); goals it paused for you
   (**Review the plan**, when they wait on one, and **Resume**); a stop of its own, its harness
   ended with an error (**Restart**); a usage limit it reached, only said, with when it goes on.
-  Two at once (one on a phone), then a line for the rest. At the bottom right, above kiln's
-  passing notifications; on a phone at the top, under kiln's header, since the bottom is the
-  message box's. ×, or a swipe, puts one away until there's something new.
+  Two at once (one on a phone), then a line for the rest. Where kiln's other notifications are,
+  on every screen: at the bottom, above any passing ones. ×, or a swipe, puts one away until
+  there's something new.
 - **Answers at once.** An answer shows as given wherever its request showed (its row, its card, the
   agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
@@ -122,7 +163,7 @@ usage, with the workers, slots and weights the person sets there ([programs.md](
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
-| GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
+| GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Devin, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
 | POST | `/api/ai-sessions/:machine/:pid/fork` | continue a copy of a found session, leaving it running → `Info[]`; see below |
 | GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
@@ -170,7 +211,7 @@ puts the end of what's on screen into the message being written.
 
 ### Taking over a found session
 
-A session found running on a machine (a Claude Code or Codex TUI someone started, in one of
+A session found running on a machine (a Claude Code, Codex or Devin TUI someone started, in one of
 kiln's terminals or any other) can be continued as a kiln agent session. `takeover` on each found
 session says whether:
 
@@ -197,6 +238,13 @@ found: it may have ended), 409 (`stop` without `{"stop": true}`, `outside`, `upg
 that continues a copy of the conversation (Claude Code's `--fork-session`, Codex's
 `thread/fork`), named `<name> (branch)`, leaving the found session running as it is. Errors: 404,
 409 (no conversation yet, or a runner too old to branch), 400 (a harness that can't branch).
+
+Devin's native sessions are read from its local `devin/cli/sessions.db` under `XDG_DATA_HOME`
+(by default `~/.local/share`; `LOCALAPPDATA` on Windows). Only the selected main message chain
+is shown. A held session lock identifies the owning ACP process and its native terminal parent;
+a stale lock or an ambiguous owner does not identify a conversation. Native sessions can be taken over, and ended
+conversations appear in the existing past-session list, excluding hidden and running ones.
+Devin does not offer conversation branching through ACP.
 
 ### Messaging many agents at once
 
@@ -241,6 +289,12 @@ and shows what a sign-in asks for:
   the code that page shows, pasted back (a browser on the same machine may finish without one).
 - Codex (`codex login --device-auth`): a page and a one-time code to enter there; it finishes by
   itself. Or an OpenAI API key (`--with-api-key`), never echoed.
+- Devin (`devin auth login --force-manual-token-flow`): a page to open on any device, then the
+  code that page shows, pasted back. Its account card reads `devin auth status`; signing out runs
+  `devin auth logout`. The CLI may also try to open that page in the machine's default browser;
+  the link in kiln works from another device. After sign-in, existing ACP sessions reload their
+  conversation before queued messages continue, refreshing credentials and model choices while
+  retaining their permission mode.
 
 Not on Windows machines yet. What is typed in goes to the CLI only: never logged, kept once the
 sign-in ends, or shown in its output.
@@ -258,10 +312,11 @@ Each change is also an `account_flow` event (`{type, flow}`) on `/api/events`.
 
 ### Continuing a past session
 
-`GET /api/harness/history?target=local|agent:<name>&kind=claude|codex&limit=50` lists the
+`GET /api/harness/history?target=local|agent:<name>&kind=claude|codex|devin&limit=50` lists the
 conversations a machine keeps that are not running, read on that machine from its own
 transcripts (Claude Code's `projects/` in `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `sessions/`
-in `CODEX_HOME` or `~/.codex`): newest first, `kind` for one harness, `limit` up to 200 (50 by
+in `CODEX_HOME` or `~/.codex`) or Devin's native session database: newest first, `kind` for one
+harness, `limit` up to 200 (50 by
 default). Each: `kind`, `id` (the harness's session or thread id), `title` (Claude Code's
 `/rename` or generated title, Codex's thread name; else the last prompt's first line), `cwd`,
 `branch?`, `model?`, `last_activity` (unix seconds of the transcript's last write),
@@ -275,7 +330,7 @@ changed. Errors: 400 (a bad `target` or `kind`), 404 (an ephemeral runner, which
 (the machine is not connected or did not answer).
 
 Continue one with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` on the same
-target. Leave `model` unset: both harnesses keep the conversation's own. Its history is in the
+target. Leave `model` unset: the harness keeps the conversation's own. Its history is in the
 timeline when the session turns idle (Codex's latest 100 turns, listed with
 `thread/turns/list`; a notice says when earlier ones are not shown). Claude Code writes a
 `/rename` into its transcript with the next exchange: a name given just before the session ends
@@ -681,7 +736,7 @@ console picks) and are answered with a `reply` update to that client.
 |---|---|---|
 | `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
-| `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex; ACP cannot steer) |
+| `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex, Devin when advertised) |
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
@@ -1086,7 +1141,8 @@ the code's (`metrics::AGENTS`): a test holds the two together.
 
 Checked end to end against the real CLIs with scripted model APIs and isolated configuration
 homes, on the server and through a runner: Claude Code 2.1.296 and Codex 0.162.1; ACP through
-Zed's Claude agent adapter (claude-agent-acp), the only ACP agent run so far.
+Zed's Claude agent adapter (claude-agent-acp). Devin has separate installed-CLI smoke tests for
+settings, steering, interruption, queueing, resumption, native history and terminal ownership.
 
 ✓ verified end to end · unit: covered by the adapter's tests (fed the harness's real message
 shapes), not end to end · — the protocol has no way · ? not run against a real install.

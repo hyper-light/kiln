@@ -151,6 +151,8 @@ impl Host {
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
         }
+        #[cfg(not(test))]
+        super::acp::warm_models();
         let files_dir = file.as_ref().and_then(|f| f.parent()).map_or_else(
             || std::env::temp_dir().join(format!("kiln-attachments-{}", crate::os::uid())),
             |d| d.join("attachments"),
