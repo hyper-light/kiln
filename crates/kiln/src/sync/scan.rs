@@ -222,9 +222,9 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the third bug kiln-sim found: a file changed again just after a look, keeping its
-    /// size and (within its filesystem's time step) its time, is read again at the next look, not
-    /// taken for what the look saw; once its time is long past, it's known by them.
+    /// CP-T6.1, AC-T6.1.3: the third bug kiln-sim found: a file changed again just after a look,
+    /// keeping its size and (within its filesystem's time step) its time, is read again at the next
+    /// look, not taken for what the look saw; once its time is long past, it's known by them.
     #[test]
     fn a_change_that_keeps_a_file_s_size_and_time_just_after_a_look_is_still_seen() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

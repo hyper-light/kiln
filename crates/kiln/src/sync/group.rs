@@ -319,10 +319,6 @@ pub struct Feed {
     /// The newest of this copy's steps its saved state holds: only those go to the server
     /// ([`Feed::sendable`]).
     saved_seq: u64,
-    /// A test build's planted bug (kiln-sim's T-T6.1.1): the saved state written over itself in
-    /// place and never fsynced, so a power loss tears it and the write it held is lost.
-    #[cfg(test)]
-    pub planted_in_place: bool,
 }
 
 /// A committed step a copy's folder took: whose, when its machine saw it, and what it did to the
@@ -381,8 +377,6 @@ impl Feed {
             outcomes: VecDeque::new(),
             took: Vec::new(),
             saved_seq,
-            #[cfg(test)]
-            planted_in_place: false,
         })
     }
 
@@ -464,15 +458,6 @@ impl Feed {
             install: self.install.clone(),
         };
         let bytes = serde_json::to_vec(&saved)?;
-        #[cfg(test)]
-        if self.planted_in_place {
-            use std::io::Write as _;
-            self.copy.fs.create(&self.file)?.write_all(&bytes)?;
-            self.durable = self.reached;
-            self.durable_conf = self.reached_conf.clone();
-            self.saved_seq = self.copy.state.sent.last().map_or(self.saved_seq, |s| s.seq.max(self.saved_seq));
-            return Ok(());
-        }
         save_atomic_on(self.copy.fs.as_ref(), &self.file, &bytes)?;
         self.saved_seq = self.copy.state.sent.last().map_or(self.saved_seq, |s| s.seq.max(self.saved_seq));
         self.durable = self.reached;

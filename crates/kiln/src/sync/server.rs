@@ -1082,7 +1082,6 @@ impl Owner {
     }
 }
 
-/// A refusal of a repo's log, as the metrics' `reason` names it.
 /// What the steps a machine sent came to (`take_steps`).
 #[derive(Debug, Default)]
 pub struct Taking {
@@ -1153,6 +1152,7 @@ pub fn take_steps<L: LogStore>(r: &mut Replica<L, Index>, next: &mut HashMap<u64
     out
 }
 
+/// A refusal of a repo's log, as the metrics' `reason` names it.
 fn why(e: &ReplicaError) -> &'static str {
     match e {
         ReplicaError::Refused(_) => "refused",

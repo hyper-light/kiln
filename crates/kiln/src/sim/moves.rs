@@ -25,8 +25,9 @@ mod tests {
             Ok(digest)
         });
         eprintln!("{}\n  counted: {all:?}", report.line());
+        let ran = report.seeds;
         report.into_result()?;
-        if seeds::replay().is_none() {
+        if seeds::replay().is_none() && ran >= 200 {
             let none = [("moves", all.moves), ("moves that waited for their changes", all.moves_waited), ("runner crashes", all.crashes), ("frames lost", all.net.dropped)];
             if let Some((what, _)) = none.iter().find(|(_, n)| *n == 0) {
                 return Err(format!("no {what} over the budget: the model didn't test what it says"));

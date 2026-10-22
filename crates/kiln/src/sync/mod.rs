@@ -196,6 +196,11 @@ pub struct Copy {
     /// removed) since its state was last saved: synced before it is ([`Copy::sync_dirs`]), so a
     /// power loss can't undo what the saved state says the folder holds. One entry a folder.
     pub touched: BTreeSet<PathBuf>,
+    /// A test build's planted bug (kiln-sim's T-T6.1.1): what sync writes into the folder renamed
+    /// in with its bytes unsynced and its folder never synced, as before the first bug kiln-sim
+    /// found was fixed. A power loss then tears, zeroes or loses it.
+    #[cfg(test)]
+    pub planted_unsynced: bool,
 }
 
 /// Whether a path from a step may be written here: relative, `/`-separated, without `.`, `..` or
@@ -246,7 +251,31 @@ impl Copy {
 
     /// A copy whose folder is on `fs`.
     pub fn on(fs: Arc<dyn Fs>, root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
-        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new(), fs, touched: BTreeSet::new() }
+        Self {
+            root: root.to_owned(),
+            me: me.to_owned(),
+            member,
+            limits,
+            state,
+            skipped: Vec::new(),
+            gone: HashSet::new(),
+            fs,
+            touched: BTreeSet::new(),
+            #[cfg(test)]
+            planted_unsynced: false,
+        }
+    }
+
+    /// Whether T-T6.1.1's bug is planted.
+    #[cfg(test)]
+    fn planted(&self) -> bool {
+        self.planted_unsynced
+    }
+
+    /// Whether T-T6.1.1's bug is planted: never, outside a test build.
+    #[cfg(not(test))]
+    fn planted(&self) -> bool {
+        false
     }
 
     /// Makes the changes of names in the folders this copy changed durable: what the copy's state
@@ -640,10 +669,15 @@ impl Copy {
                 // Its bytes durable before its name: renamed in unsynced, a power loss can leave the
                 // name holding nothing, or a torn page, which the next look would take for an edit
                 // made here and spread to every copy.
-                let made = self.fs.set_exec(&tmp, *exec).and_then(|()| self.fs.sync_file(&tmp)).and_then(|()| self.fs.rename(&tmp, &full));
+                let planted = self.planted();
+                let made = self
+                    .fs
+                    .set_exec(&tmp, *exec)
+                    .and_then(|()| if planted { Ok(()) } else { self.fs.sync_file(&tmp) })
+                    .and_then(|()| self.fs.rename(&tmp, &full));
                 if made.is_err() {
                     let _ = self.fs.remove_file(&tmp);
-                } else {
+                } else if !planted {
                     self.touch(&full, made_dirs);
                 }
                 made
@@ -795,8 +829,9 @@ mod tests {
         }
     }
 
-    /// CP-T6.1: a file sync writes is made durable through a handle to read: a blob a strict umask
-    /// made read-only still goes into the other copy (its bytes synced before its name).
+    /// CP-T6.1, AC-T6.1.3 (the first bug's fix): a file sync writes is made durable through a
+    /// handle to read: a blob a strict umask made read-only still goes into the other copy (its
+    /// bytes synced before its name).
     #[cfg(unix)]
     #[test]
     fn a_read_only_blob_still_goes_into_the_folder() -> anyhow::Result<()> {

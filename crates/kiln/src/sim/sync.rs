@@ -48,7 +48,7 @@ use super::fs::SimFs;
 use crate::sync::blobs::Blobs;
 use crate::sync::fs::Fs;
 use crate::sync::group::{Feed, Index, SERVER, TICK, learner, pump, settings};
-use crate::sync::runner::{Looked, Mark, Standing, arrived, left_at, look_now_at, stand};
+use crate::sync::runner::{Looked, Mark, Standing, arrived, left_at, look_now_at, stand, to_send};
 use crate::sync::scan::{Limits, TEMP_PREFIX};
 use crate::sync::server::{Taking, take_steps};
 use crate::sync::{Decision, Step, Version};
@@ -65,7 +65,7 @@ const TRANSFER: Duration = Duration::from_secs(30);
 const TRANSFERS: usize = 6;
 /// How long the model runs after the nemesis stops, for everything to settle.
 const SETTLE: Duration = Duration::from_secs(90);
-/// Most events one seed runs: past it, the run fails (something woke itself forever).
+/// Most events one seed runs: past them, the run fails (something woke itself forever).
 const EVENTS_MAX: u64 = 2_000_000;
 
 /// The paths people edit, and whether each is a script (made executable).
@@ -77,9 +77,10 @@ const LINK: (&str, &str) = ("latest", "a.txt");
 /// (none: any length): a write of the same length within the filesystem's time step is the
 /// change a look by size and time can't see.
 const SESSION_PATHS: [(&str, Option<usize>); 3] = [("agent/notes.md", Some(120)), ("agent/src/main.rs", None), ("agent/data.bin", Some(5000))];
-/// How long a session leaving waits for its folder's last changes to be in the log, and how often
-/// it asks (`harness::session`'s `FILES_OUT_FOR` and `FILES_EVERY`); how often one arriving asks.
-const FILES_OUT_FOR: Duration = Duration::from_secs(600);
+/// How often a session leaving asks whether its folder's last changes are in the log
+/// (`harness::session`'s `FILES_EVERY`), and how often one arriving asks. kiln gives up leaving
+/// after its `FILES_OUT_FOR`, 600 s: no run lasts that long, so a move still leaving when a run
+/// ends fails the check.
 const FILES_EVERY: Duration = Duration::from_millis(250);
 const FILES_IN_EVERY: Duration = Duration::from_secs(1);
 /// The synced repo's id, as marks and standings name it.
@@ -225,10 +226,8 @@ pub struct Counts {
     /// Steps the server got again that it had taken already (a runner's resends, after a lost
     /// answer or a reconnect).
     pub again: u64,
-    /// Moves made, moves given up (their changes didn't reach the log in time), and moves that
-    /// waited for their changes to reach the log or the folder.
+    /// Moves made, and moves that waited for their changes to reach the log or the folder.
     pub moves: u64,
-    pub moves_failed: u64,
     pub moves_waited: u64,
     pub net: NetCounts,
     pub disk: DiskCounts,
@@ -247,7 +246,6 @@ impl Counts {
         self.fetched += o.fetched;
         self.again += o.again;
         self.moves += o.moves;
-        self.moves_failed += o.moves_failed;
         self.moves_waited += o.moves_waited;
         self.net.add(&o.net);
         self.disk.add(&o.disk);
@@ -258,13 +256,17 @@ impl Counts {
 /// kiln's own), and how it runs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Plant {
-    /// Copies' saved state written in place, not to a temporary file renamed over it, nor fsynced:
-    /// a power loss tears it, and the write it held is lost (T-T6.1.1's planted bug).
-    pub state_in_place: bool,
+    /// What sync writes into a folder renamed in with its bytes unsynced, its folder never synced
+    /// (`Copy::planted_unsynced`, T-T6.1.1's planted bug): a power loss tears, zeroes or loses it.
+    pub writes_unsynced: bool,
     /// Each contents request sent once, never tried again by its client, as the model ran when the
     /// first bugs were found: their seeds replay the runs that found them. Else a seed draws whether
     /// its requests may be sent twice, and overtake one another.
     pub requests_once: bool,
+    /// Disks' names as the model kept them then too (`DiskFaults::names_in_order`), and kiln's
+    /// state folder made by kiln, not there before it ran. Else a disk keeps POSIX's names (or one
+    /// journal's), and the machine had kiln's state folder already.
+    pub names_in_order: bool,
 }
 
 struct Sim {
@@ -289,6 +291,8 @@ struct Sim {
     /// Contents requests may be sent twice (a client trying again) and overtake one another: on a
     /// network of their own, so the rest of a seed's draws are as they were without it.
     retried: Option<Net>,
+    /// An event the queue refused, full: the run fails at once.
+    overflowed: bool,
 }
 
 fn node(w: Who) -> Node {
@@ -333,14 +337,20 @@ impl Sim {
         let mut machines = Vec::new();
         for i in 0..n {
             let mut dr = rng.stream(&format!("disk{i}"));
-            let df = DiskFaults::draw(&mut dr, until);
+            let df = DiskFaults { names_in_order: plant.names_in_order, ..DiskFaults::draw(&mut dr, until) };
             let disk = Disk::new(clock.clone(), dr, df);
             let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
             let name = format!("m{}", i.saturating_add(2));
             let root = PathBuf::from(format!("/home/{name}/repo"));
             let (state, blobs_dir) = (PathBuf::from(format!("/state/{name}/copy.json")), PathBuf::from(format!("/state/{name}/blobs")));
+            // The machine's folders before kiln runs: the repo's, and kiln's own.
             fs.create_dir_all(&root).map_err(e)?;
             disk.make_durable(&root.to_string_lossy());
+            if !plant.names_in_order {
+                let kiln = format!("/state/{name}");
+                fs.create_dir_all(&PathBuf::from(&kiln)).map_err(e)?;
+                disk.make_durable(&kiln);
+            }
             machines.push(Machine {
                 name,
                 member: u64::try_from(i).unwrap_or(0).saturating_add(2),
@@ -374,6 +384,7 @@ impl Sim {
             history: BTreeMap::new(),
             session: (mode == Mode::Moves).then(|| Session { at: 0, leg: Leg::Working, wrote: BTreeMap::new(), edits: 0 }),
             retried,
+            overflowed: false,
             rng,
         };
         // Some folders hold files before they sync; then every copy starts.
@@ -398,7 +409,9 @@ impl Sim {
     }
 
     fn at(&mut self, at: Duration, ev: Ev) {
-        self.queue.push(at, ev);
+        if !self.queue.push(at, ev) {
+            self.overflowed = true;
+        }
     }
 
     fn after(&mut self, d: Duration, ev: Ev) {
@@ -611,16 +624,6 @@ impl Sim {
                         let transfer = self.rng.span(Duration::from_millis(100), Duration::from_secs(5));
                         self.after(transfer, Ev::SessionArrive);
                     }
-                    None if now.saturating_sub(since) > FILES_OUT_FOR => {
-                        // It doesn't leave: its last changes would be left behind.
-                        if since >= self.until {
-                            return Err(format!("{now:?}: the session couldn't get its folder's last changes into the log in {FILES_OUT_FOR:?} to leave m{}, the nemesis long stopped", at.saturating_add(2)));
-                        }
-                        if let Some(se) = self.session.as_mut() {
-                            se.leg = Leg::Working;
-                        }
-                        self.counts.moves_failed += 1;
-                    }
                     None => self.after(FILES_EVERY, Ev::SessionPoll),
                 }
             }
@@ -697,7 +700,7 @@ impl Sim {
         let feed = Feed::open_on(Arc::clone(&mc.fs), &mc.root, &mc.name, mc.member, Limits::default(), mc.state.clone())
             .map_err(|err| format!("{}'s copy wouldn't open after a restart: {err:#}", mc.name))?;
         let mut feed = feed;
-        feed.planted_in_place = self.plant.state_in_place;
+        feed.copy.planted_unsynced = self.plant.writes_unsynced;
         let (reached, sent, pending) = (feed.progress().0, feed.copy.state.sent.iter().map(|s| s.seq).collect::<Vec<_>>(), feed.copy.state.pending.len());
         let now = self.clock.elapsed();
         self.trace.note(|| format!("{now:?} {} starts: its state through log index {reached}, unsent steps {sent:?}, {pending} changes pending", mc.name));
@@ -732,7 +735,9 @@ impl Sim {
         self.counts.crashes += 1;
         self.trace.note(|| format!("{:?} {} crashes{}", self.clock.elapsed(), mc.name, if power { ", the power gone" } else { "" }));
         let at = self.clock.elapsed().saturating_add(back);
-        self.queue.push(at, Ev::Up(m));
+        if !self.queue.push(at, Ev::Up(m)) {
+            self.overflowed = true;
+        }
     }
 
     fn blobs(&self, m: usize) -> Option<Blobs> {
@@ -783,21 +788,22 @@ impl Sim {
             rn.attempts = rn.attempts.saturating_add(1);
             rn.fetching.insert(hash.clone(), rn.attempts);
             frames.push((Who::Server, Frame::Get { hash: hash.clone(), attempt: rn.attempts }));
-            self.queue.push(now.saturating_add(TRANSFER), Ev::GetLate { m, hash, attempt: rn.attempts });
+            if !self.queue.push(now.saturating_add(TRANSFER), Ev::GetLate { m, hash, attempt: rn.attempts }) {
+                self.overflowed = true;
+            }
         }
-        // A look at the folder, once it has taken everything committed.
+        // A look at the folder, once it has taken everything committed: the runner's own
+        // (`look_now_at`, an error said and the next look saving again).
         if now.saturating_sub(rn.looked) >= LOOK {
             rn.looked = now;
             let feed = rn.r.machine_mut();
-            if feed.idle() && !feed.copy.adopting()
-                && let Ok(steps) = feed.copy.propose(&blobs, at_ms)
-                && (!steps.is_empty() || feed.unsaved())
+            if let Some(Ok((proposed, unsaved))) = look_now_at(feed, &blobs, true, at_ms)
+                && (proposed > 0 || unsaved.is_some())
             {
-                // As the runner does: an error is said, and the next look saves again.
-                let saved = feed.save();
                 self.trace.note(|| {
-                    let what: Vec<String> = steps.iter().map(|s| format!("#{} {:?}", s.seq, s.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>())).collect();
-                    format!("{now:?} {} proposes {what:?} (saved: {saved:?})", mc.name)
+                    let sent = &feed.copy.state.sent;
+                    let what: Vec<String> = sent.iter().skip(sent.len().saturating_sub(proposed)).map(|s| format!("#{} {:?}", s.seq, s.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>())).collect();
+                    format!("{now:?} {} proposes {what:?} (not saved: {unsaved:?})", mc.name)
                 });
             }
         }
@@ -826,36 +832,22 @@ impl Sim {
             rn.attempts = rn.attempts.saturating_add(1);
             rn.uploads.insert(hash.clone(), Upload::Moving(rn.attempts));
             frames.push((Who::Server, Frame::Put { hash: hash.clone(), bytes, attempt: rn.attempts }));
-            self.queue.push(now.saturating_add(TRANSFER), Ev::PutLate { m, hash, attempt: rn.attempts });
+            if !self.queue.push(now.saturating_add(TRANSFER), Ev::PutLate { m, hash, attempt: rn.attempts }) {
+                self.overflowed = true;
+            }
             moving += 1;
         }
         // Its unsent steps whose contents are on the server, in order: new ones now, all again
-        // every so often.
+        // every so often (the runner's own `to_send`).
         let again = now.saturating_sub(rn.resent) >= RESEND;
         if again {
             rn.resent = now;
         }
-        let ready: Vec<&Step> = rn
-            .r
-            .machine()
-            .sendable()
-            .take_while(|s| {
-                s.changes.iter().all(|c| match &c.to {
-                    Some(Version::File { hash, .. }) => rn.uploads.get(hash) == Some(&Upload::Done),
-                    _ => true,
-                })
-            })
-            .collect();
-        let newest = ready.last().map_or(0, |s| s.seq);
-        if !ready.is_empty() && (again || newest > rn.sent) {
-            let mut went = Vec::new();
-            for s in ready {
-                if again || s.seq > rn.sent {
-                    went.push(s.seq);
-                    frames.push((Who::Server, Frame::Steps(vec![s.clone()])));
-                }
-            }
-            rn.sent = newest;
+        let uploads = &rn.uploads;
+        if let Some(go) = to_send(rn.r.machine(), |h| uploads.get(h) == Some(&Upload::Done), rn.sent, again) {
+            let went: Vec<u64> = go.steps.iter().map(|s| s.seq).collect();
+            frames.extend(go.steps.iter().map(|s| (Who::Server, Frame::Steps(vec![(*s).clone()]))));
+            rn.sent = go.newest;
             self.trace.note(|| format!("{now:?} {} sends steps {went:?}{}", mc.name, if again { " (again)" } else { "" }));
         }
         for (to, frame) in frames {
@@ -1066,7 +1058,9 @@ impl Sim {
             (Frame::Put { .. } | Frame::Putted { .. } | Frame::Get { .. } | Frame::Got { .. }, _) => self.net.send_once(now, node(from), node(to)),
         };
         for at in fate.arrivals() {
-            self.queue.push(at, Ev::Arrive { to, from, frame: frame.clone() });
+            if !self.queue.push(at, Ev::Arrive { to, from, frame: frame.clone() }) {
+                self.overflowed = true;
+            }
         }
     }
 
@@ -1178,9 +1172,9 @@ impl Sim {
 
     fn run(&mut self) -> Result<(), String> {
         for _ in 0..EVENTS_MAX {
-            let Some((at, ev)) = self.queue.pop() else { break };
+            let Some((at, ev)) = self.queue.pop() else { return self.check() };
             if at > self.end {
-                break;
+                return self.check();
             }
             let now = self.now();
             if at > now {
@@ -1191,8 +1185,11 @@ impl Sim {
             if !self.invented.is_empty() {
                 return Err(self.invented.join("; "));
             }
+            if self.overflowed {
+                return Err(format!("{:?}: the model's event queue was full: an event was dropped", self.now()));
+            }
         }
-        self.check()
+        Err(format!("{:?}: {EVENTS_MAX} events and the run hadn't ended: something woke itself forever", self.now()))
     }
 
     /// Once the nemesis has stopped and everything settled: every copy converged on what the log
@@ -1205,7 +1202,25 @@ impl Sim {
             let feed = rn.r.machine();
             let st = &feed.copy.state;
             if !feed.idle() || !st.sent.is_empty() || !st.pending.is_empty() {
-                return Err(format!("{} never settled: {} entries untaken, {} steps unsent, {} changes pending ({:?})", mc.name, feed.progress().1, st.sent.len(), st.pending.len(), st.pending.keys().collect::<Vec<_>>()));
+                // Contents its unsent steps carry that its store no longer holds: they can't be sent.
+                let gone = st
+                    .sent
+                    .iter()
+                    .flat_map(|s| s.changes.iter())
+                    .filter_map(|c| match &c.to {
+                        Some(Version::File { hash, .. }) => Some(hash),
+                        _ => None,
+                    })
+                    .filter(|h| !mc.disk.is_file(&mc.blobs_dir.join(h.get(..2).unwrap_or("00")).join(h.as_str()).to_string_lossy()))
+                    .count();
+                return Err(format!(
+                    "{} never settled: {} entries untaken, {} steps unsent ({gone} of the contents they carry gone from its store), {} changes pending ({:?})",
+                    mc.name,
+                    feed.progress().1,
+                    st.sent.len(),
+                    st.pending.len(),
+                    st.pending.keys().collect::<Vec<_>>()
+                ));
             }
             if st.tree.files != tree {
                 return Err(format!("{}'s tree isn't the log's: {:?} against {:?}", mc.name, differ(&st.tree.files, &tree), differ(&tree, &st.tree.files)));
@@ -1316,12 +1331,14 @@ mod tests {
 
     use super::*;
 
-    /// The model as the bugs' seeds found them (each request sent once): they replay those runs.
-    const ONCE: Plant = Plant { state_in_place: false, requests_once: true };
+    /// The model as the first bugs' seeds found it (each request sent once, disks' names kept in
+    /// order): they replay those runs.
+    const ONCE: Plant = Plant { writes_unsynced: false, requests_once: true, names_in_order: true };
 
     /// CP-T6.1, AC-T6.1.1: the sync model over the seed budget (200 seeds on every change
     /// request; nightly sets `KILN_SIM_SEEDS` and `KILN_SIM_FROM`): every copy converges, nothing
-    /// spreads that nobody wrote, no one's last write is lost; and every fault happened.
+    /// spreads that nobody wrote, no one's last write is lost; and, over a budget that size, every
+    /// fault struck.
     #[test]
     fn sync_converges_and_loses_nothing_under_the_nemesis() -> Result<(), String> {
         let mut all = Counts::default();
@@ -1332,8 +1349,9 @@ mod tests {
             Ok(digest)
         });
         eprintln!("{}\n  counted: {all:?}", report.line());
+        let ran = report.seeds;
         report.into_result()?;
-        if seeds::replay().is_none() {
+        if seeds::replay().is_none() && ran >= 200 {
             let none = [
                 ("edits", all.edits),
                 ("steps committed", all.steps_committed),
@@ -1342,14 +1360,18 @@ mod tests {
                 ("power losses", all.power_losses),
                 ("crashes at a chosen write", all.frozen),
                 ("server crashes", all.server_crashes),
-                ("full disks", all.full),
+                ("writes refused for room (ENOSPC)", all.disk.full),
                 ("contents fetched", all.fetched),
                 ("frames lost", all.net.dropped),
                 ("steps sent again", all.again),
                 ("requests doubled", all.net.duplicated),
                 ("frames cut off", all.net.cut),
-                ("files torn", all.disk.torn),
+                ("write errors", all.disk.write_errors),
                 ("fsync errors", all.disk.fsync_errors),
+                ("files torn", all.disk.torn),
+                ("files zeroed", all.disk.zeroed),
+                ("files lost", all.disk.lost),
+                ("names lost", all.disk.names_lost),
             ];
             if let Some((what, _)) = none.iter().find(|(_, n)| *n == 0) {
                 return Err(format!("no {what} over the budget: the model didn't test what it says"));
@@ -1367,13 +1389,13 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the first bug kiln-sim found, by its seeds: sync wrote another machine's change into
-    /// a folder through a temporary file renamed over its name unsynced, and saved state saying the
-    /// folder held it. A power loss then left the name holding nothing, zeroes or a torn page. The
-    /// next look took that for an edit made here and the log spread it to every copy (sync seeds 3
-    /// and 163); a moving session went on with its file empty (moves seed 57); or, its size and time
-    /// unchanged, no look saw it, and the copy kept it for good while the log held another version
-    /// (moves seed 90).
+    /// CP-T6.1, AC-T6.1.3: the first bug kiln-sim found, by its seeds: sync wrote another machine's
+    /// change into a folder through a temporary file renamed over its name unsynced, and saved
+    /// state saying the folder held it. A power loss then left the name holding nothing, zeroes or
+    /// a torn page. The next look took that for an edit made here and the log spread it to every
+    /// copy (sync seeds 3 and 163); a moving session went on with its file empty (moves seed 57);
+    /// or, its size and time unchanged, no look saw it, and the copy kept it for good while the log
+    /// held another version (moves seed 90).
     #[test]
     fn the_seeds_where_a_power_loss_tore_a_file_sync_had_written_converge() -> Result<(), String> {
         for seed in [3, 163] {
@@ -1385,9 +1407,10 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the first bug's contract: once a copy's folders are synced (as `Feed::save` does
-    /// before it writes the state that says what the folder holds), a file sync wrote holds what it
-    /// wrote, whatever a power loss does after; on either way of journaling names.
+    /// CP-T6.1, AC-T6.1.3: the first bug's contract: once a copy's folders are synced (as
+    /// `Feed::save` does before it writes the state that says what the folder holds), a file sync
+    /// wrote holds what it wrote, whatever a power loss does after; on either way of journaling
+    /// names.
     #[test]
     fn a_file_sync_wrote_holds_it_after_a_power_loss_once_its_folders_are_synced() -> Result<(), String> {
         use crate::sync::{Change, Copy, State};
@@ -1413,11 +1436,11 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the second bug kiln-sim found, by its seeds: a write failing part-way through
-    /// applying a step (an I/O error, a full disk) left the step taken by the copy's tree with the
-    /// rest of its files unwritten; tried again, the tree had it already, so they never were. A
-    /// conflict copy missing from a folder for good (sync seed 184, moves 136 and 170), a file left
-    /// at an older version (sync seed 125).
+    /// CP-T6.1, AC-T6.1.3: the second bug kiln-sim found, by its seeds: a write failing part-way
+    /// through applying a step (an I/O error, a full disk) left the step taken by the copy's tree
+    /// with the rest of its files unwritten; tried again, the tree had it already, so they never
+    /// were. A conflict copy missing from a folder for good (sync seed 184, moves 136 and 170), a
+    /// file left at an older version (sync seed 125).
     #[test]
     fn the_seeds_where_a_write_failed_part_way_through_a_step_converge() -> Result<(), String> {
         for seed in [184, 125] {
@@ -1429,8 +1452,8 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the second bug's contract: a step whose writes fail part-way, at any of them, is
-    /// applied whole when it's tried again: every file it brings is in the folder.
+    /// CP-T6.1, AC-T6.1.3: the second bug's contract: a step whose writes fail part-way, at any of
+    /// them, is applied whole when it's tried again: every file it brings is in the folder.
     #[test]
     fn a_step_a_write_failed_part_way_through_is_applied_whole_when_tried_again() -> Result<(), String> {
         use crate::sync::{Change, Copy, State};
@@ -1464,11 +1487,12 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the third bug kiln-sim found, by its seeds: a file written again just after a
-    /// look, keeping its size, kept its time too on a filesystem that stamps times by the second
-    /// (or the tick), and no look after saw the change: it took the file for what it had seen. A
-    /// moving session left its machine with its last write not in the log (moves seed 2000); a copy
-    /// kept bytes the log never had, and proposed stale ones over a conflict's (sync seed 1848).
+    /// CP-T6.1, AC-T6.1.3: the third bug kiln-sim found, by its seeds: a file written again just
+    /// after a look, keeping its size, kept its time too on a filesystem that stamps times by the
+    /// second (or the tick), and no look after saw the change: it took the file for what it had
+    /// seen. A moving session left its machine with its last write not in the log (moves seed
+    /// 2000); a copy kept bytes the log never had, and proposed stale ones over a conflict's (sync
+    /// seed 1848).
     #[test]
     fn the_seeds_where_a_change_kept_its_file_s_size_and_time_converge() -> Result<(), String> {
         run(1848, 0, ONCE, Mode::Sync)?;
@@ -1476,12 +1500,13 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the fourth bug kiln-sim found, by its seeds: a copy's save failing after it
-    /// proposed a step (a full disk, an I/O error, a crash at that write), the runner sent the step
-    /// anyway. A crash then lost the copy's record of it, and its next step took the same number:
-    /// the server, which takes a number once, let that one go as sent again, and the copy dropped it
-    /// too once the first came back through the log, its changes pending for good. A moving session
-    /// left with its last write never in the log (moves seed 3174); a copy never settled (3083).
+    /// CP-T6.1, AC-T6.1.3: the fourth bug kiln-sim found, by its seeds: a copy's save failing after
+    /// it proposed a step (a full disk, an I/O error, a crash at that write), the runner sent the
+    /// step anyway. A crash then lost the copy's record of it, and its next step took the same
+    /// number: the server, which takes a number once, let that one go as sent again, and the copy
+    /// dropped it too once the first came back through the log, its changes pending for good. A
+    /// moving session left with its last write never in the log (moves seed 3174); a copy never
+    /// settled (3083).
     #[test]
     fn the_seeds_where_a_step_went_out_before_it_was_saved_converge() -> Result<(), String> {
         for seed in [3174, 3083] {
@@ -1490,9 +1515,9 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the fourth bug's contract: a step a copy proposed goes to the server only once the
-    /// copy's saved state holds it; while a save fails, the copy says it has steps unsaved, and the
-    /// next save that works lets them go.
+    /// CP-T6.1, AC-T6.1.3: the fourth bug's contract: a step a copy proposed goes to the server
+    /// only once the copy's saved state holds it; while a save fails, the copy says it has steps
+    /// unsaved, and the next save that works lets them go.
     #[test]
     fn a_step_goes_to_the_server_only_once_the_copy_s_saved_state_holds_it() -> Result<(), String> {
         let disk = Disk::new(SimClock::new(), Rng::new(1), DiskFaults::none());
@@ -1524,19 +1549,19 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, the fifth bug kiln-sim found, by its seed: a step's version of a file was kept back
-    /// from a copy whose file was changed there, unproposed; the change was then deleted (or undone)
-    /// before a look proposed it. The folder was as the copy last synced it, so no look proposed a
-    /// thing, and the step was taken, so nothing brought its version: that copy lacked the file the
-    /// log held, for good (sync seed 1331).
+    /// CP-T6.1, AC-T6.1.3: the fifth bug kiln-sim found, by its seed: a step's version of a file
+    /// was kept back from a copy whose file was changed there, unproposed; the change was then
+    /// deleted (or undone) before a look proposed it. The folder was as the copy last synced it, so
+    /// no look proposed a thing, and the step was taken, so nothing brought its version: that copy
+    /// lacked the file the log held, for good (sync seed 1331).
     #[test]
     fn the_seed_where_a_kept_back_version_never_came_converges() -> Result<(), String> {
         run(1331, 0, ONCE, Mode::Sync).map(|_| ())
     }
 
-    /// CP-T6.1, the fifth bug's contract: a version a step brought, kept back while the file was
-    /// changed here, comes at the next look once the change here is undone, or a file made here is
-    /// deleted, without being proposed; and nothing is proposed for it.
+    /// CP-T6.1, AC-T6.1.3: the fifth bug's contract: a version a step brought, kept back while the
+    /// file was changed here, comes at the next look once the change here is undone, or a file made
+    /// here is deleted, without being proposed; and nothing is proposed for it.
     #[test]
     fn a_kept_back_version_comes_once_the_change_here_is_undone_or_deleted() -> Result<(), String> {
         use crate::sync::{Change, Copy, Outcome, State};
@@ -1580,17 +1605,54 @@ mod tests {
         Ok(())
     }
 
-    /// CP-T6.1, T-T6.1.1: a planted bug (a copy's state written in place, unsynced: a lost write
-    /// after a torn page) is found within the CI seed budget, by a seed that passes without it.
+    /// CP-T6.1, AC-T6.1.3 (the fifth bug's fix, as the runner's sweep sees it): a version kept
+    /// back is among the contents the copy still needs (`Feed::named`), so the sweep, which drops
+    /// the contents no copy names, keeps it for the look that brings it.
+    #[test]
+    fn a_kept_back_version_is_named_till_it_comes() -> Result<(), String> {
+        use crate::sync::{Change, Outcome};
+        let disk = Disk::new(SimClock::new(), Rng::new(7), DiskFaults::none());
+        let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+        let root = PathBuf::from("/home/m2/repo");
+        fs.create_dir_all(&root).map_err(e)?;
+        let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
+        let mut feed = Feed::open_on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), PathBuf::from("/state/m2/copy.json")).map_err(e)?;
+        let one = blobs.put_bytes(b"one!").map_err(e)?;
+        // A file made here, unproposed; another machine's version of it comes.
+        disk.write("/home/m2/repo/a.txt", b"mine").map_err(e)?;
+        let change = Change { path: "a.txt".into(), to: Some(Version::File { hash: one.clone(), exec: false }), base: None };
+        let kept = feed.copy.apply(&Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] }, &blobs).map_err(e)?;
+        if !matches!(kept.as_slice(), [Outcome::Kept { .. }]) {
+            return Err(format!("the version wasn't kept back: {kept:?}"));
+        }
+        if !feed.named().contains(&one) {
+            return Err("a version kept back isn't among the contents the copy names: the sweep would drop it before it came".into());
+        }
+        disk.remove_file("/home/m2/repo/a.txt").map_err(e)?;
+        feed.copy.propose(&blobs, SIM_EPOCH_MS).map_err(e)?;
+        let got = disk.read("/home/m2/repo/a.txt").ok();
+        if got.as_deref() != Some(&b"one!"[..]) {
+            return Err(format!("the kept-back version never came: a.txt holds {got:?}"));
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, T-T6.1.1: a planted bug, a lost write after a torn page, is found within the CI
+    /// seed budget. What sync writes into a folder is renamed in unsynced (as before the first
+    /// bug's fix); a power loss tears, zeroes or loses it; and the checker finds what comes of it
+    /// (contents nobody wrote spreading, a last write lost, a copy apart from the log), by a seed
+    /// that passes without the plant.
     #[test]
     fn the_planted_lost_write_after_a_torn_page_is_found() -> Result<(), String> {
+        let planted = Plant { writes_unsynced: true, ..Plant::default() };
         for seed in 0..200 {
-            if run(seed, 0, Plant { state_in_place: true, ..Plant::default() }, Mode::Sync).is_err() {
-                // The plant is what failed it.
-                run(seed, 0, Plant::default(), Mode::Sync).map_err(|why| format!("seed {seed} fails without the plant too: {why}"))?;
-                return Ok(());
+            let Err(why) = run(seed, 0, planted, Mode::Sync) else { continue };
+            if !["nobody wrote", "is lost", "isn't the log's", "never settled"].iter().any(|c| why.contains(c)) {
+                return Err(format!("seed {seed} failed with the plant, but not by the checker: {why}"));
             }
+            run(seed, 0, Plant::default(), Mode::Sync).map_err(|why| format!("seed {seed} fails without the plant too: {why}"))?;
+            return Ok(());
         }
-        Err("200 seeds didn't find the planted torn state: the nemesis is too weak".into())
+        Err("200 seeds didn't find the planted lost write: the nemesis is too weak".into())
     }
 }

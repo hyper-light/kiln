@@ -120,6 +120,31 @@ pub fn look_now_at(feed: &mut Feed, blobs: &Blobs, ready: bool, at_ms: i64) -> O
     })
 }
 
+/// The steps a copy sends the server now ([`to_send`]).
+#[derive(Debug)]
+pub struct ToSend<'a> {
+    /// In order.
+    pub steps: Vec<&'a Step>,
+    /// The newest of the copy's steps that may go: what it has sent through, once these go.
+    pub newest: u64,
+    /// How many of them it sent before.
+    pub again: u64,
+}
+
+/// What `feed`'s copy sends the server now (none: nothing): its steps the saved state holds
+/// (`Feed::sendable`), in order, as far as each one's contents are on the server (`uploaded`);
+/// those past `sent` (the newest it sent), or all of them `again`.
+pub fn to_send<'a>(feed: &'a Feed, uploaded: impl Fn(&str) -> bool, sent: u64, again: bool) -> Option<ToSend<'a>> {
+    let ready: Vec<&Step> = feed.sendable().take_while(|s| hashes(s).all(|x| uploaded(x.as_str()))).collect();
+    let newest = ready.last().map_or(0, |s| s.seq);
+    if ready.is_empty() || (!again && newest <= sent) {
+        return None;
+    }
+    let steps: Vec<&Step> = ready.into_iter().filter(|s| again || s.seq > sent).collect();
+    let again = u64::try_from(steps.iter().filter(|s| s.seq <= sent).count()).unwrap_or(u64::MAX);
+    Some(ToSend { steps, newest, again })
+}
+
 /// How `feed`'s copy stands: through where its folder has taken the log, what it hasn't taken
 /// yet, its own changes the log hasn't brought back, and what its last look left out.
 pub fn stand(feed: &Feed) -> Standing {
@@ -997,34 +1022,25 @@ impl Owner {
         }
     }
 
-    /// Looks at each folder that has taken everything committed, and proposes what changed.
+    /// Looks at each folder that has taken everything committed, and proposes what changed
+    /// ([`look_now_at`]).
     fn look(&mut self) {
         if !self.connected || !self.told {
             return;
         }
         for h in self.held.values_mut() {
-            if !h.r.machine().idle() {
-                continue;
-            }
-            let feed = h.r.machine_mut();
-            if feed.copy.adopting() {
-                continue;
-            }
             let started = Instant::now();
-            let proposed = feed.copy.propose(&self.blobs, now_ms());
-            looked(&h.spec.name, started, proposed.as_ref().map_or(0, Vec::len));
-            match proposed {
-                // New steps, or ones a save failed to keep: saved (they go to the server once
-                // they are, `Feed::sendable`).
-                Ok(steps) if !steps.is_empty() || feed.unsaved() => {
-                    h.errors[E_LOOK] = feed.save().err().map(|e| format!("the copy's state: {e}"));
+            match look_now_at(h.r.machine_mut(), &self.blobs, true, now_ms()) {
+                None => {}
+                Some(Ok((proposed, unsaved))) => {
+                    looked(&h.spec.name, started, proposed);
+                    h.errors[E_LOOK] = unsaved;
                     h.looked = true;
                 }
-                Ok(_) => {
-                    h.errors[E_LOOK] = None;
-                    h.looked = true;
+                Some(Err(e)) => {
+                    looked(&h.spec.name, started, 0);
+                    h.errors[E_LOOK] = Some(e);
                 }
-                Err(e) => h.errors[E_LOOK] = Some(format!("looking at the folder: {e}")),
             }
         }
     }
@@ -1065,23 +1081,12 @@ impl Owner {
         }
         let mut out = Vec::new();
         let mut resent: Vec<(String, u64)> = Vec::new();
+        let uploads = &self.uploads;
         for h in self.held.values_mut() {
-            let ready: Vec<&Step> = h.r.machine().sendable().take_while(|s| hashes(s).all(|x| self.uploads.get(x) == Some(&Upload::Done))).collect();
-            let newest = ready.last().map_or(0, |s| s.seq);
-            if ready.is_empty() || (!again && newest <= h.sent) {
-                continue;
-            }
-            let mut n = 0u64;
-            for s in ready {
-                if again || s.seq > h.sent {
-                    if s.seq <= h.sent {
-                        n += 1;
-                    }
-                    out.push(Msg::Steps { repo: h.spec.repo.clone(), steps: vec![s.clone()] });
-                }
-            }
-            h.sent = newest;
-            resent.push((h.spec.repo.clone(), n));
+            let Some(go) = to_send(h.r.machine(), |x| uploads.get(x) == Some(&Upload::Done), h.sent, again) else { continue };
+            out.extend(go.steps.iter().map(|s| Msg::Steps { repo: h.spec.repo.clone(), steps: vec![(*s).clone()] }));
+            h.sent = go.newest;
+            resent.push((h.spec.repo.clone(), go.again));
         }
         for msg in out {
             self.say(msg, Vec::new());
