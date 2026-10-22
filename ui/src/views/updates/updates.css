@@ -86,29 +86,28 @@
   height: auto;
   overflow: visible;
 }
-/* As big as the study drew it, however wide the page: its lettering stays its size. */
-.up-landscape {
-  max-width: 1064px;
-  margin: 0 auto;
-}
+/* As wide as the page, as Replication is: the two figures' lettering reads the same size. */
 .up-portrait {
   display: none;
 }
 .up-scene text {
   transition: fill 0.3s;
 }
+/* Names as Replication sets them; a line under each in mono, plain unless it needs attention. */
 .up-scene .up-ink {
-  fill: #c3cad4;
+  fill: #a2aab7;
   font-family: var(--font-sans);
   font-size: 14px;
+}
+.up-scene .up-tail {
+  fill: #7f8b9b;
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 .up-scene .up-sub {
   fill: #8e9bab;
   font-family: var(--font-mono);
   font-size: 11px;
-}
-.up-scene .up-sub[data-tone="ok"] {
-  fill: #a8c9bc;
 }
 .up-scene .up-sub[data-tone="warn"] {
   fill: #d0b591;
@@ -182,8 +181,10 @@
   vector-effect: non-scaling-stroke;
 }
 
-/* A light: one short dash running the cable's length, then resting, while an upgrade or a build
-   moves on it. Still under the motion setting and for reduced motion: a mark on the cable instead. */
+/* Light on a cable while an upgrade or a build moves on it: comets flowing its length one after
+   another, a bright head in a soft glow, the way things go. A connected runner's cable carries a
+   faint pulse every 6 to 8 s, the link live; an offline one's nothing. Under the motion setting and
+   for reduced motion a comet holds halfway along, a mark, and the pulses rest. */
 .up-light {
   transition: opacity 0.3s;
 }
@@ -194,35 +195,63 @@
   fill: none;
   stroke: #b8c9e8;
   stroke-linecap: round;
-  stroke-dasharray: 9 200;
-  stroke-dashoffset: 9;
   vector-effect: non-scaling-stroke;
-  opacity: 0;
-  animation: up-run 1.9s linear var(--up-delay, 0s) infinite;
+  animation: up-flow 3.6s linear var(--up-delay, 0s) infinite;
 }
 .up-light[data-kind="build"] path {
   stroke: #b6d5c8;
-  animation-duration: 2.4s;
-}
-.up-light-core {
-  stroke-width: 1.5;
 }
 .up-light-halo {
-  stroke-width: 4;
-  --up-glow: 0.3;
+  stroke-width: 5;
+  stroke-opacity: 0.2;
+  stroke-dasharray: 16 34;
 }
-@keyframes up-run {
+.up-light .up-light-core {
+  stroke-width: 1.6;
+  stroke-dasharray: 6 44;
+  animation-name: up-flow-head;
+}
+@keyframes up-flow {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -50;
+  }
+}
+@keyframes up-flow-head {
+  from {
+    stroke-dashoffset: -10;
+  }
+  to {
+    stroke-dashoffset: -60;
+  }
+}
+.up-pulse {
+  fill: none;
+  stroke: #a9bad3;
+  stroke-width: 1.2;
+  stroke-linecap: round;
+  stroke-dasharray: 7 200;
+  vector-effect: non-scaling-stroke;
+  opacity: 0;
+  animation: up-pulse var(--up-period, 7s) linear var(--up-delay, 0s) infinite;
+}
+.up-pulse[data-dim] {
+  visibility: hidden;
+}
+@keyframes up-pulse {
   0% {
-    stroke-dashoffset: 9;
+    stroke-dashoffset: 7;
     opacity: 0;
   }
   4% {
-    opacity: var(--up-glow, 1);
+    opacity: 0.6;
   }
-  72% {
-    opacity: var(--up-glow, 1);
+  36% {
+    opacity: 0.6;
   }
-  78% {
+  40% {
     stroke-dashoffset: -100;
     opacity: 0;
   }
@@ -442,7 +471,6 @@
   font-size: 15px;
 }
 .up-stage-hold {
-  max-width: 1064px;
   margin: 4px auto 0;
   aspect-ratio: 960 / 318;
 }
@@ -1002,6 +1030,7 @@
   grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 .up-platform {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -1016,6 +1045,67 @@
 }
 .up-platform[data-hl] {
   background: #0f1218;
+  box-shadow: inset 0 0 0 1px #809ab54d;
+}
+/* A platform is picked with the whole of its tile, by pointer or keyboard: its log opens under the
+   tiles. What can be done in it stays its own button, above. */
+.up-p-pick {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: transparent;
+  cursor: pointer;
+}
+.up-p-pick:focus-visible {
+  outline: 2px solid #b8b0d8;
+  outline-offset: -2px;
+}
+@media (hover: hover) {
+  .up-platform:not([data-hl]):has(> .up-p-pick:hover) {
+    background: #0d1116;
+  }
+}
+.up-p-acts,
+.up-p-shadow {
+  position: relative;
+  z-index: 2;
+  pointer-events: none;
+}
+.up-p-acts :is(a, button),
+.up-p-shadow button,
+.up-platform > .up-confirm {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+}
+/* An older build kept beside the one runners get, said quietly, with its Remove. */
+.up-p-shadow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  margin: -4px 0 0;
+  color: #7a8493;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.up-p-shadow [data-slot="button"] {
+  margin-left: -6px;
+}
+/* While its job builds it, light runs along under its facts, as on its cable in the picture; queued,
+   the line waits still. */
+.up-track-wide i {
+  background: linear-gradient(90deg, transparent, #b6d5c8, transparent);
+  animation-duration: 2.8s;
+  animation-timing-function: linear;
+}
+.up-track[data-state="queued"] i {
+  display: none;
+}
+.up-chip-die[data-building] {
+  stroke: #cfc6ef;
+  stroke-dasharray: 7 14;
+  animation: up-die 2.4s linear infinite;
 }
 .up-p-head {
   display: flex;
@@ -1072,6 +1162,101 @@
 .up-platforms-hold {
   min-height: 196px;
   border-top: 1px solid #1b2028;
+}
+
+/* A platform's build log, under the tiles: its run and job, their steps, the step's log. */
+.up-blog {
+  border-top: 1px solid #1b2028;
+  background: #0b0d11;
+}
+.up-blog-none {
+  margin: 0;
+  padding: 16px 24px;
+  color: #8f99a8;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.up-blog-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 16px 24px 12px;
+  font-size: 12px;
+}
+.up-blog-title {
+  min-width: 0;
+  color: #c9d0da;
+}
+.up-blog-title a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgb(255 255 255 / 22%);
+  text-underline-offset: 3px;
+}
+.up-blog-title a:hover {
+  text-decoration-color: currentColor;
+}
+.up-blog-meta {
+  margin-left: auto;
+  color: #7f8998;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.up-blog-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0 24px 14px;
+  list-style: none;
+}
+.up-blog-steps button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid #252c36;
+  border-radius: 6px;
+  background: #0d1015;
+  color: #b9c0cb;
+  font-size: 12px;
+  transition:
+    border-color 0.2s,
+    background 0.2s;
+}
+@media (hover: hover) {
+  .up-blog-steps button:hover {
+    border-color: #3a4350;
+  }
+}
+.up-blog-steps button[aria-pressed="true"] {
+  border-color: #6d6590;
+  background: #13121b;
+  color: #e6e8ec;
+}
+.up-blog-steps button:focus-visible {
+  outline: 2px solid #b8b0d8;
+  outline-offset: 1px;
+}
+.up-blog-n {
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.up-blog-t {
+  color: #93a1b4;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.up-blog > .upgrade-log {
+  margin: 14px 24px 18px;
+}
+.up-blog-hold {
+  border-top: 1px solid #1d2128;
 }
 .up-foot {
   display: flex;
@@ -1204,12 +1389,6 @@
     max-width: 430px;
     margin: 18px auto 0;
   }
-  .up-portrait .up-ink {
-    font-size: 13px;
-  }
-  .up-portrait .up-node-name {
-    font-size: 14px;
-  }
   .up-stage-hold {
     max-width: 430px;
     aspect-ratio: 360 / 404;
@@ -1308,7 +1487,8 @@
     width: 100%;
     height: 40px;
   }
-  .up-platforms[data-cols] {
+  .up-platforms[data-cols],
+  .up-platforms[data-cols]:not([data-cols="1"]) {
     grid-template-columns: minmax(0, 1fr);
   }
   .up-platform {
@@ -1325,6 +1505,21 @@
   }
   .up-p-acts {
     margin: 0 -14px;
+  }
+  .up-blog-none,
+  .up-blog-head {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+  .up-blog-meta {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
+  .up-blog-steps {
+    padding: 0 16px 12px;
+  }
+  .up-blog > .upgrade-log {
+    margin: 12px 16px 16px;
   }
   .up-foot {
     display: block;
@@ -1363,13 +1558,21 @@
 }
 
 /* Still under the motion setting and for reduced motion: what moves while a machine is upgraded
-   or a platform built holds as a mark. */
-:root[data-motion="paused"] .up-light path {
+   or a platform built holds as a mark, a comet halfway along its cable; the pulses rest. */
+:root[data-motion="paused"] .up-light path,
+:root[data-motion="paused"] .up-pulse {
   animation: none;
-  stroke-dashoffset: -55;
-  opacity: var(--up-glow, 1);
+}
+:root[data-motion="paused"] .up-light-halo {
+  stroke-dasharray: 16 84;
+  stroke-dashoffset: -42;
+}
+:root[data-motion="paused"] .up-light .up-light-core {
+  stroke-dasharray: 6 94;
+  stroke-dashoffset: -52;
 }
 :root[data-motion="paused"] .up-die[data-building],
+:root[data-motion="paused"] .up-chip-die[data-building],
 :root[data-motion="paused"] .up-track i {
   animation: none;
 }
@@ -1377,12 +1580,20 @@
   transform: translateX(80%);
 }
 @media (prefers-reduced-motion: reduce) {
-  .up-light path {
+  .up-light path,
+  .up-pulse {
     animation: none;
-    stroke-dashoffset: -55;
-    opacity: var(--up-glow, 1);
+  }
+  .up-light-halo {
+    stroke-dasharray: 16 84;
+    stroke-dashoffset: -42;
+  }
+  .up-light .up-light-core {
+    stroke-dasharray: 6 94;
+    stroke-dashoffset: -52;
   }
   .up-die[data-building],
+  .up-chip-die[data-building],
   .up-track i {
     animation: none;
   }

@@ -84,6 +84,8 @@ interface SimJob {
   failStep: number | null; // step index that will fail
   stepStartedMs: number | null;
   planned: PlannedJob;
+  /** Queued, it waits for a machine until then (unix seconds): one machine builds kiln's platforms in turn. */
+  holdUntil?: number;
 }
 interface LogStream {
   data: string;
@@ -664,11 +666,20 @@ const RELEASE_JOBS: JobTpl[] = [
 ];
 let releaseRun: Run | null = null;
 
-function startRelease(commit: string): Run {
+/**
+ * A release run: Build every platform's (a manual run of `commit`), or a push to main's. `hold`
+ * keeps a job queued that many seconds (one machine builds Linux and Windows in turn), `slow`
+ * draws its steps out, so a page shows it building for a while.
+ */
+function startRelease(commit: string, opts: { event?: string; message?: string; hold?: Record<string, number>; slow?: number } = {}): Run {
   const repo = repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!;
-  const { run } = makeRun(repo, { created: now(), branch: "main", event: "manual", pipeline: "release" });
-  Object.assign(run, { sha: commit, message: "Build every platform", author: "admin" });
+  const { run } = makeRun(repo, { created: now(), branch: "main", event: opts.event ?? "manual", pipeline: "release" });
+  Object.assign(run, { sha: commit, message: opts.message ?? "Build every platform", author: opts.event === "push" ? "ada" : "admin" });
   const sjobs = RELEASE_JOBS.map((tpl, i) => newSimJob(run, tpl, i));
+  for (const sj of sjobs) {
+    if (opts.slow) sj.steps.forEach((s) => (s.dur *= opts.slow!));
+    if (opts.hold?.[sj.tpl.key]) sj.holdUntil = now() + opts.hold[sj.tpl.key]!;
+  }
   runs.unshift(run);
   jobsByRun.set(run.id, sjobs);
   sjobs.forEach((s) => jobsById.set(s.job.id, s));
@@ -677,6 +688,56 @@ function startRelease(commit: string): Run {
   releaseRun = run;
   return run;
 }
+
+/**
+ * The release runs the kept binaries came from, newest first: two of kiln's past runs, made release
+ * runs of `sha`, every job done, so a binary's run number opens its job's log. The older one built
+ * the server's own platform, which the server's own build shadows.
+ */
+const pastReleases: Run[] = [
+  { ago: 80_000, sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678" },
+  { ago: 205_000, sha: "df17c34639ecbf9d5c9caefb6af28aa67ee01257" },
+].flatMap(({ ago, sha }) => {
+  const kiln = runs.filter((r) => r.repo_name === "hyper-light/kiln");
+  const run = kiln.reduce<Run | null>((a, r) => (a === null || Math.abs(r.created_at - (now() - ago)) < Math.abs(a.created_at - (now() - ago)) ? r : a), null);
+  if (!run) return [];
+  for (const s of jobsByRun.get(run.id) ?? []) jobsById.delete(s.job.id);
+  Object.assign(run, { pipeline: "release", event: "push", branch: "main", sha, message: "Release builds", status: "succeeded", error: null });
+  let end = run.created_at;
+  const sjobs = RELEASE_JOBS.map((tpl, i) => {
+    const sj = newSimJob(run, tpl, i);
+    const start = run.created_at + 4 + i * 3;
+    let t = start;
+    for (const s of sj.steps) {
+      s.dur *= 12;
+      Object.assign(s, { status: "succeeded", exit_code: 0, started_at: Math.floor(t), finished_at: Math.floor((t += s.dur)) });
+    }
+    const agent = tpl.labels.includes("macos") ? "metal-mac-mini" : "metal-ryzen-01";
+    Object.assign(sj.job, {
+      status: "succeeded",
+      agent,
+      executor: "baremetal",
+      queued_at: run.created_at + 2,
+      started_at: start,
+      finished_at: Math.floor(t),
+      exit_code: 0,
+      peak_rss: 3_100_000_000,
+      cpu_seconds: Math.round((t - start) * 5),
+    });
+    syncJob(sj);
+    end = Math.max(end, Math.floor(t));
+    return sj;
+  });
+  Object.assign(run, { started_at: run.created_at + 4, finished_at: end });
+  jobsByRun.set(run.id, sjobs);
+  sjobs.forEach((s) => jobsById.set(s.job.id, s));
+  return [run];
+});
+
+// A push to main builds a commit newer than the server's (main moved on since it was built): its
+// Mac builds first while Linux and Windows wait their turn on one machine. kiln keeps none of
+// it (it takes builds of the server's own commit only); the page shows it building.
+startRelease("25159ff8b2d4c6e0a1f3b5d7c9e1a3f5b7d9c1e3", { event: "push", message: "Builds open their logs under the platforms", hold: { linux: 45, windows: 100 }, slow: 4 });
 
 function finishJob(sj: SimJob, status: Status, error: string | null) {
   const j = sj.job;
@@ -715,7 +776,7 @@ function tick() {
           emit({ type: "job", job: j });
         }
       } else if (j.status === "queued") {
-        if (nowS - (j.queued_at ?? nowS) >= 1 && rnd() < 0.7 && assign(sj)) {
+        if ((sj.holdUntil ?? 0) <= nowS && nowS - (j.queued_at ?? nowS) >= 1 && rnd() < 0.7 && assign(sj)) {
           j.status = "running";
           j.started_at = nowS;
           const s0 = sj.steps[0]!;
@@ -1669,7 +1730,11 @@ const server = http.createServer(async (req, res) => {
         err,
         body,
         emit,
-        release: { start: startRelease, latest: () => (releaseRun ? { run: releaseRun, jobs: (jobsByRun.get(releaseRun.id) ?? []).map((s) => s.job) } : null) },
+        release: {
+          start: (commit) => startRelease(commit),
+          latest: () => (releaseRun ? { run: releaseRun, jobs: (jobsByRun.get(releaseRun.id) ?? []).map((s) => s.job) } : null),
+          past: () => pastReleases,
+        },
       })
     )
       return;
