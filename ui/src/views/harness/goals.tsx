@@ -19,7 +19,7 @@ import { Loadable } from "@/components/ui/loading";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { planHref, runHref } from "@/api/plans";
-import { StandTitle, StepGlyph, type Stand } from "@/views/plans/status";
+import type { Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
@@ -266,12 +266,13 @@ function GoalPanel({
                 const away = g.status === "pending" ? g.on : undefined;
                 return (
                   <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : g.status} data-part={g.part_of ? "" : undefined} data-depth={g.part_of ? depthOf(g, items) : undefined}>
-                    <span className="gs-node" title={WORD[g.status]}>
-                      <StepGlyph stand={standOf(g, held, working && !g.waits_on)} />
+                    {/* Its number in the stack (how it's spoken of), or how it ended; the ring says where it stands. */}
+                    <span className="gs-node" data-stand={standOf(g, held, working && !g.waits_on)} title={WORD[g.status]} aria-hidden="true">
+                      {g.status === "met" ? "✓" : g.status === "unmet" ? "✕" : g.status === "skipped" ? "–" : items.indexOf(g) + 1}
                     </span>
                     <span className="gs-text">
                       {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                      <StandTitle stand={standOf(g, held, working && !g.waits_on)}>{g.text.split(" — ")[0] ?? g.text}</StandTitle>
+                      {g.text.split(" — ")[0] ?? g.text}
                       {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
                       <span className="gs-word">
                         {held ? "paused" : away ? (
