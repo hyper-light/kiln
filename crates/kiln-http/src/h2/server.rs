@@ -212,10 +212,12 @@ struct Wire<I> {
     /// Received bytes taken (or thrown away) and not yet given back to the connection's window.
     owed: usize,
     cfg: Builder,
-    /// The decoded fields of the block at hand (kept to reuse the allocation).
-    fields: Vec<Field>,
+    /// A response's header map, emptied, for the next request's headers to take.
+    spare: Option<HeaderMap>,
     /// The client acknowledged our settings: until it has, it may hold to the defaults.
     acked: bool,
+    /// The date responses carry, read once a pass over what was read.
+    date: [u8; date::LEN],
 }
 
 impl<I: AsyncRead + AsyncWrite + Unpin> Wire<I> {
@@ -225,6 +227,14 @@ impl<I: AsyncRead + AsyncWrite + Unpin> Wire<I> {
 }
 
 impl<I> Wire<I> {
+    /// Keeps a header map's allocation for the next request (emptied).
+    fn keep_spare(&mut self, mut map: HeaderMap) {
+        if map.capacity() > 0 && self.spare.is_none() {
+            map.clear();
+            self.spare = Some(map);
+        }
+    }
+
     /// The next whole frame read, its payload taken from the buffer.
     fn next_frame(&mut self) -> Result<Option<(Head, Bytes)>, ConnError> {
         let Some(h) = frame::head(&self.rbuf) else { return Ok(None) };
@@ -273,7 +283,7 @@ impl<I> Wire<I> {
             }
         }
         if !has_date {
-            self.encoder.header_bytes(&header::DATE, &date::now(), tail);
+            self.encoder.header_bytes(&header::DATE, &self.date, tail);
         }
         let len = tail.len() - start - 9;
         let flags = if end_stream { frame::END_STREAM } else { 0 };
@@ -332,6 +342,7 @@ fn respond<I, F, B: SendBody + Unpin>(wire: &mut Wire<I>, id: u32, s: &mut Strea
     let length = body.size_hint().exact();
     let empty = s.head || body.is_end_stream() || length == Some(0);
     wire.headers(id, parts.status, &parts.headers, length.filter(|_| !s.head), empty);
+    wire.keep_spare(parts.headers);
     if empty {
         s.local_done = true;
         return true;
@@ -429,86 +440,126 @@ fn trailers<I>(wire: &mut Wire<I>, id: u32, t: &HeaderMap) {
     }
 }
 
-/// The request a header block describes (RFC 9113 §8.3.1), or why it's malformed.
-fn request(fields: &mut Vec<Field>) -> Result<(http::Request<()>, Option<u64>), ()> {
-    let (mut method, mut scheme, mut authority, mut path) = (None, None, None, None);
-    let mut regular = 0usize;
-    let mut seen_regular = false;
-    for f in fields.iter() {
-        match &f.name {
-            Name::Header(_) => {
-                seen_regular = true;
-                regular += 1;
+/// The request a header block describes (RFC 9113 §8.3.1), built field by field as the block is
+/// decoded, each value moved where it goes (a clone of a shared value costs an atomic count).
+#[derive(Default)]
+struct Building {
+    method: Option<Bytes>,
+    scheme: Option<Bytes>,
+    authority: Option<Bytes>,
+    path: Option<Bytes>,
+    headers: HeaderMap,
+    length: Option<u64>,
+    seen_regular: bool,
+    /// Malformed: the stream is reset.
+    bad: bool,
+}
+
+impl Building {
+    fn new(headers: HeaderMap) -> Building {
+        Building { headers, ..Building::default() }
+    }
+
+    fn add(&mut self, f: Field) {
+        if self.bad {
+            return;
+        }
+        match f.name {
+            Name::Header(name) => {
+                self.seen_regular = true;
+                if name == header::CONNECTION || name == header::TRANSFER_ENCODING || name == header::UPGRADE || name.as_str() == "keep-alive" || name.as_str() == "proxy-connection" {
+                    self.bad = true;
+                    return;
+                }
+                if name == header::TE && &f.value[..] != b"trailers" {
+                    self.bad = true;
+                    return;
+                }
+                if name == header::CONTENT_LENGTH {
+                    let n = std::str::from_utf8(&f.value).ok().filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).and_then(|v| v.parse::<u64>().ok());
+                    match n {
+                        Some(n) if self.length.is_none_or(|m| m == n) => self.length = Some(n),
+                        _ => {
+                            self.bad = true;
+                            return;
+                        }
+                    }
+                }
+                match HeaderValue::from_maybe_shared(f.value) {
+                    Ok(v) => {
+                        self.headers.append(name, v);
+                    }
+                    Err(_) => self.bad = true,
+                }
             }
-            Name::Invalid(_) | Name::Status | Name::Protocol => return Err(()),
+            Name::Invalid(_) | Name::Status | Name::Protocol => self.bad = true,
             pseudo => {
-                if seen_regular {
-                    return Err(());
-                }
+                // Pseudo-headers come first, each once.
                 let slot = match pseudo {
-                    Name::Method => &mut method,
-                    Name::Scheme => &mut scheme,
-                    Name::Authority => &mut authority,
-                    _ => &mut path,
+                    Name::Method => &mut self.method,
+                    Name::Scheme => &mut self.scheme,
+                    Name::Authority => &mut self.authority,
+                    _ => &mut self.path,
                 };
-                if slot.is_some() {
+                if self.seen_regular || slot.is_some() {
+                    self.bad = true;
+                    return;
+                }
+                *slot = Some(f.value);
+            }
+        }
+    }
+
+    /// The request, its body from `body` (given the content-length): `Err` with the header map to
+    /// reuse when it's malformed.
+    fn finish(self, body: impl FnOnce(Option<u64>) -> Option<Incoming>) -> Result<http::Request<Incoming>, HeaderMap> {
+        let Building { method, scheme, authority, path, headers, length, bad, .. } = self;
+        if bad {
+            return Err(headers);
+        }
+        let uri = || -> Result<(Method, Uri), ()> {
+            let method = match method.as_deref() {
+                Some(b"GET") => Method::GET,
+                Some(b"POST") => Method::POST,
+                Some(m) => Method::from_bytes(m).map_err(|_| ())?,
+                None => return Err(()),
+            };
+            let mut parts = http::uri::Parts::default();
+            if method == Method::CONNECT {
+                if scheme.is_some() || path.is_some() {
                     return Err(());
                 }
-                *slot = Some(f.value.clone());
+                parts.authority = Some(Authority::from_maybe_shared(authority.ok_or(())?).map_err(|_| ())?);
+            } else {
+                let scheme = scheme.ok_or(())?;
+                parts.scheme = Some(match &scheme[..] {
+                    b"https" => Scheme::HTTPS,
+                    b"http" => Scheme::HTTP,
+                    other => Scheme::try_from(other).map_err(|_| ())?,
+                });
+                if let Some(a) = authority.filter(|a| !a.is_empty()) {
+                    parts.authority = Some(Authority::from_maybe_shared(a).map_err(|_| ())?);
+                }
+                let path = path.filter(|p| !p.is_empty()).ok_or(())?;
+                parts.path_and_query = Some(if &path[..] == b"/" { slash() } else { PathAndQuery::from_maybe_shared(path).map_err(|_| ())? });
             }
-        }
+            Ok((method, Uri::from_parts(parts).map_err(|_| ())?))
+        };
+        let Ok((method, uri)) = uri() else { return Err(headers) };
+        let Some(body) = body(length) else { return Err(headers) };
+        let mut req = http::Request::new(body);
+        *req.method_mut() = method;
+        *req.uri_mut() = uri;
+        *req.version_mut() = Version::HTTP_2;
+        *req.headers_mut() = headers;
+        Ok(req)
     }
-    let method = match method.as_deref() {
-        Some(b"GET") => Method::GET,
-        Some(b"POST") => Method::POST,
-        Some(m) => Method::from_bytes(m).map_err(|_| ())?,
-        None => return Err(()),
-    };
-    let mut parts = http::uri::Parts::default();
-    if method == Method::CONNECT {
-        if scheme.is_some() || path.is_some() {
-            return Err(());
-        }
-        parts.authority = Some(Authority::from_maybe_shared(authority.ok_or(())?).map_err(|_| ())?);
-    } else {
-        let scheme = scheme.ok_or(())?;
-        parts.scheme = Some(match &scheme[..] {
-            b"https" => Scheme::HTTPS,
-            b"http" => Scheme::HTTP,
-            other => Scheme::try_from(other).map_err(|_| ())?,
-        });
-        if let Some(a) = authority.filter(|a| !a.is_empty()) {
-            parts.authority = Some(Authority::from_maybe_shared(a).map_err(|_| ())?);
-        }
-        let path = path.filter(|p| !p.is_empty()).ok_or(())?;
-        parts.path_and_query = Some(if &path[..] == b"/" { PathAndQuery::from_static("/") } else { PathAndQuery::from_maybe_shared(path).map_err(|_| ())? });
-    }
-    let uri = Uri::from_parts(parts).map_err(|_| ())?;
-    let mut headers = HeaderMap::with_capacity(regular);
-    let mut length = None;
-    for f in fields.drain(..) {
-        let Name::Header(name) = f.name else { continue };
-        if name == header::CONNECTION || name == header::TRANSFER_ENCODING || name == header::UPGRADE || name.as_str() == "keep-alive" || name.as_str() == "proxy-connection" {
-            return Err(());
-        }
-        if name == header::TE && &f.value[..] != b"trailers" {
-            return Err(());
-        }
-        if name == header::CONTENT_LENGTH {
-            let n = std::str::from_utf8(&f.value).ok().filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).and_then(|v| v.parse::<u64>().ok()).ok_or(())?;
-            if length.is_some_and(|m| m != n) {
-                return Err(());
-            }
-            length = Some(n);
-        }
-        headers.append(name, HeaderValue::from_maybe_shared(f.value).map_err(|_| ())?);
-    }
-    let mut req = http::Request::new(());
-    *req.method_mut() = method;
-    *req.uri_mut() = uri;
-    *req.version_mut() = Version::HTTP_2;
-    *req.headers_mut() = headers;
-    Ok((req, length))
+}
+
+/// `/`, parsed once (a clone of it shares static bytes: no count).
+fn slash() -> PathAndQuery {
+    static SLASH: std::sync::LazyLock<PathAndQuery> = std::sync::LazyLock::new(|| PathAndQuery::from_static("/"));
+    SLASH.clone()
 }
 
 struct Conn<I, S: Service> {
@@ -834,33 +885,30 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
 
     /// A whole header block: a new request, or a request's trailers.
     fn on_block(&mut self, id: u32, end_stream: bool, block: Bytes, cx: &mut Context<'_>) -> Result<(), ConnError> {
-        let mut fields = std::mem::take(&mut self.wire.fields);
-        fields.clear();
-        let whole = self.wire.decoder.decode(&block, self.wire.cfg.max_header_list_size as usize, &mut fields)?;
-        let outcome = self.on_fields(id, end_stream, whole, &mut fields, cx);
-        fields.clear();
-        self.wire.fields = fields;
-        outcome
-    }
-
-    fn on_fields(&mut self, id: u32, end_stream: bool, whole: bool, fields: &mut Vec<Field>, cx: &mut Context<'_>) -> Result<(), ConnError> {
+        let max_list = self.wire.cfg.max_header_list_size as usize;
         if let Some(s) = self.streams.get_mut(&id) {
             // Trailers: they end the request body.
+            let mut t = HeaderMap::new();
+            self.wire.decoder.decode_each(&block, max_list, |f| {
+                if let (Name::Header(n), Ok(v)) = (f.name, HeaderValue::from_maybe_shared(f.value)) {
+                    t.append(n, v);
+                }
+            })?;
             if s.remote_done || !end_stream {
                 return Err(ConnError(frame::PROTOCOL_ERROR));
             }
             s.remote_done = true;
-            let mut t = HeaderMap::new();
-            for f in fields.drain(..) {
-                if let (Name::Header(n), Ok(v)) = (f.name, HeaderValue::from_maybe_shared(f.value)) {
-                    t.append(n, v);
-                }
-            }
             if let Some(b) = &s.body_in {
                 b.feed.end(Some(t));
             }
             return Ok(());
         }
+        let mut building = Building::new(self.wire.spare.take().unwrap_or_default());
+        let whole = self.wire.decoder.decode_each(&block, max_list, |f| building.add(f))?;
+        self.on_request(id, end_stream, whole, building, cx)
+    }
+
+    fn on_request(&mut self, id: u32, end_stream: bool, whole: bool, building: Building, cx: &mut Context<'_>) -> Result<(), ConnError> {
         if id <= self.last_stream {
             return Err(ConnError(frame::PROTOCOL_ERROR));
         }
@@ -883,25 +931,28 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
             }
             return Ok(());
         }
-        let Ok((req, length)) = request(fields) else {
-            self.wire.rst(id, frame::PROTOCOL_ERROR);
-            return Ok(());
-        };
-        s.head = req.method() == Method::HEAD;
-        let body = if end_stream {
-            if length.is_some_and(|n| n > 0) {
+        // A client that hasn't taken our settings yet may send what the default window allows.
+        let window = if self.wire.acked { i64::from(self.wire.cfg.stream_window) } else { i64::from(self.wire.cfg.stream_window).max(frame::DEFAULT_WINDOW) };
+        let body_in = &mut s.body_in;
+        let built = building.finish(|length| {
+            if end_stream {
+                // A length that says there's a body, with none: malformed.
+                return length.is_none_or(|n| n == 0).then(Incoming::empty);
+            }
+            let (body, feed) = Incoming::piped(length);
+            *body_in = Some(BodyIn { feed, left: length, window, mark: 0, owed: 0 });
+            Some(body)
+        });
+        let req = match built {
+            Ok(r) => r,
+            Err(spare) => {
+                self.wire.keep_spare(spare);
                 self.wire.rst(id, frame::PROTOCOL_ERROR);
                 return Ok(());
             }
-            Incoming::empty()
-        } else {
-            let (body, feed) = Incoming::piped(length);
-            // A client that hasn't taken our settings yet may send what the default window allows.
-            let window = if self.wire.acked { i64::from(self.wire.cfg.stream_window) } else { i64::from(self.wire.cfg.stream_window).max(frame::DEFAULT_WINDOW) };
-            s.body_in = Some(BodyIn { feed, left: length, window, mark: 0, owed: 0 });
-            body
         };
-        let fut = self.service.call(req.map(|()| body));
+        s.head = req.method() == Method::HEAD;
+        let fut = self.service.call(req);
         let mut slot = self.slot(fut);
         let polled = slot.as_mut().as_pin_mut().map(|f| f.poll(cx));
         match polled {
@@ -1044,6 +1095,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         loop {
             let mut busy = false;
+            self.wire.date = date::now();
             while self.wire.wbuf.len() < HIGH_WATER {
                 match self.wire.next_frame() {
                     Ok(Some((h, payload))) => {
@@ -1090,7 +1142,11 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
                 return Poll::Ready(Ok(()));
             }
             if self.wire.rbuf.is_empty() && self.wire.wbuf.is_empty() {
+                // Idle: the connection holds no buffer.
                 self.wire.wbuf.release();
+                if self.wire.rbuf.capacity() > 0 && self.streams.is_empty() {
+                    self.wire.rbuf = BytesMut::new();
+                }
             }
             match poll_read_into(&mut self.wire.io, cx, &mut self.wire.rbuf, SCRATCH) {
                 Poll::Ready(Ok(0)) => self.wire.eof = true,
@@ -1141,8 +1197,9 @@ where
         recv_window: i64::from(cfg.connection_window),
         owed: 0,
         cfg,
-        fields: Vec::new(),
+        spare: None,
         acked: false,
+        date: date::now(),
     };
     // Our settings go first; the client's preface is checked as it arrives.
     frame::put_settings(

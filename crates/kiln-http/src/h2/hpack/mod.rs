@@ -149,6 +149,12 @@ fn static_field(i: usize) -> Option<Field> {
 
 const STATIC_LEN: usize = 61;
 
+/// The static table, made once (an entry is cloned from it: static bytes, no count).
+fn statics() -> &'static [Field] {
+    static TABLE: std::sync::LazyLock<Vec<Field>> = std::sync::LazyLock::new(|| (1..=STATIC_LEN).filter_map(static_field).collect());
+    &TABLE
+}
+
 /// The static table's index of a header's name, if it has one.
 fn static_name(name: &HeaderName) -> Option<usize> {
     Some(match name.as_str() {
@@ -231,6 +237,7 @@ fn read_int(block: &[u8], pos: &mut usize, n: u32) -> Result<usize, DecodeError>
 }
 
 /// Writes `value` with an `n`-bit prefix whose other bits are `flags`.
+#[inline]
 pub(crate) fn put_int(out: &mut Vec<u8>, flags: u8, n: u32, mut value: usize) {
     let mask = (1usize << n) - 1;
     if value < mask {
@@ -274,7 +281,7 @@ impl Decoder {
             return Err(DecodeError);
         }
         if i <= STATIC_LEN {
-            return static_field(i).ok_or(DecodeError);
+            return statics().get(i - 1).cloned().ok_or(DecodeError);
         }
         self.table.get(i - STATIC_LEN - 1).cloned().ok_or(DecodeError)
     }
@@ -323,6 +330,11 @@ impl Decoder {
     /// Decodes a header block onto `out`. Fields past `max_list` (the header list's size, RFC 9113
     /// §6.5.2) are decoded, to keep the table in step, but not kept: `Ok(false)` says some were dropped.
     pub(crate) fn decode(&mut self, block: &Bytes, max_list: usize, out: &mut Vec<Field>) -> Result<bool, DecodeError> {
+        self.decode_each(block, max_list, |f| out.push(f))
+    }
+
+    /// [`Decoder::decode`], each field handed to `each` as it's decoded.
+    pub(crate) fn decode_each(&mut self, block: &Bytes, max_list: usize, mut each: impl FnMut(Field)) -> Result<bool, DecodeError> {
         let mut pos = 0usize;
         let mut scratch = BytesMut::new();
         let mut list = 0usize;
@@ -360,7 +372,7 @@ impl Decoder {
             if list > max_list {
                 whole = false;
             } else {
-                out.push(field);
+                each(field);
             }
         }
         Ok(whole)

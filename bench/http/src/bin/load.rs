@@ -58,6 +58,8 @@ struct Args {
     path: String,
     cpus: Vec<usize>,
     server_pid: Option<u32>,
+    /// Idle connections speak HTTP/2 (each made one request on stream 1).
+    idle_h2: bool,
 }
 
 impl Args {
@@ -74,6 +76,7 @@ impl Args {
             path: "/".into(),
             cpus: Vec::new(),
             server_pid: None,
+            idle_h2: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(k) = it.next() {
@@ -98,6 +101,7 @@ impl Args {
                 "--path" => a.path = v()?,
                 "--cpus" => a.cpus = cpus(&v()?)?,
                 "--server-pid" => a.server_pid = Some(num(&v()?)? as u32),
+                "--idle-h2" => a.idle_h2 = true,
                 "-h" | "--help" => return Err("usage".into()),
                 other => return Err(format!("unknown flag {other}")),
             }
@@ -896,6 +900,38 @@ fn one_request(fd: i32, req: &[u8]) -> Result<(), String> {
     }
 }
 
+/// One HTTP/2 request on a fresh connection (the preface, settings, a GET on stream 1), blocking until
+/// its response ended; the connection stays open.
+fn one_request_h2(fd: i32, args: &Args) -> Result<(), String> {
+    let mut c = H2Conn::new(fd, 1);
+    c.open_streams(&h2_block(args), Instant::now());
+    while !c.flush()? {
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    let (mut t, mut h) = (Totals::default(), Hist::new());
+    loop {
+        let (start, end) = (c.end, c.rbuf.len());
+        match read(fd, &mut c.rbuf[start..end])? {
+            None => std::thread::sleep(Duration::from_micros(50)),
+            Some(0) => return Err("closed before answering".into()),
+            Some(n) => {
+                c.end += n;
+                if !c.frames(Instant::now(), true, &mut t, &mut h)? {
+                    return Err("GOAWAY".into());
+                }
+                while !c.flush()? {
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                if t.requests > 0 {
+                    // What a connection keeps is its own, not a quarter-megabyte read buffer here.
+                    c.rbuf = Vec::new();
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 fn idle(args: &Args) -> Result<String, String> {
     let before = match args.server_pid {
         Some(pid) => Some(rss_kib(pid)?),
@@ -907,7 +943,11 @@ fn idle(args: &Args) -> Result<String, String> {
         // 20 000 connections to a source address, so the ephemeral ports never run out.
         let from = Ipv4Addr::new(127, 0, 0, 1 + (i / 20_000) as u8);
         let fd = connect(args.addr, Some(from), false)?;
-        one_request(fd, &req)?;
+        if args.idle_h2 {
+            one_request_h2(fd, args)?;
+        } else {
+            one_request(fd, &req)?;
+        }
         fds.push(fd);
     }
     std::thread::sleep(Duration::from_secs(1));
@@ -917,7 +957,12 @@ fn idle(args: &Args) -> Result<String, String> {
     };
     let line = match (before, after) {
         (Some(b), Some(a)) => {
-            format!("{{\"mode\":\"idle\",\"conns\":{},\"rss_before_kib\":{b},\"rss_after_kib\":{a},\"bytes_per_conn\":{:.0}}}", args.conns, (a.saturating_sub(b) * 1024) as f64 / args.conns as f64)
+            format!(
+                "{{\"mode\":\"{}\",\"conns\":{},\"rss_before_kib\":{b},\"rss_after_kib\":{a},\"bytes_per_conn\":{:.0}}}",
+                if args.idle_h2 { "idle-h2" } else { "idle" },
+                args.conns,
+                (a.saturating_sub(b) * 1024) as f64 / args.conns as f64
+            )
         }
         _ => format!("{{\"mode\":\"idle\",\"conns\":{}}}", args.conns),
     };

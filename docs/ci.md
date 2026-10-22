@@ -96,11 +96,11 @@ These hold for every line written under this spec.
   (YAML, expressions, protocol frames, HTTP bodies, archives) becomes an error value that is shown
   to the user, never a crash.
 - **hyper-rt, not tokio.** Async code runs on hyper-raft's `hyper-rt` runtime, QUIC on
-  `hyper-transport`/`hyper-quic`, TLS on `hyper-tls`. HTTP is `hyper` driven by kiln's own
-  `crate::http` client and server. Do not add tokio, axum, reqwest, kube-rs or tokio-rustls. If a
-  capability is missing from hyper-rt, say so and ask; do not fall back silently.
-  Runtime-agnostic crates (serde, hyper's protocol code, k8s-openapi types, aws-lc-rs, rquickjs)
-  are fine.
+  `hyper-transport`/`hyper-quic`, TLS on `hyper-tls`. HTTP is kiln's own `kiln-http` (HTTP/1.1 and
+  HTTP/2, server and client, on hyper-rt; [docs/http.md](http.md)) behind `crate::http`. Do not add
+  tokio, hyper, h2, axum, reqwest, kube-rs or tokio-rustls. If a capability is missing from
+  hyper-rt, say so and ask; do not fall back silently. Runtime-agnostic crates (serde, the `http`
+  and `http-body` types, httparse, k8s-openapi types, aws-lc-rs, rquickjs) are fine.
 - **Deterministic cores.** Logic that decides (expressions, planning, matrices, scheduling,
   routing, retry policy, concurrency, flaky classification) lives in `crates/kiln-ci` as pure code:
   no clock, no disk, no network, no randomness except what is passed in. The kiln crate feeds it
