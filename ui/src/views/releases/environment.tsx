@@ -50,7 +50,7 @@ function gateLines(g: Gates): { label: string; value: string }[] {
   }
   if (g.checks?.length) out.push({ label: "Checks", value: g.checks.map(checkWords).join("; ") });
   if (g.require_provenance) out.push({ label: "Provenance", value: provenanceWords(g.require_provenance) });
-  if (g.via === "pull-request") out.push({ label: "Pull requests", value: "each release is a pull request: merging it is the approval, closing it cancels the release" });
+  if (g.via === "pull-request") out.push({ label: "Pull requests", value: "each release is a pull request (a merge request on GitLab): merging it is the approval, closing it cancels the release" });
   return out;
 }
 
@@ -118,7 +118,8 @@ function Settings({ e }: { e: Environment }) {
   const [agents, setAgents] = React.useState(e.agents);
   const [pulls, setPulls] = React.useState(g.via === "pull-request");
   const [busy, setBusy] = React.useState(false);
-  const onGithub = e.release_repo.host === "github";
+  // Pull requests (GitLab's merge requests) where the release repository is on another host.
+  const onGithub = e.release_repo.host === "github" || e.release_repo.host === "gitlab";
   const count = Number(approvals);
   const wrong =
     !Number.isInteger(count) || count < 0
@@ -505,17 +506,18 @@ function Here({ env }: { env: string }) {
   );
 }
 
-/** Where an environment's releases go: its release repository, linked where it's GitHub's. */
+/** Where an environment's releases go: its release repository, linked where it's GitHub's or GitLab's. */
 function RepoLine({ e }: { e: Environment }) {
-  const github = useSuspenseResource("ci/github-app", (s) => deployApi.githubApp(s)).data;
+  const hosts = useSuspenseResource("deploy/git-hosts", (s) => deployApi.gitHosts(s)).data;
   const where = `${e.release_repo.repo}@${e.release_repo.branch}${e.release_repo.root ? `/${e.release_repo.root}` : ""}`;
-  const url = releaseRepoUrl(e, github.web_url);
+  const url = releaseRepoUrl(e, hosts);
+  const proposals = e.release_repo.host === "gitlab" ? "merge requests" : "pull requests";
   return (
     <>
-      releases {e.gates.via === "pull-request" ? "proposed as pull requests on" : "committed to"}{" "}
+      releases {e.gates.via === "pull-request" ? `proposed as ${proposals} on` : "committed to"}{" "}
       {url ? (
         <>
-          GitHub's{" "}
+          {e.release_repo.host === "gitlab" ? "GitLab's" : "GitHub's"}{" "}
           <a href={url} target="_blank" rel="noreferrer">
             <code>{where}</code>
           </a>

@@ -5087,7 +5087,10 @@ credentials, W14's review pages, W19's insights and notifications, and W21.
     deployments API outside Pipelines), GitLab's deployments;
   - push webhooks;
   - new repositories from a template (GitLab: a fork, then unlinked; Bitbucket: a new repository
-    with the template's history).
+    with the template's history);
+  - KilnCI's runs of a repository there reported on its commit as a status (`kiln/<workflow>`,
+    following the run, linking to it; `crate::githost::statuses`), as GitHub's get check runs;
+    checked against a fake GitLab (`p3_gitlab_release_repositories_and_ci`).
 - *Done.* GitLab CI/CD (R04) and Bitbucket Pipelines (R05) as providers:
   - pipelines and their jobs (Bitbucket's steps) kept as runs and legs, synced every 20 seconds and
     at once on signed webhooks (`POST /api/hooks/gitlab` with GitLab's `X-Gitlab-Token`;
