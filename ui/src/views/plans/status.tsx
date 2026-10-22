@@ -6,7 +6,7 @@
  * faint; waiting, only sketched, still. Only work in progress moves, and only by what the GPU
  * moves.
  */
-import { Beam, Optic, PrismLabel, type BeamStatus } from "@/views/harness/signals";
+import { Beam, Optic, Shimmer, type BeamStatus } from "@/views/harness/signals";
 
 /** Where a step (or a goal) stands, as its glyph shows it. */
 export type Stand = "waiting" | "working" | "needs_you" | "yours" | "met" | "unmet" | "stopped" | "skipped" | "paused";
@@ -39,13 +39,7 @@ export function StepGlyph({ stand, className }: { stand: Stand; className?: stri
   return <Beam status={BEAM[stand]} className={className} />;
 }
 
-/** A step's title: in the holographic shimmer while it's worked on. */
+/** A step's title: in the holographic shimmer while it's worked on, painted into its own letters as a running subagent's are. */
 export function StandTitle({ stand, children }: { stand: Stand; children: string }) {
-  return stand === "working" ? (
-    <PrismLabel live sweep className="st-live-title">
-      {children}
-    </PrismLabel>
-  ) : (
-    <>{children}</>
-  );
+  return <Shimmer on={stand === "working"}>{children}</Shimmer>;
 }

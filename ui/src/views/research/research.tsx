@@ -15,7 +15,7 @@ import { RowsHold } from "@/components/ui/hold";
 import { Crumbs, EmptyState } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
-import { PrismLabel } from "@/views/harness/signals";
+import { Shimmer } from "@/views/harness/signals";
 import "./research.css";
 
 const CHECK_WORDS: Record<CheckState, string> = {
@@ -146,9 +146,9 @@ export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
   return (
     <div className="rs">
       <div className="rs-head">
-        <PrismLabel live={live} sweep={live}>
+        <Shimmer on={!!live} className="sg-label">
           {live ? "Researching" : "Research"} · {s.findings} finding{s.findings === 1 ? "" : "s"} · {s.sources} source{s.sources === 1 ? "" : "s"} ({s.internal} inside, {s.external} outside)
-        </PrismLabel>
+        </Shimmer>
         {grades.length > 0 && <span className="rs-grades">{grades.join(" · ")}</span>}
       </div>
       <p className="rs-question">{r.question}</p>

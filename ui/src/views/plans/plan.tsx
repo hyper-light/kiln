@@ -22,7 +22,7 @@ import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Prose } from "@/views/harness/parts";
-import { PrismLabel } from "@/views/harness/signals";
+import { Shimmer } from "@/views/harness/signals";
 import { ResearchPanel } from "@/views/research/research";
 import { effectiveNeeds, PlanGraph } from "./graph";
 import { PlanItemsEditor } from "./items";
@@ -183,10 +183,7 @@ function PlanEditor({ id }: { id: string }) {
         <p className="plan-dim plan-meta">
           {plan.phase === "planning" && (
             <>
-              <PrismLabel live sweep className="plan-phase">
-                Being planned
-              </PrismLabel>{" "}
-              ·{" "}
+              <Shimmer on>Being planned</Shimmer> ·{" "}
             </>
           )}
           v{plan.version} · changed {relativeTime(plan.updated_at)}

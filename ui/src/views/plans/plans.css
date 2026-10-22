@@ -861,16 +861,6 @@ a.pg-node:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* A step's title while it's worked on: the thinking line's holographic shimmer, in the title's own type. */
-.st-live-title.sg-label {
-  display: inline-block;
-  max-width: 100%;
-  font-family: inherit;
-  font-size: inherit;
-  letter-spacing: 0;
-  line-height: inherit;
-  text-transform: none;
-}
 .pg-bar {
   display: flex;
   gap: 2px;
@@ -897,9 +887,4 @@ a.pg-node:hover {
 }
 .pg-bar i[data-s="stopped"] {
   background: #4a4f58;
-}
-/* "Being planned", in the meta line: the shimmer kept to its own words. */
-.plan-phase.sg-label {
-  display: inline-block;
-  vertical-align: baseline;
 }
