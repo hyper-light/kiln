@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "./button";
 import { pad2 } from "@/lib/format";
 import { useLocalStorage } from "@/lib/hooks";
+import { setPref } from "@/lib/prefs";
 
 /* ---------------------------- page scaffolding ---------------------------- */
 
@@ -107,7 +108,37 @@ export function SectionHeading({
   );
 }
 
-/** A page section its heading folds away: open at first, then as you left it (kept in this browser). */
+/**
+ * Open the folded section `#hash` names (`/system#system.updates`) and bring it into view as the
+ * page draws: again as what is above it loads (its place moves), until you scroll yourself. For a
+ * page's root: called as it mounts, and when its hash changes.
+ */
+export function openFold(hash: string) {
+  let id: string;
+  try {
+    id = decodeURIComponent(hash.replace(/^#/, ""));
+  } catch {
+    return;
+  }
+  if (!/^[\w-]+\.[\w.-]+$/.test(id) || typeof window === "undefined") return;
+  setPref(`kiln.fold.${id}`, true);
+  let seeking = true;
+  const seek = () => {
+    if (seeking) document.getElementById(id)?.scrollIntoView({ block: "start" });
+  };
+  const moved = new ResizeObserver(() => requestAnimationFrame(seek));
+  const stop = () => {
+    seeking = false;
+    moved.disconnect();
+    for (const ev of ["wheel", "touchstart", "keydown"] as const) window.removeEventListener(ev, stop);
+  };
+  for (const ev of ["wheel", "touchstart", "keydown"] as const) window.addEventListener(ev, stop, { passive: true });
+  window.setTimeout(stop, 6000);
+  moved.observe(document.body);
+  requestAnimationFrame(seek);
+}
+
+/** A page section its heading folds away: open at first, then as you left it (kept in this browser). A link to `#<id>` opens it ([`openFold`]). */
 export function FoldSection({
   id,
   index,
@@ -129,7 +160,7 @@ export function FoldSection({
   const [open, setOpen] = useLocalStorage(`kiln.fold.${id}`, true);
   const body = React.useId();
   return (
-    <section className={cn("mt-12", className)}>
+    <section id={id} className={cn("mt-12", className)}>
       <SectionHeading index={index} label={label} title={title} aside={open ? aside : undefined} fold={{ open, onToggle: () => setOpen(!open), controls: body }} />
       {/* Folded, it isn't there at all: nothing in it polls or moves. */}
       <div id={body}>{open && children}</div>

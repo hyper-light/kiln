@@ -4,7 +4,7 @@ kiln builds and ships itself: every push to the release branch (`main`) runs `.k
 which builds every platform's binary from that commit, all at once, each on a machine of its own
 platform where kiln has one. By the time that commit is deployed, its binaries are usually ready,
 and every runner upgrades as soon as the server runs it. The server also starts the pipeline on
-its own commit when a platform's binary is missing (below), and it runs from **Settings → Updates →
+its own commit when a platform's binary is missing (below), and it runs from **System → Builds →
 Build every platform** (or the Runners page, when a machine's platform has no build yet), on a tag
 (`v*`), or by hand. A newer push replaces a build still under way.
 
@@ -23,12 +23,12 @@ Build every platform** (or the Runners page, when a machine's platform has no bu
    knows the commit it runs keeps only builds of that commit, so no platform runs ahead of the
    server or behind it: a push's binaries wait in its run until the server runs that commit, and
    are kept then.
-3. Every runner can then be upgraded remotely, from the Runners page or Settings → Updates; the
+3. Every runner can then be upgraded remotely, from the Runners page or System → Updates; the
    server also serves the binaries at `/dl/kiln/<target>`, so `install.sh` / `install.ps1` install
    from it on any machine, with no GitHub involved. A runner of the server's own platform gets the
    server's own build.
 
-**Each runner has an update policy, and nothing is forced.** Settings → Updates sets it for one
+**Each runner has an update policy, and nothing is forced.** System → Updates sets it for one
 runner, any selection of them, or all:
 - **Automatic**: upgraded as soon as there is a build of the newest kiln for its platform.
 - **Notify** (the default): its row says a newer kiln is available and where the build comes from
@@ -89,7 +89,7 @@ The new build is killed, and the upgrade's log says why it failed. A new build t
 it starts, three times in a row, is dropped: the supervisor goes back to the binary it was
 installed with.
 
-The upgrade's log (Settings → Updates, and the Runners page) follows each step: the download, the
+The upgrade's log (System → Updates, and the Runners page) follows each step: the download, the
 new build starting and connecting, what was handed over and what couldn't be, and the old runner
 retiring. While the old runner finishes its jobs, the machine lists both processes, and what still
 keeps the old one running.
@@ -122,7 +122,7 @@ terminals and agent sessions. Otherwise they upgrade through `kiln install --age
 
 ## When an upgrade fails
 
-Settings → Updates says what each runner does next, and what went wrong when an upgrade failed (its
+System → Updates says what each runner does next, and what went wrong when an upgrade failed (its
 row reads *upgrade failed* or *build failed*, with the upgrade's output under it). From there:
 
 - **Retry** tries the same way again now, without waiting for kiln's next automatic try (a failed
@@ -198,7 +198,7 @@ and the runner as up to date.
 | while a runner finishes the jobs it is running (it switches only once they end) | 6 hours | `wait_for_jobs_minutes` |
 | for a machine to build kiln itself, install included | 60 minutes | `build_minutes` |
 
-Settings → Updates → *How long kiln waits* changes them for this server (kept in its database; *Use
+System → Updates → *How long kiln waits* changes them for this server (kept in its database; *Use
 kiln.toml's* goes back), and so does `PUT /api/updates/waits` with all three (`DELETE` goes back). A
 change applies to upgrades under way too. A job that ran out of time says which wait it was, with a
 link to change it.
@@ -216,7 +216,7 @@ be upgraded to exactly what the server runs, so platforms don't drift apart.
   release branch, and every 10 minutes until then. A build that fails is tried again after 30
   minutes, at most 3 times.
 - An uploaded binary isn't built from any commit, so the next build replaces it.
-- `[updates] in_step = false` turns this off. Settings → Updates shows the commit, and which
+- `[updates] in_step = false` turns this off. System → Builds shows the commit, and which
   platforms are behind it.
 
 The server learns its commit when it's built:

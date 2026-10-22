@@ -1,6 +1,6 @@
 /**
  * Mock data for the pages the simulation in server.ts doesn't cover: deployments (apps, their
- * trees, history, diffs, objects, events, logs, deploy plans), kept plans, Settings → Updates, the
+ * trees, history, diffs, objects, events, logs, deploy plans), kept plans, System → Updates, the
  * runners' front doors and the tailnet, synced folders, terminal and AI sessions, and the sign-in
  * methods. Deterministic (seeded), so screenshots and layout measurements repeat.
  */
@@ -23,10 +23,14 @@ import type {
   CdSync,
   CdTree,
   FrontDoorView,
+  Job,
+  KilnBinary,
   Run,
+  ServerEvent,
   SyncView,
   TailscaleView,
   UpdateJob,
+  UpdatePolicy,
   UpdatesOverview,
   UpgradeWaits,
 } from "../src/api/types.ts";
@@ -40,6 +44,9 @@ export interface PagesCtx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   err: (res: http.ServerResponse, status: number, message: string) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
+  emit?: (ev: ServerEvent) => void;
+  /** kiln's release pipeline in the simulation: Build every platform starts it. */
+  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null };
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -689,13 +696,90 @@ const PLANS = [
 
 const NEWEST = "94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901";
 
-/** How long upgrades are waited on: kiln.toml's, unless changed in Settings → Updates. */
+/** How long upgrades are waited on: kiln.toml's, unless changed in System → Updates. */
 const WAITS_CONFIG: UpgradeWaits = { upgrade_minutes: 15, wait_for_jobs_minutes: 360, build_minutes: 60 };
 let waitsChosen: UpgradeWaits | null = null;
 /** Upgrades started from the page, by runner. */
 const started = new Map<string, UpdateJob>();
+/** Runners an upgrade from the page brought to the newest kiln. */
+const upgraded = new Set<string>();
+/** Update policies chosen on the page, by runner (else automatic). */
+const policies = new Map<string, UpdatePolicy>();
+/** Binaries removed, and uploaded, on the page. */
+const removed = new Set<string>();
+const uploaded = new Map<string, KilnBinary>();
+/** The platforms each job of the release pipeline builds (`.kiln/release.yaml`), as the mock's targets name them. */
+const RELEASE_TARGETS: Record<string, string[]> = { linux: ["aarch64-unknown-linux-gnu"], windows: ["x86_64-pc-windows-msvc"], macos: ["aarch64-apple-darwin"] };
 
-/** The Mac's build that failed, and a Linux runner's upgrade kiln stopped waiting for: what Settings → Updates offers to remedy. */
+/** What an upgrade started on the page says as it goes, by seconds in; done at the last. */
+function upgradeLines(name: string, build: boolean): [number, string][] {
+  const s = NEWEST.slice(0, 12);
+  return build
+    ? [
+        [3, `fetching the source of ${s} from https://kiln.lan`],
+        [6, `   Compiling kiln v0.2.0 (~/.cache/kiln/self-build/src/crates/kiln)`],
+        [11, "new runner started beside the old one; it takes new work"],
+        [16, `the old runner ended · ${name} runs ${NEWEST.slice(0, 7)}`],
+      ]
+    : [
+        [3, "downloading build 0.1.0+a1b2c3d (36.4 MiB) from the server"],
+        [5, "checksum matches"],
+        [8, "new runner started beside the old one; it takes new work"],
+        [14, `the old runner ended · ${name} runs ${NEWEST.slice(0, 7)}`],
+      ];
+}
+
+let ticking: ReturnType<typeof setInterval> | null = null;
+/** Upgrades started on the page go on by themselves: a line every few seconds, then done. */
+function tickUpgrades(ctx: PagesCtx) {
+  if (ticking) return;
+  ticking = setInterval(() => {
+    let running = 0;
+    for (const job of started.values()) {
+      if (job.state !== "running") continue;
+      running++;
+      const lines = upgradeLines(job.target, job.method === "build");
+      const t = now() - job.started_at;
+      const said = lines.filter(([at]) => at <= t).map(([, l]) => l);
+      if (said.length + 1 === job.log.length && t < lines[lines.length - 1]![0] + 2) continue;
+      job.log = [job.log[0]!, ...said];
+      if (t >= lines[lines.length - 1]![0] + 2) {
+        Object.assign(job, { state: "done", ended_at: now(), reached: true });
+        upgraded.add(job.target);
+        ctx.emit?.({ type: "updates" });
+      }
+      ctx.emit?.({ type: "update_job", job: { ...job, log: [...job.log] } });
+    }
+    if (running === 0 && ticking) {
+      clearInterval(ticking);
+      ticking = null;
+    }
+  }, 1000);
+}
+
+function startUpgrade(ctx: PagesCtx, name: string, way?: "download" | "build"): UpdateJob {
+  const build = way === "build" || (way === undefined && ctx.agents().find((a) => a.name === name)?.os === "macos");
+  const job: UpdateJob = {
+    id: hex(mulberry32(hashStr(name + Date.now())), 16),
+    kind: "runner",
+    target: name,
+    method: build ? "build" : "native",
+    state: "running",
+    started_at: now(),
+    ended_at: null,
+    from_build: "0.0.9+0f1e2d3",
+    to_build: build ? null : "0.1.0+a1b2c3d",
+    commit: NEWEST,
+    reached: false,
+    log: [build ? `upgrading ${name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped` : `upgrading ${name} to build 0.1.0+a1b2c3d; nothing it runs is stopped`],
+    error: null,
+  };
+  started.set(name, job);
+  tickUpgrades(ctx);
+  return job;
+}
+
+/** The Mac's build that failed, and a Linux runner's upgrade kiln stopped waiting for: what System → Updates offers to remedy. */
 function failedJobs(ctx: PagesCtx): UpdateJob[] {
   const agents = ctx.agents().filter((a) => !a.ephemeral && a.connected);
   const mac = agents.find((a) => a.os === "macos");
@@ -752,18 +836,56 @@ function failedJobs(ctx: PagesCtx): UpdateJob[] {
   return out;
 }
 
+/** The binaries kept here: the server's own and one the release pipeline built, then what the page's release run, uploads and removals made of them. */
+function binariesOf(ctx: PagesCtx): KilnBinary[] {
+  const base: KilnBinary[] = [
+    { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
+    { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
+  ];
+  const rel = ctx.release?.latest();
+  const built = new Map<string, KilnBinary>();
+  for (const j of rel?.jobs ?? []) {
+    if (j.status !== "succeeded") continue;
+    for (const t of RELEASE_TARGETS[j.key] ?? []) {
+      built.set(t, {
+        target: t,
+        sha256: hex(mulberry32(hashStr(t)), 64),
+        size: t.includes("windows") ? 43_000_000 : t.includes("darwin") ? 36_100_000 : 39_600_000,
+        build: `0.1.0+${hex(mulberry32(hashStr(t + "b")), 7)}`,
+        origin: "built",
+        at: j.finished_at ?? now(),
+        run: rel!.run.number,
+        sha: NEWEST,
+      });
+    }
+  }
+  const out = base.filter((b) => b.origin === "server" || !built.has(b.target)).concat([...built.values()]);
+  for (const [t, b] of uploaded) {
+    const i = out.findIndex((x) => x.target === t && x.origin !== "server");
+    if (i >= 0) out.splice(i, 1);
+    out.push(b);
+  }
+  return out.filter((b) => !removed.has(`${b.target}:${b.at}`));
+}
+
 function updates(ctx: PagesCtx): UpdatesOverview {
+  const binaries = binariesOf(ctx);
+  const rel = ctx.release?.latest() ?? null;
+  const darwin = binaries.find((b) => b.target === "aarch64-apple-darwin" && b.sha === NEWEST);
+  // While the page's release run goes, what it builds and isn't built from the newest yet; else the Mac's platform, as before.
+  const releaseTargets = Object.values(RELEASE_TARGETS).flat();
+  const behind = rel ? releaseTargets.filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST)) : ["aarch64-apple-darwin"];
   const runners = ctx
     .agents()
     .filter((a) => !a.ephemeral)
     .map((a) => {
       const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
-      const mac = a.os === "macos";
-      // The Mac is behind and builds the newest kiln itself (crate::fleet).
-      const up = a.version === ctx.version && !mac;
+      // The Mac is behind and builds the newest kiln itself (crate::fleet), until the release run built its platform.
+      const mac = a.os === "macos" && !darwin;
+      const up = upgraded.has(a.name) || (a.version === ctx.version && a.os !== "macos");
       return {
         name: a.name,
-        policy: "auto" as const,
+        policy: policies.get(a.name) ?? ("auto" as const),
         locked: false,
         from: up || mac ? null : "built by release run #412",
         hostname: a.hostname,
@@ -772,7 +894,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         connected: a.connected,
         version: a.version,
         target,
-        target_build: a.os === "macos" ? null : "0.1.0+a1b2c3d",
+        target_build: mac ? null : a.os === "macos" ? (darwin?.build ?? null) : "0.1.0+a1b2c3d",
         build: up ? "0.1.0+a1b2c3d" : "0.0.9+0f1e2d3",
         up_to_date: up,
         method: up ? ("native" as const) : ("terminal" as const),
@@ -815,12 +937,9 @@ function updates(ctx: PagesCtx): UpdatesOverview {
     },
     runners,
     jobs: [...started.values(), ...failedJobs(ctx).filter((j) => !started.has(j.target))],
-    binaries: [
-      { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
-      { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
-    ],
+    binaries,
     targets: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"],
-    build: { repo: "hyper-light/kiln", pipeline: "release", last: null, commit: NEWEST, in_step: false, behind: ["aarch64-apple-darwin"], keeps_in_step: true },
+    build: { repo: "hyper-light/kiln", pipeline: "release", last: rel?.run ?? null, commit: NEWEST, in_step: behind.length === 0, behind, keeps_in_step: true },
     newest: { commit: NEWEST, from: "server", since: T0 - 3600 },
     follow: true,
     waits: { now: waitsChosen ?? WAITS_CONFIG, config: WAITS_CONFIG, changed: waitsChosen !== null },
@@ -962,26 +1081,54 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     return true;
   }
   if ((mm = p.match(/^\/api\/updates\/runners\/([^/]+)$/)) && m === "POST") {
-    const name = decodeURIComponent(mm[1] ?? "");
     const ask = await ctx.body<{ way?: "download" | "build" }>(req);
-    const build = ask.way === "build";
-    const job: UpdateJob = {
-      id: hex(mulberry32(hashStr(name + Date.now())), 16),
-      kind: "runner",
-      target: name,
-      method: build ? "build" : "native",
-      state: "running",
-      started_at: now(),
-      ended_at: null,
-      from_build: "0.0.9+0f1e2d3",
-      to_build: build ? null : "0.1.0+a1b2c3d",
-      commit: NEWEST,
-      reached: false,
-      log: [build ? `upgrading ${name}: it builds ${NEWEST.slice(0, 12)} itself; nothing it runs is stopped` : `upgrading ${name} to build 0.1.0+a1b2c3d; nothing it runs is stopped`],
-      error: null,
-    };
-    started.set(name, job);
-    return (void json(res, 202, job), true);
+    return (void json(res, 202, startUpgrade(ctx, decodeURIComponent(mm[1] ?? ""), ask.way)), true);
+  }
+  if ((mm = p.match(/^\/api\/updates\/runners\/([^/]+)$/)) && m === "PUT") {
+    const { policy } = await ctx.body<{ policy: UpdatePolicy }>(req);
+    policies.set(decodeURIComponent(mm[1] ?? ""), policy);
+    ctx.emit?.({ type: "updates" });
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
+  if (p === "/api/updates/policy" && m === "PUT") {
+    const ask = await ctx.body<{ policy: UpdatePolicy; runners?: string[]; all?: boolean }>(req);
+    const names = ask.all ? updates(ctx).runners.map((r) => r.name) : (ask.runners ?? []);
+    for (const n of names) policies.set(n, ask.policy);
+    ctx.emit?.({ type: "updates" });
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
+  if (p === "/api/updates/runners" && m === "POST") {
+    const behind = updates(ctx).runners.filter((r) => r.connected && !r.up_to_date && !r.locked && started.get(r.name)?.state !== "running");
+    return (void json(res, 202, { jobs: behind.map((r) => startUpgrade(ctx, r.name)), errors: [] }), true);
+  }
+  if (p === "/api/updates/build" && m === "POST") {
+    if (!ctx.release) return (void err(res, 404, "no release pipeline"), true);
+    const run = ctx.release.start(NEWEST);
+    ctx.emit?.({ type: "updates" });
+    return (void json(res, 202, run), true);
+  }
+  if (p === "/api/updates/binaries" && m === "POST") {
+    const target = url.searchParams.get("target") ?? "";
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const size = chunks.reduce((n, c) => n + c.length, 0);
+    const bin: KilnBinary = { target, sha256: hex(mulberry32(hashStr(target + size + Date.now())), 64), size, build: "0.1.0+a1b2c3d", origin: "upload", at: now() };
+    uploaded.set(target, bin);
+    ctx.emit?.({ type: "updates" });
+    return (void json(res, 201, bin), true);
+  }
+  if ((mm = p.match(/^\/api\/updates\/binaries\/([^/]+)$/)) && m === "DELETE") {
+    const target = decodeURIComponent(mm[1] ?? "");
+    uploaded.delete(target);
+    for (const b of binariesOf(ctx)) if (b.target === target && b.origin !== "server") removed.add(`${b.target}:${b.at}`);
+    ctx.emit?.({ type: "updates" });
+    res.statusCode = 204;
+    res.end();
+    return true;
   }
   if (p === "/api/front-doors" && m === "GET")
     return (

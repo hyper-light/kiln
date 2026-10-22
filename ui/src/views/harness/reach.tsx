@@ -28,7 +28,7 @@ function Choices({ agent, value, onPick }: { agent: Agent; value: string; onPick
   const runners = useSuspenseResource("harness/reach", askRunners).data;
   // A runner without a reach identity runs a kiln from before commands could run elsewhere.
   const here = runners.find((r) => `agent:${r.name}` === agent.target);
-  if (here && !here.fingerprint) return <p className="mv-none">{here.name} runs an older kiln, without commands on other runners: upgrade it in Settings → Updates.</p>;
+  if (here && !here.fingerprint) return <p className="mv-none">{here.name} runs an older kiln, without commands on other runners: upgrade it in System → Updates.</p>;
   const others = runners.filter((r) => r.connected && r.reach);
   const choices = [{ value: "", label: "Any runner it needs" }, ...reachChoices(others, agent.target), { value: "off", label: "Only its own machine" }];
   // The one it has stays a choice, whether or not that runner is around now.

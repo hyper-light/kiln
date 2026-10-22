@@ -1967,6 +1967,9 @@ impl Codex {
                 if let Some(m) = result.get("model").and_then(Value::as_str) {
                     core.state.model = m.to_owned();
                 }
+                if let Some(e) = result.get("reasoningEffort").and_then(Value::as_str) {
+                    self.effort_reported(core, e);
+                }
                 if let Some(c) = result.get("cwd").and_then(Value::as_str) {
                     core.state.cwd = c.to_owned();
                 }
@@ -2090,9 +2093,11 @@ impl Codex {
                         self.efforts.insert(String::new(), levels.clone());
                     }
                 }
-                // An effort to show when none was chosen: its own model's default (the default
-                // model's when its own isn't listed). Only the default model's was taken before, so
-                // a session on any other model said nothing of how hard it thinks.
+                // An effort to show when none was chosen and Codex hasn't said what the thread runs
+                // at ([`Self::effort_reported`]; it says none when the model's default is all
+                // there is): its own model's default (the default model's when its own isn't
+                // listed). Only the default model's was taken before, so a session on any other
+                // model said nothing of how hard it thinks.
                 if core.state.effort.is_empty() {
                     let model = core.state.model.clone();
                     let default_of = |pick: &dyn Fn(&Value) -> bool| data.iter().find(|m| pick(m)).and_then(|m| m.get("defaultReasoningEffort")).and_then(Value::as_str).map(str::to_owned);
@@ -2507,6 +2512,19 @@ impl Codex {
         });
         core.add_approval(approval);
         self.settle(core);
+    }
+
+    /// The effort Codex says the thread runs at (when it opens, and as its settings change): what
+    /// the page shows unless one was chosen here, which goes with every turn and so is what runs.
+    /// With none chosen it comes from the person's own Codex configuration
+    /// (`model_reasoning_effort`), which a model's default from model/list only guesses at; and
+    /// what the page shows is what a resumed session goes on with (`Session::resume_spec`), so a
+    /// guess kept there set every later turn to it.
+    fn effort_reported(&mut self, core: &mut Core, effort: &str) {
+        if self.effort.is_none() && !effort.is_empty() && core.state.effort != effort {
+            core.state.effort = effort.to_owned();
+            core.touch_state();
+        }
     }
 
     fn thread_status(&mut self, core: &mut Core, status: &Value) {
@@ -2964,6 +2982,11 @@ impl Codex {
                 if let Some(n) = p.get("name").or_else(|| p.get("threadName")).and_then(Value::as_str) {
                     core.state.title = n.to_owned();
                     core.touch_state();
+                }
+            }
+            "thread/settings/updated" => {
+                if let Some(e) = p.pointer("/threadSettings/effort").and_then(Value::as_str) {
+                    self.effort_reported(core, e);
                 }
             }
             "serverRequest/resolved" => {
@@ -5320,6 +5343,48 @@ mod tests {
             ]}),
         );
         assert_eq!(core.state.effort, "high");
+    }
+
+    /// With no effort chosen here, the page shows the effort Codex says the thread runs at (the
+    /// person's own `model_reasoning_effort`), not its model's default: fedora's Codex agents ran
+    /// at "ultra" while their page said "low", and a resumed session went on sending "low".
+    #[test]
+    fn the_effort_codex_reports_is_shown_over_a_model_s_default() {
+        let models = json!({"data": [
+            {"id": "gpt-5", "model": "gpt-5", "displayName": "GPT-5", "description": "", "isDefault": true, "defaultReasoningEffort": "low", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "high", "description": ""}, {"reasoningEffort": "ultra", "description": ""}]}
+        ]});
+        let thread = json!({"thread": {"id": "th1", "turns": []}, "model": "gpt-5", "cwd": "/work", "reasoningEffort": "ultra"});
+        let settings = |effort: &str| json!({"method": "thread/settings/updated", "params": {"threadId": "th1", "threadSettings": {"model": "gpt-5", "effort": effort}}});
+        let opening = |chosen: Option<&str>| {
+            let mut core = Core::new();
+            core.state.cwd = "/work".into();
+            let mut c = Codex::new(None, None, None, false);
+            c.start(&mut core);
+            if let Some(e) = chosen {
+                c.command(&mut core, Command::SetEffort { effort: e.into() });
+            }
+            let w = written(&mut core);
+            respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+            let w = written(&mut core);
+            (c, core, w)
+        };
+        // Whichever answers first.
+        for model_list_first in [true, false] {
+            let (mut c, mut core, w) = opening(None);
+            for method in if model_list_first { ["model/list", "thread/start"] } else { ["thread/start", "model/list"] } {
+                respond(&mut c, &mut core, &w, method, if method == "model/list" { models.clone() } else { thread.clone() });
+            }
+            assert_eq!(core.state.effort, "ultra", "model/list answered first: {model_list_first}");
+            // Its settings change: what it runs at from then on.
+            feed(&mut c, &mut core, &[settings("high")]);
+            assert_eq!(core.state.effort, "high");
+        }
+        // One chosen here goes with every turn: what Codex says of its own doesn't replace it.
+        let (mut c, mut core, w) = opening(Some("low"));
+        respond(&mut c, &mut core, &w, "thread/start", thread.clone());
+        respond(&mut c, &mut core, &w, "model/list", models.clone());
+        feed(&mut c, &mut core, &[settings("high")]);
+        assert_eq!(core.state.effort, "low");
     }
 
     #[test]
