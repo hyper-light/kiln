@@ -254,24 +254,26 @@ struct Read {
     by: HashMap<String, Figures>,
 }
 
-/// The queries that read the figures, and where each value goes.
-const FIGURE_QUERIES: [(&str, fn(&mut Figures, f64)); 10] = [
-    ("avg:system.cpu.idle{*} by {host}", |f, v| f.cpu = Some((100.0 - v).clamp(0.0, 100.0))),
-    ("avg:system.cpu.iowait{*} by {host}", |f, v| f.iowait = Some(v)),
-    ("avg:system.load.15{*} by {host}", |f, v| f.load = Some(v)),
-    ("avg:system.load.norm.15{*} by {host}", |f, v| f.load_norm = Some(v)),
-    ("avg:system.mem.pct_usable{*} by {host}", |f, v| f.memory = Some((100.0 * (1.0 - v)).clamp(0.0, 100.0))),
-    ("max:system.disk.in_use{*} by {host}", |f, v| f.disk = Some((100.0 * v).clamp(0.0, 100.0))),
-    ("avg:system.cpu.num_cores{*} by {host}", |f, v| f.cores = Some(v)),
-    ("avg:system.mem.total{*} by {host}", |f, v| f.memory_mib = Some(v)),
+/// The figures' metrics (the System Check's), whether a host's several series of one are taken at
+/// their most (its fullest disk) or on average, and where each value goes.
+#[allow(clippy::type_complexity)]
+const FIGURE_METRICS: [(&str, bool, fn(&mut Figures, f64)); 10] = [
+    ("system.cpu.idle", false, |f, v| f.cpu = Some((100.0 - v).clamp(0.0, 100.0))),
+    ("system.cpu.iowait", false, |f, v| f.iowait = Some(v)),
+    ("system.load.15", false, |f, v| f.load = Some(v)),
+    ("system.load.norm.15", false, |f, v| f.load_norm = Some(v)),
+    ("system.mem.pct_usable", false, |f, v| f.memory = Some((100.0 * (1.0 - v)).clamp(0.0, 100.0))),
+    ("system.disk.in_use", true, |f, v| f.disk = Some((100.0 * v).clamp(0.0, 100.0))),
+    ("system.cpu.num_cores", false, |f, v| f.cores = Some(v)),
+    ("system.mem.total", false, |f, v| f.memory_mib = Some(v)),
     // A runner too old to report its own figures (`super::hub::host_sample`): its CPU in use, and
     // its memory's use of its total. Read where the above say nothing.
-    ("avg:system.cpu.pct_usage{*} by {host}", |f, v| {
+    ("system.cpu.pct_usage", false, |f, v| {
         if f.cpu.is_none() {
             f.cpu = Some(v.clamp(0.0, 100.0));
         }
     }),
-    ("avg:system.mem.used{*} by {host}", |f, v| {
+    ("system.mem.used", false, |f, v| {
         if f.memory.is_none()
             && let Some(total) = f.memory_mib.filter(|t| *t > 0.0)
         {
@@ -280,26 +282,54 @@ const FIGURE_QUERIES: [(&str, fn(&mut Figures, f64)); 10] = [
     }),
 ];
 
-/// Each host's figures, read in one pass of each query over the last [`FIGURES_MS`].
+/// Each host's figures: of each metric, each series' newest sample of the last [`FIGURES_MS`]
+/// (read from the head with nothing decoded where it holds it, `Store::newest_by`), a host's taken
+/// together; the store held a metric at a time.
 fn read_figures(store: &kiln_obs::machine::Shared, now_ms: i64) -> Read {
-    use kiln_obs::query::eval;
-    let mut read = Read::default();
-    for (q, put) in FIGURE_QUERIES {
-        let mut r = eval::Request::new(q, now_ms - FIGURES_MS, now_ms);
-        r.step = Some(60_000);
-        r.max_series = FIGURE_SERIES;
-        let Ok((a, _)) = eval::eval_shared(store, &r) else { continue };
-        for s in &a.series {
-            let Some(host) = s.tags.iter().find(|(k, _)| k == "host").map(|(_, v)| v) else { continue };
-            if host.is_empty() {
-                continue;
-            }
-            if let Some(v) = s.values.iter().rev().copied().find(|v| v.is_finite()) {
-                put(read.by.entry(host.clone()).or_default(), v);
+    let mut hosts: HashMap<String, usize> = HashMap::new();
+    let mut figures: Vec<Figures> = Vec::new();
+    // Of one metric, each host's value so far and its series, and the hosts it reached.
+    let mut taken: Vec<(f64, u32)> = Vec::new();
+    let mut touched: Vec<usize> = Vec::new();
+    let mut scratch = kiln_obs::store::Scratch::default();
+    for (metric, most, put) in FIGURE_METRICS {
+        {
+            let s = store.read().unwrap_or_else(PoisonError::into_inner);
+            s.newest_by(metric, "host", now_ms - FIGURES_MS, &mut scratch, &mut |host, v| {
+                if host.is_empty() || !v.is_finite() {
+                    return;
+                }
+                let i = match hosts.get(host) {
+                    Some(&i) => i,
+                    None => {
+                        hosts.insert(host.to_owned(), figures.len());
+                        figures.push(Figures::default());
+                        figures.len() - 1
+                    }
+                };
+                if taken.len() <= i {
+                    taken.resize(i + 1, (0.0, 0));
+                }
+                if let Some(t) = taken.get_mut(i) {
+                    if t.1 == 0 {
+                        touched.push(i);
+                        *t = (v, 1);
+                    } else {
+                        t.0 = if most { t.0.max(v) } else { t.0 + v };
+                        t.1 += 1;
+                    }
+                }
+            });
+        }
+        for &i in &touched {
+            if let (Some(t), Some(f)) = (taken.get_mut(i), figures.get_mut(i)) {
+                put(f, if most { t.0 } else { t.0 / f64::from(t.1) });
+                *t = (0.0, 0);
             }
         }
+        touched.clear();
     }
-    read
+    Read { by: hosts.into_iter().filter_map(|(h, i)| figures.get(i).map(|f| (h, *f))).collect() }
 }
 
 /// The infrastructure list's keeping: what the Agent says of its hosts, and the inventory made

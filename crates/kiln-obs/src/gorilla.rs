@@ -146,6 +146,11 @@ impl Encoder {
         (self.count > 0).then_some((self.first, self.t))
     }
 
+    /// The last sample pushed, as it was pushed (none before the first).
+    pub fn last_sample(&self) -> Option<(i64, f64)> {
+        (self.count > 0).then(|| (self.t, f64::from_bits(self.v)))
+    }
+
     /// Bytes the chunk takes.
     pub fn byte_len(&self) -> usize {
         self.w.byte_len()

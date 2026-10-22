@@ -1166,6 +1166,50 @@ fn applied_log_records_reach_a_follower_once_through_a_reopen_and_an_image() {
     assert_eq!(read(&mut f), ["event 8", "event 9"]);
 }
 
+/// Each series' newest sample by a tag, as reading it whole says: from the head where it holds it
+/// in order, a late write beside it or a block holding it read as a query reads it; a series of no
+/// such tag under `""`; one whose newest is before the bound left out.
+#[test]
+fn the_newest_samples_are_read_by_a_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let keys = [gauge("m", "a"), gauge("m", "b"), gauge("m", "c"), SeriesKey::new("m", [("env", "x")], Kind::Gauge).unwrap(), gauge("other", "a")];
+    let mut b = Builder::new();
+    for k in &keys {
+        b.define(k);
+    }
+    b.run(keys[0].fp, [(100_000, 1.0), (200_000, 2.0)]);
+    b.run(keys[1].fp, [(100_000, 10.0), (200_000, 20.0)]);
+    b.run(keys[2].fp, [(1_000, 7.0)]);
+    b.run(keys[3].fp, [(150_000, 3.5)]);
+    b.run(keys[4].fp, [(200_000, 99.0)]);
+    s.apply(&b.finish()).unwrap();
+    // A late write beside b's newest: read as a query reads it.
+    b.run(keys[1].fp, [(150_000, 15.0)]);
+    s.apply(&b.finish()).unwrap();
+    let newest = |s: &Store, since: i64| {
+        let mut out: Vec<(String, f64)> = Vec::new();
+        s.newest_by("m", "host", since, &mut Scratch::default(), &mut |h, v| out.push((h.to_owned(), v)));
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    };
+    let want = vec![("".to_owned(), 3.5), ("a".to_owned(), 2.0), ("b".to_owned(), 20.0)];
+    assert_eq!(newest(&s, 50_000), want, "c's newest is before the bound");
+    assert_eq!(newest(&s, 0).len(), 4);
+    // Every series' newest as reading it whole says it.
+    for (h, v) in newest(&s, 0) {
+        let sel = if h.is_empty() { Selector::metric("m").tag("env", "x") } else { Selector::metric("m").tag("host", &h) };
+        let read = read_all(&s, &sel);
+        assert_eq!(read.first().and_then(|(_, pts)| pts.last()).map(|p| f64::from_bits(p.1)), Some(v), "{h}");
+    }
+    // Cut into a block: read from it, the same.
+    s.cut(Point { index: 1, term: 1 }).unwrap();
+    assert_eq!(newest(&s, 50_000), want);
+    let mut none = Vec::new();
+    s.newest_by("nonesuch", "host", 0, &mut Scratch::default(), &mut |h, v| none.push((h.to_owned(), v)));
+    assert!(none.is_empty());
+}
+
 /// Each host as the index says it: its series, its newest sample, its metrics' namespaces, and the
 /// tags asked of its first series; a host whose newest sample is before the bound is left out, and
 /// one gone with retention is gone.

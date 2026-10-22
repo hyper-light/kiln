@@ -1844,6 +1844,40 @@ impl Store {
         out
     }
 
+    /// Each series of `metric` whose newest sample is at or after `since_ms`, to `each`: its value
+    /// of tag `key` (`""` where it has none) and its newest sample's value. Read from the head with
+    /// nothing decoded where the head holds it in order (most series: what a host reported last),
+    /// else as [`Store::read_with`] reads it: what a host list's figures are.
+    pub fn newest_by(&self, metric: &str, key: &str, since_ms: i64, scratch: &mut Scratch, each: &mut dyn FnMut(&str, f64)) {
+        let Some(m) = self.symbols.find(metric) else { return };
+        let k = self.symbols.find(key);
+        let since = since_ms.max(self.cutoff);
+        let (mut ts, mut vs) = (std::mem::take(&mut scratch.ts), std::mem::take(&mut scratch.vs));
+        for &id in self.index.series_of(m) {
+            let last = self.last.get(id as usize).copied().unwrap_or(i64::MIN);
+            if last < since {
+                continue;
+            }
+            let Some(info) = self.index.info(id) else { continue };
+            let tagged = k.and_then(|k| self.index.tags(&info).iter().find(|(tk, _)| *tk == k)).map_or("", |&(_, v)| self.symbols.get(v));
+            let value = match self.head.get(id as usize).and_then(HeadSeries::newest) {
+                Some((t, v)) if t == last => v,
+                _ => {
+                    ts.clear();
+                    vs.clear();
+                    if self.read_with(id, since, i64::MAX, scratch, &mut ts, &mut vs).is_err() {
+                        continue;
+                    }
+                    let Some(&v) = vs.last() else { continue };
+                    v
+                }
+            };
+            each(tagged, value);
+        }
+        scratch.ts = ts;
+        scratch.vs = vs;
+    }
+
     /// Every metric's samples applied since the store opened: what a rate is reckoned from.
     pub fn metric_samples(&self) -> Vec<(&str, u64)> {
         self.index.metrics().iter().map(|&m| (self.symbols.get(m), self.metric_samples.get(m.0 as usize).copied().unwrap_or(0))).collect()
@@ -2006,6 +2040,9 @@ pub struct Scratch {
     rollups: Vec<u8>,
     /// What [`Store::read_rolled`] reads of a block as samples.
     ranges: Vec<(i64, i64)>,
+    /// A series' samples [`Store::newest_by`] reads where the head does not hold its newest.
+    ts: Vec<i64>,
+    vs: Vec<f64>,
 }
 
 /// What [`Store::read_rolled`] may read from rollups: windows of a tier's `width` (one of

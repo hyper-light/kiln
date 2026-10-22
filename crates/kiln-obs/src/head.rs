@@ -50,6 +50,15 @@ pub enum Appended {
 }
 
 impl HeadSeries {
+    /// Its newest sample, where the open chunk holds it in order and no late write may stand
+    /// beside it (none: read it as a query does).
+    pub fn newest(&self) -> Option<(i64, f64)> {
+        if self.late.is_some() {
+            return None;
+        }
+        self.open.last_sample()
+    }
+
     fn last(&self) -> Option<i64> {
         self.open.span().map(|(_, l)| l).or_else(|| self.closed.last().map(|c| c.last))
     }

@@ -1,8 +1,10 @@
 //! The infrastructure list's reading of the store (`docs/observe.md` §12.31), on fleets of hosts
 //! each reporting as a kiln runner or Datadog's Agent reports one (its System Check's 50 series,
 //! an app's ten): each host's series, newest sample, namespaces and platform tags
-//! ([`kiln_obs::store::Store::tag_seen`]), and each of the list's figures (a query of every host at
-//! once over its last ten minutes). Time (the median of five), allocations, and the series held.
+//! ([`kiln_obs::store::Store::tag_seen`]), and each of the list's figures: a query of every host at
+//! once over its last ten minutes, as the list first read them, and each series' newest sample by
+//! host (`Store::newest_by`), as it reads them now. Time (the median of five), allocations, and the
+//! series held.
 //!
 //! `cargo bench -p kiln-obs --bench hosts` (`KOBS_HOSTS`: the fleets' sizes, `1000,5000,20000`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss)]
@@ -13,7 +15,7 @@ use hyper_measure::alloc;
 use kiln_obs::batch::{Builder, Kind, SeriesKey};
 use kiln_obs::hash::Keyed;
 use kiln_obs::query::eval::{Request, eval};
-use kiln_obs::store::Store;
+use kiln_obs::store::{Scratch, Store};
 
 #[global_allocator]
 static COUNTING: alloc::Counting = alloc::Counting;
@@ -170,5 +172,38 @@ fn main() {
         }
         let figures: Duration = all.iter().sum();
         println!("{:<9} {:>9} {:<44} {:>8.2}ms", "", "", "the ten figures' queries in all", figures.as_secs_f64() * 1e3);
+        // The same figures by each series' newest sample, a host's taken together.
+        let metrics: Vec<&str> = FIGURES.iter().map(|q| q.split(':').nth(1).and_then(|m| m.split('{').next()).unwrap_or("")).collect();
+        let mut times = Vec::new();
+        let mut counted = alloc::Counts::default();
+        let mut answers = 0;
+        let mut scratch = Scratch::default();
+        for i in 0..5 {
+            let t = Instant::now();
+            if i == 1 {
+                alloc::begin();
+            }
+            let mut hosts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut sums: Vec<f64> = Vec::new();
+            for m in &metrics {
+                store.newest_by(m, "host", NOW - 600_000, &mut scratch, &mut |h, v| {
+                    let at = match hosts.get(h) {
+                        Some(&at) => at,
+                        None => {
+                            hosts.insert(h.to_owned(), sums.len());
+                            sums.push(0.0);
+                            sums.len() - 1
+                        }
+                    };
+                    sums[at] += v;
+                });
+            }
+            if i == 1 {
+                counted = alloc::end();
+            }
+            times.push(t.elapsed());
+            answers = hosts.len();
+        }
+        println!("{:<9} {:>9} {:<44} {:>8.2}ms {:>9} {:>9}", "", "", "the ten figures by newest samples", median(times).as_secs_f64() * 1e3, counted.calls(), answers);
     }
 }

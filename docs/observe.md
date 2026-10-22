@@ -2107,8 +2107,10 @@ it besides.
 - **Its figures**, its newest of the last ten minutes: CPU in use (`100 - system.cpu.idle`), I/O wait,
   the load over 15 minutes (and a core's), memory in use (`1 - system.mem.pct_usable`) and its
   fullest disk's use (`system.disk.in_use`): the System Check's names, which kiln's own figures use
-  too (a runner too old to report its own: its hub sample's CPU and memory). Each a query of every
-  host at once.
+  too (a runner too old to report its own: its hub sample's CPU and memory). Each series' newest
+  sample (`Store::newest_by`: read from the head with nothing decoded where the head holds it in
+  order, as a query reads it where not), a host's several series of one taken on average (its disks
+  at their most).
 - **Its apps**: its metrics' namespaces (a name to its first dot, or a name of none, Prometheus's,
   to its first underscore; the Agent's `datadog.*` its `agent`).
 - **Its platform**, from the best of what says it: its runner's probed facts, then the Agent's
@@ -2134,8 +2136,9 @@ it besides.
   writer's, reads and mutes nothing.
 
 An inventory is made of the index (each host's series, newest sample, namespaces and platform tags),
-the ten figures' queries, the Agent's hosts, the hub's runners and the downtimes; reused 15 seconds,
-then still answered while one is made again (one at a time; one begun before a mute is not kept).
+the ten figures' newest samples, the Agent's hosts, the hub's runners and the downtimes, on the
+blocking pool; reused 15 seconds, then still answered while one is made again (one at a time; one
+begun before a mute is not kept).
 
 ## 11. UI
 
@@ -3776,16 +3779,19 @@ Agent's System Check report one (50 series: CPU, load, memory, swap, two disks, 
 app's ten; two samples a series in the last minute; every third a resource's `os.type`, every fifth
 its cloud.
 
-| hosts | series | each host's series, newest, apps, platform | the ten figures' queries in all |
-| --- | --- | --- | --- |
-| 1,000 | 55,000 | 0.67 ms (6.2 allocations a host) | 5.1 ms |
-| 5,000 | 275,000 | 6.2 ms | 43 ms |
-| 20,000 | 1,100,000 | 24 ms | 375 ms (35–64 ms a query; six allocations a series, its answer's) |
+| hosts | series | each host's series, newest, apps, platform | the ten figures' queries in all | the ten figures by newest samples |
+| --- | --- | --- | --- | --- |
+| 1,000 | 55,000 | 0.57–0.67 ms (6.2 allocations a host) | 4.3–5.1 ms | 0.34 ms (1,019 allocations) |
+| 5,000 | 275,000 | 3.6–6.2 ms | 28–43 ms | 2.6 ms |
+| 20,000 | 1,100,000 | 18–24 ms | 264–375 ms (six allocations a series, its answer's) | 33 ms (20,028 allocations: a host's name each) |
 
-A list of 20,000 hosts is made in some 400 ms, reused 15 seconds and made again while the last is
-answered: no request waits on it but the first. Each figure's query reads its metric's series of
-the last ten minutes through the query engine (its grid, its answer's series); a read of each
-series' newest sample alone, by host, would spare most of it. Not done.
+The figures were first ten queries of every host (`avg:system.cpu.idle{*} by {host}`, …): the query
+engine's grid and answer for every series, some 400 ms and 1.2 million allocations at 20,000 hosts.
+They are each series' newest sample now, read where the head holds it with nothing decoded (the
+Gorilla encoder keeps its last sample), a host's taken together as they come: 8 to 13 times faster,
+an allocation a host. A test holds them to reading each series whole, a late write beside the newest
+and a block holding it among them. The list is reused 15 seconds and made again on the blocking pool
+while the last is answered: no request waits on it but the first.
 
 Beside it, the browser suite found a debug build's server dead of a stack overflow on a cloud's
 test (`hyper-rt-shard-2 has overflowed its stack`): at `-O0` a router's frame holds every arm's
