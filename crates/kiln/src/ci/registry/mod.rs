@@ -406,7 +406,7 @@ async fn get_blob(hub: &Hub, name: &str, digest: &str, req: &Request) -> Answer 
         Ok(Some((s, e))) => (StatusCode::PARTIAL_CONTENT, s, e),
         Err(()) => return Ok(srv::with_header(base(srv::status(StatusCode::RANGE_NOT_SATISFIABLE)), header::CONTENT_RANGE, &format!("bytes */{size}"))),
     };
-    let body = if req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(crate::ci::services::cas::read(hub, &obj, start, end).await) };
+    let body = if req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(crate::ci::services::cas::read(hub, &obj, start, end)) };
     let mut r = base(srv::response(status, "application/octet-stream", body));
     r = srv::with_header(r, header::CONTENT_LENGTH, &(end - start).to_string());
     r = with(r, "docker-content-digest", digest);

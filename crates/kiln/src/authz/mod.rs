@@ -536,6 +536,9 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/incidents/*", "runs.read", At::Anywhere),
     any("/api/plans", "agents.run", At::Server),
     any("/api/plans/**", "agents.run", At::Server),
+    // Research (docs/research.md): agents' and people's, each finding graded.
+    any("/api/research", "agents.run", At::Server),
+    any("/api/research/**", "agents.run", At::Server),
     any("/api/places", "agents.run", At::Server),
     any("/api/places/**", "agents.run", At::Server),
     any("/api/voice", "agents.run", At::Server),

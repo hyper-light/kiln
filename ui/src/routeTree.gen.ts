@@ -40,6 +40,7 @@ import { Route as AppAgentsExperimentsIndexRouteImport } from './routes/_app.age
 import { Route as AppAgentsExperimentsIdRouteImport } from './routes/_app.agents.experiments.$id'
 import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
+import { Route as AppAgentsResearchIdRouteImport } from './routes/_app.agents.research.$id'
 import { Route as AppDeploymentsEnvironmentsIndexRouteImport } from './routes/_app.deployments.environments.index'
 import { Route as AppDeploymentsEnvironmentsNameRouteImport } from './routes/_app.deployments.environments.$name'
 import { Route as AppDeploymentsReleasesIndexRouteImport } from './routes/_app.deployments.releases.index'
@@ -210,6 +211,11 @@ const AppAgentsPlansIdRoute = AppAgentsPlansIdRouteImport.update({
   path: '/agents/plans/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAgentsResearchIdRoute = AppAgentsResearchIdRouteImport.update({
+  id: '/agents/research/$id',
+  path: '/agents/research/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDeploymentsEnvironmentsIndexRoute =
   AppDeploymentsEnvironmentsIndexRouteImport.update({
     id: '/deployments/environments/',
@@ -319,6 +325,7 @@ export interface FileRoutesByFullPath {
   '/runs/': typeof AppRunsIndexRoute
   '/agents/experiments/$id': typeof AppAgentsExperimentsIdRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/research/$id': typeof AppAgentsResearchIdRoute
   '/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
   '/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
   '/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
@@ -365,6 +372,7 @@ export interface FileRoutesByTo {
   '/runs': typeof AppRunsIndexRoute
   '/agents/experiments/$id': typeof AppAgentsExperimentsIdRoute
   '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/research/$id': typeof AppAgentsResearchIdRoute
   '/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
   '/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
   '/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
@@ -413,6 +421,7 @@ export interface FileRoutesById {
   '/_app/runs/': typeof AppRunsIndexRoute
   '/_app/agents/experiments/$id': typeof AppAgentsExperimentsIdRoute
   '/_app/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/_app/agents/research/$id': typeof AppAgentsResearchIdRoute
   '/_app/deployments/environments/$name': typeof AppDeploymentsEnvironmentsNameRoute
   '/_app/deployments/releases/$id': typeof AppDeploymentsReleasesIdRoute
   '/_app/deployments/releases/new': typeof AppDeploymentsReleasesNewRoute
@@ -461,6 +470,7 @@ export interface FileRouteTypes {
     | '/runs/'
     | '/agents/experiments/$id'
     | '/agents/plans/$id'
+    | '/agents/research/$id'
     | '/deployments/environments/$name'
     | '/deployments/releases/$id'
     | '/deployments/releases/new'
@@ -507,6 +517,7 @@ export interface FileRouteTypes {
     | '/runs'
     | '/agents/experiments/$id'
     | '/agents/plans/$id'
+    | '/agents/research/$id'
     | '/deployments/environments/$name'
     | '/deployments/releases/$id'
     | '/deployments/releases/new'
@@ -554,6 +565,7 @@ export interface FileRouteTypes {
     | '/_app/runs/'
     | '/_app/agents/experiments/$id'
     | '/_app/agents/plans/$id'
+    | '/_app/agents/research/$id'
     | '/_app/deployments/environments/$name'
     | '/_app/deployments/releases/$id'
     | '/_app/deployments/releases/new'
@@ -796,6 +808,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppAgentsPlansIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/agents/research/$id': {
+      id: '/_app/agents/research/$id'
+      path: '/agents/research/$id'
+      fullPath: '/agents/research/$id'
+      preLoaderRoute: typeof AppAgentsResearchIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/environments/': {
       id: '/_app/deployments/environments/'
       path: '/deployments/environments'
@@ -925,6 +944,7 @@ interface AppRouteChildren {
   AppRunsIndexRoute: typeof AppRunsIndexRoute
   AppAgentsExperimentsIdRoute: typeof AppAgentsExperimentsIdRoute
   AppAgentsPlansIdRoute: typeof AppAgentsPlansIdRoute
+  AppAgentsResearchIdRoute: typeof AppAgentsResearchIdRoute
   AppDeploymentsEnvironmentsNameRoute: typeof AppDeploymentsEnvironmentsNameRoute
   AppDeploymentsReleasesIdRoute: typeof AppDeploymentsReleasesIdRoute
   AppDeploymentsReleasesNewRoute: typeof AppDeploymentsReleasesNewRoute
@@ -971,6 +991,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppRunsIndexRoute: AppRunsIndexRoute,
   AppAgentsExperimentsIdRoute: AppAgentsExperimentsIdRoute,
   AppAgentsPlansIdRoute: AppAgentsPlansIdRoute,
+  AppAgentsResearchIdRoute: AppAgentsResearchIdRoute,
   AppDeploymentsEnvironmentsNameRoute: AppDeploymentsEnvironmentsNameRoute,
   AppDeploymentsReleasesIdRoute: AppDeploymentsReleasesIdRoute,
   AppDeploymentsReleasesNewRoute: AppDeploymentsReleasesNewRoute,

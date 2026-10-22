@@ -133,10 +133,9 @@ async fn missing_image(hub: &Arc<Hub>, images: impl IntoIterator<Item = String>)
 /// taken by its cluster in a server-side dry run.
 async fn rendered(d: &Deploy, cd: &Arc<Cd>, a: &App, env: &Environment, reg: &Registration, file: &ReleaseFile, values: Option<&str>) -> Found {
     let refused = |why: String| Found { refused: Some(why), irreversible: None };
-    let rr = env.release_repo.clone();
-    let hosted = d.hosted.clone();
-    let Some(head) = crate::rt::blocking(move || hosted.head(&rr.repo, &rr.branch)).await.and_then(|x| x).ok().flatten() else { return Found::default() };
-    let Ok(url) = d.hosted.url(&env.release_repo.repo) else { return Found::default() };
+    let Ok(at) = super::git::open(d, &env.release_repo).await else { return Found::default() };
+    let Some(head) = at.head().await.ok().flatten() else { return Found::default() };
+    let Ok(url) = at.url() else { return Found::default() };
     if kilncd::fetched(cd, &url, &head).await.is_err() {
         return Found::default();
     }

@@ -110,6 +110,28 @@ export interface Gates {
   freeze?: string;
   /** `auto`: a version that lands in one of `after` is released here by itself (§9.2). */
   promote?: "auto" | "manual";
+  /** `pull-request`: each release is a pull request on the release repository (a merge request on GitLab); its merge is the approval, and closing it cancels the release (§4). */
+  via?: "commit" | "pull-request";
+}
+
+/** A git host release repositories may be on (docs/deploy-api.md §7): kiln's own, GitHub through kiln's App, a GitLab with the groups its token covers. */
+export interface GitHost {
+  host: "kiln" | "github" | "gitlab";
+  name: string;
+  /** Its web origin. */
+  web?: string;
+  /** A GitLab's: the groups its token covers (none: every project there). */
+  groups?: string[];
+}
+
+/** The GitHub App kiln acts through, if it has one (docs/ci.md W14-R10). */
+export interface GithubApp {
+  configured: boolean;
+  /** GitHub's web origin. */
+  web_url: string;
+  slug?: string | null;
+  html_url?: string | null;
+  install_url?: string | null;
 }
 
 export interface Environment {
@@ -382,8 +404,12 @@ export const deployApi = {
   environment: (name: string, signal?: AbortSignal) => request<Environment>("GET", `/api/deploy/environments/${enc(name)}`, undefined, { signal }),
   putEnvironment: (e: Environment) => request<Environment>("PUT", `/api/deploy/environments/${enc(e.name)}`, e),
   /** A new environment: what isn't given is the server's default (no gates, one release at a time, no agents). */
-  createEnvironment: (e: { name: string; provider: string; release_repo: { repo: string; branch: string; root: string }; targets: { kubernetes: string[] }; argocd?: { applications: boolean } }) =>
+  createEnvironment: (e: { name: string; provider: string; release_repo: { host?: string; repo: string; branch: string; root: string }; targets: { kubernetes: string[] }; gates?: Gates; argocd?: { applications: boolean } }) =>
     request<Environment>("POST", "/api/deploy/environments", e),
+  /** kiln's GitHub App, through which release repositories on GitHub are made and written. */
+  githubApp: (signal?: AbortSignal) => request<GithubApp>("GET", "/api/ci/github/app", undefined, { signal }),
+  /** The git hosts release repositories may be on. */
+  gitHosts: (signal?: AbortSignal) => request<{ hosts: GitHost[] }>("GET", "/api/deploy/git-hosts", undefined, { signal }).then((r) => r.hosts),
   /** How an environment's move between providers stands; `null` when it hasn't moved. */
   move: (env: string, signal?: AbortSignal) =>
     request<Move>("GET", `/api/deploy/environments/${enc(env)}/move`, undefined, { signal }).catch((err: unknown) => {
@@ -486,6 +512,27 @@ export function packageWords(p: Package): string {
     case "platform":
       return p.provider;
   }
+}
+
+/** The host a release repository is on (a GitLab's: the one whose token covers its group), if it's another's. */
+export function repoHost(e: Environment, hosts: GitHost[]): GitHost | null {
+  const { host, repo } = e.release_repo;
+  if (host === "kiln") return null;
+  return hosts.find((h) => h.host === host && (!h.groups?.length || h.groups.some((g) => repo.startsWith(`${g.replace(/\/$/, "")}/`)))) ?? null;
+}
+
+/** Where a release repository is seen: its page on GitHub or GitLab, none for kiln's own. */
+export function releaseRepoUrl(e: Environment, hosts: GitHost[]): string | null {
+  const h = repoHost(e, hosts);
+  return h?.web ? `${h.web.replace(/\/$/, "")}/${e.release_repo.repo}` : null;
+}
+
+/** A release proposed as a pull request (`via: pull-request`, a merge request on GitLab): its number, where it is, and what the host calls it. */
+export function pullRequestOf(r: Release): { number: number; url: string; name: string } | null {
+  const pr = r.provider?.pull_request as { number?: unknown; url?: unknown } | undefined;
+  if (!pr || typeof pr.number !== "number" || typeof pr.url !== "string") return null;
+  const gitlab = pr.url.includes("/-/merge_requests/");
+  return { number: pr.number, url: pr.url, name: gitlab ? `merge request !${pr.number}` : `pull request #${pr.number}` };
 }
 
 /** The provider's name, as people say it. */

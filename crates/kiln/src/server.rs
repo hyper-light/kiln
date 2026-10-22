@@ -97,8 +97,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     })?;
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
-    let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone())?;
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
+    // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
+    crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.
@@ -130,6 +132,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }};
     }
     child!("scheduler", h => h.scheduler_loop());
+    child!("blobs", h => crate::blobs::run(h));
+    child!("transcripts", h => crate::harness::archive::run(h));
     // `kiln workflow run`'s own server (docs/ci.md W17-R06) runs CI and nothing else: no polling
     // or schedules, terminals, agents, sync, fleet or UI.
     if !cfg.ci.local {
@@ -153,6 +157,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
         child!("land-queue", h => crate::ci::land::run_loop(h));
         child!("github-checks", h => crate::githost::github::checks_loop(h));
+        child!("host-statuses", h => crate::githost::statuses::statuses_loop(h));
         child!("ci-providers", h => crate::ci::providers::sync_loop(h));
         child!("pool-samples", h => crate::ci::pools::sample_loop(h));
         child!("diff-runs", h => crate::ci::review::runs_loop(h));

@@ -306,7 +306,7 @@ sync and health, resources and why they differ, diffs, history, syncs, clusters.
 agents for parts of the work on any machine (`agents_start`), carry on while they work (kiln tells you when each is done; \
 `agents_wait` when you can't go on without one) and read what they concluded \
 (`agents_result`), and put an agent's work up for review (`agents_change`); what they ask a person stays a person's to answer. \
-Goal stacks and plans are under `kiln.goals` and `kiln.plans`. Prefer code_run: one program can list, filter and act on a \
+Goal stacks, plans and research are under `kiln.goals`, `kiln.plans` and `kiln.research`. Prefer code_run: one program can list, filter and act on a \
 whole fleet and return only what matters. code_search shows the operations and their inputs. The skills (kiln-agents, \
 kiln-plans, kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd-migration, and CI's kiln-ci-author, kiln-ci-diagnose, \
 kiln-ci-runners, kiln-ci-review, kiln-ci-migrate, kiln-ci-secrets and kiln-ci-performance) say how to use them.";
@@ -325,7 +325,12 @@ is kept in kiln for the person to read, change and run again: `plans_create` kee
 steps; a step's `needs` are the steps it waits for), and `plans_run` runs it on you (leave out `session` and `new`: as one \
 message, a step a turn, or each step a goal) or with an agent of its own for each step (mode `agents`: in your harness, on \
 your machine and in your folder unless you say otherwise; steps that don't wait for each other run side by side; a step \
-given to `main` goes on your own goal stack; `plans_runs_get` follows the run). The kiln-plans skill says how.";
+given to `main` goes on your own goal stack; `plans_runs_get` follows the run). `goals_plan` turns a goal into a plan: research \
+it first, inside (files on your machine and others, kiln's records: `conversations_search`) and outside (the web, docs, \
+papers), recording each claim with its sources and the exact words quoted (`research_add`: kiln checks each quote where it's \
+cited and grades each finding A to F), write its steps with the findings each rests on, then `plans_ready`: its steps become \
+the goal's parts, and once they're all met so is the goal. Whenever you present research to a person, give every claim's \
+sources and its grade and score as `research_get`'s markdown has them. The kiln-plans skill says how.";
 
 /// Who an agent kiln runs is, as kiln's MCP servers tell it.
 pub fn you_are(agent: &str) -> String {

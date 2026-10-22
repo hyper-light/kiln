@@ -239,7 +239,7 @@ impl Bitbucket {
             bail!("pull request #{number} ({st}): {}", said(&v));
         }
         Ok(match v.get("state").and_then(Value::as_str).unwrap_or_default() {
-            "MERGED" => ChangeState::Merged { commit: v.pointer("/merge_commit/hash").and_then(Value::as_str).map(str::to_owned) },
+            "MERGED" => ChangeState::Merged { commit: v.pointer("/merge_commit/hash").and_then(Value::as_str).map(str::to_owned), by: v.pointer("/closed_by/nickname").and_then(Value::as_str).map(str::to_owned) },
             "DECLINED" | "SUPERSEDED" => ChangeState::Closed,
             _ => ChangeState::Open,
         })

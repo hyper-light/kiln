@@ -90,6 +90,8 @@ fn ask_login_shell(shell: &str, agent: Vec<(String, String)>) -> Option<Vec<(Str
     let mut cmd = std::process::Command::new(shell);
     cmd.args(["-l", "-i", "-c", &script]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
     cmd.current_dir(crate::os::home_dir()).envs(agent);
+    // A second early: process start times are whole seconds.
+    let since = unix_s().saturating_sub(1);
     let mut child = cmd.spawn().ok()?;
     let started = Instant::now();
     loop {
@@ -109,16 +111,52 @@ fn ask_login_shell(shell: &str, agent: Vec<(String, String)>) -> Option<Vec<(Str
     std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
     let body = out.split_once(&format!("\n{BEGIN}\n"))?.1.split_once(&format!("\n{END}\n"))?.0;
     let env: Vec<(String, String)> = parse_env(body).into_iter().filter(|(k, _)| !SKIP_ENV.contains(&k.as_str())).collect();
-    (!env.is_empty()).then_some(env)
+    (!env.is_empty()).then(|| without_its_agent(env, since))
 }
 
-/// The environment runs get: the login shell's (kept [`ENV_TTL`]), else this process's.
+/// Seconds since the epoch, as process start times are given.
+fn unix_s() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The environment a login shell said, without the `ssh-agent` its startup files started for it
+/// alone. `eval "$(ssh-agent -s)"` (fish: `eval (ssh-agent -c)`) starts one in every shell that
+/// reads the file, or every one given none, and it runs on after the shell: asked every few
+/// minutes, the shell left one each time, for good (hundreds on a machine). It's stopped, and runs
+/// get the agent this process has, or none, rather than the stopped one's socket. An agent the
+/// shell found running (started before `since`, kept in a file) is left as it is.
+fn without_its_agent(mut env: Vec<(String, String)>, since: u64) -> Vec<(String, String)> {
+    let pid_of = |v: &str| v.trim().parse::<u32>().ok();
+    let theirs = env.iter().find(|(k, _)| k == "SSH_AGENT_PID").and_then(|(_, v)| pid_of(v));
+    let ours = std::env::var("SSH_AGENT_PID").ok().and_then(|v| pid_of(&v));
+    let Some(pid) = theirs.filter(|p| Some(*p) != ours && started_agent(*p, since)) else { return env };
+    crate::harness::survivors::stop(&[pid]);
+    env.retain(|(k, _)| k != "SSH_AGENT_PID" && k != "SSH_AUTH_SOCK");
+    env.extend(["SSH_AUTH_SOCK", "SSH_AGENT_PID"].into_iter().filter_map(|k| std::env::var(k).ok().map(|v| (k.to_owned(), v))));
+    env
+}
+
+/// Whether `pid` is an `ssh-agent` that started at `since` or later, and runs.
+fn started_agent(pid: u32, since: u64) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let p = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), true, ProcessRefreshKind::nothing());
+    sys.process(p).is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie && p.name().to_string_lossy().starts_with("ssh-agent") && p.start_time() >= since)
+}
+
+/// The environment runs get: the login shell's (kept [`ENV_TTL`]), else this process's. One shell
+/// is asked at a time: runs that start while it answers take its answer.
 pub async fn login_env() -> Vec<(String, String)> {
+    static ASKING: OnceLock<futures::lock::Mutex<()>> = OnceLock::new();
     let cell = LOGIN_ENV.get_or_init(|| Mutex::new(None));
-    if let Some((at, env)) = cell.lock().as_ref()
-        && at.elapsed() < ENV_TTL
-    {
-        return env.clone();
+    let kept = || cell.lock().as_ref().filter(|(at, _)| at.elapsed() < ENV_TTL).map(|(_, env)| env.clone());
+    if let Some(env) = kept() {
+        return env;
+    }
+    let _asking = ASKING.get_or_init(|| futures::lock::Mutex::new(())).lock().await;
+    if let Some(env) = kept() {
+        return env;
     }
     let agent = cell.lock().as_ref().map(|(_, env)| agent_of(env)).unwrap_or_default();
     let env = crate::rt::blocking(move || ask_login_shell(&login_shell(), agent)).await.ok().flatten().unwrap_or_else(|| std::env::vars().collect());
@@ -345,6 +383,29 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ssh_agent_a_login_shell_started_is_stopped_and_not_handed_on() -> anyhow::Result<()> {
+        let Ok(out) = std::process::Command::new("ssh-agent").arg("-s").stdin(std::process::Stdio::null()).output() else {
+            eprintln!("skipped: no ssh-agent here");
+            return Ok(());
+        };
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        let value = |k: &str| said.split([';', '\n']).find_map(|p| p.trim().strip_prefix(&format!("{k}=")).map(str::to_owned));
+        let (Some(sock), Some(pid)) = (value("SSH_AUTH_SOCK"), value("SSH_AGENT_PID")) else { anyhow::bail!("ssh-agent said {said:?}") };
+        let n: u32 = pid.parse()?;
+        let env = vec![("PATH".to_owned(), "/bin".to_owned()), ("SSH_AUTH_SOCK".to_owned(), sock.clone()), ("SSH_AGENT_PID".to_owned(), pid.clone())];
+        // One that ran before the shell was asked: the shell found it, and it stays.
+        assert_eq!(without_its_agent(env.clone(), u64::MAX), env);
+        assert!(started_agent(n, 0), "it still runs");
+        // One the shell started: stopped, and neither its socket nor its pid handed on.
+        let kept = without_its_agent(env, unix_s().saturating_sub(60));
+        assert!(!started_agent(n, 0), "the agent still runs");
+        assert!(!kept.iter().any(|(_, v)| *v == sock || *v == pid), "{kept:?}");
+        assert!(kept.iter().any(|(k, v)| k == "PATH" && v == "/bin"));
+        Ok(())
+    }
 
     #[cfg(unix)]
     async fn run(spec: RunSpec, cwd: &Path, shell: Option<PathBuf>) -> anyhow::Result<(Vec<u8>, Vec<u8>, Option<i32>, Option<String>)> {

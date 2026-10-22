@@ -10,6 +10,7 @@ pub mod github;
 pub mod gitlab;
 pub mod hooks;
 pub mod pulls;
+pub mod statuses;
 pub mod web;
 
 use std::sync::Arc;
@@ -100,7 +101,8 @@ pub struct ChangeRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeState {
     Open,
-    Merged { commit: Option<String> },
+    /// Merged, into `commit` where the host says, by `by` (the host's name for them).
+    Merged { commit: Option<String>, by: Option<String> },
     Closed,
 }
 
@@ -290,7 +292,7 @@ impl GitHost {
                 let id = d.id.clone();
                 let landed: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT landed_commit FROM diffs WHERE id = ?1", [&id], |r| r.get(0))?)).await?;
                 Ok(match d.state.as_str() {
-                    "landed" => ChangeState::Merged { commit: landed },
+                    "landed" => ChangeState::Merged { commit: landed, by: None },
                     "abandoned" => ChangeState::Closed,
                     _ => ChangeState::Open,
                 })

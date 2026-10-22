@@ -9,6 +9,7 @@
 //!
 //! The engine is behind [`Engine`]: Turso ([`super::turso`]).
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -29,6 +30,8 @@ pub const COMMIT_ROWS: usize = 2048;
 pub const QUEUE: usize = 65_536;
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
+/// The most sessions [`Store::ended`] answers a page.
+pub const ENDED_MAX: usize = 1000;
 /// While the writer has nothing else to do, record lines kept before lines were compressed are
 /// compressed this many at a time, this often.
 const SQUEEZE_BATCH: usize = 2000;
@@ -231,6 +234,9 @@ pub trait Engine: Send + 'static {
     fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
     /// The sessions not ended, heard of since `since` (unix ms), oldest first.
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
+    /// The sessions that ended after `after` (`(closed_at, id)` together), oldest first, `limit` at
+    /// most: `(id, closed_at)`.
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>>;
     /// Compress the next `limit` record lines kept before lines were compressed, if any are left:
     /// whether more are.
     fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool>;
@@ -283,6 +289,8 @@ pub struct Store {
     id: Arc<str>,
     meter: Arc<Meter>,
     watchers: Watchers,
+    /// Sessions that ended at or after this (unix ms) keep their records ([`Store::hold_prune`]).
+    hold: Arc<AtomicI64>,
 }
 
 impl Store {
@@ -292,9 +300,23 @@ impl Store {
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let meter: Arc<Meter> = Arc::default();
-        let (w, m) = (watchers.clone(), meter.clone());
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m))?;
-        Ok(Self { tx, id, meter, watchers })
+        let hold = Arc::new(AtomicI64::new(i64::MAX));
+        let (w, m, h) = (watchers.clone(), meter.clone(), Arc::clone(&hold));
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h))?;
+        Ok(Self { tx, id, meter, watchers, hold })
+    }
+
+    /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
+    /// ago, whatever `keep_closed` says: those the server's archive of transcripts hasn't taken yet
+    /// (`crate::harness::archive`). `i64::MAX` holds nothing back; moved later, the writer lets go
+    /// at once of what it now may.
+    pub fn hold_prune(&self, ended_ms: i64) {
+        self.hold.store(ended_ms, Ordering::Release);
+    }
+
+    /// Where [`Store::hold_prune`] holds it: None, nothing held back.
+    pub fn held(&self) -> Option<i64> {
+        Some(self.hold.load(Ordering::Acquire)).filter(|h| *h != i64::MAX)
     }
 
     /// Who this store is to its peers.
@@ -480,6 +502,16 @@ impl Store {
         self.run(move |e| e.unended(since))
     }
 
+    /// The sessions that ended after `after` (the page before's last, `(closed_at, id)`; `None`:
+    /// from the first), oldest first, a page of `limit`, at most [`ENDED_MAX`]: `(id, closed_at)`.
+    /// Paged by close and id together, so sessions that closed in one millisecond each come once.
+    /// Blocking.
+    pub fn ended(&self, after: Option<(i64, String)>, limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        let (at, id) = after.unwrap_or((i64::MIN, String::new()));
+        let limit = limit.min(ENDED_MAX);
+        self.run(move |e| e.ended((at, &id), limit))
+    }
+
     /// Wait until everything sent so far is committed. Blocking.
     pub fn sync(&self) -> anyhow::Result<()> {
         self.run(|_| Ok(()))
@@ -520,8 +552,11 @@ impl SendWait for mpsc::SyncSender<Msg> {
 
 /// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64) {
     let keep_closed = upkeep.keep_closed;
+    // The hold on letting records go as it last looked: one moved later lets more go, so it looks
+    // again.
+    let mut held = hold.load(Ordering::Acquire);
     let mut pending: Vec<Row> = Vec::new();
     let mut since: Option<Instant> = None;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
@@ -596,9 +631,10 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             return;
                         }
                     };
-                } else if !had && (looking || Instant::now() >= look_at) {
+                } else if !had && (looking || Instant::now() >= look_at || hold.load(Ordering::Acquire) > held) {
+                    held = hold.load(Ordering::Acquire);
                     let gone = match keep_closed {
-                        Some(keep) => engine.prune_some(crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX)), PRUNE_BATCH),
+                        Some(keep) => engine.prune_some(crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX)).min(held), PRUNE_BATCH),
                         None => Ok(0),
                     };
                     match gone {
@@ -689,7 +725,7 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::sync_channel(1);
-    Store { tx, id: "stopped".into(), meter: Arc::default(), watchers: Arc::default() }
+    Store { tx, id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
 }
 
 #[cfg(test)]
@@ -717,6 +753,56 @@ mod tests {
             std::thread::sleep(SQUEEZE_EVERY * 3);
         }
         assert_eq!(store.marks("new")?.len(), 1, "a session that ended just now keeps its record");
+        Ok(())
+    }
+
+    /// CP-T10.1: a hold keeps the records of sessions that ended at or after it, however long ago,
+    /// while those that ended before it go; moved past them, they go at once (the server's
+    /// transcripts are archived before their records go).
+    #[test]
+    fn a_hold_keeps_the_records_of_sessions_that_ended_at_or_after_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None })?;
+        let now = crate::util::now_ms();
+        let held = now - 3_600_000;
+        store.hold_prune(held);
+        let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
+        let line = |s: &str, n: u64| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: "{}".into(), kept: None }));
+        store.put(vec![session("before"), line("before", 0), Row::Closed { session: "before".into(), at: held - 60_000 }]);
+        store.put(vec![session("held"), line("held", 0), Row::Closed { session: "held".into(), at: held }]);
+        let until = Instant::now() + Duration::from_secs(15);
+        while !store.marks("before")?.is_empty() {
+            anyhow::ensure!(Instant::now() < until, "the record of a session that ended before the hold was kept");
+            std::thread::sleep(SQUEEZE_EVERY * 3);
+        }
+        assert_eq!(store.marks("held")?.len(), 1, "a session that ended at the hold keeps its record");
+        store.hold_prune(held + 1);
+        // Asked more seldom than the writer waits, idle, before it looks again.
+        let until = Instant::now() + Duration::from_secs(30);
+        while !store.marks("held")?.is_empty() {
+            anyhow::ensure!(Instant::now() < until, "the hold moved past it, the record was still kept");
+            std::thread::sleep(LOOK_FILE + SQUEEZE_EVERY);
+        }
+        Ok(())
+    }
+
+    /// CP-T10.1: sessions that ended come a page at a time by close and id together: sessions that
+    /// closed in one millisecond each come once across pages, and one not ended never.
+    #[test]
+    fn ended_sessions_page_by_close_and_id_together() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep::default())?;
+        let t = crate::util::now_ms() - 60_000;
+        let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: t };
+        let closed = |s: &str, at: i64| Row::Closed { session: s.into(), at };
+        assert!(store.put_wait(vec![session("s3"), session("s1"), session("s2"), session("s4"), session("open")]));
+        assert!(store.put_wait(vec![closed("s3", t), closed("s1", t), closed("s2", t), closed("s4", t + 1)]));
+        let first = store.ended(None, 2)?;
+        assert_eq!(first, [("s1".to_owned(), t), ("s2".to_owned(), t)]);
+        let second = store.ended(Some((t, "s2".to_owned())), 2)?;
+        assert_eq!(second, [("s3".to_owned(), t), ("s4".to_owned(), t + 1)]);
+        assert!(store.ended(Some((t + 1, "s4".to_owned())), 2)?.is_empty());
+        assert_eq!(store.ended(None, 10_000)?.len(), 4, "capped at ENDED_MAX, and every ended one");
         Ok(())
     }
 

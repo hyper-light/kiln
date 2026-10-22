@@ -62,6 +62,12 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             hub.store.audit("github".into(), format!("github.{event}"), format!("{action} for {account}")).await;
         }
         _ => {
+            // A release repository's push, or a release's pull request (docs/deploy-api.md §7).
+            if matches!(event.as_str(), "push" | "pull_request")
+                && let Some(d) = crate::deploy::get()
+            {
+                crate::deploy::remote::on_github_event(&d, &event, &v).await;
+            }
             let hub2 = Arc::clone(hub);
             let delivery = (!delivery.is_empty()).then_some(delivery);
             crate::rt::spawn(async move {
@@ -95,16 +101,21 @@ async fn runs_of(hub: &Hub, full: &str, sha: &str) -> Vec<String> {
 fn manifest(hub: &Hub) -> Value {
     let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let host = super::host_of(&base);
+    // GitHub delivers webhooks only where it reaches: a kiln on a private address polls instead.
+    let name = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h).trim_matches(['[', ']']);
+    let private = name == "localhost" || name.parse::<std::net::IpAddr>().is_ok_and(crate::discovery::is_private);
     json!({
         "name": format!("kiln ({host})"),
         "url": base,
-        "hook_attributes": { "url": format!("{base}/api/hooks/github/app"), "active": true },
+        "hook_attributes": { "url": format!("{base}/api/hooks/github/app"), "active": !private },
         "redirect_url": format!("{base}/api/ci/github/app/callback"),
         "callback_urls": [format!("{base}/api/auth/github/callback")],
         "public": false,
+        // `administration`: release repositories made in an organization (docs/deploy-api.md §7).
         "default_permissions": {
             "checks": "write", "statuses": "write", "contents": "write", "pull_requests": "write", "issues": "write",
             "actions": "write", "deployments": "write", "metadata": "read", "members": "read", "workflows": "write",
+            "administration": "write",
         },
         "default_events": ["push", "pull_request", "pull_request_review", "pull_request_review_comment", "issue_comment", "check_run", "check_suite", "create", "delete", "release", "workflow_run", "workflow_job"],
     })

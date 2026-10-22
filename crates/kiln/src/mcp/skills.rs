@@ -150,6 +150,10 @@ mod tests {
             "`needs`",
             "## One agent per step",
             "{agent: \"main\"}",
+            "### Turning a goal into a plan: `goals_plan`",
+            "## Research: sources and grades",
+            "**Never grade it yourself.**",
+            "**Present it with its sources and grades, always.**",
             "## What a person decides",
         ] {
             assert!(plans.contains(part), "kiln-plans: {part}");

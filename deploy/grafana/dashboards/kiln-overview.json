@@ -2822,6 +2822,309 @@
         "x": 0,
         "y": 78
       }
+    },
+    {
+      "type": "row",
+      "title": "Blobs",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 84
+      },
+      "id": 36,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Blobs requests",
+      "description": "Requests to the store kiln keeps its bytes in (docs/blobs.md), by operation and outcome.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (store, op, outcome) (rate(kiln_blobs_requests_total{job=\"$job\"}[5m]))",
+          "legendFormat": "{{store}} {{op}} {{outcome}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 60000,
+            "lineInterpolation": "smooth",
+            "axisBorderShow": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "barAlignment": 0,
+            "pointSize": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 37,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 85
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Blobs latency",
+      "description": "How long requests to the store took: p50 and p99, by operation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(kiln_blobs_request_seconds_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "p50 {{op}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, op) (rate(kiln_blobs_request_seconds_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "p99 {{op}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 60000,
+            "lineInterpolation": "smooth",
+            "axisBorderShow": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "barAlignment": 0,
+            "pointSize": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 38,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 85
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Blobs bytes",
+      "description": "Bytes written to and read from the store.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (store, direction) (rate(kiln_blobs_bytes_total{job=\"$job\"}[5m]))",
+          "legendFormat": "{{store}} {{direction}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 60000,
+            "lineInterpolation": "smooth",
+            "axisBorderShow": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "barAlignment": 0,
+            "pointSize": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 39,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 92
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Blobs refused or unavailable",
+      "description": "The share of requests refused (a typed refusal: not found, precondition failed, too large, ...) or that the store couldn't answer.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(kiln_blobs_requests_total{job=\"$job\",outcome=\"refused\"}[5m])) / sum(rate(kiln_blobs_requests_total{job=\"$job\"}[5m]))",
+          "legendFormat": "refused",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(kiln_blobs_requests_total{job=\"$job\",outcome=\"unavailable\"}[5m])) / sum(rate(kiln_blobs_requests_total{job=\"$job\"}[5m]))",
+          "legendFormat": "unavailable",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 60000,
+            "lineInterpolation": "smooth",
+            "axisBorderShow": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "barAlignment": 0,
+            "pointSize": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 40,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 92
+      }
     }
   ]
 }

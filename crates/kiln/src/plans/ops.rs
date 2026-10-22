@@ -46,7 +46,8 @@ fn items_schema() -> Value {
             "examples": {"type": "string"},
             "acceptance": criteria_schema(),
             "testing": {"type": "array", "description": "Tests: each a scenario and the criteria it passes by.", "items": {"type": "object", "properties": {"scenario": {"type": "string"}, "criteria": criteria_schema()}}},
-            "needs": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "The steps (by number, from 1) this one waits for: run with an agent per step, it starts once each is met, and steps that don't wait for each other run side by side. Left out of every step: each waits for the one before."}
+            "needs": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "The steps (by number, from 1) this one waits for: run with an agent per step, it starts once each is met, and steps that don't wait for each other run side by side. Left out of every step: each waits for the one before."},
+            "basis": {"type": "array", "items": {"type": "string"}, "description": "The findings of the plan's research this step rests on (their ids: f1, f2 …)."}
         }, "required": ["title"]}
     })
 }
@@ -129,6 +130,81 @@ async fn runs_retry(cx: Cx, v: Value) -> Out {
     let run = run_of(&v)?;
     may_steer_run(&cx, &run).await?;
     json_of(&super::agents::retry(&cx.hub, &run, step_of(&v)?, &cx.caller.name).await.map_err(fail)?)
+}
+
+fn goals_fail(e: crate::goals::Error) -> Fail {
+    match e {
+        crate::goals::Error::Bad(m) => (StatusCode::BAD_REQUEST, m),
+        crate::goals::Error::NoAgent => (StatusCode::NOT_FOUND, "the goal's agent isn't there".into()),
+        crate::goals::Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// Ends a plan's planning phase (`super::ready`); a plan made from a goal then goes on as `then`
+/// says: its steps the goal's parts on its agent (`goals`, the default), the same paused for a
+/// person to look first (`review`), or a run with an agent per step that the goal waits for
+/// (`agents`). Once every step is met, so is the goal.
+async fn ready(cx: Cx, v: Value) -> Out {
+    let id = id_of(&v)?;
+    let p = super::get(&cx.hub, &id).await.map_err(fail)?;
+    let goal = p.source.as_ref().and_then(|s| s.goal.clone());
+    if let Some(g) = &goal {
+        crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &g.agent)?;
+    }
+    let then = v.get("then").and_then(Value::as_str).unwrap_or("goals");
+    if !matches!(then, "goals" | "agents" | "review") {
+        return Err((StatusCode::BAD_REQUEST, "`then` is goals, agents or review".into()));
+    }
+    let skipped: Option<crate::research::Skipped> =
+        v.get("skipped").cloned().filter(|s| !s.is_null()).map(serde_json::from_value).transpose().map_err(|e| (StatusCode::BAD_REQUEST, format!("`skipped`: {e}")))?;
+    let was_planning = p.phase == "planning";
+    let (plan, said) = super::ready(&cx.hub, &id, skipped).await.map_err(fail)?;
+    let mut out = json!({"plan": plan, "warnings": said.warnings});
+    // Its research, to show: every claim with its sources and grade, as a person reads it.
+    if let (true, Some(rid)) = (was_planning, plan.research.as_deref())
+        && let Ok(r) = crate::research::get(&cx.hub, rid).await
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("research".into(), json!(crate::research::view(&r, true).markdown));
+        o.insert(
+            "say".into(),
+            json!("Show the person this research now, in your reply, as it is: every finding with its grade, score and sources, and the sources numbered; then the warnings, if any. Then carry on with the plan's first step."),
+        );
+    }
+    if let (Some(g), true) = (goal, was_planning) {
+        let by = crate::goals::By::of(&cx.hub, &cx.caller, &g.agent);
+        let info = cx.hub.harness.info(&g.agent).ok_or_else(|| (StatusCode::NOT_FOUND, "the goal's agent has ended: run the plan another way (plans_run)".to_owned()))?;
+        let (next, run) = if then == "agents" {
+            let place = super::agents::Place {
+                on: Some(crate::harness::wait::machine(&info.target).to_owned()),
+                kind: Some(info.kind.clone()),
+                cwd: Some(info.cwd.clone()),
+                ..super::agents::Place::default()
+            };
+            let cfg = super::agents::Config {
+                place,
+                main: Some(g.agent.clone()),
+                parent: Some(g.agent.clone()),
+                opener: cx.caller.opener(),
+                actor: cx.caller.name.clone(),
+                ..super::agents::Config::default()
+            };
+            let started = super::agents::start(&cx.hub, &plan, cfg).await.map_err(fail)?;
+            (crate::goals::Then::Run(started.run.clone()), started.run)
+        } else {
+            let run = super::note_run(&cx.hub, &plan, &g.agent, "goals", &cx.caller.name).await.map_err(fail)?;
+            (if then == "review" { crate::goals::Then::Review } else { crate::goals::Then::Goals }, run)
+        };
+        let stack = crate::goals::planned(&cx.hub, &g.agent, &g.id, &plan, &run, &next, &by).await.map_err(goals_fail)?;
+        if let Some(o) = out.as_object_mut() {
+            o.insert("then".into(), json!(then));
+            o.insert("goal".into(), json!(g.id));
+            o.insert("run".into(), json!(run));
+            o.insert("stack".into(), serde_json::to_value(&stack).unwrap_or(Value::Null));
+        }
+    }
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.ready".into(), format!("{} (v{})", plan.title, plan.version)).await;
+    Ok(out)
 }
 
 async fn versions(cx: Cx, v: Value) -> Out {
@@ -248,6 +324,24 @@ pub fn list_ops() -> Vec<Op> {
             input: || schema(json!({"id": {"type": "string", "description": ID}, "title": {"type": "string"}, "body": {"type": "string"}, "items": items_schema(), "tags": {"type": "array", "items": {"type": "string"}}}), &["id"]),
             route: |v| Ok((Method::PATCH, path(&["api", "plans", &id_of(v)?]))),
             run: |cx, v| Box::pin(update(cx, v)),
+        },
+        Op {
+            name: "plans.ready",
+            summary: "Say a plan in its planning phase (one made from a goal: goals_plan) is ready: it has steps, its research has sources inside and outside (or `skipped` says why not), and each step rests only on findings of its research (`basis`). What's weak comes back as warnings: say them. A plan made from a goal then goes on as `then` says: `goals` (the default: its steps become the goal's parts on its agent, each splittable into its acceptance criteria and tests), `review` (the same, the stack paused for the person to look at the plan first), or `agents` (it runs with an agent per step, as its `needs` say; the goal waits for the run). Once every step is met, so is the goal.",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "id": {"type": "string", "description": ID},
+                        "then": {"type": "string", "enum": ["goals", "review", "agents"]},
+                        "skipped": {"type": "object", "properties": {"internal": {"type": "string"}, "external": {"type": "string"}}, "description": "Why its research has no internal, or no external, sources."}
+                    }),
+                    &["id"],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "ready"]))),
+            run: |cx, v| Box::pin(ready(cx, v)),
         },
         Op {
             name: "plans.versions",

@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
-use super::{cas, remote};
+use super::cas;
 use crate::ci::token::Claims;
 use crate::ci::{Fail, token};
 use crate::http::server::{self as srv, Request, Response};
@@ -49,6 +49,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
     let Some(claims) = token::of_request(hub, req.headers()) else {
         return Ok(msg(StatusCode::UNAUTHORIZED, "a leg's ACTIONS_RUNTIME_TOKEN is needed"));
     };
+    // Chunks move one by one only from a store that keeps them (docs/blobs.md).
+    if cas::chunked(hub).is_none() {
+        return Ok(msg(StatusCode::NOT_IMPLEMENTED, "kiln/cache's chunked cache needs kiln's local store of bytes (`[blobs] store = \"local\"`)"));
+    }
     let method = req.method().clone();
     match (method, rest) {
         (Method::POST, ["lookup"]) => lookup(hub, &claims, req).await,
@@ -161,10 +165,11 @@ async fn lookup(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respons
     };
     let Some(digest) = all.iter().find(|(e, _)| e.id == hit.id).and_then(|(_, o)| o.clone()) else { return Ok(srv::status(StatusCode::NO_CONTENT)) };
     let Some(obj) = cas::object(hub, &digest).await.map_err(internal)? else { return Ok(srv::status(StatusCode::NO_CONTENT)) };
+    let Some(chunks) = cas::chunks_of(hub, &digest).await.map_err(internal)? else { return Ok(srv::status(StatusCode::NO_CONTENT)) };
     crate::ci::insights::cache_event(hub, claims, &hit.key, "hit", Some(hit.size));
     let id = hit.id;
     hub.store.call(move |c| Ok(c.execute("UPDATE ci_caches SET last_used_at = ?2 WHERE id = ?1", params![id, crate::util::now_unix()])?)).await.map_err(internal)?;
-    Ok(srv::json(StatusCode::OK, &json!({ "id": hit.id, "key": hit.key, "scope": hit.scope, "object": { "digest": obj.digest, "size": obj.size, "chunks": obj.chunks } })))
+    Ok(srv::json(StatusCode::OK, &json!({ "id": hit.id, "key": hit.key, "scope": hit.scope, "object": { "digest": obj.digest, "size": obj.size, "chunks": chunks } })))
 }
 
 #[derive(Deserialize)]
@@ -198,11 +203,8 @@ async fn missing(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respon
         })
         .await
         .map_err(internal)?;
-    // The store has a chunk in the data directory, or in its bucket (W08-R02).
-    let in_bucket = if remote::on(hub) { remote::in_bucket(hub, held.iter().cloned().collect()).await.map_err(internal)? } else { Default::default() };
     let h = Arc::clone(hub);
-    let need: Vec<String> =
-        crate::rt::blocking(move || m.chunks.into_iter().filter(|d| !(held.contains(d) && (in_bucket.contains(d) || cas::chunk_file(&h, d).is_some()))).collect()).await.map_err(internal)?;
+    let need: Vec<String> = crate::rt::blocking(move || m.chunks.into_iter().filter(|d| !(held.contains(d) && cas::chunk_file(&h, d).is_some())).collect()).await.map_err(internal)?;
     Ok(srv::json(StatusCode::OK, &json!({ "missing": need })))
 }
 
@@ -235,11 +237,11 @@ async fn get_chunk(hub: &Arc<Hub>, claims: &Claims, id: &str, digest: &str) -> R
     if !readable {
         return Ok(msg(StatusCode::NOT_FOUND, "no such entry"));
     }
-    let Some(obj) = cas::object(hub, &object).await.map_err(internal)? else { return Ok(msg(StatusCode::NOT_FOUND, "no such entry")) };
-    if !obj.chunks.iter().any(|(d, _)| d == digest) {
+    let Some(chunks) = cas::chunks_of(hub, &object).await.map_err(internal)? else { return Ok(msg(StatusCode::NOT_FOUND, "no such entry")) };
+    if !chunks.iter().any(|(d, _)| d == digest) {
         return Ok(msg(StatusCode::NOT_FOUND, "the entry has no such chunk"));
     }
-    let Some(path) = cas::chunk_here(hub, digest).await else { return Ok(msg(StatusCode::NOT_FOUND, "the chunk is gone")) };
+    let Some(path) = cas::chunk_file(hub, digest) else { return Ok(msg(StatusCode::NOT_FOUND, "the chunk is gone")) };
     let data = crate::rt::blocking(move || std::fs::read(path)).await.map_err(internal)?.map_err(|e| internal(e.into()))?;
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::full(bytes::Bytes::from(data))))
 }
@@ -285,12 +287,7 @@ async fn commit(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respons
         return Ok(msg(StatusCode::BAD_REQUEST, "the chunks' sizes don't add up to the object's"));
     }
     // The content, read back in order: every chunk there and as long as said, the whole as the
-    // digest says. One only the bucket holds is brought back first (W08-R02).
-    if remote::on(hub) {
-        for (d, _) in &c.object.chunks {
-            let _ = cas::chunk_here(hub, d).await;
-        }
-    }
+    // digest says.
     let (h, list) = (Arc::clone(hub), c.object.chunks.clone());
     let checked = crate::rt::blocking(move || -> Result<String, String> {
         let mut whole = Sha256::new();
@@ -313,8 +310,7 @@ async fn commit(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respons
     if digest != c.object.digest {
         return Ok(msg(StatusCode::BAD_REQUEST, &format!("the chunks make sha256:{digest}, not the object's sha256:{}", c.object.digest)));
     }
-    let obj = cas::Object { digest: digest.clone(), size: c.object.size, chunks: c.object.chunks.clone() };
-    cas::record(hub, &obj).await.map_err(internal)?;
+    cas::put_chunked(hub, &digest, c.object.chunks.clone()).await.map_err(internal)?;
     let (repo, leg, key, version, size, chunks) = (claims.repo.clone(), claims.sub.clone(), c.key.clone(), c.version.clone(), i64::try_from(c.object.size).unwrap_or(i64::MAX), c.object.chunks.clone());
     let made = hub
         .store

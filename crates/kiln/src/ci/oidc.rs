@@ -363,7 +363,7 @@ async fn put_s3_here(hub: &Hub, bucket: &str, prefix: &str, files: &[(&'static s
     let c = &hub.cfg.ci.oidc;
     let region = c.publish_region.clone().unwrap_or_else(|| "us-east-1".into());
     let base = c.publish_endpoint.clone().unwrap_or_else(|| crate::ci::integrations::aws::endpoint("s3", &region));
-    let creds = crate::ci::services::remote::credentials(hub, &c.publish_credentials, "[ci.oidc] publish_credentials").await?;
+    let creds = crate::ci::services::s3::credentials(hub, &c.publish_credentials, "[ci.oidc] publish_credentials").await?;
     put_s3(&crate::ci::integrations::aws::Aws { creds, region }, base.trim_end_matches('/'), bucket, prefix, files).await
 }
 
@@ -899,7 +899,7 @@ mod tests {
     #[test]
     fn w10_r12_published_to_a_bucket() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let (base, fake) = crate::ci::services::remote::tests::fake_s3()?;
+            let (base, fake) = crate::ci::services::s3::tests::fake_s3()?;
             let dir = tempfile::tempdir()?;
             let issuer = "https://kiln-oidc.s3.us-east-1.amazonaws.com/acme";
             let hub_with = |secret: &str| -> anyhow::Result<_> {

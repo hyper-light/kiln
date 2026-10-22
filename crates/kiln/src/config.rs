@@ -39,6 +39,8 @@ pub struct Config {
     pub push: crate::push::Push,
     /// Agents that start agents (docs/agents.md, "Agents that run agents").
     pub agents: Agents,
+    /// Where kiln keeps its bytes (docs/blobs.md): the server's data directory, or any S3.
+    pub blobs: crate::blobs::Config,
     /// What a runner's administrator declares of it (docs/ci.md W13-R02): `[agent.facts]` and
     /// `[agent.probes]`. The server's own runner reads them here; `kiln agent` from its config file.
     pub agent: crate::runner::probe::Declared,
@@ -187,6 +189,9 @@ pub struct Conversations {
     /// Days the server's store keeps an ended agent's transcript (its events stay). 0: for good.
     /// Runners and mirrors keep them the default 30.
     pub keep_closed_days: u32,
+    /// Days kiln's store of bytes keeps an ended agent's archived transcript after its last close
+    /// (docs/blobs.md, `transcripts/`). 0: for good.
+    pub keep_archived_days: u32,
     /// Make the store's file compact once a third of it is free: a copy written a batch at a time
     /// while the store has nothing else to do, then put in its place. Runners and mirrors compact
     /// theirs.
@@ -457,7 +462,7 @@ impl Default for Terminal {
 
 impl Default for Conversations {
     fn default() -> Self {
-        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, compact: true, off: false }
+        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, keep_archived_days: 365, compact: true, off: false }
     }
 }
 

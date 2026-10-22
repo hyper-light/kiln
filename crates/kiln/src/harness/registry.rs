@@ -324,6 +324,11 @@ impl Registry {
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
+        // No record goes before kiln's store of bytes has it: held back entirely until the archive
+        // of transcripts (`super::archive`) says how far it has come.
+        if let Some(c) = &convo {
+            c.hold_prune(0);
+        }
         // Runners that keep a store send it here; the server keeps their sessions from that. What
         // a mirror sends back to restore the store from isn't sent to it again.
         let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
@@ -947,6 +952,7 @@ impl Registry {
             self.keeper.forget(id);
             self.visuals.forget(id);
             self.opened.forget(id);
+            super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
@@ -1007,6 +1013,7 @@ impl Registry {
         };
         self.kinds.lock().insert(format!("agent:{machine}"), inv.kinds);
         for id in gone {
+            super::archive::closed(hub, &id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }
     }
@@ -1159,6 +1166,7 @@ impl Registry {
                         harness_session: spec.resume.clone(),
                         approvals: Vec::new(),
                         queued: 0,
+                        queue: Vec::new(),
                         tasks_running: 0,
                         subagents: Vec::new(),
                         cost_usd: 0.0,
@@ -1439,6 +1447,7 @@ impl Registry {
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
+            super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }
         ok || loc.is_some()
@@ -1452,6 +1461,12 @@ impl Registry {
     /// A session as lists show it.
     pub fn info(&self, id: &str) -> Option<Info> {
         self.mirrors.lock().get(id).map(|m| m.info.clone())
+    }
+
+    /// What waits in session `id`'s queue, as its machine last said, the messages whole.
+    pub fn queue(&self, id: &str) -> Vec<super::model::QueueItem> {
+        let g = self.mirrors.lock();
+        g.get(id).and_then(|m| m.state.get("queue")).and_then(|q| serde_json::from_value(q.clone()).ok()).unwrap_or_default()
     }
 
     /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as

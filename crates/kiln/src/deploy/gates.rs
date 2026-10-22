@@ -573,7 +573,7 @@ mod tests {
     async fn deploy_with(f: impl FnOnce(&mut crate::config::Config)) -> anyhow::Result<Arc<Deploy>> {
         let hub = crate::hub::tests::scratch_hub_with(f).await?;
         let root = tempfile::tempdir()?.keep();
-        Ok(Arc::new(Deploy { hosted: super::super::host::Hosted::new(&root), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), hub }))
+        Ok(Arc::new(Deploy { hosted: super::super::host::Hosted::new(&root), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub }))
     }
 
     fn app(name: &str) -> anyhow::Result<App> {

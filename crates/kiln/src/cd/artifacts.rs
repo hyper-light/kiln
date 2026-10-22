@@ -26,7 +26,7 @@ impl Files for Hub {
         Box::pin(async move {
             let obj = crate::ci::services::cas::object(self, hex).await?.with_context(|| format!("no artifact sha256:{hex} in kiln's store (expired?)"))?;
             let size = obj.size;
-            Ok((crate::ci::services::cas::read(self, &obj, 0, size).await, size))
+            Ok((crate::ci::services::cas::read(self, &obj, 0, size), size))
         })
     }
 }
@@ -199,6 +199,26 @@ pub mod tests {
             }
         }
         !c
+    }
+
+    /// CP-T10.1: what CD deploys is read from kiln's store of bytes, by its SHA-256, checked
+    /// against it; content the store doesn't hold is an error naming it.
+    #[test]
+    fn an_artifact_is_read_from_the_store_by_its_hash() -> Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let z = zip(&[("index.js", b"export default {}"), ("big.bin", &kiln_seams::blobs::noise(3 << 20, 8))]);
+            let path = dir.path().join("artifact.zip");
+            std::fs::write(&path, &z)?;
+            let obj = crate::ci::services::cas::put_file(&hub, &path).await?;
+            let got = read(hub.as_ref(), &obj.digest).await?;
+            assert!(got == z, "{} bytes read of {}", got.len(), z.len());
+            assert_eq!(unzip(&got, 16 << 20)?.len(), 2);
+            let missing = read(hub.as_ref(), &crate::util::sha256_hex(b"nothing kept")).await;
+            assert!(missing.is_err_and(|e| e.to_string().contains("no artifact")));
+            Ok(())
+        })
     }
 
     #[test]

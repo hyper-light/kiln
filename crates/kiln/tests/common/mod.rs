@@ -99,6 +99,11 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Its process group with it: what it started (its UI server) is never left running.
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let work = self.dir.join("work");
@@ -150,16 +155,26 @@ pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
 /// `start`, serving HTTPS too (on the same port) when `https`: its address is `https://`, the
 /// kiln CA's certificate.
 pub fn start_with(dir: &Path, o: &Options<'_>, https: bool) -> anyhow::Result<Server> {
-    start_env(dir, o, https, &[])
+    start_full(dir, o, https, false, &[])
 }
 
-/// `start_with`, the server's environment given `env` too. A port picked here can be taken before
-/// the server binds it (tests run side by side): then the server exits, or another test's server
-/// answers on it and refuses this one's token. Either way it starts again, on new ports.
+/// [`start`], with KilnCD and deploying by API running (no cluster of its own).
+pub fn start_cd(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
+    start_full(dir, o, false, true, &[])
+}
+
+/// `start_with`, the server's environment given `env` too.
 pub fn start_env(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)]) -> anyhow::Result<Server> {
+    start_full(dir, o, https, false, env)
+}
+
+/// A port picked here can be taken before the server binds it (tests run side by side): then the
+/// server exits, or another test's server answers on it and refuses this one's token. Either way it
+/// starts again, on new ports.
+fn start_full(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, &str)]) -> anyhow::Result<Server> {
     let mut why = String::new();
     for _ in 0..3 {
-        match start_once(dir, o, https, env)? {
+        match start_once(dir, o, https, cd, env)? {
             Ok(server) => return Ok(server),
             Err(w) => why = w,
         }
@@ -167,7 +182,8 @@ pub fn start_env(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)])
     anyhow::bail!("the server didn't start: {why}")
 }
 
-/// `kiln server` with `dir`'s configuration, its home in `dir`, writing to `log`.
+/// `kiln server` with `dir`'s configuration, its home in `dir`, writing to `log`, in a process group
+/// of its own.
 fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
@@ -176,10 +192,12 @@ fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CHAOS"] {
         cmd.env_remove(var);
     }
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     Ok(cmd)
 }
 
-fn start_once(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)]) -> anyhow::Result<Result<Server, String>> {
+fn start_once(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, &str)]) -> anyhow::Result<Result<Server, String>> {
     let (port, quic) = (free_port()?, free_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
@@ -223,8 +241,14 @@ enabled = true
         agent = o.agent,
         ci = o.ci,
         extra = o.extra,
-        // CD stays off unless a test turns it on with a `[cd]` of its own.
-        cd = if o.extra.contains("[cd]") { "" } else { "[cd]\nenabled = false\n" },
+        // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
+        cd = if o.extra.contains("[cd]") {
+            ""
+        } else if cd {
+            "[cd]\nenabled = true\n"
+        } else {
+            "[cd]\nenabled = false\n"
+        },
         // So do terminals (its own runner's, and into legs: docs/ci.md W17-R01).
         terminal = if o.extra.contains("[terminal]") { "" } else { "[terminal]\nenabled = false\n" },
         // And pods (a `k8s` pool's: docs/ci.md W13-R07).

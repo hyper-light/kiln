@@ -150,7 +150,7 @@ async fn platforms_of(hub: &Hub, manifest: &Value) -> Vec<String> {
         return Vec::new();
     }
     let mut buf = Vec::new();
-    let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size).await;
+    let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size);
     while let Ok(b) = rx.recv().await {
         buf.extend_from_slice(&b);
     }

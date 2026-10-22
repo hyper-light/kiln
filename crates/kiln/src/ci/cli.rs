@@ -237,7 +237,7 @@ pub async fn oidc(args: OidcArgs, cfg: &Config) -> Result<()> {
                 super::oidc::Target::S3 { bucket, prefix } => {
                     let region = region.or_else(|| std::env::var("AWS_REGION").ok()).or_else(|| std::env::var("AWS_DEFAULT_REGION").ok()).unwrap_or_else(|| "us-east-1".into());
                     let base = endpoint.unwrap_or_else(|| super::integrations::aws::endpoint("s3", &region));
-                    let creds = super::services::remote::from_env()?;
+                    let creds = super::services::s3::from_env()?;
                     super::oidc::put_s3(&super::integrations::aws::Aws { creds, region }, base.trim_end_matches('/'), &bucket, &prefix, &super::oidc::published_files(discovery, jwks)?).await?;
                     println!("put the discovery document and keys in s3://{bucket}/{prefix}; the issuer must be where they're served (it's {issuer})");
                 }
@@ -1130,13 +1130,7 @@ pub async fn store(args: StoreArgs, cfg: &Config) -> Result<()> {
         }
         StoreCmd::Gc => {
             let v = run_op(&api, "ci.store.gc", json!({})).await?;
-            println!(
-                "removed {} objects and {} chunks ({} bytes){}",
-                n(&v, "objects"),
-                n(&v, "chunks"),
-                n(&v, "bytes"),
-                if n(&v, "remote") > 0 { format!("; {} chunks from the bucket", n(&v, "remote")) } else { String::new() }
-            );
+            println!("removed {} objects ({} bytes)", n(&v, "objects"), n(&v, "bytes"));
         }
     }
     Ok(())

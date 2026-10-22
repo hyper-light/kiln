@@ -625,7 +625,7 @@ pub fn ops() -> &'static [Op] {
                 route: |_| Ok((Method::POST, path(&["store", "gc"]), HashMap::new())),
                 run: |cx: Cx, _v: Value| async move {
                     let c = super::services::cas::collect(&cx.hub).await.map_err(internal)?;
-                    Ok(json!({ "objects": c.objects, "chunks": c.chunks, "bytes": c.bytes, "remote": c.remote }))
+                    Ok(json!({ "objects": c.objects, "bytes": c.bytes }))
                 }),
             op!("ci.workflows.schema", "The JSON Schema of a workflow file (`gha` or `kiln`), an overlay (`overlay`) or an action (`action`): what editors complete and validate against.", ro: true, destructive: false,
                 input: || schema(json!({"kind": {"type": "string", "enum": ["gha", "kiln", "overlay", "action"]}}), &["kind"]),

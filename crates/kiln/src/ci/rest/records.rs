@@ -458,7 +458,7 @@ pub async fn asset_content(s: &Site<'_>, by: AssetBy<'_>) -> Result<Response, Fa
     let Some(obj) = crate::ci::services::cas::object(s.hub, &object).await.map_err(internal)? else { return Ok(srv::json(StatusCode::GONE, &json!({ "message": "The asset's content is gone" }))) };
     let _ = s.hub.store.call(move |c| Ok(c.execute("UPDATE ci_release_assets SET downloads = downloads + 1 WHERE id = ?1", [id])?)).await;
     let size = obj.size;
-    let r = srv::response(StatusCode::OK, &ct, srv::channel_body(crate::ci::services::cas::read(s.hub, &obj, 0, size).await));
+    let r = srv::response(StatusCode::OK, &ct, srv::channel_body(crate::ci::services::cas::read(s.hub, &obj, 0, size)));
     let r = srv::with_header(r, http::header::CONTENT_LENGTH, &size.to_string());
     Ok(srv::with_header(r, http::header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", name.replace('"', "_"))))
 }

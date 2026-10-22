@@ -73,6 +73,14 @@ machine, harness and folder chosen for the run, or for the step; the run has a p
 (each step with its agent, where it stands, what it waits for and what it changed) and Mission
 Control groups its agents under it.
 
+The run's page draws its steps as their graph, in rounds (each step after the latest step it waits
+for, a round's steps side by side), with a bar of where each stands, the way an agent's
+conversation draws its work: a step at work with hyperlight's mark turning and its title in the
+holographic shimmer; one needing a person with the optic held in amber; met, its loop closed; not
+met, broken; skipped, dashed; stopped, faint; waiting, sketched and still. Only steps at work move.
+A plan's page draws its steps the same way, without where they stand, so **Runs after** reads as a
+graph while it's written.
+
 - **Which steps run when.** A step starts once each step it waits for is met (**Runs after**;
   `needs` in the API). Steps that don't wait for each other run side by side: the run's page says
   which. In a plan whose steps say nothing of it, each step waits for the one before, or, run
@@ -103,6 +111,40 @@ Control groups its agents under it.
   one commit on the commit of the step met before it: the run ends as a stack with one diff per
   step, in the order they were met (a step always after the steps it waits for).
 
+## Planning a goal
+
+An agent turns a goal of its stack into a plan kiln keeps with `goals_plan` (docs/goals.md): a plan
+in its **planning phase**, the goal's words its brief, with research of its own (docs/research.md).
+The goal gets one part first, planning it; the plan isn't run until it's ready.
+
+1. **Research.** The agent looks inside (its machine's files and others': code, documents, data,
+   pictures, frames of video; kiln's records: `conversations_search`, plans, CI runs, deployments)
+   and outside (the web, standards and official docs, papers, books, blogs, forums), recording each
+   finding with `research_add`: the claim, each source and the words quoted from it, and any
+   counterclaims. kiln looks for each quote where it's cited and grades each finding (A to F, out
+   of 100) by its sources' kinds, how far its citations hold up, how many independent sources
+   agree and what's against it.
+2. **Steps.** It writes the plan's steps (`plans_update`): each with what to do, its acceptance
+   criteria and tests, the steps it waits for (`needs`), and the findings it rests on (`basis`).
+3. **Ready.** `plans_ready` ends the planning phase. It refuses while the plan has no steps, its
+   research has no sources inside or outside (unless the agent says why: `skipped`), or a step
+   rests on a finding that isn't there. It answers with the research, as `research_get`'s markdown
+   gives it, and with what's weak (a step resting on nothing, or on findings graded D or F; quotes
+   still being checked): the agent shows the person the research in its reply, as it is, every
+   claim with its sources and grade, and says what's weak. The plan's page shows the research too
+   (**Being planned**, then **Research** under its steps), live while it's planned. Then, as `then`
+   says:
+   - `goals` (the default): the plan's steps become the goal's parts on the same agent, each a
+     goal saying the step it's made from (`goals_split` turns one into its acceptance criteria and
+     tests);
+   - `review`: the same, and the goal stack pauses for a person to look at the plan first; resuming
+     it carries on;
+   - `agents`: the plan runs with an agent per step, as its graph says; the goal waits for the run
+     (a part held for it, nothing sent to its agent for it).
+
+Once every step is met (or the run is done), the goal is met too, at once, with no check of its
+own: "Met with its plan: its 4 steps are met."
+
 ## Sharing one
 
 **Anyone with the link can read it**: a read-only page at `/shared/plans/<token>` that needs no
@@ -116,7 +158,7 @@ the plan**, for keeping it in another kiln.
 
 ## API
 
-A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing, needs?}]` (up to 100; `needs`: the steps it waits for, by number from 1). `acceptance` is a list of criteria: `{kind: "qualitative", text}` or `{kind: "quantitative", target, op, value, value2?, unit?, baseline?, measured?}`, `op` one of `lt`, `le`, `eq`, `ne`, `ge`, `gt`, `between` (`value2` the upper bound), `within` (`value2` the tolerance), `rises_at_least`, `falls_at_least`, `rises_at_most`, `falls_at_most` (`value` a percentage against `baseline`). `testing` is a list of `{scenario, criteria}`. A threshold is a number. `steps` is what runs, one string a step, the criteria and tests as sentences.
+A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing, needs?, basis?}]` (up to 100; `needs`: the steps it waits for, by number from 1; `basis`: the findings of its research it rests on, by id). A plan says its `phase` (`planning` or `ready`), its `research` (an id), and in `source.goal` the goal it was made from (`{agent, id, text}`). `acceptance` is a list of criteria: `{kind: "qualitative", text}` or `{kind: "quantitative", target, op, value, value2?, unit?, baseline?, measured?}`, `op` one of `lt`, `le`, `eq`, `ne`, `ge`, `gt`, `between` (`value2` the upper bound), `within` (`value2` the tolerance), `rises_at_least`, `falls_at_least`, `rises_at_most`, `falls_at_most` (`value` a percentage against `baseline`). `testing` is a list of `{scenario, criteria}`. A threshold is a number. `steps` is what runs, one string a step, the criteria and tests as sentences.
 
 
 | Method | Path | |
@@ -126,6 +168,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
+| POST | `/api/plans/:id/ready` | `{then?: goals \| review \| agents, skipped?: {internal?, external?}}`: its planning phase ended (a plan made from a goal goes on as `then` says); answers `{plan, warnings, research?, say?, then?, goal?, run?, stack?}` (`research`: its research's markdown, for the agent to show) |
 | POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}` |
 | GET | `/api/plans/:id/runs` | runs, newest first |
 | GET | `/api/plans/runs` | runs of one agent per step (`?active=1`: those under way) |

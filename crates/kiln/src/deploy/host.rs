@@ -66,6 +66,12 @@ impl std::fmt::Display for CommitError {
     }
 }
 
+impl From<anyhow::Error> for CommitError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
 /// The repositories kiln hosts: its native repositories (docs/ci.md W14), whose bare repositories
 /// live under one root as `<owner>/<name>.git`.
 #[derive(Debug, Clone)]
@@ -170,6 +176,27 @@ impl Hosted {
         if self.head(repo, branch)?.as_deref() != expected {
             return Err(Moved.into());
         }
+        let made = self.make(repo, expected, changes, message, author)?;
+        let Committed::New(commit) = &made else { return Ok(made) };
+        // The compare-and-swap: only if the branch still is where the commit was made.
+        let swap = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["update-ref", &format!("refs/heads/{branch}"), commit, expected.unwrap_or(NO_COMMIT)])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .context("run git")?;
+        if !swap.status.success() {
+            return Err(Moved.into());
+        }
+        Ok(made)
+    }
+
+    /// The commit of `changes` made on `parent` (`None`: on nothing), its objects written and no
+    /// branch moved: `Unchanged` (the parent) when the parent holds every file as asked already.
+    pub fn make(&self, repo: &str, parent: Option<&str>, changes: &[Change], message: &str, author: &Author) -> anyhow::Result<Committed> {
+        let dir = self.path(repo)?;
+        let expected = parent;
         // A scratch index of its own (commits from several callers never share one), and an empty
         // work tree: git updates an index only beside one, and `--cacheinfo` never reads it.
         let scratch = crate::util::new_id();
@@ -211,23 +238,32 @@ impl Hosted {
             ];
             let ident: Vec<(&str, &std::ffi::OsStr)> = ident.iter().map(|(k, v)| (*k, std::ffi::OsStr::new(*v))).collect();
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let commit = text(git(&dir, &args, Some(message.as_bytes()), &ident)?);
-            // The compare-and-swap: only if the branch still is where the commit was made.
-            let swap = Command::new("git")
-                .arg("-C")
-                .arg(&dir)
-                .args(["update-ref", &format!("refs/heads/{branch}"), &commit, expected.unwrap_or(NO_COMMIT)])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .context("run git")?;
-            if !swap.status.success() {
-                return Err(Moved.into());
-            }
-            Ok(Committed::New(commit))
+            Ok(Committed::New(text(git(&dir, &args, Some(message.as_bytes()), &ident)?)))
         })();
         let _ = std::fs::remove_file(&index);
         let _ = std::fs::remove_dir_all(&work);
         result
+    }
+
+    /// Whether the repository holds a commit (a revision: `<sha>`, `<sha>^`).
+    pub fn has(&self, repo: &str, rev: &str) -> anyhow::Result<bool> {
+        let dir = self.path(repo)?;
+        if !dir.join("HEAD").exists() {
+            return Ok(false);
+        }
+        let found = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .context("run git")?;
+        Ok(found.status.success())
+    }
+
+    /// Moves `branch` to `commit`, wherever it was (a mirror, following what its remote took).
+    pub fn set_head(&self, repo: &str, branch: &str, commit: &str) -> anyhow::Result<()> {
+        git(&self.path(repo)?, &["update-ref", &format!("refs/heads/{branch}"), commit], None, &[]).map(|_| ())
     }
 
     /// The newest commit on `branch` whose message has the line `<key>: <value>`.

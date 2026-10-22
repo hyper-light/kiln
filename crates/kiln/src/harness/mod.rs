@@ -15,10 +15,12 @@
 //! * [`lineage`] — agents an agent starts: its children, held to no more than it has.
 //! * [`ops`] — the `agents.*` operations (HTTP, MCP, code mode, the CLI).
 //! * [`wait`] — where agents stand, and waiting for them to settle.
+//! * [`queued`] — what waits in an agent's queue, and the messages kiln keeps there itself.
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 
 pub mod acp;
 pub mod antigravity;
+pub mod archive;
 pub mod broadcast;
 pub mod carry;
 pub mod claude;
@@ -41,6 +43,7 @@ pub mod opened;
 pub mod ops;
 pub mod pause;
 pub mod port;
+pub mod queued;
 pub mod registry;
 pub mod relocate;
 pub mod screen;

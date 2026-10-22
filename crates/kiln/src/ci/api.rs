@@ -287,7 +287,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         (&Method::POST, ["store", "gc"]) => {
             let c = boxed(|| super::services::cas::collect(hub)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-            Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "objects": c.objects, "chunks": c.chunks, "bytes": c.bytes, "remote": c.remote })))
+            Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "objects": c.objects, "bytes": c.bytes })))
         }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => boxed(|| super::routing::get(hub)).await,

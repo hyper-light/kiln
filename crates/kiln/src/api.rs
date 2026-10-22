@@ -317,6 +317,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let hash = (*hash).to_owned();
             return sync_blob_get(&hub, &hash, &req);
         }
+        // The local store's presigned URLs (docs/blobs.md): the URL is the credential.
+        (&Method::GET | &Method::HEAD | &Method::PUT, ["api", "blobs", _, ..]) => {
+            let encoded = path.strip_prefix("/api/blobs/").unwrap_or_default().to_owned();
+            return boxed(|| presigned(&hub, &encoded, req)).await;
+        }
         (&Method::PUT, ["api", "sync", "blobs", hash]) => {
             let hash = (*hash).to_owned();
             return boxed(|| sync_blob_put(&hub, &hash, req)).await;
@@ -641,6 +646,28 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "incidents.report", body)).await
         }
         // A plan run as one agent per step (docs/plans.md): its own page's routes.
+        // Research (docs/research.md): each operation is its route.
+        (&Method::GET, ["api", "research"]) => boxed(|| own_op(&hub, &caller, "research.list", query_value(&q))).await,
+        (&Method::POST, ["api", "research"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "research.start", body)).await
+        }
+        (&Method::GET, ["api", "research", id]) => {
+            let mut input = query_value(&q);
+            if let Some(o) = input.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "research.get", input)).await
+        }
+        (&Method::POST, ["api", "research", id, "findings"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "research.add", body)).await
+        }
+        (&Method::GET, ["api", "harness", "conversations", "search"]) => boxed(|| own_op(&hub, &caller, "conversations.search", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
         (&Method::POST, ["api", "plans", "runs", run, "stop"]) => boxed(|| own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run }))).await,
@@ -669,6 +696,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "plans.run", body)).await
         }
         (&Method::POST, ["api", "plans", id, "share"]) => boxed(|| plans_share(&hub, id, req)).await,
+        (&Method::POST, ["api", "plans", id, "ready"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
+        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -808,6 +843,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let (name, field) = match *what {
                 "done" => ("goals.done", None),
                 "split" => ("goals.split", None),
+                "plan" => ("goals.plan", None),
                 action => ("goals.control", Some(("action", (*action).to_owned()))),
             };
             let mut body = boxed(|| body_value(req)).await?;
@@ -852,6 +888,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Recordings of its streams (`crate::browser::record`): theirs a person's own profile's.
         (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
         (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => boxed(|| recording_file(&hub, id, rid, what, &req)).await,
+        // Its record once it closed, as kiln's store of bytes keeps it (`crate::harness::archive`).
+        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => Ok(srv::json(StatusCode::OK, &json!({ "pieces": boxed(|| crate::harness::archive::archived(&hub, id)).await? }))),
+        (&Method::GET, ["api", "harness", "sessions", id, "transcripts", source]) => boxed(|| archived_transcript(&hub, id, source)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match boxed(|| hub.harness.task_output(&hub, id, task, since)).await {
@@ -1158,7 +1197,21 @@ async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Requ
 async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &Request) -> R {
     let rec = hub.harness.streams.recordings(id, person(req).as_deref()).into_iter().find(|r| r.id == rid).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such recording"))?;
     let path = rec.file(what).ok_or_else(|| err(StatusCode::NOT_FOUND, "a recording's files are its video, inputs and test"))?.to_owned();
-    let mut r = serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?;
+    let mut r = match rec.kept.get(what) {
+        // Copied into kiln's store of bytes: served from there, its machine there or not.
+        Some(meta) => {
+            let etag = format!("W/\"{}-{}\"", meta.size, meta.mtime);
+            if let Some(r) = unchanged(req, &etag, false) {
+                return Ok(r);
+            }
+            let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+            let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+            let key = crate::harness::streams::recording_key(id, rid, what);
+            let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, None, start, end) };
+            file_response(meta, &path, &etag, false, range, srv::channel_body(body))
+        }
+        None => serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?,
+    };
     if what != "video" {
         let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().replace('"', "")).unwrap_or_default();
         r.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/plain; charset=utf-8"));
@@ -1167,6 +1220,19 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
         }
     }
     Ok(r)
+}
+
+/// `GET /api/harness/sessions/:id/transcripts/:source`: a closed conversation's record from
+/// `source`, every line archived, in order (JSON lines, read back from its pieces).
+async fn archived_transcript(hub: &Arc<Hub>, id: &str, source: &str) -> R {
+    let pieces: Vec<_> = crate::harness::archive::archived(hub, id).await?.into_iter().filter(|p| p.source == source).collect();
+    if pieces.is_empty() {
+        return Err(err(StatusCode::NOT_FOUND, "no record of that source archived for this conversation"));
+    }
+    // Its length, so a reader told of every piece knows when one was missing.
+    let length = pieces.iter().fold(0u64, |n, p| n.saturating_add(p.raw));
+    let r = srv::response(StatusCode::OK, "application/x-ndjson", srv::channel_body(crate::harness::archive::lines(hub, pieces)));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &length.to_string()))
 }
 
 /// A file of session `id`'s machine (`location`), in ranges, as it reads it.
@@ -1439,22 +1505,92 @@ fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
     let machine = sync_machine(req);
-    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
-    let Some(path) = blobs.path(hash).filter(|p| p.is_file()) else {
-        sync_blob_counted(&machine, direction, "missing", 0);
-        return Err(err(StatusCode::NOT_FOUND, "no such blob"));
-    };
+    let contents = hub.sync.contents();
     if req.method() == Method::HEAD {
-        sync_blob_counted(&machine, direction, "present", 0);
-        return Ok(srv::status(StatusCode::OK));
+        let held = contents.has(hash);
+        sync_blob_counted(&machine, direction, if held { "present" } else { "missing" }, 0);
+        return if held { Ok(srv::status(StatusCode::OK)) } else { Err(err(StatusCode::NOT_FOUND, "no such blob")) };
     }
-    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
-    let Ok(body) = crate::rt::file_source(path) else {
+    let Some((bytes, body)) = contents.stream(hash) else {
         sync_blob_counted(&machine, direction, "missing", 0);
         return Err(err(StatusCode::NOT_FOUND, "no such blob"));
     };
     sync_blob_counted(&machine, direction, "ok", bytes);
-    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &bytes.to_string()))
+}
+
+/// What a presigned URL is answered when it gives nothing: one answer for a bad signature, another
+/// method's or key's URL, an expired one, a body of another length, and no such object, so the
+/// route tells its holder nothing it doesn't already know.
+fn not_granted() -> ApiError {
+    err(StatusCode::FORBIDDEN, "this URL grants nothing here")
+}
+
+/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local store's presigned
+/// URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential: its signature covers
+/// the method, the exact key, the expiry (at most an hour) and a put's length, and is checked in
+/// constant time before anything is read or written. A get streams the one object it names, in a
+/// range when one is asked; a put keeps a body of exactly the length declared, or nothing. No
+/// listing, no prefixes, and keys with `.` or `..` segments are refused as any bad key is. An S3
+/// store's presigned URLs lead to the S3, not here.
+async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
+    use kiln_seams::blobs::{Access, Method as Signed, Refusal};
+    let local = hub.blobs.local.clone().ok_or_else(not_granted)?;
+    let signed = if req.method() == Method::PUT { Signed::Put } else { Signed::Get };
+    let query = req.uri().query().unwrap_or_default().to_owned();
+    let (key, access) = local.check_presigned(encoded, &query, signed).map_err(|_| not_granted())?;
+    let blobs = Arc::clone(&hub.blobs.blobs);
+    let failed = |e: Refusal| match e {
+        Refusal::Unavailable(_) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        _ => not_granted(),
+    };
+    if let Access::Put { length } = access {
+        let said = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+        if said.is_some_and(|n| n != length) {
+            return Err(not_granted());
+        }
+        let mut writer = crate::blobs::io::Writer::new(blobs.as_ref(), &key);
+        let mut body = req.into_body();
+        let mut got = 0u64;
+        loop {
+            let chunk = match srv::next_chunk(&mut body).await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(e) => {
+                    writer.abort().await;
+                    return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
+                }
+            };
+            got = got.saturating_add(chunk.len() as u64);
+            if got > length {
+                writer.abort().await;
+                return Err(not_granted());
+            }
+            if let Err(e) = writer.write(&chunk).await {
+                writer.abort().await;
+                return Err(failed(e));
+            }
+        }
+        if got != length {
+            writer.abort().await;
+            return Err(not_granted());
+        }
+        writer.finish().await.map_err(failed)?;
+        return Ok(srv::status(StatusCode::OK));
+    }
+    let meta = blobs.head(&key).await.map_err(failed)?;
+    let Ok(range) = byte_range(&req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
+    let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+    let length = if meta.size == 0 { 0 } else { end.saturating_sub(start).saturating_add(1) };
+    let body = if req.method() == Method::HEAD || meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(blobs, key, Some(meta.etag.clone()), start, end) };
+    let mut r = srv::response(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK }, "application/octet-stream", srv::channel_body(body));
+    r = srv::with_header(r, header::CONTENT_LENGTH, &length.to_string());
+    r = srv::with_header(r, header::ACCEPT_RANGES, "bytes");
+    if range.is_some() {
+        r = srv::with_header(r, header::CONTENT_RANGE, &format!("bytes {start}-{end}/{}", meta.size));
+    }
+    Ok(r)
 }
 
 /// The largest contents a machine sends (a copy leaves out files over 256 MiB unless told otherwise).
@@ -1462,7 +1598,8 @@ const SYNC_BLOB_MAX: u64 = 1 << 30;
 /// Room the server keeps free on its data volume: contents are refused below it.
 const SYNC_DISK_FLOOR: u64 = 2 << 30;
 
-/// Contents a machine's steps name: kept once they hash to their name. Refused past
+/// Contents a machine's steps name: kept in kiln's store of bytes once they hash to their name
+/// (`crate::sync::contents`), arriving first in `<data>/sync/incoming`. Refused past
 /// [`SYNC_BLOB_MAX`], or while the server's disk has less than [`SYNC_DISK_FLOOR`] free.
 async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     if !sync_token_ok(hub, &req) {
@@ -1471,12 +1608,12 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     }
     let machine = sync_machine(&req);
     let counted = |result: &str, bytes: u64| sync_blob_counted(&machine, "up", result, bytes);
-    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
+    let contents = hub.sync.contents();
     if !crate::sync::blobs::valid_hash(hash) {
         counted("refused", 0);
         return Err(err(StatusCode::BAD_REQUEST, "not a SHA-256"));
     }
-    if blobs.has(hash) {
+    if contents.has(hash) {
         counted("present", 0);
         return Ok(srv::status(StatusCode::OK));
     }
@@ -1485,12 +1622,17 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
         counted("refused", 0);
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("contents are synced up to {} MiB", SYNC_BLOB_MAX >> 20)));
     }
-    if blobs.free_bytes().is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+    let incoming = hub.cfg.data("sync").join("incoming");
+    if let Err(e) = std::fs::create_dir_all(&incoming) {
+        counted("failed", 0);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", incoming.display())));
+    }
+    if crate::os::disk_available(&incoming).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
         counted("refused", 0);
         tracing::warn!(target: "kiln.sync", event = "sync.blob_refused", machine = %machine, reason = "disk_full", "the server's disk is nearly full: sync takes no more contents");
         return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full: sync takes no more contents until there is room"));
     }
-    let tmp = blobs.incoming();
+    let tmp = incoming.join(crate::util::new_id());
     let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX).inspect_err(|_| counted("failed", 0))?;
     let mut body = req.into_body();
     let mut bytes = 0u64;
@@ -1499,6 +1641,9 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
             Ok(Some(c)) => c,
             Ok(None) => break,
             Err(e) => {
+                drop(sink);
+                let _ = done.await;
+                let _ = std::fs::remove_file(&tmp);
                 counted("failed", 0);
                 return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
             }
@@ -1514,20 +1659,21 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
         counted("failed", 0);
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
     }
-    let store = blobs.clone();
-    let name = hash.to_owned();
-    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| {
-        counted("failed", 0);
-        err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
-    })?;
+    let kept = contents.put_file(hash, &tmp).await;
+    let t = tmp.clone();
+    let _ = crate::rt::blocking(move || std::fs::remove_file(&t)).await;
     match kept {
-        Ok(true) => {
+        Ok(()) => {
             counted("ok", bytes);
             Ok(srv::status(StatusCode::CREATED))
         }
-        Ok(false) => {
+        Err(kiln_seams::blobs::Refusal::BadChecksum { .. }) => {
             counted("refused", 0);
             Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name"))
+        }
+        Err(e @ kiln_seams::blobs::Refusal::Full { .. }) => {
+            counted("refused", 0);
+            Err(err(StatusCode::INSUFFICIENT_STORAGE, e.to_string()))
         }
         Err(e) => {
             counted("failed", 0);
@@ -1634,7 +1780,7 @@ async fn sync_bundle_put(hub: &Hub, batch: &str, req: Request) -> R {
     if length.is_some_and(|n| n > SYNC_BUNDLE_MAX) {
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("bundles go up to {} GiB", SYNC_BUNDLE_MAX >> 30)));
     }
-    if hub.sync.blobs().and_then(crate::sync::Blobs::free_bytes).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+    if crate::os::disk_available(&hub.cfg.data("sync")).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
         return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full"));
     }
     let tmp = file.with_extension("part");
@@ -3084,9 +3230,9 @@ async fn download_for(hub: &Hub, target: &str) -> R {
     if target == TARGET {
         return download_binary().await;
     }
-    if let Some((path, _)) = crate::updates::stored(hub, target) {
-        let body = crate::rt::file_source(path)?;
-        return Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)));
+    if let Some((b, body)) = crate::updates::stream(hub, target) {
+        let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
+        return Ok(srv::with_header(r, header::CONTENT_LENGTH, &b.size.to_string()));
     }
     if !RELEASE_TARGETS.contains(&target) {
         return Err(err(
@@ -3107,9 +3253,9 @@ async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
     if b.origin == "server" {
         return download_binary().await;
     }
-    let (path, _) = crate::updates::stored(hub, target).filter(|(_, m)| m.build == build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
-    let body = crate::rt::file_source(path)?;
-    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+    let (kept, body) = crate::updates::stream(hub, target).filter(|(m, _)| m.build == build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &kept.size.to_string()))
 }
 
 fn build_token_ok(hub: &Hub, headers: &HeaderMap, job: &str) -> bool {
@@ -3335,11 +3481,7 @@ async fn upload_binary(hub: &Arc<Hub>, q: &HashMap<String, String>, req: Request
         return Err(err(StatusCode::BAD_REQUEST, format!("unknown platform {target:?}: one of {TARGET}, {}", RELEASE_TARGETS.join(", "))));
     }
     let bytes = srv::body_bytes(req.into_body(), crate::updates::MAX_BINARY).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
-    let (h, t) = (Arc::clone(hub), target.clone());
-    let b = crate::rt::blocking(move || crate::updates::store(&h, &t, &bytes, "upload"))
-        .await
-        .and_then(|r| r)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let b = crate::updates::store(hub, &target, bytes.to_vec(), "upload").await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     hub.store.audit("admin".into(), "upgrade.binary".into(), format!("uploaded build {} for {target}", b.build)).await;
     hub.emit(&json!({ "type": "updates" }));
     Ok(srv::json(StatusCode::OK, &b))
@@ -3347,7 +3489,7 @@ async fn upload_binary(hub: &Arc<Hub>, q: &HashMap<String, String>, req: Request
 
 /// `DELETE /api/updates/binaries/{target}`.
 async fn delete_binary(hub: &Hub, target: &str) -> R {
-    if !crate::updates::unstore(hub, target) {
+    if !crate::updates::unstore(hub, target).await {
         return Err(err(StatusCode::NOT_FOUND, format!("no binary is kept for {target}")));
     }
     hub.store.audit("admin".into(), "upgrade.binary".into(), format!("removed the binary for {target}")).await;

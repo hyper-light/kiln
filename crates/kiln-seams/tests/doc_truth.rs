@@ -52,6 +52,14 @@ fn size(n: u64) -> String {
     }
 }
 
+/// An hour as the doc says it, or hours.
+fn hours(d: Duration) -> String {
+    match d.as_secs() / 3600 {
+        1 => "an hour".into(),
+        n => format!("{n} hours"),
+    }
+}
+
 /// Days as the doc says them: a day, 7 days.
 fn days(d: Duration) -> String {
     match d.as_secs() / 86_400 {
@@ -128,10 +136,11 @@ fn seams() -> Vec<Seam> {
                 format!("objects to {}, {} of them, {} in all", size(blobs.object), count(blobs.objects as u64), size(blobs.total)),
                 format!("{} uploads under way", count(blobs.uploads as u64)),
                 format!("keys 1 to {} bytes", blobs::KEY_MAX),
+                format!("in segments of 1 to {} bytes", blobs::SEGMENT_MAX),
                 format!("{} keys a listing", count(blobs::LIST_MAX as u64)),
                 format!("part numbers 1 to {}", count(u64::from(blobs::PARTS_MAX))),
                 format!("every part but the last at least {}", size(blobs::PART_MIN as u64)),
-                format!("presigned URLs for up to {}", days(blobs::PRESIGN_MAX)),
+                format!("presigned URLs for up to {}", hours(blobs::PRESIGN_MAX)),
             ],
         },
         Seam {
