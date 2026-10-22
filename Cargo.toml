@@ -2,7 +2,7 @@
 resolver = "3"
 members = ["crates/*"]
 # Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md.
-exclude = ["vendor/turso", "bench/kilndb"]
+exclude = ["vendor/turso", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"

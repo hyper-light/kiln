@@ -2259,6 +2259,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-http"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "hyper-rt",
+ "memchr",
+ "tracing",
+]
+
+[[package]]
 name = "kiln-seams"
 version = "0.2.0"
 dependencies = [

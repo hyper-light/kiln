@@ -13,3 +13,6 @@ ci/ui/shots/
 # KilnDB benchmark build output (bench/kilndb has a workspace of its own)
 /bench/kilndb/target/
 /bench/kilndb/Cargo.lock
+# HTTP benchmark build output (bench/http has a workspace of its own: its baseline, hyper on tokio, stays out of kiln's lockfile)
+/bench/http/target/
+/bench/http/Cargo.lock
