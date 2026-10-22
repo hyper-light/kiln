@@ -20,8 +20,8 @@ An agent's **Plan** tab has its **Goal stack** (`/goals` opens it), in a panel o
 each with how it came out; a field to add goals (a line each); and:
 
 - **Start**: the first goal goes to the agent at once, whatever it's doing (behind a turn under
-  way, its harness queues it); each next one once it's free (idle, nothing waiting on you, nothing
-  queued).
+  way, its harness queues it: "One message at a time", below); each next one once it's free (idle,
+  nothing waiting on you, nothing queued).
 - **Pause**: the agent isn't held to the goal under way any more: its harness's own goal is
   cleared there (so Claude Code's or Codex's goal stops driving it), nothing is sent again, and no
   next goal starts. The goal keeps its place, shown as paused.
@@ -66,6 +66,23 @@ The goal under way shows how many times it was sent again, and when. While the a
 away, the stack waits for it and goes on when it's back. Only you (or the agent itself, below)
 stop it: **Pause**, **Skip this one** or **Clear**; the stack pauses by itself only when the
 agent is gone (closed).
+
+### One message at a time
+
+What the stack sends an agent behind a turn under way (a goal, the goal again, a clear of its
+harness's own goal) waits in the agent's queue, and the stack keeps one message there at a time.
+Sent while its last one still waits, the next takes that one's place: kiln edits it to say the new
+word (a clear followed by the next goal is that goal), and doesn't send a word the waiting one says
+already (the stack resumed again and again). A goal that ends or goes back among the others before
+the agent took it is taken out of the queue (what's next goes in a message of its own, or, when
+its harness's own goal is cleared first, as an edit of the clear). So an agent that spends hours in
+one turn, its stack changing meanwhile, finds the stack's latest word when the turn ends, once,
+rather than every goal and clear sent since, in the order they went. kiln sees the queue as the
+agent's machine last reported it: an edit that reaches the machine just after the turn ended, the
+message gone as it was, does nothing there, so what the edit said goes again, in a message of its
+own (and again at the next look, should it not reach the agent either). The stack's messages say
+so in their ids (`goal-…`): a server that started since (an upgrade) takes the one waiting for the
+stack's last word.
 
 A goal set in the agent itself (`/goal …` in its composer) joins its stack as the goal under way,
 so it's kept the same way, across restarts too; a goal the stack had under way goes back to the

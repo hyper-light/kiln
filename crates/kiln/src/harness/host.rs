@@ -912,6 +912,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         harness_session: None,
         approvals: Vec::new(),
         queued: 0,
+        queue: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
         cost_usd: 0.0,

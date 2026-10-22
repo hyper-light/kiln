@@ -9,7 +9,10 @@
 //! started again after a runner update or a restart), the goal is sent again, after a pause that
 //! grows while the reminders bring no real work. A goal set in the agent directly (`/goal` in its
 //! composer) joins its stack, so it's kept the same way. The server keeps the stacks and drives
-//! them (`run`), so they go on with no console open and across restarts.
+//! them (`run`), so they go on with no console open and across restarts. What a stack says to an
+//! agent behind a turn under way (a goal, the goal again, a clear) waits in its queue one message
+//! at a time ([`say`]): the next edits the one waiting, so a long turn doesn't end with goals and
+//! clears stacked up behind it.
 //!
 //! An agent works its stack itself too: it says a goal is met ([`done`], with what shows it), changes
 //! one goal ([`update`]: other words, moved, taken out), splits one into parts pursued first
@@ -24,8 +27,9 @@
 pub mod keep;
 pub mod ops;
 
+use std::collections::HashMap;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use kiln_seams::HarnessPort;
@@ -35,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::harness::model::{Command, SendMode, Status};
+use crate::harness::queued::{GOAL, Kept, Now};
 use crate::harness::session::Info;
 use crate::hub::Hub;
 
@@ -322,26 +327,148 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
     Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, dropped_at })
 }
 
-/// Takes the messages that last took goals `items` to the agent out of its queue, where they still
-/// wait (behind a turn under way): a goal that ended, or went back among the others, before the
-/// agent took it doesn't reach it after (where, set as its harness's own goal, it would join the
-/// stack again as one set in the agent). A message the agent took already is left as it is.
-async fn withdraw(hub: &Hub, agent: &str, sent: Vec<String>) {
-    for id in sent {
-        let _ = hub.harness.command(hub, agent, Command::QueueRemove { id }).await;
+/// What a goal stack last said to its agent through its queue (`say`): the message, while it may
+/// still wait there, and the goal it takes (none: a clear).
+#[derive(Debug, Clone)]
+struct Word {
+    msg: Kept,
+    item: Option<String>,
+}
+
+/// Each agent's word from its stack, by agent.
+static SAID: LazyLock<parking_lot::Mutex<HashMap<String, Word>>> = LazyLock::new(Default::default);
+/// The most agents' words kept: past it, the oldest goes (an agent gone without being closed keeps
+/// its word otherwise).
+const SAID_MAX: usize = 4096;
+
+/// Says `c` to `agent` for goal `item` (none: a clear), at `now`, one word at a time: a message,
+/// while the stack's last one still waits in the agent's queue (behind a turn under way), goes as
+/// an edit of that one, or not at all when it says the same, so goals, reminders and clears never
+/// stack up there; anything else goes as it is. A word a server before this one left waiting
+/// (`queued::from_before`) is the one waiting. How it went, and the message that takes it.
+async fn say<P>(port: &P, agent: &str, item: Option<&str>, c: Command, now: i64) -> (Sent, Option<String>)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
+    let Command::Send { id, text, .. } = &c else { return (port.send(agent, c).await, None) };
+    let (id, text) = (id.clone(), text.clone());
+    let info = port.agent(agent);
+    let waiting = {
+        let mut said = SAID.lock();
+        let w = said.get_mut(agent).and_then(|w| (w.msg.look(info.as_ref(), now) == Now::Waiting).then(|| (w.msg.id.clone(), w.msg.text == text)));
+        if w.is_none() {
+            said.remove(agent);
+        }
+        // Its words not known, what it holds is known by its digest: the same words, or an edit.
+        w.or_else(|| {
+            let q = info.as_ref()?.queue.iter().find(|q| crate::harness::queued::from_before(&q.id, GOAL))?;
+            let same = q.digest == crate::harness::queued::digest(&text);
+            said.insert(agent.to_owned(), Word { msg: Kept::found(q.id.clone(), if same { text.clone() } else { String::new() }, now), item: None });
+            Some((q.id.clone(), same))
+        })
+    };
+    let item = item.map(str::to_owned);
+    match waiting {
+        Some((waits, true)) => {
+            if let Some(w) = SAID.lock().get_mut(agent) {
+                w.item = item;
+            }
+            (Sent::Delivered, Some(waits))
+        }
+        Some((waits, false)) => {
+            let sent = port.send(agent, Command::QueueEdit { id: waits.clone(), text: text.clone() }).await;
+            if sent == Sent::Delivered
+                && let Some(w) = SAID.lock().get_mut(agent)
+            {
+                w.msg.text = text;
+                w.item = item;
+            }
+            (sent, Some(waits))
+        }
+        None => {
+            let sent = port.send(agent, c).await;
+            if sent == Sent::Delivered
+                && let Some(to) = info.as_ref()
+            {
+                let mut said = SAID.lock();
+                if said.len() >= SAID_MAX
+                    && !said.contains_key(agent)
+                    && let Some(oldest) = said.iter().min_by_key(|(_, w)| w.msg.at()).map(|(a, _)| a.clone())
+                {
+                    said.remove(&oldest);
+                }
+                said.insert(agent.to_owned(), Word { msg: Kept::sent(id.clone(), text, to, now), item });
+            }
+            (sent, Some(id))
+        }
     }
 }
 
-/// The messages that last took goals to the agent, of those `which` picks.
-fn sent_of(items: &[Item], which: impl Fn(&Item) -> bool) -> Vec<String> {
-    items.iter().filter(|i| which(i)).filter_map(|i| i.sent_id.clone()).collect()
+/// The stacks' words that went from their agents' queues before the edit that last changed them
+/// was seen there (it may have come too late, and done nothing): each said again, at `now`, in a
+/// message of its own. The rest gone are forgotten; an agent not known right now keeps its word.
+async fn resay<P>(port: &P, now: i64)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
+    let agents: Vec<String> = SAID.lock().keys().cloned().collect();
+    let infos: Vec<(String, Info)> = agents.into_iter().filter_map(|a| port.agent(&a).map(|i| (a, i))).collect();
+    let lost: Vec<(String, Word)> = {
+        let mut said = SAID.lock();
+        let mut lost = Vec::new();
+        for (agent, info) in &infos {
+            if said.get_mut(agent).is_some_and(|w| w.msg.look(Some(info), now) == Now::Gone)
+                && let Some(w) = said.remove(agent)
+                && w.msg.lost()
+            {
+                lost.push((agent.clone(), w));
+            }
+        }
+        lost
+    };
+    for (agent, w) in lost {
+        let c = send(w.msg.text.clone());
+        let (sent, _) = say(port, &agent, w.item.as_deref(), c, now).await;
+        // Not delivered: kept as it was, to say again at the next look (unless something was said since).
+        if sent != Sent::Delivered {
+            tracing::info!(%agent, "a goal stack's word, said again, didn't reach its agent");
+            SAID.lock().entry(agent).or_insert(w);
+        }
+    }
 }
 
-/// The id of a message a command sends, if it sends one.
-fn sent_id(c: &Command) -> Option<String> {
-    match c {
-        Command::Send { id, .. } => Some(id.clone()),
-        _ => None,
+/// Takes the messages that last took goals `which` picks to the agent out of its queue, where
+/// they still wait (behind a turn under way): a goal that ended, or went back among the others,
+/// before the agent took it doesn't reach it after (where, set as its harness's own goal, it would
+/// join the stack again as one set in the agent). A message the agent took already is left as it
+/// is, and so is the stack's word waiting when it says something else by now (`say`).
+async fn withdraw<P>(port: &P, agent: &str, items: &[Item], which: impl Fn(&Item) -> bool)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
+    let mut gone: Vec<String> = Vec::new();
+    for i in items.iter().filter(|i| which(i)) {
+        let mut said = SAID.lock();
+        match said.get(agent) {
+            // The word waiting takes this goal: it goes.
+            Some(w) if w.item.as_deref() == Some(i.id.as_str()) => {
+                gone.push(w.msg.id.clone());
+                said.remove(agent);
+            }
+            // The message that took it says something else by now.
+            Some(w) if i.sent_id.as_deref() == Some(w.msg.id.as_str()) => {}
+            // No word of it kept (the server started since): by the message kept with the goal,
+            // unless a goal still to go has that one too.
+            _ => {
+                let shared = |id: &String| items.iter().any(|o| !which(o) && matches!(o.status.as_str(), "pending" | "active") && o.sent_id.as_ref() == Some(id));
+                if let Some(id) = i.sent_id.as_ref().filter(|id| !shared(id) && !gone.contains(id)) {
+                    gone.push(id.clone());
+                }
+            }
+        }
+    }
+    for id in gone {
+        let _ = port.send(agent, Command::QueueRemove { id }).await;
     }
 }
 
@@ -430,10 +557,10 @@ async fn set_locked(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
     // the agent to it; and the goal under way, back or in other words, doesn't reach the agent as
     // it was if that still waits in its queue.
     if back {
-        clear_in_agent(hub, info, &stack.items).await;
+        clear_in_agent(hub, info, &stack.items, now_ms(hub)).await;
     }
     if moved {
-        withdraw(hub, agent, sent_of(&stack.items, |i| i.status == "active")).await;
+        withdraw(hub, agent, &stack.items, |i| i.status == "active").await;
     }
     let agent_s = agent.to_owned();
     let now = now_ms(hub);
@@ -614,10 +741,9 @@ pub async fn done(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&st
     let ending = |i: &Item| i.id == target_id || (i.part_of.as_deref() == Some(target_id.as_str()) && matches!(i.status.as_str(), "pending" | "active"));
     let was_active = stack.items.iter().any(|i| i.status == "active" && ending(i));
     if was_active {
-        clear_in_agent(hub, &info, &stack.items).await;
+        clear_in_agent(hub, &info, &stack.items, now_ms(hub)).await;
     }
-    let sent = sent_of(&stack.items, ending);
-    withdraw(hub, agent, sent).await;
+    withdraw(hub, agent, &stack.items, ending).await;
     let reason = format!("{} said so{}", by.name(), evidence.map(|e| format!(": {e}")).unwrap_or_default());
     let (agent_s, now) = (agent.to_owned(), now_ms(hub));
     let running = hub
@@ -676,10 +802,9 @@ pub async fn update(hub: &Hub, agent: &str, id: &str, change: Change, by: &By) -
     if change.remove {
         let (active, gone, who, now, agent_s) = (it.status == "active", id.to_owned(), by.name(), now_ms(hub), agent.to_owned());
         if active {
-            clear_in_agent(hub, &info, &stack.items).await;
+            clear_in_agent(hub, &info, &stack.items, now_ms(hub)).await;
         }
-        let sent = sent_of(&stack.items, |i| i.id == id || (i.part_of.as_deref() == Some(id) && i.status == "pending"));
-        withdraw(hub, agent, sent).await;
+        withdraw(hub, agent, &stack.items, |i| i.id == id || (i.part_of.as_deref() == Some(id) && i.status == "pending")).await;
         let running = hub
             .store
             .call(move |c| {
@@ -819,11 +944,11 @@ pub async fn control_as(hub: &Hub, agent: &str, action: Action, by: &By, pausing
     // goal goes too, so nothing holds the agent to it.
     let active = stack.items.iter().any(|i| i.status == "active");
     if action == Action::Clear || (matches!(action, Action::Skip | Action::Pause) && active) {
-        clear_in_agent(hub, &info, &stack.items).await;
+        clear_in_agent(hub, &info, &stack.items, now).await;
     }
     // What still waits in its queue for the goal it leaves, pauses or clears doesn't reach it after.
     if matches!(action, Action::Clear | Action::Skip | Action::Pause) {
-        withdraw(hub, agent, sent_of(&stack.items, |i| matches!(i.status.as_str(), "active" | "pending"))).await;
+        withdraw(hub, agent, &stack.items, |i| matches!(i.status.as_str(), "active" | "pending")).await;
     }
     // What the agent last said of its goal: a verdict from before you resume doesn't count.
     let said_at = info.objective.as_ref().map_or(0, |o| o.at);
@@ -946,6 +1071,7 @@ async fn push(hub: &Hub, agent: &str) {
 
 /// Forgets an agent's stack (the agent was closed).
 pub async fn forget(hub: &Hub, agent: &str) -> R<()> {
+    SAID.lock().remove(agent);
     let agent = agent.to_owned();
     hub.store
         .call(move |c| {
@@ -995,8 +1121,9 @@ fn reminder_command(how: &str, text: &str, stopped: bool) -> Command {
     }
 }
 
+/// A message of the stack's (its id says so: `queued::GOAL`).
 fn send(text: String) -> Command {
-    Command::Send { id: crate::util::new_id(), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
+    Command::Send { id: crate::harness::queued::made(GOAL), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
 }
 
 /// The same goal: the same words, however they're spaced (a goal is kept as one line).
@@ -1021,8 +1148,11 @@ fn gap(reminders: i64) -> i64 {
 
 /// Clears the stack's goal in the agent's harness, where it has goals of its own: the one under
 /// way, or one it stopped pursuing while still set (Claude Code's after its checks gave up), so
-/// the agent doesn't go on chasing it.
-async fn clear_in_agent(hub: &Hub, info: &Info, items: &[Item]) {
+/// the agent doesn't go on chasing it. Said at `now`, as the stack's word (`say`).
+async fn clear_in_agent<P>(port: &P, info: &Info, items: &[Item], now: i64)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
     let Some(o) = info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet")) else { return };
     let Some(item) = items.iter().rev().find(|i| same(&i.text, &o.text) && i.how.is_some()) else { return };
     let c = match item.how.as_deref() {
@@ -1030,7 +1160,7 @@ async fn clear_in_agent(hub: &Hub, info: &Info, items: &[Item]) {
         Some("goal") => goal_command("goal", "clear"),
         _ => return,
     };
-    let _ = hub.harness.command(hub, &info.id, c).await;
+    let _ = say(port, &info.id, None, c, now).await;
 }
 
 /// Drives every running stack: sends the next goal to an agent that's free, follows the one under
@@ -1101,6 +1231,11 @@ where
                 if let Err(e) = step(self, agent, false).await {
                     tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
                 }
+            }
+            // What the stacks said that an edit may not have got to their agents: said again.
+            {
+                let _one = CHANGING.lock().await;
+                resay(self.port, self.clock.unix_ms()).await;
             }
             // The agents no goal stack drives: kept going when they stop part-way (`keep`), but for
             // those that paused their stack for a while: they wait on purpose, until it resumes.
@@ -1367,8 +1502,8 @@ where
             let how = how(port, agent);
             let stopped = info.as_ref().is_some_and(|i| i.status == Status::Exited);
             let c = first_command(how, &text, stopped);
-            let sent = sent_id(&c);
-            match port.send(agent, c).await {
+            let (went, sent) = say(port, agent, Some(id.as_str()), c, now).await;
+            match went {
                 Sent::Delivered => {
                     store
                         .call(move |c| {
@@ -1387,8 +1522,8 @@ where
         }
         Next::Remind { id, text, how, worked, stopped, fresh } => {
             let c = if fresh { first_command(&how, &text, stopped) } else { reminder_command(&how, &text, stopped) };
-            let sent = sent_id(&c);
-            match port.send(agent, c).await {
+            let (went, sent) = say(port, agent, Some(id.as_str()), c, now).await;
+            match went {
                 Sent::Delivered => {
                     tracing::info!(%agent, worked, stopped, fresh, "goal sent again");
                     store
@@ -1436,6 +1571,14 @@ mod tests {
 
     /// Past the first pause after the goal was sent.
     const LATER: i64 = 1_000 + REMIND_MS;
+
+    /// The id of a message a command sends, if it sends one.
+    fn sent_id(c: &Command) -> Option<String> {
+        match c {
+            Command::Send { id, .. } => Some(id.clone()),
+            _ => None,
+        }
+    }
 
     #[test]
     fn a_stack_holds_a_program_of_more_than_a_hundred_goals_and_stays_bounded() {
@@ -1613,9 +1756,10 @@ mod tests {
     }
 
     /// What you start, resume or skip goes at once (`push`), as the driver's step does it: through
-    /// its port, by its clock, behind a turn under way; not to an agent whose machine is away (it
-    /// goes once it's back); and a send refused (its inbox full, its machine unreachable) is tried
-    /// again later, as a reminder that brought no work.
+    /// its port, by its clock, behind a turn under way (but not again while the message that took
+    /// it still waits there); not to an agent whose machine is away (it goes once it's back); and a
+    /// send refused (its inbox full, its machine unreachable) is tried again later, as a reminder
+    /// that brought no work.
     #[test]
     fn what_you_push_goes_through_the_driver_s_port_at_once_and_a_refused_one_is_tried_again() -> anyhow::Result<()> {
         use kiln_seams::Clock as _;
@@ -1659,9 +1803,15 @@ mod tests {
             let heard = port.heard(id);
             assert!(matches!(heard.as_slice(), [first] if first.at_ms == clock.unix_ms() && matches!(&first.command, Command::Send { text, .. } if text == "/goal tests pass")), "{heard:?}");
             assert_eq!(sent(&store, id).await?, Some((clock.unix_ms(), 0)));
-            // Resumed again, its inbox full: nothing delivered, and it's tried again later.
+            // Resumed at once, the goal still waiting in its queue: that one says it already.
             resumed(&store).await?;
             clock.advance(Duration::from_secs(5));
+            step(&d, id, true).await?;
+            assert_eq!((port.heard(id).len(), sent(&store, id).await?), (1, Some((clock.unix_ms(), 0))));
+            // Resumed again once it took the goal, its inbox full: nothing delivered, and it's tried
+            // again later.
+            resumed(&store).await?;
+            clock.advance(Duration::from_millis(u64::try_from(crate::harness::queued::SHOW_MS).unwrap_or(0)));
             step(&d, id, true).await?;
             assert_eq!((port.heard(id).len(), sent(&store, id).await?), (1, Some((clock.unix_ms(), 1))));
             // So too when its machine can't be reached.
@@ -1672,6 +1822,156 @@ mod tests {
             assert_eq!((port.heard(id).len(), sent(&store, id).await?), (1, Some((clock.unix_ms(), 2))));
             Ok(())
         })
+    }
+
+    /// What waits in agent `id`'s queue: each command it was sent, applied in order behind its one
+    /// long turn, but for the messages it took (`taken`); shown on the agent as its machine would
+    /// report it.
+    fn queue_of(port: &kiln_seams::harness::SimHarness<Info, Command>, id: &str, taken: &[String]) -> Vec<(String, String)> {
+        let mut q: Vec<(String, String)> = Vec::new();
+        for d in port.heard(id) {
+            match d.command {
+                Command::Send { id, text, .. } => q.push((id, text)),
+                Command::QueueEdit { id, text } => {
+                    if let Some(m) = q.iter_mut().find(|m| m.0 == id) {
+                        m.1 = text;
+                    }
+                }
+                Command::QueueRemove { id } => q.retain(|m| m.0 != id),
+                _ => {}
+            }
+        }
+        q.retain(|m| !taken.contains(&m.0));
+        port.update(id, |i| {
+            i.queue = q.iter().map(|(m, t)| crate::harness::queued::Queued::of(m, t)).collect();
+            i.queued = q.len();
+        });
+        q
+    }
+
+    /// The incident's goals: an agent in one long turn, its stack resumed again and again, a goal
+    /// said met and the next sent, then that one met before the agent took it, its own goal cleared
+    /// each time. One message of the stack's waits in its queue at a time, edited, never a second
+    /// behind it; and what an edit said that came too late (the agent took the message as it was)
+    /// is said again.
+    #[test]
+    fn a_goal_stack_s_word_waits_in_its_agent_s_queue_one_message_at_a_time() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let id = "goals-one-word";
+            // At work on one long turn, its harness's own goal the stack's first, met there already.
+            let lint = Objective { text: "lint passes".into(), status: "active".into(), reason: None, at: clock.unix_ms() };
+            assert!(port.open(id, Info { id: id.into(), status: Status::Running, objective: Some(lint), ..Info::default() }));
+            port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
+            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+            let a = id.to_owned();
+            store
+                .call(move |c| {
+                    touch(c, &a, Some("running"), None, 0)?;
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status, how, reminded_at) VALUES ('g0', ?1, 0, 'lint passes', 'active', 'goal', 1)", params![a])?;
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES ('g1', ?1, 1, 'tests pass', 'pending'), ('g2', ?1, 2, 'docs build', 'pending')", params![a])?;
+                    Ok(())
+                })
+                .await?;
+            let st = &store;
+            let items = || async move { anyhow::Ok(stack_of(st, id).await?.items) };
+            let info = || port.agent(id).unwrap_or_default();
+            let met = |goal: &'static str| async move {
+                st.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE id = ?1", params![goal]).map(|_| ())?)).await?;
+                renumber_in(st, id).await
+            };
+            // g0 is met (as `done` does it): its goal cleared in the agent, behind its turn; then the next goes.
+            clear_in_agent(&port, &info(), &items().await?, clock.unix_ms()).await;
+            withdraw(&port, id, &items().await?, |i| i.id == "g0").await;
+            met("g0").await?;
+            queue_of(&port, id, &[]);
+            step(&d, id, true).await?;
+            let q = queue_of(&port, id, &[]);
+            anyhow::ensure!(matches!(q.as_slice(), [(_, t)] if t == "/goal tests pass"), "the clear waiting became the next goal: {q:?}");
+            // Resumed again and again: the goal waiting already says it, so nothing more goes.
+            for _ in 0..3 {
+                store.call(|c| Ok(c.execute("UPDATE goal_items SET reminded_at = 0 WHERE status = 'active'", []).map(|_| ())?)).await?;
+                clock.advance(Duration::from_secs(60));
+                step(&d, id, true).await?;
+            }
+            let heard: Vec<Command> = port.heard(id).into_iter().map(|d| d.command).collect();
+            anyhow::ensure!(matches!(heard.as_slice(), [Command::Send { .. }, Command::QueueEdit { .. }]), "one message, edited once: {heard:?}");
+            // g1 met before the agent took it: the agent's own goal is cleared, the next goes, and
+            // each is the one message, edited.
+            clear_in_agent(&port, &info(), &items().await?, clock.unix_ms()).await;
+            withdraw(&port, id, &items().await?, |i| i.id == "g1").await;
+            met("g1").await?;
+            step(&d, id, true).await?;
+            let q = queue_of(&port, id, &[]);
+            anyhow::ensure!(matches!(q.as_slice(), [(_, t)] if t == "/goal docs build"), "{q:?}");
+            let sends = port.heard(id).iter().filter(|d| matches!(d.command, Command::Send { .. })).count();
+            anyhow::ensure!(sends == 1, "a single message queued all along: {:?}", port.heard(id));
+            let waiting = q.first().map(|(m, _)| m.clone()).unwrap_or_default();
+            // Its goal reworded, and the edit comes too late: the turn ended, the agent took the
+            // message as it was. What the edit said goes again, in a message of its own.
+            let _ = say(&port, id, Some("g2"), send("/goal docs build on every platform".into()), clock.unix_ms()).await;
+            queue_of(&port, id, std::slice::from_ref(&waiting));
+            resay(&port, clock.unix_ms()).await;
+            let q = queue_of(&port, id, std::slice::from_ref(&waiting));
+            anyhow::ensure!(matches!(q.as_slice(), [(m, t)] if *m != waiting && t == "/goal docs build on every platform"), "{q:?}");
+            // Once that's seen waiting and then taken, nothing more is said.
+            resay(&port, clock.unix_ms()).await;
+            let taken: Vec<String> = q.iter().map(|(m, _)| m.clone()).chain(std::iter::once(waiting)).collect();
+            queue_of(&port, id, &taken);
+            let before = port.heard(id).len();
+            resay(&port, clock.unix_ms()).await;
+            anyhow::ensure!(port.heard(id).len() == before, "{:?}", port.heard(id));
+            Ok(())
+        })
+    }
+
+    /// A word a server before this one left waiting in the agent's queue (its id says it's a goal
+    /// stack's) is the one waiting: the same goal isn't sent again, another goes as an edit of it.
+    /// One said again that doesn't reach the agent (its machine away) is kept, and said once it's
+    /// back.
+    #[test]
+    fn a_word_a_server_before_left_waiting_is_the_one_waiting_and_one_said_again_is_kept_till_it_goes() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let id = "goals-word-from-before";
+            let old = "goal-01a16251c49a75fba41b1fae971ba8a9";
+            let waiting = vec![crate::harness::queued::Queued::of(old, "/goal tests pass")];
+            assert!(port.open(id, Info { id: id.into(), status: Status::Running, queue: waiting, queued: 1, ..Info::default() }));
+            let (went, by) = say(&port, id, Some("g1"), send("/goal tests pass".into()), clock.unix_ms()).await;
+            anyhow::ensure!(went == Sent::Delivered && by.as_deref() == Some(old) && port.heard(id).is_empty(), "the same word, left as it is: {:?}", port.heard(id));
+            let (_, by) = say(&port, id, Some("g2"), send("/goal docs build".into()), clock.unix_ms()).await;
+            let heard = port.heard(id);
+            anyhow::ensure!(by.as_deref() == Some(old) && matches!(heard.as_slice(), [d] if matches!(&d.command, Command::QueueEdit { id: e, text } if e == old && text == "/goal docs build")), "{heard:?}");
+            // The agent took it before the edit came, and its machine is away when it's said again.
+            port.update(id, |i| {
+                i.queue.clear();
+                i.queued = 0;
+            });
+            assert!(port.away(id, true));
+            resay(&port, clock.unix_ms()).await;
+            anyhow::ensure!(port.heard(id).len() == 1, "nothing reached it: {:?}", port.heard(id));
+            assert!(port.away(id, false));
+            resay(&port, clock.unix_ms()).await;
+            let heard = port.heard(id);
+            anyhow::ensure!(heard.len() == 2 && matches!(heard.last().map(|d| &d.command), Some(Command::Send { id, text, .. }) if id.starts_with(GOAL) && text == "/goal docs build"), "said once it's back: {heard:?}");
+            Ok(())
+        })
+    }
+
+    /// Puts the goals done first, as `done` leaves them.
+    async fn renumber_in(store: &crate::store::Store, agent: &str) -> anyhow::Result<()> {
+        let a = agent.to_owned();
+        store.call(move |c| renumber(c, &a)).await
     }
 
     /// A stack paused for a while resumes by itself when its time is up, by the driver's clock: not

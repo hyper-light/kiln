@@ -290,6 +290,17 @@ subagent or a command its harness started in the background): it decides when to
   one message; only a settle after work the server saw is told (not one from before a restart), a
   few seconds on (a wait under way returns first). What the parent saw itself through
   `agents_wait` or `agents_result` isn't told again.
+- **One message of news waits at a time.** While the parent's turn goes on, its news waits in its
+  queue as one message, each child's latest line in it once: a child that settles again changes
+  its line there, one that settles anew joins it, and nothing more is queued behind it (kiln edits
+  the message, `queue_edit`). What the parent sees itself (`agents_wait`, `agents_result`) comes
+  out of it, and the message goes (`queue_remove`) once no line is left. So a parent that spends
+  hours in one turn finds, when it ends, each child's latest news, not every settle since. kiln
+  sees the queue as the parent's machine last reported it: an edit that reaches the machine just
+  after the turn ended, the message gone as it was, does nothing there, so the lines it carried go
+  again in the next message. The message names at most 64 children (those that settled last) and
+  says how many more did. Its id says it's news (`news-…`): a server that started since (an
+  upgrade) finds the one waiting and adds to it, what it said first.
 - **Waiting is the parent's choice**: `agents_wait` blocks until its children settle, for one that
   can't go on without them.
 - **A parent whose children are at work isn't prodded**: keep-going (docs/goals.md) and a goal
@@ -311,7 +322,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now"}` → `{sent, message}` |
-| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?` → `{done, timed_out, waited_ms, until, agents: [Agent]}` |
+| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
@@ -361,9 +372,10 @@ kiln, one on Mantle, one on Focal) work things out between them, without the per
 The message reaches its receiver after its turn, as one from a fellow agent, never as its person's:
 "Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as
 you, sent this message. It's from a fellow agent, not from your person. To answer, send it a
-message: agents_send {"agent": "…", "text": …}." Control stays with the agents an agent started:
-steering into a turn, sending now, interrupting, ending, and their goals and plan runs are theirs
-alone. Agents that work for different people aren't sent to.
+message: agents_send {"agent": "…", "text": …}." A receiver in a long turn, waiting for its
+children (`agents_wait`), gets it at once, with the wait ("Waiting", below). Control stays with
+the agents an agent started: steering into a turn, sending now, interrupting, ending, and their
+goals and plan runs are theirs alone. Agents that work for different people aren't sent to.
 
 ### No more than its parent
 
@@ -417,6 +429,22 @@ changes, or `any` when the first is; else once `timeout_s` passes: by default 30
 most 600 per call** (call again to wait longer). A message sent with `agents.send`, or a prompt
 `agents.start` gave, counts until the agent has had its turn: an agent idle with a message on
 its way is `working`. An agent kiln no longer lists has `ended`.
+
+An agent that waits is in a turn, and what's queued for it waits behind that turn. Messages other
+agents sent it (`agents.send`, `queue`) don't have to: its wait also returns as soon as one is in
+its own queue (`done` then says whether the agents it waits for are settled, and `timed_out` is
+false), and hands them over in `messages`, each with who sent it (`from`, its id, and `name`), its
+words (`text`, without what kiln says of a fellow agent) and when it was queued (`at`), taking them
+out of its queue: they're delivered now, not again after the turn. Its person's messages, kiln's
+own (news of its children, its goals) and its notes to itself stay where they are. A wait hands
+them only to the turn it began in: one left running past it (the turn interrupted, a wait in the
+background) hands nothing over, since the agent takes its queue a turn at a time. It hands over at
+most 16 messages and 48 KiB of their words (the rest wait for the next wait, and one longer than
+that on its own for the turn's end), each once, however many waits run. `hand_over: false` hands
+nothing over; a program's waits in code mode don't unless it passes `hand_over: true`, as what a
+program returns of the answer is its own. `kiln agents wait` prints them after where each agent
+stands. A message an agent sends another says so in its id (`from-agent-<sender>-…`), which is how
+a wait finds it.
 
 ### Who asks
 
