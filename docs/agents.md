@@ -706,7 +706,7 @@ console picks) and are answered with a `reply` update to that client.
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
 | `max_subagents` | `count` (null: no limit of its own) | the most subagents it runs at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, each. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it |
 | `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
-| `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too |
+| `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too, if its own usage says the limit is its own as well |
 
 ### Questions
 
@@ -847,7 +847,14 @@ turn (`harness/pause.rs`):
   ignored ones aren't. `git diff <commit>` shows what changed since; `git restore --source <commit>
   -- .` brings it back.
 - **The whole account.** The server pauses every other session on the same account, on every
-  machine (`limit_hold`), so they don't each find out by failing.
+  machine (`limit_hold`), so they don't each find out by failing: each one the limit is its own
+  as well. A session whose own usage shows it isn't goes on: that window starts over at another
+  time there (it uses another account; an account id can go stale when a machine signs in to
+  another account under a running harness), or the window is another model's (Weekly · Opus, to
+  a session on Sonnet). One whose usage doesn't say (not used up as last reported, or nothing
+  known of that window) asks its harness first, and pauses only if the answer shows the limit
+  reached. Paused, it keeps to its own settings: it goes on by itself at the reset or not, and
+  goes on elsewhere or not, as set for it.
 - **Going on.** Once the window starts over (`until`, plus 30 s and a spread of up to 90 s across
   the account's sessions), kiln asks the harness for its usage (Claude Code's `get_usage`, Codex's
   `account/rateLimits/read`). A limit no longer reached ends the pause: the turn it cut off goes on

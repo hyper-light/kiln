@@ -477,10 +477,18 @@ mod tests {
             let spec = RunSpec { id: 9, command: format!("sleep 300 >/dev/null 2>&1 & echo $! > {}; echo started", pid_file.display()), ..RunSpec::default() };
             let (out, _, code, error) = run(spec, dir.path(), None).await?;
             assert_eq!((String::from_utf8_lossy(&out).trim(), code, error), ("started", Some(0), None));
-            let left: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
-            // Gone by the time the run is said to have ended (or a moment after, reaped).
+            let left: u32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+            // Ended by the time the run is said to have: gone, or a zombie no one has read the end
+            // of yet (a container whose first process reaps nothing keeps those).
+            let runs = |pid: u32| {
+                use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+                let mut sys = System::new();
+                let p = Pid::from_u32(pid);
+                sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), true, ProcessRefreshKind::nothing());
+                sys.process(p).is_some_and(|p| p.status() != ProcessStatus::Zombie)
+            };
             for _ in 0..50 {
-                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(left), None).is_err() {
+                if !runs(left) {
                     return Ok(());
                 }
                 crate::rt::sleep(Duration::from_millis(20)).await;
