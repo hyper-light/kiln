@@ -91,6 +91,10 @@ knows the app, release it this way; the tools are `deploy_*` (code mode: `kiln.d
      `message` says why. It goes by itself once the gate lets it.
    - `waiting_approval`: people must approve it. Tell the person who asked, with its link; don't
      approve your own request.
+   - `committing` with "waits for its pull request #N to be merged": the environment releases
+     as pull requests (`via: pull-request`). A person merges it on GitHub, and that's the
+     approval: tell the person who asked, with the pull request's link (its `provider.pull_request.url`);
+     never merge it yourself. Closed unmerged, the release is cancelled.
    - `failed`: read `message` and `provider`. Its commit was reverted: what ran before runs
      again. Fix forward and release again.
 4. **Promote.** `kiln.deploy.releases.create({ app, environment: "production", promote_from: "staging" })`

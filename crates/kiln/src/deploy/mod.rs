@@ -6,7 +6,9 @@
 //! - [`model`]: the records, and `release.json`.
 //! - [`store`]: where the records are kept (kiln's store, until KilnDB).
 //! - [`repo`]: the release repository's layout.
-//! - [`host`]: kiln's own git server.
+//! - [`git`]: an environment's release repository, wherever it is: [`host`], kiln's own git
+//!   server, or [`github`], GitHub through kiln's GitHub App (its pull requests, deployments and
+//!   webhooks too).
 //! - [`kilncd`], [`argocd`]: the CD providers, KilnCD and Argo CD ([`appset`]: an environment's
 //!   ApplicationSet there); [`provider`]: what they answer; [`moves`]: an environment moved from one
 //!   to the other.
@@ -28,6 +30,8 @@ pub mod cli;
 pub mod external;
 pub mod flow;
 pub mod gates;
+pub mod git;
+pub mod github;
 pub mod host;
 pub mod init;
 pub mod kilncd;
@@ -62,6 +66,8 @@ pub struct Deploy {
     pub changes: crate::rt::Broadcast<i64>,
     /// What each Argo CD's stream says of the Applications kiln made.
     pub argo: argocd::Watches,
+    /// Release repositories on GitHub: their mirrors, and the releases reported there.
+    pub github: Arc<github::Mirrors>,
 }
 
 static DEPLOY: RwLock<Option<Arc<Deploy>>> = RwLock::new(None);
@@ -84,6 +90,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         wake: crate::rt::Notify::new(),
         changes: crate::rt::Broadcast::new(256),
         argo: argocd::Watches::default(),
+        github: Arc::default(),
         hub: Arc::clone(&hub),
     });
     *DEPLOY.write() = Some(Arc::clone(&d));

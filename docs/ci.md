@@ -3509,7 +3509,9 @@ left.
   - from `[ci.github]` (app id, private key, webhook secret; `api_url` and `web_url` for
     Enterprise Server), or made in one step by GitHub's App manifest flow
     (`POST /api/ci/github/app/manifest`, GitHub's callback at `/api/ci/github/app/callback`; its key
-    and secrets sealed in the store); `GET /api/ci/github/app` says which, and where to install it;
+    and secrets sealed in the store; `administration: write` among its permissions, for release
+    repositories it makes, and its webhook off where kiln's URL is a private one GitHub can't
+    reach); `GET /api/ci/github/app` says which, and where to install it;
   - RS256 JWTs, installation tokens limited to one repository and the permissions each call needs,
     kept until shortly before they expire;
   - a check run for every KilnCI run of a repository on GitHub, made when it's queued, done with its
@@ -3519,8 +3521,9 @@ left.
   - `github_api: github` (R12): the job's `GITHUB_TOKEN` is an installation token with the job's
     permissions, and `GITHUB_SERVER_URL`, `GITHUB_API_URL` and the `github` context are GitHub's;
   - the git-host calls deploy-api.md §7 needs: read, commit through the Git Data API (moved only as a
-    fast-forward of what it was made on), push with a lease, pull requests and their state,
-    statuses, deployments, push webhooks, repositories from templates.
+    fast-forward of what it was made on), push with a lease, pull requests (opened, found by their
+    branch, followed, closed with why) and who merged one, statuses, deployments with their
+    statuses, push webhooks, repositories made in an organization or from templates.
   - Checked against a fake GitHub API and `git daemon` (`w14_r10_github_app`); W14-AC07 against
     GitHub itself waits for an App and a test repository from the user.
 - *Done.* R04's change requests, in `crates/kiln/src/ci/cr.rs`: a branch reviewed against a
