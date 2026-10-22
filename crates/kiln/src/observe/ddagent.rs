@@ -93,6 +93,10 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
     if matches!(path, ["api", "v1", "validate"]) {
         return srv::json(StatusCode::OK, &json!({ "valid": true }));
     }
+    // DORA's API (`super::dora`): deployments and failures a CD system sends.
+    if let ["api", "v2", "dora", rest @ ..] = path {
+        return super::dora::http::datadog(rest, req).await;
+    }
     if req.method() != Method::POST {
         return srv::json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "errors": ["Datadog's intake takes POST"] }));
     }

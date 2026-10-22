@@ -50,6 +50,7 @@ const SECTIONS = [
   { to: "/observe/events", label: "Events" },
   { to: "/observe/monitors", label: "Monitors" },
   { to: "/observe/slos", label: "SLOs" },
+  { to: "/observe/delivery", label: "Delivery" },
   { to: "/observe/synthetics", label: "Synthetics" },
   { to: "/observe/integrations", label: "Integrations" },
   { to: "/observe/live", label: "Live" },

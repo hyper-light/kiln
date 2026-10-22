@@ -740,6 +740,17 @@ fn reads_slo(m: &super::monitors::Monitor, id: &str) -> bool {
 pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let method = req.method().clone();
     match (&method, rest) {
+        // DORA metrics (§10.7): the four keys, deployments and failures.
+        (&Method::GET, ["dora", "summary"]) => super::dora::http::summary_of(q),
+        (&Method::POST, ["dora", "deployment"]) => super::dora::http::take_deployment(req, "api").await,
+        (&Method::POST, ["dora", "failure"]) => super::dora::http::take_failure(req).await,
+        (&Method::POST, ["dora", "deployments"]) => super::dora::http::deployments(req).await,
+        (&Method::POST, ["dora", "failures"]) => super::dora::http::failures(req).await,
+        (&Method::GET, ["dora", "deployments", id]) => super::dora::http::deployment(id),
+        (&Method::PATCH, ["dora", "deployments", id]) => super::dora::http::mark(Some(id), req).await,
+        (&Method::DELETE, ["dora", "deployments", id]) => super::dora::http::remove_deployment(id).await,
+        (&Method::GET, ["dora", "failures", id]) => super::dora::http::failure(id),
+        (&Method::DELETE, ["dora", "failures", id]) => super::dora::http::remove_failure(id).await,
         (&Method::POST, ["query"]) => query(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["checks", "status"]) => check_status(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::GET, ["query"]) => {

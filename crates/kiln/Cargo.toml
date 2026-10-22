@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "scanner"
 harness = false
+
+[[bench]]
+name = "dora"
+harness = false

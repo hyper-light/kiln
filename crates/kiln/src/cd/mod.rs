@@ -1191,14 +1191,21 @@ impl Cd {
         if !succeeded {
             tracing::info!(app = %app, op, message = %message, "deployments: a sync failed");
         }
-        let (limit, commits, artifacts) = {
+        let (limit, commits, artifacts, dora) = {
             let apps = self.apps.read();
             let e = apps.get(app.as_ref());
             let r = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)));
             let commits = r.map(|r| r.commits.clone()).unwrap_or_default();
             let artifacts = r.map(|r| r.artifacts.clone()).unwrap_or_default();
-            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts)
+            // What DORA's deployment says (docs/observe.md §10.7): its environment, its first git
+            // source and that source's commit, its team.
+            let dora = e.map(|e| {
+                let source = e.def.sources.iter().zip(commits.iter()).find_map(|(s, c)| c.clone().map(|c| (s.repo.clone(), c)));
+                (e.def.environment.clone(), source, e.def.labels.get("team").cloned())
+            });
+            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts, dora)
         };
+        let started_ms = self.started.lock().get(app.as_ref()).filter(|s| s.op == op).map(|s| s.at_ms);
         let d = Deployment {
             app: app.to_string(),
             op,
@@ -1217,6 +1224,9 @@ impl Cd {
             artifacts,
         };
         crate::observe::kiln::deployed(&d);
+        if let Some((env, source, team)) = &dora {
+            crate::observe::dora::cd_deployed(&d, started_ms, env.as_deref(), source.as_ref().map(|(r, c)| (r.as_str(), c.as_str())), team.as_deref());
+        }
         let rx = self.store.submit(Command::Deployed { deployment: Box::new(d), limit });
         crate::rt::spawn(async move {
             if let Ok(Err(e)) = rx.await {

@@ -1158,6 +1158,74 @@ export interface IssueDetail {
 
 const rangeQuery = (from: number, to: number, env?: string) => `from=${Math.floor(from)}&to=${Math.ceil(to)}${env && env !== "*" ? `&env=${enc(env)}` : ""}`;
 
+/** DORA's levels: the 2024 report's clusters (docs/observe.md §10.7). */
+export type DoraLevel = "elite" | "high" | "medium" | "low";
+
+/** The four keys over a range, week by week (`GET dora/summary`). */
+export interface DoraSummary {
+  from: number;
+  to: number;
+  deployments: number;
+  per_day: number;
+  frequency_level: DoraLevel | null;
+  lead_time_s: number | null;
+  lead_time_level: DoraLevel | null;
+  lead_deployments: number;
+  change_failures: number;
+  failure_rate: number | null;
+  failure_rates: { level: DoraLevel; rate: number }[];
+  recovery_s: number | null;
+  recovery_level: DoraLevel | null;
+  recovered: number;
+  failures: number;
+  open_failures: number;
+  restore_s: number | null;
+  weeks: { start: number; deployments: number; change_failures: number; lead_time_s: number | null; recovery_s: number | null }[];
+  services: string[];
+  envs: string[];
+  teams: string[];
+}
+
+export type DoraFound = "rollback" | "revert" | "hotfix" | "manual";
+export type DoraRemedyKind = "rollback" | "rollforward";
+
+/** A deployment as kiln keeps it: its lead time, whether it failed and what put it right. Times in ms. */
+export interface DoraDeployment {
+  id: string;
+  type: "dora_deployment";
+  attributes: {
+    service: string;
+    env: string;
+    team: string;
+    version: string;
+    started_at: number;
+    finished_at: number;
+    git: { commit_sha: string; repository_url: string } | null;
+    custom_tags: string[];
+    source: "api" | "kiln.cd";
+    lead: { commits: number; mean_s: number; min_s: number; max_s: number } | null;
+    change_failure: { found: DoraFound; remediation: { id: string; type: DoraRemedyKind; finished_at: number } | null } | null;
+    recovery_s: number | null;
+    remedies: string[];
+  };
+}
+
+/** A failure (an incident). Times in ms. */
+export interface DoraFailure {
+  id: string;
+  type: "dora_failure";
+  attributes: { services: string[]; env: string; team: string; name: string; severity: string; started_at: number; finished_at: number | null; version: string; custom_tags: string[] };
+}
+
+/** What a list of deployments or failures asks: a range (ms), a search of their fields, an order. */
+export interface DoraList {
+  from: number;
+  to: number;
+  query?: string;
+  limit?: number;
+  sort?: "-finished_at" | "finished_at" | "-started_at" | "started_at";
+}
+
 export const observeApi = {
   spans: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<SpanSearch>("POST", `${BASE}/spans/search`, body, { signal }),
   spanHistogram: (body: { query: string; from: number; to: number; step: number; by?: string[] }, signal?: AbortSignal) => request<LogHistogram>("POST", `${BASE}/spans/aggregate`, body, { signal }),
@@ -1245,6 +1313,15 @@ export const observeApi = {
   createScanningGroup: (g: ScanningGroupIn) => request<ScanningGroup>("POST", `${BASE}/scanner/groups`, g),
   updateScanningGroup: (id: string, g: ScanningGroupIn) => request<ScanningGroup>("PUT", `${BASE}/scanner/groups/${enc(id)}`, g),
   deleteScanningGroup: (id: string) => request<void>("DELETE", `${BASE}/scanner/groups/${enc(id)}`),
+  doraSummary: (q: { from: number; to: number; service?: string; env?: string; team?: string }, signal?: AbortSignal) => {
+    const p = new URLSearchParams({ from: String(q.from), to: String(q.to) });
+    for (const k of ["service", "env", "team"] as const) if (q[k]) p.set(k, q[k] as string);
+    return request<DoraSummary>("GET", `${BASE}/dora/summary?${p}`, undefined, { signal });
+  },
+  doraDeployments: (body: DoraList, signal?: AbortSignal) => request<{ data: DoraDeployment[] }>("POST", `${BASE}/dora/deployments`, body, { signal }).then((r) => r.data),
+  doraFailures: (body: DoraList, signal?: AbortSignal) => request<{ data: DoraFailure[] }>("POST", `${BASE}/dora/failures`, body, { signal }).then((r) => r.data),
+  markDeployment: (id: string, body: { change_failure: boolean; remediation?: { id: string; type: DoraRemedyKind } }) =>
+    request<{ data: DoraDeployment }>("PATCH", `${BASE}/dora/deployments/${enc(id)}`, body).then((r) => r.data),
   orderScanningGroups: (ids: string[]) => request<void>("PUT", `${BASE}/scanner/group_order`, { group_ids: ids }),
   standardPatterns: (signal?: AbortSignal) => request<{ standard_patterns: StandardPattern[] }>("GET", `${BASE}/scanner/standard_patterns`, undefined, { signal }).then((r) => r.standard_patterns),
   tryScanner: (group: ScanningGroupIn | null, records: PipelineSample[]) =>

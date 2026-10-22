@@ -11,6 +11,7 @@ pub mod dashboards;
 pub mod ddash;
 pub mod ddagent;
 pub mod ddtrace;
+pub mod dora;
 pub mod downtimes;
 pub mod errors;
 pub mod github;

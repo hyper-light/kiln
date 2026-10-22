@@ -251,6 +251,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             o.set_scanner(groups, key);
         }
         crate::observe::api::set_scanner(scanning);
+        // DORA's ledger: kiln CD's deployments and those Datadog's API is sent, and failures.
+        crate::observe::dora::set(crate::observe::dora::Dora::open(&cfg.data("observe"), Some(hub.clone())));
         // Logs collected: the sources kept here, the server's own read here, each runner told its
         // own.
         let sources = std::sync::Arc::new(crate::observe::collect::Sources::open(&cfg.data("observe")));

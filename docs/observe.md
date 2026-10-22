@@ -36,6 +36,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-22 | Log archives (§10.5): Datadog's, to S3 (and S3-compatible stores), Cloud Storage and Azure Blob Storage with the cloud integrations' credentials (S3's requests signed with SigV4, the path once and the payload's hash), each record to the first archive whose search takes it; Datadog's objects (an hour's events a folder) and events; each record once through failures, restarts, installs and changes (each archive its place, a file kept to the archives it was begun with, a part written not written again); the store cut within 15 minutes when records come slowly; checked live against RustFS and stand-ins for Google's and Microsoft's stores and token services (§13) | done |
 | O-23 | Rehydration from archives (§10.6): an archive's records of a range that a search takes read back from S3, Cloud Storage or Blob Storage (Datadog's format: what Datadog wrote reads alike) into a view of their own, searched, counted, faceted and patterned as the live logs are (`view`); objects read as they come off the wire (none whole in memory), a read cut short taken up where it stopped; each event read into its record in place (400 ns, nothing allocated; 1.8 million events a second a core as objects come, §12.27); a scan's bound; a view kept for its retention, read again whole when the server stopped in it; checked live against RustFS and the stand-ins, every read cut short (§13) | done |
 | O-24 | Sensitive Data Scanner (§8.9): Datadog's scanning groups and rules, run on every machine where records are taken, after the pipelines, before anything is kept; the standard library (cards with their Luhn digits, IBANs with their checksums, SSNs in their ranges, personal data, network addresses, credentials of a dozen services, private keys, passwords in URLs and assignments), patterns of one's own; what a match becomes (a string, partly hidden, a keyed hash, or tags alone), keywords near, namespaces; the fast path kept for lines no rule may touch; the API, OpenAPI, its pages | done |
+| O-25 | Delivery: DORA metrics (§10.7), Datadog's: deployment frequency, change lead time (each commit's, from kiln's mirrors), change failure rate (rollbacks, reverts and hotfixes found as Datadog finds them, or marked by hand) and failed deployment recovery time, from kiln CD's deploys and Datadog's DORA API; failures; levels from DORA's 2024 report; metrics and events of each; the API, OpenAPI, its page | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1956,6 +1957,70 @@ read cut short half way by the stand-ins (Google's giving the rest when asked; M
 whole again): each view holds exactly its records, once, as they were sent; the server killed as
 one reads, it is read again whole; a bound stops one after its first object.
 
+### 10.7 Delivery: DORA metrics
+
+The four keys of software delivery (Forsgren, Humble, Kim 2018; DORA's yearly reports), measured
+as Datadog's DORA Metrics measure them (`crate::observe::dora`), from deployments and failures: kiln
+CD's own deploys, and those any CD system sends to Datadog's API (`POST /api/v2/dora/deployment`,
+`POST /api/v2/dora/failure`; the ingest token, as the Agent's intakes). A deployment is a service's
+(in an environment, owned by a team) at a version and a git commit, started and finished; a failure
+(an incident) names the services it hurt, its environment, severity, start and, once over, end.
+
+- **Deployment frequency**: the deployments finished in a range, a day. A kiln CD deploy is one when
+  it changes the app's revision (a redeploy of what runs, a self-heal, is none).
+- **Change lead time**: each commit a deployment brings, from its author's time to the deployment's
+  finish; a deployment's is its commits' mean, and a range's the median of its deployments'. The
+  commits are git's log from the previous deployment's commit (the same service and environment) to
+  its own, merges left out, 5,000 at most, read from kiln's mirror of the repository the deployment
+  names (its clone URL or kiln's name for it; a commit the mirror lacks is fetched). None for a
+  service's first deployment, one whose previous is more than 60 days older, or a repository kiln
+  does not mirror (Datadog's rules, and its: the author's time survives a rebase).
+- **Change failure rate**: the deployments marked failed among the range's. A deployment is marked
+  - by a rollback: a deployment of a commit (with no git, a version) deployed before, but not the
+    one just before it, marks the deployment after that earlier one (V1 → V2 → V3 → V1: V2). kiln
+    CD's rollbacks are such;
+  - by a revert: a commit `Revert "<title>"` among a deployment's marks the earlier deployment that
+    brought the commit it reverts (`This reverts commit <sha>`, else the one titled `<title>`); none
+    when both came in one deployment;
+  - by a hotfix: a commit among a deployment's that says `hotfix` (a squashed pull request's title,
+    a merge's branch), or a version ending `_hotfix`, marks the deployment just before it;
+  - or by hand (`PATCH /api/v2/dora/deployments/{id}`: `change_failure`, and the deployment that
+    remedied it, by id or version, a `rollback` or a `rollforward`).
+
+  A rollback's target and a revert's commit are looked for among the latest 1,000 deployments of
+  the service and environment (a bound on what one deployment costs: at a busy service's six a day,
+  five months; a service deployed less often is looked through further back), and a rollback's only
+  when what it deploys was deployed before (a count kept of each).
+- **Failed deployment recovery time**: from a failed deployment's finish to its remedy's (the
+  rollback, revert or hotfix that marked it, or the one given by hand); a range's median.
+- **Failures**: kept and listed; their median duration is the time to restore of DORA's reports
+  before 2023.
+
+The page shows each beside DORA's levels (the 2024 report's, found by cluster analysis of some
+39,000 answers): lead time under a day (elite), a day to a week (high), a week to a month (medium),
+a month to six months (low); deployments on demand, several a day; daily to weekly; weekly to
+monthly; monthly to every six months; recovery under an hour; under a day (high and medium); a week
+to a month. A change failure rate is shown with the clusters' own (5%, 20%, 10%, 40%), no level:
+the report's medium cluster failed less often than its high one, so no band orders them.
+
+Each is also a metric, for dashboards and monitors (`dora.deployments`, a count; `dora.change_lead_time`,
+a distribution of each commit's, in seconds; `dora.change_failures`, a count at the failed
+deployment's finish; `dora.recovery_time`, a distribution; `dora.failures`, a count; and
+`dora.time_to_restore`, a distribution; each by `service`, `env` and `team`), and each deployment
+and failure an event (`source:dora`). The page's figures are the ledger's, exactly: a metric
+written as a deployment comes is not taken back if an earlier one comes after it.
+
+- **The ledger**: the server keeps every deployment and failure of the last 400 days
+  (`<observe>/dora.jsonl`, an entry a line, the last for an id standing; rewritten whole once it
+  holds twice what stands), and reads it as it starts. A service and environment's deployments go in
+  one at a time, so each finds the one before it; one that comes after a later one is put in its
+  place, and the one after it read again.
+- **The API**: Datadog's (`/api/v2/dora/deployment`, `/failure` and `/incident`, the lists
+  `POST /api/v2/dora/deployments` and `/failures` with `from`, `to`, a search of their fields and a
+  `limit` of 1,000, `GET` one, `DELETE`, and `PATCH` to mark one); an id given again replaces what
+  it said (a failure's end sent later). And `GET /api/observe/v1/dora/summary` for the page: the
+  four keys over a range by service, environment and team, week by week.
+
 ## 11. UI
 
 Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
@@ -2052,6 +2117,15 @@ time range and the search in the address (a page is a link).
   from zero, cannot); and the monitors that alert on it, the workbook's two for its timeframe added
   in a click while none reads its burn rate. Made and edited in a form: good events over all, or
   time slices of a query meeting a condition.
+- **Delivery** (§10.7): DORA's four keys over 7, 30 or 90 days, narrowed to a service, an
+  environment or a team: each its value, what it was taken from, and the 2024 report's four ranges
+  beside it, the one it falls in marked in words (a change failure rate beside the clusters' own
+  rates, none marked); deployments and those that failed week by week (bars), the week's median lead
+  time (a line: recovery times are few and far between, and an axis for them would flatten it); the
+  failures, those going on first; each deployment, its lead time and commits, whether it failed (how
+  that was found, what put it right and how soon), marked failed by hand in a dialog (what put it
+  right: a later deployment of its service and environment, a rollback or a fix rolled forward) or
+  not failed again.
 - **Pipelines** (a link from the logs explorer): kiln's own and yours in the order they apply, each
   its filter, processors and whether it is on; turned off and on, yours moved and removed, kiln's
   copied to be changed. A pipeline's page lists its processors in order, each edited as its type
@@ -4018,6 +4092,28 @@ it kept 2 of the 4 records it read; its view searched in the logs explorer (pick
 own range, no live tail) holding those two, a search within it finding one; the live logs picked
 again; removed from its row, and from the server. 2026-10-21: passes in all four (9 s each).
 
+**DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
+mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,
+two more, a feature merged, the second reverted (`git revert`), a hotfix branch merged. Six
+deployments of it sent to Datadog's API with the ingest token (times in seconds, milliseconds and
+nanoseconds; one naming the repository by kiln's name for it): each commit's lead time is its
+author's time to the deployment's finish to the second, merges left out, none for the first or for a
+rollback (16 h, 2 h, 1 h, 2 h); the revert marks the deployment that brought the reverted commit
+(recovered in 15 h, a rollforward), the hotfix the one before it (5 h), the rollback to an earlier
+commit the deployment after that one (16 h, a rollback). The four keys over ten days (6 deployments,
+3 failed, the lead time's median 2 h and recovery's 15 h, their levels), a list by a search of their
+fields and in either order, `dora.deployments` and `dora.change_failures` as the query API sums them,
+an event each. A deployment marked failed by hand through Datadog's `PATCH`, one refused as its own
+remediation; a failure, then its end at Datadog's earlier path (its duration, none going on). What
+is refused, saying why: a key that is not one, no service, an id too short, a start after its end,
+microseconds. The server killed and started again: the same, from its ledger; a deployment removed,
+the one it put right failed still, without its remedy. 2026-10-21: passes (44 s; adacachy). In a
+browser (`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): a service's
+four deployments, the last back to the first's version: the Delivery page says 1 of 4 failed (25%)
+and recovery in 2 h, the second's row failed by a rollback; the third marked failed from its row
+(put right by the rollback, in 1 h), 2 of 4 then, the API agreeing; then not failed again. Nothing on
+the page wider than a phone. 2026-10-21: passes in all four (2–3 s each; adacachy).
+
 **Sensitive Data Scanner** (`crates/kiln/tests/observe_scanner.rs`): a kiln server and a runner as
 processes of their own; a scanning group made through the API before the runner joins (it is told
 the group as it connects): cards replaced, emails hashed, AWS key IDs replaced, a password given its
@@ -4289,3 +4385,10 @@ machine can.
 - Steinarsson. Downsampling time series for visual representation. MSc thesis, Univ. of Iceland 2013.
 - He, Zhu, Zheng, Lyu. Drain: an online log parsing approach with fixed depth tree. ICWS 2017 (log
   patterns, O-6).
+- Forsgren, Humble, Kim. Accelerate: the science of lean software and DevOps. IT Revolution 2018
+  (the four keys; software delivery performance by cluster analysis).
+- DORA (Google Cloud). Accelerate State of DevOps Report 2024, its software delivery performance
+  levels (p. 13: four clusters, their lead time, deployment frequency, change failure rate and
+  failed deployment recovery time).
+- Datadog. DORA Metrics: calculation and change failure detection (docs.datadoghq.com/dora_metrics),
+  and its API (`/api/v2/dora`).

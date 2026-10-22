@@ -411,6 +411,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/observe/v1/spans/facets", "observe.read", At::Server),
     r("POST", "/api/observe/v1/events/search", "observe.read", At::Server),
     r("POST", "/api/observe/v1/monitors/validate", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/dora/deployments", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/dora/failures", "observe.read", At::Server),
     any("/api/observe/v1/integrations/**", "observe.manage", At::Server),
     any("/api/observe/v1/clouds/**", "observe.manage", At::Server),
     any("/api/observe/v1/scrapes/**", "observe.manage", At::Server),

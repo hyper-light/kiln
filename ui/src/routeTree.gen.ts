@@ -29,6 +29,7 @@ import { Route as AppDeploymentsNewRouteImport } from './routes/_app.deployments
 import { Route as AppDeploymentsPlansRouteImport } from './routes/_app.deployments.plans'
 import { Route as AppObserveIndexRouteImport } from './routes/_app.observe.index'
 import { Route as AppObserveArchivesRouteImport } from './routes/_app.observe.archives'
+import { Route as AppObserveDeliveryRouteImport } from './routes/_app.observe.delivery'
 import { Route as AppObserveDowntimesRouteImport } from './routes/_app.observe.downtimes'
 import { Route as AppObserveEventsRouteImport } from './routes/_app.observe.events'
 import { Route as AppObserveIntegrationsRouteImport } from './routes/_app.observe.integrations'
@@ -163,6 +164,11 @@ const AppObserveIndexRoute = AppObserveIndexRouteImport.update({
 const AppObserveArchivesRoute = AppObserveArchivesRouteImport.update({
   id: '/observe/archives',
   path: '/observe/archives',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppObserveDeliveryRoute = AppObserveDeliveryRouteImport.update({
+  id: '/observe/delivery',
+  path: '/observe/delivery',
   getParentRoute: () => AppRoute,
 } as any)
 const AppObserveDowntimesRoute = AppObserveDowntimesRouteImport.update({
@@ -368,6 +374,7 @@ export interface FileRoutesByFullPath {
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
   '/observe/archives': typeof AppObserveArchivesRoute
+  '/observe/delivery': typeof AppObserveDeliveryRoute
   '/observe/downtimes': typeof AppObserveDowntimesRoute
   '/observe/events': typeof AppObserveEventsRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
@@ -425,6 +432,7 @@ export interface FileRoutesByTo {
   '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
   '/observe/archives': typeof AppObserveArchivesRoute
+  '/observe/delivery': typeof AppObserveDeliveryRoute
   '/observe/downtimes': typeof AppObserveDowntimesRoute
   '/observe/events': typeof AppObserveEventsRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
@@ -484,6 +492,7 @@ export interface FileRoutesById {
   '/_app/deployments/new': typeof AppDeploymentsNewRoute
   '/_app/deployments/plans': typeof AppDeploymentsPlansRoute
   '/_app/observe/archives': typeof AppObserveArchivesRoute
+  '/_app/observe/delivery': typeof AppObserveDeliveryRoute
   '/_app/observe/downtimes': typeof AppObserveDowntimesRoute
   '/_app/observe/events': typeof AppObserveEventsRoute
   '/_app/observe/integrations': typeof AppObserveIntegrationsRoute
@@ -543,6 +552,7 @@ export interface FileRouteTypes {
     | '/deployments/new'
     | '/deployments/plans'
     | '/observe/archives'
+    | '/observe/delivery'
     | '/observe/downtimes'
     | '/observe/events'
     | '/observe/integrations'
@@ -600,6 +610,7 @@ export interface FileRouteTypes {
     | '/deployments/new'
     | '/deployments/plans'
     | '/observe/archives'
+    | '/observe/delivery'
     | '/observe/downtimes'
     | '/observe/events'
     | '/observe/integrations'
@@ -658,6 +669,7 @@ export interface FileRouteTypes {
     | '/_app/deployments/new'
     | '/_app/deployments/plans'
     | '/_app/observe/archives'
+    | '/_app/observe/delivery'
     | '/_app/observe/downtimes'
     | '/_app/observe/events'
     | '/_app/observe/integrations'
@@ -844,6 +856,13 @@ declare module '@tanstack/react-router' {
       path: '/observe/archives'
       fullPath: '/observe/archives'
       preLoaderRoute: typeof AppObserveArchivesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/observe/delivery': {
+      id: '/_app/observe/delivery'
+      path: '/observe/delivery'
+      fullPath: '/observe/delivery'
+      preLoaderRoute: typeof AppObserveDeliveryRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/observe/downtimes': {
@@ -1118,6 +1137,7 @@ interface AppRouteChildren {
   AppDeploymentsNewRoute: typeof AppDeploymentsNewRoute
   AppDeploymentsPlansRoute: typeof AppDeploymentsPlansRoute
   AppObserveArchivesRoute: typeof AppObserveArchivesRoute
+  AppObserveDeliveryRoute: typeof AppObserveDeliveryRoute
   AppObserveDowntimesRoute: typeof AppObserveDowntimesRoute
   AppObserveEventsRoute: typeof AppObserveEventsRoute
   AppObserveIntegrationsRoute: typeof AppObserveIntegrationsRoute
@@ -1175,6 +1195,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppDeploymentsNewRoute: AppDeploymentsNewRoute,
   AppDeploymentsPlansRoute: AppDeploymentsPlansRoute,
   AppObserveArchivesRoute: AppObserveArchivesRoute,
+  AppObserveDeliveryRoute: AppObserveDeliveryRoute,
   AppObserveDowntimesRoute: AppObserveDowntimesRoute,
   AppObserveEventsRoute: AppObserveEventsRoute,
   AppObserveIntegrationsRoute: AppObserveIntegrationsRoute,

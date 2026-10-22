@@ -1722,6 +1722,61 @@ const scenarios = {
     }
   },
 
+  /** A service's deployments on the Delivery page: a rollback found by its version (the deployment
+   * after the one gone back to failed, put right in two hours), the four keys as the API says them;
+   * one marked failed by hand from its row, what put it right chosen, then not failed again. */
+  async "a deployment is found failed by a rollback, and another is marked failed by hand"() {
+    const service = `e2e-dora-${run}`;
+    const hour = 3_600_000;
+    const t = Date.now() - 6 * hour;
+    const ids = [];
+    try {
+      // v1, v2, v3, then v1 again: a rollback, v2 the failure.
+      for (const [i, version] of ["1.0", "1.1", "1.2", "1.0"].entries()) {
+        const id = `e2e-dora-deploy-${run}-${i}`;
+        const at = t + i * hour;
+        const r = await api("POST", "/api/observe/v1/dora/deployment", { data: { attributes: { id, service, env: "e2e", version, started_at: at - 60_000, finished_at: at } } });
+        expect(r.status === 200, `deployment ${i}: ${r.status} ${JSON.stringify(r.body)}`);
+        ids.push(id);
+      }
+      const summary = async () => (await api("GET", `/api/observe/v1/dora/summary?service=${service}&from=${t - hour}&to=${Date.now()}`)).body;
+      const s = await summary();
+      expect(s.deployments === 4 && s.change_failures === 1 && s.failure_rate === 0.25 && s.recovery_s === 7200, `the API's four keys: ${JSON.stringify(s)}`);
+      await page.goto(`${BASE}/observe/delivery?service=${encodeURIComponent(service)}&range=7d`);
+      const rate = page.getByRole("group", { name: "Change failure rate" });
+      await until("the failure rate", async () => /25%/.test((await rate.textContent()) ?? "") && /1 of 4 failed/.test((await rate.textContent()) ?? ""));
+      await until("the recovery time", async () => /2h 00m/.test((await page.getByRole("group", { name: "Failed deployment recovery time" }).textContent()) ?? ""));
+      const rows = page.getByRole("region", { name: "Deployments" }).locator("table.data-table tbody tr");
+      // A row by its deployment's id (its buttons say it to a screen reader): a version is said in the row that put it right too.
+      const row = (i) => rows.filter({ hasText: ids[i] });
+      await until("v1.1 failed by the rollback", async () => /Failed.*by a rollback.*put right by rollback in 2h 00m/.test((await row(1).textContent()) ?? ""));
+      await fitsAcross("the Delivery page");
+      // v1.2 marked failed by hand, put right by the rollback an hour after it.
+      await row(2)
+        .getByRole("button", { name: `Mark failed ${ids[2]}`, exact: true })
+        .click();
+      const d = page.getByRole("dialog");
+      await d.getByLabel("Put right by", { exact: true }).selectOption({ value: ids[3] });
+      await d.getByRole("button", { name: "Mark it failed", exact: true }).click();
+      await d.waitFor({ state: "detached" });
+      await until("two of four failed", async () => /50%/.test((await rate.textContent()) ?? "") && /2 of 4 failed/.test((await rate.textContent()) ?? ""));
+      const marked = (await api("GET", `/api/observe/v1/dora/deployments/${ids[2]}`)).body.data.attributes;
+      expect(
+        marked.change_failure?.found === "manual" && marked.change_failure.remediation?.id === ids[3] && marked.change_failure.remediation.type === "rollback" && marked.recovery_s === 3600,
+        `marked as said: ${JSON.stringify(marked)}`,
+      );
+      await until("its row says so", async () => /Failed.*by hand.*put right by rollback in 1h 00m/.test((await row(2).textContent()) ?? ""));
+      // Not failed after all.
+      await row(2)
+        .getByRole("button", { name: `Not failed ${ids[2]}`, exact: true })
+        .click();
+      await until("one of four again", async () => /1 of 4 failed/.test((await rate.textContent()) ?? ""));
+      expect((await api("GET", `/api/observe/v1/dora/deployments/${ids[2]}`)).body.data.attributes.change_failure === null, "not failed on the server");
+    } finally {
+      for (const id of ids) await api("DELETE", `/api/observe/v1/dora/deployments/${id}`);
+    }
+  },
+
   /** A metric from logs tried on the records of the last fifteen minutes, made, counting the
    * records that come after (as the API's query says), charted, and removed. */
   async "a metric from logs is tried, made, counts what comes after, and is removed"() {

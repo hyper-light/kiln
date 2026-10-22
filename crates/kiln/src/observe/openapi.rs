@@ -1043,6 +1043,199 @@ fn schemas() -> Map<String, Value> {
             &["records"],
         ),
     );
+    // DORA metrics (§10.7): Datadog's deployments and failures, kiln's view of them, the four keys.
+    let when = || describe(integer(), "seconds, milliseconds or nanoseconds since the epoch (told apart by size)");
+    let git = || object(&[("commit_sha", string()), ("repository_url", describe(string(), "its clone URL, or kiln's name for it (owner/name)"))], &["commit_sha", "repository_url"]);
+    let dora_id = || describe(string(), "16 to 128 letters, digits, -, _, . and :; made when not given (a repeat replaces what it said)");
+    let custom_tags = || describe(array(string()), "key:value tags, 100 at the most");
+    put(
+        "DoraDeploymentIn",
+        describe(
+            object(
+                &[
+                    ("service", string()),
+                    ("env", string()),
+                    ("started_at", when()),
+                    ("finished_at", when()),
+                    ("git", git()),
+                    ("id", dora_id()),
+                    ("team", string()),
+                    ("version", string()),
+                    ("custom_tags", custom_tags()),
+                ],
+                &["service", "started_at", "finished_at"],
+            ),
+            "Datadog's deployment event; as its API sends it (in {\"data\": {\"attributes\": ...}}) or bare",
+        ),
+    );
+    put(
+        "DoraFailureIn",
+        describe(
+            object(
+                &[
+                    ("services", array(string())),
+                    ("team", describe(string(), "services or team: one is required")),
+                    ("env", string()),
+                    ("name", string()),
+                    ("severity", string()),
+                    ("started_at", when()),
+                    ("finished_at", describe(integer(), "as started_at; none while it goes on")),
+                    ("git", git()),
+                    ("id", dora_id()),
+                    ("version", string()),
+                    ("custom_tags", custom_tags()),
+                ],
+                &["started_at"],
+            ),
+            "Datadog's failure (incident) event; enveloped or bare",
+        ),
+    );
+    put(
+        "DoraPatch",
+        object(
+            &[
+                ("change_failure", describe(boolean(), "marked failed (true unless said), or no longer")),
+                (
+                    "remediation",
+                    describe(
+                        object(
+                            &[
+                                ("id", string()),
+                                ("version", describe(string(), "the first deployment of it after the failed one, its service and environment's")),
+                                ("type", one_of(&["rollback", "rollforward"])),
+                            ],
+                            &["type"],
+                        ),
+                        "the deployment that remedied it: its id or its version",
+                    ),
+                ),
+                ("service", describe(string(), "with version (and env): the deployment marked, when no id is in the path")),
+                ("env", string()),
+                ("version", string()),
+            ],
+            &[],
+        ),
+    );
+    put(
+        "DoraList",
+        object(
+            &[
+                ("from", describe(any(), "RFC 3339, or seconds, milliseconds or nanoseconds (30 days before to)")),
+                ("to", describe(any(), "as from (now)")),
+                ("query", describe(string(), "a log search of their fields: service:, @env:, @team:, @version:, @git.commit_sha:, @change_failure:true, tags")),
+                ("limit", describe(integer(), "100 unless said; 1,000 at the most")),
+                ("sort", one_of(&["-finished_at", "finished_at", "-started_at", "started_at"])),
+            ],
+            &[],
+        ),
+    );
+    put(
+        "DoraDeployment",
+        object(
+            &[
+                ("id", string()),
+                ("type", one_of(&["dora_deployment"])),
+                (
+                    "attributes",
+                    object(
+                        &[
+                            ("service", string()),
+                            ("env", string()),
+                            ("team", string()),
+                            ("version", string()),
+                            ("started_at", describe(integer(), "ms since the epoch")),
+                            ("finished_at", describe(integer(), "ms since the epoch")),
+                            ("git", nullable(git())),
+                            ("custom_tags", array(string())),
+                            ("source", one_of(&["api", "kiln.cd"])),
+                            ("lead", nullable(object(&[("commits", integer()), ("mean_s", number()), ("min_s", number()), ("max_s", number())], &["commits", "mean_s", "min_s", "max_s"]))),
+                            (
+                                "change_failure",
+                                nullable(object(
+                                    &[
+                                        ("found", one_of(&["rollback", "revert", "hotfix", "manual"])),
+                                        (
+                                            "remediation",
+                                            nullable(object(&[("id", string()), ("type", one_of(&["rollback", "rollforward"])), ("finished_at", integer())], &["id", "type", "finished_at"])),
+                                        ),
+                                    ],
+                                    &["found"],
+                                )),
+                            ),
+                            ("recovery_s", describe(nullable(number()), "from its finish to its remediation's")),
+                            ("remedies", describe(array(string()), "the failed deployments it remedied")),
+                        ],
+                        &["service", "started_at", "finished_at", "source"],
+                    ),
+                ),
+            ],
+            &["id", "type", "attributes"],
+        ),
+    );
+    put(
+        "DoraFailure",
+        object(
+            &[
+                ("id", string()),
+                ("type", one_of(&["dora_failure"])),
+                (
+                    "attributes",
+                    object(
+                        &[
+                            ("services", array(string())),
+                            ("env", string()),
+                            ("team", string()),
+                            ("name", string()),
+                            ("severity", string()),
+                            ("started_at", describe(integer(), "ms")),
+                            ("finished_at", describe(nullable(integer()), "ms; none while it goes on")),
+                            ("git", nullable(git())),
+                            ("version", string()),
+                            ("custom_tags", array(string())),
+                        ],
+                        &["services", "started_at"],
+                    ),
+                ),
+            ],
+            &["id", "type", "attributes"],
+        ),
+    );
+    let level = || nullable(one_of(&["elite", "high", "medium", "low"]));
+    put(
+        "DoraSummary",
+        object(
+            &[
+                ("from", integer()),
+                ("to", integer()),
+                ("deployments", integer()),
+                ("per_day", number()),
+                ("frequency_level", describe(level(), "the 2024 report's cluster whose range it falls in")),
+                ("lead_time_s", describe(nullable(number()), "the median of the deployments' (each its commits' mean)")),
+                ("lead_time_level", level()),
+                ("lead_deployments", integer()),
+                ("change_failures", integer()),
+                ("failure_rate", nullable(number())),
+                ("failure_rates", describe(array(object(&[("level", string()), ("rate", number())], &["level", "rate"])), "each cluster's rate in the report (not ordered: no level is given)")),
+                ("recovery_s", describe(nullable(number()), "the median of the failed deployments' recoveries")),
+                ("recovery_level", describe(level(), "none for a day to a week: no cluster's")),
+                ("recovered", integer()),
+                ("failures", integer()),
+                ("open_failures", integer()),
+                ("restore_s", nullable(number())),
+                (
+                    "weeks",
+                    array(object(
+                        &[("start", integer()), ("deployments", integer()), ("change_failures", integer()), ("lead_time_s", nullable(number())), ("recovery_s", nullable(number()))],
+                        &["start", "deployments", "change_failures"],
+                    )),
+                ),
+                ("services", array(string())),
+                ("envs", array(string())),
+                ("teams", array(string())),
+            ],
+            &["from", "to", "deployments", "per_day", "change_failures", "weeks"],
+        ),
+    );
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
@@ -1915,6 +2108,81 @@ fn ops() -> Vec<Op<'static>> {
             Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("group_ids", array(string()))], &["group_ids"]) } } })),
             vec![no_content()],
         ),
+        // DORA metrics (§10.7).
+        Op {
+            params: vec![
+                param("from", "query", false, integer(), "ms since the epoch (30 days before to)"),
+                param("to", "query", false, integer(), "ms since the epoch (now)"),
+                param("service", "query", false, string(), "one service"),
+                param("env", "query", false, string(), "one environment"),
+                param("team", "query", false, string(), "one team"),
+            ],
+            ..op(
+                "get",
+                "/dora/summary",
+                "The four keys over a range (deployment frequency, change lead time, change failure rate, failed deployment recovery time) and week by week, beside DORA's 2024 levels",
+                "observe.read",
+                None,
+                vec![ok("DoraSummary")],
+            )
+        },
+        op(
+            "post",
+            "/dora/deployment",
+            "Takes a deployment (Datadog's body): its commits read, what it marks failed marked",
+            "observe.write",
+            Some(body("DoraDeploymentIn")),
+            vec![("200", answer_of("taken", object(&[("data", object(&[("id", string()), ("type", string())], &["id", "type"]))], &["data"])))],
+        ),
+        op(
+            "post",
+            "/dora/failure",
+            "Takes a failure (an incident; Datadog's body), or its end",
+            "observe.write",
+            Some(body("DoraFailureIn")),
+            vec![("200", answer_of("taken", object(&[("data", object(&[("id", string()), ("type", string())], &["id", "type"]))], &["data"])))],
+        ),
+        op(
+            "post",
+            "/dora/deployments",
+            "Lists deployments: a range, a search of their fields, an order",
+            "observe.read",
+            Some(body("DoraList")),
+            vec![("200", answer_of("the deployments", object(&[("data", array(schema("DoraDeployment")))], &["data"])))],
+        ),
+        op(
+            "post",
+            "/dora/failures",
+            "Lists failures: a range, a search of their fields, an order",
+            "observe.read",
+            Some(body("DoraList")),
+            vec![("200", answer_of("the failures", object(&[("data", array(schema("DoraFailure")))], &["data"])))],
+        ),
+        Op {
+            params: vec![id()],
+            ..op(
+                "get",
+                "/dora/deployments/{id}",
+                "A deployment, its lead time, whether it failed and what remedied it",
+                "observe.read",
+                None,
+                vec![("200", answer_of("it", object(&[("data", schema("DoraDeployment"))], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id()],
+            ..op(
+                "patch",
+                "/dora/deployments/{id}",
+                "Marks a deployment failed (or not), and what remedied it",
+                "observe.write",
+                Some(body("DoraPatch")),
+                vec![("200", answer_of("as it is now", object(&[("data", schema("DoraDeployment"))], &["data"])))],
+            )
+        },
+        Op { params: vec![id()], ..op("delete", "/dora/deployments/{id}", "Removes a deployment (its marks with it)", "observe.write", None, vec![no_content()]) },
+        Op { params: vec![id()], ..op("get", "/dora/failures/{id}", "A failure", "observe.read", None, vec![("200", answer_of("it", object(&[("data", schema("DoraFailure"))], &["data"])))]) },
+        Op { params: vec![id()], ..op("delete", "/dora/failures/{id}", "Removes a failure", "observe.write", None, vec![no_content()]) },
         op(
             "get",
             "/scanner/standard_patterns",
@@ -1991,6 +2259,18 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: dd_key(), body: Some(dd_body("events by source, and host metadata (passed over), JSON")), ..op("post", "/intake/", "Datadog's Agent's events", "ingest", None, vec![("202", answer("taken", None))]) },
         Op { params: dd_key(), body: Some(dd_body("log records, JSON")), ..op("post", "/api/v2/logs", "Datadog's Agent's logs", "ingest", None, vec![("202", answer("taken", None))]) },
         Op { params: dd_key(), ..op("get", "/api/v1/validate", "Whether a Datadog API key is one", "ingest", None, vec![("200", answer_of("valid", object(&[("valid", boolean())], &["valid"]))), ("403", answer("not one", None))]) },
+        // Datadog's DORA API (docs/observe.md §10.7): what a CD system sends.
+        Op { params: dd_key(), body: Some(body("DoraDeploymentIn")), ..op("post", "/api/v2/dora/deployment", "Datadog's DORA deployment event", "ingest", None, vec![("200", answer_of("taken", object(&[("data", object(&[("id", string()), ("type", string())], &["id", "type"]))], &["data"])))]) },
+        Op { params: dd_key(), body: Some(body("DoraFailureIn")), ..op("post", "/api/v2/dora/failure", "Datadog's DORA failure (incident) event", "ingest", None, vec![("200", answer_of("taken", object(&[("data", object(&[("id", string()), ("type", string())], &["id", "type"]))], &["data"])))]) },
+        Op { params: dd_key(), body: Some(body("DoraFailureIn")), ..op("post", "/api/v2/dora/incident", "Datadog's DORA incident event (its earlier name for a failure)", "ingest", None, vec![("200", answer("taken", None))]) },
+        Op {
+            params: { let mut p = dd_key(); p.push(path_param("id", "the deployment's")); p },
+            body: Some(body("DoraPatch")),
+            ..op("patch", "/api/v2/dora/deployments/{id}", "Datadog's: marks a deployment failed, and what remedied it", "ingest", None, vec![("200", answer_of("as it is now", object(&[("data", schema("DoraDeployment"))], &["data"])))])
+        },
+        Op { params: dd_key(), body: Some(body("DoraPatch")), ..op("patch", "/api/v2/dora/deployments", "Datadog's: marks the deployment of a service, environment and version failed", "ingest", None, vec![("200", answer_of("as it is now", object(&[("data", schema("DoraDeployment"))], &["data"])))]) },
+        Op { params: { let mut p = dd_key(); p.push(path_param("id", "the deployment's")); p }, ..op("delete", "/api/v2/dora/deployment/{id}", "Datadog's: removes a deployment", "ingest", None, vec![("204", answer("removed", None))]) },
+        Op { params: { let mut p = dd_key(); p.push(path_param("id", "the failure's")); p }, ..op("delete", "/api/v2/dora/failure/{id}", "Datadog's: removes a failure", "ingest", None, vec![("204", answer("removed", None))]) },
         Op {
             params: vec![param("token", "query", true, string(), "observe's ingest token")],
             body: Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("message", object(&[("data", describe(string(), "base64: a Cloud Logging entry")), ("messageId", string()), ("attributes", map_of(string()))], &["data"])), ("subscription", string())], &["message"]) } } })),
