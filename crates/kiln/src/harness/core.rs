@@ -239,6 +239,9 @@ pub struct Core {
     pub hold: bool,
     /// The harness running now (its name): new events say so (`Event::by`).
     pub harness: Option<String>,
+    /// A limit another session on the account reached, asked of the harness before it holds this
+    /// one too (`pause::account_hold`).
+    pub limit_ask: Option<super::pause::Ask>,
 }
 
 impl Default for Core {
@@ -294,6 +297,7 @@ impl Core {
             reset: false,
             hold: false,
             harness: None,
+            limit_ask: None,
         }
     }
 
