@@ -626,7 +626,11 @@ impl Copy {
         }
         let here = self.now(path)?;
         if here.as_ref() == to {
-            // Here already (the same file on both machines).
+            // Here already: the same file on both machines, or what a process here wrote (or
+            // deleted) before a crash, its folders maybe never synced: synced before the state
+            // says it's here, as a write's are.
+            let full = self.root.join(path);
+            self.touch(&full, true);
             set(&mut self.state.synced, path, to.cloned());
             return Ok(Outcome::Applied { path: path.to_owned() });
         }

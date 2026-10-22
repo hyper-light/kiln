@@ -1808,6 +1808,51 @@ mod tests {
         Ok(())
     }
 
+    /// CP-T6.1, AC-T6.1.3: the ninth bug kiln-sim found, by its seed: a file a runner wrote into
+    /// its folder, crashing before it synced the folders, was found in place by the next process
+    /// ("here already") and taken as synced, no folder synced. Its state saved, a power loss took
+    /// the name, and the copy proposed the file deleted: a moving session went on without it
+    /// (moves seed 738).
+    #[test]
+    fn the_seed_where_a_file_found_in_place_was_never_synced_converges() -> Result<(), String> {
+        run(738, 0, Plant::default(), Mode::Moves).map(|_| ())
+    }
+
+    /// CP-T6.1, AC-T6.1.3: the ninth bug's contract: a file a process wrote before a crash, found
+    /// in place by the next one, holds after a power loss once that one's folders are synced; on
+    /// either way of journaling names.
+    #[test]
+    fn a_file_found_in_place_holds_after_a_power_loss_once_the_folders_are_synced() -> Result<(), String> {
+        use crate::sync::{Change, Copy, Outcome, State};
+        for seed in 0..200u64 {
+            let disk = Disk::new(SimClock::new(), Rng::new(seed), DiskFaults { fsync_commits_names: seed % 2 == 0, ..DiskFaults::none() });
+            let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+            let root = PathBuf::from("/home/m2/repo");
+            fs.create_dir_all(&root).map_err(e)?;
+            disk.make_durable("/home/m2/repo");
+            let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
+            let bytes = filled("another machine's file\n", 3000);
+            let hash = blobs.put_bytes(&bytes).map_err(e)?;
+            let change = Change { path: "agent/notes.md".into(), to: Some(Version::File { hash, exec: false }), base: None };
+            let step = Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] };
+            // A process writes it, and crashes before it syncs the folders.
+            Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default()).apply(&step, &blobs).map_err(e)?;
+            // The next finds it in place.
+            let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
+            let took = copy.apply(&step, &blobs).map_err(e)?;
+            if !matches!(took.as_slice(), [Outcome::Applied { .. }]) {
+                return Err(format!("seed {seed}: the file in place wasn't taken as applied: {took:?}"));
+            }
+            copy.sync_dirs().map_err(e)?;
+            disk.power_loss();
+            let got = disk.read("/home/m2/repo/agent/notes.md").map_err(|err| format!("seed {seed}: after a power loss agent/notes.md: {err}"))?;
+            if got != bytes {
+                return Err(format!("seed {seed}: after a power loss agent/notes.md holds {} bytes, not the {} sync wrote", got.len(), bytes.len()));
+            }
+        }
+        Ok(())
+    }
+
     /// CP-T6.1, T-T6.1.1: a planted bug, a lost write after a torn page, is found within the CI
     /// seed budget. What sync writes into a folder is renamed in unsynced (as before the first
     /// bug's fix); a power loss tears, zeroes or loses it; and the checker finds what comes of it
