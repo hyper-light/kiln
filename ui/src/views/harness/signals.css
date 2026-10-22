@@ -166,15 +166,25 @@
     transform: translateX(-60%);
   }
 }
-/* A subagent running: the same sweep through what says so (the activity line's "1 subagent" with its
-   mark, Mission Control's "Working" with its dot), drawn white on black and screened onto the page. */
+/* A subagent running: the prism sweeps through what says so (the activity line's "1 subagent",
+   Mission Control's "Working"), painted into its own letters (background-clip: text). No layer of
+   its own and no blending, so nothing beside it (shells, the queue, the Latest button) takes it. */
 .sg-shimmer {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  color: #fff;
-  background: #000;
-  mix-blend-mode: screen;
+  background-image: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 18%, #b8a6d5 34%, #d6a2aa 50%, #b8a6d5 66%, #a6c4ed 82%, #b8d9d2 100%);
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: sg-shimmer-sweep 6s ease-in-out infinite alternate;
+}
+@keyframes sg-shimmer-sweep {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
 }
 /* The same sweep painted every frame (the conversation loader's words). */
 @keyframes sg-prism-current {
@@ -454,6 +464,7 @@
 :root[data-motion="paused"] .sg-optic > span,
 :root[data-motion="paused"] .sg-label,
 :root[data-motion="paused"] .sg-sweep,
+:root[data-motion="paused"] .sg-shimmer,
 :root[data-motion="paused"] .sg-think::before,
 :root[data-motion="paused"] .sg-trace path,
 :root[data-motion="paused"] .sg-beam,
@@ -468,6 +479,7 @@
   .sg-optic > span,
   .sg-label,
   .sg-sweep,
+  .sg-shimmer,
   .sg-think::before,
   .sg-trace path,
   .sg-beam,
@@ -493,6 +505,7 @@
   .sg-label[data-live="true"][data-sweep],
   .sg-shimmer {
     color: CanvasText;
+    -webkit-text-fill-color: CanvasText;
     background: none;
     mix-blend-mode: normal;
   }
