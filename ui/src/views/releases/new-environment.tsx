@@ -25,7 +25,7 @@ const LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 function Form({ onDone }: { onDone: () => void }) {
   const integrations = useSuspenseResource("deploy/integrations", (s) => api.integrations(s)).data.integrations.filter((i) => i.kind === "argocd");
   const clusters = useSuspenseResource("cd/clusters", (s) => cdApi.clusters(s)).data.clusters;
-  const github = useSuspenseResource("ci/github-app", (s) => deployApi.githubApp(s)).data;
+  const hosts = useSuspenseResource("deploy/git-hosts", (s) => deployApi.gitHosts(s)).data;
   const navigate = useNavigate();
   const [name, setName] = React.useState("");
   const [provider, setProvider] = React.useState("kilncd");
@@ -50,7 +50,7 @@ function Form({ onDone }: { onDone: () => void }) {
       : picked;
     setBusy(true);
     try {
-      const gates = host === "github" && pulls ? { via: "pull-request" as const } : undefined;
+      const gates = host !== "kiln" && pulls ? { via: "pull-request" as const } : undefined;
       const e = await deployApi.createEnvironment({ name: clean, provider, release_repo: { host, repo: repo.trim(), branch: branch.trim() || "main", root: root.trim() }, targets: { kubernetes }, gates });
       toast({ title: `${e.name} is made`, description: "Set its gates on its page; register apps in it from theirs.", tone: "succeeded", href: releaseEnvHref(e.name) });
       invalidate("deploy/");
@@ -71,17 +71,18 @@ function Form({ onDone }: { onDone: () => void }) {
         onChange={setProvider}
         options={[{ value: "kilncd", label: "KilnCD (kiln's own)" }, ...integrations.map((i) => ({ value: `argocd/${i.name}`, label: `Argo CD ${i.name}` }))]}
       />
-      {github.configured && (
+      {hosts.length > 1 && (
         <SelectField
           label="Release repository on"
           value={host}
           onChange={(v) => {
             setHost(v);
-            if (v === "github" && repo === "kiln/releases") setRepo("");
+            if (v !== "kiln" && repo === "kiln/releases") setRepo("");
           }}
           options={[
             { value: "kiln", label: "kiln's own git server" },
-            { value: "github", label: "GitHub, through kiln's GitHub App" },
+            ...(hosts.some((h) => h.host === "github") ? [{ value: "github", label: "GitHub, through kiln's GitHub App" }] : []),
+            ...(hosts.some((h) => h.host === "gitlab") ? [{ value: "gitlab", label: `GitLab (${hosts.filter((h) => h.host === "gitlab").map((h) => h.web).join(", ")})` }] : []),
           ]}
         />
       )}
@@ -92,14 +93,21 @@ function Form({ onDone }: { onDone: () => void }) {
           value={repo}
           spellCheck={false}
           onChange={(e) => setRepo(e.target.value)}
-          hint={host === "github" ? "On GitHub: kiln's App makes it in an organization if it isn't there." : "One of kiln's own: made if it isn't there."}
+          hint={
+            host === "github"
+              ? "On GitHub: kiln's App makes it in an organization if it isn't there."
+              : host === "gitlab"
+                ? "On GitLab (group/name): made in its group if it isn't there, with kiln's token for that group."
+                : "One of kiln's own: made if it isn't there."
+          }
         />
         <TextField label="Branch" value={branch} spellCheck={false} onChange={(e) => setBranch(e.target.value)} />
         <TextField label="Folder" placeholder="(the top)" value={root} spellCheck={false} onChange={(e) => setRoot(e.target.value)} />
       </div>
-      {host === "github" && (
+      {host !== "kiln" && (
         <label className="cd-new-check">
-          <input type="checkbox" className="check" checked={pulls} onChange={(e) => setPulls(e.target.checked)} /> Releases as pull requests: merging one releases it, closing it cancels it
+          <input type="checkbox" className="check" checked={pulls} onChange={(e) => setPulls(e.target.checked)} /> Releases as {host === "gitlab" ? "merge requests" : "pull requests"}: merging one releases it,
+          closing it cancels it
         </label>
       )}
       {argo ? (

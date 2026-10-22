@@ -1,9 +1,10 @@
 /**
  * System → Updates' figure, Rollout (the approved design study, system-updates): kiln's builds on
  * the left, its server in the middle, its runners on the right, the cables between them; on a phone
- * a tree, the server at the top and a branch to each runner. A cable lights only while something
- * moves on it, in CSS (still under the motion setting and for reduced motion): a runner's upgrade,
- * the release pipeline building a platform. Picking a machine or a build says what it is doing, and
+ * a tree, the server at the top and a branch to each runner. Light flows along a cable while
+ * something moves on it, in CSS (held still as a mark under the motion setting and for reduced
+ * motion): a runner's upgrade, the release pipeline building a platform; a faint pulse runs a
+ * connected runner's cable now and then. Picking a machine or a build says what it is doing, and
  * lights its row or tile below.
  */
 import * as React from "react";
@@ -100,7 +101,11 @@ function SceneView({ scene, className, picked }: { scene: RolloutScene; classNam
   const prism = `url(#${id}-prism)`;
   // A runner or a build picked: the other cables step back.
   const focus = picked && picked !== "server" ? picked : null;
-  const lights = [...scene.builds.map((b) => ({ key: b.key, cable: b.cable, kind: "build" })), ...scene.runners.map((r) => ({ key: r.key, cable: r.cable, kind: "down" }))].filter((l) => l.cable.lit);
+  const dim = (key: string) => (focus !== null && focus !== key) || undefined;
+  // Light flows along a cable while a platform builds or a runner upgrades, comet after comet; a
+  // connected runner's cable carries a faint pulse every 6 to 8 s, the runners' out of step.
+  const flows = [...scene.builds.map((b) => ({ key: b.key, cable: b.cable, kind: "build" })), ...scene.runners.map((r) => ({ key: r.key, cable: r.cable, kind: "down" }))].filter((l) => l.cable.lit);
+  const pulses = scene.runners.filter((r) => r.pulse);
   return (
     <svg
       className={cn("up-scene", className)}
@@ -147,18 +152,22 @@ function SceneView({ scene, className, picked }: { scene: RolloutScene; classNam
       {scene.runners.map((r) => (
         <CableView key={r.key} cable={r.cable} dim={focus !== null && focus !== r.key} />
       ))}
-      {lights.map((l, i) => (
-        <g
-          key={l.key}
-          className="up-light"
-          data-kind={l.kind}
-          data-dim={(focus !== null && focus !== l.key) || undefined}
-          style={{ "--up-delay": `${-((i * 0.53) % 1.9).toFixed(2)}s` } as React.CSSProperties}
-          aria-hidden="true"
-        >
+      {flows.map((l, i) => (
+        <g key={l.key} className="up-light" data-kind={l.kind} data-dim={dim(l.key)} style={{ "--up-delay": `${-((i * 1.3) % 3.6).toFixed(2)}s` } as React.CSSProperties} aria-hidden="true">
           <path d={l.cable.d} pathLength={100} className="up-light-halo" />
           <path d={l.cable.d} pathLength={100} className="up-light-core" />
         </g>
+      ))}
+      {pulses.map((r, i) => (
+        <path
+          key={r.key}
+          d={r.cable.d}
+          pathLength={100}
+          className="up-pulse"
+          data-dim={dim(r.key)}
+          style={{ "--up-period": `${(6.4 + ((i * 0.55) % 1.6)).toFixed(2)}s`, "--up-delay": `${-(0.8 + i * 2.35).toFixed(2)}s` } as React.CSSProperties}
+          aria-hidden="true"
+        />
       ))}
       {scene.builds.map((b) => (
         <BuildView key={b.key} node={b} picked={picked === b.key} prism={prism} id={id} />
@@ -228,13 +237,21 @@ function BuildView({ node, picked, prism, id }: { node: BuildNode; picked: boole
       <path d={node.die} pathLength={42} stroke={prism} className="up-die" data-building={node.building || undefined} />
       <text className="up-ink" x={node.name.x} y={node.name.y}>
         {node.name.text}
+        {node.name.tail && (
+          <tspan className="up-tail" dx={7}>
+            {node.name.tail}
+          </tspan>
+        )}
       </text>
-      <text className="up-sub" data-tone={node.tone} x={node.sub.x} y={node.sub.y}>
+      <text className="up-sub" data-tone={attention(node.tone)} x={node.sub.x} y={node.sub.y}>
         {node.sub.text}
       </text>
     </Node>
   );
 }
+
+/** A line's tone, said only where it needs attention: all's well reads plain. */
+const attention = (tone: Tone) => (tone === "ok" ? undefined : tone);
 
 function ServerView({ node, picked, prism, id, big }: { node: ServerNode; picked: boolean; prism: string; id: string; big: boolean }) {
   return (
@@ -249,7 +266,7 @@ function ServerView({ node, picked, prism, id, big }: { node: ServerNode; picked
       <text className={big ? "up-node-name" : "up-node-name up-node-name-small"} x={node.name.x} y={node.name.y} textAnchor={node.name.anchor}>
         {node.name.text}
       </text>
-      <text className="up-sub" data-tone={node.tone === "ok" ? undefined : node.tone} x={node.sub.x} y={node.sub.y} textAnchor={node.sub.anchor}>
+      <text className="up-sub" data-tone={attention(node.tone)} x={node.sub.x} y={node.sub.y} textAnchor={node.sub.anchor}>
         {node.sub.text}
       </text>
     </Node>
@@ -271,7 +288,7 @@ function RunnerView({ node, picked, prism, id }: { node: RunnerNode; picked: boo
       <text className="up-ink" x={node.name.x} y={node.name.y}>
         {node.name.text}
       </text>
-      <text className="up-sub" data-tone={node.tone} x={node.sub.x} y={node.sub.y}>
+      <text className="up-sub" data-tone={attention(node.tone)} x={node.sub.x} y={node.sub.y}>
         {node.sub.text}
       </text>
     </Node>

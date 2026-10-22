@@ -92,7 +92,7 @@ export const Changes = React.memo(function Changes({
     <div className="hx-changes">
       {wsBar}
       {agentId && (
-        <Loadable label="Loading its change request" fallback={<div className="hx-change-bar" aria-busy="true" />}>
+        <Loadable label="Loading its change request" fallback={<div className="hx-cr" aria-busy="true" />}>
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}

@@ -269,9 +269,11 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
-Mission Control shows only standalone kiln sessions, in a flat list. Managed children and native
-subagents are excluded from its rows, counts, filters, conversation search and bulk actions.
-Subagent status and output remain available inside the agent chats, including after they finish.
+Mission Control lists every agent kiln runs, in one flat list. An agent started through kiln's API
+is a top-level agent, whoever started it: a row of its own, in the counts, filters, conversation
+search and bulk actions, with no nesting under the agent that started it. A harness's own
+subagents stay subagents: they aren't rows, and their status and output stay inside their agent's
+chat, including after they finish.
 The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
@@ -479,7 +481,7 @@ Workspace → Its own volume; `agents.start` with `workspace: "volume"`) (docs/a
 
 ## Change requests from agents
 
-An agent's work goes up for review from its Changes tab (**Open change request**), or by the agent
+An agent's work goes up for review from its Changes tab (**Open PR**), or by the agent
 itself (`agents.change`; an agent may open one for its own work and for the agents it started)
 (docs/agentic.md, C1–C4):
 
@@ -499,12 +501,18 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
     the pull or merge request is opened through the provider when kiln has an integration with
     it; otherwise the change's link opens one.
   - A folder whose repository kiln doesn't know: the branch goes to its `origin`.
-- **Each push is a version.** Pushing again (**Push a new version**, or `agents.change` again)
+- **Each push is a version.** Pushing again (**Push update**, or `agents.change` again)
   makes the commit anew from the agent's files as they are then.
+- **Where it stands**, in a word above its files: **Pending** (not up for review yet), **Pushed**
+  (its branch is pushed, its pull request not opened yet), **Checking**, **Failed** or **Fixing**
+  (its checks failed; with **Auto-Fix** on, the agent fixes them), **Changes requested**,
+  **In review**, **Approved**, then **Merged** or **Closed**. While it's open, failing checks come
+  first, then changes asked for, then checks still running. On a card 400px wide or more it's one
+  line, what to do at its end; on a narrower one (a phone), a line each.
 - **What comes back** to the agent, as a message after its turn, while it runs: a comment on
   its change (with the file, the lines, the version and a link), a review asking for changes,
   CI that failed on its newest version (the failed legs and the first one's failure excerpt;
-  only when **Fix failing checks by itself** is on, which it is unless you turn it off when
+  only when **Auto-Fix** is on, which it is unless you turn it off when
   opening it), and the land queue taking it out (with the reason). Approvals and landing only
   update where it stands. An agent that has ended is sent nothing.
 - **A plan run's steps** (`plans.run` with `mode: "agents"`, steps in order; docs/agentic.md P4)
