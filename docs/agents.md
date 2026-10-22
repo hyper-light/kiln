@@ -73,17 +73,21 @@ Its **Programs** follow multi-stack programs (the critical path first), a row pe
 worker and how it stands, the goal under way, goals met, change requests, pass, threshold and
 usage, with the workers, slots and weights the person sets there ([programs.md](programs.md)).
 
-- **Order.** By default (Needs you first) the agents that wait on you come first, longest waiting
-  first, then those stopped, paused, finished since you last looked, working, ready, offline and
-  ended. The list follows the agents as they change: one that comes to need you rises at once.
-  While you use the list (a finger or button pressed on it, focus on one of its controls, a menu
-  or dialog open, agents selected, or a moment after the pointer last moved over it), its rows
-  hold still, then glide to their places. A sort chosen on purpose (by name, age, activity,
-  runner, harness or cost) is followed as it is.
-- **Requests anywhere.** On any other page (and an agent's page, for the other agents), each
-  agent's oldest request shows as a card at the top: a tool call is allowed or denied there, a
-  question or plan opens the agent. Two at once (one on a phone), then a line for the rest. ×, or
-  a swipe, puts one away until that agent asks for something else.
+- **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
+  paused for you) come first, longest waiting first, then those stopped, paused, finished since
+  you last looked, working, ready, offline and ended. The list follows the agents as they change:
+  one that comes to need you rises at once. While you use the list (a finger or button pressed on
+  it, focus on one of its controls, a menu or dialog open, agents selected, or a moment after the
+  pointer last moved over it), its rows hold still, then glide to their places. A sort chosen on
+  purpose (by name, age, activity, runner, harness or cost) is followed as it is.
+- **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
+  says what each agent has for you, the most pressing first: its oldest request (a tool call is
+  allowed or denied there, a question or plan opens the agent); goals it paused for you
+  (**Review the plan**, when they wait on one, and **Resume**); a stop of its own, its harness
+  ended with an error (**Restart**); a usage limit it reached, only said, with when it goes on.
+  Two at once (one on a phone), then a line for the rest. At the bottom right, above kiln's
+  passing notifications; on a phone at the top, under kiln's header, since the bottom is the
+  message box's. ×, or a swipe, puts one away until there's something new.
 - **Answers at once.** An answer shows as given wherever its request showed (its row, its card, the
   agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select

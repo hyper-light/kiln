@@ -14,7 +14,7 @@ use super::kept::{Job, Keeper, Kept};
 use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
-use super::session::{Info, MAX_NAME, Spec, SubagentBrief};
+use super::session::{Held, Info, MAX_NAME, Spec, SubagentBrief};
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
 use crate::rt::Broadcast;
@@ -527,6 +527,25 @@ impl Registry {
         hub.emit(&json!({"type": "harness", "info": info}));
     }
 
+    /// What each agent's goals wait on a person for (`goals::held_stacks`, every tick of the goals'
+    /// driver): each one that changes told to every viewer.
+    pub fn set_held(&self, hub: &Hub, held: &HashMap<String, Held>) {
+        let mut changed = Vec::new();
+        {
+            let mut g = self.mirrors.lock();
+            for (id, m) in g.iter_mut() {
+                let now = held.get(id).cloned();
+                if m.info.held != now {
+                    m.info.held = now;
+                    changed.push(m.info.clone());
+                }
+            }
+        }
+        for info in changed {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
+    }
+
     /// A session is given a name here (the "rename" control from any device; empty gives it its
     /// harness's name back): its page and every list show it at once.
     fn rename(&self, hub: &Hub, id: &str, value: Option<&Value>) {
@@ -841,7 +860,9 @@ impl Registry {
         {
             let mut g = self.mirrors.lock();
             if let Update::Open { info } = &u {
-                let info = (**info).clone();
+                let mut info = (**info).clone();
+                // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
+                info.held = g.get(id).and_then(|m| m.info.held.clone());
                 let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone()));
                 m.info = info.clone();
                 m.reported = reported;
@@ -1199,6 +1220,7 @@ impl Registry {
                         pause: None,
                         last_turn: None,
                         keep_off: false,
+                        held: None,
                         move_on_limit: false,
                         move_plan: Default::default(),
                         pause_at: None,
