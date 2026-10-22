@@ -64,6 +64,11 @@ export function periodOf(batchesPerSecond: number | null | undefined): number | 
   return Math.min(6, Math.max(1.2, 1 / batchesPerSecond));
 }
 
+/** A store's cable's pace while batches move on it: about a light a batch, the slowest while its rate isn't known yet; none when nothing moves. */
+export function paceOf(s: ConvoStore, now: number): number | null {
+  return moving(s, now) ? (periodOf(s.rates.batches) ?? 6) : null;
+}
+
 /** Rows to come as marks at a cable's start: one for a few, one more for each ten times as many, at most six. */
 export function marksOf(behind: number): number {
   return behind > 0 ? Math.min(6, 1 + Math.floor(Math.log10(behind))) : 0;
@@ -74,6 +79,12 @@ const at = (p: P) => `${f(p[0])} ${f(p[1])}`;
 
 export function cylinder(p: Plate): Cylinder {
   return { x: p.x, rx: p.w * 0.68, ry: p.h * 0.25, top: p.y - p.h * 0.67 * 0.46, depth: p.h * 0.67 };
+}
+
+/** Where a database's heading sits: over its middle, just clear of the top of its cap. */
+export function above(p: Plate, gap = 16): P {
+  const d = cylinder(p);
+  return [p.x, d.top - d.ry - gap];
 }
 
 /** Where a cable meets a database: its left or right side, `level` of the way down. */
@@ -170,8 +181,9 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
   if (!portrait) {
     const width = 960;
     const height = Math.max(300, last + 71);
-    const sp: Plate = { x: 520, y: mid - 9, w: 110, h: 66 };
-    const mp: Plate = { x: 794, y: mid - 9, w: 88, h: 55 };
+    // Level with the stores' middle, low enough for their headings over them however few stores there are.
+    const sp: Plate = { x: 520, y: Math.max(mid - 9, 80), w: 110, h: 66 };
+    const mp: Plate = { x: 794, y: sp.y, w: 88, h: 55 };
     const sources = stores.map((s, i) => {
       const plate: Plate = { x: 250, y: ys[i]!, w: 36, h: 25 };
       const sub = sourceSub(s, now);
@@ -185,17 +197,19 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
         sub: { text: sub.text, at: [30, ys[i]! + 16] as P, anchor: "start" as const, tone: sub.tone },
         hit: { x: 22, y: ys[i]! - 25, w: 262, h: 54 },
         title: `${s.machine}: its store, ${sub.text.toLowerCase()}`,
-        cable: curve(port(plate, "right"), port(sp, "left", level(i)), 76, 66, behind, moving(s, now) ? periodOf(s.rates.batches) : null, tone),
+        cable: curve(port(plate, "right"), port(sp, "left", level(i)), 76, 66, behind, paceOf(s, now), tone),
       };
     });
+    // The server's and the mirror's headings just over their databases, on one line.
+    const heads = above(sp)[1];
     return {
       width,
       height,
       headings: [
         { text: "RUNNER STORES", at: [30, 22], anchor: "start" },
-        { text: "SERVER", at: [sp.x, 36], anchor: "middle" },
-        { text: "MIRROR", at: [mp.x, 36], anchor: "middle" },
-        { text: "MIRROR FEED", at: [(sp.x + sp.w * 0.68 + mp.x - mp.w * 0.68) / 2, mid - 41], anchor: "middle" },
+        { text: "SERVER", at: [sp.x, heads], anchor: "middle" },
+        { text: "MIRROR", at: [mp.x, heads], anchor: "middle" },
+        { text: "MIRROR FEED", at: [(sp.x + sp.w * 0.68 + mp.x - mp.w * 0.68) / 2, sp.y - 32], anchor: "middle" },
       ],
       sources,
       server: {
@@ -224,7 +238,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
                 64,
                 64,
                 mirror.connected ? (mirror.mirror?.behind ?? 0) : 0,
-                moving(mirror, now) ? periodOf(mirror.rates.batches) : null,
+                paceOf(mirror, now),
                 mirror.connected ? (sub.tone === "warn" ? "warn" : undefined) : "off",
               ),
             };
@@ -233,10 +247,11 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
     };
   }
 
-  // A phone: the stores down the left, the server to their right, the mirror below it all.
+  // A phone: the stores down the left, the server to their right, the mirror below it all, each
+  // heading just over its database: the server low enough for its own, the mirror's under its words.
   const width = 360;
-  const sp: Plate = { x: 267, y: mid - 22, w: 66, h: 50 };
-  const mp: Plate = { x: 267, y: last + 67, w: 54, h: 42 };
+  const sp: Plate = { x: 267, y: Math.max(mid - 22, 62), w: 66, h: 50 };
+  const mp: Plate = { x: 267, y: Math.max(last + 67, sp.y + 141), w: 54, h: 42 };
   const height = mp.y + 62;
   const sources = stores.map((s, i) => {
     const plate: Plate = { x: 150, y: ys[i]!, w: 24, h: 18 };
@@ -251,7 +266,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
       sub: { text: short(sub.text), at: [20, ys[i]! + 16] as P, anchor: "start" as const, tone: sub.tone },
       hit: { x: 13, y: ys[i]! - 25, w: 160, h: 54 },
       title: `${s.machine}: its store, ${sub.text.toLowerCase()}`,
-      cable: curve(port(plate, "right"), port(sp, "left", level(i)), 28, 32, behind, moving(s, now) ? periodOf(s.rates.batches) : null, tone),
+      cable: curve(port(plate, "right"), port(sp, "left", level(i)), 28, 32, behind, paceOf(s, now), tone),
     };
   });
   let mirrorNode: ReplicationScene["mirror"] = null;
@@ -266,7 +281,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
       key: mirror.key,
       plate: mp,
       big: true,
-      heading: { text: "MIRROR", at: [20, mp.y - 14], anchor: "start" },
+      heading: { text: "MIRROR", at: above(mp, 14), anchor: "middle" },
       name: { text: plateName(mirror.machine, 24), at: [20, mp.y + 8], anchor: "start" },
       sub: { text: sub.text, at: [20, mp.y + 29], anchor: "start", tone: sub.tone },
       hit: { x: 13, y: mp.y - 30, w: 300, h: 77 },
@@ -274,7 +289,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
       cable: {
         d: `M${at(a)} C${f(x - 4)} ${f(a[1])} ${f(x)} ${f(a[1] + 14)} ${f(x)} ${f(a[1] + 39)} L${f(x)} ${f(b[1] - 49)} C${f(x)} ${f(b[1] - 16)} ${f(x - 19)} ${f(b[1])} ${at(b)}`,
         arrow: chevron({ p: [x, midY], d: [0, 1] }),
-        period: moving(mirror, now) ? periodOf(mirror.rates.batches) : null,
+        period: paceOf(mirror, now),
         marks: [],
         tone,
       },
@@ -285,7 +300,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
     height,
     headings: [
       { text: "RUNNER STORES", at: [20, 22], anchor: "start" },
-      { text: "SERVER", at: [sp.x, sp.y - 64], anchor: "middle" },
+      { text: "SERVER", at: above(sp, 14), anchor: "middle" },
     ],
     sources,
     server: {
