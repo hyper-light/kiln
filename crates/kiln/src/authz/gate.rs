@@ -133,6 +133,17 @@ impl Caller {
         self
     }
 
+    /// Whether its token's own grant, if it has one, allows `capability` in `target`: how far a
+    /// token may go on what its user is (an app's owner team, docs/deploy-api.md §15).
+    pub fn token_allows(&self, capability: &str, target: &Scope) -> bool {
+        self.limit.as_ref().is_none_or(|l| l.allows(capability, target))
+    }
+
+    /// Whether its token's own grant, if it has one, gives `capability` anywhere.
+    pub fn token_somewhere(&self, capability: &str) -> bool {
+        self.limit.as_ref().is_none_or(|l| l.somewhere(capability))
+    }
+
     /// Whether it has `capability` anywhere (a route that narrows by itself).
     pub fn has_somewhere(&self, capability: &str) -> bool {
         capability == SIGNED_IN || [&self.rights, &self.limit].into_iter().all(|r| r.as_ref().is_none_or(|r| r.somewhere(capability)))
@@ -419,7 +430,7 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
             Some(r) => repo_scope(hub, r).await,
             None => Scope::Server,
         },
-        At::Server | At::Anywhere | At::Own => Scope::Server,
+        At::Server | At::Anywhere | At::Own | At::Deploy => Scope::Server,
     }
 }
 
@@ -444,7 +455,8 @@ pub async fn repo_scope(hub: &Hub, s: &str) -> Scope {
 /// anywhere, or the caller's own).
 pub fn decide(caller: &Caller, rule: &super::Rule, target: Option<&Scope>) -> bool {
     match (rule.at, target) {
-        (At::Anywhere, _) => caller.has_somewhere(rule.capability),
+        // The owner-team half of a deploy route needs the store: [`check`] adds it.
+        (At::Anywhere | At::Deploy, _) => caller.has_somewhere(rule.capability),
         (At::Own, _) => caller.kind != Kind::Job,
         (_, Some(t)) => caller.can(rule.capability, t),
         (_, None) => caller.can(rule.capability, &Scope::Server),
@@ -458,10 +470,19 @@ pub async fn check(hub: &Hub, caller: &Caller, method: &Method, segs: &[&str], q
     }
     let rule = super::rule(method, segs);
     let scope = match rule.at {
-        At::Anywhere | At::Own => None,
+        At::Anywhere | At::Own | At::Deploy => None,
         at => Some(target(hub, at, segs, q).await),
     };
     if decide(caller, rule, scope.as_ref()) {
+        return Ok(());
+    }
+    // A person in a group may be in an app's owner team (docs/deploy-api.md §15), as far as their
+    // token lets them deploy anywhere: the handler checks which app, and where.
+    if rule.at == At::Deploy
+        && let Some(user) = &caller.user
+        && caller.token_somewhere(rule.capability)
+        && !super::groups::of_user(hub, user).await.unwrap_or_default().is_empty()
+    {
         return Ok(());
     }
     let on = scope.map(|s| format!(" on {}", s.text())).unwrap_or_default();
@@ -496,7 +517,7 @@ mod tests {
                 }
                 // On one repository: that repository only (and the routes that narrow themselves).
                 let scoped = Caller::with(Kind::User, name, Some(rights(&[&format!("{name}@repo:acme/app")])), None);
-                let narrows = matches!(rule.at, At::Anywhere | At::Own);
+                let narrows = matches!(rule.at, At::Anywhere | At::Own | At::Deploy);
                 assert_eq!(decide(&scoped, rule, Some(&app)), has(rule.capability) || rule.at == At::Own, "{name}@repo: {} on its repository", rule.pattern);
                 assert_eq!(decide(&scoped, rule, Some(&other)), rule.capability == SIGNED_IN || rule.at == At::Own || (narrows && has(rule.capability)), "{name}@repo: {} elsewhere", rule.pattern);
                 assert_eq!(decide(&scoped, rule, Some(&Scope::Server)), rule.capability == SIGNED_IN || rule.at == At::Own || (narrows && has(rule.capability)), "{name}@repo: {} on the server", rule.pattern);
@@ -506,7 +527,7 @@ mod tests {
             let agent = Caller::with(Kind::Agent, "agent:fix", Some(rights(&["maintainer"])), Some(rights(&["viewer@repo:acme/app"])));
             let reads = role("viewer").unwrap_or_default().contains(&rule.capability) || rule.capability == SIGNED_IN;
             assert_eq!(decide(&agent, rule, Some(&app)), reads || rule.at == At::Own, "agent: {} on its repository", rule.pattern);
-            let narrows = matches!(rule.at, At::Anywhere | At::Own);
+            let narrows = matches!(rule.at, At::Anywhere | At::Own | At::Deploy);
             assert_eq!(decide(&agent, rule, Some(&other)), rule.capability == SIGNED_IN || rule.at == At::Own || (narrows && reads), "agent: {} elsewhere", rule.pattern);
             // A deny wins over the role.
             let denied = Caller::with(Kind::User, "d", Some(rights(&["admin", &format!("!{}@repo:acme/app", rule.capability)])), None);

@@ -297,6 +297,7 @@ mod tests {
             concurrency: Default::default(),
             agents: Default::default(),
             argocd: Default::default(),
+            owners: Default::default(),
         }
     }
 

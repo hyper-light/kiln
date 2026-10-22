@@ -390,7 +390,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
     }
     let mut req = req;
     req.extensions_mut().insert(caller.clone());
-    if matches!(s.get(1), Some(&("users" | "grants" | "roles" | "tokens"))) {
+    if matches!(s.get(1), Some(&("users" | "groups" | "grants" | "roles" | "tokens"))) {
         return match boxed(|| crate::authz::api::route(&hub, &caller, &method, &s, &q, req)).await {
             Some(r) => r.map_err(|(c, m)| err(c, m)),
             None => Err(err(StatusCode::NOT_FOUND, "not found")),
@@ -2032,6 +2032,12 @@ fn logout() -> Response {
 
 async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     let caller = caller_of(hub, headers).await;
+    // The groups the person is in (kiln's, and their identity providers'): the owner teams they may
+    // name for an app (docs/deploy-api.md §3.1).
+    let groups = match caller.as_ref().and_then(|c| c.user.clone()) {
+        Some(u) => crate::authz::groups::of_user(hub, &u).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
     // What discovery announces anyway (when it does), so a probe can tell which instance answers.
     let d = &hub.discovery;
     let announced = d.announcing().then(|| {
@@ -2050,6 +2056,7 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "principal": caller.as_ref().map(|c| c.name.clone()),
             "kind": caller.as_ref().map(|c| c.kind),
             "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
+            "groups": groups,
             "public_url": hub.cfg.server.public_url,
             // Where pages agents show are served, when not here (docs/previews.md).
             "pages_url": hub.cfg.server.pages_url,

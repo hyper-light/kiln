@@ -116,6 +116,7 @@ function Settings({ e }: { e: Environment }) {
   );
   const [concurrency, setConcurrency] = React.useState(e.concurrency);
   const [agents, setAgents] = React.useState(e.agents);
+  const [ownersRelease, setOwnersRelease] = React.useState(e.owners?.release ?? false);
   const [pulls, setPulls] = React.useState(g.via === "pull-request");
   const [busy, setBusy] = React.useState(false);
   // Pull requests (GitLab's merge requests) where the release repository is on another host.
@@ -153,7 +154,7 @@ function Settings({ e }: { e: Environment }) {
     };
     setBusy(true);
     try {
-      await deployApi.putEnvironment({ ...e, gates, concurrency, agents });
+      await deployApi.putEnvironment({ ...e, gates, concurrency, agents, owners: { release: ownersRelease } });
       toast({ title: `${e.name} is saved`, description: "Releases asked for from now on pass its gates as they are.", tone: "succeeded" });
       invalidate("deploy/");
     } catch (err) {
@@ -289,6 +290,9 @@ function Settings({ e }: { e: Environment }) {
           </label>
           <label className="cd-new-check">
             <input type="checkbox" className="check" checked={agents.approve} onChange={(ev) => setAgents({ ...agents, approve: ev.target.checked })} /> Agents may approve here
+          </label>
+          <label className="cd-new-check">
+            <input type="checkbox" className="check" checked={ownersRelease} onChange={(ev) => setOwnersRelease(ev.target.checked)} /> An app's owner teams may release it here
           </label>
         </div>
       </div>
@@ -555,6 +559,7 @@ function EnvView({ name }: { name: string }) {
               ...(platforms.length ? [{ label: "Platforms", value: platforms.join(", ") }] : []),
               { label: "Concurrency", value: e.concurrency === "queue" ? "a release waits for the one before" : "one release at a time; another is refused" },
               { label: "Agents", value: e.agents.deploy ? (e.agents.approve ? "release and approve here" : "release here") : "may not release here" },
+              { label: "Owners", value: e.owners?.release ? "an app's owner teams release it here" : "release here with environments.deploy on it" },
             ]}
           />
         </Panel>

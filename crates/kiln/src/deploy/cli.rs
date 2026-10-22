@@ -513,6 +513,10 @@ enum EnvCmd {
         /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
         #[arg(long)]
         agents: bool,
+        /// An app's owner teams may release it here without environments.deploy on it
+        /// (docs/deploy-api.md §15).
+        #[arg(long)]
+        owners_release: bool,
         /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after (an
         /// environment of a linked server as `staging@eu`), soak, approvals, windows, checks (built
         /// in by name, or `{name, http: {url}}`, `{name, workflow: {repository, workflow, ref}}`),
@@ -1241,7 +1245,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, host, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates, applications } => {
+        EnvCmd::Add { env, provider, host, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, owners_release, gates, applications } => {
             let gates: Value = match gates {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1258,6 +1262,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
                 "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },
                 "concurrency": if queue { "queue" } else { "reject" },
                 "agents": { "deploy": agents },
+                "owners": { "release": owners_release },
                 "gates": gates,
                 "argocd": { "applications": applications },
             });

@@ -143,6 +143,8 @@ export interface Environment {
   gates: Gates;
   concurrency: "reject" | "queue";
   agents: { deploy: boolean; approve: boolean };
+  /** What an app's owner teams may do here without environments.deploy on it (docs/deploy-api.md §15). */
+  owners?: { release: boolean };
   /** On Argo CD: kiln writes each Application itself, rather than through the environment's ApplicationSet. */
   argocd?: { applications: boolean };
 }

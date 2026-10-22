@@ -2578,7 +2578,8 @@ elsewhere (G-24, G-33).
   `routing.manage`, `environments.deploy`, `environments.manage`, `diffs.read`, `diffs.submit`,
   `diffs.review`, `diffs.land`, `queue.manage`, `agents.run`, `agents.attach`, `experiments.run`,
   `settings.manage`, `tokens.manage`, `users.manage`, `audit.read`. Scopes: server, organization,
-  repository, workflow, environment, runner, pool. Roles `viewer`, `developer`, `maintainer`,
+  repository, workflow, environment, runner, pool, and a deploy environment (`deploy:<env>`,
+  deploy-api.md §15). Roles `viewer`, `developer`, `maintainer`,
   `admin`, `owner` as access.md defines, plus custom roles. An explicit deny wins.
 - **W10-R03 Tokens**, stored as SHA-256 hashes with their last use: personal access tokens
   `kiln_pat_<id>_<secret>` (≤ 1 year), agent tokens `kiln_agt_<id>_<secret>` (rotated hourly while

@@ -103,12 +103,82 @@ pub(super) fn emit_release(d: &Deploy, r: &Release) {
 pub struct Who {
     pub name: String,
     pub agent: bool,
+    /// What it may do; `None`: kiln itself (a promotion, a revert), or a server without sign-in.
+    pub caller: Option<crate::authz::Caller>,
 }
 
 impl Who {
     pub fn of(caller: &crate::authz::Caller) -> Self {
-        Self { name: caller.name.clone(), agent: caller.kind == crate::authz::gate::Kind::Agent }
+        Self { name: caller.name.clone(), agent: caller.kind == crate::authz::gate::Kind::Agent, caller: Some(caller.clone()) }
     }
+
+    /// kiln itself, or a caller it acts for that isn't checked again (`name` for the audit).
+    pub fn kiln(name: impl Into<String>) -> Self {
+        Self { name: name.into(), agent: false, caller: None }
+    }
+}
+
+/// The deploy environment as an authorization scope.
+fn deploy_scope(env: &str) -> crate::authz::Scope {
+    crate::authz::Scope::Deploy { environment: env.to_owned() }
+}
+
+/// Releasing every app in an environment (§15): `environments.deploy` on it, or on the server.
+fn may_deploy(who: &Who, env: &Environment, what: &str) -> Result<(), Fail> {
+    match &who.caller {
+        Some(c) if !c.can("environments.deploy", &deploy_scope(&env.name)) => {
+            Err((StatusCode::FORBIDDEN, format!("{} may not {what} in {}: that needs environments.deploy on it (deploy:{})", who.name, env.name, env.name)))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Releasing an app in an environment (§15): what [`may_deploy`] allows, or being in one of the
+/// app's owner teams where the environment lets owners release (a token as far as its own grant
+/// would let it deploy there).
+pub async fn may_release(d: &Deploy, who: &Who, a: &App, env: &Environment, what: &str) -> Result<(), Fail> {
+    let Some(c) = &who.caller else { return Ok(()) };
+    let scope = deploy_scope(&env.name);
+    if c.can("environments.deploy", &scope) {
+        return Ok(());
+    }
+    if env.owners.release
+        && let Some(user) = &c.user
+        && c.token_allows("environments.deploy", &scope)
+        && crate::authz::groups::member_of_any(&d.hub, user, &a.owners).await.map_err(internal)?
+    {
+        return Ok(());
+    }
+    let owners = if a.owners.is_empty() { format!("{} has no owner team", a.name) } else { format!("its owner teams are {}", a.owners.join(", ")) };
+    let lets = if env.owners.release { "" } else { ", and this environment doesn't let owners release (owners: { release: true })" };
+    Err((StatusCode::FORBIDDEN, format!("{} may not {what} {} in {}: that needs environments.deploy on deploy:{}, or a place in one of its owner teams ({owners}){lets}", who.name, a.name, env.name, env.name)))
+}
+
+/// Who may give an app its owner teams (§3.1): each a group (kiln's, or an identity provider's);
+/// someone in the owner team it gets (and in the one it had, when that changes), unless an admin.
+async fn owners_ok(d: &Deploy, who: &Who, owners: &[String], had: Option<&[String]>) -> Result<(), Fail> {
+    for o in owners {
+        crate::authz::groups::ref_ok(o).map_err(bad)?;
+    }
+    if owners.len() > 3 {
+        return Err(bad("owner teams: the owner, and a co-owner and an ops owner at most"));
+    }
+    let Some(c) = &who.caller else { return Ok(()) };
+    if crate::authz::groups::admin(c) || had.is_some_and(|h| h == owners) {
+        return Ok(());
+    }
+    let forbidden = |m: String| (StatusCode::FORBIDDEN, m);
+    let Some(user) = &c.user else { return Err(forbidden(format!("{} may not give an app its owners: a person in its owner team does, or an administrator", who.name))) };
+    let Some(owner) = owners.first() else { return Err(forbidden("name the app's owner team, one you're in (owners: [<group>, …])".to_owned())) };
+    if !crate::authz::groups::member_of_any(&d.hub, user, std::slice::from_ref(owner)).await.map_err(internal)? {
+        return Err(forbidden(format!("{} isn't in {owner}: an app's owner team is one its maker is in, unless an administrator makes it", who.name)));
+    }
+    if let Some(before) = had.and_then(|h| h.first())
+        && !crate::authz::groups::member_of_any(&d.hub, user, std::slice::from_ref(before)).await.map_err(internal)?
+    {
+        return Err(forbidden(format!("{} isn't in {before}, the owner team the app has: someone in it, or an administrator, changes its owners", who.name)));
+    }
+    Ok(())
 }
 
 /// Agents change what runs only where the environment lets them.
@@ -375,7 +445,14 @@ async fn environment(d: &Deploy, name: &str) -> Result<Environment, Fail> {
 
 // ------------------------------------------------------------------ apps
 
-pub async fn put_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
+pub async fn put_app(d: &Deploy, who: &Who, a: App) -> Result<App, Fail> {
+    let had = store::app(&d.hub.store, &a.name).await.map_err(internal)?.map(|a| a.owners);
+    owners_ok(d, who, &a.owners, had.as_deref()).await?;
+    keep_app(d, &who.name, a).await
+}
+
+/// An app checked and kept, its owners already allowed.
+async fn keep_app(d: &Deploy, actor: &str, a: App) -> Result<App, Fail> {
     check_app(d, &a).await?;
     store::put_app(&d.hub.store, &a).await.map_err(internal)?;
     audit(d, actor, "deploy.app.put", a.name.clone()).await;
@@ -491,7 +568,11 @@ pub struct AppAsk {
 }
 
 /// Creates (or replaces) an app from what was asked: what its template gives fills what wasn't.
-pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fail> {
+pub async fn create_app(d: &Deploy, who: &Who, ask: AppAsk) -> Result<App, Fail> {
+    let actor = who.name.as_str();
+    // Its owners first: nothing is made (its repository) for an app its maker may not own.
+    let before = store::app(&d.hub.store, &ask.name).await.map_err(internal)?;
+    owners_ok(d, who, &ask.owners, before.as_ref().map(|a| a.owners.as_slice())).await?;
     let t = match &ask.template {
         Some(name) => Some(template(d, name).await?),
         None => None,
@@ -507,7 +588,7 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         None => from_template()?.ok_or_else(|| bad("how is it deployed? give a package, or a template that has one"))?,
     };
     let namespace = ask.namespace.clone().or_else(|| t.as_ref().and_then(|t| t.namespace.as_ref()).map(|p| p.replace("{app}", &ask.name)));
-    let had = store::app(&d.hub.store, &ask.name).await.map_err(internal)?.and_then(|a| a.source);
+    let had = before.and_then(|a| a.source);
     let mut a = App {
         name: ask.name,
         project: ask.project.unwrap_or_else(|| "default".to_owned()),
@@ -533,7 +614,7 @@ pub async fn create_app(d: &Deploy, actor: &str, ask: AppAsk) -> Result<App, Fai
         }
         (None, None, None) => None,
     };
-    put_app(d, actor, a).await.map_err(|(code, why)| match &made {
+    keep_app(d, actor, a).await.map_err(|(code, why)| match &made {
         Some(r) => (code, format!("{why} (its repository {r} is made: give it as the app's source)")),
         None => (code, why),
     })
@@ -577,12 +658,13 @@ pub struct AppPatch {
 
 /// Changes what a patch gives of an app; the package's change reaches each environment with its
 /// next release.
-pub async fn patch_app(d: &Deploy, actor: &str, name: &str, p: AppPatch) -> Result<App, Fail> {
+pub async fn patch_app(d: &Deploy, who: &Who, name: &str, p: AppPatch) -> Result<App, Fail> {
     let mut a = app(d, name).await?;
     if let Some(x) = p.project {
         a.project = x;
     }
     if let Some(x) = p.owners {
+        owners_ok(d, who, &x, Some(&a.owners)).await?;
         a.owners = x;
     }
     if let Some(x) = p.package {
@@ -609,7 +691,7 @@ pub async fn patch_app(d: &Deploy, actor: &str, name: &str, p: AppPatch) -> Resu
     if let Some(x) = p.archived {
         a.archived = x;
     }
-    put_app(d, actor, a).await
+    keep_app(d, &who.name, a).await
 }
 
 /// Whether `name` is free for a new app, and why not.
@@ -967,6 +1049,7 @@ pub async fn fleet(d: &Deploy, who: &Who, f: FleetAsk) -> Result<Value, Fail> {
     }
     let env = store::environment(&d.hub.store, &f.environment).await.map_err(internal)?.ok_or_else(|| missing(format!("no environment {}", f.environment)))?;
     agents_may(who, &env, "release apps")?;
+    may_deploy(who, &env, "release apps across")?;
     let id = f.idempotency_key.clone().unwrap_or_else(crate::util::new_id);
     let registered: Vec<String> = store::registrations(&d.hub.store, None, Some(&env.name)).await.map_err(internal)?.into_iter().map(|r| r.app).collect();
     let apps: Vec<App> = store::apps(&d.hub.store)
@@ -1050,6 +1133,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     let env = environment(d, &ask.environment).await?;
     let _reg = registration(d, &ask.app, &ask.environment).await?;
     agents_may(who, &env, "release apps")?;
+    may_release(d, who, &a, &env, "release").await?;
     let key = ask.idempotency_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned);
     if key.as_ref().is_some_and(|k| k.len() > 255) {
         return Err(bad("an idempotency key is at most 255 characters"));
@@ -1191,7 +1275,12 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
 pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Release, Fail> {
     let actor = who.name.as_str();
     let mut r = store::release(&d.hub.store, id).await.map_err(internal)?.ok_or_else(|| missing(format!("no release {id}")))?;
-    agents_may(who, &environment(d, &r.environment).await?, "cancel releases")?;
+    let env = environment(d, &r.environment).await?;
+    agents_may(who, &env, "cancel releases")?;
+    match store::app(&d.hub.store, &r.app).await.map_err(internal)? {
+        Some(a) => may_release(d, who, &a, &env, "cancel a release of").await?,
+        None => may_deploy(who, &env, "cancel releases")?,
+    }
     let was = r.state;
     match was {
         State::Waiting | State::WaitingApproval | State::Delivering => {}
@@ -2032,7 +2121,7 @@ async fn promote_onward(d: &Deploy, landed: &Release) {
             return;
         }
     };
-    let who = Who { name: landed.requested_by.clone(), agent: false };
+    let who = Who::kiln(landed.requested_by.clone());
     for env in next {
         // A registration that needs a person is theirs to release to.
         if let Ok(Some(reg)) = store::registration(st, &landed.app, &env).await
@@ -2497,6 +2586,7 @@ mod tests {
             concurrency: Default::default(),
             agents: super::super::model::AgentPolicy { deploy: agents_deploy, approve: false },
             argocd: Default::default(),
+            owners: Default::default(),
         }
     }
 
@@ -2649,5 +2739,115 @@ mod tests {
         assert!(matches!(agents_may(&agent, &env(false), "release apps"), Err((StatusCode::FORBIDDEN, m)) if m.contains("agents: { deploy: true }")));
         assert!(agents_may(&agent, &env(true), "release apps").is_ok());
         assert!(agents_may(&person, &env(false), "release apps").is_ok(), "a person releases anywhere the route table lets them");
+    }
+
+    /// A person as the gate hands them to the flow: their user (`<name>-id`) and grants, and a
+    /// token's own grant when they came with one.
+    fn person(name: &str, grants: &[&str], token: Option<&[&str]>) -> Who {
+        let rights = |g: &[&str]| crate::authz::Rights { grants: g.iter().filter_map(|g| crate::authz::Grant::parse(g).ok()).collect(), custom: Default::default() };
+        let mut c = crate::authz::Caller::with(CallerKind::User, &format!("user:{name}"), Some(rights(grants)), token.map(rights));
+        c.user = Some(format!("{name}-id"));
+        Who::of(&c)
+    }
+
+    /// docs/deploy-api.md §3.1 and §15: an app's owner teams are groups (kiln's, or an identity
+    /// provider's); its owners release it where their environment lets them, a deployer anywhere
+    /// they have environments.deploy, a token no further than its own grant; an app's owners are
+    /// given by someone in its owner team (the one it has, and the one it gets), or an admin.
+    #[test]
+    fn owners_release_their_app_where_their_environment_lets_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                remote: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let st = &hub.store;
+            // ada is in kiln's group shop; carol in acme/platform on GitHub, as she last signed in.
+            st.call(|c| {
+                c.execute_batch(
+                    "INSERT INTO user_groups (name, created_at, created_by) VALUES ('shop', 0, 'admin'), ('payments', 0, 'admin');
+                     INSERT INTO user_group_members (group_name, user_id, added_at, added_by) VALUES ('shop', 'ada-id', 0, 'admin'), ('payments', 'bob-id', 0, 'admin');
+                     INSERT INTO user_identities (provider, subject, user_id, login, groups, created_at, last_at) VALUES ('github', '42', 'carol-id', 'carol', '[\"acme\",\"acme/platform\"]', 0, 0);",
+                )?;
+                Ok(())
+            })
+            .await?;
+            let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec!["shop".into(), "github:acme/platform".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+            store::put_app(st, &web).await?;
+            for (name, owners) in [("staging", true), ("production", false)] {
+                let mut e = Environment { name: name.into(), ..env(false) };
+                e.owners.release = owners;
+                store::put_environment(st, &e).await?;
+                store::put_registration(st, &Registration { app: "web".into(), environment: name.into(), enabled: true, paused: false, running: Some(1), created_at: 0, degraded: None }).await?;
+            }
+            let (Some(staging), Some(production)) = (store::environment(st, "staging").await?, store::environment(st, "production").await?) else { anyhow::bail!("the environments") };
+            let forbidden = |r: &Result<(), Fail>| matches!(r, Err((StatusCode::FORBIDDEN, _)));
+            let viewer: &[&str] = &["viewer"];
+            let (ada, bob, carol) = (person("ada", viewer, None), person("bob", viewer, None), person("carol", viewer, None));
+            let dave = person("dave", &["environments.deploy@deploy:production"], None);
+
+            // Owners, kiln's group or GitHub's, where the environment lets them; nobody else.
+            anyhow::ensure!(may_release(&d, &ada, &web, &staging, "release").await.is_ok(), "ada is in shop");
+            anyhow::ensure!(may_release(&d, &carol, &web, &staging, "release").await.is_ok(), "carol is in github:acme/platform");
+            let r = may_release(&d, &ada, &web, &production, "release").await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("doesn't let owners release"), "production doesn't let owners: {r:?}");
+            let r = may_release(&d, &bob, &web, &staging, "release").await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("shop, github:acme/platform"), "bob owns nothing of web: {r:?}");
+            // A deployer of one environment releases there, whoever owns the app, and nowhere else.
+            anyhow::ensure!(may_release(&d, &dave, &web, &production, "release").await.is_ok());
+            anyhow::ensure!(forbidden(&may_release(&d, &dave, &web, &staging, "release").await));
+            anyhow::ensure!(may_deploy(&dave, &production, "release apps across").is_ok() && may_deploy(&dave, &staging, "release apps across").is_err());
+            anyhow::ensure!(may_deploy(&ada, &staging, "release apps across").is_err(), "a fleet is a deployer's: owners have their own apps, not the environment");
+            // ada's token, held to reading, releases nothing on the strength of her team.
+            let reading = person("ada", viewer, Some(&["runs.read"]));
+            anyhow::ensure!(forbidden(&may_release(&d, &reading, &web, &staging, "release").await));
+            // kiln itself (a promotion, a revert) is never stopped.
+            anyhow::ensure!(may_release(&d, &Who::kiln("kiln"), &web, &production, "release").await.is_ok());
+
+            // Through the flow: a release, and its cancel, are its owners'.
+            let ask = || Ask { app: "web".into(), environment: "staging".into(), values: Some("replicaCount: 2\n".into()), ..Ask::default() };
+            let r = release(&d, &bob, ask()).await;
+            anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "{r:?}");
+            let made = release(&d, &ada, ask()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            // Waiting on its gates, it can be cancelled.
+            let mut waiting = made.clone();
+            waiting.state = State::Waiting;
+            anyhow::ensure!(store::update_release(st, &waiting, made.state).await?);
+            let r = cancel(&d, &bob, made.id, false).await;
+            anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "bob cancels nothing of web: {r:?}");
+            let gone = cancel(&d, &carol, made.id, false).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            anyhow::ensure!(gone.state == State::Cancelled, "a co-owner cancels: {gone:?}");
+            let fleet_ask = FleetAsk { environment: "staging".into(), apps: vec![], template: None, project: None, owner: None, version: None, set: [("replicaCount".to_owned(), "3".to_owned())].into(), idempotency_key: None };
+            let r = fleet(&d, &ada, fleet_ask).await;
+            anyhow::ensure!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "{r:?}");
+
+            // Who gives an app its owners.
+            let names = |o: &[&str]| o.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+            anyhow::ensure!(owners_ok(&d, &ada, &names(&["shop"]), None).await.is_ok(), "ada makes an app shop owns");
+            anyhow::ensure!(owners_ok(&d, &ada, &names(&["shop", "payments", "github:acme/platform"]), None).await.is_ok(), "with a co-owner and an ops owner she isn't in");
+            let r = owners_ok(&d, &ada, &names(&["payments"]), None).await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("isn't in payments"), "{r:?}");
+            anyhow::ensure!(forbidden(&owners_ok(&d, &ada, &[], None).await), "a person names an owner team");
+            anyhow::ensure!(matches!(owners_ok(&d, &ada, &names(&["slack:acme"]), None).await, Err((StatusCode::BAD_REQUEST, _))));
+            anyhow::ensure!(matches!(owners_ok(&d, &ada, &names(&["a", "b", "c", "d"]), None).await, Err((StatusCode::BAD_REQUEST, _))), "three at most");
+            let admin = person("root", &["admin"], None);
+            anyhow::ensure!(owners_ok(&d, &admin, &names(&["anyone"]), None).await.is_ok() && owners_ok(&d, &Who::kiln("kiln"), &[], None).await.is_ok());
+            // Changing them: someone in the team it has, and in the one it gets.
+            let had = names(&["shop"]);
+            anyhow::ensure!(owners_ok(&d, &ada, &names(&["shop", "payments"]), Some(&had)).await.is_ok());
+            let r = owners_ok(&d, &bob, &names(&["payments"]), Some(&had)).await;
+            anyhow::ensure!(forbidden(&r) && format!("{r:?}").contains("the owner team the app has"), "bob takes nothing over: {r:?}");
+            anyhow::ensure!(forbidden(&owners_ok(&d, &ada, &names(&["payments"]), Some(&had)).await), "nor gives it to a team she isn't in");
+            anyhow::ensure!(owners_ok(&d, &bob, &had, Some(&had)).await.is_ok(), "owners unchanged need nothing");
+            Ok(())
+        })
     }
 }

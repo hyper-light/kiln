@@ -136,14 +136,14 @@ pub fn ops() -> &'static [Op] {
                 route: |_| Ok((Method::POST, path(&["apps"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let ask: flow::AppAsk = serde_json::from_value(v.get("app").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the app doesn't read: {e}")))?;
-                    answer(flow::create_app(&*service()?, &cx.caller.name, ask).await?)
+                    answer(flow::create_app(&*service()?, &Who::of(&cx.caller), ask).await?)
                 }),
             op!("deploy.apps.patch", "Change some of an app: owners, properties (null removes one), contacts (on call, channels, links), template, package, namespace, source (a kiln repository, `\"\"` for none), archived. A package's change reaches each environment with its next release.", ro: false, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "patch": {"type": "object"}}), &["app", "patch"]),
                 route: |v| Ok((Method::PATCH, path(&["apps", &text(v, "app")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let p: flow::AppPatch = serde_json::from_value(v.get("patch").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the patch doesn't read: {e}")))?;
-                    answer(flow::patch_app(&*service()?, &cx.caller.name, &text(&v, "app")?, p).await?)
+                    answer(flow::patch_app(&*service()?, &Who::of(&cx.caller), &text(&v, "app")?, p).await?)
                 }),
             op!("deploy.apps.delete", "Delete an app. With `everywhere`, it is deregistered from every environment first, what it runs deleted (or kept, with `keep`); otherwise an app still registered somewhere is refused. Its source repository is kept.", ro: false, destructive: true,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "everywhere": {"type": "boolean"}, "keep": {"type": "boolean"}}), &["app"]),
@@ -181,7 +181,7 @@ pub fn ops() -> &'static [Op] {
                 },
                 run: |cx: Cx, v: Value| async move {
                     let a: App = serde_json::from_value(v.get("app").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the app doesn't read: {e}")))?;
-                    answer(flow::put_app(&*service()?, &cx.caller.name, a).await?)
+                    answer(flow::put_app(&*service()?, &Who::of(&cx.caller), a).await?)
                 }),
             op!("deploy.registrations.get", "What runs for an app in an environment, the release in flight, the latest releases, and what its provider (KilnCD or Argo CD) says now.", ro: true, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),

@@ -127,9 +127,11 @@ being delivered (a delivery is reverted).
 
 **Rules for agents.**
 - You release only where the environment lets agents (its `agents.deploy`); approve only where
-  `agents.approve` says so, and never your own request. A 403 means a person must: say so, with
-  what you would have released, and stop. Don't work around it (committing to a release
-  repository by hand, or asking another agent).
+  `agents.approve` says so, and never your own request. You act for your person, so an app's
+  release is also theirs to make: they deploy in that environment, or they're in one of the app's
+  owner teams and the environment lets owners release. A 403 means a person must (one who may,
+  as its message says): say so, with what you would have released, and stop. Don't work around
+  it (committing to a release repository by hand, or asking another agent).
 - One release at a time per app and environment: while one is in flight a second is refused
   (409), or queued where the environment says so. Wait for it, or cancel it if that's what the
   person asked.

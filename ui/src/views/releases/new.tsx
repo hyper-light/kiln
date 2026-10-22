@@ -12,6 +12,7 @@
 import * as React from "react";
 import { Rocket } from "lucide-react";
 
+import { api } from "@/api/client";
 import { boardHref, checkName, deployApi, packageWords, providerName, releaseAppHref, type AppAsk, type Package } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
@@ -21,7 +22,7 @@ import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { reposRes, useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate } from "@/lib/router";
 import { environmentsRes, templatesRes } from "./index";
 import "@/views/deployments/deployments.css";
@@ -61,6 +62,8 @@ function Builder() {
   const [checked, setChecked] = React.useState<NameCheck | null>(null);
   const [project, setProject] = React.useState("default");
   const [owners, setOwners] = React.useState("");
+  // The groups the person is in: an app's owner team is one its maker is in (docs/deploy-api.md §3.1).
+  const groups = useSuspenseResource("me", (s) => api.me(s)).data.groups ?? [];
   const [templateName, setTemplateName] = React.useState(templates[0]?.name ?? "");
   const [kind, setKind] = React.useState<Kind>("helm");
   const [repo, setRepo] = React.useState("");
@@ -181,7 +184,7 @@ function Builder() {
           placeholder="payments, platform"
           value={owners}
           onChange={(e) => setOwners(e.target.value)}
-          hint="The owner first, then a co-owner and an ops owner, separated by commas."
+          hint={`The owner first, then a co-owner and an ops owner, separated by commas: kiln's groups (shop) or an identity provider's (github:acme/platform). The owner team is one you're in${groups.length ? `: ${groups.join(", ")}` : ""}.`}
         />
       </Panel>
 

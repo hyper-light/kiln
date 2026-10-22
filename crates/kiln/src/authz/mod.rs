@@ -16,6 +16,7 @@
 pub mod api;
 pub mod cli;
 pub mod gate;
+pub mod groups;
 pub mod sso;
 pub mod tokens;
 
@@ -110,15 +111,17 @@ pub enum Scope {
     Environment { repo: String, environment: String },
     Runner { runner: String },
     Pool { pool: String },
+    /// An environment apps are deployed to (docs/deploy-api.md §4, §15): releasing every app there.
+    Deploy { environment: String },
 }
 
 impl Scope {
     /// `server`, `org:<o>`, `repo:<o>/<r>`, `workflow:<o>/<r>:<path>`, `environment:<o>/<r>:<env>`
-    /// (or `env:`, as secrets write it), `runner:<name>`, `pool:<name>`.
+    /// (or `env:`, as secrets write it), `runner:<name>`, `pool:<name>`, `deploy:<environment>`.
     pub fn parse(s: &str) -> Result<Scope, String> {
         let s = s.trim();
         let bad = || {
-            format!("`{s}` is not a scope: server, org:<org>, repo:<owner>/<repo>, workflow:<owner>/<repo>:<path>, environment:<owner>/<repo>:<env>, runner:<name> or pool:<name>")
+            format!("`{s}` is not a scope: server, org:<org>, repo:<owner>/<repo>, workflow:<owner>/<repo>:<path>, environment:<owner>/<repo>:<env>, runner:<name>, pool:<name> or deploy:<environment>")
         };
         if s == "server" {
             return Ok(Scope::Server);
@@ -138,6 +141,7 @@ impl Scope {
             }
             "runner" => Scope::Runner { runner: need(rest)? },
             "pool" => Scope::Pool { pool: need(rest)? },
+            "deploy" => Scope::Deploy { environment: need(rest)? },
             _ => return Err(bad()),
         })
     }
@@ -151,6 +155,7 @@ impl Scope {
             Scope::Environment { repo, environment } => format!("environment:{repo}:{environment}"),
             Scope::Runner { runner } => format!("runner:{runner}"),
             Scope::Pool { pool } => format!("pool:{pool}"),
+            Scope::Deploy { environment } => format!("deploy:{environment}"),
         }
     }
 
@@ -184,7 +189,7 @@ impl Scope {
             Scope::Repo { repo } => target.repo().is_some_and(|r| same(r, repo)),
             Scope::Workflow { repo, path } => matches!(target, Scope::Workflow { repo: r, path: p } if same(r, repo) && p == path),
             Scope::Environment { repo, environment } => matches!(target, Scope::Environment { repo: r, environment: e } if same(r, repo) && e == environment),
-            Scope::Runner { .. } | Scope::Pool { .. } => self == target,
+            Scope::Runner { .. } | Scope::Pool { .. } | Scope::Deploy { .. } => self == target,
         }
     }
 }
@@ -265,6 +270,10 @@ pub enum At {
     /// The caller's own (tokens): any user may manage theirs, `tokens.manage` anyone's; the
     /// handler tells them apart.
     Own,
+    /// Releasing an app (docs/deploy-api.md §15): the capability somewhere, or a person in a group
+    /// (an app's owner team, where its environment lets owners release); the handler checks the
+    /// app and the environment the request names.
+    Deploy,
 }
 
 /// One route's rule: its method (`None`: any), path pattern (`*` one segment, `**` one or more),
@@ -410,13 +419,14 @@ pub static ROUTES: &[Rule] = &[
     // Deploying by API (docs/deploy-api.md §15): releases are deploys; apps, environments and
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
-    r("POST", "/api/deploy/releases", "environments.deploy", At::Server),
-    r("POST", "/api/deploy/fleets", "environments.deploy", At::Server),
+    // Releases are a deployer's in their environment, or an owner team's where it lets owners.
+    r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
+    r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),
     r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
-    r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Deploy),
     // Acting on what runs (a restart, a scale, a pod deleted) is a deployer's.
-    r("POST", "/api/deploy/apps/*/environments/*/actions", "environments.deploy", At::Server),
+    r("POST", "/api/deploy/apps/*/environments/*/actions", "environments.deploy", At::Deploy),
     // An app's secrets (§3.5) are read as the rest of it (names and versions: no value is read
     // back), and set or deleted by those who manage secrets.
     any("/api/deploy/apps/*/environments/*/secrets/*", "secrets.manage", At::Server),
@@ -477,6 +487,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/roles/**", "users.manage", At::Server),
     any("/api/users", "users.manage", At::Server),
     any("/api/users/**", "users.manage", At::Server),
+    // Groups of users, which own apps (docs/deploy-api.md §15).
+    any("/api/groups", "users.manage", At::Server),
+    any("/api/groups/**", "users.manage", At::Server),
     any("/api/grants", "users.manage", At::Server),
     any("/api/grants/**", "users.manage", At::Server),
 ];

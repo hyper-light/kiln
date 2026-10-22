@@ -35,6 +35,8 @@ export interface Me {
   origins?: string[];
   /** Where pages agents show are served, when not here (docs/previews.md). */
   pages_url?: string | null;
+  /** The groups the person is in: kiln's (`shop`), and their identity providers' (`github:acme/platform`), as an app's owner teams name them. */
+  groups?: string[];
 }
 
 export interface Repo {

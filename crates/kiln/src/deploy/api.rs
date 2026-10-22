@@ -104,7 +104,7 @@ pub fn route<'a>(hub: &'a Arc<Hub>, rest: &'a [&'a str], q: &'a HashMap<String, 
 
 async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))?;
-    let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who { name: "admin".to_owned(), agent: false }, Who::of);
+    let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who::kiln("admin"), Who::of);
     let actor = who.name.clone();
     // A template that makes repositories is put by someone who may add them.
     let adds_repos = req.extensions().get::<crate::authz::Caller>().is_none_or(|c| c.can("settings.manage", &crate::authz::Scope::Server));
@@ -175,11 +175,11 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         (&Method::GET, ["apps"]) => ok(&json!({ "apps": store::apps(store).await.map_err(internal)? })),
         (&Method::POST, ["apps"]) => {
             let ask: flow::AppAsk = body(req.into_body()).await?;
-            created(&boxed(|| flow::create_app(&d, &actor, ask)).await?)
+            created(&boxed(|| flow::create_app(&d, &who, ask)).await?)
         }
         (&Method::PATCH, ["apps", name]) => {
             let patch: flow::AppPatch = body(req.into_body()).await?;
-            ok(&boxed(|| flow::patch_app(&d, &actor, name, patch)).await?)
+            ok(&boxed(|| flow::patch_app(&d, &who, name, patch)).await?)
         }
         (&Method::GET, ["apps", name, "catalog-info.yaml"]) => {
             let a = store::app(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
@@ -191,7 +191,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             if a.name != *name {
                 return Err(bad(format!("the body is app {}, the path {name}", a.name)));
             }
-            ok(&boxed(|| flow::put_app(&d, &actor, a)).await?)
+            ok(&boxed(|| flow::put_app(&d, &who, a)).await?)
         }
         (&Method::DELETE, ["apps", name]) => {
             let yes = |k: &str| q.get(k).is_some_and(|v| v == "true" || v == "1");
@@ -242,6 +242,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         (&Method::POST, ["apps", app, "environments", env, "actions"]) => {
             let ask: actions::Ask = body(req.into_body()).await?;
             let (a, environment) = registered(&d, app, env).await?;
+            boxed(|| flow::may_release(&d, &who, &a, &environment, "act on what runs of")).await?;
             ok(&boxed(|| actions::run(&d, &who, &a, &environment, &ask)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": boxed(|| versions(&d, app, env)).await? })),
@@ -594,12 +595,13 @@ mod tests {
             concurrency: Default::default(),
             agents: AgentPolicy::default(),
             argocd: Default::default(),
+            owners: Default::default(),
         }
     }
 
     /// Sets a secret as a person would over the API: what the answer says.
     async fn set(d: &Deploy, env: &str, name: &str, release: bool) -> anyhow::Result<Value> {
-        let ada = Who { name: "ada".into(), agent: false };
+        let ada = Who::kiln("ada");
         secret_put(d, &ada, "web", env, name, secrets::Value::new(b"value".to_vec()), Change { release, revert: true }).await.map_err(|(code, m)| anyhow::anyhow!("{code}: {m}"))
     }
 

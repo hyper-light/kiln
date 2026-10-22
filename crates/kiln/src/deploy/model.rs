@@ -52,6 +52,10 @@ pub struct Environment {
     /// What agents may do here (docs/cd-targets.md D6). Nothing, by default: a person releases.
     #[serde(default)]
     pub agents: AgentPolicy,
+    /// What an app's owner teams may do here without `environments.deploy` on it (§15). Nothing,
+    /// by default.
+    #[serde(default, skip_serializing_if = "OwnerPolicy::is_default")]
+    pub owners: OwnerPolicy,
     /// How kiln drives Argo CD here (§8.3), when it's the provider.
     #[serde(default)]
     pub argocd: ArgoSettings,
@@ -77,6 +81,22 @@ pub struct AgentPolicy {
     /// Answer what waits for an approval here (when gates do).
     #[serde(default)]
     pub approve: bool,
+}
+
+/// What an app's owner teams may do in an environment (docs/deploy-api.md §15).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerPolicy {
+    /// Release their app here: deploy, config, rollback, enable, disable, cancel, and act on what
+    /// it runs (a restart, a scale).
+    #[serde(default)]
+    pub release: bool,
+}
+
+impl OwnerPolicy {
+    pub fn is_default(&self) -> bool {
+        *self == OwnerPolicy::default()
+    }
 }
 
 fn kilncd() -> String {
