@@ -93,16 +93,28 @@ class Api:
         self.token = token
 
     def call(self, method, path, body=None):
+        """The server's answer. A server that doesn't answer (the lab frozen by its pacer while the
+        machine's disks are busy) is asked again for up to 15 minutes. A retried change the first
+        try made already (404 for a DELETE, 409 for a POST) is done."""
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.server + path, data=data, method=method, headers={"Authorization": "Bearer " + self.token})
-        if data is not None:
-            req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                raw = r.read()
-                return json.loads(raw) if raw else None
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"{method} {path}: {e.code} {e.read().decode(errors='replace')[:300]}") from None
+        for attempt in range(31):
+            req = urllib.request.Request(self.server + path, data=data, method=method, headers={"Authorization": "Bearer " + self.token})
+            if data is not None:
+                req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    raw = r.read()
+                    return json.loads(raw) if raw else None
+            except urllib.error.HTTPError as e:
+                if attempt and method != "GET" and e.code in (404, 409):
+                    return None
+                raise RuntimeError(f"{method} {path}: {e.code} {e.read().decode(errors='replace')[:300]}") from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if attempt == 30:
+                    raise RuntimeError(f"{method} {path}: no answer in 15 minutes ({e})") from None
+                print(f"  {method} {path}: no answer ({e}); again in 30 s", flush=True)
+                time.sleep(30)
+        return None
 
 
 def git(cwd, *args, check=True, env=None):
