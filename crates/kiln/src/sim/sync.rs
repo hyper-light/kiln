@@ -1459,6 +1459,14 @@ mod tests {
         for seed in [136, 170] {
             run(seed, 0, ONCE, Mode::Moves)?;
         }
+        // kiln's later fixes moved those runs off the bug: with this fix undone at the head, these
+        // fail (the revert check), so they keep it caught.
+        for seed in [68, 119] {
+            run(seed, 0, Plant::default(), Mode::Sync)?;
+        }
+        for seed in [10, 16] {
+            run(seed, 0, Plant::default(), Mode::Moves)?;
+        }
         Ok(())
     }
 
