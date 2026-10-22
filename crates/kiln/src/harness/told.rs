@@ -99,8 +99,10 @@ pub async fn saw(hub: &crate::hub::Hub, child: &Info) {
 }
 
 /// Tells parents of their children that settled: in the one message of news waiting for each
-/// (`Told::plan`), queued after the parent's turn. `driven`: the agents a goal stack drives now.
-pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64, driven: &[String]) {
+/// (`Told::plan`), queued after the parent's turn. `driven`: the agents a goal stack drives now;
+/// `quiet`: those paused for usage (docs/programs.md), which get no new message, since one would
+/// start their turn: their news waits, and goes once they go on.
+pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64, driven: &[String], quiet: &[String]) {
     let _one = SENDING.lock().await;
     // News a server before this one queued, waiting still: this one adds to it.
     for p in all.iter().filter(|p| !matches!(p.status, Status::Exited | Status::Disconnected) && p.queue.iter().any(|q| super::queued::from_before(&q.id, NEWS))) {
@@ -111,7 +113,7 @@ pub async fn tick(hub: &crate::hub::Hub, all: &[Info], now: i64, driven: &[Strin
             TOLD.lock().found(&p.id, q.id, q.text, now);
         }
     }
-    let plan = TOLD.lock().plan(all, now, driven);
+    let plan = TOLD.lock().plan(all, now, driven, quiet);
     for (parent, c) in plan {
         if matches!(c, Command::Send { .. })
             && let Some(p) = all.iter().find(|i| i.id == parent)
@@ -194,8 +196,9 @@ impl Told {
     /// waiting in its queue, edited to hold each child's latest line; or, none waiting, a message
     /// with them. What a message that went may not have said (an edit that came too late) goes in
     /// the next. An agent that has ended isn't sent anything; one whose machine is away, once it's
-    /// back.
-    fn plan(&mut self, all: &[Info], now: i64, driven: &[String]) -> Vec<(String, Command)> {
+    /// back; one paused for usage (`quiet`), no new message (it would start its turn), its news
+    /// waiting here until it goes on.
+    fn plan(&mut self, all: &[Info], now: i64, driven: &[String], quiet: &[String]) -> Vec<(String, Command)> {
         let mut due = self.due(all, now, driven);
         self.news.retain(|p, _| all.iter().any(|i| i.id == *p));
         let parents: BTreeSet<String> = self.news.keys().chain(due.keys()).cloned().collect();
@@ -241,6 +244,7 @@ impl Told {
                     m.text = text;
                     n.said.clone_from(&n.lines);
                 }
+                None if quiet.contains(&parent) => {}
                 None => {
                     let id = super::queued::made(NEWS);
                     out.push((parent, Command::Send { id: id.clone(), text: text.clone(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None }));
@@ -398,6 +402,28 @@ mod tests {
         Ok(())
     }
 
+    /// CP-M3 (docs/programs.md, "Usage"): a parent paused for usage (`quiet`) gets no new message
+    /// of news, since one would start its turn: what its children did waits, and goes once it goes
+    /// on.
+    #[test]
+    fn a_parent_paused_for_usage_gets_its_news_once_it_goes_on() -> anyhow::Result<()> {
+        let mut t = Told::default();
+        let p = coordinator("q9");
+        let mut kids = helpers("q9", &["k9"]);
+        let (now, quiet) = (3_000_000, vec!["q9".to_owned()]);
+        anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &quiet).is_empty(), "seen at work first");
+        if let Some(c) = kids.first_mut() {
+            c.status = Status::Idle;
+            "Track 7's goal met.".clone_into(&mut c.summary);
+            c.last_turn = Some(TurnEnd { at: now + 1, how: "done".into(), ..TurnEnd::default() });
+        }
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 1, &[], &quiet).is_empty());
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 1 + SETTLE_MS, &[], &quiet).is_empty(), "nothing while it's paused for usage");
+        let sent = t.plan(&all(&p, &kids), now + 2 + SETTLE_MS, &[], &[]);
+        anyhow::ensure!(matches!(sent.first(), Some((parent, Command::Send { text, .. })) if parent == "q9" && text.contains("Track 7's goal met.")), "once it goes on: {sent:?}");
+        Ok(())
+    }
+
     #[test]
     fn what_a_parent_is_told_says_what_its_child_needs() -> anyhow::Result<()> {
         let mut asking = child("c9", Status::Waiting, 5, "");
@@ -455,7 +481,7 @@ mod tests {
                     }
                 }
             }
-            out.extend(t.plan(&all(p, kids), at, &[]).into_iter().map(|(_, c)| c));
+            out.extend(t.plan(&all(p, kids), at, &[], &[]).into_iter().map(|(_, c)| c));
         }
         out
     }
@@ -474,7 +500,7 @@ mod tests {
         let mut p = coordinator("q1");
         let mut kids = helpers("q1", &["k1", "k2", "k3"]);
         let mut now = 2_000_000;
-        assert!(t.plan(&all(&p, &kids), now, &[]).is_empty(), "seen at work first");
+        assert!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "seen at work first");
         // Two settle: one message, behind the parent's turn.
         now += 10_000;
         let first = settle(&mut t, &p, &mut kids, &[(0, "The lexer is done."), (1, "Docs updated.")], now);
@@ -492,7 +518,7 @@ mod tests {
             sent.iter().for_each(|c| apply(&mut p, c));
         }
         // A look later: nothing more to say, and its queue is seen holding the last edit.
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[]).is_empty());
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty());
         let latest = news_of(&t, "q1");
         anyhow::ensure!(p.queue == [Queued::of(&id, &latest)], "its queue holds the one message, as kiln last had it: {:?}", p.queue);
         for old in ["The lexer is done.", "Docs updated.", "Docs: round 1.", "Docs: round 2."] {
@@ -520,7 +546,7 @@ mod tests {
         let mut p = coordinator("q2");
         let mut kids = helpers("q2", &["j1", "j2"]);
         let mut now = 3_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[]);
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
         now += 10_000;
         let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
         first.iter().for_each(|c| apply(&mut p, c));
@@ -531,7 +557,7 @@ mod tests {
         // Before the edit came, the turn ended and the message went as it was.
         p.queue.clear();
         p.queued = 0;
-        let resent = t.plan(&all(&p, &kids), now + 10_000, &[]);
+        let resent = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
         let Some((to, Command::Send { text, .. })) = resent.first() else { anyhow::bail!("the edit's words were lost: {resent:?}") };
         anyhow::ensure!(resent.len() == 1 && to == "q2" && text.contains("Second news.") && !text.contains("First news."), "only what didn't reach it: {resent:?}");
         Ok(())
@@ -546,25 +572,25 @@ mod tests {
         let mut p = coordinator("q6");
         let mut kids = helpers("q6", &["w1", "w2"]);
         let mut now = 6_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[]);
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
         now += 10_000;
         let first = settle(&mut t, &p, &mut kids, &[(0, "First news.")], now);
         let Some(send) = first.first() else { anyhow::bail!("no news") };
         t.unsent("q6", send);
-        let again = t.plan(&all(&p, &kids), now + 10_000, &[]);
+        let again = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
         anyhow::ensure!(matches!(again.as_slice(), [(_, Command::Send { text, .. })] if text.contains("First news.")), "{again:?}");
         again.iter().for_each(|(_, c)| apply(&mut p, c));
         now += 20_000;
         let edit = settle(&mut t, &p, &mut kids, &[(1, "Second news.")], now);
         let Some(c) = edit.first() else { anyhow::bail!("no edit") };
         t.unsent("q6", c);
-        let again = t.plan(&all(&p, &kids), now + 10_000, &[]);
+        let again = t.plan(&all(&p, &kids), now + 10_000, &[], &[]);
         anyhow::ensure!(again.len() == 1 && again.first().map(|(_, c)| c) == Some(c), "the same edit again: {again:?}");
         // It didn't go either, and the parent took the message as it was.
         t.unsent("q6", c);
         p.queue.clear();
         p.queued = 0;
-        let next = t.plan(&all(&p, &kids), now + 20_000, &[]);
+        let next = t.plan(&all(&p, &kids), now + 20_000, &[], &[]);
         anyhow::ensure!(matches!(next.as_slice(), [(_, Command::Send { text, .. })] if text.contains("Second news.") && !text.contains("First news.")), "{next:?}");
         Ok(())
     }
@@ -578,19 +604,19 @@ mod tests {
         let mut p = coordinator("q7");
         let mut kids = helpers("q7", &["v1", "v2"]);
         let mut now = 7_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[]);
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
         now += 10_000;
         let first = settle(&mut t, &p, &mut kids, &[(0, "v1 is done.")], now);
         first.iter().for_each(|c| apply(&mut p, c));
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[]).is_empty(), "seen waiting");
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 5_000, &[], &[]).is_empty(), "seen waiting");
         p.status = Status::Disconnected;
         now += 10_000;
         anyhow::ensure!(settle(&mut t, &p, &mut kids, &[(1, "v2 is done.")], now).is_empty(), "nothing goes while it's away");
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[]).is_empty());
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty());
         p.status = Status::Running;
         p.queue.clear();
         p.queued = 0;
-        let back = t.plan(&all(&p, &kids), now + 20_000, &[]);
+        let back = t.plan(&all(&p, &kids), now + 20_000, &[], &[]);
         anyhow::ensure!(matches!(back.as_slice(), [(_, Command::Send { text, .. })] if text.contains("v2 is done.") && !text.contains("v1 is done.")), "{back:?}");
         Ok(())
     }
@@ -606,14 +632,14 @@ mod tests {
         let mut kids = helpers("q8", &["u1"]);
         let mut now = 8_000_000;
         t.found("q8", old.into(), before.into(), now);
-        anyhow::ensure!(t.plan(&all(&p, &kids), now, &[]).is_empty(), "nothing new to say");
+        anyhow::ensure!(t.plan(&all(&p, &kids), now, &[], &[]).is_empty(), "nothing new to say");
         now += 10_000;
         let sent = settle(&mut t, &p, &mut kids, &[(0, "u1 is done.")], now);
         let [Command::QueueEdit { id, text }] = sent.as_slice() else { anyhow::bail!("{sent:?}") };
         anyhow::ensure!(id == old && text.starts_with(before) && text.contains("u1 is done."), "{text}");
         sent.iter().for_each(|c| apply(&mut p, c));
         // Once the parent takes it, what came before goes with it.
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[]).is_empty());
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 10_000, &[], &[]).is_empty());
         p.queue.clear();
         p.queued = 0;
         now += 20_000;
@@ -630,7 +656,7 @@ mod tests {
         let mut p = coordinator("q3");
         let mut kids = helpers("q3", &["x1", "x2", "x3"]);
         let mut now = 4_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[]);
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
         now += 10_000;
         let first = settle(&mut t, &p, &mut kids, &[(0, "x1 is done."), (1, "x2 is done."), (2, "x3 is done.")], now);
         first.iter().for_each(|c| apply(&mut p, c));
@@ -656,8 +682,8 @@ mod tests {
         anyhow::ensure!(p.queue.is_empty(), "{:?}", p.queue);
         anyhow::ensure!(t.saw(&x1).is_none(), "nothing of it waits");
         // Nothing comes back for what it saw.
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 20_000, &[]).is_empty());
-        anyhow::ensure!(t.plan(&all(&p, &kids), now + 20_000 + SETTLE_MS, &[]).is_empty());
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 20_000, &[], &[]).is_empty());
+        anyhow::ensure!(t.plan(&all(&p, &kids), now + 20_000 + SETTLE_MS, &[], &[]).is_empty());
         // x1 settles again: news again.
         now += 30_000;
         let again = settle(&mut t, &p, &mut kids, &[(0, "x1 is done again.")], now);
@@ -674,21 +700,21 @@ mod tests {
         let ids: Vec<String> = (0..LINES_MAX + 3).map(|n| format!("y{n}")).collect();
         let mut kids = helpers("q4", &ids.iter().map(String::as_str).collect::<Vec<_>>());
         let mut now = 5_000_000;
-        let _ = t.plan(&all(&p, &kids), now, &[]);
+        let _ = t.plan(&all(&p, &kids), now, &[], &[]);
         now += 10_000;
         let which: Vec<(usize, &str)> = (0..kids.len()).map(|k| (k, "Done.")).collect();
         anyhow::ensure!(settle(&mut t, &p, &mut kids, &which, now).is_empty(), "its machine is away");
         p.status = Status::Running;
-        let back = t.plan(&all(&p, &kids), now + 20_000, &[]);
+        let back = t.plan(&all(&p, &kids), now + 20_000, &[], &[]);
         let Some((_, Command::Send { text, .. })) = back.first() else { anyhow::bail!("nothing once it's back: {back:?}") };
         anyhow::ensure!(text.matches("which you started").count() == LINES_MAX && text.contains("and 3 more that settled before these"), "{text}");
         // Ended: nothing for it, and its news goes.
         let mut ended = Info { status: Status::Exited, ..coordinator("q5") };
         let mut kids = helpers("q5", &["z1"]);
-        let _ = t.plan(&all(&ended, &kids), now, &[]);
+        let _ = t.plan(&all(&ended, &kids), now, &[], &[]);
         anyhow::ensure!(settle(&mut t, &ended, &mut kids, &[(0, "Done.")], now + 10_000).is_empty());
         ended.status = Status::Running;
-        anyhow::ensure!(t.plan(&all(&ended, &kids), now + 30_000, &[]).is_empty(), "told once, while it had ended: not again");
+        anyhow::ensure!(t.plan(&all(&ended, &kids), now + 30_000, &[], &[]).is_empty(), "told once, while it had ended: not again");
         Ok(())
     }
 }

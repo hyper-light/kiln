@@ -61,6 +61,10 @@ counted.
 
 ## Mission control
 
+Its **Programs** follow multi-stack programs (the critical path first), a row per track: its
+worker and how it stands, the goal under way, goals met, change requests, pass, threshold and
+usage, with the workers, slots and weights the person sets there ([programs.md](programs.md)).
+
 - **Order.** By default (Needs you first) the agents that wait on you come first, longest waiting
   first, then those stopped, paused, finished since you last looked, working, ready, offline and
   ended. The list follows the agents as they change: one that comes to need you rises at once.

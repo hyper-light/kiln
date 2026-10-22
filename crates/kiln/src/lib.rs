@@ -46,6 +46,7 @@ pub mod pipeline;
 pub mod pki;
 pub mod goals;
 pub mod plans;
+pub mod programs;
 pub mod proc;
 pub mod proto;
 pub mod peers;

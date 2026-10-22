@@ -44,6 +44,8 @@ export interface SuspenseResource<T> {
   reload: () => void;
   /** Change the data here, at once (after a change the server will confirm). */
   setData: (fn: (prev: T) => T) => void;
+  /** The last refresh failed, and why: the data shown is the last there was. */
+  refreshError?: unknown;
 }
 
 interface Snap {
@@ -52,6 +54,7 @@ interface Snap {
   error: unknown;
   failed: boolean;
   refreshing: boolean;
+  refreshError?: unknown;
 }
 
 interface Entry {
@@ -156,11 +159,12 @@ function load(e: Entry): Promise<void> {
       (data) => {
         // Settled for React before anyone hears of the data: the render it replays reads on at once.
         Object.assign(p, { status: "fulfilled", value: undefined });
-        set(e, { data, has: true, error: undefined, failed: false, refreshing: false });
+        set(e, { data, has: true, error: undefined, failed: false, refreshing: false, refreshError: undefined });
       },
       (error: unknown) => {
-        // A refresh that failed leaves the data that's shown; a first load that failed says so.
-        if (e.snap.has) set(e, { refreshing: false });
+        // A refresh that failed leaves the data that's shown (and says why); a first load that
+        // failed says so.
+        if (e.snap.has) set(e, { refreshing: false, refreshError: error });
         else set(e, { error, failed: true, refreshing: false });
       },
     )
@@ -279,6 +283,7 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
     refreshing: snap.refreshing,
     reload: () => void load(e),
     setData: (fn) => set(e, { data: fn(e.snap.data as T), has: true }),
+    refreshError: snap.refreshError,
   };
 }
 
@@ -290,6 +295,17 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
 export function preload<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}) {
   const e = entry(key, fetcher as Fetcher<unknown>, opts);
   if (!e.snap.has && !e.snap.failed && !e.promise) void load(e);
+}
+
+/**
+ * `preload`, settled once its first data is in (or its first load failed). A route's loader awaits
+ * it, so its page renders with its data and never shows its fallback: once a fallback is shown,
+ * React reveals what replaces it no sooner than 300 ms on, however soon the data came.
+ */
+export function loaded<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}): Promise<void> {
+  const e = entry(key, fetcher as Fetcher<unknown>, opts);
+  if (e.snap.has || e.snap.failed) return Promise.resolve();
+  return e.promise ?? load(e);
 }
 
 /** Refreshes every key that starts with `prefix` (all of them for ""). */
