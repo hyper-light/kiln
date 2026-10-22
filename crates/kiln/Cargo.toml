@@ -119,3 +119,7 @@ harness = false
 [[bench]]
 name = "grok"
 harness = false
+
+[[bench]]
+name = "incidents"
+harness = false

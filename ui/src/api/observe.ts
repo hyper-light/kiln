@@ -1165,6 +1165,115 @@ export interface CatalogScore {
   scorecards: { name: string; passed: number; total: number }[];
 }
 
+/** An incident's field: Datadog's, a text or a list of texts (docs/observe.md §9.5). */
+export interface IncidentField {
+  type: string;
+  value: string | string[] | null;
+}
+
+export interface IncidentHandle {
+  display_name: string;
+  handle: string;
+}
+
+export type IncidentState = "active" | "stable" | "resolved";
+
+/** An incident as Datadog's API gives it (times RFC 3339, figures in seconds), kiln's own beside under `kiln`. */
+export interface Incident {
+  id: string;
+  type: "incidents";
+  attributes: {
+    public_id: number;
+    title: string;
+    customer_impacted: boolean;
+    customer_impact_scope: string | null;
+    customer_impact_start: string | null;
+    customer_impact_end: string | null;
+    customer_impact_duration: number | null;
+    time_to_detect: number | null;
+    time_to_internal_response: number | null;
+    time_to_repair: number | null;
+    time_to_resolve: number | null;
+    created: string;
+    modified: string;
+    detected: string;
+    declared: string;
+    resolved: string | null;
+    severity: string;
+    state: IncidentState;
+    fields: Record<string, IncidentField>;
+    notification_handles: IncidentHandle[];
+    is_test: boolean;
+    declared_by: { name: string };
+    kiln: {
+      monitor: { id: string; name: string; group: [string, string][] } | null;
+      todos: number;
+      todos_open: number;
+      postmortem: { url: string; title: string } | null;
+    };
+  };
+  relationships: {
+    commander_user: { data: { type: "users"; id: string } | null };
+    created_by_user: { data: { type: "users"; id: string } };
+  };
+}
+
+export interface IncidentTodo {
+  id: string;
+  type: "incident_todos";
+  attributes: { content: string; assignees: string[]; due_date: string | null; completed: string | null; created: string; modified: string; incident_id: string };
+}
+
+export interface IncidentAttachment {
+  id: string;
+  type: "incident_attachments";
+  attributes: { attachment_type: "postmortem" | "link"; attachment: { documentUrl: string; title: string }; modified: string };
+}
+
+/** A cell of an incident's timeline: a note, a change, its monitor's state. */
+export type TimelineCell = { id: string; created: string; author: string } & (
+  | { cell_type: "markdown"; content: string; important: boolean }
+  | { cell_type: "changed"; what: string; from: string; to: string }
+  | { cell_type: "monitor"; monitor_id: string; monitor: string; state: string; value: number | null; message: string }
+);
+
+export interface FacetCount {
+  name: string;
+  count: number;
+}
+
+/** What a search matched, counted by facet (Datadog's). */
+export interface IncidentFacets {
+  state: FacetCount[];
+  severity: FacetCount[];
+  commander: FacetCount[];
+  created_by: FacetCount[];
+  postmortem: FacetCount[];
+  impact: FacetCount[];
+  fields: { name: string; facets: FacetCount[] }[];
+}
+
+export interface IncidentSearch {
+  incidents: Incident[];
+  total: number;
+  facets: IncidentFacets;
+}
+
+/** What declaring or changing an incident says: Datadog's attributes. */
+export interface IncidentChange {
+  title?: string;
+  severity?: string;
+  state?: IncidentState;
+  customer_impacted?: boolean;
+  customer_impact_scope?: string | null;
+  customer_impact_start?: string | null;
+  customer_impact_end?: string | null;
+  fields?: Record<string, IncidentField>;
+  notification_handles?: IncidentHandle[];
+  is_test?: boolean;
+  initial_cells?: { cell_type: "markdown"; content: { content: string }; important?: boolean }[];
+}
+
 /** A host's figures, its newest of the last ten minutes: CPU in use, I/O wait, memory in use and its fullest disk's use (%), the load over 15 minutes (and a core's). */
 export interface HostFigures {
   cpu: number | null;
@@ -1462,6 +1571,40 @@ export const observeApi = {
   createScanningGroup: (g: ScanningGroupIn) => request<ScanningGroup>("POST", `${BASE}/scanner/groups`, g),
   updateScanningGroup: (id: string, g: ScanningGroupIn) => request<ScanningGroup>("PUT", `${BASE}/scanner/groups/${enc(id)}`, g),
   deleteScanningGroup: (id: string) => request<void>("DELETE", `${BASE}/scanner/groups/${enc(id)}`),
+  /** Incidents `query` matches (Datadog's search syntax), the newest first: a page of `size` from `offset`, with what matched counted by facet. */
+  incidentSearch: (query: string, offset: number, size: number, signal?: AbortSignal) =>
+    request<{ data: { attributes: { incidents: { data: Incident }[]; total: number; facets: IncidentFacets } } }>(
+      "GET",
+      `${BASE}/incidents/search?${new URLSearchParams({ query, "page[size]": String(size), "page[offset]": String(offset) })}`,
+      undefined,
+      { signal },
+    ).then((r): IncidentSearch => ({ incidents: r.data.attributes.incidents.map((x) => x.data), total: r.data.attributes.total, facets: r.data.attributes.facets })),
+  incident: (id: string, signal?: AbortSignal) => request<{ data: Incident }>("GET", `${BASE}/incidents/${enc(id)}`, undefined, { signal }).then((r) => r.data),
+  /** Declares an incident; `commander` a user's id or name. */
+  declareIncident: (attributes: IncidentChange, commander?: string) =>
+    request<{ data: Incident }>("POST", `${BASE}/incidents`, {
+      data: { type: "incidents", attributes, ...(commander ? { relationships: { commander_user: { data: { type: "users", id: commander } } } } : {}) },
+    }).then((r) => r.data),
+  /** Changes an incident; `commander` set (a user) or cleared (`null`) when given. */
+  updateIncident: (id: string, attributes: IncidentChange, commander?: string | null) =>
+    request<{ data: Incident }>("PATCH", `${BASE}/incidents/${enc(id)}`, {
+      data: { type: "incidents", attributes, ...(commander !== undefined ? { relationships: { commander_user: { data: commander ? { type: "users", id: commander } : null } } } : {}) },
+    }).then((r) => r.data),
+  removeIncident: (id: string) => request<void>("DELETE", `${BASE}/incidents/${enc(id)}`),
+  incidentTimeline: (id: string, signal?: AbortSignal) => request<{ data: TimelineCell[] }>("GET", `${BASE}/incidents/${enc(id)}/timeline`, undefined, { signal }).then((r) => r.data),
+  noteIncident: (id: string, content: string, important: boolean) => request<{ data: TimelineCell }>("POST", `${BASE}/incidents/${enc(id)}/timeline`, { content, important }),
+  incidentTodos: (id: string, signal?: AbortSignal) => request<{ data: IncidentTodo[] }>("GET", `${BASE}/incidents/${enc(id)}/relationships/todos`, undefined, { signal }).then((r) => r.data),
+  addIncidentTodo: (id: string, content: string, assignees: string[]) =>
+    request<{ data: IncidentTodo }>("POST", `${BASE}/incidents/${enc(id)}/relationships/todos`, { data: { type: "incident_todos", attributes: { content, assignees } } }),
+  setIncidentTodo: (id: string, todo: string, attributes: { content?: string; completed?: string | null }) =>
+    request<{ data: IncidentTodo }>("PATCH", `${BASE}/incidents/${enc(id)}/relationships/todos/${enc(todo)}`, { data: { type: "incident_todos", attributes } }),
+  removeIncidentTodo: (id: string, todo: string) => request<void>("DELETE", `${BASE}/incidents/${enc(id)}/relationships/todos/${enc(todo)}`),
+  incidentAttachments: (id: string, signal?: AbortSignal) => request<{ data: IncidentAttachment[] }>("GET", `${BASE}/incidents/${enc(id)}/attachments`, undefined, { signal }).then((r) => r.data),
+  attachToIncident: (id: string, kind: "postmortem" | "link", url: string, title: string) =>
+    request<{ data: IncidentAttachment }>("POST", `${BASE}/incidents/${enc(id)}/attachments`, {
+      data: { type: "incident_attachments", attributes: { attachment_type: kind, attachment: { documentUrl: url, title } } },
+    }),
+  removeIncidentAttachment: (id: string, attachment: string) => request<void>("DELETE", `${BASE}/incidents/${enc(id)}/attachments/${enc(attachment)}`),
   hosts: (q: HostQuery, signal?: AbortSignal) => {
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));

@@ -744,9 +744,38 @@ impl Monitors {
         if muted {
             return;
         }
-        let notice = Notice { monitor_id: m.id.clone(), monitor: m.name.clone(), state: to.as_str(), previous: from.as_str(), group: g.group.clone(), value: g.value, threshold: said.threshold, message: message.clone(), link, at: now, priority: m.priority, tags: m.tags.clone() };
-        for mention in monitor::mentions(&message) {
-            match self.integrations.mentioned(&mention) {
+        let notice = Notice {
+            monitor_id: m.id.clone(),
+            monitor: m.name.clone(),
+            state: to.as_str(),
+            previous: from.as_str(),
+            group: g.group.clone(),
+            value: g.value,
+            threshold: said.threshold,
+            message: message.clone(),
+            link,
+            at: now,
+            priority: m.priority,
+            tags: m.tags.clone(),
+            event: "monitor.transition",
+            headline: None,
+            facts: None,
+        };
+        let mentions = monitor::mentions(&message);
+        let mut incident = false;
+        for mention in &mentions {
+            // `@incident` (`@incident-sev2`, `@incident-<name>`): an incident of the group declared,
+            // or its timeline told (`super::incidents`); the first such mention alone.
+            if mention == "incident" || mention.starts_with("incident-") {
+                if !std::mem::replace(&mut incident, true)
+                    && let Some(k) = super::incidents::get()
+                {
+                    let from = super::incidents::FromMonitor { id: m.id.clone(), name: m.name.clone(), group: g.group.clone() };
+                    k.from_monitor(&from, mention, to.as_str(), g.value, &message, &mentions, now);
+                }
+                continue;
+            }
+            match self.integrations.mentioned(mention) {
                 Some((name, i)) => self.notifier.send(&name, i, notice.clone()),
                 None => tracing::debug!(monitor = %m.name, %mention, "a mention names no integration"),
             }
@@ -756,11 +785,70 @@ impl Monitors {
         }
     }
 
+    /// An incident's change told to its handles (`@slack-ops`, …) as a monitor's notifications go:
+    /// its declaring and each change of its state or severity, one PagerDuty incident or Opsgenie
+    /// alert an incident (its public id), resolved as it is; its severity its priority.
+    pub fn tell_incident(&self, t: &super::incidents::Told) {
+        let i = &t.incident;
+        let (state, word) = match (t.what, i.state.as_str()) {
+            ("declared", _) => ("ALERT", "Declared"),
+            (_, "resolved") => ("OK", "Resolved"),
+            (_, "stable") => ("WARN", "Stable"),
+            ("state", _) => ("ALERT", "Active"),
+            _ => (if i.state == "active" { "ALERT" } else { "WARN" }, i.severity.as_str()),
+        };
+        let event = match t.what {
+            "declared" => "incident.declared",
+            "state" => "incident.state",
+            _ => "incident.severity",
+        };
+        let notice = Notice {
+            monitor_id: format!("incident-{}", i.public_id),
+            monitor: i.title.clone(),
+            state,
+            previous: "",
+            group: Vec::new(),
+            value: None,
+            threshold: 0.0,
+            message: super::incidents::http::told_text(i, t.what),
+            link: format!("{}/observe/incidents/{}", self.link_base, i.public_id),
+            at: i.modified,
+            // SEV-0 and SEV-1 first (Opsgenie's P1), on to SEV-5.
+            priority: i.severity.strip_prefix("SEV-").and_then(|d| d.parse::<u8>().ok()).map(|d| d.max(1)),
+            tags: vec![format!("severity:{}", i.severity), format!("state:{}", i.state)],
+            event,
+            headline: Some(format!("[{word}] Incident #{}: {}", i.public_id, i.title)),
+            facts: Some(vec![("Severity".into(), i.severity.clone()), ("State".into(), i.state.clone()), ("Commander".into(), i.commander.clone().unwrap_or_else(|| "none".into()))]),
+        };
+        for mention in super::incidents::mentions(&i.notification_handles) {
+            match self.integrations.mentioned(&mention) {
+                Some((name, integration)) => self.notifier.send(&name, integration, notice.clone()),
+                None => tracing::debug!(incident = i.public_id, %mention, "an incident's handle names no integration"),
+            }
+        }
+    }
+
     /// A test notification to integration `name`.
     pub fn test(&self, name: &str) -> Result<(), String> {
         let i = self.integrations.get(name).ok_or_else(|| format!("no integration {name}"))?;
         let now = crate::util::now_ms();
-        let notice = Notice { monitor_id: "test".into(), monitor: "A test from kiln".into(), state: "ALERT", previous: "OK", group: vec![("host".into(), "kiln".into())], value: Some(1.0), threshold: 0.0, message: "This is a test notification from kiln's monitors.".into(), link: format!("{}/observe/monitors", self.link_base), at: now, priority: None, tags: Vec::new() };
+        let notice = Notice {
+            monitor_id: "test".into(),
+            monitor: "A test from kiln".into(),
+            state: "ALERT",
+            previous: "OK",
+            group: vec![("host".into(), "kiln".into())],
+            value: Some(1.0),
+            threshold: 0.0,
+            message: "This is a test notification from kiln's monitors.".into(),
+            link: format!("{}/observe/monitors", self.link_base),
+            at: now,
+            priority: None,
+            tags: Vec::new(),
+            event: "monitor.transition",
+            headline: None,
+            facts: None,
+        };
         self.notifier.send(name, i, notice);
         Ok(())
     }

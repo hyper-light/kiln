@@ -2325,6 +2325,104 @@ const scenarios = {
       if (id) await api("DELETE", `/api/observe/v1/slos/${id}`);
     }
   },
+
+  /** An incident declared from the list (its severity, its commander, a first note, the webhook at
+   * the receiver told), worked from its page (a note, a todo done, its postmortem, its properties,
+   * its severity raised, stable, resolved), then found among the resolved by its service; what each
+   * did checked through the API, and what the webhook was told. */
+  async "an incident is declared, worked from its page and resolved"() {
+    const receiver = process.env.RECEIVER;
+    const hook = `e2e-inc-${run}`;
+    if (receiver) expect((await api("PUT", `/api/observe/v1/integrations/${hook}`, { kind: "webhook", url: `${receiver}/${hook}` })).status === 204, "the webhook");
+    const before = receiver && fs.existsSync(process.env.RECEIVED) ? fs.readFileSync(process.env.RECEIVED, "utf8").split("\n").filter(Boolean).length : 0;
+    const title = `E2E checkout failing ${run}`;
+    const incident = async () => (await api("GET", `/api/observe/v1/incidents/${id}`)).body.data;
+    let id;
+    try {
+      await page.goto(`${BASE}/observe/incidents`);
+      await page.getByRole("button", { name: "Declare incident", exact: true }).click();
+      const d = page.getByRole("dialog");
+      await fillIn(d.getByLabel("What is happening", { exact: true }), title);
+      await d.getByLabel("Severity", { exact: true }).selectOption("SEV-2");
+      await fillIn(d.getByLabel("Commander (optional)", { exact: true }), "ada");
+      if (receiver) await d.getByLabel(`@webhook-${hook}`, { exact: true }).check();
+      await fillIn(d.getByLabel("A first note (optional, Markdown)", { exact: true }), "Paged **payments**.");
+      await d.getByRole("button", { name: "Declare", exact: true }).click();
+      await page.waitForURL(/\/observe\/incidents\/\d+$/);
+      id = page.url().split("/").pop();
+      let i = await incident();
+      expect(
+        i.attributes.title === title && i.attributes.severity === "SEV-2" && i.attributes.state === "active" && i.relationships.commander_user.data?.id === "ada",
+        `declared as asked: ${JSON.stringify(i)}`,
+      );
+      // Its first note, as Markdown.
+      await page.locator(".obs-note strong", { hasText: "payments" }).waitFor();
+      await fitsAcross("an incident's page");
+      await fillIn(page.getByLabel("A note", { exact: true }), "Rolled back checkout-api.");
+      await page.getByRole("button", { name: "Add note", exact: true }).click();
+      await page.getByText("Rolled back checkout-api.", { exact: true }).waitFor();
+      // A todo, its assignee by its mention, done.
+      await fillIn(page.getByLabel("A todo", { exact: true }), "Write the postmortem @ada");
+      await page.getByRole("button", { name: "Add", exact: true }).click();
+      await page.getByLabel("Done: Write the postmortem @ada", { exact: true }).check();
+      await until("the todo done", async () =>
+        (await api("GET", `/api/observe/v1/incidents/${id}/relationships/todos`)).body.data.some((t) => t.attributes.completed && t.attributes.assignees.includes("ada")),
+      );
+      // Its postmortem.
+      await fillIn(page.getByLabel("Its URL", { exact: true }), "https://docs.example.com/pm/e2e");
+      await fillIn(page.getByLabel("Its title", { exact: true }), "The postmortem");
+      await page.getByLabel("It is the postmortem", { exact: true }).check();
+      await page.getByRole("button", { name: "Attach", exact: true }).click();
+      await page.getByRole("link", { name: "The postmortem", exact: true }).waitFor();
+      expect((await incident()).attributes.kiln.postmortem?.url === "https://docs.example.com/pm/e2e", "its postmortem kept");
+      // Its properties: its services and root cause.
+      await page.getByRole("button", { name: "Edit…", exact: true }).click();
+      const e = page.getByRole("dialog");
+      await fillIn(e.getByLabel("Services", { exact: true }), "checkout, payments");
+      await fillIn(e.getByLabel("Root cause", { exact: true }), "A bad deploy");
+      await e.getByRole("button", { name: "Save", exact: true }).click();
+      await e.waitFor({ state: "detached" });
+      i = await incident();
+      expect(
+        JSON.stringify(i.attributes.fields.services?.value) === '["checkout","payments"]' && i.attributes.fields.root_cause?.value === "A bad deploy",
+        `its properties: ${JSON.stringify(i.attributes.fields)}`,
+      );
+      await page.getByText("checkout, payments", { exact: true }).waitFor();
+      // Raised to SEV-1, stable, resolved: each on its timeline.
+      await page.getByLabel("Severity", { exact: true }).selectOption("SEV-1");
+      await until("SEV-1", async () => (await incident()).attributes.severity === "SEV-1");
+      const state = page.getByRole("group", { name: "State", exact: true });
+      await state.getByRole("button", { name: "Stable", exact: true }).click();
+      await until("stable", async () => (await incident()).attributes.state === "stable");
+      await state.getByRole("button", { name: "Resolved", exact: true }).click();
+      await until("resolved", async () => (await incident()).attributes.state === "resolved");
+      for (const said of ["Severity: SEV-2 → SEV-1", "State: active → stable", "State: stable → resolved"]) await page.locator("ol li", { hasText: said }).waitFor();
+      await fitsAcross("a resolved incident's page");
+      // Found among the resolved, by its service.
+      await page.goto(`${BASE}/observe/incidents?state=resolved&q=${encodeURIComponent("services:checkout")}`);
+      await page.getByRole("link", { name: title, exact: false }).waitFor();
+      await fitsAcross("the incidents");
+      if (receiver) {
+        const told = await until("the webhook told of its declaring and each change of its state", () => {
+          const events = fs
+            .readFileSync(process.env.RECEIVED, "utf8")
+            .split("\n")
+            .filter(Boolean)
+            .slice(before)
+            .map((l) => JSON.parse(l))
+            .filter((x) => x.path === `/${hook}`)
+            .map((x) => JSON.parse(x.body).event);
+          return events.includes("incident.declared") && events.includes("incident.severity") && events.filter((v) => v === "incident.state").length === 2 ? events : null;
+        });
+        expect(told.length === 4, `told four times: ${told.join(", ")}`);
+      }
+    } finally {
+      // Away from its page before it goes (its page would ask for it again).
+      await page.goto(`${BASE}/observe/incidents`).catch(() => undefined);
+      if (id) await api("DELETE", `/api/observe/v1/incidents/${id}`);
+      if (receiver) await api("DELETE", `/api/observe/v1/integrations/${hook}`);
+    }
+  },
 };
 
 let failed = 0;

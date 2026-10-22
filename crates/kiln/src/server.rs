@@ -179,10 +179,16 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::api::set_issues(issues.clone());
         crate::rt::spawn(issues.run(shutdown.clone()));
         child!("observe", h => crate::observe::hub::send_loop(h));
+        // Incidents (`crate::observe::incidents`), told to their handles through the monitors'
+        // integrations.
+        let incidents = crate::observe::incidents::Incidents::open(&cfg.data("observe"));
+        crate::observe::incidents::set(incidents.clone());
         match crate::http::client::Client::public() {
             Ok(http) => {
                 let ms = crate::observe::monitors::Monitors::open(&cfg.data("observe"), std::sync::Arc::new(http), &cfg.server.public_url);
                 crate::observe::api::set_monitors(ms.clone());
+                let told = ms.clone();
+                incidents.on_change(move |t| told.tell_incident(&t));
                 // Its loop holds nothing that panics (the crate's lints): run, not supervised.
                 crate::rt::spawn(ms.run(shutdown.clone()));
             }

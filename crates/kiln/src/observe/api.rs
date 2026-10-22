@@ -750,6 +750,25 @@ fn reads_slo(m: &super::monitors::Monitor, id: &str) -> bool {
 pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let method = req.method().clone();
     match (&method, rest) {
+        // Incidents (§9.5): Datadog's API (declared, listed, searched, read, changed, removed; todos
+        // and attachments), and each one's timeline.
+        (&Method::GET, ["incidents"]) => super::incidents::http::list(q),
+        (&Method::POST, ["incidents"]) => super::incidents::http::create(q, req).await,
+        (&Method::GET, ["incidents", "search"]) => super::incidents::http::search_of(q),
+        (&Method::GET, ["incidents", id]) => super::incidents::http::get_one(id, q),
+        (&Method::PATCH, ["incidents", id]) => super::incidents::http::update(id, q, req).await,
+        (&Method::DELETE, ["incidents", id]) => super::incidents::http::remove(id).await,
+        (&Method::GET, ["incidents", id, "relationships", "todos"]) => super::incidents::http::todos(id),
+        (&Method::POST, ["incidents", id, "relationships", "todos"]) => super::incidents::http::add_todo(id, req).await,
+        (&Method::GET, ["incidents", id, "relationships", "todos", todo]) => super::incidents::http::todo(id, todo),
+        (&Method::PATCH, ["incidents", id, "relationships", "todos", todo]) => super::incidents::http::change_todo(id, todo, req).await,
+        (&Method::DELETE, ["incidents", id, "relationships", "todos", todo]) => super::incidents::http::remove_todo(id, todo, &req).await,
+        (&Method::GET, ["incidents", id, "attachments"]) => super::incidents::http::attachments(id),
+        (&Method::POST, ["incidents", id, "attachments"]) => super::incidents::http::attach(id, req).await,
+        (&Method::PATCH, ["incidents", id, "attachments", attachment]) => super::incidents::http::change_attachment(id, attachment, req).await,
+        (&Method::DELETE, ["incidents", id, "attachments", attachment]) => super::incidents::http::remove_attachment(id, attachment, &req).await,
+        (&Method::GET, ["incidents", id, "timeline"]) => super::incidents::http::timeline(id),
+        (&Method::POST, ["incidents", id, "timeline"]) => super::incidents::http::note(id, req).await,
         // The infrastructure list (§10.9): Datadog's host list and totals, a host whole, a host
         // muted and unmuted.
         (&Method::GET, ["hosts"]) => super::infra::http::hosts(q).await,

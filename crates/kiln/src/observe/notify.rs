@@ -225,10 +225,27 @@ pub struct Notice {
     pub at: i64,
     pub priority: Option<u8>,
     pub tags: Vec<String>,
+    /// What it is about (a webhook's `event`): `monitor.transition`, or an incident's change.
+    pub event: &'static str,
+    /// A title of its own (an incident's), in place of a monitor's state and name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headline: Option<String>,
+    /// What it shows beside its message, in place of a monitor's value and threshold (an
+    /// incident's severity and state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<Vec<(String, String)>>,
 }
 
 impl Notice {
+    /// What it shows beside its message: its own facts, or a monitor's value and threshold.
+    fn facts(&self) -> Vec<(String, String)> {
+        self.facts.clone().unwrap_or_else(|| vec![("Value".to_owned(), self.value_text()), ("Threshold".to_owned(), self.threshold.to_string())])
+    }
+
     fn title(&self) -> String {
+        if let Some(h) = &self.headline {
+            return h.clone();
+        }
         let group = if self.group.is_empty() { String::new() } else { format!(" on {}", self.group.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(",")) };
         let word = match self.state {
             "ALERT" => "Triggered",
@@ -278,19 +295,22 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
     match i {
         Integration::Slack { url } => {
             let body = json!({
-                "text": format!("{} — {}", n.title(), n.value_text()),
+                "text": if n.facts.is_some() { n.title() } else { format!("{} — {}", n.title(), n.value_text()) },
                 "attachments": [{
                     "color": hex,
                     "blocks": [
                         { "type": "section", "text": { "type": "mrkdwn", "text": format!("*<{}|{}>*\n{}", n.link, clip(&n.title(), 200), clip(&n.body(), 2900)) } },
-                        { "type": "context", "elements": [{ "type": "mrkdwn", "text": format!("value *{}* · threshold {} · {}", n.value_text(), n.threshold, if group.is_empty() { "all".to_owned() } else { group.clone() }) }] },
+                        { "type": "context", "elements": [{ "type": "mrkdwn", "text": match &n.facts {
+                            Some(f) => f.iter().map(|(k, v)| format!("{k} *{v}*")).collect::<Vec<_>>().join(" · "),
+                            None => format!("value *{}* · threshold {} · {}", n.value_text(), n.threshold, if group.is_empty() { "all".to_owned() } else { group.clone() }),
+                        } }] },
                     ],
                 }],
             });
             (url.clone(), serde_json::to_vec(&body).unwrap_or_default(), json_headers)
         }
         Integration::Discord { url } => {
-            let mut fields = vec![json!({ "name": "Value", "value": n.value_text(), "inline": true }), json!({ "name": "Threshold", "value": n.threshold.to_string(), "inline": true })];
+            let mut fields: Vec<Value> = n.facts().into_iter().map(|(k, v)| json!({ "name": clip(&k, 256), "value": clip(&v, 1024), "inline": true })).collect();
             for (k, v) in n.group.iter().take(23) {
                 fields.push(json!({ "name": clip(k, 256), "value": clip(v, 1024), "inline": true }));
             }
@@ -308,7 +328,7 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
             (url.clone(), serde_json::to_vec(&body).unwrap_or_default(), json_headers)
         }
         Integration::Teams { url } => {
-            let mut facts = vec![json!({ "title": "Value", "value": n.value_text() }), json!({ "title": "Threshold", "value": n.threshold.to_string() })];
+            let mut facts: Vec<Value> = n.facts().into_iter().map(|(k, v)| json!({ "title": k, "value": v })).collect();
             for (k, v) in &n.group {
                 facts.push(json!({ "title": k, "value": v }));
             }
@@ -333,9 +353,15 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
         }
         Integration::Pagerduty { routing_key, url } => {
             let resolve = n.state == "OK";
-            let severity = match n.state {
-                "ALERT" => "critical",
-                "WARN" => "warning",
+            // An incident's by its severity (SEV-0 and SEV-1 critical, SEV-2 error, SEV-3 warning);
+            // a monitor's by its state.
+            let severity = match (n.facts.is_some(), n.priority, n.state) {
+                (true, Some(0 | 1), _) => "critical",
+                (true, Some(2), _) => "error",
+                (true, Some(3), _) => "warning",
+                (true, _, _) => "info",
+                (false, _, "ALERT") => "critical",
+                (false, _, "WARN") => "warning",
                 _ => "info",
             };
             let source = n.group.iter().find(|(k, _)| k == "host").map_or("kiln", |(_, v)| v.as_str());
@@ -349,8 +375,11 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
                     "severity": severity,
                     "timestamp": rfc3339(n.at),
                     "group": group,
-                    "class": "kiln.monitor",
-                    "custom_details": { "message": n.body(), "value": n.value, "threshold": n.threshold, "monitor_id": n.monitor_id, "state": n.state, "tags": n.tags },
+                    "class": if n.facts.is_some() { "kiln.incident" } else { "kiln.monitor" },
+                    "custom_details": match &n.facts {
+                        Some(f) => json!({ "message": n.body(), "facts": f.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect::<serde_json::Map<String, Value>>(), "incident": n.monitor_id, "tags": n.tags }),
+                        None => json!({ "message": n.body(), "value": n.value, "threshold": n.threshold, "monitor_id": n.monitor_id, "state": n.state, "tags": n.tags }),
+                    },
                 },
                 "links": [{ "href": n.link, "text": "Open in kiln" }],
                 "client": "kiln",
@@ -372,8 +401,9 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
             let mut details = serde_json::Map::new();
             details.insert("monitor_id".into(), json!(n.monitor_id));
             details.insert("state".into(), json!(n.state));
-            details.insert("value".into(), json!(n.value_text()));
-            details.insert("threshold".into(), json!(n.threshold.to_string()));
+            for (k, v) in n.facts() {
+                details.insert(clip(&k.to_lowercase(), 100), json!(clip(&v, 500)));
+            }
             details.insert("link".into(), json!(n.link));
             for (k, v) in &n.group {
                 details.insert(clip(k, 100), json!(clip(v, 500)));
@@ -381,7 +411,7 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
             let body = json!({
                 "message": clip(&n.title(), 130),
                 "alias": alias,
-                "description": clip(&format!("{}\n\nvalue {} · threshold {}\n{}", n.body(), n.value_text(), n.threshold, n.link), 15_000),
+                "description": clip(&format!("{}\n\n{}\n{}", n.body(), n.facts().iter().map(|(k, v)| format!("{} {v}", k.to_lowercase())).collect::<Vec<_>>().join(" · "), n.link), 15_000),
                 "tags": n.tags.iter().take(20).map(|t| clip(t, 50)).collect::<Vec<_>>(),
                 "details": details,
                 "entity": clip(if group.is_empty() { &n.monitor } else { &group }, 512),
@@ -393,9 +423,9 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
         // Not over HTTP: `deliver_email`.
         Integration::Email { .. } => (String::new(), Vec::new(), Vec::new()),
         Integration::Webhook { url, secret } => {
-            let body = serde_json::to_vec(&json!({ "event": "monitor.transition", "notice": n })).unwrap_or_default();
+            let body = serde_json::to_vec(&json!({ "event": n.event, "notice": n })).unwrap_or_default();
             let mut headers = json_headers;
-            headers.push(("x-kiln-event".into(), "monitor.transition".into()));
+            headers.push(("x-kiln-event".into(), n.event.into()));
             headers.push(("x-kiln-delivery".into(), crate::util::new_id()));
             if let Some(s) = secret {
                 headers.push(("x-kiln-signature".into(), format!("sha256={}", crate::util::hmac_hex(s.as_bytes(), &body))));
@@ -425,7 +455,7 @@ fn html_escape(s: &str) -> String {
 /// they share.
 pub fn email(n: &Notice, to: &[String], from: &str) -> super::smtp::Mail {
     let (_, color, _) = n.color();
-    let mut facts = vec![("Value".to_owned(), n.value_text()), ("Threshold".to_owned(), n.threshold.to_string())];
+    let mut facts = n.facts();
     facts.extend(n.group.iter().cloned());
     let text = format!("{}\n\n{}\n\n{}\n\nOpen in kiln: {}\n", n.title(), n.body(), facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"), n.link);
     let rows: String = facts
@@ -613,6 +643,9 @@ mod tests {
             at: 1_700_000_000_000,
             priority: Some(1),
             tags: vec!["team:infra".into()],
+            event: "monitor.transition",
+            headline: None,
+            facts: None,
         }
     }
 

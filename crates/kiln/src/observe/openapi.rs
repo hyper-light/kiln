@@ -1367,6 +1367,160 @@ fn schemas() -> Map<String, Value> {
     let mut host_detail = host_fields();
     host_detail.push(("containers", describe(array(map_of(any())), "its containers: id, name, image, pod, last reported, CPU (nanocores), memory (bytes)")));
     put("HostDetail", object(&host_detail, &["name", "up", "is_muted", "metrics", "kiln"]));
+    // Incidents (§9.5): Datadog's JSON:API.
+    let rel = |t: &str| object(&[("data", nullable(object(&[("type", one_of(&[t])), ("id", string())], &["type", "id"])))], &["data"]);
+    let field =
+        || describe(object(&[("type", one_of(&["dropdown", "textbox", "multiselect", "textarray", "metrictag", "autocomplete"])), ("value", any())], &["type", "value"]), "a text, or a list of texts");
+    let handle = || object(&[("display_name", string()), ("handle", describe(string(), "@slack-ops, @pagerduty-oncall, …"))], &["handle"]);
+    let seconds = || describe(nullable(integer()), "seconds");
+    let time = || describe(nullable(string()), "RFC 3339");
+    put(
+        "Incident",
+        object(
+            &[
+                ("id", string()),
+                ("type", one_of(&["incidents"])),
+                (
+                    "attributes",
+                    object(
+                        &[
+                            ("public_id", integer()),
+                            ("title", string()),
+                            ("customer_impacted", boolean()),
+                            ("customer_impact_scope", nullable(string())),
+                            ("customer_impact_start", time()),
+                            ("customer_impact_end", time()),
+                            ("customer_impact_duration", seconds()),
+                            ("time_to_detect", seconds()),
+                            ("time_to_internal_response", seconds()),
+                            ("time_to_repair", seconds()),
+                            ("time_to_resolve", seconds()),
+                            ("created", string()),
+                            ("modified", string()),
+                            ("detected", string()),
+                            ("declared", string()),
+                            ("resolved", time()),
+                            ("severity", one_of(&super::incidents::SEVERITIES)),
+                            ("state", one_of(&super::incidents::STATES)),
+                            ("fields", map_of(field())),
+                            ("notification_handles", array(handle())),
+                            ("is_test", boolean()),
+                            ("kiln", describe(map_of(any()), "kiln's own: the monitor that declared it, its todos open, its postmortem")),
+                        ],
+                        &["public_id", "title", "severity", "state", "created"],
+                    ),
+                ),
+                ("relationships", object(&[("commander_user", rel("users")), ("created_by_user", rel("users")), ("last_modified_by_user", rel("users")), ("attachments", any())], &[])),
+            ],
+            &["id", "type", "attributes"],
+        ),
+    );
+    put(
+        "IncidentBody",
+        object(
+            &[(
+                "data",
+                object(
+                    &[
+                        ("type", one_of(&["incidents"])),
+                        (
+                            "attributes",
+                            object(
+                                &[
+                                    ("title", string()),
+                                    ("customer_impacted", boolean()),
+                                    ("customer_impact_scope", describe(nullable(string()), "how customers were impacted: said when they were")),
+                                    ("customer_impact_start", time()),
+                                    ("customer_impact_end", time()),
+                                    ("detected", time()),
+                                    ("severity", one_of(&super::incidents::SEVERITIES)),
+                                    ("state", one_of(&super::incidents::STATES)),
+                                    ("fields", describe(map_of(field()), "its fields (severity and state among them, or others: a null value removes one)")),
+                                    ("notification_handles", array(handle())),
+                                    (
+                                        "initial_cells",
+                                        array(object(
+                                            &[("cell_type", one_of(&["markdown"])), ("content", object(&[("content", string())], &["content"])), ("important", boolean())],
+                                            &["cell_type", "content"],
+                                        )),
+                                    ),
+                                    ("is_test", boolean()),
+                                ],
+                                &[],
+                            ),
+                        ),
+                        ("relationships", object(&[("commander_user", rel("users"))], &[])),
+                    ],
+                    &["attributes"],
+                ),
+            )],
+            &["data"],
+        ),
+    );
+    put(
+        "IncidentTodo",
+        object(
+            &[
+                ("id", string()),
+                ("type", one_of(&["incident_todos"])),
+                (
+                    "attributes",
+                    object(
+                        &[
+                            ("content", string()),
+                            ("assignees", array(string())),
+                            ("due_date", nullable(string())),
+                            ("completed", time()),
+                            ("created", string()),
+                            ("modified", string()),
+                            ("incident_id", string()),
+                        ],
+                        &["content"],
+                    ),
+                ),
+            ],
+            &["id", "type", "attributes"],
+        ),
+    );
+    put(
+        "IncidentAttachment",
+        object(
+            &[
+                ("id", string()),
+                ("type", one_of(&["incident_attachments"])),
+                (
+                    "attributes",
+                    object(
+                        &[("attachment_type", one_of(&["postmortem", "link"])), ("attachment", object(&[("documentUrl", string()), ("title", string())], &["documentUrl"])), ("modified", string())],
+                        &["attachment_type", "attachment"],
+                    ),
+                ),
+            ],
+            &["id", "type", "attributes"],
+        ),
+    );
+    put(
+        "TimelineCell",
+        object(
+            &[
+                ("id", string()),
+                ("created", string()),
+                ("author", string()),
+                ("cell_type", one_of(&["markdown", "changed", "monitor"])),
+                ("content", describe(string(), "a note's Markdown")),
+                ("important", boolean()),
+                ("what", describe(string(), "a change's: declared, severity, state, commander, title, postmortem")),
+                ("from", string()),
+                ("to", string()),
+                ("monitor_id", string()),
+                ("monitor", string()),
+                ("state", string()),
+                ("value", nullable(number())),
+                ("message", string()),
+            ],
+            &["id", "created", "cell_type"],
+        ),
+    );
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
@@ -2239,6 +2393,172 @@ fn ops() -> Vec<Op<'static>> {
             Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("group_ids", array(string()))], &["group_ids"]) } } })),
             vec![no_content()],
         ),
+        // Incidents (§9.5).
+        Op {
+            params: vec![
+                param("page[size]", "query", false, integer(), "10 unless said, 100 at the most"),
+                param("page[offset]", "query", false, integer(), "the first of the page"),
+                param("include", "query", false, string(), "users, attachments"),
+            ],
+            ..op(
+                "get",
+                "/incidents",
+                "Incidents, the newest first, as Datadog's API lists them",
+                "observe.read",
+                None,
+                vec![("200", answer_of("a page of them", object(&[("data", array(schema("Incident"))), ("included", array(any())), ("meta", any())], &["data", "meta"])))],
+            )
+        },
+        op(
+            "post",
+            "/incidents",
+            "Declares an incident (Datadog's body); its handles told",
+            "observe.write",
+            Some(body("IncidentBody")),
+            vec![("201", answer_of("declared", object(&[("data", schema("Incident"))], &["data"])))],
+        ),
+        Op {
+            params: vec![
+                param("query", "query", false, string(), "facets joined by AND, a facet's values by OR in parentheses: state:(active OR stable) AND severity:SEV-1"),
+                param("sort", "query", false, one_of(&["created", "-created"]), "-created unless said"),
+                param("page[size]", "query", false, integer(), "10 unless said, 100 at the most"),
+                param("page[offset]", "query", false, integer(), "the first of the page"),
+                param("include", "query", false, string(), "users, attachments"),
+            ],
+            ..op(
+                "get",
+                "/incidents/search",
+                "Incidents a query matches, and their facets counted (Datadog's search)",
+                "observe.read",
+                None,
+                vec![("200", answer_of("the incidents and their facets", object(&[("data", any()), ("meta", any())], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id(), param("include", "query", false, string(), "users, attachments")],
+            ..op(
+                "get",
+                "/incidents/{id}",
+                "An incident, by its id or its public id",
+                "observe.read",
+                None,
+                vec![("200", answer_of("the incident", object(&[("data", schema("Incident"))], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id()],
+            ..op(
+                "patch",
+                "/incidents/{id}",
+                "Changes an incident: what its body says (each change of its severity, state, commander or title on its timeline; its handles told of a severity's or state's)",
+                "observe.write",
+                Some(body("IncidentBody")),
+                vec![("200", answer_of("changed", object(&[("data", schema("Incident"))], &["data"])))],
+            )
+        },
+        Op { params: vec![id()], ..op("delete", "/incidents/{id}", "Removes an incident", "observe.write", None, vec![no_content()]) },
+        Op {
+            params: vec![id()],
+            ..op(
+                "get",
+                "/incidents/{id}/relationships/todos",
+                "An incident's todos",
+                "observe.read",
+                None,
+                vec![("200", answer_of("its todos", object(&[("data", array(schema("IncidentTodo")))], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id()],
+            ..op(
+                "post",
+                "/incidents/{id}/relationships/todos",
+                "Makes a todo of an incident",
+                "observe.write",
+                Some(
+                    json!({ "required": true, "content": { "application/json": { "schema": object(&[("data", object(&[("attributes", object(&[("content", string()), ("assignees", array(string())), ("due_date", nullable(string()))], &["content"]))], &["attributes"]))], &["data"]) } } }),
+                ),
+                vec![("201", answer_of("made", object(&[("data", schema("IncidentTodo"))], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id(), path_param("todo", "its id")],
+            ..op("get", "/incidents/{id}/relationships/todos/{todo}", "A todo", "observe.read", None, vec![("200", answer_of("the todo", object(&[("data", schema("IncidentTodo"))], &["data"])))])
+        },
+        Op {
+            params: vec![id(), path_param("todo", "its id")],
+            ..op(
+                "patch",
+                "/incidents/{id}/relationships/todos/{todo}",
+                "Changes a todo: its content, assignees, due date; done (completed a time) or not (null)",
+                "observe.write",
+                Some(
+                    json!({ "required": true, "content": { "application/json": { "schema": object(&[("data", object(&[("attributes", object(&[("content", string()), ("assignees", array(string())), ("due_date", nullable(string())), ("completed", describe(nullable(string()), "RFC 3339: done; null: not"))], &[]))], &["attributes"]))], &["data"]) } } }),
+                ),
+                vec![("200", answer_of("changed", object(&[("data", schema("IncidentTodo"))], &["data"])))],
+            )
+        },
+        Op { params: vec![id(), path_param("todo", "its id")], ..op("delete", "/incidents/{id}/relationships/todos/{todo}", "Removes a todo", "observe.write", None, vec![no_content()]) },
+        Op {
+            params: vec![id()],
+            ..op(
+                "get",
+                "/incidents/{id}/attachments",
+                "An incident's attachments",
+                "observe.read",
+                None,
+                vec![("200", answer_of("its attachments", object(&[("data", array(schema("IncidentAttachment")))], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id()],
+            ..op(
+                "post",
+                "/incidents/{id}/attachments",
+                "Attaches a postmortem (one an incident) or a link",
+                "observe.write",
+                Some(
+                    json!({ "required": true, "content": { "application/json": { "schema": object(&[("data", object(&[("attributes", object(&[("attachment_type", one_of(&["postmortem", "link"])), ("attachment", object(&[("documentUrl", string()), ("title", string())], &["documentUrl"]))], &["attachment"]))], &["attributes"]))], &["data"]) } } }),
+                ),
+                vec![("201", answer_of("attached", object(&[("data", schema("IncidentAttachment"))], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id(), path_param("attachment", "its id")],
+            ..op(
+                "patch",
+                "/incidents/{id}/attachments/{attachment}",
+                "Changes an attachment's URL or title",
+                "observe.write",
+                Some(
+                    json!({ "required": true, "content": { "application/json": { "schema": object(&[("data", object(&[("attributes", object(&[("attachment", object(&[("documentUrl", string()), ("title", string())], &[]))], &[]))], &["attributes"]))], &["data"]) } } }),
+                ),
+                vec![("200", answer_of("changed", object(&[("data", schema("IncidentAttachment"))], &["data"])))],
+            )
+        },
+        Op { params: vec![id(), path_param("attachment", "its id")], ..op("delete", "/incidents/{id}/attachments/{attachment}", "Removes an attachment", "observe.write", None, vec![no_content()]) },
+        Op {
+            params: vec![id()],
+            ..op(
+                "get",
+                "/incidents/{id}/timeline",
+                "An incident's timeline: its notes, each change, its monitor's alerts and recoveries",
+                "observe.read",
+                None,
+                vec![("200", answer_of("its cells, the oldest first", object(&[("data", array(schema("TimelineCell")))], &["data"])))],
+            )
+        },
+        Op {
+            params: vec![id()],
+            ..op(
+                "post",
+                "/incidents/{id}/timeline",
+                "Puts a note on an incident's timeline",
+                "observe.write",
+                Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("content", describe(string(), "Markdown")), ("important", boolean())], &["content"]) } } })),
+                vec![("201", answer_of("put", object(&[("data", schema("TimelineCell"))], &["data"])))],
+            )
+        },
         // The infrastructure list (§10.9).
         Op {
             params: vec![

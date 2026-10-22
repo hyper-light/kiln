@@ -9,7 +9,7 @@
 //! `cargo test -p kiln --test observe_live -- --ignored --nocapture`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 mod common;
-use common::{Fleet, at, caught_up, now_ms, raw};
+use common::{Fleet, Got, Mock, at, caught_up, now_ms, raw};
 
 #[test]
 #[ignore = "starts a kiln server and two runners as processes"]
@@ -318,98 +318,6 @@ fn a_ci_run_is_in_the_metrics_the_events_and_a_trace_a_span_monitor_watches() ->
     let listed = |n: &str| at(&names, &["metrics"]).as_array().is_some_and(|a| a.iter().any(|x| x == n));
     anyhow::ensure!(listed("kiln_runs_started_total") && listed("kiln_job_duration_seconds_bucket") && !listed("kiln_agent_cpu_percent"), "the registry's families: {names}");
     Ok(())
-}
-
-/// What a mock service received: each request's path, headers (lowercased names) and body.
-#[derive(Debug, Clone)]
-struct Got {
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Got {
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
-    }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-}
-
-/// A service for monitors to notify, on a port of its own: it takes every POST, answers 200 (or,
-/// for the first `refuse` requests to a path, 429 with `Retry-After: 1`), and keeps what came.
-struct Mock {
-    port: u16,
-    got: std::sync::Arc<std::sync::Mutex<Vec<Got>>>,
-}
-
-impl Mock {
-    fn start(refuse: &[(&str, usize)]) -> anyhow::Result<Self> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let got: std::sync::Arc<std::sync::Mutex<Vec<Got>>> = std::sync::Arc::default();
-        let refused: std::sync::Arc<std::sync::Mutex<BTreeMap<String, usize>>> = std::sync::Arc::new(std::sync::Mutex::new(refuse.iter().map(|(p, n)| ((*p).to_owned(), *n)).collect()));
-        let g = got.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut s) = stream else { continue };
-                let (g, refused) = (g.clone(), refused.clone());
-                std::thread::spawn(move || {
-                    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 8192];
-                    // Headers, then the body by its length.
-                    let head_end = loop {
-                        let Ok(n) = s.read(&mut chunk) else { return };
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
-                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break i;
-                        }
-                    };
-                    let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or(&[])).into_owned();
-                    let mut lines = head.lines();
-                    let path = lines.next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_owned();
-                    let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned())).collect();
-                    let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
-                    let mut body = buf.get(head_end + 4..).unwrap_or(&[]).to_vec();
-                    while body.len() < len {
-                        let Ok(n) = s.read(&mut chunk) else { break };
-                        if n == 0 {
-                            break;
-                        }
-                        body.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
-                    }
-                    let refuse = {
-                        let mut r = refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match r.get_mut(&path) {
-                            Some(n) if *n > 0 => {
-                                *n -= 1;
-                                true
-                            }
-                            _ => false,
-                        }
-                    };
-                    g.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Got { path, headers, body });
-                    let answer = if refuse { "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" } else { "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" };
-                    let _ = s.write_all(answer.as_bytes());
-                });
-            }
-        });
-        Ok(Self { port, got })
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port)
-    }
-
-    fn at(&self, path: &str) -> Vec<Got> {
-        self.got.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|g| g.path == path).cloned().collect()
-    }
 }
 
 #[test]

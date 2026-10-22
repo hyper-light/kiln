@@ -51,6 +51,7 @@ const SECTIONS = [
   { to: "/observe/errors", label: "Errors" },
   { to: "/observe/events", label: "Events" },
   { to: "/observe/monitors", label: "Monitors" },
+  { to: "/observe/incidents", label: "Incidents" },
   { to: "/observe/slos", label: "SLOs" },
   { to: "/observe/delivery", label: "Delivery" },
   { to: "/observe/synthetics", label: "Synthetics" },

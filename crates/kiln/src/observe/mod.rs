@@ -18,6 +18,7 @@ pub mod errors;
 pub mod github;
 pub mod host;
 pub mod hub;
+pub mod incidents;
 pub mod infra;
 pub mod kafka;
 pub mod kiln;

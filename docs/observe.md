@@ -39,6 +39,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-25 | Delivery: DORA metrics (§10.7), Datadog's: deployment frequency, change lead time (each commit's, from kiln's mirrors), change failure rate (rollbacks, reverts and hotfixes found as Datadog finds them, or marked by hand) and failed deployment recovery time, from kiln CD's deploys and Datadog's DORA API; failures; levels from DORA's 2024 report; metrics and events of each; the API, OpenAPI, its page | done |
 | O-26 | Service Catalog (§10.8), Datadog's: service definitions (v2.2) from Datadog's API and from `service.datadog.yaml` in the repositories kiln mirrors, services seen by their traces and deployments, each one's facts (requests, errors, latency, issues, monitors, SLOs, deployments, logs correlated) and Datadog's three scorecards; teams for DORA; the API, OpenAPI, its pages | done |
 | O-27 | Infrastructure (§10.9), Datadog's host list: every host that reports (kiln's runners, Datadog's Agent, OpenTelemetry's resources, any series tagged `host:<name>`), whether it is up, its CPU, I/O wait, load, memory and disk, its apps, its platform and tags by source, its containers; what the Agent says of its host (its host metadata, checks and inventory) kept; a host muted (a downtime of every monitor's groups of it); the API (Datadog's list and totals), its pages; checked live and in browsers (§13), measured (§12.31) | done |
+| O-28 | Incident management (§9.5), Datadog's: incidents declared (from kiln's pages, Datadog's v2 API, or a monitor naming `@incident`), their severity and state, commander, customer impact and fields; their timeline (notes, each change, their monitor's alerts and recoveries), todos and attachments (a postmortem, links); Datadog's figures of each (time to detect, respond, repair, resolve); told to the integrations they name (PagerDuty's incident and Opsgenie's alert closed as one is resolved); searched with Datadog's syntax, counted by facet; kept a file each within bounds; the API, OpenAPI, its pages; checked live and in browsers (§13), measured (§12.32) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -607,6 +608,7 @@ its schema (§13). Built:
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
+| `GET/POST incidents`, `GET incidents/search?query=`, `GET/PATCH/DELETE incidents/{id}`, `GET/POST incidents/{id}/relationships/todos`, `GET/PATCH/DELETE …/todos/{todo}`, `GET/POST incidents/{id}/attachments`, `PATCH/DELETE …/attachments/{id}`, `GET/POST incidents/{id}/timeline` | incidents (§9.5), Datadog's v2 API at kiln's paths (`{id}` its id or its public id): declared, listed, searched (Datadog's syntax; what matched counted by facet), read, changed and removed; their todos and attachments; their timeline (kiln's), a note put on it |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET synthetics`, `PUT/DELETE synthetics/{name}`, `POST synthetics/{name}/test`, `POST synthetics/{name}/run` | Synthetic tests (§10.4), each with how each location goes (passed, its last run's time, status, certificate's minutes, tries, failures; a runner's as of its last status) and the monitor it owns; a token left out of a `PUT` (or `"…"`) is the one kept, never shown; `test` runs one once from the server, nothing written; `run` runs it now at every location |
@@ -1641,6 +1643,79 @@ The check status widget (Datadog's `check_status`, §11) asks `POST checks/statu
 runs over the time whose tags hold its tags, each group's status, the worst of its series' latest
 runs (CRITICAL, then WARNING, UNKNOWN, OK); by `group_by`'s tags, or each series a group of its own.
 
+### 9.5 Incidents
+
+Datadog's incident management (`crate::observe::incidents`): an incident declared from kiln's
+pages, through the API (Datadog's v2 body), or by a monitor; worked as people work one; told to the
+integrations it names.
+
+- **What one is**: a title; a severity (`UNKNOWN`, `SEV-0` to `SEV-5`, the most severe first) and a
+  state (`active`, `stable`, `resolved`), each one of its fields too, as Datadog's API has them
+  (`fields.severity`, `fields.state`: dropdowns); its commander (a user, by id or name); whether
+  customers are impacted (then how, said: its scope) and from when to when; its other fields by name,
+  Datadog's types (`dropdown` and `textbox` a text; `multiselect`, `textarray`, `metrictag` and
+  `autocomplete` a list of texts; a null value removes one): `summary`, `root_cause`, `services`,
+  `teams` and `detection_method` among them; the integrations it tells (`notification_handles`:
+  `@slack-ops`, `@pagerduty-oncall`, as a monitor's message names them); whether it is a test. Its
+  public id (`#7`) besides its id (a UUID): either names it in every path, and a public id is never
+  given twice.
+- **Its timeline**, the oldest first: notes (Markdown, important or not), each change of its
+  severity, state, commander or title (from what to what, by whom), its postmortem attached, and its
+  monitor's alerts and recoveries (each its state, value and message). 1,000 cells at the most: past
+  them its first 100 (its declaring and first notes) stay, and the oldest after them go.
+- **Its todos** (Datadog's: what is to do, its assignees, a due date, done or not; 200 at the most)
+  and **attachments** (a postmortem, one an incident, and links; HTTP(S) alone; 100).
+- **Datadog's figures of it**, seconds, none below zero: time to detect (from the customers' impact
+  starting to its detection), to respond (from its detection to its declaring), to repair (from its
+  detection to the impact's end) and to resolve (from its declaring to its resolving), and the
+  impact's duration. It is detected as it is declared unless said (`detected`).
+- **From a monitor**: a monitor whose message names `@incident` (`@incident-sev2`: its severity;
+  `@incident-<anything>`) declares one as a group alerts with none of that monitor's group open: its
+  title the monitor's and the group's (`Checkout errors on service:checkout`), its severity the
+  mention's (else unknown), its handles the message's other mentions, `detection_method: monitor`,
+  the alert its first cell, all written at once under the lock that found none open (one incident a
+  group's alert). While it is open, each change of that group the message names `@incident` in goes
+  on its timeline (alerting again, recovering: people resolve it, not its monitor); once it is
+  resolved, the group's next alert declares another. A muted group, or one a downtime holds,
+  declares none, as it tells none; the first `@incident` of a message alone counts.
+- **Told**: its declaring, and each change of its state or severity, to each integration its handles
+  name, as monitors' notices go (§10): Slack's, Discord's and Teams' messages titled
+  `[Declared] Incident #7: …` (`[SEV-1]`, `[Stable]`, `[Resolved]`) with its severity, state and
+  commander; PagerDuty one incident an incident (its dedup key its public id's), triggered at its
+  severity (SEV-0 and SEV-1 critical, SEV-2 error, SEV-3 warning, the rest info) and resolved as it
+  is; Opsgenie one alert by the same alias, its priority its severity's (SEV-0 and SEV-1 P1, to SEV-5
+  P5; unknown P3), closed as it is resolved; email; a webhook's `event` `incident.declared`,
+  `incident.state` or `incident.severity`, its notice's `headline` and `facts`.
+- **Searched** as Datadog's API searches them (`GET incidents/search?query=`): facets joined by `AND`
+  (or a space), a facet's values by `OR` within its parentheses (`state:(active OR stable) AND
+  severity:SEV-1`), `*` any part of a value, a word alone a part of the title, quotes keeping words
+  together; facets `state`, `severity`, `commander`, `created_by`, `last_modified_by`, `postmortem`
+  and `impact` (`true`, `false`), `public_id`, `is_test`, and its fields by name (`services:checkout`,
+  `fields.teams:payments`); `OR` between facets refused, saying where it goes. What matched is counted
+  by facet as Datadog's search counts it (state, severity, commander, …; each field whose values come
+  from a list: dropdowns, multiselects, metric tags, autocompletes; not a text of one's own, a
+  summary never the same twice; each facet's 100 most common values; the least and the most time to
+  repair and to resolve), the newest first unless `sort=created`, a page of `page[size]` (10, 100 at
+  the most) from `page[offset]`. Read in place under the store's lock and written as it is read: no
+  incident copied, nothing allocated an incident (§12.32).
+- **Kept** by the server, each incident a file of its own (`<observe>/incidents/<public id>.json`),
+  written whole and atomically as it changes, and only it (a note writes its incident, not every
+  one): a change is made to a copy, the copy written, and then kept, so what is not on disk is not
+  answered either. The next public id (`next.json`) is written as one is removed (otherwise the
+  newest file says it). 10,000 incidents and 64 MiB of their files at the most (about what they take
+  in memory, §12.32): past either, the oldest resolved are let go; with none resolved to let go, none
+  is declared, and a change to an open one is still made. A file that does not read is left as it is,
+  said, and its id never given again; what a write cut short left is removed as the server starts.
+- **The API** (kiln's, a session's; reading `observe.read`, the rest `observe.write`): Datadog's v2
+  incidents API at kiln's paths (`/api/observe/v1/incidents…`): declared (`POST incidents`,
+  Datadog's body: `data.attributes`, `initial_cells` its first notes, `data.relationships.commander_user`),
+  listed (a page, the newest first; `include=users,attachments`), searched, read, changed (`PATCH`:
+  what the body says; a null clears) and removed; its todos (`relationships/todos`) and attachments,
+  Datadog's; and kiln's own, its timeline (read, a note put on it). Times RFC 3339 (or ms), figures
+  seconds; kiln's own beside, under `attributes.kiln` (its monitor, its todos counted, its
+  postmortem). At Datadog's own paths (`/api/v2/incidents…`) the ingest token, a writer of data,
+  reads and changes none (403).
+
 ## 10. Integrations
 
 Notifications (`crate::observe::notify`), each in its service's format: Slack (incoming webhook,
@@ -2229,6 +2304,18 @@ time range and the search in the address (a page is a link).
   4h (Europe/Paris)"), its window now or next; made and edited in a form (a monitor or monitors
   tagged, a scope, once or recurring with a weekly builder or a rule of one's own, what to tell as it
   ends), canceled from its row. A monitor's page says the downtime that holds it, until when.
+- **Incidents** (§9.5): by state (active, stable, resolved, all; each counted), by severity and by
+  Datadog's search (`services:checkout`, a word of the title), the newest first, 50 a page: each its
+  public id and title, when it was declared and by whom (or its monitor), its severity and state, its
+  commander, its todos open and how long it has run; on a phone, its title and a line of its severity
+  and state. Declared from a dialog (what is happening, its severity, a commander, whether customers
+  are impacted and how, the integrations to tell, picked from those set up, a first note), then its
+  page: its state and severity changed in place; its commander, customers, how long it has run and
+  Datadog's four times; its timeline, the newest first (notes as Markdown, an important one marked,
+  each change from what to what, its monitor's alerts and recoveries with their values), a note put
+  on it; its todos (an assignee by `@name`), done and removed; its postmortem and links attached and
+  removed; its properties (summary, root cause, services, teams, how it was found, whom it tells),
+  edited in a dialog with its title, commander and impact (its start and end); deleted.
 - **SLOs**: their states, in trouble first; each one's target and timeframe, SLI, budget left (a
   meter) and the hour's burn rate. An SLO's page: its standing and its four burn rates; each day's
   SLI against the target and the budget left through it, as lines (an SLI's days differ in their
@@ -3800,6 +3887,42 @@ a cloud's pull nests under them past a shard's 2 MiB. In a release build the thr
 55 KB. Observe's routes run as a task of their own now (kiln's `api.rs`): their handlers nest from
 the shard's loop, not under the routers.
 
+### 12.32 The incidents' store
+
+`cargo bench -p kiln --bench incidents` (adacachy, 2026-10-22, release; the files on its NVMe
+disk, `KOBS_DIR`; the machine's load some 70 to 140 on 32 cores, so times are rough, allocations
+exact): 10,000 incidents as an organization's years of them come to be (one in twenty active, two
+stable, the rest resolved; one to three of 40 services, a team of ten, a summary; five to fifteen
+notes, a monitor's alerts on half, its changes; up to four todos; a postmortem for three in five
+resolved), 52.4 MiB of files, 5.5 KB each.
+
+| search (a page of 50, what matched counted by facet) | matched | as first built | read in place, written as read |
+| --- | --- | --- | --- |
+| everything | 10,000 | 163 ms, 1,501,165 allocations | 22 ms, 83 allocations |
+| `state:active` (the page's first view) | 516 | 79 ms, 1,026,049 | 1.0 ms, 51 |
+| `state:resolved AND severity:(SEV-1 OR SEV-2)` | 2,453 | 74 ms, 1,199,591 | 1.6 ms, 87 |
+| `services:svc-07` | 481 | 84 ms, 1,076,862 | 1.5–4.6 ms, 76 |
+| `teams:team-3 postmortem:true` | 519 | 93 ms, 1,056,000 | 1.5 ms, 101 |
+| `checkout` (a word of the title) | 1,296 | 88 ms, 1,049,889 | 1.2 ms, 78 |
+
+As first built, a search copied every incident (some 94 allocations each, its timeline among them),
+then cloned and lowercased each value a term read, cloned each value a facet counted (every summary
+and root cause among them, each its own facet value), and made a tree of JSON of the page (193
+allocations an incident). Now a search reads the incidents in place under the store's lock: a term
+compares without allocating (ASCII case folded in place; a glob or a capital outside ASCII lowercased
+alone), facets count borrowed values in one pass over what matched (fields whose values come from a
+list, each facet's 100 most common), and the answer is written as it is serialized from borrowed
+structs (a time formatted on the stack): its allocations are the answer's buffer and a few map nodes,
+whatever the number of incidents. One incident read and written: 7 allocations (193 as a value).
+Opening the store (each file read) takes 0.2–0.26 s and holds 100.8 MiB, 1.92 times its files' bytes:
+the 64 MiB bound on the files holds an incident store to some 125 MiB of memory.
+
+A change writes its incident's file alone (and syncs it and its folder): a note took 6.8 ms here,
+where writing the whole store (as it was first kept, one file) took 147 ms and wrote 52 MiB. Its
+bytes formatted, `time` 0.3.55's `format_into` counts a fraction of a second short (`.123Z` as
+`.1`): the length written is taken from how far the writer went, and a test holds every fraction's
+form to `format`'s.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -4419,6 +4542,43 @@ figures and platform (its busy memory told apart), the Agent's failing check's e
 muted for an hour from its page, saying why, the API agreeing; unmuted. Nothing on either page wider
 than a phone. 2026-10-22: passes in all four (14–18 s each, most of it the list's 15 seconds of
 reuse before its series show; adacachy); and the whole suite, 36 scenarios, in all four.
+
+**Incidents** (`crates/kiln/tests/observe_incidents.rs`): a kiln server as a process of its own,
+and a service for it to tell on a port of its own (Slack, PagerDuty, Opsgenie and a webhook). An
+incident declared with Datadog's body (its severity a field, its services and teams, the
+integrations it tells, a first note, its commander; the customers' impact begun five minutes
+before): public id 1, its fields and commander as given, declared by the caller; detected five
+minutes after its impact began and declared at once, as Datadog's figures say. Told: Slack's
+`[Declared] Incident #1: …` with its severity and commander, PagerDuty's trigger at `error` (SEV-2;
+`kiln.incident`, its facts, its link), Opsgenie's alert P2 by the same key, the webhook's
+`incident.declared`. Found by state and severity (`state:active AND severity:(SEV-1 OR SEV-2)`), by
+its fields (`teams:pay*`) and by a word of its title; what matched counted by facet (each of its
+services once); `OR` between facets refused. Two todos (one with a due date), one done (counted: two,
+one open), one removed (and again, 404). Its postmortem; a second refused (one an incident), a
+`javascript:` link refused, a link kept; found by `postmortem:true`. A note; raised to SEV-1 as
+Datadog's field (Slack's `[SEV-1]`, PagerDuty's incident raised to critical on its key); stable
+(`[Stable]`); resolved with the impact's end 30 s after its detection (time to repair 30 s; the
+impact's duration and time to resolve as they follow): PagerDuty's incident resolved and Opsgenie's
+alert closed on the one key, Slack's `[Resolved]`; its timeline each of these in order. A monitor
+naming `@incident-sev1` and `@slack-ops`: its group alerting declares #2 (`e2e checkout errors on
+host:web-1`, SEV-1, `detection_method: monitor`, telling Slack, declared by its monitor), its alert
+on its timeline; recovering, its recovery there too, #2 still active; #2 resolved, the group
+alerting again declares #3. A viewer's token reads and is refused declaring and noting (403); a
+developer's declares (#4, a test, declared by its token). Datadog's incident API refused to the
+ingest token (403, reading and declaring). Refused, saying why: a title of 513 bytes, `SEV-9`, an
+impact without its scope, a multiselect of one text. The server killed and started again: #1's
+timeline the same, its state, todos and postmortem kept, all four there; the next declared #5. The
+drill removed, then read and removed again: 404. 2026-10-22: passes (63 s; adacachy). In a
+browser (`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): an incident
+declared from the list (SEV-2, a commander, the webhook at the receiver picked from the
+integrations, a first note), then on its page: its first note as Markdown; a note; a todo, `@ada`
+its assignee, done; its postmortem attached; its services and root cause edited; raised to SEV-1,
+stable, resolved, each on its timeline; found among the resolved by `services:checkout`; the webhook
+told four times (its declaring, its severity, its state twice); the API agreeing at each step.
+Nothing on either page wider than a phone. A todo done, a state or a severity picked shows at once,
+put back if the server refuses it (the first run found the checkbox waiting on the server's answer).
+2026-10-22: passes in all four (3–7 s each; adacachy); and the whole suite's other 36 scenarios in
+all four, Incidents among Observe's tabs.
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,

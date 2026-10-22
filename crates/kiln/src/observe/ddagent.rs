@@ -103,6 +103,10 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
     if let ["api", "v2", "services", "definitions", rest @ ..] = path {
         return super::catalog::http::datadog(rest, req).await;
     }
+    // Datadog's incident API (`super::incidents`): a writer's token reads and changes none.
+    if matches!(path, ["api", "v2", "incidents", ..]) {
+        return super::incidents::http::datadog();
+    }
     // Datadog's host API (`super::infra`): a writer's token reads and mutes no host.
     if matches!(path, ["api", "v1", "hosts", ..] | ["api", "v1", "host", ..]) {
         return super::infra::http::datadog();
