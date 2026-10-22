@@ -109,7 +109,7 @@ async fn control(cx: Cx, v: Value) -> Out {
         return Err((StatusCode::BAD_REQUEST, "`why`, `resume_in_s` and `resume_at` go with pause".into()));
     }
     let by = By::of(&cx.hub, &cx.caller, &agent);
-    let s = super::control_as(&cx.hub, &agent, action, &by, Pausing { why: opt(&v, "why"), until }).await.map_err(fail)?;
+    let s = super::control_as(&cx.hub, &agent, action, &by, Pausing { why: opt(&v, "why"), until, review: None }).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.control".into(), format!("{agent}: {action:?}")).await;
     json_of(&s)
 }

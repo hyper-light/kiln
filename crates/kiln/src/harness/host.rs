@@ -959,6 +959,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         pause: None,
         last_turn: None,
         keep_off: false,
+        held: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,

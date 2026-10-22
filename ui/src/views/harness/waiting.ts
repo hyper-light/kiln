@@ -1,11 +1,13 @@
 /**
- * The agents waiting on you, kept for the whole app (the requests shown wherever you are in kiln):
- * read once when first asked for, then kept from the server's events, and read again whenever the
- * event stream comes back (what changed while it was away isn't told). Only a change in what waits
- * (a request, its agent's name) tells the page; an agent's other news doesn't.
+ * The agents with something to show wherever you are in kiln (cards.ts: a request, goals paused for
+ * you, a stop of their own, a usage limit), kept for the whole app: read once when first asked for,
+ * then kept from the server's events, and read again whenever the event stream comes back (what
+ * changed while it was away isn't told). Only a change in what the cards show tells the page; an
+ * agent's other news doesn't.
  */
 import { events } from "@/api/events";
 import { harnessApi, type AgentInfo } from "@/api/harness";
+import { atLimit, notable, stoppedItself } from "./cards";
 
 const agents = new Map<string, AgentInfo>();
 /** What each waiting agent shows, so news that changes none of it says nothing. */
@@ -14,12 +16,21 @@ let waiting: AgentInfo[] = [];
 const listeners = new Set<() => void>();
 let stop: (() => void) | null = null;
 
-const shownOf = (a: AgentInfo) => [a.name, a.title, a.target, ...a.approvals.map((p) => `${p.id}\u0000${p.tool}\u0000${p.tool_name}\u0000${p.title}`)].join("\u0001");
-/** Since when it has waited: its oldest request. */
-const since = (a: AgentInfo) => Math.min(...a.approvals.map((p) => p.at || a.last_activity));
+const shownOf = (a: AgentInfo) =>
+  [
+    a.name,
+    a.title,
+    a.target,
+    ...a.approvals.map((p) => `${p.id}\u0000${p.tool}\u0000${p.tool_name}\u0000${p.title}`),
+    a.held ? `held\u0000${a.held.since}\u0000${a.held.why}\u0000${a.held.plan ?? ""}` : "",
+    stoppedItself(a) ? `stopped\u0000${a.last_activity}\u0000${a.exit?.error ?? ""}` : "",
+    a.pause && atLimit(a) ? `limit\u0000${a.pause.since}\u0000${a.pause.reason}\u0000${a.pause.label ?? ""}\u0000${a.pause.until ?? ""}\u0000${a.pause.auto}\u0000${a.pause.by}` : "",
+  ].join("\u0001");
+/** Since when it has had something to show: its oldest request, else when it paused or stopped. */
+const since = (a: AgentInfo) => (a.approvals.length > 0 ? Math.min(...a.approvals.map((p) => p.at || a.last_activity)) : (a.held?.since ?? a.pause?.since ?? a.last_activity));
 
 function changed(a: AgentInfo | undefined, id: string): boolean {
-  const now = a && a.approvals.length > 0 ? shownOf(a) : undefined;
+  const now = a && notable(a) ? shownOf(a) : undefined;
   if (shown.get(id) === now) return false;
   if (now === undefined) shown.delete(id);
   else shown.set(id, now);
@@ -27,7 +38,7 @@ function changed(a: AgentInfo | undefined, id: string): boolean {
 }
 
 function publish() {
-  waiting = [...agents.values()].filter((a) => a.approvals.length > 0).sort((x, y) => since(x) - since(y));
+  waiting = [...agents.values()].filter(notable).sort((x, y) => since(x) - since(y));
   listeners.forEach((l) => l());
 }
 

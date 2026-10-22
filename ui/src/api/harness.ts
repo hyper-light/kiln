@@ -623,6 +623,16 @@ export interface TurnEnd {
   kept?: number;
 }
 
+/** Goals an agent paused for you, until you resume them (`AgentInfo.held`). */
+export interface Held {
+  /** Why, as its goal stack says it ("Paused by the agent: …"). */
+  why: string;
+  /** The plan it waits for you to look at first, when that's why. */
+  plan?: string;
+  /** Unix ms it paused. */
+  since: number;
+}
+
 export interface AgentInfo {
   id: string;
   kind: string;
@@ -651,6 +661,8 @@ export interface AgentInfo {
   pause?: Pause;
   /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
   keep_off?: boolean;
+  /** Its goals wait on you: it paused them for you, until you resume them (set on the server). */
+  held?: Held;
   /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
   move_on_limit?: boolean;
   /** Where it goes on then (as `State.move_plan`). */

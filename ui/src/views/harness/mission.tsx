@@ -20,6 +20,7 @@ import { useAgentsLive } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { heldWords } from "./cards";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
@@ -59,6 +60,7 @@ function lineOf(a: AgentInfo, stand: Stand): string {
   switch (stand) {
     case "needs": {
       const ap = a.approvals[0];
+      if (!ap && a.held) return heldWords(a.held.why) ? `Paused its goals for you: ${heldWords(a.held.why)}` : "Paused its goals for you";
       if (!ap) return "Waiting for you";
       const more = a.approvals.length > 1 ? ` (+${a.approvals.length - 1} more)` : "";
       return ap.tool === "question" ? `Asks: ${ap.title}${more}` : ap.tool === "plan" ? `Proposes a plan${more}` : `${ap.tool_name || ap.tool}: ${ap.title}${more}`;
@@ -104,6 +106,27 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
       <Link to={`/agents/${a.id}`} className="ms-link">
         Review
       </Link>
+    </>
+  );
+}
+
+/** Goals it paused for you: the plan they wait on to look at, and Resume. */
+function HeldDecide({ a }: { a: AgentInfo }) {
+  const resume = () => void harnessApi.goalAction(a.id, "start").catch((e: unknown) => toast.error("Couldn't resume its goals", errorMessage(e)));
+  if (!a.held?.plan)
+    return (
+      <Button size="xs" onClick={resume}>
+        Resume
+      </Button>
+    );
+  return (
+    <>
+      <Button size="xs" asChild>
+        <Link to={`/agents/plans/${a.held.plan}`}>Review the plan</Link>
+      </Button>
+      <Button size="xs" variant="secondary" onClick={resume}>
+        Resume
+      </Button>
     </>
   );
 }
@@ -168,6 +191,7 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
         {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
         <span className="ms-decide">
           {stand === "needs" && ap && <Decide a={a} ap={ap} />}
+          {stand === "needs" && !ap && a.held && <HeldDecide a={a} />}
           {stand === "paused" && (
             <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>
               Resume

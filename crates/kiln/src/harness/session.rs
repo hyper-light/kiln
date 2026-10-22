@@ -179,6 +179,18 @@ impl SubagentBrief {
     }
 }
 
+/// Goals an agent paused for a person, until someone resumes them (`Info::held`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Held {
+    /// Why, as the stack says it ("Paused by the agent: …").
+    pub why: String,
+    /// The plan it waits for you to look at first, when that's why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Unix ms it paused.
+    pub since: i64,
+}
+
 /// A session as lists show it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Info {
@@ -278,6 +290,10 @@ pub struct Info {
     /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_off: bool,
+    /// Its goals wait on a person: it paused them for you, until you resume them (`goals::held_stacks`;
+    /// set on the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Held>,
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub move_on_limit: bool,
@@ -860,6 +876,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         pause: None,
         last_turn: None,
         keep_off: false,
+        held: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
@@ -3252,6 +3269,7 @@ mod tests {
             pause: None,
             last_turn: None,
             keep_off: false,
+            held: None,
             move_on_limit: false,
             move_plan: Default::default(),
             pause_at: None,
