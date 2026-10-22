@@ -19,6 +19,27 @@ fn update(a: &mut Acp, core: &mut Core, options: Vec<Value>) {
     a.line(core, &json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "config_option_update", "configOptions": options}}}).to_string());
 }
 
+#[test]
+fn a_session_keeps_effort_choices_learned_after_it_started() -> anyhow::Result<()> {
+    let config = vec![
+        json!({"id": "model", "category": "model", "type": "select", "currentValue": "catalog-current", "options": [{"value": "catalog-current", "name": "Current"}, {"value": "catalog-later", "name": "Later"}]}),
+        json!({"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high", "options": [{"value": "high", "name": "High"}]}),
+    ];
+    let mut a = Acp::from_spec(&Spec { kind: "devin".into(), ..Spec::default() });
+    let mut core = Core::new();
+    let new = initialize(&mut a, &mut core, false)?;
+    reply(&mut a, &mut core, &new, json!({"sessionId": "s1", "configOptions": config}));
+    assert!(core.meta.models.iter().find(|m| m.id == "catalog-later").is_some_and(|m| m.efforts.is_empty()));
+    super::super::kinds::note_models("devin", &[
+        ModelOption { id: "catalog-current".into(), efforts: vec!["obsolete".into()], ..ModelOption::default() },
+        ModelOption { id: "catalog-later".into(), efforts: vec!["max".into()], ..ModelOption::default() },
+    ]);
+    update(&mut a, &mut core, config);
+    assert_eq!(core.meta.models.iter().find(|m| m.id == "catalog-later").map(|m| m.efforts.as_slice()), Some(["max".to_owned()].as_slice()));
+    assert_eq!(core.meta.models.iter().find(|m| m.id == "catalog-current").map(|m| m.efforts.as_slice()), Some(["high".to_owned()].as_slice()));
+    Ok(())
+}
+
 fn send(a: &mut Acp, core: &mut Core, id: &str) {
     a.command(core, Command::Send { id: id.into(), text: format!("work {id}"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
 }
@@ -47,6 +68,29 @@ fn opened(config: Vec<Value>) -> anyhow::Result<(Acp, Core)> {
     reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": config}));
     anyhow::ensure!(written(&mut core).is_empty(), "an empty startup sent a request");
     Ok((a, core))
+}
+
+#[test]
+fn model_changes_keep_each_models_own_efforts_and_the_original_default() -> anyhow::Result<()> {
+    let (mut a, mut core) = opened(options("accept-edits", "default", "low"))?;
+    a.command(&mut core, Command::SetModel { model: "careful".into(), kind: None });
+    let setting = request(&mut core, "session/set_config_option")?;
+    reply(&mut a, &mut core, &setting, json!({"configOptions": options("accept-edits", "careful", "high")}));
+    assert_eq!(core.meta.models.iter().map(|m| (m.id.as_str(), m.efforts.clone(), m.default)).collect::<Vec<_>>(), [
+        ("default", vec!["low".to_owned()], true),
+        ("careful", vec!["low".to_owned(), "high".to_owned()], false),
+    ]);
+    let frozen = serde_json::to_value(&a)?;
+    a = serde_json::from_value(frozen)?;
+    a.command(&mut core, Command::SetModel { model: "default".into(), kind: None });
+    let setting = request(&mut core, "session/set_config_option")?;
+    reply(&mut a, &mut core, &setting, json!({"configOptions": options("accept-edits", "default", "low")}));
+    assert_eq!(core.meta.models.iter().find(|m| m.id == "careful").map(|m| m.efforts.clone()), Some(vec!["low".into(), "high".into()]));
+    assert_eq!(core.meta.models.iter().find(|m| m.default).map(|m| m.id.as_str()), Some("default"));
+    update(&mut a, &mut core, options("accept-edits", "default", "low").into_iter().filter(|c| c.get("category").and_then(Value::as_str) != Some("thought_level")).collect());
+    assert!(core.meta.models.iter().find(|m| m.id == "default").is_some_and(|m| m.efforts.is_empty()));
+    assert!(core.meta.models.iter().find(|m| m.id == "careful").is_some_and(|m| m.efforts.len() == 2));
+    Ok(())
 }
 
 #[test]

@@ -726,12 +726,17 @@ impl Registry {
     }
 
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
+        #[cfg(not(test))]
+        super::acp::warm_models();
         let mut all = self.kinds.lock().clone();
         // The server's own harnesses: the models its sessions listed since it started.
         for k in all.get_mut("local").into_iter().flatten() {
             let m = super::kinds::models_of(&k.id);
             if !m.is_empty() {
                 k.models = m;
+            }
+            if k.id == "devin" && let Some(kind) = super::kinds::Kind::get(&k.id) {
+                k.efforts = kind.efforts();
             }
         }
         all

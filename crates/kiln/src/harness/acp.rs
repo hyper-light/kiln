@@ -20,6 +20,13 @@ use super::model::{
     Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
 };
 
+mod catalog;
+
+#[cfg(not(test))]
+pub(super) fn warm_models() {
+    catalog::warm_models();
+}
+
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
@@ -511,7 +518,16 @@ impl Acp {
     fn config_options(&mut self, core: &mut Core, options: &[Value]) {
         self.has_config = true;
         self.config = options.to_vec();
-        core.meta.models.clear();
+        let mut known = std::mem::take(&mut core.meta.models);
+        if self.account {
+            for model in super::kinds::models_of("devin") {
+                match known.iter_mut().find(|m| m.id == model.id) {
+                    Some(kept) if kept.efforts.is_empty() => kept.efforts = model.efforts,
+                    Some(_) => {}
+                    None => known.push(model),
+                }
+            }
+        }
         core.meta.modes.clear();
         core.meta.efforts.clear();
         core.meta.controls.retain(|c| !c.id.starts_with("acp:"));
@@ -532,7 +548,7 @@ impl Acp {
             if prominent {
                 match category {
                     "model" => {
-                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), ..ModelOption::default() }).collect();
+                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), efforts: known.iter().find(|m| m.id == o.id).map(|m| m.efforts.clone()).unwrap_or_default(), default: known.iter().find(|m| m.id == o.id).is_some_and(|m| m.default) }).collect();
                         core.state.model = current.as_str().unwrap_or_default().to_owned();
                         core.meta.features.push("set_model".into());
                     }
@@ -573,6 +589,9 @@ impl Acp {
         }
         if !primary.contains("thought_level") {
             core.state.effort.clear();
+        }
+        if let Some(model) = core.meta.models.iter_mut().find(|m| m.id == core.state.model) {
+            model.efforts = core.meta.efforts.iter().map(|e| e.id.clone()).collect();
         }
         if !primary.contains("mode") {
             core.meta.modes.push(kiln_ask());
@@ -865,6 +884,7 @@ impl Acp {
     fn response(&mut self, core: &mut Core, id: &Value, v: &Value) {
         let Some(kind) = id.as_u64().and_then(|n| self.pending.remove(&n)) else { return };
         let refreshed = matches!(&kind, Pending::Refresh | Pending::RefreshNew);
+        let new_session = matches!(&kind, Pending::RefreshNew) || (matches!(&kind, Pending::Session) && self.resume.is_none());
         let result = v.get("result").cloned().unwrap_or(Value::Null);
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("request failed").to_owned();
@@ -1005,6 +1025,11 @@ impl Acp {
                     self.config_options(core, options);
                 } else if self.has_config {
                     self.config_options(core, &self.config.clone());
+                }
+                if new_session {
+                    for model in &mut core.meta.models {
+                        model.default = model.id == core.state.model;
+                    }
                 }
                 core.touch_state();
                 if refreshed {

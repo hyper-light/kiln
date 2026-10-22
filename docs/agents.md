@@ -20,6 +20,13 @@ tools and conversation resumption run over ACP. Its own terminal interface is `d
 settings, interruption, queueing, resume and native terminal discovery were tested against
 Devin CLI 3000.11.92.
 
+Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
+in a temporary configuration, with imports, MCP servers and automatic updates off. It sends no
+prompts. Each model's effort choices are read from the agent and kept in the existing model
+cache for the start dialog. Shared effort choices are offered only when every listed model
+supports them; choosing a model shows its own levels. The native permission modes are available
+before discovery finishes.
+
 ACP sessions prefer [config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
 (`configOptions`) over the older `modes` and `models` fields. The first select
 in the `mode`, `model` and `thought_level` categories drives kiln's existing permission, model
@@ -297,10 +304,11 @@ Each change is also an `account_flow` event (`{type, flow}`) on `/api/events`.
 
 ### Continuing a past session
 
-`GET /api/harness/history?target=local|agent:<name>&kind=claude|codex&limit=50` lists the
+`GET /api/harness/history?target=local|agent:<name>&kind=claude|codex|devin&limit=50` lists the
 conversations a machine keeps that are not running, read on that machine from its own
 transcripts (Claude Code's `projects/` in `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `sessions/`
-in `CODEX_HOME` or `~/.codex`): newest first, `kind` for one harness, `limit` up to 200 (50 by
+in `CODEX_HOME` or `~/.codex`) or Devin's native session database: newest first, `kind` for one
+harness, `limit` up to 200 (50 by
 default). Each: `kind`, `id` (the harness's session or thread id), `title` (Claude Code's
 `/rename` or generated title, Codex's thread name; else the last prompt's first line), `cwd`,
 `branch?`, `model?`, `last_activity` (unix seconds of the transcript's last write),
@@ -314,7 +322,7 @@ changed. Errors: 400 (a bad `target` or `kind`), 404 (an ephemeral runner, which
 (the machine is not connected or did not answer).
 
 Continue one with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` on the same
-target. Leave `model` unset: both harnesses keep the conversation's own. Its history is in the
+target. Leave `model` unset: the harness keeps the conversation's own. Its history is in the
 timeline when the session turns idle (Codex's latest 100 turns, listed with
 `thread/turns/list`; a notice says when earlier ones are not shown). Claude Code writes a
 `/rename` into its transcript with the next exchange: a name given just before the session ends

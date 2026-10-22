@@ -423,8 +423,7 @@ pub struct KindInfo {
     pub verified: bool,
     pub available: bool,
     /// Its permission modes, those that skip every check marked `dangerous` (a choice that takes
-    /// a confirmation, never a default). ACP agents announce theirs per session, so theirs are
-    /// empty here.
+    /// a confirmation, never a default). ACP agents other than Devin announce theirs per session.
     #[serde(default)]
     pub modes: Vec<super::model::ModeOption>,
     #[serde(default)]
@@ -468,6 +467,19 @@ impl Kind {
             }
             Protocol::CodexAppServer => (super::codex::modes(true), "auto"),
             Protocol::AgyStreamJson => (super::antigravity::modes(), super::antigravity::DEFAULT_MODE),
+            Protocol::Acp(_) if self.id == "devin" => (
+                [
+                    ("accept-edits", "Code", "Write and edit code", false),
+                    ("smart", "Smart", "Auto-approve actions the model judges safe", false),
+                    ("ask", "Ask", "Answer questions without code changes", false),
+                    ("plan", "Plan", "Plan changes before implementing", false),
+                    ("bypass", "Bypass Permissions", "Auto-approve all tool calls unless your organization's policy requires approval", true),
+                ]
+                .into_iter()
+                .map(|(id, label, description, dangerous)| super::model::ModeOption { id: id.into(), label: label.into(), description: description.into(), dangerous })
+                .collect(),
+                "accept-edits",
+            ),
             Protocol::Acp(_) | Protocol::Terminal => (Vec::new(), ""),
         }
     }
@@ -479,12 +491,13 @@ impl Kind {
     }
 
     /// The effort levels a new session can start at, before the harness says which its model has:
-    /// Codex's, those of its default model on this machine.
+    /// Codex's default model; Devin's common levels, safe for a model not learned yet too.
     pub fn efforts(&self) -> Vec<super::model::ControlOption> {
         let levels: Vec<String> = match self.protocol {
             Protocol::ClaudeStreamJson => super::claude::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
             Protocol::CodexAppServer => super::codex::default_efforts(),
             Protocol::AgyStreamJson => super::antigravity::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
+            Protocol::Acp(_) if self.id == "devin" => common_efforts(&models_of("devin")),
             Protocol::Acp(_) | Protocol::Terminal => Vec::new(),
         };
         levels
@@ -494,7 +507,13 @@ impl Kind {
     }
 }
 
+fn common_efforts(models: &[super::model::ModelOption]) -> Vec<String> {
+    models.first().map(|first| first.efforts.iter().filter(|e| models.iter().all(|m| m.efforts.contains(e))).cloned().collect()).unwrap_or_default()
+}
+
 pub fn offered() -> Vec<KindInfo> {
+    #[cfg(not(test))]
+    super::acp::warm_models();
     KINDS
         .iter()
         .map(|k| {
@@ -623,7 +642,23 @@ mod tests {
         assert_eq!(env.get(std::ffi::OsStr::new("CLAUDECODE")), Some(&None));
         assert_eq!(Kind::get("claude").map(|k| k.protocol), Some(Protocol::ClaudeStreamJson));
         assert_eq!(Kind::get("codex").map(|k| k.protocol), Some(Protocol::CodexAppServer));
+        let (modes, default) = kind.modes();
+        assert_eq!(default, "accept-edits");
+        assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("accept-edits", false), ("smart", false), ("ask", false), ("plan", false), ("bypass", true)]);
         Ok(())
+    }
+
+    #[test]
+    fn common_efforts_never_offers_a_level_missing_from_another_model() {
+        use super::super::model::ModelOption;
+        let mut models = vec![
+            ModelOption { efforts: vec!["low".into(), "high".into()], ..ModelOption::default() },
+            ModelOption { efforts: vec!["medium".into(), "high".into()], ..ModelOption::default() },
+        ];
+        assert_eq!(common_efforts(&models), ["high"]);
+        models.push(ModelOption::default());
+        assert!(common_efforts(&models).is_empty());
+        assert!(common_efforts(&[]).is_empty());
     }
 
     #[test]
