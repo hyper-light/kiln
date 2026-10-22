@@ -460,7 +460,7 @@ function Dock({
   const resume = useSession(store, (s) => (s.meta?.features ?? []).includes("resume"));
   return (
     <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
-      <ActivityLine store={store} agent={id} onOpenTask={onOpenTask} />
+      <ActivityLine store={store} onOpenTask={onOpenTask} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}

@@ -108,8 +108,9 @@ route, an MCP tool (`agents_start`, …), a code-mode function (`kiln.agents.sta
 There is no operation for answering another agent's approvals or questions.
 
 **O2 Parents and children.** An agent started by an agent records its parent (`parent`, set from
-the caller's identity, never from input). Mission Control lists only standalone agents; child
-status, output and requests for a person remain available in the agent chats.
+the caller's identity, never from input). It's a top-level agent all the same: Mission Control
+lists it as a row of its own, like an agent a person starts. A harness's own subagents stay in
+their agent's chat.
 Ending a parent lists its live children and offers to end them too.
 
 **O3 No more than its parent.** A child's permission mode is at most its parent's (plan < ask <

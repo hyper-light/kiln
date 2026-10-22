@@ -17,6 +17,7 @@ import { machineName } from "./parts";
 import { RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
+import { subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
 import "./console.css";
 
 type BorderState = "active" | "stopped" | "finished" | "ready" | "disconnected";
@@ -28,6 +29,9 @@ function turnSignal(status: Status, conn: string, state: State | null, info: Age
   if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "ready", label: "Waiting for you" };
   if (status === "starting") return { tone: "active", label: state?.harness_session ? "Resuming…" : "Starting…" };
   if (status === "running") return { tone: "active", label: "Working" };
+  // Its turn over, a subagent it sent off still works.
+  const subs = state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info?.subagents).length;
+  if (workingThrough(status, subs)) return { tone: "active", label: `Working · ${subs} subagent${subs === 1 ? "" : "s"}` };
   if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
   return { tone: "ready", label: "Ready" };
 }
