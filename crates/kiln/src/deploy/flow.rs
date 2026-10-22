@@ -20,7 +20,7 @@ use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
 use super::gates::{self, Verdict};
-use super::model::{App, Approval, Artifact, Concurrency, Contacts, Environment, GITHUB_HOST, GITLAB_HOST, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template, Via};
+use super::model::{App, Approval, Artifact, BITBUCKET_HOST, Concurrency, Contacts, Environment, GITHUB_HOST, GITLAB_HOST, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template, Via, remote_host};
 use super::{Deploy, repo, store};
 
 /// An error and the status that says what went wrong.
@@ -74,7 +74,7 @@ pub(super) fn emit_release(d: &Deploy, r: &Release) {
     }
     d.hub.emit(&e);
     d.changes.send(r.id);
-    // The host's deployment of its commit, where the release repository is GitHub's or GitLab's (§7).
+    // The host's deployment of its commit, where the release repository is on another host (§7).
     remote::report(d, r);
     // Chat, paging and webhooks: the server's rules, and the app's own channels.
     let event = match r.state {
@@ -208,17 +208,18 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     }
     match e.release_repo.host.as_str() {
         KILN_HOST => {}
-        // GitHub through kiln's App, a GitLab with its token: one reaches it, or it's refused.
-        GITHUB_HOST | GITLAB_HOST => {
+        // GitHub through kiln's App, a GitLab with its token, Bitbucket with `[ci.bitbucket]`'s
+        // credentials: one reaches it, or it's refused.
+        GITHUB_HOST | GITLAB_HOST | BITBUCKET_HOST => {
             remote::open(d, &e.release_repo).await.map_err(bad)?;
         }
-        other => return Err(bad(format!("{other}: a release repository is on kiln's own git server (`kiln`), on GitHub (`github`) or on a GitLab (`gitlab`); Bitbucket comes later"))),
+        other => return Err(bad(format!("{other}: a release repository is on kiln's own git server (`kiln`), on GitHub (`github`), on a GitLab (`gitlab`) or on Bitbucket (`bitbucket`)"))),
     }
     // The merge of a pull request is its approval (docs/deploy-api.md §9.1), and only a host with
     // pull requests has one.
     if e.gates.via == Via::PullRequest {
-        if !matches!(e.release_repo.host.as_str(), GITHUB_HOST | GITLAB_HOST) {
-            return Err(bad("gates.via: pull-request: releases as pull requests need a release repository on GitHub (host: github) or GitLab (host: gitlab)"));
+        if !remote_host(&e.release_repo.host) {
+            return Err(bad("gates.via: pull-request: releases as pull requests need a release repository on GitHub (host: github), GitLab (host: gitlab) or Bitbucket (host: bitbucket)"));
         }
         if e.gates.approvals.is_some() {
             return Err(bad("gates.via: pull-request: the merge of a release's pull request is its approval; leave out gates.approvals (who may merge is the branch's protection on the host)"));
@@ -296,9 +297,10 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
 /// An environment's release repository there: on kiln's own git server, one of kiln's native
 /// repositories (docs/ci.md W14), its bare repository and its row, so kiln's git server serves it
 /// to readers with a token, its review rules hold, and people change it in diffs as any
-/// repository's; on GitHub, the repository, made through kiln's GitHub App if it isn't there.
+/// repository's; on another host, the repository, made there if it isn't (GitHub's through kiln's
+/// GitHub App).
 pub async fn ensure_release_repo(d: &Deploy, rr: &super::model::RepoRef) -> Result<(), String> {
-    if matches!(rr.host.as_str(), GITHUB_HOST | GITLAB_HOST) {
+    if remote_host(&rr.host) {
         return remote::ensure(d, rr).await;
     }
     if crate::ci::hosting::path_of(&d.hub, &rr.repo).is_none() {
@@ -1276,8 +1278,8 @@ pub async fn answer(d: &Deploy, who: &Who, id: i64, approved: bool, note: Option
 const LEASE_SECS: i64 = 60;
 /// How often release repositories are looked at for commits kiln didn't make.
 const SCAN_SECS: i64 = 30;
-/// How often Argo CD's tokens for release repositories on GitHub are looked at (each is replaced
-/// every half hour).
+/// How often Argo CD's credentials for release repositories on other hosts are looked at (GitHub's
+/// tokens are replaced every half hour).
 const READERS_SECS: i64 = 300;
 
 /// Follows every release due, until the server shuts down.
@@ -1702,7 +1704,7 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
         changes.push(Change { path: values_path, content: Some(v.clone().into_bytes()) });
     }
     if env.gates.via == Via::PullRequest {
-        let gh = at.remote().ok_or("gates.via: pull-request needs a release repository on GitHub or GitLab")?;
+        let gh = at.remote().ok_or("gates.via: pull-request needs a release repository on GitHub, GitLab or Bitbucket")?;
         let p = gh.propose(&remote::proposal_branch(r), changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
         let kept = json!({ "number": p.number, "url": p.url, "branch": p.branch, "secrets": changed, "irreversible": found.irreversible });
         return Ok(Committed::Proposed(kept, waits_for(&rr.host, p.number, &p.url)));

@@ -476,11 +476,12 @@ enum EnvCmd {
         /// `kilncd`, or `argocd/<integration>`.
         #[arg(long, default_value = "kilncd")]
         provider: String,
-        /// Where the release repository is: `kiln` (kiln's git server), or `github` (through kiln's
-        /// GitHub App, which makes it in an organization if it isn't there).
+        /// Where the release repository is: `kiln` (kiln's git server), `github` (through kiln's
+        /// GitHub App), `gitlab` (a `[[ci.gitlab]]`) or `bitbucket` (`[ci.bitbucket]`); on another
+        /// host, kiln makes it if it isn't there.
         #[arg(long, default_value = "kiln")]
         host: String,
-        /// The release repository (`owner/name`).
+        /// The release repository (`owner/name`; on GitLab `group/…/name`).
         #[arg(long, default_value = "kiln/releases")]
         repo: String,
         #[arg(long, default_value = "main")]
