@@ -25,6 +25,31 @@ kiln-sim moves: seeds 2000..=2000 (1) in 0.04 s, 1409 seeds/min on one thread, 1
     replay: KILN_SIM_SEED=2000
 ```
 
+## How fast it runs
+
+Each run's report says its seeds a minute on one thread, timed by the simulator itself. Measured
+on 2026-10-22 on fedora (an i9-14900HX) with a release build:
+
+- one test thread pinned to one CPU;
+- 2,000 seeds a run, from seed 100,000;
+- each run started once the machine's 1-minute load average was below 2.
+
+| Model | Seeds a minute |
+| --- | --- |
+| sync | 7,097 and 6,046 (two runs) |
+| moves | 4,921 |
+
+Other work started on the machine during these runs: by the time each ended, the load average was
+between 4 and 7. To measure again, build with `cargo test --release -p kiln --lib --no-run`, then
+run the test binary it builds:
+
+```
+KILN_SIM_SEEDS=2000 KILN_SIM_FROM=100000 taskset -c <cpu> <the binary> --exact <the model's test> --test-threads 1 --nocapture
+```
+
+The model's test is `sim::sync::tests::sync_converges_and_loses_nothing_under_the_nemesis` or
+`sim::moves::tests::a_moving_session_never_leaves_its_work_behind`.
+
 ## What it is
 
 | Part | |
