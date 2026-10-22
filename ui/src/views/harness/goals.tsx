@@ -18,15 +18,94 @@ import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { planHref, runHref } from "@/api/plans";
+import { ApiError } from "@/api/client";
+import { planHref, plansApi, runHref, type Plan } from "@/api/plans";
+import { PlanGraph } from "@/views/plans/graph";
+import { effectiveNeeds } from "@/views/plans/graph-layout";
 import type { Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
-import { fromLines, stackReads, startWords, stoppedBy, toGo } from "./goal-stack";
+import { canPlan, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "./goal-stack";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
+
+/** Longer than this, a goal's words fold to their first lines. */
+const LONG_GOAL = 220;
+
+/** A goal's words: a long one folds to its first lines, opened on asking. */
+function GoalWords({ text }: { text: string }) {
+  const [open, setOpen] = React.useState(false);
+  const long = text.length > LONG_GOAL;
+  return (
+    <>
+      <span className="gs-words" data-folded={long && !open ? "" : undefined}>
+        {text}
+      </span>
+      {long && (
+        <button type="button" className="gs-fold" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? "Less" : "More"}
+        </button>
+      )}
+    </>
+  );
+}
+
+/** "gone" for a plan or run that isn't there any more. */
+const unlessGone = (e: unknown): "gone" => {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return "gone";
+  throw e;
+};
+
+/** A goal that became a plan: its steps as they run (each as the goal's parts, or its run, say), and the plan to open. */
+function PlannedGoal({ goal, items, paused }: { goal: GoalItem; items: GoalItem[]; paused: boolean }) {
+  const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
+  return (
+    <Loadable label="its plan" fallback={null}>
+      {run ? <PlannedRun plan={goal.planned_as ?? ""} run={run} /> : <PlannedParts plan={goal.planned_as ?? ""} goal={goal} items={items} paused={paused} />}
+    </Loadable>
+  );
+}
+
+const usePlan = (plan: string) => useSuspenseResource(`plans/${plan}`, (s) => plansApi.get(plan, s).catch(unlessGone)).data;
+
+/** Its steps are the goal's parts: each stands as its part does. */
+function PlannedParts({ plan, goal, items, paused }: { plan: string; goal: GoalItem; items: GoalItem[]; paused: boolean }) {
+  const p = usePlan(plan);
+  if (!p || p === "gone") return null;
+  return <PlannedView p={p} stand={(n) => stepStand(goal, items, n, paused)} />;
+}
+
+/** Its steps run with an agent each: each stands as its run says. */
+function PlannedRun({ plan, run }: { plan: string; run: string }) {
+  const p = usePlan(plan);
+  const v = useSuspenseResource(`plans/runs/${run}`, (s) => plansApi.runView(run, s).catch(unlessGone), { on: ["harness", "harness_closed", "plan_stack"], pollMs: 4000 }).data;
+  if (!p || p === "gone") return null;
+  const steps = v && v !== "gone" ? v.steps : [];
+  return <PlannedView p={p} stand={(n) => steps.find((s) => s.n === n)?.stand} run={run} />;
+}
+
+function PlannedView({ p, stand, run }: { p: Plan; stand: (n: number) => Stand | undefined; run?: string }) {
+  const titles = p.items?.length ? p.items.map((it) => it.title || "Untitled step") : p.steps;
+  const waits = effectiveNeeds(titles.map((_, i) => p.items?.[i]?.needs));
+  const steps = titles.map((title, i) => ({ n: i + 1, title, needs: waits[i] ?? [], stand: stand(i + 1) }));
+  const met = steps.filter((s) => s.stand === "met").length;
+  return (
+    <div className="gs-plan">
+      {steps.length > 0 && <PlanGraph label={`Its plan, “${p.title}”`} steps={steps} />}
+      <p className="gs-plan-line">
+        <Link to={planHref(p.id)}>{p.phase === "planning" ? "Being planned: researching it and writing its steps" : `${met} of ${steps.length} step${steps.length === 1 ? "" : "s"} met`}</Link>
+        {run && (
+          <>
+            {" · "}
+            <Link to={runHref(run)}>its run</Link>
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
 
 /** An agent's name, from the agents kiln knows (its id's start until they're in). */
 function AgentLabel({ id }: { id: string }) {
@@ -272,7 +351,7 @@ function GoalPanel({
                     </span>
                     <span className="gs-text">
                       {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                      {g.text.split(" — ")[0] ?? g.text}
+                      <GoalWords text={g.text.split(" — ")[0] ?? g.text} />
                       {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
                       <span className="gs-word">
                         {held ? "paused" : away ? (
@@ -293,6 +372,24 @@ function GoalPanel({
                             <Link to={planHref(g.planned_as)}>planned</Link>: met once every step of its plan is
                           </>
                         )}
+                        {canPlan(g) && (
+                          <>
+                            {" · "}
+                            <button
+                              type="button"
+                              className="gs-act"
+                              disabled={busy}
+                              onClick={() =>
+                                void act(async () => {
+                                  await harnessApi.planGoal(agent, g.id);
+                                  return harnessApi.goals(agent);
+                                })
+                              }
+                            >
+                              Make a plan
+                            </button>
+                          </>
+                        )}
                         {g.waits_on && (
                           <>
                             {" · waits for "}
@@ -301,6 +398,7 @@ function GoalPanel({
                         )}
                       </span>
                     </span>
+                    {g.planned_as && <PlannedGoal goal={g} items={items} paused={stack?.state === "paused"} />}
                   </li>
                 );
               })}

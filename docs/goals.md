@@ -126,7 +126,10 @@ doesn't need a person for any of it:
   something); parts kiln makes (a step's acceptance criteria and tests, a plan's steps) don't:
   once they're all met, so is the goal, at once ("Met: each of its acceptance criteria and tests is
   met.").
-- **Turning a goal into a plan: `goals_plan`.** The goal under way (or the one `id` names) becomes
+- **Turning a goal into a plan: `goals_plan`**, or a goal's **Make a plan** on its agent's Plan
+  tab. A goal that's become one shows its plan's steps under it, as their graph, each as it stands
+  (its part on the stack, or its run's step), with how many are met and the plan to open; a long
+  goal folds to its first lines (**More**). The goal under way (or the one `id` names) becomes
   a plan in its planning phase, with research of its own (docs/plans.md, "Planning a goal"): its
   first part is planning it (research inside and outside, its steps written, said ready with
   `plans_ready`). Ready, the plan's steps become its parts (or it runs with an agent per step, a

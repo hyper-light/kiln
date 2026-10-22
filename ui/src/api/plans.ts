@@ -213,6 +213,14 @@ export interface PlanRan {
   session: string;
   sent: number;
   run: string;
+  /** As goals, split into its acceptance criteria and tests: how many steps were. */
+  split?: number;
+}
+
+/** Which of a plan's steps a run takes (`only`, by number), and as goals, each split into its acceptance criteria and tests (`split`). */
+export interface PlanPick {
+  only?: number[];
+  split?: boolean;
 }
 
 export interface SharedPlan {
@@ -240,9 +248,9 @@ export const plansApi = {
   versions: (id: string, signal?: AbortSignal) => request<PlanVersion[]>("GET", `/api/plans/${enc(id)}/versions`, undefined, { signal }),
   runs: (id: string, signal?: AbortSignal) => request<PlanRun[]>("GET", `/api/plans/${enc(id)}/runs`, undefined, { signal }),
   restore: (id: string, version: number) => request<Plan>("POST", `/api/plans/${enc(id)}/restore`, { version }),
-  run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode }),
+  run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">, pick: PlanPick = {}) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode, ...pick }),
   /** One agent per step, on the machine and harness given, one after another. */
-  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }) => request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents" }),
+  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }, pick: Pick<PlanPick, "only"> = {}) => request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents", ...pick }),
   /** Runs of one agent per step (`active`: those under way). */
   agentRuns: (active: boolean, signal?: AbortSignal) => request<{ runs: PlanRunBrief[] }>("GET", `/api/plans/runs${active ? "?active=1" : ""}`, undefined, { signal }),
   runView: (run: string, signal?: AbortSignal) => request<PlanRunView>("GET", `/api/plans/runs/${enc(run)}`, undefined, { signal }),

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { GoalItem, GoalStack } from "../src/api/harness.ts";
-import { fromLines, stackReads, startWords, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
+import { canPlan, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
 
 const goal = (id: string, text: string, status: GoalItem["status"] = "pending"): GoalItem => ({ id, text, status });
 const stack = (rest: Partial<GoalStack> = {}): GoalStack => ({ agent: "a1", state: "running", items: [], updated_at: 1, ...rest });
@@ -118,4 +118,19 @@ test("a read asked for before a change here came back doesn't undo the change; t
   assert.equal(reads.last("a1"), sent);
   // Another agent's reads are its own.
   assert.equal(reads.ask("a2")(running), running);
+});
+
+test("a planned goal's steps stand as their parts do: under way while one of its criteria is", () => {
+  const g = goal("g", "Ship the replication");
+  const step = (id: string, n: number, status: GoalItem["status"]): GoalItem => ({ ...goal(id, `Step ${n}`, status), part_of: "g", part_kind: "plan", step: { plan: "p", version: 1, n } });
+  const items = [step("s1", 1, "met"), step("s2", 2, "pending"), { ...goal("c1", "fills stay ahead", "active"), part_of: "s2", part_kind: "checks" as const }, step("s3", 3, "pending"), g];
+  assert.deepEqual(
+    [1, 2, 3, 4].map((n) => stepStand(g, items, n, false)),
+    ["met", "working", "waiting", undefined],
+  );
+  assert.equal(stepStand(g, items, 2, true), "paused", "the stack paused: the step under way is paused");
+  assert.equal(canPlan(g), true);
+  assert.equal(canPlan(items[0]!), false, "a plan's step isn't planned on its own");
+  assert.equal(canPlan({ ...g, planned_as: "p" }), false, "nor a goal planned already");
+  assert.equal(canPlan({ ...g, status: "met" }), false, "nor one met");
 });
