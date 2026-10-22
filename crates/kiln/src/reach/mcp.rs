@@ -144,43 +144,59 @@ fn command_schema(waits: bool) -> Value {
     json!({"type": "object", "properties": props, "required": ["command"]})
 }
 
-/// The plans operations an agent has as tools: keeping plans, running them and following their
-/// runs (a plan's versions, and deleting one, are code mode's).
-const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.ready", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
-
-/// kiln's operations an agent uses most: `agents.*`, `goals.*` and most of `plans.*`.
-fn agent_ops() -> Vec<crate::ops::Op> {
-    crate::harness::ops::list_ops()
-        .into_iter()
-        .chain(crate::goals::ops::list_ops())
-        .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
-        .chain(crate::research::ops::list_ops())
-        .collect()
-}
-
-/// [`agent_ops`] as tools of their own (`agents_start`, `goals_add`, `plans_run`, …), asked of the
-/// server for this session like the rest of kiln's operations: what an agent starts here is its
-/// child, and the goals it lines up without naming an agent are its own.
+/// kiln's operations an agent has as tools of its own ([`crate::mcp::agent_ops`]: `agents_start`,
+/// `goals_plan`, `plans_run`, …), as this binary knows them: what's offered when the server can't
+/// say (one from before it said, or out of reach).
 fn agent_tools() -> Vec<Value> {
-    agent_ops()
-        .iter()
-        .map(|o| {
-            json!({
-                "name": crate::mcp::tool_name(o.name),
-                "title": o.name,
-                "description": o.summary,
-                "inputSchema": (o.input)(),
-                "annotations": {"readOnlyHint": o.read_only, "destructiveHint": o.destructive, "openWorldHint": false},
+    crate::mcp::agent_ops().iter().map(|o| tool_of(o.name, &json!(o.summary), &(o.input)(), o.read_only, o.destructive)).collect()
+}
+
+/// One operation as an agent's tool, asked of the server for this session like the rest of kiln's
+/// operations: what an agent starts here is its child, and the goals it lines up without naming an
+/// agent are its own.
+fn tool_of(op: &str, summary: &Value, input: &Value, read_only: bool, destructive: bool) -> Value {
+    json!({
+        "name": crate::mcp::tool_name(op),
+        "title": op,
+        "description": summary,
+        "inputSchema": input,
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "openWorldHint": false},
+    })
+}
+
+/// The agent tools as the server lists them (`agent_tools`, each as its registry has it); `None`
+/// from a server that doesn't say.
+fn agent_tools_of(registry: &[Value], names: Option<&[String]>) -> Option<Vec<Value>> {
+    let names = names?;
+    let by_name: HashMap<&str, &Value> = registry.iter().filter_map(|o| Some((o.get("name")?.as_str()?, o))).collect();
+    Some(
+        names
+            .iter()
+            .filter_map(|n| by_name.get(n.as_str()))
+            .filter_map(|o| {
+                let op = o.get("name")?.as_str()?;
+                let flag = |k: &str| o.get(k).and_then(Value::as_bool).unwrap_or(false);
+                Some(tool_of(op, o.get("summary").unwrap_or(&Value::Null), o.get("input").unwrap_or(&json!({"type": "object"})), flag("read_only"), flag("destructive")))
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
-/// The operation of [`agent_ops`] a tool is, by its name (`agents_start` is `agents.start`).
-fn agent_op(tool: &str) -> Option<&'static str> {
-    agent_ops().iter().map(|o| o.name).find(|n| crate::mcp::tool_name(n) == tool)
+/// The operation a tool is, by its name (`agents_start` is `agents.start`), among `tools`.
+fn op_of(tools: &[Value], tool: &str) -> Option<String> {
+    tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(tool)).and_then(|t| t.get("title")?.as_str().map(str::to_owned))
 }
 
+/// What a list of tools is, to tell when it changes.
+fn fingerprint(tools: &Value) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tools.to_string().hash(&mut h);
+    h.finish()
+}
+
+/// The tools as this binary knows them alone.
+#[cfg(test)]
 fn tools() -> Value {
     let mut t = base_tools();
     if let Some(list) = t.as_array_mut() {
@@ -453,8 +469,8 @@ fn running(v: &Value) -> bool {
 }
 
 /// kiln's operations as the server lists them for this session, when it does: (when asked, the
-/// registry, why there is none).
-type Registry = (Instant, Vec<Value>, Option<String>);
+/// registry, why there is none, which are agents' tools when it says).
+type Registry = (Instant, Vec<Value>, Option<String>, Option<Vec<String>>);
 
 struct Server {
     sock: std::path::PathBuf,
@@ -465,6 +481,11 @@ struct Server {
     runs: Runs,
     next: Mutex<u64>,
     registry: Mutex<Option<Registry>>,
+    /// The agent tools as the server last listed them: kept while it's out of reach.
+    agent_tools: Mutex<Option<Vec<Value>>>,
+    /// What the agent was last given as the tools (`fingerprint`): when the server's change, it's
+    /// told to ask again (`notifications/tools/list_changed`).
+    listed: Mutex<Option<u64>>,
 }
 
 impl Server {
@@ -647,26 +668,57 @@ impl Server {
     /// server can't be asked, the ones this kiln knows, and why they can't be called: a program
     /// calling one learns that, rather than finding `kiln.ci` undefined.
     fn remote(&self) -> (Vec<Value>, Option<String>) {
+        let (reg, why, _) = self.remote_with_tools();
+        (reg, why)
+    }
+
+    /// [`Self::remote`], and which of the operations are agents' tools, when the server says.
+    fn remote_with_tools(&self) -> (Vec<Value>, Option<String>, Option<Vec<String>>) {
         if let Ok(g) = self.registry.lock()
-            && let Some((at, reg, why)) = g.as_ref()
+            && let Some((at, reg, why, tools)) = g.as_ref()
             && at.elapsed() < REGISTRY_TTL
         {
-            return (reg.clone(), why.clone());
+            return (reg.clone(), why.clone(), tools.clone());
         }
-        let (reg, why) = match self.ask(json!({"op": "registry"})) {
+        let (reg, why, tools) = match self.ask(json!({"op": "registry"})) {
             Ok(a) => match (a.get("registry").and_then(Value::as_array), a.get("error").and_then(Value::as_str)) {
-                (Some(r), _) => (r.clone(), None),
-                (None, Some(e)) => (Vec::new(), Some(e.to_owned())),
+                (Some(r), _) => {
+                    let tools = a.get("agent_tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|n| n.as_str().map(str::to_owned)).collect());
+                    (r.clone(), None, tools)
+                }
+                (None, Some(e)) => (Vec::new(), Some(e.to_owned()), None),
                 // A server from before: "unknown reach question".
-                (None, None) => (Vec::new(), Some("this kiln server doesn't offer its operations to agents on runners yet: upgrade it".to_owned())),
+                (None, None) => (Vec::new(), Some("this kiln server doesn't offer its operations to agents on runners yet: upgrade it".to_owned()), None),
             },
-            Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+            Err(e) => (Vec::new(), Some(format!("{e:#}")), None),
         };
         let reg = if why.is_some() { code::registry_of(&crate::ops::listed(true)).as_array().cloned().unwrap_or_default() } else { reg };
         if let Ok(mut g) = self.registry.lock() {
-            *g = Some((Instant::now(), reg.clone(), why.clone()));
+            *g = Some((Instant::now(), reg.clone(), why.clone(), tools.clone()));
         }
-        (reg, why)
+        (reg, why, tools)
+    }
+
+    /// The tools to offer: this server's own, then kiln's operations an agent has as tools, as
+    /// the kiln server lists them (those it last listed while it's out of reach; this binary's own
+    /// from a server that doesn't say), so a deploy reaches the agents at work.
+    fn tools(&self) -> Value {
+        let (reg, why, names) = self.remote_with_tools();
+        let listed = if why.is_none() { agent_tools_of(&reg, names.as_deref()) } else { None };
+        let agent = match listed {
+            Some(t) => {
+                if let Ok(mut g) = self.agent_tools.lock() {
+                    *g = Some(t.clone());
+                }
+                t
+            }
+            None => self.agent_tools.lock().ok().and_then(|g| g.clone()).unwrap_or_else(agent_tools),
+        };
+        let mut t = base_tools();
+        if let Some(list) = t.as_array_mut() {
+            list.extend(agent);
+        }
+        t
     }
 
     fn call(self: &Arc<Self>, name: &str, args: &Value) -> Value {
@@ -741,7 +793,7 @@ impl Server {
                 text_result(&v, failed)
             }
             // kiln's agents, goals and plans operations, asked of the server for this session.
-            other => match agent_op(other) {
+            other => match op_of(self.tools().as_array().map_or(&[][..], Vec::as_slice), other) {
                 Some(op) => match self.ask(json!({"op": "call", "name": op, "input": args})) {
                     Ok(a) => match a.get("ok") {
                         Some(v) => text_result(v, false),
@@ -844,7 +896,7 @@ pub fn serve() -> anyhow::Result<()> {
     let session = std::env::var("KILN_SESSION").unwrap_or_default();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let machines = machines(&sock);
-    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None) });
+    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None) });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = |out: &Arc<Mutex<std::io::Stdout>>, v: &Value| {
         if let Ok(mut o) = out.lock() {
@@ -852,6 +904,24 @@ pub fn serve() -> anyhow::Result<()> {
             let _ = o.flush();
         }
     };
+    // The tools the server offers change (a deploy): the agent is told to ask for them again,
+    // once it has asked for them at all.
+    {
+        let (server, out) = (Arc::clone(&server), Arc::clone(&out));
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(REGISTRY_TTL);
+                let Some(before) = server.listed.lock().ok().and_then(|g| *g) else { continue };
+                let now = fingerprint(&server.tools());
+                if now != before {
+                    if let Ok(mut g) = server.listed.lock() {
+                        *g = Some(now);
+                    }
+                    say(&out, &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
+                }
+            }
+        });
+    }
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -876,7 +946,7 @@ pub fn serve() -> anyhow::Result<()> {
                         id,
                         json!({
                             "protocolVersion": version,
-                            "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
+                            "capabilities": {"tools": {"listChanged": true}, "resources": {"listChanged": false}},
                             "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
                             "instructions": instructions(server.prefer.as_deref(), &machines, &server.session),
                         }),
@@ -884,7 +954,13 @@ pub fn serve() -> anyhow::Result<()> {
                 );
             }
             "ping" => say(&out, &rpc_ok(id, json!({}))),
-            "tools/list" => say(&out, &rpc_ok(id, json!({"tools": tools()}))),
+            "tools/list" => {
+                let t = server.tools();
+                if let Ok(mut g) = server.listed.lock() {
+                    *g = Some(fingerprint(&t));
+                }
+                say(&out, &rpc_ok(id, json!({"tools": t})));
+            }
             "tools/call" => {
                 let (server, out) = (Arc::clone(&server), Arc::clone(&out));
                 std::thread::spawn(move || {
@@ -960,6 +1036,29 @@ pub fn acp_config(kiln: &std::path::Path, sock: &str, prefer: Option<&str>, sess
 mod tests {
     use super::*;
 
+    /// The agent tools are the server's: those it names (each as its registry has it, one it
+    /// added since this binary was built included), and this binary's own from a server that
+    /// doesn't say; the list's fingerprint tells a change.
+    #[test]
+    fn agent_tools_are_the_ones_the_server_names() {
+        let registry = vec![
+            json!({"name": "goals.add", "summary": "Line goals up.", "read_only": false, "destructive": false, "input": {"type": "object", "properties": {"goals": {"type": "array"}}}}),
+            json!({"name": "goals.later", "summary": "A goal for later (new on the server).", "read_only": false, "destructive": false, "input": {"type": "object"}}),
+            json!({"name": "ci.runs.list", "summary": "Runs.", "read_only": true, "destructive": false, "input": {"type": "object"}}),
+        ];
+        let names = vec!["goals.add".to_owned(), "goals.later".to_owned(), "goals.gone".to_owned()];
+        let tools = agent_tools_of(&registry, Some(&names)).unwrap_or_default();
+        let listed: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
+        assert_eq!(listed, ["goals_add", "goals_later"], "named and in the registry; code mode's ci.runs.list isn't a tool");
+        assert_eq!(tools.get(1).and_then(|t| t.get("description")), Some(&json!("A goal for later (new on the server).")));
+        assert_eq!(op_of(&tools, "goals_later").as_deref(), Some("goals.later"));
+        assert!(agent_tools_of(&registry, None).is_none(), "a server that doesn't say: this binary's own");
+        let before = fingerprint(&json!(tools));
+        let fewer = agent_tools_of(&registry, names.get(..1)).unwrap_or_default();
+        assert_ne!(before, fingerprint(&json!(fewer)));
+        assert_eq!(before, fingerprint(&json!(agent_tools_of(&registry, Some(&names)).unwrap_or_default())));
+    }
+
     #[test]
     fn long_output_keeps_its_head_and_tail() {
         let s: String = (0..50_000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
@@ -994,7 +1093,9 @@ mod tests {
         let devices: Vec<&str> = crate::browser::devices::DEVICES.iter().map(|d| d.name).collect();
         assert_eq!(live.pointer("/inputSchema/properties/device/enum"), Some(&json!(devices)));
         assert_eq!(live.pointer("/inputSchema/properties/engine/enum"), Some(&json!(["chromium", "firefox", "webkit"])));
-        assert_eq!(agent_op("agents_wait"), Some("agents.wait"));
+        let list = t.as_array().map_or(&[][..], Vec::as_slice);
+        let agent_op = |tool: &str| op_of(list, tool);
+        assert_eq!(agent_op("agents_wait").as_deref(), Some("agents.wait"));
         assert_eq!(agent_op("run"), None);
         // Its own goal stack and plans are tools too, the agent's own without naming it.
         for (tool, op) in [
@@ -1006,7 +1107,7 @@ mod tests {
             ("plans_runs_get", "plans.runs.get"),
         ] {
             assert!(names.contains(&tool), "{tool}: {names:?}");
-            assert_eq!(agent_op(tool), Some(op));
+            assert_eq!(agent_op(tool).as_deref(), Some(op));
         }
         assert_eq!(agent_op("plans_delete"), None, "deleting a plan is code mode's");
         let add = t.as_array().into_iter().flatten().find(|t| t.get("name") == Some(&json!("goals_add"))).cloned().unwrap_or_default();

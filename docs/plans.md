@@ -40,6 +40,14 @@ A plan's **steps** are the ones written with their parts; a plan written only as
 items of its top-level lists (`1.`, `-`, `*`, `- [ ]`) as its steps (lines indented under an
 item belong to it, and lists in code blocks don't count). The editor shows them as you type.
 
+## Reading one
+
+A plan opens as you read it: its title, its overview, then its steps, as their graph (when they
+say what they wait for) and as cards, each its number and title, what it waits for, and what it is
+(what to do, examples, acceptance criteria, tests), folded until asked. **Edit** opens the editor
+(its words and its steps); **Done** goes back. Pick steps on their cards to run just those, or
+press a step's own **Run** to run it alone: **Run it**, below, takes them.
+
 ## Changing one
 
 Saving a new title, text or steps makes a new version; the old ones stay, readable, and any one
@@ -60,6 +68,12 @@ From the plan: **Run it**, on an agent that runs or on a new one (machine, harne
   agent can split it into a goal stack of its own (`goals_split`): its acceptance criteria and
   tests, a goal each, pursued first, then the step itself for its check.
 - **One agent per step**: below.
+
+With steps picked, only those run, each keeping its number; the steps they wait for outside them
+are taken as done (the run says which), and one message isn't offered. As goals, **Each step as a
+goal stack of its own** (on by default for steps with acceptance criteria or tests) puts each
+step's criteria and tests on the stack at once, a goal each, before the step: the step is met
+once they are.
 
 From an agent: its **Plan** tab shows the plan it proposed (with **Save plan**), **Your plans** (write
 one, pick one, **Run here** any of the three ways) and its **Goal stack**.
@@ -169,7 +183,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | GET | `/api/plans/:id/versions` | every version, newest first |
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
 | POST | `/api/plans/:id/ready` | `{then?: goals \| review \| agents, skipped?: {internal?, external?}}`: its planning phase ended (a plan made from a goal goes on as `then` says); answers `{plan, warnings, research?, say?, then?, goal?, run?, stack?}` (`research`: its research's markdown, for the agent to show) |
-| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}` |
+| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}`; any mode but `message` takes `only` (step numbers from 1: just those, each keeping its number, the steps they wait for outside them taken as done), and `goals` takes `split` (each step a goal stack of its acceptance criteria and tests; answers `split`: how many were) |
 | GET | `/api/plans/:id/runs` | runs, newest first |
 | GET | `/api/plans/runs` | runs of one agent per step (`?active=1`: those under way) |
 | GET | `/api/plans/runs/:run` | a run: each step's `{n, title, goal, stand, needs, given, agent, agent_id, reason, tries}`, its `state`, `reason`, `note` and stack |

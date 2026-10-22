@@ -630,6 +630,15 @@ function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
 
 /* ------------------------------------------------------------------ plans */
 
+/** A goal turned into a plan here (Make a plan): a plan being planned, its words the goal's. */
+export function planning(goal: { agent: string; id: string; text: string }): string {
+  const id = `pl_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Math.floor(Date.now() / 1000);
+  const title = goal.text.split(/[.:—]/)[0]!.trim().slice(0, 80);
+  PLANS.unshift({ ...PLANS[0]!, id, title, body: goal.text, items: [], steps: [], tags: [], version: 1, runs: 0, updated_at: now, share: undefined, phase: "planning", research: undefined, source: { goal } } as unknown as (typeof PLANS)[number]);
+  return id;
+}
+
 const PLANS = [
   {
     id: "pl_release",
@@ -1382,6 +1391,17 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
         true
       );
     return (void json(res, 200, pl), true);
+  }
+  // A plan run (`plans.run`): some of its steps (`only`), as goals split into their criteria and tests (`split`), or an agent each.
+  if ((mm = p.match(/^\/api\/plans\/([^/]+)\/run$/)) && m === "POST") {
+    const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
+    if (!pl) return (err(res, 404, "no such plan"), true);
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { mode?: string; only?: number[]; split?: boolean; session?: string };
+    const n = b.only?.length ?? (pl.items?.length || pl.steps?.length || 0);
+    if (b.mode === "agents") return (void json(res, 200, { run: "pr_agents1", steps: n, note: b.only?.length ? `Not in this run, taken as done: the steps step ${b.only[0]} waits for.` : null }), true);
+    return (void json(res, 200, { session: b.session ?? "fam-orch", sent: n, run: "pr_goals1", split: b.mode === "goals" && b.split ? n : 0 }), true);
   }
   if ((mm = p.match(/^\/api\/shared\/plans\/([^/]+)$/))) {
     const pl = PLANS.find((x) => x.share === decodeURIComponent(mm![1]!));

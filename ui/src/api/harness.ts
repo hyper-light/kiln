@@ -982,6 +982,8 @@ export const harnessApi = {
   addGoals: (id: string, goals: string[], start = false) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start }),
   /** Start (or resume), pause, skip the goal under way, clear, or bring back the goals cleared last. */
   goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
+  /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
+  planGoal: (id: string, goal: string) => call<{ plan: string; research: string; goal: string; part: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/plan`, { id: goal }),
   /** The terminals beside an agent (its shell, its harness's own screen), live ones first. */
   terminals: (id: string) => call<BesideTerminal[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`),
   /** Open one beside it: its shell (the one already open, with `command` run in it), or its harness's own screen on `command`. */

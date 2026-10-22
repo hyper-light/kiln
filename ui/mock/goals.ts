@@ -11,6 +11,7 @@
  */
 import type http from "node:http";
 import type { GoalItem, GoalStack } from "../src/api/harness.ts";
+import { planning } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -275,6 +276,25 @@ export async function handleGoals(req: http.IncomingMessage, res: http.ServerRes
   } else if (!action && method === "PUT") {
     const b = await body<{ goals?: { id?: string; text: string }[] }>(req);
     if (set(s, b.goals ?? [])) push(s);
+  } else if (action === "plan" && method === "POST") {
+    // Turned into a plan: planning it goes first, a part of it, and the goal waits after it.
+    const b = await body<{ id?: string }>(req);
+    const goal = s.items.find((i) => i.id === b.id) ?? s.items.find((i) => i.status === "active");
+    if (!goal) return (json(res, 400, { error: "no goal to plan" }), true);
+    const plan = planning({ agent, id: goal.id, text: goal.text });
+    const part: GoalItem = {
+      id: `g_${Math.random().toString(36).slice(2, 8)}`,
+      text: `Plan "${goal.text.slice(0, 60)}": research it inside and outside, write its steps, say it's ready`,
+      status: goal.status === "active" ? "active" : "pending",
+      part_of: goal.id,
+      part_kind: "planning",
+    };
+    if (goal.status === "active") goal.status = "pending";
+    goal.planned_as = plan;
+    s.items.splice(s.items.indexOf(goal), 0, part);
+    s.updated_at = Date.now();
+    json(res, 200, { plan, research: "", goal: goal.id, part: part.id });
+    return true;
   } else if (action && method === "POST") {
     const why = control(s, action);
     if (why) {

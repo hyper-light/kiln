@@ -188,6 +188,23 @@ pub async fn token_caller(hub: &Hub, actor: &str) -> Option<Result<Caller, Strin
 /// The most an answer to a runner may be (it goes over the runner's control lane).
 const RUNNER_ANSWER_MAX: usize = 4 << 20;
 
+/// The plans operations an agent has as tools: keeping plans, running them and following their
+/// runs (a plan's versions, and deleting one, are code mode's).
+const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.ready", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
+
+/// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
+/// …): `agents.*`, `goals.*`, most of `plans.*`, and `research.*`. The server says which
+/// ([`runner_ask`]'s registry answer), so its agents' MCP servers offer what it has, however old
+/// their runner: a deploy reaches the agents at work.
+pub fn agent_ops() -> Vec<crate::ops::Op> {
+    crate::harness::ops::list_ops()
+        .into_iter()
+        .chain(crate::goals::ops::list_ops())
+        .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
+        .chain(crate::research::ops::list_ops())
+        .collect()
+}
+
 /// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
 /// mode runs on the runner, `crate::reach::mcp`): `{"op": "registry", "session"}` for the
 /// operations, `{"op": "call", "session", "name", "input"}` to run one, or `{"op": "page",
@@ -216,7 +233,8 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
     let answer = match ask.get("op").and_then(Value::as_str) {
         Some("registry") => {
             let skills: Vec<Value> = skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();
-            json!({"registry": code::registry(hub), "skills": skills})
+            let tools: Vec<&str> = agent_ops().iter().map(|o| o.name).collect();
+            json!({"registry": code::registry(hub), "skills": skills, "agent_tools": tools})
         }
         Some("call") => {
             let name = ask.get("name").and_then(Value::as_str).unwrap_or("");
@@ -323,9 +341,11 @@ and tests); `goals_update` changes one goal by its id (its words, its place, or 
 stack (say `why`; `resume_in_s` resumes it by itself), resumes, skips or clears it; `goals_get` says where it stands. A plan \
 is kept in kiln for the person to read, change and run again: `plans_create` keeps one (its top-level list items are its \
 steps; a step's `needs` are the steps it waits for), and `plans_run` runs it on you (leave out `session` and `new`: as one \
-message, a step a turn, or each step a goal) or with an agent of its own for each step (mode `agents`: in your harness, on \
-your machine and in your folder unless you say otherwise; steps that don't wait for each other run side by side; a step \
-given to `main` goes on your own goal stack; `plans_runs_get` follows the run). `goals_plan` turns a goal into a plan: research \
+message, a step a turn, or each step a goal on your goal stack, `split` making each a goal stack of its acceptance criteria \
+and tests) or with an agent of its own for each step (mode `agents`: in your harness, on your machine and in your folder \
+unless you say otherwise; steps that don't wait for each other run side by side; a step given to `main` goes on your own goal \
+stack; `plans_runs_get` follows the run); `only` runs just some of its steps, by number. `goals_plan` turns a goal into a plan \
+(do that first with a goal that takes several steps of work, rather than starting on it): research \
 it first, inside (files on your machine and others, kiln's records: `conversations_search`) and outside (the web, docs, \
 papers), recording each claim with its sources and the exact words quoted (`research_add`: kiln checks each quote where it's \
 cited and grades each finding A to F), write its steps with the findings each rests on, then `plans_ready`: its steps become \

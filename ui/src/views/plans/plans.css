@@ -888,3 +888,95 @@ a.pg-node:hover {
 .pg-bar i[data-s="stopped"] {
   background: #4a4f58;
 }
+/* A plan, read (steps-view.tsx): its overview, then its steps as cards in the graph's own look, each
+   to pick (to run just those) or run alone. */
+.plan-overview {
+  color: var(--color-secondary);
+  font-size: 14px;
+}
+.ps-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.ps-hint {
+  font-size: 12px;
+}
+.ps-picked {
+  color: var(--color-bright);
+  font-size: 12px;
+}
+.ps-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ps-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #262a31;
+  border-radius: 9px;
+  background: #0d0f12;
+}
+.ps-step[data-picked] {
+  border-color: var(--color-line-hover);
+  background: #12151a;
+}
+.ps-check {
+  margin-top: 3px;
+}
+.ps-title {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.ps-n {
+  display: inline-block;
+  min-width: 1.7em;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.ps-after {
+  margin: 2px 0 0;
+  color: var(--color-meta);
+  font-size: 12px;
+}
+.ps-detail {
+  margin-top: 8px;
+  font-size: 13px;
+}
+.ps-link {
+  margin: -6px 0;
+  padding: 6px 0;
+  border: 0;
+  background: none;
+  color: var(--color-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.ps-link:hover {
+  color: var(--color-bright);
+}
+/* On a phone, Run goes under the step's words. */
+@media (max-width: 640px) {
+  .ps-step {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .ps-step > :last-child {
+    grid-column: 2;
+    justify-self: start;
+  }
+}

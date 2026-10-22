@@ -92,9 +92,10 @@ no check of its own. Said met, a goal takes its parts still to go with it.
 
 ### Turning a goal into a plan: `goals_plan`
 
-A goal that needs thinking through before it's done becomes a plan kiln keeps: `goals_plan`
-(the goal under way, or `id`) makes a plan in its planning phase, with research of its own, and
-puts one part before the goal: planning it. Then, in this order:
+A goal that takes several steps of work, or needs thinking through before it's done, becomes a
+plan kiln keeps before you start on it: `goals_plan` (the goal under way, or `id`) makes a plan in
+its planning phase, with research of its own, and puts one part before the goal: planning it (a
+person can ask for the same with the goal's **Make a plan**). Then, in this order:
 
 1. **Research it** (below): inside and outside, recording what you find as you go.
 2. **Write its steps** with `plans_update` (`items`): each with what to do, its acceptance
@@ -190,8 +191,11 @@ or for a step that waits for it.
 |---|---|
 | `message` | the whole plan in one message |
 | `steps` | each step its own message, one a turn |
-| `goals` | each step a goal in the agent's goal stack, with its acceptance criteria and tests in the goal |
+| `goals` | each step a goal in the agent's goal stack, with its acceptance criteria and tests in the goal (`split`: each step a goal stack of its own, its criteria and tests a goal each, before it) |
 | `agents` | each step an agent of its own, held to the step as a goal; the next starts once the one before is met |
+
+`only` (step numbers, from 1) runs just some of a plan's steps, each keeping its number: the steps
+they wait for outside them are taken as done (the run says which).
 
 **On you**: leave out `session` and `new` (modes `message`, `steps`, `goals`). As with your own
 goals, end your turn after `plans_run` in `goals` mode: the first step comes when you're free.
