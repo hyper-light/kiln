@@ -30,7 +30,7 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { missionFoundSessions, missionRows, standOf, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
+import { missionFoundSessions, standOf, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
@@ -230,8 +230,7 @@ function Lead({ short }: { short?: boolean }) {
   const list = useAgentList();
   const seen = useSeen();
   const done = useAnswered();
-  const managed = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
-  const all = React.useMemo(() => missionRows(managed), [managed]);
+  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
   const n = (s: Stand) => all.filter((r) => r.stand === s).length;
   const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
   const status = [
@@ -460,8 +459,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
   const [messaging, setMessaging] = React.useState(false);
 
   const done = useAnswered();
-  const managed = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
-  const all = React.useMemo(() => missionRows(managed), [managed]);
+  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
   // to find a name are not. (A new key: everyone starts on Needs you first once.) While you're using
   // the list, or have agents selected, it holds still: see useListHold.
@@ -631,7 +629,7 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
       <React.Suspense fallback={null}>
-        <Found all={managed} />
+        <Found all={all} />
       </React.Suspense>
 
       {ended.length > 0 && (
