@@ -361,6 +361,8 @@ pub fn task(root: &Ran) -> super::model::Task {
         started: i64::try_from(root.started).unwrap_or(0).saturating_mul(1000),
         class: Some("shell".to_owned()),
         command: Some(shown),
+        // kiln stops it itself, whatever the harness (`Session`'s `stop_left`).
+        stoppable: true,
         ..super::model::Task::default()
     }
 }
