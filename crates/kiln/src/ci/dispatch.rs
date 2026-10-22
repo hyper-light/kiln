@@ -2509,10 +2509,18 @@ impl Dispatch {
         let seq = last_seq;
         let logged = !log.is_empty();
         let mut reported: HashSet<String> = HashSet::new();
+        // The legs a cancel in the log cancelled. The scheduler, rebuilt below, hears it again
+        // for those not ended yet: a leg that was running ends cancelled however it ends (lost
+        // with its runner across the restart, say), not run again.
+        let mut cancelled: Vec<(String, String)> = Vec::new();
         for (_, kind, leg, report) in log {
             match kind.as_str() {
                 "cancel" => {
-                    let _ = plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree });
+                    for act in plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree }) {
+                        if let PlanAction::Cancel { leg, reason, .. } = act {
+                            cancelled.push((leg, reason));
+                        }
+                    }
                 }
                 _ => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
@@ -2622,6 +2630,15 @@ impl Dispatch {
                 continue;
             }
             let cmds = self.sched.handle(Input::LegQueued(Box::new(li)), now_ms());
+            self.commands(cmds).await;
+        }
+        for (key, reason) in cancelled {
+            let Some(id) = self.runs.get(run).and_then(|r| r.keys.get(&key).cloned()).filter(|id| self.legs.contains_key(id)) else { continue };
+            if self.held.remove(&id).is_some() {
+                Box::pin(self.settled(&id, Outcome::Cancelled, Some(reason))).await?;
+                continue;
+            }
+            let cmds = self.sched.handle(Input::LegCancelled { leg: id, reason }, now_ms());
             self.commands(cmds).await;
         }
         for (key, report) in late {

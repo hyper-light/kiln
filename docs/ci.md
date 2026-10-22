@@ -1860,7 +1860,12 @@ W20.
     window no longer leaves the run waiting forever. Restored legs are the replayed plan's
     (`RunPlan::spec_of`): environment, permissions, concurrency group, exported environment and
     a called workflow's job all come back. They used to be rebuilt from a few fields, which let
-    a leg held for review run unapproved after a restart.
+    a leg held for review run unapproved after a restart. A cancel in the log reaches the
+    rebuilt scheduler too: a leg it cancelled that hasn't ended is cancelled again, so a leg
+    whose runner lost it across the restart ends cancelled. The rebuild used to give the
+    cancel to the plan alone. Such a leg went back in the queue as lost, ran again with its
+    run still cancelling, and the run never ended (the corpus lab's tokio run, which held its
+    one runner for hours; `w05_r25_a_cancel_holds_over_a_restart`).
   - R21's rules by scope (`crates/kiln/src/ci/routing.rs`), in the order they apply:
     - the server's configuration (`[[ci.routing]]`);
     - the database (`ci_routing_rules`: `GET/PUT /api/ci/routing/rules?scope=server|org:<owner>`,

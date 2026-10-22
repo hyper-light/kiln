@@ -300,6 +300,43 @@ fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W05-R25 across a restart: a run cancelled while its leg runs, the server killed before the
+/// runner said the leg ended (the step is deaf to the cancel's signals). The rebuild cancels the
+/// leg again, as the run's log says: lost with the runner, it ends cancelled instead of running
+/// again, the run ends cancelled, and the runner's slot is free for the next leg.
+#[test]
+fn w05_r25_a_cancel_holds_over_a_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let tree = Tree::new(dir.path(), &s)?;
+    tree.commit(".kiln/deaf.yaml", "on: push\njobs:\n  deaf:\n    runs-on: local\n    steps:\n      - run: trap '' INT TERM; sleep 300\n")?;
+    let run = run_of(&s, ".kiln/deaf.yaml")?;
+    until(&s, 300, "the leg running", || {
+        let all = legs(&s, &run)?;
+        Ok((!all.iter().any(|(_, _, st, _)| st == "running")).then(|| format!("{all:?}")))
+    })?;
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{run}/cancel"), &s.admin, Some(&json!({})))?;
+    anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
+    // The cancel in the run's log, its runner still in the leg's step: then the server goes.
+    std::thread::sleep(Duration::from_secs(1));
+    s.restart()?;
+    until(&s, 120, "the run cancelled", || {
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+        let status = serde_json::from_str::<Value>(&detail)?.pointer("/run/status").and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok((status != "cancelled").then(|| format!("{status}: {:?}", legs(&s, &run))))
+    })?;
+    let all = legs(&s, &run)?;
+    assert!(all.iter().all(|(_, _, st, attempt)| st == "cancelled" && *attempt == 1), "the leg isn't run again: {all:?}\n{}", s.log());
+    // Its slot free: a leg for it now runs.
+    tree.commit(".kiln/next.yaml", "on: push\njobs:\n  next:\n    runs-on: local\n    steps:\n      - run: echo next\n")?;
+    let next = run_of(&s, ".kiln/next.yaml")?;
+    until(&s, 120, "the next leg on the runner", || {
+        let all = legs(&s, &next)?;
+        Ok((!all.iter().any(|(_, _, st, _)| st == "succeeded")).then(|| format!("{all:?}")))
+    })?;
+    Ok(())
+}
+
 /// The same with a runner that doesn't come back: the restart finds its leg running, and once
 /// the runner has had its grace to reconnect (45 s), the leg was lost with it.
 #[test]
