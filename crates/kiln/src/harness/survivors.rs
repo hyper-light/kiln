@@ -78,6 +78,21 @@ pub fn agents_to_stop(seen: &HashMap<String, Seen>, now_s: u64) -> Vec<u32> {
     seen.values().flat_map(|s| &s.agents).filter(|r| now_s.saturating_sub(r.started) >= AGENT_KEPT.as_secs()).map(|r| r.pid).collect()
 }
 
+/// What a look found that goes now, for [`stop`]: the shells' ssh-agents old enough, and, of the
+/// agents between turns (`settled`), their ssh-agents and everything they have apart from their
+/// harness (what their commands left running). Two lists: the ssh-agents, and the rest.
+pub fn to_stop(seen: &HashMap<String, Seen>, settled: &HashSet<String>, now_s: u64) -> (Vec<u32>, Vec<u32>) {
+    let mut agents = agents_to_stop(seen, now_s);
+    let mut left = Vec::new();
+    for s in seen.iter().filter(|(id, _)| settled.contains(*id)).map(|(_, s)| s) {
+        left.extend(s.apart.iter().map(|r| r.pid));
+        agents.extend(s.agents.iter().map(|r| r.pid));
+    }
+    agents.sort_unstable();
+    agents.dedup();
+    (agents, left)
+}
+
 fn system(pids: Option<&[u32]>) -> sysinfo::System {
     refreshed(pids, false)
 }
@@ -430,6 +445,19 @@ mod tests {
         let kept = AGENT_KEPT.as_secs();
         let seen = HashMap::from([("s".to_owned(), Seen { agents: vec![agent(7, 1_000), agent(8, 1_001)], ..Seen::default() })]);
         assert_eq!(agents_to_stop(&seen, 1_000 + kept), vec![7], "only those kept long enough");
+    }
+
+    #[test]
+    fn between_turns_nothing_its_commands_left_running_stays() {
+        let ran = |pid, command: &str| Ran { pid, ppid: 1, started: 1_000, command: command.into() };
+        let working = Seen { apart: vec![ran(10, "npm run dev")], agents: vec![ran(11, "ssh-agent -s")], ..Seen::default() };
+        let idle = Seen { under: vec![ran(20, "bash -c sleep 99")], apart: vec![ran(21, "python3 -m http.server")], agents: vec![ran(22, "ssh-agent -c")], ..Seen::default() };
+        let seen = HashMap::from([("working".to_owned(), working), ("idle".to_owned(), idle)]);
+        let settled = HashSet::from(["idle".to_owned()]);
+        // The idle one's leftovers and ssh-agent go; what runs under its harness stays, and so does
+        // everything of the one at work (its ssh-agent until it's old enough).
+        assert_eq!(to_stop(&seen, &settled, 1_001), (vec![22], vec![21]));
+        assert_eq!(to_stop(&seen, &settled, 1_000 + AGENT_KEPT.as_secs()), (vec![11, 22], vec![21]));
     }
 
     #[test]

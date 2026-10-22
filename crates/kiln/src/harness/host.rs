@@ -687,13 +687,23 @@ impl Host {
                 let which: Vec<(String, Option<u32>)> = sessions.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect();
                 let known: Vec<super::survivors::Ran> = sessions.iter().flat_map(|s| s.ran.lock().1.clone()).collect();
                 let now_s = u64::try_from(clock.unix_s()).unwrap_or(0);
+                // Agents between turns whose harness runs: what their commands left running apart
+                // from it (`nohup … &`, a daemon, what a harness before this one started) goes now.
+                // Their harness's own background tasks run under it, and end with the agent.
+                let settled: std::collections::HashSet<String> = sessions.iter().filter(|s| s.pid.lock().is_some() && super::session::settled(s)).map(|s| s.id.clone()).collect();
+                let adopted: Vec<super::survivors::Ran> = sessions.iter().filter(|s| settled.contains(&s.id)).flat_map(|s| s.left.lock().clone()).collect();
                 let look = move || {
                     let seen = super::survivors::scan(&which);
                     // Shells' ssh-agents are no session's work: stopped once old enough.
-                    let agents = super::survivors::agents_to_stop(&seen, now_s);
+                    let (agents, leftovers) = super::survivors::to_stop(&seen, &settled, now_s);
                     if !agents.is_empty() {
                         tracing::info!(count = agents.len(), "stopping the ssh-agents shells' startup files left in agents' sessions");
                         super::survivors::stop(&agents);
+                    }
+                    if !leftovers.is_empty() || !adopted.is_empty() {
+                        tracing::info!(count = leftovers.len() + adopted.len(), "stopping what agents' commands left running, now that they're between turns");
+                        super::survivors::stop(&leftovers);
+                        adopted.iter().for_each(super::survivors::stop_tree);
                     }
                     (seen, super::survivors::alive(&known))
                 };
@@ -952,6 +962,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
+        max_subagents: None,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
         no_bypass: !spec.allow_bypass,

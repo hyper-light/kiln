@@ -180,6 +180,43 @@ function LimitRows({ agent, state, send }: { agent: AgentInfo | null; state: Sta
   );
 }
 
+/** The most subagents at once a person may choose. */
+const SUBAGENTS = [1, 2, 3, 4, 6, 8, 12, 16];
+
+/** kiln's own, whatever the harness: the most subagents it runs at once. */
+function SubagentRows({ agent, state, send }: { agent: AgentInfo | null; state: State | null; send: Send }) {
+  const most = state?.max_subagents ?? agent?.max_subagents;
+  return (
+    <section className="hx-ctl-group">
+      <div className="hx-eyebrow">Subagents</div>
+      <div className="hx-ctl">
+        <div className="hx-ctl-text">
+          <span className="hx-ctl-label">At once</span>
+          <span className="hx-dim text-[12px]">
+            The most subagents it runs at the same time: its harness&apos;s own, and the agents it starts through kiln. Past that, it&apos;s told to wait for one to finish.
+            {agent?.kind === "codex" ? " Codex takes a change when it next starts." : ""}
+          </span>
+        </div>
+        <div className="hx-ctl-input">
+          <select
+            className="hx-select"
+            aria-label="Subagents at once"
+            value={most ? String(most) : ""}
+            onChange={(e) => send({ type: "max_subagents", count: e.target.value ? Number(e.target.value) : null })}
+          >
+            <option value="">No limit of its own</option>
+            {SUBAGENTS.map((n) => (
+              <option key={n} value={String(n)}>
+                {n === 1 ? "One at a time" : `Up to ${n}`}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 export function SettingsSheet({
   open,
   onOpenChange,
@@ -212,6 +249,7 @@ export function SettingsSheet({
         >
           <div className="hx-ctls">
             <LimitRows agent={agent} state={state} send={send} />
+            <SubagentRows agent={agent} state={state} send={send} />
             {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">

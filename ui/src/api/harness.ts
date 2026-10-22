@@ -350,6 +350,8 @@ export interface State {
   pause?: Pause;
   /** It pauses once a limit is this full (percent): between turns, or at the next step of one under way; absent: only when one is reached. */
   pause_at?: number;
+  /** The most subagents it runs at once: its harness's own, and the agents it starts through kiln (absent: no limit of its own). */
+  max_subagents?: number;
   /** How its last turn ended (what kiln's keep-going reads). */
   last_turn?: TurnEnd;
   /** Turns in a row kiln started to keep it going, since a person last said something. */
@@ -655,6 +657,8 @@ export interface AgentInfo {
   move_plan?: MovePlan;
   /** Where it pauses as its limits fill (as `State.pause_at`). */
   pause_at?: number;
+  /** The most subagents it runs at once (as `State.max_subagents`). */
+  max_subagents?: number;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -805,6 +809,8 @@ export type Command =
   | { type: "auto_resume"; on: boolean }
   /** Pause once a limit is this full (null: only when one is reached). */
   | { type: "pause_at"; percent: number | null }
+  /** The most subagents it runs at once (null: no limit of its own). */
+  | { type: "max_subagents"; count: number | null }
   /** Whether at a limit it goes on on another machine with room, and where (`MovePlan`). */
   | ({ type: "move_on_limit"; on: boolean } & MovePlan);
 
