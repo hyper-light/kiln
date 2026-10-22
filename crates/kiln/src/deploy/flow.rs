@@ -15,12 +15,12 @@ use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{appset, argocd};
+use super::{appset, argocd, git, github};
 use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
 use super::gates::{self, Verdict};
-use super::model::{App, Approval, Artifact, Concurrency, Contacts, Environment, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template};
+use super::model::{App, Approval, Artifact, Concurrency, Contacts, Environment, GITHUB_HOST, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template, Via};
 use super::{Deploy, repo, store};
 
 /// An error and the status that says what went wrong.
@@ -74,6 +74,8 @@ pub(super) fn emit_release(d: &Deploy, r: &Release) {
     }
     d.hub.emit(&e);
     d.changes.send(r.id);
+    // GitHub's deployment of its commit, where the release repository is GitHub's (§7).
+    github::report(d, r);
     // Chat, paging and webhooks: the server's rules, and the app's own channels.
     let event = match r.state {
         State::WaitingApproval => Some("release.waiting_approval"),
@@ -204,8 +206,25 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
         None if e.provider == KILNCD => {}
         None => return Err(bad(format!("{}: a provider is {KILNCD} or argocd/<integration>", e.provider))),
     }
-    if e.release_repo.host != KILN_HOST {
-        return Err(bad(format!("{}: release repositories live on kiln's own git server so far; GitHub, GitLab and Bitbucket come with P3", e.release_repo.host)));
+    match e.release_repo.host.as_str() {
+        KILN_HOST => {}
+        GITHUB_HOST => {
+            github::name_ok(&e.release_repo.repo).map_err(bad)?;
+            if crate::githost::github::app(&d.hub).await.is_none() {
+                return Err(bad("a release repository on GitHub is written through kiln's GitHub App, and kiln has none: make one in Settings (GitHub), or give `[ci.github]` its id and key"));
+            }
+        }
+        other => return Err(bad(format!("{other}: a release repository is on kiln's own git server (`kiln`) or on GitHub (`github`); GitLab and Bitbucket come later"))),
+    }
+    // The merge of a pull request is its approval (docs/deploy-api.md §9.1), and only a host with
+    // pull requests has one.
+    if e.gates.via == Via::PullRequest {
+        if e.release_repo.host != GITHUB_HOST {
+            return Err(bad("gates.via: pull-request: releases as pull requests need a release repository on GitHub (host: github)"));
+        }
+        if e.gates.approvals.is_some() {
+            return Err(bad("gates.via: pull-request: the merge of a release's pull request is its approval; leave out gates.approvals (who may merge is the branch's protection on GitHub)"));
+        }
     }
     let branch = &e.release_repo.branch;
     if branch.is_empty() || branch.contains("..") || branch.chars().any(|c| c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')) {
@@ -276,10 +295,14 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     Ok(e)
 }
 
-/// An environment's release repository as one of kiln's native repositories (docs/ci.md W14): its
-/// bare repository, and its row, so kiln's git server serves it to readers with a token, its review
-/// rules hold, and people change it in diffs as any repository's.
+/// An environment's release repository there: on kiln's own git server, one of kiln's native
+/// repositories (docs/ci.md W14), its bare repository and its row, so kiln's git server serves it
+/// to readers with a token, its review rules hold, and people change it in diffs as any
+/// repository's; on GitHub, the repository, made through kiln's GitHub App if it isn't there.
 pub async fn ensure_release_repo(d: &Deploy, rr: &super::model::RepoRef) -> Result<(), String> {
+    if rr.host == GITHUB_HOST {
+        return github::ensure(d, rr).await;
+    }
     if crate::ci::hosting::path_of(&d.hub, &rr.repo).is_none() {
         return Err(format!("{}: a release repository on kiln's git server is `owner/name`, of letters, digits, '-', '_' and '.'", rr.repo));
     }
@@ -676,8 +699,7 @@ const REGISTRATION_TRAILER: &str = "Kiln-Registration";
 /// saying what it is. An empty repository has no `HEAD` for Argo CD to read, and Argo CD tries one
 /// as it's registered (§8.3).
 pub(super) async fn first_commit(d: &Deploy, env: &Environment) -> Result<(), String> {
-    let (hosted, rr) = (d.hosted.clone(), env.release_repo.clone());
-    let head = crate::rt::blocking(move || hosted.head(&rr.repo, &rr.branch)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    let head = git::open(d, &env.release_repo).await?.head().await.map_err(|e| format!("{e:#}"))?;
     if head.is_some() {
         return Ok(());
     }
@@ -693,20 +715,16 @@ pub(super) async fn first_commit(d: &Deploy, env: &Environment) -> Result<(), St
 /// Commits `changes` on the environment's release repository, made on its head, again on a newer
 /// head while someone else's push races it.
 async fn commit_files(d: &Deploy, env: &Environment, changes: Vec<Change>, message: String, who: &str) -> Result<String, String> {
-    let (hosted, rr, who) = (d.hosted.clone(), env.release_repo.clone(), author(who));
-    crate::rt::blocking(move || -> Result<String, String> {
-        for _ in 0..5 {
-            let head = hosted.head(&rr.repo, &rr.branch).map_err(|e| format!("{e:#}"))?;
-            match hosted.commit(&rr.repo, &rr.branch, head.as_deref(), &changes, &message, &who) {
-                Ok(c) => return Ok(c.sha().to_owned()),
-                Err(CommitError::Moved) => continue,
-                Err(e) => return Err(e.to_string()),
-            }
+    let (repo, who) = (git::open(d, &env.release_repo).await?, author(who));
+    for _ in 0..5 {
+        let head = repo.head().await.map_err(|e| format!("{e:#}"))?;
+        match repo.commit(head.as_deref(), changes.clone(), message.clone(), who.clone()).await {
+            Ok(c) => return Ok(c.sha().to_owned()),
+            Err(CommitError::Moved) => continue,
+            Err(e) => return Err(e.to_string()),
         }
-        Err("the release repository kept moving: five tries".to_owned())
-    })
-    .await
-    .map_err(|e| format!("{e:#}"))?
+    }
+    Err("the release repository kept moving: five tries".to_owned())
 }
 
 pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -> Result<Registration, Fail> {
@@ -734,14 +752,11 @@ pub async fn register(d: &Deploy, actor: &str, app_name: &str, env_name: &str) -
     }
     let rr = &env.release_repo;
     let values = repo::values_file(rr, &a, env_name);
-    let (hosted, repo_name, branch, values_path) = (d.hosted.clone(), rr.repo.clone(), rr.branch.clone(), values.clone());
-    let has_values = crate::rt::blocking(move || -> anyhow::Result<bool> {
-        let Some(head) = hosted.head(&repo_name, &branch)? else { return Ok(false) };
-        Ok(hosted.read(&repo_name, &head, &values_path)?.is_some())
-    })
-    .await
-    .and_then(|r| r)
-    .map_err(internal)?;
+    let release_repo = git::open(d, rr).await.map_err(bad)?;
+    let has_values = match release_repo.head().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))? {
+        Some(head) => release_repo.read(&head, &values).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?.is_some(),
+        None => false,
+    };
     let mut changes = vec![
         Change { path: repo::app_file(rr, &a), content: Some(repo::app_yaml(&a).map_err(internal)?) },
         Change { path: repo::release_file(rr, &a, env_name), content: Some(repo::encode(&repo::registered_json(&a, env_name)).map_err(internal)?) },
@@ -1102,14 +1117,11 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
             None => options.first().cloned().ok_or_else(|| conflict(format!("{} has no earlier release in {} to roll back to", a.name, env.name)))?,
         };
         let commit = to.commit.clone().unwrap_or_default();
-        let (hosted, rr) = (d.hosted.clone(), env.release_repo.clone());
-        let (release_path, values_path) = (repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name));
-        let (file, values) = crate::rt::blocking(move || -> anyhow::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-            Ok((hosted.read(&rr.repo, &commit, &release_path)?, hosted.read(&rr.repo, &commit, &values_path)?))
-        })
-        .await
-        .and_then(|x| x)
-        .map_err(internal)?;
+        let rr = &env.release_repo;
+        let at = git::open(d, rr).await.map_err(bad)?;
+        let gone = |e: anyhow::Error| (StatusCode::BAD_GATEWAY, format!("{e:#}"));
+        let file = at.read(&commit, &repo::release_file(rr, &a, &env.name)).await.map_err(gone)?;
+        let values = at.read(&commit, &repo::values_file(rr, &a, &env.name)).await.map_err(gone)?;
         let file = file.map(|b| repo::decode(&b)).transpose().map_err(internal)?.ok_or_else(|| conflict(format!("release {}'s commit holds no release.json", to.id)))?;
         r.kind = Kind::Rollback;
         r.version = file.version;
@@ -1185,6 +1197,8 @@ pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Relea
         State::Waiting | State::WaitingApproval | State::Delivering => {}
         // A retried cancel (with an idempotency key) finds it cancelled already.
         State::Cancelled if again => return Ok(r),
+        // Proposed as a pull request: its pull request is closed.
+        State::Committing if r.provider.get("pull_request").is_some_and(Value::is_object) => {}
         State::Committing => return Err(conflict(format!("release {id} is being committed right now: cancel it in a moment, or roll back"))),
         s => return Err(conflict(format!("release {id} is {}: nothing to cancel", s.as_str()))),
     }
@@ -1193,13 +1207,17 @@ pub async fn cancel(d: &Deploy, who: &Who, id: i64, again: bool) -> Result<Relea
     r.state = State::Cancelled;
     r.ended_at = Some(now);
     let undo = was == State::Delivering;
+    let withdraw = was == State::Committing;
     if undo {
         note(&mut r.provider, "undo", json!(true));
+    }
+    if withdraw {
+        note(&mut r.provider, "withdraw", json!(true));
     }
     if !store::update_release(&d.hub.store, &r, was).await.map_err(internal)? {
         return Err(conflict(format!("release {id} moved meanwhile: look again")));
     }
-    if undo {
+    if undo || withdraw {
         store::schedule(&d.hub.store, id, now).await.map_err(internal)?;
     } else {
         store::done(&d.hub.store, id).await.map_err(internal)?;
@@ -1260,10 +1278,13 @@ pub async fn answer(d: &Deploy, who: &Who, id: i64, approved: bool, note: Option
 const LEASE_SECS: i64 = 60;
 /// How often release repositories are looked at for commits kiln didn't make.
 const SCAN_SECS: i64 = 30;
+/// How often Argo CD's tokens for release repositories on GitHub are looked at (each is replaced
+/// every half hour).
+const READERS_SECS: i64 = 300;
 
 /// Follows every release due, until the server shuts down.
 pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
-    let mut last_scan = 0;
+    let (mut last_scan, mut last_readers) = (0, 0);
     loop {
         if d.hub.shutdown.is_cancelled() {
             return Ok(());
@@ -1280,7 +1301,11 @@ pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "deploy: the work queue can't be read"),
         }
-        if now - last_scan >= SCAN_SECS {
+        if now - last_readers >= READERS_SECS {
+            last_readers = now;
+            github::refresh_readers(d).await;
+        }
+        if now - last_scan >= SCAN_SECS || d.github.take_scan() {
             last_scan = now;
             if let Err(e) = scan_git(d).await {
                 tracing::warn!(error = %format!("{e:#}"), "deploy: release repositories can't be scanned");
@@ -1349,26 +1374,39 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 }
                 finish(d, r, State::Failed, Some(message)).await?;
             }
-            Ok(Committed::Done(sha, secrets, irreversible)) => {
-                r.irreversible = irreversible;
-                r.commit = Some(sha);
-                // What it changes of the app's secrets, as it pinned them (§3.5).
-                if let Some(changed) = secrets.filter(|c| !c.is_empty()) {
-                    r.secrets = Some(changed);
+            Ok(Committed::Done(sha, secrets, irreversible)) => committed(d, r, sha, secrets, irreversible, now).await?,
+            // Proposed as a pull request (`via: pull-request`): it waits for the merge, looked at
+            // every minute, and at once when GitHub's webhook says the pull request moved.
+            Ok(Committed::Proposed(pr, why)) => {
+                note(&mut r.provider, "pull_request", pr);
+                r.message = Some(why);
+                if store::update_release(st, &r, State::Committing).await? {
+                    emit_release(d, &r);
                 }
-                r.committed_at = Some(now);
-                r.state = State::Delivering;
-                r.message = None;
-                if !store::update_release(st, &r, State::Committing).await? {
-                    return Ok(());
+                store::schedule(st, id, now + PROPOSAL_LOOK).await?;
+            }
+            Ok(Committed::Waiting(why)) => {
+                let moved = r.message.as_deref() != Some(why.as_str());
+                r.message = Some(why);
+                if store::update_release(st, &r, State::Committing).await? && moved {
+                    emit_release(d, &r);
                 }
-                emit_release(d, &r);
-                match deliver(d, &r).await {
-                    Ok(()) => note(&mut r.provider, "delivered_at", json!(now)),
-                    Err(e) => r.message = Some(e.to_string()),
+                store::schedule(st, id, now + PROPOSAL_LOOK).await?;
+            }
+            // The merge is its approval (§9.1), and its commit.
+            Ok(Committed::Merged { commit, by, secrets, irreversible }) => {
+                let number = r.provider.pointer("/pull_request/number").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(by) = by {
+                    r.approvals.push(Approval { by: format!("{by} on GitHub"), at: now, approved: true, note: Some(format!("merged pull request #{number}")) });
                 }
-                store::update_release(st, &r, State::Delivering).await?;
-                store::schedule(st, id, now + 2).await?;
+                committed(d, r, commit, secrets, irreversible, now).await?;
+            }
+            Ok(Committed::Closed(why)) => finish(d, r, State::Cancelled, Some(why)).await?,
+            // One waiting on its pull request waits on while GitHub can't be asked.
+            Err(e) if r.provider.get("pull_request").is_some_and(Value::is_object) => {
+                r.message = Some(format!("its pull request can't be looked at now: {e}"));
+                store::update_release(st, &r, State::Committing).await?;
+                store::schedule(st, id, now + PROPOSAL_LOOK).await?;
             }
             Err(e) if now - r.created_at > timeout => finish(d, r, State::Failed, Some(format!("not committed: {e}"))).await?,
             Err(e) => {
@@ -1493,6 +1531,17 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 }
             }
         }
+        // Cancelled while its pull request waited: the pull request is closed (or, merged meanwhile,
+        // its merge undone).
+        State::Cancelled if r.provider.get("withdraw").and_then(Value::as_bool) == Some(true) => {
+            let withdrawn = withdraw(d, &mut r).await;
+            note(&mut r.provider, "withdraw", json!(false));
+            r.message = Some(format!("{}; {withdrawn}", r.message.as_deref().unwrap_or("cancelled")));
+            if store::update_release(st, &r, State::Cancelled).await? {
+                emit_release(d, &r);
+            }
+            store::done(st, id).await?;
+        }
         State::Cancelled if r.provider.get("undo").and_then(Value::as_bool) == Some(true) => {
             let undone = undo(d, &r, &format!("{} (release {} was delivering)", r.message.as_deref().unwrap_or("cancelled"), r.id)).await;
             note(&mut r.provider, "undo", json!(false));
@@ -1507,6 +1556,71 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How often a release proposed as a pull request looks at it by itself (GitHub's webhook wakes it
+/// sooner).
+const PROPOSAL_LOOK: i64 = 60;
+
+/// A release committed (`sha`): delivering from now, handed to its provider.
+async fn committed(d: &Deploy, mut r: Release, sha: String, secrets: Option<String>, irreversible: Option<String>, now: i64) -> anyhow::Result<()> {
+    let st = &d.hub.store;
+    r.irreversible = irreversible;
+    r.commit = Some(sha);
+    // What it changes of the app's secrets, as it pinned them (§3.5).
+    if let Some(changed) = secrets.filter(|c| !c.is_empty()) {
+        r.secrets = Some(changed);
+    }
+    r.committed_at = Some(now);
+    r.state = State::Delivering;
+    r.message = None;
+    if !store::update_release(st, &r, State::Committing).await? {
+        return Ok(());
+    }
+    emit_release(d, &r);
+    match deliver(d, &r).await {
+        Ok(()) => note(&mut r.provider, "delivered_at", json!(now)),
+        Err(e) => r.message = Some(e.to_string()),
+    }
+    store::update_release(st, &r, State::Delivering).await?;
+    store::schedule(st, r.id, now + 2).await?;
+    Ok(())
+}
+
+/// A release cancelled while its pull request waited: the pull request closed, saying so, and its
+/// branch deleted. Merged meanwhile, its merge is in git: undone as a delivering release's commit
+/// is (§9). What was done, as the release's message says it.
+async fn withdraw(d: &Deploy, r: &mut Release) -> String {
+    let (Some(number), branch) = (r.provider.pointer("/pull_request/number").and_then(Value::as_u64), r.provider.pointer("/pull_request/branch").and_then(Value::as_str).unwrap_or_default().to_owned()) else {
+        return "it had no pull request".to_owned();
+    };
+    let env = match store::environment(&d.hub.store, &r.environment).await {
+        Ok(Some(e)) => e,
+        _ => return format!("its environment is gone: close pull request #{number} on GitHub"),
+    };
+    let at = match git::open(d, &env.release_repo).await {
+        Ok(at) => at,
+        Err(e) => return format!("its pull request #{number} couldn't be closed ({e}): close it on GitHub"),
+    };
+    let Some(gh) = at.github() else { return format!("its release repository isn't on GitHub any more: close pull request #{number} there") };
+    let why = r.message.clone().unwrap_or_else(|| "cancelled".to_owned());
+    match gh.proposal(number).await {
+        Ok(crate::githost::ChangeState::Open) => match gh.withdraw(number, &branch, &format!("kiln's release {} is {why}: this pull request goes with it.", r.id)).await {
+            Ok(()) => format!("its pull request #{number} is closed"),
+            Err(e) => format!("its pull request #{number} couldn't be closed ({e:#}): close it on GitHub"),
+        },
+        Ok(crate::githost::ChangeState::Merged { commit: Some(sha), .. }) => {
+            gh.drop_branch(&branch).await;
+            r.commit = Some(sha);
+            format!("its pull request #{number} was merged meanwhile; {}", undo(d, r, &format!("{why} (release {} was proposed)", r.id)).await)
+        }
+        Ok(crate::githost::ChangeState::Merged { commit: None, .. }) => format!("its pull request #{number} was merged meanwhile, into a commit GitHub hasn't said: roll back to undo it"),
+        Ok(crate::githost::ChangeState::Closed) => {
+            gh.drop_branch(&branch).await;
+            format!("its pull request #{number} was closed already")
+        }
+        Err(e) => format!("its pull request #{number} couldn't be looked at ({e:#}): close it on GitHub"),
+    }
+}
+
 /// What committing a release came to.
 enum Committed {
     /// Its commit, what it changes of the app's secrets (§3.5), and what it runs that a revert
@@ -1514,33 +1628,45 @@ enum Committed {
     Done(String, Option<String>, Option<String>),
     /// Refused by its preflight (§8.1), why: nothing changed.
     Refused(String),
+    /// Proposed as a pull request (`via: pull-request`): what the release keeps of it
+    /// (`provider.pull_request`), and what it waits for.
+    Proposed(Value, String),
+    /// Its pull request is open: what it waits for.
+    Waiting(String),
+    /// Its pull request merged: the merge, who merged it, and what it was proposed with (its
+    /// secrets' changes, what it runs that a revert couldn't undo).
+    Merged { commit: String, by: Option<String>, secrets: Option<String>, irreversible: Option<String> },
+    /// Its pull request closed unmerged: why it's cancelled.
+    Closed(String),
+}
+
+/// What a release proposed as a pull request waits for.
+fn waits_for(number: u64, url: &str) -> String {
+    format!("waits for its pull request #{number} to be merged: {url}")
 }
 
 /// Commits a release to its environment's release repository, once its preflight finds nothing
 /// against it: the commit, and what it changes of the app's secrets. A commit made before a crash
-/// is found by its trailer, not made again.
+/// is found by its trailer, not made again. With `via: pull-request` it's proposed as a pull
+/// request instead, and followed until it's merged or closed.
 async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
     let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let rr = env.release_repo.clone();
-    let (hosted, id) = (d.hosted.clone(), r.id);
-    let found = {
-        let rr = rr.clone();
-        crate::rt::blocking(move || hosted.find_trailer(&rr.repo, &rr.branch, repo::RELEASE_TRAILER, &id.to_string())).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?
-    };
-    if let Some(sha) = found {
+    let at = git::open(d, &rr).await?;
+    let e = |e: anyhow::Error| format!("{e:#}");
+    if let Some(pr) = r.provider.get("pull_request").filter(|p| p.is_object()) {
+        return proposed(&at, pr).await;
+    }
+    if env.gates.via != Via::PullRequest
+        && let Some(sha) = at.find_trailer(repo::RELEASE_TRAILER, &r.id.to_string()).await.map_err(e)?
+    {
         return Ok(Committed::Done(sha, None, None));
     }
-    let (hosted, release_path, values_path) = (d.hosted.clone(), repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name));
-    let prior = {
-        let (hosted, rr, release_path) = (hosted.clone(), rr.clone(), release_path.clone());
-        crate::rt::blocking(move || -> anyhow::Result<Option<ReleaseFile>> {
-            let Some(head) = hosted.head(&rr.repo, &rr.branch)? else { return Ok(None) };
-            hosted.read(&rr.repo, &head, &release_path)?.map(|b| repo::decode(&b)).transpose()
-        })
-        .await
-        .and_then(|x| x)
-        .map_err(|e| format!("{e:#}"))?
+    let (release_path, values_path) = (repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name));
+    let prior = match at.head().await.map_err(e)? {
+        Some(head) => at.read(&head, &release_path).await.map_err(e)?.map(|b| repo::decode(&b)).transpose().map_err(e)?,
+        None => None,
     };
     let enabled = match r.kind {
         Kind::Disable => false,
@@ -1576,8 +1702,56 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
     if let Some(v) = &r.values {
         changes.push(Change { path: values_path, content: Some(v.clone().into_bytes()) });
     }
+    if env.gates.via == Via::PullRequest {
+        let gh = at.github().ok_or("gates.via: pull-request needs a release repository on GitHub")?;
+        let p = gh.propose(&github::proposal_branch(r), changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
+        let kept = json!({ "number": p.number, "url": p.url, "branch": p.branch, "secrets": changed, "irreversible": found.irreversible });
+        return Ok(Committed::Proposed(kept, waits_for(p.number, &p.url)));
+    }
     let sha = commit_files(d, &env, changes, repo::message(&a, &env.name, r), &r.requested_by).await?;
     Ok(Committed::Done(sha, Some(changed), found.irreversible))
+}
+
+/// Where a release proposed as a pull request is: merged, its merge is its commit; closed
+/// unmerged, it's cancelled; open, it waits. A merged or closed one's branch goes.
+async fn proposed(at: &git::Repo, pr: &Value) -> Result<Committed, String> {
+    let gh = at.github().ok_or("its pull request is on GitHub, and its release repository isn't any more")?;
+    let number = pr.get("number").and_then(Value::as_u64).ok_or("its pull request has no number")?;
+    let (url, branch) = (pr.get("url").and_then(Value::as_str).unwrap_or_default(), pr.get("branch").and_then(Value::as_str).unwrap_or_default());
+    let text = |key: &str| pr.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    match gh.proposal(number).await.map_err(|e| format!("{e:#}"))? {
+        crate::githost::ChangeState::Open => Ok(Committed::Waiting(waits_for(number, url))),
+        crate::githost::ChangeState::Merged { commit: Some(commit), by } => {
+            gh.drop_branch(branch).await;
+            Ok(Committed::Merged { commit, by, secrets: text("secrets"), irreversible: text("irreversible") })
+        }
+        crate::githost::ChangeState::Merged { commit: None, .. } => Ok(Committed::Waiting(format!("its pull request #{number} is merged; GitHub hasn't said into which commit yet"))),
+        crate::githost::ChangeState::Closed => {
+            gh.drop_branch(branch).await;
+            Ok(Committed::Closed(format!("its pull request #{number} was closed without merging ({url})")))
+        }
+    }
+}
+
+/// What a release's pull request says: what it is, what merging and closing it do, its gates, and
+/// where it is on kiln.
+fn proposal_body(d: &Deploy, r: &Release, env: &Environment) -> String {
+    let what = match (&r.version, r.kind) {
+        (Some(v), _) => format!("{} {v}", r.kind.as_str()),
+        (None, k) => k.as_str().to_owned(),
+    };
+    let gates: Vec<String> = r.gates.iter().map(|g| format!("- `{}`: {}{}", g.gate, if g.passed { "passed" } else { "not passed" }, if g.detail.is_empty() { String::new() } else { format!(", {}", g.detail) })).collect();
+    let page = format!("{}/deployments/releases/{}", d.hub.cfg.server.public_url.trim_end_matches('/'), r.id);
+    format!(
+        "kiln's release {} of **{}** to **{}**: {what}, asked for by {}.\n\nMerging this pull request releases it: kiln hands the merge to {} and follows it until it lands. Closing it without merging cancels the release.\n{}\n[Release {} on kiln]({page})\n",
+        r.id,
+        r.app,
+        env.name,
+        r.requested_by,
+        provider_name(env),
+        if gates.is_empty() { String::new() } else { format!("\nIts gates:\n{}\n", gates.join("\n")) },
+        r.id,
+    )
 }
 
 /// What a release changes of the app's secrets, from the versions the one before pinned to its
@@ -1592,8 +1766,8 @@ fn secrets_changed(before: &str, after: &str) -> String {
 
 /// What a release's commit holds for its registration.
 pub(super) async fn release_file_at(d: &Deploy, a: &App, env: &Environment, commit: &str) -> Result<ReleaseFile, String> {
-    let (hosted, rr, path, commit) = (d.hosted.clone(), env.release_repo.clone(), repo::release_file(&env.release_repo, a, &env.name), commit.to_owned());
-    let bytes = crate::rt::blocking(move || hosted.read(&rr.repo, &commit, &path)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    let at = git::open(d, &env.release_repo).await?;
+    let bytes = at.read(commit, &repo::release_file(&env.release_repo, a, &env.name)).await.map_err(|e| format!("{e:#}"))?;
     let bytes = bytes.ok_or("the commit holds no release.json for the registration")?;
     repo::decode(&bytes).map_err(|e| format!("release.json doesn't read: {e:#}"))
 }
@@ -1617,7 +1791,7 @@ pub(super) async fn kilncd_preview(d: &Deploy, a: &App, env: &Environment, versi
     if let Some(why) = super::check::missing_version(&d.hub, &a.package, &file).await {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
     }
-    let url = d.hosted.url(&env.release_repo.repo).map_err(internal)?;
+    let url = git::open(d, &env.release_repo).await.map_err(bad)?.url().map_err(internal)?;
     let chart = kilncd::git_chart(&cd, &a.package, version).await;
     // Filled again for that version, as a release of it would be.
     file.package = a.package.clone();
@@ -1633,8 +1807,7 @@ pub(super) async fn values_at(d: &Deploy, a: &App, env: &Environment, commit: &s
 
 /// A file of a release's commit, for its registration (`None`: the commit has none).
 async fn file_at(d: &Deploy, env: &Environment, commit: &str, path: String) -> Result<Option<String>, String> {
-    let (hosted, rr, commit) = (d.hosted.clone(), env.release_repo.clone(), commit.to_owned());
-    let bytes = crate::rt::blocking(move || hosted.read(&rr.repo, &commit, &path)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    let bytes = git::open(d, &env.release_repo).await?.read(commit, &path).await.map_err(|e| format!("{e:#}"))?;
     Ok(bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
@@ -1687,7 +1860,7 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
         // Registered and enabled, but never given a version: nothing runs yet.
         return Ok(());
     }
-    let url = d.hosted.url(&env.release_repo.repo).map_err(|e| format!("{e:#}"))?;
+    let url = git::open(d, &env.release_repo).await?.url().map_err(|e| format!("{e:#}"))?;
     let chart = kilncd::git_chart(&cd, &a.package, file.version.as_deref().unwrap_or_default()).await;
     let def = kilncd::definition(&a, &env, &reg, &file, &commit, &url, chart).map_err(Undelivered::Refused)?;
     kilncd::deliver(&d.hub, &cd, &actor, &def).await
@@ -2096,33 +2269,28 @@ async fn revert(d: &Deploy, r: &Release, why: &str) -> Result<(Option<String>, O
     let a = store::app(&d.hub.store, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
     let env = store::environment(&d.hub.store, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let rr = env.release_repo.clone();
-    let (hosted, at, key) = (d.hosted.clone(), rr.clone(), r.id.to_string());
+    let at = git::open(d, &rr).await?;
+    let e = |e: anyhow::Error| format!("{e:#}");
     // Reverted already, before a restart.
-    let found = crate::rt::blocking(move || hosted.find_trailer(&at.repo, &at.branch, REVERT_TRAILER, &key)).await.and_then(|x| x).map_err(|e| format!("{e:#}"))?;
+    let found = at.find_trailer(REVERT_TRAILER, &r.id.to_string()).await.map_err(e)?;
     if found.is_some() {
         return Ok((found.clone(), found));
     }
-    let paths = [repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name)];
-    let (hosted, at) = (d.hosted.clone(), rr.clone());
-    let (head, changes) = crate::rt::blocking(move || -> anyhow::Result<(Option<String>, Vec<Change>)> {
-        let Some(head) = hosted.head(&at.repo, &at.branch)? else { return Ok((None, Vec::new())) };
-        let mut changes = Vec::new();
-        for path in paths {
-            let ours = hosted.read(&at.repo, &commit, &path)?;
-            // Someone changed it since: theirs stands.
-            if hosted.read(&at.repo, &head, &path)? != ours {
-                continue;
-            }
-            let before = hosted.read(&at.repo, &format!("{commit}^"), &path)?;
-            if before != ours {
-                changes.push(Change { path, content: before });
-            }
+    let Some(head) = at.head().await.map_err(e)? else { return Ok((None, None)) };
+    let mut changes = Vec::new();
+    for path in [repo::release_file(&rr, &a, &env.name), repo::values_file(&rr, &a, &env.name)] {
+        let ours = at.read(&commit, &path).await.map_err(e)?;
+        // Someone changed it since: theirs stands.
+        if at.read(&head, &path).await.map_err(e)? != ours {
+            continue;
         }
-        Ok((Some(head), changes))
-    })
-    .await
-    .and_then(|x| x)
-    .map_err(|e| format!("{e:#}"))?;
+        // What it was before the commit (a merge's: before its first parent took the rest).
+        let before = at.read(&format!("{commit}^"), &path).await.map_err(e)?;
+        if before != ours {
+            changes.push(Change { path, content: before });
+        }
+    }
+    let head = Some(head);
     if changes.is_empty() {
         return Ok((None, head));
     }
@@ -2151,18 +2319,21 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
             Some(s) => Some(s),
             None => st.kv_get(format!("deploy/seen/{}/{}", rr.repo, rr.branch)).await?,
         };
-        let (hosted, rr2, since) = (d.hosted.clone(), rr.clone(), seen.clone());
-        let (head, commits) = crate::rt::blocking(move || -> anyhow::Result<(Option<String>, Vec<super::host::LoggedCommit>)> {
-            let head = hosted.head(&rr2.repo, &rr2.branch)?;
-            // The first look only notes where the branch is: history before it is kiln's own.
-            let commits = match &since {
-                Some(s) => hosted.commits_since(&rr2.repo, &rr2.branch, Some(s))?,
-                None => Vec::new(),
-            };
-            Ok((head, commits))
-        })
-        .await
-        .and_then(|x| x)?;
+        // The first look only notes where the branch is: history before it is kiln's own. One on
+        // GitHub is looked at once a minute, or when its webhook says it changed.
+        let (head, commits) = match git::open(d, &rr).await {
+            Ok(at) => match at.scan(seen.as_deref()).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::debug!(environment = %env.name, repo = %rr.repo, error = %format!("{e:#}"), "deploy: a release repository can't be looked at now");
+                    continue;
+                }
+            },
+            Err(why) => {
+                tracing::debug!(environment = %env.name, repo = %rr.repo, error = %why, "deploy: a release repository can't be looked at now");
+                continue;
+            }
+        };
         let Some(head) = head else { continue };
         if seen.as_deref() == Some(head.as_str()) {
             continue;
@@ -2241,6 +2412,7 @@ mod tests {
                 wake: crate::rt::Notify::new(),
                 changes: crate::rt::Broadcast::new(16),
                 argo: Default::default(),
+                github: Default::default(),
                 hub: Arc::clone(&hub),
             };
             let st = &hub.store;
@@ -2289,6 +2461,7 @@ mod tests {
                 wake: crate::rt::Notify::new(),
                 changes: crate::rt::Broadcast::new(16),
                 argo: Default::default(),
+                github: Default::default(),
                 hub: Arc::clone(&hub),
             };
             let mut e = env(false);

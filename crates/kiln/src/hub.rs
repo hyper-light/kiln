@@ -210,6 +210,9 @@ pub struct Hub {
     pub tasks: crate::sync::tasks::Tasks,
     /// Notifications to people's devices (`crate::push`).
     pub push: crate::push::Service,
+    /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
+    /// any S3.
+    pub blobs: crate::blobs::Opened,
 }
 
 impl Hub {
@@ -223,7 +226,7 @@ impl Hub {
         admin_token: String,
         join_token: String,
         shutdown: Shutdown,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_on(crate::rt::clock(), cfg, store, logs, net, pki, admin_token, join_token, shutdown)
     }
 
@@ -239,16 +242,18 @@ impl Hub {
         admin_token: String,
         join_token: String,
         shutdown: Shutdown,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
+        let blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock));
-        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
+        let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
+        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             cfg,
             store,
             logs,
@@ -296,7 +301,8 @@ impl Hub {
             places,
             tasks,
             push: crate::push::Service::default(),
-        })
+            blobs,
+        }))
     }
 
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
@@ -311,18 +317,16 @@ impl Hub {
         if !path.exists() {
             return;
         }
-        let (cfg, run_c) = (self.cfg.clone(), run.clone());
-        let adopted = crate::rt::blocking(move || crate::updates::adopt_into(&cfg, &path, &run_c)).await;
-        match adopted {
-            Ok(Ok(kept)) if !kept.is_empty() => {
+        match crate::updates::adopt_into(self, &path, run).await {
+            Ok(kept) if !kept.is_empty() => {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
                 self.emit(&serde_json::json!({ "type": "updates" }));
                 self.updates.fleet.wake();
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) | Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
         }
     }
 
@@ -1109,8 +1113,13 @@ impl Hub {
             // A streamed page's chunks and events (`crate::harness::streams`): to its viewers.
             AgentMsg::StreamFrame { stream, data } => self.harness.streams.chunk(&agent, &stream, data),
             AgentMsg::StreamEvent { stream, json } => {
+                let after = self.harness.streams.event(&agent, &stream, json);
+                // A recording that ended: its files kept in kiln's store of bytes.
+                if let Some((session, rec)) = after.ended {
+                    self.harness.streams.keep(self, session, rec);
+                }
                 // Opened: the size its viewer asked for while it was being set up, asked again.
-                if let Some((live, again)) = self.harness.streams.event(&agent, &stream, json) {
+                if let Some((live, again)) = after.again {
                     live.control(self, &again).await;
                 }
             }
@@ -2165,7 +2174,7 @@ pub(crate) mod tests {
         let pki = Arc::new(pki);
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
-        Ok(Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
+        Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }
 
     #[test]

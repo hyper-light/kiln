@@ -329,7 +329,8 @@ and `result`), its child `move.barrier`, and `move.files` on the machine it arri
 
 - **Server:** one thread (`sync::server`) leads every repo's group on one hyper-log file
   (`<data>/sync/sync.log`), keeps each repo's tree beside it (`<id>.tree.json`) and its contents in
-  `<data>/sync/blobs`, and the list of repos and copies in `repos.json`. It takes a copy's steps in
+  kiln's store of bytes (`sync/<sha256>`, docs/blobs.md; those kept in `<data>/sync/blobs` before
+  are taken in where they lie), and the list of repos and copies in `repos.json`. It takes a copy's steps in
   that copy's order, once their contents are on the server, and adds or removes one learner at a
   time to match the copies. It compacts each log well within the room hyper-log keeps for a group,
   leaving about 2 MiB of entries for copies a little behind; one further behind takes an image.

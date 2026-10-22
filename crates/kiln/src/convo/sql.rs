@@ -106,6 +106,9 @@ pub const SESSION_GET: &str = "SELECT info, meta, state, changes, updated_at, cl
 pub const SESSION_EPOCH: &str = "SELECT epoch FROM sessions WHERE id = ?1";
 /// Sessions not ended, heard of since `?1` (unix ms).
 pub const SESSIONS_UNENDED: &str = "SELECT id, info, meta, state, machine FROM sessions WHERE closed_at IS NULL AND info IS NOT NULL AND updated_at >= ?1 ORDER BY updated_at";
+/// Sessions that ended after `(?1, ?2)` by close (unix ms) and id together, oldest first, `?3` at
+/// most: a page by keyset, so sessions that closed in one millisecond each come once.
+pub const SESSIONS_ENDED_AFTER: &str = "SELECT id, closed_at FROM sessions WHERE closed_at IS NOT NULL AND (closed_at > ?1 OR (closed_at = ?1 AND id > ?2)) ORDER BY closed_at, id LIMIT ?3";
 /// The machine whose feed brought the session.
 pub const SESSION_MACHINE: &str = "UPDATE sessions SET machine = ?2 WHERE id = ?1";
 

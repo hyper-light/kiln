@@ -469,13 +469,18 @@ enum EnvCmd {
     List,
     Show { env: String },
     /// Add (or replace) an environment, deployed from a release repository on kiln's own git
-    /// server through KilnCD, or through an Argo CD integration (`--provider argocd/<name>`).
+    /// server or on GitHub, through KilnCD or through an Argo CD integration (`--provider
+    /// argocd/<name>`).
     Add {
         env: String,
         /// `kilncd`, or `argocd/<integration>`.
         #[arg(long, default_value = "kilncd")]
         provider: String,
-        /// The release repository on kiln's git server.
+        /// Where the release repository is: `kiln` (kiln's git server), or `github` (through kiln's
+        /// GitHub App, which makes it in an organization if it isn't there).
+        #[arg(long, default_value = "kiln")]
+        host: String,
+        /// The release repository (`owner/name`).
         #[arg(long, default_value = "kiln/releases")]
         repo: String,
         #[arg(long, default_value = "main")]
@@ -1235,7 +1240,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates, applications } => {
+        EnvCmd::Add { env, provider, host, repo, branch, root, clusters, no_prune, self_heal, timeout, settle, refused, queue, agents, gates, applications } => {
             let gates: Value = match gates {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1246,7 +1251,7 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let body = json!({
                 "name": env,
                 "provider": provider,
-                "release_repo": { "host": "kiln", "repo": repo, "branch": branch, "root": root },
+                "release_repo": { "host": host, "repo": repo, "branch": branch, "root": root },
                 "targets": { "kubernetes": clusters },
                 "sync": { "prune": !no_prune, "self_heal": self_heal },
                 "watch": { "timeout_secs": timeout, "settle_secs": settle, "refused_secs": refused },

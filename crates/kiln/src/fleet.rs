@@ -787,8 +787,7 @@ pub async fn on_built(hub: &Arc<Hub>, job: &str, sha256: &str, bytes: Option<Vec
     anyhow::ensure!(b.keep, "a build of {} isn't kept here", b.target);
     let got = hex::encode(sha2::Sha256::digest(&bytes));
     anyhow::ensure!(got == sha256, "the binary's SHA-256 is {got}, not {sha256}");
-    let (h, target, machine, commit) = (Arc::clone(hub), b.target.clone(), b.machine.clone(), b.commit.clone());
-    let kept = crate::rt::blocking(move || crate::updates::keep_built(&h, &target, &bytes, &machine, &commit)).await??;
+    let kept = crate::updates::keep_built(hub, &b.target, bytes, &b.machine, &b.commit).await?;
     hub.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} ({}): {} for {}", b.machine, short(&b.commit), kept.build, b.target)).await;
     hub.emit(&serde_json::json!({ "type": "updates" }));
     hub.updates.fleet.wake();
