@@ -77,4 +77,13 @@ written by hand for what a peer gets wrong.
 ## How fast
 
 `bench/http` compares kiln-http with hyper on tokio, the solution it replaces, using one load
-generator for every server. bench/http/README.md has the method and the numbers.
+generator for every server and four threads each. bench/http/README.md has the method, every run
+and why each gap is what it is. The headline figures, from 2026-10-22:
+
+| | kiln-http | hyper on tokio |
+|---|---|---|
+| HTTP/2, 64 connections × 100 streams | 13.2M requests/s, 273 ns of CPU each, p99 0.64 ms | 1.32M requests/s (10.0× fewer), 2,494 ns each, p99 27 ms |
+| memory per idle HTTP/1.1 connection | 868 B | 11,377 B (13.1× more) |
+| memory per idle HTTP/2 connection | 2,487 B | 19,989 B (8.0× more) |
+| HTTP/1.1 pipelined 16 deep | 6.7M requests/s | 1.07M (6.3× fewer; 5.9M with `pipeline_flush`) |
+| HTTP/1.1, one request at a time | 450k requests/s | 468k: level, as the kernel bounds both |
