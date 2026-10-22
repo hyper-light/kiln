@@ -30,28 +30,18 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { missionFoundSessions, missionRows, type MissionRow, type MissionStand as Stand } from "./mission-rows";
+import { missionFoundSessions, missionRows, standOf, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
 import { RowChange, RowReview } from "./change-bar";
+import { Shimmer } from "./signals";
+import { subagentRunning, subagentsAtWork, throughSubagents } from "./tasks";
 
 /** A phone: the page's head is one line, and the message box folds. */
 const PHONE = "(max-width: 640px)";
-
-function standOf(a: AgentInfo, seen: number | undefined): Stand {
-  if (a.approvals.length > 0 || a.status === "waiting") return "needs";
-  if (a.status === "exited" && a.exit?.error) return "crashed";
-  // Waiting for a usage limit to reset (its current turn, if any, finishes first).
-  if (a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected") return "paused";
-  if (a.status === "running" || a.status === "starting") return "working";
-  if (a.status === "idle") return a.last_activity > (seen ?? 0) + 1500 ? "finished" : "ready";
-  // Its machine is reconnecting (a runner or server restart): it stays where it is.
-  if (a.status === "disconnected") return "offline";
-  return "ended";
-}
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -79,7 +69,9 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return a.pause ? pauseLine(a.pause, Date.now()) : "Paused";
     case "working": {
       const plan = (a.todos_total ?? 0) > 0 ? `plan ${a.todos_done ?? 0}/${a.todos_total}` : "";
-      return [a.status === "starting" ? (a.harness_session ? "Resuming" : "Starting") : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
+      // Its turn over, what its subagents do.
+      const doing = a.status === "starting" ? (a.harness_session ? "Resuming" : "Starting") : throughSubagents(a) ? subagentsLine(subagentsAtWork(a.subagents)) : a.doing || a.activity || "Working";
+      return [doing, plan].filter(Boolean).join(" · ");
     }
     case "finished":
       return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
@@ -130,10 +122,11 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
   const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
   const line = (
     <span className="ms-line">
-      <span className="ms-word">
+      {/* A subagent of its own running: the prism sweeps through its word. */}
+      <Shimmer on={stand === "working" && subagentRunning(a.subagents)} className="ms-word">
         <i aria-hidden="true" />
         {WORD[stand]}
-      </span>
+      </Shimmer>
       <span className="ms-text">{lineOf(a, stand)}</span>
     </span>
   );

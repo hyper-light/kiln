@@ -20,6 +20,7 @@ import {
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { cn } from "@/lib/utils";
 import { HarnessMark, StatusPill } from "@/views/harness/parts";
+import { throughSubagents } from "@/views/harness/tasks";
 
 export interface SwitcherTab {
   id: string;
@@ -162,7 +163,7 @@ function SwitcherSheet({
               <button type="button" className="sw-main" onClick={done(() => navigate(`/agents/${a.id}`))}>
                 <HarnessMark kind={a.kind} name={a.kind_name} size={20} />
                 <span className="sw-title">{a.name}</span>
-                {a.approvals.length > 0 ? <span className="sw-needs">needs you</span> : <StatusPill status={a.status} className="sw-pill" />}
+                {a.approvals.length > 0 ? <span className="sw-needs">needs you</span> : <StatusPill status={throughSubagents(a) ? "running" : a.status} className="sw-pill" />}
               </button>
             </li>
           ))}
