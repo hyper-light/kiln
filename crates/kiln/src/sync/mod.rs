@@ -386,9 +386,15 @@ impl Copy {
             }
             changes.push(Change { path, to: here, base: expected });
         }
-        // The store's folders its new contents went into: synced with this copy's before the
+        // The store's folders holding what the new steps carry, whoever put it there (a look
+        // before a crash may have, its folders never synced): synced with this copy's before the
         // state that names them is saved, or a power loss could keep the steps and lose what they
         // carry.
+        for c in &changes {
+            if let Some(Version::File { hash, .. }) = &c.to {
+                blobs.hold(hash);
+            }
+        }
         self.touched.extend(blobs.take_touched());
         self.state.seen = found;
         for c in &changes {

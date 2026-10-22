@@ -86,6 +86,17 @@ impl Blobs {
         Ok(())
     }
 
+    /// Notes the folders holding blob `hash` (its own, and the store's, which names that one), to
+    /// sync before a state names it: one a process put there before a crash may not be durable yet,
+    /// though it's there to see.
+    pub fn hold(&self, hash: &str) {
+        if let Some(dir) = self.path(hash).as_deref().and_then(Path::parent) {
+            let mut touched = self.touched.lock();
+            touched.insert(dir.to_owned());
+            touched.insert(self.dir.clone());
+        }
+    }
+
     /// Notes that a blob was renamed into `dest`'s folder.
     fn renamed_in(&self, dest: &Path) {
         if let Some(dir) = dest.parent() {

@@ -1339,8 +1339,10 @@ mod tests {
 
     use super::*;
 
-    /// The model as the first bugs' seeds found it (each request sent once, disks' names kept in
-    /// order): they replay those runs.
+    /// The model as the first five bugs' seeds found it: each request sent once, disks' names kept
+    /// in order. kiln's code has changed since (each later fix), so they don't replay the runs that
+    /// found them (their replays at the commits before the fixes do); they run on the model those
+    /// runs had.
     const ONCE: Plant = Plant { writes_unsynced: false, requests_once: true, names_in_order: true };
 
     /// CP-T6.1, AC-T6.1.1: the sync model over the seed budget (200 seeds on every change
@@ -1649,19 +1651,22 @@ mod tests {
     /// what a look put in it into its folders and never synced them, so a power loss on a disk
     /// that keeps each folder's names apart, as POSIX allows, could lose them while the state
     /// naming them, saved and synced, survived. The copy's steps carrying them could never be sent,
-    /// and its changes stayed pending for good (sync seeds 12 and 14, moves 12 and 14).
+    /// and its changes stayed pending for good (sync seeds 12 and 14, moves 12 and 14). And, once
+    /// that was fixed, contents a process put there before a crash, named by the next process's
+    /// look, which found them there and put nothing (sync seed 4079).
     #[test]
     fn the_seeds_where_contents_a_look_kept_were_lost_converge() -> Result<(), String> {
         for seed in [12, 14] {
             run(seed, 0, Plant::default(), Mode::Sync)?;
             run(seed, 0, Plant::default(), Mode::Moves)?;
         }
-        Ok(())
+        run(4079, 0, Plant::default(), Mode::Sync).map(|_| ())
     }
 
     /// CP-T6.1, AC-T6.1.3: the sixth bug's contract: once a copy has saved the state that names
     /// the contents a look put in its store, a power loss leaves the store holding every one its
-    /// unsent steps carry; on either way of journaling names.
+    /// unsent steps carry: put by that look, or by one whose process crashed before it saved; on
+    /// either way of journaling names.
     #[test]
     fn contents_a_look_kept_outlive_a_power_loss_once_the_state_naming_them_is_saved() -> Result<(), String> {
         for seed in 0..200u64 {
@@ -1677,6 +1682,13 @@ mod tests {
                 let full = format!("/home/m2/repo/{path}");
                 disk.write(&full, &filled(path, len)).map_err(e)?;
                 disk.make_durable(&full);
+            }
+            // In half the seeds, a look whose process crashes before it saves: what it put is in
+            // the store, the store's folders unsynced, and the next process looks again.
+            if seed % 4 >= 2 {
+                let first = Blobs::on(Arc::clone(&fs), &store).map_err(e)?;
+                let mut gone = Feed::open_on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), state.clone()).map_err(e)?;
+                gone.copy.propose(&first, SIM_EPOCH_MS).map_err(e)?;
             }
             let blobs = Blobs::on(Arc::clone(&fs), &store).map_err(e)?;
             let mut feed = Feed::open_on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), state.clone()).map_err(e)?;
