@@ -474,7 +474,15 @@ mod tests {
         let out = std::process::Command::new("sh").arg("-c").arg(format!("{sleep_32} >/dev/null 2>&1 & echo $!")).env(MARK, "s1").output()?;
         let apart: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
         let me = std::process::id();
-        let seen = scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
+        let look = || scan(&[("s1".to_owned(), Some(me)), ("s2".to_owned(), None)]);
+        // Its shell forked it: looked at again until it runs as the sleeper (a process caught
+        // between fork and exec shows no environment on macOS, so no mark).
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = look();
+        while !seen.get("s1").is_some_and(|s| s.apart.iter().any(|r| r.pid == apart)) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            seen = look();
+        }
         let s1 = seen.get("s1").cloned().unwrap_or_default();
         let sleep = s1.under.iter().find(|r| r.pid == child.id()).cloned().ok_or_else(|| anyhow::anyhow!("the child isn't seen under its harness: {:?}", s1.under))?;
         assert!(sleep.command.contains("sleep 31"));
