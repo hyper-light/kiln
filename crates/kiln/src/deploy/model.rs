@@ -472,6 +472,24 @@ pub struct App {
     pub source: Option<String>,
     #[serde(default)]
     pub archived: bool,
+    /// The repositories made for its images and chart (§3.1, step 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registries: Option<Registries>,
+}
+
+/// The repositories made for an app's images and chart (docs/deploy-api.md §3.1, step 5), as
+/// references name them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Registries {
+    /// Where they are: `kiln`, or the integration they were made through.
+    pub at: String,
+    /// Release images, their tags immutable: `kiln.example.com/shop/web`.
+    pub images: String,
+    /// Snapshot images (prereleases), only the newest kept: `kiln.example.com/shop/web/snapshots`.
+    pub snapshots: String,
+    /// Its chart, versions immutable: `oci://kiln.example.com/charts/shop/web`.
+    pub chart: String,
 }
 
 /// Who to reach about an app (§3.1): on call, the chat channels its release messages go to, links.
@@ -520,6 +538,10 @@ pub struct Template {
     /// The source repository kiln makes for each of its apps (§3.1), unless the app names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<RepoTemplate>,
+    /// The registry each of its apps gets its image and chart repositories on (§3.1, step 5),
+    /// made by kiln with the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryTemplate>,
     /// The cluster-scoped kinds its apps may make (`ClusterRole`, as `rbac.authorization.k8s.io/ClusterRole`;
     /// a core kind by its name alone): on Argo CD its apps' AppProject allows them, and a Namespace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -554,6 +576,34 @@ pub struct RepoTemplate {
 
 fn is_kiln_host(h: &str) -> bool {
     h == KILN_HOST
+}
+
+/// Where a template's apps get their image and chart repositories (docs/deploy-api.md §3.1,
+/// step 5), and their names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryTemplate {
+    /// `kiln` (kiln's own registry), or an integration: an `aws` one (ECR, in the account and
+    /// region its role is in) or a `gcp` one (Artifact Registry, in `project` and `location`).
+    #[serde(default = "kiln_host")]
+    pub at: String,
+    /// The repositories' name, with `{app}` and `{project}` filled in: release images at it,
+    /// snapshots at `<it>/snapshots`, the chart at `charts/<it>`.
+    #[serde(default = "default_repo_name")]
+    pub name: String,
+    /// How many snapshots are kept: the newest.
+    #[serde(default = "keep_snapshots")]
+    pub keep_snapshots: u32,
+    /// Artifact Registry's location (`europe-west1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Artifact Registry's project: the integration's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+fn keep_snapshots() -> u32 {
+    20
 }
 
 fn default_repo_name() -> String {

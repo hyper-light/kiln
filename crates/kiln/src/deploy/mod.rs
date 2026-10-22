@@ -44,6 +44,7 @@ pub mod provider;
 pub mod reads;
 pub mod remote;
 pub mod repo;
+pub mod registries;
 pub mod scaffold;
 pub mod store;
 

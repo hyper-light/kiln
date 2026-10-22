@@ -7,7 +7,7 @@ import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { Pause, Play, Plus, Rocket } from "lucide-react";
 
-import { boardHref, deployApi, describe, packageWords, providerName, registrationHref, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type ReleaseAsk } from "@/api/deploy";
+import { boardHref, deployApi, describe, packageWords, providerName, registrationHref, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type Registries, type ReleaseAsk } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
@@ -461,6 +461,22 @@ function took(secs: number | null | undefined) {
   return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
 }
 
+/** Where its images and chart go: the repositories kiln made for it (docs/deploy-api.md §3.1, step 5). */
+function RegistriesPanel({ r }: { r: Registries }) {
+  return (
+    <Panel eyebrow="Registries" title="Where its images and chart go" description={r.at === "kiln" ? "On kiln's own registry." : `Made through ${r.at}.`}>
+      <Facts
+        items={[
+          { label: "Release images", value: <code>{r.images}</code> },
+          { label: "Snapshots", value: <code>{r.snapshots}</code> },
+          { label: "Chart", value: <code>{r.chart}</code> },
+        ]}
+      />
+      <p className="muted">A release image's tag never points at another image; only the newest snapshots are kept.</p>
+    </Panel>
+  );
+}
+
 /** How it delivers, over the last 30 days: DORA's four keys, from its releases. */
 function Delivery({ app }: { app: string }) {
   const m = useSuspenseResource(`deploy/metrics/app/${app}`, (s) => deployApi.metrics({ app, days: 30 }, s), { on: DEPLOY_EVENTS }).data;
@@ -546,6 +562,7 @@ function AppView({ name }: { name: string }) {
         <Loadable label="how it delivers">
           <Delivery app={a.name} />
         </Loadable>
+        {a.registries && <RegistriesPanel r={a.registries} />}
         <Loadable label="its releases">
           <Latest app={a.name} />
         </Loadable>

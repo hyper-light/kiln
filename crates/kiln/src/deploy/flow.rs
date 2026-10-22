@@ -588,7 +588,7 @@ pub async fn create_app(d: &Deploy, who: &Who, ask: AppAsk) -> Result<App, Fail>
         None => from_template()?.ok_or_else(|| bad("how is it deployed? give a package, or a template that has one"))?,
     };
     let namespace = ask.namespace.clone().or_else(|| t.as_ref().and_then(|t| t.namespace.as_ref()).map(|p| p.replace("{app}", &ask.name)));
-    let had = before.and_then(|a| a.source);
+    let (had, had_registries) = before.map_or((None, None), |a| (a.source, a.registries));
     let mut a = App {
         name: ask.name,
         project: ask.project.unwrap_or_else(|| "default".to_owned()),
@@ -600,8 +600,15 @@ pub async fn create_app(d: &Deploy, who: &Who, ask: AppAsk) -> Result<App, Fail>
         contacts: ask.contacts,
         source: None,
         archived: ask.archived,
+        registries: had_registries,
     };
     check_app(d, &a).await?;
+    // Its registries, before its repository: the starter names them (`{{kiln.image}}` …).
+    if a.registries.is_none()
+        && let Some(r) = t.as_ref().and_then(|t| t.registry.as_ref())
+    {
+        a.registries = Some(super::registries::make(d, r, &a, actor).await?);
+    }
     // Its source repository: the one named, the one it has, or one its template makes, once the
     // rest of it is known to be right.
     let mut made = None;
@@ -742,12 +749,18 @@ async fn template(d: &Deploy, name: &str) -> Result<Template, Fail> {
 /// repositories (`adds_repos`: `settings.manage`), since each app made from it makes one.
 pub async fn put_template(d: &Deploy, actor: &str, t: Template, adds_repos: bool) -> Result<Template, Fail> {
     dns_label("template", &t.name)?;
+    let before = store::template(&d.hub.store, &t.name).await.map_err(internal)?;
     if let Some(r) = &t.repository {
-        let before = store::template(&d.hub.store, &t.name).await.map_err(internal)?.and_then(|b| b.repository);
-        if !adds_repos && before.as_ref() != Some(r) {
+        if !adds_repos && before.as_ref().and_then(|b| b.repository.as_ref()) != Some(r) {
             return Err((StatusCode::FORBIDDEN, "a template that makes repositories is put by someone who may add them (settings.manage)".into()));
         }
         super::scaffold::check(d, r).map_err(bad)?;
+    }
+    if let Some(r) = &t.registry {
+        if !adds_repos && before.as_ref().and_then(|b| b.registry.as_ref()) != Some(r) {
+            return Err((StatusCode::FORBIDDEN, "a template that makes registries is put by someone who may (settings.manage)".into()));
+        }
+        super::registries::check(d, r).await.map_err(bad)?;
     }
     gates::check_checks(d, &t.checks).await.map_err(|why| bad(format!("checks: {why}")))?;
     if let Some(p) = &t.package {
@@ -2510,7 +2523,7 @@ mod tests {
             let st = &hub.store;
             // Two environments on one release repository: kiln's default.
             let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
-            let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
             store::put_app(st, &web).await?;
             for name in ["staging", "production"] {
                 store::put_environment(st, &Environment { name: name.into(), ..env(false) }).await?;
@@ -2608,6 +2621,7 @@ mod tests {
             contacts: Contacts { oncall: Some("ada".into()), channels: vec!["#deploys".into()], links: BTreeMap::from([("dashboard".into(), "https://grafana.example/d/web".into())]) },
             source: Some("shop/web".into()),
             archived: false,
+            registries: None,
         };
         let doc: Value = serde_yaml::from_str(&catalog_info(&a)).map_err(|e| e.to_string())?;
         assert_eq!(doc.pointer("/metadata/annotations/kiln.dev~1source"), Some(&json!("shop/web")));
@@ -2709,7 +2723,7 @@ mod tests {
     #[test]
     fn what_a_release_made_goes_with_its_revert_where_nothing_ran_before() -> anyhow::Result<()> {
         let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
-        let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+        let web = App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
         let registered = repo::registered_json(&web, "production");
         assert!(!keeps(Some(&registered), None), "the first release: nothing ran before");
         let running = ReleaseFile { release: 7, enabled: true, version: Some("1.4.0".into()), ..registered.clone() };
@@ -2780,7 +2794,7 @@ mod tests {
             })
             .await?;
             let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
-            let web = App { name: "web".into(), project: "shop".into(), owners: vec!["shop".into(), "github:acme/platform".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false };
+            let web = App { name: "web".into(), project: "shop".into(), owners: vec!["shop".into(), "github:acme/platform".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
             store::put_app(st, &web).await?;
             for (name, owners) in [("staging", true), ("production", false)] {
                 let mut e = Environment { name: name.into(), ..env(false) };

@@ -214,15 +214,39 @@ export interface App {
   /** Its source repository, as kiln names it (`acme/web`). */
   source?: string;
   archived: boolean;
+  /** The repositories kiln made for its images and chart (docs/deploy-api.md §3.1, step 5). */
+  registries?: Registries;
 }
 
-/** The source repository a template makes for each app (§3.1): one of kiln's own. */
+/** Where an app's images and chart go: release images (tags immutable), snapshots (the newest kept), its chart. */
+export interface Registries {
+  /** `kiln`, or the integration they were made through. */
+  at: string;
+  images: string;
+  snapshots: string;
+  chart: string;
+}
+
+/** The registry a template's apps get their image and chart repositories on (§3.1, step 5). */
+export interface RegistryTemplate {
+  /** `kiln`, or an `aws` (ECR) or `gcp` (Artifact Registry) integration. */
+  at: string;
+  /** `{project}/{app}`. */
+  name: string;
+  keep_snapshots: number;
+  location?: string;
+  project?: string;
+}
+
+/** The source repository a template makes for each app (§3.1): one of kiln's own, or on another host. */
 export interface RepoTemplate {
   /** `acme/{app}`: `{app}` and `{project}` filled in. */
   name: string;
   starter?: string;
   starter_ref?: string;
   branch: string;
+  /** `kiln` (the default), `github`, `gitlab` or `bitbucket`. */
+  host?: string;
 }
 
 /** What apps are made from (§3.2). */
@@ -235,6 +259,7 @@ export interface Template {
   properties?: Record<string, string[]>;
   environments?: string[];
   repository?: RepoTemplate;
+  registry?: RegistryTemplate;
 }
 
 /** An app as asked for: a template fills what isn't given. `source: ""` makes none. */

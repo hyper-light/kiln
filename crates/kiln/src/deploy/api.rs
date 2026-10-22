@@ -630,6 +630,7 @@ mod tests {
                 contacts: Contacts::default(),
                 source: None,
                 archived: false,
+                registries: None,
             };
             store::put_app(st, &web).await?;
 

@@ -578,7 +578,7 @@ mod tests {
 
     fn app(name: &str) -> anyhow::Result<App> {
         let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
-        Ok(App { name: name.into(), project: "shop".into(), owners: vec!["payments".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), source: None, archived: false })
+        Ok(App { name: name.into(), project: "shop".into(), owners: vec!["payments".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), source: None, archived: false, registries: None })
     }
 
     fn environment(name: &str, gates: Value) -> anyhow::Result<Environment> {

@@ -3,8 +3,10 @@
 //! one of kiln's repositories as any upstream is), named as its template says (`acme/{app}`). Its
 //! first commit holds the files of the template's starter repository as they are (its branch's
 //! tree, not its history), with `{{kiln.app}}`, `{{kiln.project}}`, `{{kiln.owner}}` and
-//! `{{kiln.repository}}` filled in, in files and in file names. The starter's `.kiln/ci.yaml`
-//! builds what it holds, so the app's first build starts with its first commit.
+//! `{{kiln.repository}}` filled in, in files and in file names (and, where kiln made its
+//! registries, `{{kiln.image}}`, `{{kiln.snapshots}}` and `{{kiln.chart}}`: where its images and
+//! chart go). The starter's `.kiln/ci.yaml` builds what it holds, so the app's first build starts
+//! with its first commit.
 //!
 //! The starter is data: kiln copies its files and runs nothing from it. Links stay links, as git
 //! keeps them; files keep their modes.
@@ -46,12 +48,16 @@ pub fn name_for(t: &RepoTemplate, app: &App) -> String {
 }
 
 /// What `{{kiln.*}}` stands for in an app's starter.
-fn values(app: &App, repository: &str) -> [(&'static str, String); 4] {
+fn values(app: &App, repository: &str) -> [(&'static str, String); 7] {
+    let r = app.registries.as_ref();
     [
         ("{{kiln.app}}", app.name.clone()),
         ("{{kiln.project}}", app.project.clone()),
         ("{{kiln.owner}}", app.owners.first().cloned().unwrap_or_default()),
         ("{{kiln.repository}}", repository.to_owned()),
+        ("{{kiln.image}}", r.map(|r| r.images.clone()).unwrap_or_default()),
+        ("{{kiln.snapshots}}", r.map(|r| r.snapshots.clone()).unwrap_or_default()),
+        ("{{kiln.chart}}", r.map(|r| r.chart.clone()).unwrap_or_default()),
     ]
 }
 
@@ -367,6 +373,7 @@ mod tests {
             contacts: Default::default(),
             source: None,
             archived: false,
+            registries: None,
         }
     }
 
