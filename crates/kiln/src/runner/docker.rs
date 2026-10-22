@@ -118,6 +118,9 @@ pub struct Spec {
     /// For a `docker` executor's container given Docker: the leg's own socket in the host's
     /// place, which finds what its steps bind-mount ([`super::docker_sock`]).
     pub docker_proxy: Option<PathBuf>,
+    /// No seccomp filter, as on a hosted runner's machine: for a `docker` executor's container
+    /// given the host's Docker, which can start any container it likes anyway.
+    pub seccomp_unconfined: bool,
     /// For a `docker` executor's container: the host user (uid, gid) its steps run as, through
     /// the image's `runner` user.
     pub user: Option<(u32, u32)>,
@@ -236,7 +239,7 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
         d.push_str(&format!(
             "RUN u=$(getent passwd {uid} | cut -d: -f1); if [ -n \"$u\" ]; then userdel -r \"$u\" 2>/dev/null || userdel \"$u\"; fi \\\n    \
              && (getent group {gid} >/dev/null || groupadd -g {gid} runner) \\\n    \
-             && useradd -m -u {uid} -g {gid} -s /bin/bash runner \\\n    \
+             && useradd -m -u {uid} -g {gid} -s /bin/bash runner && install -d -o {uid} -g {gid} /home/runner/work \\\n    \
              && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner\n\
              ENV PATH=/home/runner/.local/bin:$PATH\n"
         ));
@@ -769,6 +772,9 @@ impl Containers {
                         args.extend([s("-v"), format!("{}:{inside}", host.to_string_lossy())]);
                     }
                 }
+                if spec.seccomp_unconfined {
+                    args.extend([s("--security-opt"), s("seccomp=unconfined")]);
+                }
                 if let Some(bytes) = spec.workspace_size {
                     args.extend([s("--mount"), format!("type=tmpfs,destination={workdir},tmpfs-size={bytes},tmpfs-mode=1777")]);
                 }
@@ -1138,6 +1144,9 @@ mod tests {
         // The host's user, with sudo; root stays root.
         let u = runner_dockerfile("kiln/runner-ubuntu-24.04", Some((1000, 1000))).unwrap_or_default();
         assert!(u.contains("useradd -m -u 1000 -g 1000 -s /bin/bash runner") && u.contains("NOPASSWD:ALL"), "{u}");
+        // `/home/runner/work`, GitHub's hosted runners' work directory, is the runner's: what a step
+        // makes beside its repository's directory there is its own.
+        assert!(u.contains("install -d -o 1000 -g 1000 /home/runner/work"), "{u}");
         assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda"), "{u}");
         assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
     }

@@ -225,6 +225,12 @@ const BACKGROUND_GRACE: Duration = Duration::from_secs(10);
 /// included (GitHub's `cancel-timeout-minutes`).
 const CLEANUP_TIME: Duration = Duration::from_secs(5 * 60);
 
+/// Where a `docker` leg's own Docker socket listens ([`super::docker_sock`]): beside its directory,
+/// where nothing the leg mounts reaches it.
+fn leg_socket_path(l: &Layout) -> PathBuf {
+    l.runner_workspace.with_extension("docker.sock")
+}
+
 /// The paths of W06-R01.
 #[derive(Clone)]
 struct Layout {
@@ -1974,7 +1980,7 @@ impl Leg {
             Some(o) => Some(st.render(o, site, "options")?),
             None => None,
         };
-        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, docker_proxy: None, user: None, workspace_size: None })
+        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, docker_proxy: None, seccomp_unconfined: false, user: None, workspace_size: None })
     }
 
     /// "Initialize containers" (W13-R08): the leg's network, services and job container, before
@@ -2018,6 +2024,18 @@ impl Leg {
     fn container_map(&self, l: &Layout) -> super::docker::PathMap {
         let repo = self.a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
         let work = &self.work_dir;
+        if self.github_paths(l) {
+            // As on GitHub's hosted runners, the event file and the file commands included
+            // (`/home/runner/work/_temp/_github_workflow/event.json`).
+            return super::docker::PathMap::new(vec![
+                (l.workspace.clone(), format!("/home/runner/work/{repo}/{repo}")),
+                (l.runner_workspace.clone(), format!("/home/runner/work/{repo}")),
+                (l.temp.clone(), "/home/runner/work/_temp".into()),
+                (work.join("_actions"), "/home/runner/work/_actions".into()),
+                (l.tool_cache.clone(), "/opt/hostedtoolcache".into()),
+                (work.join("_externals"), "/__e".into()),
+            ]);
+        }
         let same = self.hosted_image().is_some();
         let at = |host: &Path, inside: String| if same { host.to_string_lossy().into_owned() } else { inside };
         super::docker::PathMap::new(vec![
@@ -2103,14 +2121,36 @@ impl Leg {
         // runner's it would: given Docker, it gets a socket of the leg's own in the host's place,
         // which finds what its steps bind-mount (`cross` mounts the image's Rust toolchain).
         let socket = open && self.docker_inside();
-        let proxy = if socket && Path::new("/var/run/docker.sock").exists() { self.leg_socket(idx, &st.layout).await } else { None };
+        let proxy = match (socket && Path::new("/var/run/docker.sock").exists()).then(|| self.leg_socket(l)) {
+            None => None,
+            Some(listening) => match listening.await {
+                Ok(s) => Some(s),
+                // GitHub's paths aren't the host's: without it, what a step bind-mounts is nowhere.
+                Err(e) if self.github_paths(l) => return Err(e.context("the leg's Docker socket")),
+                Err(e) => {
+                    self.note(idx, &format!("The leg gets the host's Docker socket as it is ({e:#}): a step's bind mounts find only its workspace, temporary and action directories.")).await;
+                    None
+                }
+            },
+        };
         let job = match (&a.job_container, &a.executor.image) {
             (Some(c), _) => Some(super::docker::Spec { docker_socket: open, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
             (None, Some(image)) if a.executor.kind == "docker" => {
                 // Without one, `cross`'s remote mode copies what it mounts into volumes instead.
                 let env = if socket && proxy.is_none() { vec![("CROSS_REMOTE".to_owned(), "1".to_owned())] } else { Vec::new() };
                 let docker_proxy = proxy.as_ref().map(|p| p.path().to_owned());
-                Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: socket, docker_proxy, env, ..super::docker::Spec::default() })
+                // Given the host's Docker, the leg could start any container it likes: a seccomp
+                // filter on its own would guard nothing, and it keeps debuggers from what they do
+                // on a hosted runner's machine (lldb's and gdb's `personality` to turn ASLR off).
+                Some(super::docker::Spec {
+                    image: image.clone(),
+                    user: super::docker::host_user(),
+                    docker_socket: socket,
+                    docker_proxy,
+                    seccomp_unconfined: socket,
+                    env,
+                    ..super::docker::Spec::default()
+                })
             }
             _ => None,
         };
@@ -2175,19 +2215,23 @@ impl Leg {
         Ok(())
     }
 
-    /// The leg's Docker socket (W13-R04), beside its directory; `None`, and said, when it can't
-    /// listen there, and the leg gets the host's own.
-    async fn leg_socket(&self, idx: u32, l: &Layout) -> Option<super::docker_sock::Socket> {
-        let path = l.runner_workspace.with_extension("docker.sock");
+    /// The leg's Docker socket (W13-R04), beside its directory.
+    async fn leg_socket(&self, l: &Layout) -> anyhow::Result<super::docker_sock::Socket> {
+        let path = leg_socket_path(l);
         // One a runner that stopped short left behind.
         let _ = std::fs::remove_file(&path);
-        match super::docker_sock::Socket::listen(path, PathBuf::from("/var/run/docker.sock")).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                self.note(idx, &format!("The leg gets the host's Docker socket as it is ({e:#}): a step's bind mounts find only its workspace, temporary and action directories.")).await;
-                None
-            }
-        }
+        super::docker_sock::Socket::listen(path, PathBuf::from("/var/run/docker.sock")).await
+    }
+
+    /// Whether the `docker` executor's container has GitHub's hosted runners' paths
+    /// (`/home/runner/work/<repo>/<repo>`, `_temp` and `_actions` beside it) rather than the
+    /// host's: kiln's runner image, in a container of the leg's own (a pool's executor keeps the
+    /// host's), given the host's Docker only through the leg's own socket, which finds what a step
+    /// bind-mounts wherever it is. Paths as long as some hosts' are too long for the Unix sockets
+    /// tests make in a workspace (cargo's tests' `ssh-agent`), and a hosted runner's are these.
+    fn github_paths(&self, l: &Layout) -> bool {
+        let Some(image) = self.hosted_image() else { return false };
+        super::docker::runner_dockerfile(image, None).is_some() && self.warm.lock().is_none() && (!self.docker_inside() || leg_socket_path(l).as_os_str().len() < 100)
     }
 
     /// What the leg's network policy lets it reach: kiln's server always, as this runner reaches it.
@@ -4911,6 +4955,44 @@ jobs:
         assert_eq!(map.translate(&l.temp.to_string_lossy()), "/__w/_temp");
         assert_eq!(map.to_host("/__w/app/results"), Some(l.runner_workspace.join("results")));
         assert!(map.mounts().contains(&format!("{}:/__w/app", l.runner_workspace.display())), "{:?}", map.mounts());
+        Ok(())
+    }
+
+    /// The `docker` executor's container of kiln's runner image has GitHub's hosted runners' paths;
+    /// of another image, or a pool's executor, the host's.
+    #[test]
+    fn w13_r04_hosted_legs_have_githubs_paths() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let leg_of = |image: &str| -> anyhow::Result<Leg> {
+            let mut a = AssignmentV2 { job_id: "leg-h".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
+            a.executor.kind = "docker".into();
+            a.executor.image = Some(image.to_owned());
+            let (tx, _rx) = async_channel::unbounded();
+            Ok(Leg {
+                a,
+                work_dir: tmp.path().to_path_buf(),
+                runner_name: "test-runner".into(),
+                up: Uplink(tx),
+                cancel: Shutdown::new(),
+                http: std::sync::Arc::new(crate::http::client::Client::public()?),
+                warm: Default::default(),
+                cache_max: None,
+            })
+        };
+        let leg = leg_of("kiln/runner-ubuntu-24.04")?;
+        let l = leg.layout();
+        let map = leg.container_map(&l);
+        assert_eq!(map.translate(&l.workspace.to_string_lossy()), "/home/runner/work/app/app");
+        assert_eq!(map.translate(&l.runner_workspace.to_string_lossy()), "/home/runner/work/app");
+        assert_eq!(map.translate(&l.temp.join("_github_workflow").join("event.json").to_string_lossy()), "/home/runner/work/_temp/_github_workflow/event.json");
+        assert_eq!(map.translate(&l.commands.to_string_lossy()), "/home/runner/work/_temp/_runner_file_commands");
+        assert_eq!(map.translate(&tmp.path().join("_actions").join("actions").to_string_lossy()), "/home/runner/work/_actions/actions");
+        assert_eq!(map.translate(&l.tool_cache.to_string_lossy()), "/opt/hostedtoolcache");
+        assert_eq!(map.to_host("/home/runner/work/app/results"), Some(l.runner_workspace.join("results")));
+        // Another image keeps the host's paths.
+        let other = leg_of("docker.io/library/node:24-bookworm")?;
+        let l = other.layout();
+        assert_eq!(other.container_map(&l).translate(&l.workspace.to_string_lossy()), l.workspace.to_string_lossy());
         Ok(())
     }
 

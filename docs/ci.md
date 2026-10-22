@@ -3382,14 +3382,11 @@ enforcement points to W18, agent isolation to W20.
   is the basics alone. A new build removes its user's older ones.
 - *Done.* R04's opt-in Docker access: a routing rule's `docker: socket` gives a trusted run's
   `docker` legs the host's Docker socket, reached through the socket's group. The image has the
-  Docker CLI with buildx and compose. These legs keep the host's paths for the workspace, temp
-  and action directories, so `docker run -v $GITHUB_WORKSPACE:/src` mounts what the step sees.
-  Every docker leg on a runner has its workspace at the same depth, so a cache saved relative to
-  it restores in any other. The rest of the leg's machine is a container the daemon doesn't look
+  Docker CLI with buildx and compose. The leg's machine is a container the daemon doesn't look
   into, so these legs get a socket of their own in the host's place (`runner/docker_sock.rs`). It
   passes every request on and translates the bind mounts of the containers a step creates:
-  - a path the leg has from the host (its workspace, temporary and action directories) stays that
-    path;
+  - a path the leg has from the host (its workspace, temporary and action directories) goes to
+    the host's path for it;
   - the kernel's (`/proc`, `/sys`, `/dev`, `/lib/modules`) stay the host's;
   - everything else goes to the leg container's own root as the host has it mounted: the graph
     driver's merged directory, or with containerd's image store, `<root dir>/rootfs/<driver>/<id>`.
@@ -3401,7 +3398,20 @@ enforcement points to W18, agent isolation to W20.
   puts `--target-dir` after a `--`, so cargo made `/target` and was denied, and it lost its own
   named container from one step to the next ("is not running"): the corpus's ripgrep and bat.
   Remote mode is left only for a runner that can't listen beside the leg's directory. The socket
-  is for fidelity, not containment: a leg given the host's Docker is trusted.
+  is for fidelity, not containment: a leg given the host's Docker is trusted. For the same reason
+  these legs' containers have no seccomp filter, as a hosted runner's machine has none: with the
+  host's Docker they could start any container they like, and the filter kept debuggers from
+  turning ASLR off (`personality`, which lldb needs to launch a program: cargo's `lldb` tests).
+- *Done.* In kiln's runner image, a `docker` leg has GitHub's hosted runners' paths:
+  `/home/runner/work/<repo>/<repo>` for the workspace, `/home/runner/work/_temp` and
+  `/home/runner/work/_actions` beside it, the event file and the file commands under `_temp`, and
+  `/home/runner/work` the `runner` user's. The leg's own socket finds what
+  `docker run -v $GITHUB_WORKSPACE:/src` mounts wherever it is, so the host's paths aren't needed.
+  Those were long enough on some hosts that the Unix sockets tests make in a workspace didn't fit
+  (cargo's `ssh-agent` tests, 108 bytes at most). Every such leg has its workspace at the same
+  path, so a cache saved relative to it restores in any other
+  (`w13_r04_hosted_legs_have_githubs_paths`). A pool's executor, another image, or a runner that
+  can't listen beside the leg's directory keeps the host's paths.
 - *Done.* What a runner leaves behind goes:
   - A runner's legs' networks and containers and its pools' executors carry its label. The label
     comes from its work directory, so each runner on an engine has its own.
