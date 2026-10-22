@@ -1,5 +1,6 @@
-//! The goal driver's model (CP-T6.1): kiln's goal driver (its `adopt` and `step` every tick, as
-//! `Driver::drive` runs them) as a task of the server's node under kiln-sim's seeded scheduler,
+//! The goal driver's model (CP-T6.1): kiln's goal driver (its own round of the stacks every tick,
+//! adopting, resuming and stepping them, as `Driver::drive` runs it) as a task of the server's
+//! node under kiln-sim's seeded scheduler,
 //! its time a simulated clock, its stacks in a test build's inline store (each call a wait a crash
 //! can come at), its agents on kiln-seams' `SimHarness`.
 //!
@@ -28,7 +29,7 @@ use kiln_sim::{Queue, Rng, Trace, World};
 use rusqlite::params;
 use serde_json::{Value, json};
 
-use super::{Driver, REMIND_MS, adopt, step, touch};
+use super::{Driver, REMIND_MS, touch};
 use crate::harness::model::{Command, Objective, Pause, Status};
 use crate::harness::session::Info;
 use crate::rt::Shutdown;
@@ -141,27 +142,17 @@ struct Sim {
     counts: Counts,
 }
 
-/// The driver's loop, as `Driver::drive` runs it, without what it does for agents no stack drives.
+/// The driver's loop, as `Driver::drive` runs it: its own round of the stacks every tick (what
+/// it does then for agents no stack drives, `keep`, is the process's, shared with other tests: the
+/// model's agents have it off). Its own lock for each change: `CHANGING` is the process's too.
 async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, shutdown: Shutdown) {
     let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+    let changing = async_lock::Mutex::new(());
     loop {
         if !d.tick().await {
             return;
         }
-        for info in kiln_seams::HarnessPort::agents(&port) {
-            let _ = adopt(&d, &info).await;
-        }
-        let running: Vec<String> = store
-            .call(|c| {
-                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running' ORDER BY agent")?;
-                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                Ok(v)
-            })
-            .await
-            .unwrap_or_default();
-        for agent in &running {
-            let _ = step(&d, agent, false).await;
-        }
+        d.round(&changing).await;
     }
 }
 

@@ -1058,65 +1058,18 @@ impl<P> Driver<'_, P>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
-    /// Every [`TICK`] by its clock, until it's shut down: each running stack stepped, goals set
-    /// in agents adopted, agents no stack drives kept going. Each agent's adoption and step is one
-    /// change to the stacks (`CHANGING`), as each of yours is.
+    /// Every [`TICK`] by its clock, until it's shut down: a round of the stacks (`round`), then the
+    /// agents no stack drives kept going.
     pub async fn drive(&self) -> anyhow::Result<()> {
         loop {
             if !self.tick().await {
                 return Ok(());
             }
-            for info in self.port.agents() {
-                let _one = CHANGING.lock().await;
-                if let Err(e) = adopt(self, &info).await {
-                    tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
-                }
-            }
-            // Stacks paused for a while whose time is up: running again, what's next going at once.
-            let now = self.clock.unix_ms();
-            let due: Vec<String> = self
-                .store
-                .call(move |c| {
-                    let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0 AND resume_at <= ?1")?;
-                    let v = st.query_map(params![now], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                    Ok(v)
-                })
-                .await
-                .unwrap_or_default();
-            for agent in &due {
-                let _one = CHANGING.lock().await;
-                if let Err(e) = resume_due(self, agent).await {
-                    tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
-                }
-            }
-            let running: Vec<String> = self
-                .store
-                .call(|c| {
-                    let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
-                    let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                    Ok(v)
-                })
-                .await
-                .unwrap_or_default();
-            for agent in &running {
-                let _one = CHANGING.lock().await;
-                if let Err(e) = step(self, agent, false).await {
-                    tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
-                }
-            }
+            let (running, waiting) = self.round(&CHANGING).await;
             // The agents no goal stack drives: kept going when they stop part-way (`keep`), but for
             // those that paused their stack for a while: they wait on purpose, until it resumes.
             let now = self.clock.unix_ms();
             let all = self.port.agents();
-            let waiting: Vec<String> = self
-                .store
-                .call(|c| {
-                    let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0")?;
-                    let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-                    Ok(v)
-                })
-                .await
-                .unwrap_or_default();
             for info in all.iter().filter(|i| !running.contains(&i.id) && !waiting.contains(&i.id)) {
                 keep::tick(self.port, info, now, crate::harness::told::children_working(&all, &info.id)).await;
             }
@@ -1128,6 +1081,62 @@ where
                 crate::harness::elsewhere::tick(hub, &all, now);
             }
         }
+    }
+
+    /// One round of the stacks, as each [`TICK`] has: goals set in agents adopted, stacks paused
+    /// for a while whose time is up running again, and each running stack stepped. Each agent's
+    /// adoption, resumption and step is one change to the stacks, under `changing` (`CHANGING`, as
+    /// each of yours is; kiln-sim's model has its own). The stacks running, and those paused for a
+    /// while.
+    async fn round(&self, changing: &async_lock::Mutex<()>) -> (Vec<String>, Vec<String>) {
+        for info in self.port.agents() {
+            let _one = changing.lock().await;
+            if let Err(e) = adopt(self, &info).await {
+                tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
+            }
+        }
+        // Stacks paused for a while whose time is up: running again, what's next going at once.
+        let now = self.clock.unix_ms();
+        let due: Vec<String> = self
+            .store
+            .call(move |c| {
+                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0 AND resume_at <= ?1")?;
+                let v = st.query_map(params![now], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok(v)
+            })
+            .await
+            .unwrap_or_default();
+        for agent in &due {
+            let _one = changing.lock().await;
+            if let Err(e) = resume_due(self, agent).await {
+                tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
+            }
+        }
+        let running: Vec<String> = self
+            .store
+            .call(|c| {
+                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
+                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok(v)
+            })
+            .await
+            .unwrap_or_default();
+        for agent in &running {
+            let _one = changing.lock().await;
+            if let Err(e) = step(self, agent, false).await {
+                tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
+            }
+        }
+        let waiting: Vec<String> = self
+            .store
+            .call(|c| {
+                let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0")?;
+                let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                Ok(v)
+            })
+            .await
+            .unwrap_or_default();
+        (running, waiting)
     }
 
     /// Waits one [`TICK`] by its clock: false when it's shut down first.
