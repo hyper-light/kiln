@@ -315,12 +315,16 @@ kiln-plans, kiln-ci-diagnose, kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd
 pub const GOALS_AND_PLANS: &str = "kiln keeps a goal stack for you: `goals_add` lines goals up (leave out `agent`: they're \
 yours), one condition or objective each, in order, and kiln gives you each in turn and holds you to it until it's met, then \
 the next, so you carry on without a person. To pursue a document or a list as a goal stack, add one goal per item (every \
-item asked for), each saying what done is, then end your turn: the first comes to you as soon as you're free. `goals_get` \
-says where it stands; `goals_control` pauses, skips or clears it. A plan is \
-kept in kiln for the person to read, change and run again: `plans_create` keeps one (its top-level list items are its \
-steps), and `plans_run` runs it on you (leave out `session` and `new`: as one message, a step a turn, or each step a goal) \
-or with an agent of its own for each step (mode `agents`: in your harness, on your machine and in your folder unless you \
-say otherwise; `plans_runs_get` follows the run). The kiln-plans skill says how.";
+item asked for), each saying what done is, then end your turn: the first comes to you as soon as you're free. When you've \
+met the goal under way, say so with `goals_done` and what shows it (`evidence`): the next comes at once (skipping a goal \
+leaves it unmet). `goals_split` splits a goal into parts you pursue first (a plan step's goal into its acceptance criteria \
+and tests); `goals_update` changes one goal by its id (its words, its place, or takes it out); `goals_control` pauses the \
+stack (say `why`; `resume_in_s` resumes it by itself), resumes, skips or clears it; `goals_get` says where it stands. A plan \
+is kept in kiln for the person to read, change and run again: `plans_create` keeps one (its top-level list items are its \
+steps; a step's `needs` are the steps it waits for), and `plans_run` runs it on you (leave out `session` and `new`: as one \
+message, a step a turn, or each step a goal) or with an agent of its own for each step (mode `agents`: in your harness, on \
+your machine and in your folder unless you say otherwise; steps that don't wait for each other run side by side; a step \
+given to `main` goes on your own goal stack; `plans_runs_get` follows the run). The kiln-plans skill says how.";
 
 /// Who an agent kiln runs is, as kiln's MCP servers tell it.
 pub fn you_are(agent: &str) -> String {

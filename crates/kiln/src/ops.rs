@@ -93,7 +93,7 @@ pub fn listed(cd: bool) -> Vec<Info> {
 
 /// Operations on one agent that an agent calling them without `agent` means for itself: its own
 /// goal stack, and putting its own work up for review.
-const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "agents.change"];
+const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "goals.done", "goals.update", "goals.split", "agents.change"];
 
 /// `input` to operation `name` as `caller` means it: an agent's own id where it left out `agent`
 /// on one of [`YOURS`].

@@ -477,6 +477,27 @@ export interface ConvoStatus {
 }
 
 /** `GET /api/conversations/series`: one store's series, a column each; `t` in unix seconds. */
+/** A line of the replication log (`GET /api/conversations/log`): what moved between the stores
+ * since the board's sample before (`batch`: a runner's store into the server's; `restore`: a mirror's
+ * copy sent back; `ship`: the server's store to a mirror's copy), or what happened to one (`note`). */
+export interface ConvoLogLine {
+  at: number;
+  /** Its store's key on the board (`fedora/abc`, `server`, `mirror:adacachy`). */
+  key: string;
+  kind: "batch" | "restore" | "ship" | "note";
+  level: "info" | "warn" | "error";
+  text: string;
+  moved?: { batches: number; rows: number; bytes: number; rev: number | null };
+}
+
+/** The replication log, newest first; `total` lines kept, `matched` of them have what was searched. */
+export interface ConvoLog {
+  at: number;
+  total: number;
+  matched: number;
+  lines: ConvoLogLine[];
+}
+
 export interface ConvoSeries {
   key: string;
   step: number;
@@ -542,7 +563,7 @@ export type ServerEvent =
   | { type: "harness"; info: AgentInfo }
   /** An agent session kiln ran is gone. */
   | { type: "harness_closed"; id: string }
-  /** Settings → Updates changed: refetch GET /api/updates. */
+  /** System → Updates changed: refetch GET /api/updates. */
   | { type: "updates" }
   /** An upgrade moved on (new output, or it finished). */
   | { type: "update_job"; job: UpdateJob }
@@ -700,7 +721,7 @@ export interface FrontDoorView {
   ca: { subject: string; sha256: string; not_after: number } | null;
 }
 
-/* ---------------------------- updates (Settings → Updates) ---------------------------- */
+/* ---------------------------- updates (System → Updates) ---------------------------- */
 
 export interface UpdateJob {
   id: string;

@@ -60,7 +60,7 @@ export function openSettings(...ids: string[]) {
 let sought: string | null = null;
 
 /**
- * Open what `#hash` names, a section (`#updates`) or a group (`#updates.waits`), and bring it into
+ * Open what `#hash` names, a section (`#deployments`) or a group (`#deployments.accounts`), and bring it into
  * view as it's drawn: again when what it waited on loads (its place moves as what's above it
  * fills in), until you scroll yourself. For the page's root: called once, as it mounts.
  */

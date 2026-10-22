@@ -40,7 +40,7 @@ subjects:
     name: {{ include "kiln.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 ---
-# Settings → Updates: restart kiln's own Deployment onto the image now on the nodes (a rollout
+# System → Updates: restart kiln's own Deployment onto the image now on the nodes (a rollout
 # restart, as `kubectl rollout restart` does). Only this Deployment, only get and patch.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

@@ -114,6 +114,13 @@
   font-family: var(--font-mono);
   font-size: 10.5px;
 }
+/* A goal's parts: smaller links on the same chain, before the goal they're parts of. */
+.gs-link[data-part] .gs-node {
+  width: 14px;
+  height: 14px;
+  margin: 4px;
+  font-size: 0;
+}
 .gs-link[data-status="met"] .gs-node {
   border-color: #5d7a74;
   color: #b8d9d2;

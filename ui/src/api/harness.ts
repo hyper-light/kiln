@@ -343,8 +343,9 @@ export interface State {
   reach?: string | null;
   /** Which of those lists the harness has reported yet (servers that predate it omit this). */
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
-  /** A switch to another harness's model, waiting for the turn under way to end. */
-  switching?: { kind: string; model: string };
+  /** A switch to another harness's model, waiting for the turn under way to end: with the permission
+   * mode and effort it carries over and that harness's choices of each, how it will run there. */
+  switching?: { kind: string; model: string; mode?: string; effort?: string; modes?: ModeOption[]; efforts?: ControlOption[] };
   /** Nothing more goes to the harness until this ends: its account reached a usage limit. Queued messages, goals and plan steps wait. */
   pause?: Pause;
   /** It pauses once a limit is this full (percent): between turns, or at the next step of one under way; absent: only when one is reached. */
@@ -452,6 +453,10 @@ export interface GoalItem {
   reminders?: number;
   /** When it was last sent (unix ms). */
   reminded_at?: number;
+  /** The goal it's a part of (split into parts: that one comes back after them). */
+  part_of?: string;
+  /** The plan step it was made from (`n` from 1). */
+  step?: { plan: string; version: number; n: number; run?: string };
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -463,6 +468,8 @@ export interface GoalStack {
   updated_at: number;
   /** How many goals the last clear kept, to bring back (`restore`). */
   cleared?: number;
+  /** Paused for a while: when it resumes by itself (unix ms). */
+  resume_at?: number;
 }
 
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */

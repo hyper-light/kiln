@@ -550,7 +550,7 @@ pub struct Updates {
     /// server shows it so.
     pub accept: bool,
     /// Minutes a runner has to switch to its new build and report in, counted once it has no
-    /// jobs running. Settings → Updates can change it, and the two below.
+    /// jobs running. System → Updates can change it, and the two below.
     pub upgrade_minutes: u64,
     /// Minutes kiln keeps an upgrade open while the runner finishes the jobs it is running (it
     /// switches only once they are done).

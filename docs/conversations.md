@@ -277,28 +277,38 @@ the API. Nothing of it asks a store's writer for anything.
   - What changed since the last sample is noted: a store that came or went, fell behind or caught
     up, a gap, a batch that couldn't be taken, a quiet spell, updates dropped, reads that timed
     out, a compaction begun or done, old transcripts let go, a restore.
+  - The replication log takes a line for what each feed moved since the sample before (batches,
+    their rows and bytes on the wire, and the row it reached), into the server's store from each
+    runner's and out of it to each mirror's copy, and a line for each note. It keeps its last
+    5,000 lines. A feed's counters count from when kiln started: one seen first is only counted,
+    and counters that went down (a restart) count from nothing.
 - **API** (`runners.read`):
   - `GET /api/conversations/status` returns `{at, on, mirrors_wanted, restore, stores, notes}`;
   - `GET /api/conversations/series?key=&window=` returns one store's series, a column each, rates
-    per second.
+    per second;
+  - `GET /api/conversations/log?since=&q=&limit=` returns `{at, total, matched, lines}`: the
+    replication log's lines after `since` (unix ms) with `q` in their words or their store's key
+    (any case), newest first, at most `limit` (1,000; up to 5,000).
 - **Prometheus.** `/metrics` labels each line by `store`, `role` and `machine`:
   - `kiln_convo_store_up`, `_bytes`, `_free_bytes`, `_wal_bytes`, `_rev`, `_sessions` and
     `_behind_rows`;
   - `kiln_convo_store_commits_total`, `_busy_milliseconds_total`, `_dropped_total` and
     `_read_timeouts_total`;
   - `kiln_convo_feed_batches_total` and `kiln_convo_feed_bytes_total`.
-- **On the System page,** a figure in the style of hyperlight's articles draws every store:
-  - runners' stores on the left, the server's in the middle, the mirror's copy on the right;
-  - a light runs on a cable while batches move on it, and on a store's file while it writes;
-    nothing else moves;
-  - tabs for replication, the server's store, the mirror and upkeep, each with its facts as they
-    stand.
+- **On the System page,** the figure draws every store as a database:
+  - runners' stores on the left, the server's in the middle, the mirror's copy on the right (below
+    it on a phone);
+  - a light runs on a cable about once a batch while batches move on it, rows to come wait as marks
+    at its start, and a cable whose store is away is faint; idle cables stay still;
+  - picking a store says what it is doing and dims the other runners' cables; under the picture,
+    the stores in sync, the rows still to come and the mirror's copy.
 
-  Below the figure, every store is in a table. Picking one (or clicking it in the figure) opens its
-  dashboard: writes, the file, the feed (rows to come, batches), and the writer (busy, reads'
-  waits at p50 and p99), over 1 h, 6 h or 24 h, with what happened to it lately. The UI mock has
-  stores too: they write, feed, fall behind and catch up, and the server's file is made compact
-  every ten minutes.
+  Below it, the replication log: read again every 4 s, searched on the server as you type, and
+  downloaded whole (every line that matches). Then every store in a table. Picking one (in the
+  table or in the figure) shows its dashboard: writes, the file, the feed (rows to come, batches),
+  and the writer (busy, reads' waits at p50 and p99), over 1 h, 6 h or 24 h, with what happened to
+  it lately. The UI mock has stores too: they write, feed, fall behind and catch up, the server's
+  file is made compact every ten minutes, and its log is sampled every 5 s as the server's is.
 
 ## Settings
 

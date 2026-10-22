@@ -1,4 +1,4 @@
-//! Upgrading kiln from its own UI (Settings → Updates).
+//! Upgrading kiln from its own UI (System → Updates).
 //!
 //! * **Runners**, without a restart and without losing anything, always through
 //!   `kiln install --agent --upgrade` on the machine: a runner from before in-place upgrades gets
@@ -333,10 +333,36 @@ pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::st
         }
         let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
         entry.read_to_end(&mut bytes)?;
+        // An archive cut short (its upload broke off) reads as a shorter file, with no error: never
+        // one runners would upgrade to. Nor what isn't its platform's program.
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != entry.size() {
+            tracing::warn!(target, run = run.number, got = bytes.len(), size = entry.size(), "a release binary cut short in its run's artifacts: not kept");
+            break;
+        }
+        if !runs_on(target, &bytes) {
+            tracing::warn!(target, run = run.number, "a release binary that isn't its platform's program: not kept");
+            continue;
+        }
         let target = target.to_owned();
         kept.push(keep(&dir, &target, &bytes, "built", Some((run.number, run.sha.clone())))?);
     }
     Ok(kept)
+}
+
+/// Whether `bytes` is a program `target` runs: an ELF on Linux, a Mach-O (or a universal one) on
+/// macOS, a PE on Windows, by its first bytes.
+fn runs_on(target: &str, bytes: &[u8]) -> bool {
+    let head = bytes.get(..4).unwrap_or_default();
+    if target.contains("linux") {
+        head == b"\x7fELF"
+    } else if target.contains("apple-darwin") {
+        // 64-bit Mach-O, either way round, or a universal (fat) one.
+        [[0xcf, 0xfa, 0xed, 0xfe], [0xfe, 0xed, 0xfa, 0xcf], [0xca, 0xfe, 0xba, 0xbe]].iter().any(|m| head == m)
+    } else if target.contains("windows") {
+        head.get(..2) == Some(b"MZ".as_slice())
+    } else {
+        true
+    }
 }
 
 // ------------------------------------------------------------------ every platform in step
@@ -593,7 +619,7 @@ pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u
     let version = env!("CARGO_PKG_VERSION");
     let Some(bytes) = download_release(version, target).await? else {
         anyhow::bail!(
-            "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under Settings → Updates.",
+            "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under System → Builds.",
             crate::api::TARGET
         );
     };
@@ -1032,7 +1058,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
 
 // ------------------------------------------------------------------ runners
 
-/// A machine's runner as Settings → Updates shows it.
+/// A machine's runner as System → Updates shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerInfo {
     pub name: String,
@@ -1101,7 +1127,7 @@ pub struct WayOpen {
     pub why: String,
 }
 
-/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in Settings → Updates.
+/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in System → Updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Policy {
@@ -1149,7 +1175,7 @@ pub async fn set_policy(hub: &Hub, machine: &str, p: Policy) -> anyhow::Result<(
 }
 
 /// How long kiln waits on a runner's upgrade before it calls it failed: `[updates]` in kiln.toml,
-/// unless changed in Settings → Updates. A change applies to upgrades under way too.
+/// unless changed in System → Updates. A change applies to upgrades under way too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Waits {
@@ -1223,7 +1249,7 @@ pub fn said(d: Duration) -> String {
     }
 }
 
-/// Where the waits chosen in Settings → Updates are kept (none: kiln.toml's).
+/// Where the waits chosen in System → Updates are kept (none: kiln.toml's).
 const WAITS_KEY: &str = "updates/waits";
 
 /// How long upgrades are waited on now.
@@ -1237,7 +1263,7 @@ pub async fn waits(hub: &Hub) -> Waits {
     w
 }
 
-/// The waits were changed in Settings → Updates: kiln.toml's don't apply.
+/// The waits were changed in System → Updates: kiln.toml's don't apply.
 pub async fn waits_changed(hub: &Hub) -> bool {
     hub.store.kv_get(WAITS_KEY.to_owned()).await.ok().flatten().is_some()
 }
@@ -2538,6 +2564,51 @@ mod tests {
             let others: Vec<&str> = OTHERS.into_iter().filter(|t| *t != crate::api::TARGET).collect();
             assert_eq!(targets, others, "this server's own platform keeps its own build");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_release_binary_cut_short_or_not_a_program_is_never_kept() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut cfg = crate::config::Config::default();
+        cfg.server.data_dir = dir.path().to_owned();
+        let mut mac = vec![0xcf, 0xfa, 0xed, 0xfe];
+        mac.resize(2 << 20, 7);
+        // Windows' isn't its program; the Mac's is cut short, as an upload that broke off leaves it.
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, bytes) in [("dist/kiln-x86_64-pc-windows-msvc.exe", b"not a program".to_vec()), ("dist/kiln-aarch64-apple-darwin", mac)] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, name, bytes.as_slice())?;
+        }
+        let mut archive = tar.into_inner()?;
+        archive.truncate(archive.len().saturating_sub(1 << 20));
+        let artifacts = dir.path().join("artifacts.tar");
+        std::fs::write(&artifacts, archive)?;
+        let run = crate::store::Run {
+            id: "r".into(),
+            repo_id: "k".into(),
+            repo_name: "hyper-light/kiln".into(),
+            number: 13,
+            pipeline: "release".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "0d21482abcdef".into(),
+            message: String::new(),
+            author: String::new(),
+            status: crate::store::Status::Succeeded,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        let kept = adopt_into(&cfg, &artifacts, &run)?;
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(!dir.path().join("binaries/kiln-aarch64-apple-darwin").exists());
+        assert!(!dir.path().join("binaries/kiln-x86_64-pc-windows-msvc").exists());
         Ok(())
     }
 

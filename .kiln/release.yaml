@@ -4,15 +4,17 @@
 # the server keeps them (`[updates]`) as what each platform's runners upgrade to once it runs that
 # commit, and serves them at /dl/kiln/<target>, so remote upgrades and `install.sh` /
 # `install.ps1` work on Linux, macOS and Windows with nothing but this server. A server running a
-# commit with no binaries yet builds it again itself (Settings → Updates: Build every platform),
-# and a v* tag builds too. A newer push to the branch replaces a build still under way.
+# commit with no binaries yet builds it again itself (System → Builds: Build every platform),
+# and a v* tag builds too. A newer push to the branch replaces a build still under way; a server's
+# own build of its commit (a manual run) replaces only another such, so pushes coming faster than a
+# Mac builds can't keep the commit the server runs from ever having all its binaries.
 # ci/release/publish.sh still hands dist/ to another server by hand.
 name: release
 on:
   push: { branches: [main] }
   tag: { branches: ["v*"] }
   manual: true
-concurrency: { group: "release-${{ branch }}", cancel-in-progress: true }
+concurrency: { group: "release-${{ event }}-${{ branch }}", cancel-in-progress: true }
 jobs:
   linux:
     name: Linux (x86-64, ARM64)
