@@ -6,7 +6,7 @@ import { toast } from "@/components/ui/toast";
 import { formatDuration, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { copyText } from "@/views/terminal/clipboard";
-import "./settings-upgrade-log.css";
+import "./upgrade-log.css";
 
 interface UpgradeLogProps {
   job: UpdateJob;

@@ -114,8 +114,27 @@
   color: var(--st-muted);
   font-size: var(--st-body);
 }
-.st-sections[data-searching]:not(:has(.st-group)) > .st-none {
+.st-sections[data-searching]:not(:has(.st-group, .st-elsewhere)) > .st-none {
   display: block;
+}
+/* Where a section was, a line saying where it is now (Updates, on the System page). */
+.st-elsewhere {
+  margin: 0;
+  padding: 6px 20px;
+  color: var(--st-muted);
+  font-size: var(--st-small);
+  line-height: 1.6;
+}
+.st-elsewhere a {
+  margin-left: 4px;
+  color: var(--st-text);
+  text-decoration: underline;
+  text-decoration-color: rgb(255 255 255 / 20%);
+  text-underline-offset: 3px;
+}
+.st-elsewhere a:hover {
+  color: var(--st-bright);
+  text-decoration-color: currentColor;
 }
 /* Searching: a section none of whose groups matched isn't shown. */
 .st-sections[data-searching] > .st-section:not(:has(.st-group)) {

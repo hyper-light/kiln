@@ -158,7 +158,7 @@ session says whether:
 | `"ready"` | it runs in a kiln terminal: taking it over ends that terminal and continues the conversation as an agent session | offer it |
 | `"stop"` | it runs outside kiln: taking it over ends it there (asked to quit, killed after 10 s), then continues the conversation as an agent session | offer it, saying so; confirm with `{"stop": true}` |
 | `"outside"` | it runs outside kiln as an ACP agent, which might start anew rather than resume it: it must be quit there first | explain; once it has ended, resume it with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` |
-| `"upgrade"` | the machine's runner is too old for this take-over | link to Settings → Updates |
+| `"upgrade"` | the machine's runner is too old for this take-over | link to System → Updates |
 | `"no_id"` | it has no conversation to continue yet (still starting) | wait |
 | `"unsupported"` | kiln cannot run that harness as an agent session | — |
 
@@ -571,7 +571,7 @@ while its attachment is paused, past its limit for the day, or when its agent co
 **Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
 its workflows' and environments' too. Mission Control lists the agents an attachment woke with
 the other agents; their questions come to Needs you and to notifications as any agent's do. A runner doctor's
-open incident shows in the runner's row in Settings → Updates.
+open incident shows in the runner's row in System → Updates.
 
 | Operation | Route | |
 |---|---|---|

@@ -1,5 +1,5 @@
 //! What's wrong with a runner, and what fixes it (docs/agentic.md R; docs/releases.md, "When an
-//! upgrade fails"): kiln's own checks of a machine, for people (Settings → Updates → Diagnose) and
+//! upgrade fails"): kiln's own checks of a machine, for people (System → Updates → Diagnose) and
 //! agents (`runners.diagnose`), and the repairs kiln makes there itself (`runners.repair`).
 //!
 //! A diagnosis has two halves. What the server knows of the machine ([`server_side`]): whether
@@ -389,7 +389,7 @@ impl From<&crate::updates::Job> for LastUpgrade {
     }
 }
 
-/// What the server knows of runner `name` (its updates row, as Settings → Updates shows it; how it
+/// What the server knows of runner `name` (its updates row, as System → Updates shows it; how it
 /// was when last heard; its last upgrade), as findings.
 pub fn server_side(info: Option<&crate::updates::RunnerInfo>, live: Option<&Live>, last_job: Option<&LastUpgrade>) -> Vec<Finding> {
     let mut out = Vec::new();

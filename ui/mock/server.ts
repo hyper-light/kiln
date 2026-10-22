@@ -637,6 +637,47 @@ function startRun(repo: Repo, opts: { branch?: string; event?: string; pipeline?
   return run;
 }
 
+/** kiln's release pipeline (`.kiln/release.yaml`), as System → Builds' Build every platform runs it: a job per platform family, each on a machine of its own. */
+const RELEASE_UI = { name: "ui", run: "npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build", dur: [5, 8] as [number, number], kind: "npm" };
+const RELEASE_JOBS: JobTpl[] = [
+  {
+    key: "linux",
+    needs: [],
+    labels: ["baremetal", "linux"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl", dur: [14, 20], kind: "compile" }],
+  },
+  {
+    key: "windows",
+    needs: [],
+    labels: ["baremetal", "linux"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh x86_64-pc-windows-msvc", dur: [18, 26], kind: "compile" }],
+  },
+  {
+    key: "macos",
+    needs: [],
+    labels: ["baremetal", "macos"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh aarch64-apple-darwin x86_64-apple-darwin", dur: [24, 32], kind: "compile" }],
+  },
+];
+let releaseRun: Run | null = null;
+
+function startRelease(commit: string): Run {
+  const repo = repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!;
+  const { run } = makeRun(repo, { created: now(), branch: "main", event: "manual", pipeline: "release" });
+  Object.assign(run, { sha: commit, message: "Build every platform", author: "admin" });
+  const sjobs = RELEASE_JOBS.map((tpl, i) => newSimJob(run, tpl, i));
+  runs.unshift(run);
+  jobsByRun.set(run.id, sjobs);
+  sjobs.forEach((s) => jobsById.set(s.job.id, s));
+  emit({ type: "run", run });
+  sjobs.forEach((s) => emit({ type: "job", job: s.job }));
+  releaseRun = run;
+  return run;
+}
+
 function finishJob(sj: SimJob, status: Status, error: string | null) {
   const j = sj.job;
   j.status = status;
@@ -1618,7 +1659,20 @@ const server = http.createServer(async (req, res) => {
     if (await handleStores(req, res, url, { json, err, runners: () => [...agents.values()].filter((a) => !a.ephemeral).map((a) => ({ name: a.name, connected: a.connected, version: a.version, last_seen: a.last_seen })) })) return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
-    if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
+    if (
+      await handlePages(req, res, url, {
+        agents: () => [...agents.values()],
+        runs: () => runs,
+        version: VERSION,
+        hostname: HOSTNAME,
+        json,
+        err,
+        body,
+        emit,
+        release: { start: startRelease, latest: () => (releaseRun ? { run: releaseRun, jobs: (jobsByRun.get(releaseRun.id) ?? []).map((s) => s.job) } : null) },
+      })
+    )
+      return;
 
     return err(res, 404, `no route for ${m} ${p}`);
   } catch (e) {

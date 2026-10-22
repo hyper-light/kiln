@@ -563,7 +563,7 @@ export type ServerEvent =
   | { type: "harness"; info: AgentInfo }
   /** An agent session kiln ran is gone. */
   | { type: "harness_closed"; id: string }
-  /** Settings → Updates changed: refetch GET /api/updates. */
+  /** System → Updates changed: refetch GET /api/updates. */
   | { type: "updates" }
   /** An upgrade moved on (new output, or it finished). */
   | { type: "update_job"; job: UpdateJob }
@@ -721,7 +721,7 @@ export interface FrontDoorView {
   ca: { subject: string; sha256: string; not_after: number } | null;
 }
 
-/* ---------------------------- updates (Settings → Updates) ---------------------------- */
+/* ---------------------------- updates (System → Updates) ---------------------------- */
 
 export interface UpdateJob {
   id: string;

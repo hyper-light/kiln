@@ -473,13 +473,42 @@ a.plan-row-main:hover {
   color: #c9cbd1;
 }
 
+/* The steps a step runs after: a tick each. */
+.pi-needs {
+  display: grid;
+  gap: 2px;
+}
+.pi-need {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 30px;
+  color: #c9ccd3;
+  font-size: 13px;
+}
+.pi-need[data-blocked] {
+  color: #7d818b;
+}
+.pi-need-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pi-need-why {
+  flex: none;
+  color: #7d818b;
+  font-size: 11px;
+}
+
 @media (pointer: coarse) {
   .pi-icon {
     width: 40px;
     height: 40px;
   }
   .pi-add,
-  .pi-text {
+  .pi-text,
+  .pi-need {
     min-height: 40px;
   }
   .pi-body {

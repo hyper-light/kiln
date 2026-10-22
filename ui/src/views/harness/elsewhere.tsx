@@ -138,7 +138,7 @@ export function AtLimit({ agent, state, send }: { agent: Agent; state: State | n
       )}
       {unanswered ? (
         <span className="hx-pick-why">
-          Its runner didn&rsquo;t take this: it runs an older kiln. <Link to="/settings#updates.runners">Upgrade it</Link>.
+          Its runner didn&rsquo;t take this: it runs an older kiln. <Link to="/system#system.updates">Upgrade it</Link>.
         </span>
       ) : (
         on && !plans && <span className="hx-pick-why">Its runner picks the machine: upgrade it to choose one.</span>

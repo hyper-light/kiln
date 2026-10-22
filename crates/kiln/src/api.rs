@@ -743,7 +743,32 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
         (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
         (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, &caller, id, action)).await,
+        // Said met, split, one goal changed, or the stack started, paused (for a while, too) …: each
+        // its operation (`goals.*`), the body its input.
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", what]) => {
+            let (name, field) = match *what {
+                "done" => ("goals.done", None),
+                "split" => ("goals.split", None),
+                action => ("goals.control", Some(("action", (*action).to_owned()))),
+            };
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+                if let Some((k, v)) = field {
+                    o.insert(k.into(), json!(v));
+                }
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
+        }
+        (&Method::PATCH, ["api", "harness", "sessions", id, "goals", goal]) => {
+            let (id, goal) = ((*id).to_owned(), (*goal).to_owned());
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+                o.insert("id".into(), json!(goal));
+            }
+            boxed(|| own_op(&hub, &caller, "goals.update", body)).await
+        }
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -1253,7 +1278,7 @@ async fn ai_takeover(hub: &Hub, machine: &str, pid: &str, q: &HashMap<String, St
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): taking it over ends it there, so ask with {{\"stop\": true}}")));
         }
         (TakeOver::Upgrade, _) => {
-            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in Settings → Updates first")));
+            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in System → Updates first")));
         }
         (TakeOver::Outside, _) => {
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}), as a harness kiln might not resume: quit it there first, then continue it")));
@@ -1280,7 +1305,7 @@ async fn ai_fork(hub: &Hub, machine: &str, pid: &str) -> R {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
     if !forks_on(hub, machine) {
-        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in Settings → Updates first")));
+        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in System → Updates first")));
     }
     let Some(spec) = found.fork_spec() else {
         return Err(if !found.started() {
@@ -2896,7 +2921,7 @@ async fn download_binary() -> R {
 }
 
 /// The binary for `target`: this server's own when it was built for that target, one uploaded
-/// or fetched here (Settings → Updates), otherwise a redirect to the release build of the same
+/// or fetched here (System → Builds), otherwise a redirect to the release build of the same
 /// version on GitHub.
 async fn download_for(hub: &Hub, target: &str) -> R {
     if target == TARGET {
@@ -2956,7 +2981,7 @@ async fn build_binary(hub: &Arc<Hub>, id: &str, q: &HashMap<String, String>, req
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
-// ------------------------------------------------------------------ updates (Settings → Updates)
+// ------------------------------------------------------------------ updates (System → Updates)
 
 /// `GET /api/updates`: this server and how it is upgraded, every machine's runner, the latest
 /// upgrades and the binaries kiln can hand out. `POST /api/updates/check` asks GitHub (and, in
@@ -3669,15 +3694,6 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
-    Ok(srv::json(StatusCode::OK, &s))
-}
-
-/// Start, pause, skip, clear or restore an agent's goal stack.
-async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
-    let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
-    may_steer_goals(hub, caller, id)?;
-    let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
-    hub.store.audit(caller.name.clone(), "goals.control".into(), format!("{id}: {action}")).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 

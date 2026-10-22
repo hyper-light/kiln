@@ -1,7 +1,8 @@
 /**
- * Settings: sections that open and close (this device, updates, deployments, integrations,
- * sign-in), each in groups of rows, and a search that narrows the page to what matches. A link to a
- * section or a group (`/settings#updates`, `/settings#updates.waits`) opens it.
+ * Settings: sections that open and close (this device, deployments, integrations, sign-in), each
+ * in groups of rows, and a search that narrows the page to what matches. A link to a section or a
+ * group (`/settings#deployments`, `/settings#deployments.accounts`) opens it. Updates are on the
+ * System page: a line here says so.
  */
 import * as React from "react";
 import { Check, LoaderCircle, LogOut } from "lucide-react";
@@ -10,18 +11,20 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Facts, PageIntro, TextField } from "@/components/ui/misc";
-import { SettingRow, SettingsGroup, SettingsSearch, SettingsSection, SettingsSections, openHash } from "@/components/ui/settings";
+import { SettingRow, SettingsGroup, SettingsSearch, SettingsSection, SettingsSections, matches, openHash, wordsOf } from "@/components/ui/settings";
 import { useMotionPreference } from "@/components/shell/motion";
 import { Link, useLocation } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { useAuth } from "@/lib/auth";
 import { usePref } from "@/lib/prefs";
-import { updatesRes, useRes, warm, type Res } from "@/lib/data";
+import { useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
-import { UpdatesHold, UpdatesPanel, UpdatesStatus } from "@/views/settings-updates";
 import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
 import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
+
+/** What finds the line saying Updates are on the System page, in a search of Settings. */
+const ELSEWHERE_WORDS = "updates upgrade upgrades version server runners policy builds binaries platform waits";
 
 const methodsRes: Res<{ password: boolean; token: boolean }> = {
   key: "auth/methods",
@@ -29,7 +32,7 @@ const methodsRes: Res<{ password: boolean; token: boolean }> = {
 };
 
 export default function Settings() {
-  warm(updatesRes, methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes);
+  warm(methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes);
   const [query, setQuery] = React.useState("");
   // At /settings#<section or group>, arriving or following a link here: that one opens.
   const { hash } = useLocation();
@@ -51,26 +54,19 @@ export default function Settings() {
           </Loadable>
           <MotionGroup />
         </SettingsSection>
-        <SettingsSection
-          id="updates"
-          index={2}
-          title="Updates"
-          about="Upgrade kiln and its runners; a runner keeps what it runs while it's upgraded"
-          words="upgrade version"
-          status={<UpdatesStatus />}
-        >
-          <Loadable label="the updates" fallback={<UpdatesHold />}>
-            <UpdatesPanel />
-          </Loadable>
-        </SettingsSection>
-        <SettingsSection id="deployments" index={3} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">
+        {(!query.trim() || matches(wordsOf(query), ELSEWHERE_WORDS)) && (
+          <p className="st-elsewhere">
+            Updates and builds are on the System page. <Link to="/system#system.updates">System → Updates</Link>
+          </p>
+        )}
+        <SettingsSection id="deployments" index={2} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">
           <DeploySettings />
         </SettingsSection>
-        <SettingsSection id="integrations" index={4} title="Integrations" about="Peered kiln clusters, and a Grafana link" words="peering">
+        <SettingsSection id="integrations" index={3} title="Integrations" about="Peered kiln clusters, and a Grafana link" words="peering">
           <ClustersGroup />
           <GrafanaGroup />
         </SettingsSection>
-        <SettingsSection id="signin" index={5} title="Sign-in" about="The password other devices sign in with, and this session" words="login account" status={<PasswordStatus />}>
+        <SettingsSection id="signin" index={4} title="Sign-in" about="The password other devices sign in with, and this session" words="login account" status={<PasswordStatus />}>
           <Loadable label="sign-in" fallback={<PasswordHold />}>
             <PasswordGroup />
           </Loadable>
