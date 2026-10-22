@@ -591,6 +591,28 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "incidents.report", body)).await
         }
         // A plan run as one agent per step (docs/plans.md): its own page's routes.
+        // Research (docs/research.md): each operation is its route.
+        (&Method::GET, ["api", "research"]) => boxed(|| own_op(&hub, &caller, "research.list", query_value(&q))).await,
+        (&Method::POST, ["api", "research"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "research.start", body)).await
+        }
+        (&Method::GET, ["api", "research", id]) => {
+            let mut input = query_value(&q);
+            if let Some(o) = input.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "research.get", input)).await
+        }
+        (&Method::POST, ["api", "research", id, "findings"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "research.add", body)).await
+        }
+        (&Method::GET, ["api", "harness", "conversations", "search"]) => boxed(|| own_op(&hub, &caller, "conversations.search", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
         (&Method::POST, ["api", "plans", "runs", run, "stop"]) => boxed(|| own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run }))).await,
@@ -602,6 +624,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let r = if *what == "take" { boxed(|| crate::plans::agents::take(&hub, run, n, &by)).await } else { boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await };
             r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
+        (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
+        (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,
+        (&Method::PUT, ["api", "programs", id, "settings"]) => boxed(|| programs_op(&hub, &caller, "programs.set", json!({"program": id}), req)).await,
+        (&Method::PUT, ["api", "programs", id, "tracks", track]) => boxed(|| programs_op(&hub, &caller, "programs.assign", json!({"program": id, "track": track}), req)).await,
         (&Method::GET, ["api", "plans"]) => boxed(|| plans_list(&hub, &q)).await,
         (&Method::POST, ["api", "plans"]) => boxed(|| plans_create(&hub, req)).await,
         (&Method::GET, ["api", "plans", id]) => boxed(|| crate::plans::get(&hub, id)).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
@@ -619,6 +645,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "plans.run", body)).await
         }
         (&Method::POST, ["api", "plans", id, "share"]) => boxed(|| plans_share(&hub, id, req)).await,
+        (&Method::POST, ["api", "plans", id, "ready"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
+        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -758,6 +792,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let (name, field) = match *what {
                 "done" => ("goals.done", None),
                 "split" => ("goals.split", None),
+                "plan" => ("goals.plan", None),
                 action => ("goals.control", Some(("action", (*action).to_owned()))),
             };
             let mut body = boxed(|| body_value(req)).await?;
@@ -3819,6 +3854,15 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     }
     let b = crate::harness::screen::open(hub, id, o).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::CREATED, &b))
+}
+
+/// One of the Programs view's changes (`programs.set`, `programs.assign`): the request's JSON
+/// object with `base` (the program, and the track) on it.
+async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, base: serde_json::Value, req: Request) -> R {
+    let mut b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let (Some(o), Some(base)) = (b.as_object_mut(), base.as_object()) else { return Err(err(StatusCode::BAD_REQUEST, "the request is a JSON object")) };
+    o.extend(base.clone());
+    own_op(hub, caller, name, b).await
 }
 
 /// One of kiln's own operations (agents, plans, goal stacks) as its HTTP route, which the route

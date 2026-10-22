@@ -125,6 +125,8 @@ pub struct Host {
     /// Looks the watch has taken, and records written: told to `changed`'s listeners.
     looks: AtomicU64,
     saves: AtomicU64,
+    /// Where its looks and record writes are counted for /metrics (kiln's, `metrics::agents()`).
+    metrics: &'static crate::metrics::AgentMetrics,
     changed: event_listener::Event,
 }
 
@@ -140,6 +142,11 @@ impl Host {
 
     /// A host whose time is `clock`'s.
     pub fn with_clock(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
+        Self::counting_into(sink, file, limits, clock, crate::metrics::agents())
+    }
+
+    /// A host whose time is `clock`'s, its looks and record writes counted into `metrics`.
+    pub fn counting_into(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
@@ -161,6 +168,7 @@ impl Host {
             clock,
             looks: AtomicU64::new(0),
             saves: AtomicU64::new(0),
+            metrics,
             changed: event_listener::Event::new(),
         })
     }
@@ -711,6 +719,7 @@ impl Host {
                     h.mark_dirty();
                 }
                 h.looks.fetch_add(1, Ordering::AcqRel);
+                h.metrics.harness_polls.inc();
                 h.changed.notify(usize::MAX);
             }
         });
@@ -780,6 +789,7 @@ impl Host {
         match wrote {
             Ok(()) => {
                 self.saves.fetch_add(1, Ordering::AcqRel);
+                self.metrics.harness_records_written.inc();
             }
             Err(e) => tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions"),
         }
@@ -922,6 +932,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         harness_session: None,
         approvals: Vec::new(),
         queued: 0,
+        queue: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
         cost_usd: 0.0,
@@ -988,7 +999,8 @@ mod tests {
     }
 
     /// The watch looks at what the harnesses run every 10 s by the host's clock: not before
-    /// (CP-M2's AC-M2.1: the harness host's watch on the simulated clock in tests).
+    /// (CP-M2's AC-M2.1: the harness host's watch on the simulated clock in tests). Each look is
+    /// counted for /metrics, once (`kiln_harness_polls_total`, a non-vacuity check).
     #[test]
     fn the_watch_looks_every_10_s_by_the_host_s_clock() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -996,7 +1008,8 @@ mod tests {
             let clock = SimClock::new();
             let start = clock.now();
             let (tx, _rx) = async_channel::unbounded();
-            let host = Host::with_clock(tx, None, Limits::default(), Arc::new(clock.clone()));
+            let metrics: &'static crate::metrics::AgentMetrics = Box::leak(Box::default());
+            let host = Host::counting_into(tx, None, Limits::default(), Arc::new(clock.clone()), metrics);
             // A session starts the watch; closed again, a look has nothing to scan.
             host.open(Some("watched".into()), no_harness(dir.path()))?;
             assert!(host.close("watched"));
@@ -1011,13 +1024,15 @@ mod tests {
                 assert_eq!((clock.sleepers(), host.looks()), (1, u64::from(n - 1)), "awake, or a look, before 10 s");
                 clock.advance(Duration::from_millis(1));
                 until(&host, |h| h.looks() == u64::from(n)).await?;
+                assert_eq!(metrics.harness_polls.get(), u64::from(n), "each look counted");
             }
             Ok(())
         })
     }
 
     /// Changes in a burst are written once, half a second by the host's clock after the first
-    /// (CP-M2, AC-M2.1).
+    /// (CP-M2, AC-M2.1), and the write counted for /metrics, once
+    /// (`kiln_harness_records_written_total`, a non-vacuity check).
     #[test]
     fn changes_are_written_once_half_a_second_after_them_by_the_host_s_clock() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
@@ -1026,7 +1041,8 @@ mod tests {
             let clock = SimClock::new();
             let start = clock.now();
             let (tx, _rx) = async_channel::unbounded();
-            let host = Host::with_clock(tx, Some(file.clone()), Limits::default(), Arc::new(clock.clone()));
+            let metrics: &'static crate::metrics::AgentMetrics = Box::leak(Box::default());
+            let host = Host::counting_into(tx, Some(file.clone()), Limits::default(), Arc::new(clock.clone()), metrics);
             host.open(Some("first".into()), no_harness(dir.path()))?;
             // The watch's sleep, and the write's: the write sleeps half a second, and it's the
             // only way to the write, so one that hasn't woken is one that hasn't written.
@@ -1044,6 +1060,7 @@ mod tests {
             assert_eq!(ids, ["first", "second"], "both changes in the one write");
             // (What the sessions do next, their harnesses failing to start, is the next burst's.)
             assert_eq!(host.saves(), 1);
+            assert_eq!(metrics.harness_records_written.get(), 1, "the write counted");
             Ok(())
         })
     }

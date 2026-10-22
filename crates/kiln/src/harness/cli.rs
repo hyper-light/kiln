@@ -246,6 +246,13 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
                 };
                 print(&format!("{}  {:<10} {}  {}", short(&g("id")), g("stand"), g("name"), what));
             }
+            // Messages other agents sent it, handed over here (taken out of its queue).
+            for m in v.get("messages").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let g = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+                let from = g("from");
+                let who = if g("name").is_empty() { short(&from).to_owned() } else { format!("{} ({})", g("name"), short(&from)) };
+                print(&format!("\nA message from {who}:\n{}", g("text").trim()));
+            }
             if v.get("timed_out").and_then(Value::as_bool) == Some(true) {
                 print(&format!("still going after {timeout}s: wait again to keep waiting"));
             }

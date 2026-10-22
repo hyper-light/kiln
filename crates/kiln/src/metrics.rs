@@ -117,6 +117,12 @@ impl CounterVec {
         *self.series.write().entry(key).or_insert(0) += n;
     }
 
+    /// One series' count (0 before it's counted).
+    pub fn get(&self, values: &[&str]) -> u64 {
+        let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
+        self.series.read().get(&key).copied().unwrap_or(0)
+    }
+
     fn render(&self, out: &mut String, name: &str) {
         for (vals, n) in self.series.read().iter() {
             let _ = writeln!(out, "{name}{{{}}} {n}", labels(self.keys, vals));
@@ -362,6 +368,90 @@ pub fn sync() -> &'static SyncMetrics {
     })
 }
 
+/// A family as docs/agents.md ("Metrics") lists it: its name, type, label and that label's values
+/// (none: it has no label), and what it counts (its help, word for word the doc's).
+pub(crate) struct Family {
+    pub name: &'static str,
+    pub kind: &'static str,
+    pub label: Option<(&'static str, &'static [&'static str])>,
+    pub help: &'static str,
+}
+
+/// Agents' families (agreed with Observe's owner, 2026-10-20; CP-M2): the goal driver's sends and
+/// the goals it saw end, and the harness host's looks and record writes. In this order, they're
+/// the fields of [`AgentMetrics`].
+pub(crate) const AGENTS: [Family; 4] = [
+    Family {
+        name: "kiln_goals_sent_total",
+        kind: "counter",
+        label: Some(("kind", &["start", "reminder"])),
+        help: "Goals the goal driver sent an agent: a goal's first send, or afresh once resumed or reworded (start), or again after the agent stopped short of it (reminder).",
+    },
+    Family {
+        name: "kiln_goals_ended_total",
+        kind: "counter",
+        label: Some(("status", &["met", "skipped"])),
+        help: "Goals that ended: met (as its harness, the agent or you said, or with its plan's steps or run), or skipped (cleared in the agent, skipped through goal control, or taken out while under way).",
+    },
+    Family { name: "kiln_harness_polls_total", kind: "counter", label: None, help: "Looks the harness host's watch took at what its harnesses run (every 10 s)." },
+    Family { name: "kiln_harness_records_written_total", kind: "counter", label: None, help: "Writes of the harness host's record of its sessions." },
+];
+
+/// The agents' families' counts ([`AGENTS`]): every series there from the start, at 0, so a rate
+/// reads from the first scrape. Production counts into [`agents`]; a test into one of its own.
+pub struct AgentMetrics {
+    pub goals_sent: CounterVec,
+    pub goals_ended: CounterVec,
+    pub harness_polls: Counter,
+    pub harness_records_written: Counter,
+}
+
+impl Default for AgentMetrics {
+    fn default() -> Self {
+        let m = Self { goals_sent: CounterVec::new(&["kind"]), goals_ended: CounterVec::new(&["status"]), harness_polls: Counter::default(), harness_records_written: Counter::default() };
+        let [sent, ended, ..] = &AGENTS;
+        for (family, v) in [(sent, &m.goals_sent), (ended, &m.goals_ended)] {
+            for value in family.label.map_or(&[][..], |(_, values)| values) {
+                v.add(&[*value], 0);
+            }
+        }
+        m
+    }
+}
+
+impl AgentMetrics {
+    /// A goal sent to its agent: its first send, or again (`reminder`).
+    pub fn goal_sent(&self, reminder: bool) {
+        self.goals_sent.inc(&[if reminder { "reminder" } else { "start" }]);
+    }
+
+    /// A goal ended: met, or skipped.
+    pub fn goal_ended(&self, met: bool) {
+        self.goals_ended.inc(&[if met { "met" } else { "skipped" }]);
+    }
+}
+
+pub fn agents() -> &'static AgentMetrics {
+    static M: OnceLock<AgentMetrics> = OnceLock::new();
+    M.get_or_init(AgentMetrics::default)
+}
+
+/// The agents' families of `m`, in the exposition.
+fn render_agents(m: &AgentMetrics, o: &mut String) {
+    let [sent, ended, polls, written] = &AGENTS;
+    let head = |o: &mut String, f: &Family| {
+        let _ = writeln!(o, "# HELP {} {}\n# TYPE {} {}", f.name, f.help, f.name, f.kind);
+    };
+    head(o, sent);
+    m.goals_sent.render(o, sent.name);
+    head(o, ended);
+    m.goals_ended.render(o, ended.name);
+    head(o, polls);
+    let _ = writeln!(o, "{} {}", polls.name, m.harness_polls.get());
+    head(o, written);
+    let _ = writeln!(o, "{} {}", written.name, m.harness_records_written.get());
+}
+
 /// kiln's bytes behind kiln-seams' `Blobs` (docs/blobs.md), by `store` (`local`, `s3`): requests by
 /// `op` and `outcome` (`ok`, `refused`: a typed refusal, `unavailable`: the store couldn't answer);
 /// how long each took; the bytes `written` and `read`; objects let go by what keeps them (`kind`:
@@ -486,6 +576,77 @@ mod tests {
             assert!(text.contains(&format!("# TYPE {name} ")), "{name}");
         }
         assert!(text.contains("kiln_move_barrier_seconds_bucket{le=\"600\"} "), "an unlabelled histogram's buckets");
+    }
+
+    /// CP-M2's counters (docs/agents.md, "Metrics"): every series is there before anything is
+    /// counted, at 0, under the help and type the table gives, and in the server's exposition.
+    #[test]
+    fn the_agents_families_render_every_series_from_the_start() {
+        let mut out = String::new();
+        render_agents(&AgentMetrics::default(), &mut out);
+        for f in &AGENTS {
+            assert!(out.contains(&format!("# HELP {} {}\n# TYPE {} {}\n", f.name, f.help, f.name, f.kind)), "{}: {out}", f.name);
+            match f.label {
+                Some((key, values)) => {
+                    for v in values {
+                        assert!(out.contains(&format!("{}{{{key}=\"{v}\"}} 0\n", f.name)), "{} {v}: {out}", f.name);
+                    }
+                }
+                None => assert!(out.contains(&format!("\n{} 0\n", f.name)), "{}: {out}", f.name),
+            }
+        }
+        let text = render();
+        for f in &AGENTS {
+            assert!(text.contains(&format!("# TYPE {} {}\n", f.name, f.kind)), "{}", f.name);
+        }
+    }
+
+    /// A row of the metrics reference: metric, type, its label and that label's values, and what
+    /// it counts.
+    type Said = (String, String, Option<(String, Vec<String>)>, String);
+
+    fn said_of(f: &Family) -> Said {
+        let label = f.label.map(|(k, vs)| (k.to_owned(), vs.iter().map(|v| (*v).to_owned()).collect()));
+        (f.name.to_owned(), f.kind.to_owned(), label, f.help.to_owned())
+    }
+
+    /// The rows of a doc's "## Metrics" table, in order: `| `name` | type | `label`: `a`, `b` | counts |`.
+    fn metrics_said(doc: &str) -> Option<Vec<Said>> {
+        let section = doc.split("\n## ").find(|s| s.starts_with("Metrics\n"))?;
+        let rows = section.lines().filter(|l| l.starts_with("| `")).map(|l| {
+            let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+            let [name, kind, labels, counts] = cells.as_slice() else { return (l.to_owned(), String::new(), None, String::new()) };
+            let ticked: Vec<String> = labels.split('`').skip(1).step_by(2).map(str::to_owned).collect();
+            let label = ticked.split_first().map(|(k, vs)| (k.clone(), vs.to_vec()));
+            (name.trim_matches('`').to_owned(), (*kind).to_owned(), label, (*counts).to_owned())
+        });
+        Some(rows.collect())
+    }
+
+    /// The metrics reference (docs/agents.md, "Metrics") is the code's (CP-M2, doc-truth): each
+    /// row's metric, type, label and values, and what it counts, in [`AGENTS`]'s order, word for
+    /// word.
+    #[test]
+    fn docs_agents_md_lists_the_agents_metrics_as_the_code_has_them() -> Result<(), String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/agents.md");
+        let doc = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let said = metrics_said(&doc).ok_or("docs/agents.md has no \"## Metrics\" section")?;
+        let code: Vec<Said> = AGENTS.iter().map(said_of).collect();
+        if said == code { Ok(()) } else { Err(format!("docs/agents.md says\n{said:#?}\nthe code has\n{code:#?}")) }
+    }
+
+    /// The check itself: a label value, or a row, the code doesn't have shows; other sections'
+    /// tables don't count.
+    #[test]
+    fn a_row_the_code_doesn_t_have_is_caught() {
+        let doc = "# x\n\n## Metrics\n\n| Metric | Type | Labels | Counts |\n| --- | --- | --- | --- |\n| `a_total` | counter | `kind`: `x`, `y` | Xs. |\n| `b_total` | counter | | Bs. |\n\n## Next\n\n| `c_total` | counter | | not this section's |\n";
+        let said = metrics_said(doc).unwrap_or_default();
+        let a = Family { name: "a_total", kind: "counter", label: Some(("kind", &["x", "y"])), help: "Xs." };
+        let b = Family { name: "b_total", kind: "counter", label: None, help: "Bs." };
+        assert_eq!(said, vec![said_of(&a), said_of(&b)]);
+        let fewer = Family { label: Some(("kind", &["x"])), ..a };
+        assert_ne!(said, vec![said_of(&fewer), said_of(&b)], "a label value the code doesn't have");
+        assert_ne!(said, vec![said_of(&b)], "a row the code doesn't have");
     }
 }
 
@@ -635,6 +796,7 @@ pub fn render() -> String {
     help(&mut o, "kiln_queue_wait_seconds", "histogram", "Time from queued to started.");
     m.queue_wait.render(&mut o, "kiln_queue_wait_seconds", "");
     render_sync(&mut o);
+    render_agents(agents(), &mut o);
     render_blobs(&mut o);
 
     let samples = agent_samples().read();

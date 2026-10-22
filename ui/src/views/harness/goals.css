@@ -102,43 +102,36 @@
 .gs-link[data-status="met"]:not(:last-child)::before {
   background: #5d7a74;
 }
+/* Each goal's node: where it stands, drawn as the console draws work (plans/status.tsx), on the
+   panel's own colour so the line runs behind it. Waiting goals are only sketched, still. */
 .gs-node {
   display: grid;
   width: 22px;
   height: 22px;
   place-items: center;
-  border: 1px solid #343a45;
-  border-radius: 50%;
   background: #0a0c0f;
-  color: #8d9099;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
 }
-/* A goal's parts: smaller links on the same chain, before the goal they're parts of. */
-.gs-link[data-part] .gs-node {
-  width: 14px;
-  height: 14px;
-  margin: 4px;
-  font-size: 0;
+.gs-node .sg-beam {
+  width: 15px;
+  height: 15px;
 }
-.gs-link[data-status="met"] .gs-node {
-  border-color: #5d7a74;
-  color: #b8d9d2;
+.gs-chain .sg-beam[data-status="pending"] {
+  animation: none;
 }
-.gs-link[data-status="active"] .gs-node {
-  border-color: #a6c4ed;
-  color: #a6c4ed;
-  box-shadow: 0 0 0 3px rgb(166 196 237 / 12%);
+/* A goal's parts: smaller links on the same chain, before the goal they're parts of; a step's own
+   parts (its criteria and tests) smaller still. */
+.gs-link[data-part] .gs-node .sg-beam,
+.gs-link[data-part] .gs-node .sg-optic {
+  width: 11px;
+  height: 11px;
 }
-.gs-link[data-status="unmet"] .gs-node {
-  border-color: #8a5a55;
-  color: #e3a7a0;
+.gs-link[data-depth="2"] .gs-node .sg-beam,
+.gs-link[data-depth="2"] .gs-node .sg-optic {
+  width: 9px;
+  height: 9px;
 }
-/* The goal under way while you've paused the stack: held, in the paused chip's amber. */
-.gs-link[data-status="paused"] .gs-node {
-  border-color: #e3c9a0;
-  border-style: dashed;
-  color: #e3c9a0;
+.gs-link[data-depth="2"] .gs-text {
+  font-size: 12px;
 }
 .gs-link[data-status="paused"] .gs-word {
   color: #e3c9a0;
@@ -162,6 +155,11 @@
 }
 .gs-link[data-status="unmet"] .gs-word {
   color: #d9a29b;
+}
+.gs-word a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
 }
 .gs-more {
   padding: 0 0 10px 32px;

@@ -176,11 +176,8 @@
   background: #6f8f84;
 }
 /* A subagent of its own running: its word and dot take the prism as it sweeps through them (signals.css). */
-.ms-row[data-stand] .ms-word.sg-shimmer {
-  color: #fff;
-}
 .ms-row[data-stand] .ms-word.sg-shimmer > i {
-  background: currentColor;
+  background: #b8a6d5;
 }
 .ms-row[data-stand="offline"] .ms-name {
   color: #a1a4ad;

@@ -104,6 +104,10 @@ pub enum Ask {
     Stack(Stacked),
     /// A new version of one step of a plan run's stack, and the steps above it made again on it.
     Restack(Restack),
+    /// Look for quotes a finding cites (docs/research.md, "Checks"): each in a file, read in the
+    /// agent's folder, or a page, fetched from here as the agent would; only whether each is
+    /// there comes back.
+    Cite { looks: Vec<crate::research::check::Look> },
 }
 
 /// A push of one commit to one ref, as one principal.
@@ -221,6 +225,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
             })
         }
         Ask::Git => Ok(json!({"facts": git::facts(cwd).await?})),
+        Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         Ask::Change(c) => {
             let facts = git::facts(cwd).await?;
             let top = Path::new(&facts.top);

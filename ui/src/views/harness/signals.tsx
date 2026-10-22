@@ -41,14 +41,9 @@ export function PrismLabel({ live = false, sweep = false, className, children }:
   );
 }
 
-/** What says a subagent is running, words and marks alike, with the thinking line's sweep through it (`on`: else as it is; signals.css). */
+/** What says a subagent is running, the prism sweeping through its words (`on`: else as it is; signals.css). */
 export function Shimmer({ on, className, children }: { on: boolean; className?: string; children: React.ReactNode }) {
-  return (
-    <span className={cn(className, on && "sg-shimmer")}>
-      {children}
-      {on && <span className="sg-sweep" aria-hidden="true" />}
-    </span>
-  );
+  return <span className={cn(className, on && "sg-shimmer")}>{children}</span>;
 }
 
 /** "<1s", "12s", "1m 05s", "1h 02m". */

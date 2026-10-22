@@ -206,6 +206,11 @@ pub struct Info {
     pub approvals: Vec<ApprovalBrief>,
     #[serde(default)]
     pub queued: usize,
+    /// What waits in its queue, each message by its id and a digest of its words (as
+    /// `State::queue`): the server's, for the messages kiln keeps there itself
+    /// (`super::queued`). Lists don't show it.
+    #[serde(skip)]
+    pub queue: Vec<super::queued::Queued>,
     #[serde(default)]
     pub tasks_running: usize,
     /// Native harness subagents, including finished work, for the list's child disclosure.
@@ -325,6 +330,7 @@ impl Info {
             .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at })
             .collect();
         self.queued = s.queue.len();
+        self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
         self.tasks_running = s.tasks.iter().filter(|t| t.status == "running").count();
         self.subagents = SubagentBrief::of(&s.tasks);
         self.cost_usd = s.usage.cost_usd;
@@ -358,9 +364,10 @@ impl Info {
         self.max_subagents = s.max_subagents;
     }
 
-    /// The parts lists care about changed (activity timestamps aside).
+    /// The parts lists care about changed (activity timestamps aside, and the words of what's queued:
+    /// a message edited while it waits changes nothing they show).
     pub fn differs(&self, o: &Self) -> bool {
-        let strip = |i: &Self| Self { last_activity: 0, ..i.clone() };
+        let strip = |i: &Self| Self { last_activity: 0, queue: Vec::new(), ..i.clone() };
         strip(self) != strip(o)
     }
 }
@@ -826,6 +833,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         harness_session: spec.resume.clone(),
         approvals: Vec::new(),
         queued: 0,
+        queue: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
         cost_usd: 0.0,
@@ -2892,6 +2900,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                         on_change();
                     }
+                    // Its threshold, set while it isn't running (a person's, or kiln's for a
+                    // program's worker): kept, and it holds from its next start.
+                    Command::PauseAt { percent } => {
+                        let mut core = s.core.lock();
+                        core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
+                        core.touch_state();
+                        drop(core);
+                        on_change();
+                    }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
                 // No process to hand over: the next image starts it from its record.
@@ -3208,6 +3225,7 @@ mod tests {
             harness_session: None,
             approvals: vec![],
             queued: 0,
+            queue: Vec::new(),
             tasks_running: 0,
             subagents: Vec::new(),
             cost_usd: 0.0,

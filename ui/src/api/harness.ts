@@ -459,6 +459,14 @@ export interface GoalItem {
   part_of?: string;
   /** The plan step it was made from (`n` from 1). */
   step?: { plan: string; version: number; n: number; run?: string };
+  /** The agent it's under way on, handed to it (a program's coordinator's goal, its track's worker's: docs/programs.md). */
+  on?: string;
+  /** Who made it a part: the agent (`own`: its goal comes back for its own check), or kiln (`checks`, `plan`, `planning`, `run`: its goal is met once they all are). */
+  part_kind?: "own" | "checks" | "plan" | "planning" | "run";
+  /** The plan it became. */
+  planned_as?: string;
+  /** The plan run it waits for. */
+  waits_on?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
