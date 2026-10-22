@@ -1166,6 +1166,45 @@ fn applied_log_records_reach_a_follower_once_through_a_reopen_and_an_image() {
     assert_eq!(read(&mut f), ["event 8", "event 9"]);
 }
 
+/// Each host as the index says it: its series, its newest sample, its metrics' namespaces, and the
+/// tags asked of its first series; a host whose newest sample is before the bound is left out, and
+/// one gone with retention is gone.
+#[test]
+fn hosts_are_seen_by_their_series() {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    let mut b = Builder::new();
+    let keys = [
+        SeriesKey::new("system.cpu.idle", [("host", "web-1"), ("os.type", "linux")], Kind::Gauge).unwrap(),
+        SeriesKey::new("system.load.15", [("host", "web-1"), ("os.type", "linux")], Kind::Gauge).unwrap(),
+        SeriesKey::new("nginx.net.conn_opened_per_s", [("host", "web-1"), ("port", "80")], Kind::Gauge).unwrap(),
+        SeriesKey::new("system.cpu.idle", [("host", "db-1")], Kind::Gauge).unwrap(),
+        SeriesKey::new("postgresql.connections", [("host", "db-1"), ("db", "shop")], Kind::Gauge).unwrap(),
+        SeriesKey::new("system.cpu.idle", [("host", "old-1")], Kind::Gauge).unwrap(),
+        SeriesKey::new("http.requests", [("service", "api")], Kind::Count).unwrap(),
+        SeriesKey::new("kiln_jobs_queued", [("host", "db-1")], Kind::Gauge).unwrap(),
+    ];
+    for k in &keys {
+        b.define(k);
+    }
+    for (i, k) in keys.iter().enumerate() {
+        let at = if i == 5 { 1_000 } else { 100_000 + i as i64 * 1000 };
+        b.run(k.fp, [(at, 1.0)]);
+    }
+    s.apply(&b.finish()).unwrap();
+    let seen = s.tag_seen("host", 50_000, &["os.type", "cloud.provider"]);
+    let names: Vec<(&str, usize, i64)> = seen.iter().map(|h| (h.value.as_str(), h.series, h.last_ms)).collect();
+    assert_eq!(names, vec![("db-1", 3, 107_000), ("web-1", 3, 102_000)], "old-1 is before the bound");
+    let db = seen.iter().find(|h| h.value == "db-1").unwrap();
+    assert_eq!(db.namespaces, vec!["kiln".to_owned(), "postgresql".to_owned(), "system".to_owned()], "a name of no dot, to its first underscore");
+    let web = seen.iter().find(|h| h.value == "web-1").unwrap();
+    assert_eq!(web.namespaces, vec!["nginx".to_owned(), "system".to_owned()]);
+    assert_eq!(web.tags, vec![("os.type".to_owned(), "linux".to_owned())]);
+    assert_eq!(s.tag_seen("host", i64::MIN, &[]).len(), 3);
+    assert!(s.tag_seen("nonesuch", i64::MIN, &[]).is_empty());
+    assert!(s.retain_logical(50_000, i64::MIN) > 0);
+    assert_eq!(s.tag_seen("host", i64::MIN, &[]).iter().map(|h| h.value.as_str()).collect::<Vec<_>>(), vec!["db-1", "web-1"]);
+}
+
 /// A metric's summary: its series by kind, each tag's values and the series carrying it (the most
 /// values first, each tag's values of most series first), the samples applied and its newest time;
 /// the metrics of most series first; counts carried over when retention numbers the symbols anew.

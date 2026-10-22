@@ -355,7 +355,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
-        (_, ["api", "observe", "v1", rest @ ..]) => crate::observe::api::route(rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        // Observe's routes as a task of their own: its handlers reach out (a cloud's pull, a
+        // synthetic test) and nest deep, and in a debug build the routers' frames under them
+        // (each arm's temporaries a slot of its own) took a shard's 2 MiB stack whole.
+        (_, ["api", "observe", "v1", rest @ ..]) => {
+            let rest: Vec<String> = rest.iter().map(|s| (*s).to_owned()).collect();
+            let q = q.clone();
+            crate::rt::spawn(async move {
+                let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+                crate::observe::api::route(&rest, &q, req).await
+            })
+            .await
+            .unwrap_or_else(|_| Err((StatusCode::INTERNAL_SERVER_ERROR, "the request's task ended before it answered".to_owned())))
+            .map_err(|(c, m)| err(c, m))
+        }
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();

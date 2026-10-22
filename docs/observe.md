@@ -38,6 +38,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-24 | Sensitive Data Scanner (§8.9): Datadog's scanning groups and rules, run on every machine where records are taken, after the pipelines, before anything is kept; the standard library (cards with their Luhn digits, IBANs with their checksums, SSNs in their ranges, personal data, network addresses, credentials of a dozen services, private keys, passwords in URLs and assignments), patterns of one's own; what a match becomes (a string, partly hidden, a keyed hash, or tags alone), keywords near, namespaces; the fast path kept for lines no rule may touch; the API, OpenAPI, its pages | done |
 | O-25 | Delivery: DORA metrics (§10.7), Datadog's: deployment frequency, change lead time (each commit's, from kiln's mirrors), change failure rate (rollbacks, reverts and hotfixes found as Datadog finds them, or marked by hand) and failed deployment recovery time, from kiln CD's deploys and Datadog's DORA API; failures; levels from DORA's 2024 report; metrics and events of each; the API, OpenAPI, its page | done |
 | O-26 | Service Catalog (§10.8), Datadog's: service definitions (v2.2) from Datadog's API and from `service.datadog.yaml` in the repositories kiln mirrors, services seen by their traces and deployments, each one's facts (requests, errors, latency, issues, monitors, SLOs, deployments, logs correlated) and Datadog's three scorecards; teams for DORA; the API, OpenAPI, its pages | done |
+| O-27 | Infrastructure (§10.9), Datadog's host list: every host that reports (kiln's runners, Datadog's Agent, OpenTelemetry's resources, any series tagged `host:<name>`), whether it is up, its CPU, I/O wait, load, memory and disk, its apps, its platform and tags by source, its containers; what the Agent says of its host (its host metadata, checks and inventory) kept; a host muted (a downtime of every monitor's groups of it); the API (Datadog's list and totals), its pages; checked live and in browsers (§13), measured (§12.31) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1586,8 +1587,9 @@ deleted until the monitor is.
 ### 9.3 Downtimes
 
 Datadog's downtimes (`crate::observe::downtimes`, `kiln_obs::monitor::downtime`): monitors'
-notifications held for a while, for the monitors a downtime names (one by its id, or every one that
-carries all of some tags) and the groups its scope holds (`env:prod host:(web-1 OR web-2) -region:eu`,
+notifications held for a while, for the monitors a downtime names (one by its id, every one that
+carries all of some tags, or every monitor: `monitor_tags: ["*"]`, what a host's mute makes, §10.9)
+and the groups its scope holds (`env:prod host:(web-1 OR web-2) -region:eu`,
 a value a glob; `*` every group; a monitor of one group only by `*`). Its schedule is once (from a
 time, now when none, to a time, until canceled when none) or recurring: up to five recurrences, each
 an RFC 5545 rule, the wall-clock time its first occurrence begins at, and how long each lasts, in a
@@ -2078,6 +2080,63 @@ of them.
   they are read through kiln's), and kiln's (`/api/observe/v1/catalog`, a session's): the services
   with their facts and scores, one service, its definition made, changed or removed.
 
+### 10.9 Infrastructure
+
+Every host that reports (`crate::observe::infra`), Datadog's Infrastructure List: a host is a value
+of the `host` tag, whatever wrote it (kiln's runners, each with its own figures, §8; Datadog's Agent;
+an OpenTelemetry resource's `host.name`; a series posted with `host:<name>`), and what kiln knows of
+it besides.
+
+- **Where it comes from** (`sources`): `kiln` (a runner the hub knows: its name, connection, version,
+  labels and probed facts), `agent` (Datadog's Agent, by its metadata or its own metrics), `otel` (a
+  resource's `host.name`), a cloud (`aws`, `gcp`, `azure`: the Agent's inventory or a resource's
+  `cloud.provider`).
+- **What the Agent says of its host**, kept by the server (`<observe>/hosts.json`, saved within a
+  minute, a host the Agent has said nothing of for seven days let go; 100,000 hosts at the most): its
+  host metadata (`POST /intake/`, at its start and every 30 minutes: its version, `systemStats`, its
+  aliases, its tags by source, how it was installed, gohai's system information), its checks
+  (`/intake/` too: each check, its status and error) and its inventory of the host
+  (`/api/v1/metadata`'s `host_metadata`: cores, threads, memory, kernel, OS version, cloud, instance
+  type, addresses). An Agent 7.84's own payloads, as it sent them (addresses and identities
+  replaced), are the tests' fixtures.
+- **When it last reported** (Datadog's `last_reported_time`): its newest sample, from the series
+  index alone (each series' newest time; nothing read from disk). Up: a sample within two hours;
+  active: within one (Datadog's totals); listed: within three hours unless asked from further back
+  (`from`), kept seven days. kiln's page dots it: reporting (within two minutes, eight of the
+  15-second intervals the Agent and kiln's own figures report at), late, or gone.
+- **Its figures**, its newest of the last ten minutes: CPU in use (`100 - system.cpu.idle`), I/O wait,
+  the load over 15 minutes (and a core's), memory in use (`1 - system.mem.pct_usable`) and its
+  fullest disk's use (`system.disk.in_use`): the System Check's names, which kiln's own figures use
+  too (a runner too old to report its own: its hub sample's CPU and memory). Each a query of every
+  host at once.
+- **Its apps**: its metrics' namespaces (a name to its first dot, or a name of none, Prometheus's,
+  to its first underscore; the Agent's `datadog.*` its `agent`).
+- **Its platform**, from the best of what says it: its runner's probed facts, then the Agent's
+  inventory and metadata (its distribution from `nixV`), then its resource's attributes (`os.type`,
+  `host.arch`, `cloud.region`, …, read from its first 64 series), then its metrics (cores, memory).
+- **Its tags by source**: the Agent's (its own tags `Datadog`, a cloud's under its name), kiln's (its
+  runner's labels), OpenTelemetry's (its resource's attributes).
+- **Its containers**: each container (`container_id`, or OpenTelemetry's `container.id`) whose
+  series say it runs on the host, its name, image and pod, and its CPU and memory of the last ten
+  minutes (the container check's `container.cpu.usage`, nanocores; `container.memory.usage`).
+- **Muted**: as Datadog's mute makes one, a downtime (§9.3) of every monitor's groups of the host
+  (`monitor_tags: ["*"]`, scope `host:<name>`), to an end or until unmuted; muting a muted host again
+  changes its mute only when it says so (`override`). A host's name that does not read whole in a
+  scope (a space, a parenthesis) is refused.
+- **The API** (kiln's, a session's): Datadog's host list (`GET /api/observe/v1/hosts`: `filter`,
+  terms each a part of its name, an alias, an app or a source, or a tag, `key:value` with `*` for any
+  part; `sort_field` of name, status, cpu, iowait, load, memory, disk, apps or last_reported;
+  `sort_dir`; `start`; `count`, 1,000 at the most; `from`; `include_hosts_metadata`), its totals
+  (`/hosts/totals`), a host whole (`/hosts/{name}`: its inventory, checks and containers too), and a
+  host muted and unmuted (`POST /hosts/{name}/mute`, `…/unmute`, Datadog's bodies and answers). Each
+  host as Datadog gives it (times in seconds; its `metrics`; `meta` when asked), kiln's own beside
+  under `kiln`. At Datadog's own paths (`/api/v1/hosts`, `/api/v1/host/…`) the ingest token, a
+  writer's, reads and mutes nothing.
+
+An inventory is made of the index (each host's series, newest sample, namespaces and platform tags),
+the ten figures' queries, the Agent's hosts, the hub's runners and the downtimes; reused 15 seconds,
+then still answered while one is made again (one at a time; one begun before a mute is not kept).
+
 ## 11. UI
 
 Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
@@ -2184,6 +2243,14 @@ time range and the search in the address (a page is a link).
   the monitors and SLOs that read it, its latest deployments (to the Delivery page), and its
   definition, made or changed in a dialog (YAML or JSON, as Datadog's API takes it) and removed;
   one a repository defines says so and is changed there.
+- **Hosts** (§10.9): every host that reports, found by a part of its name or a tag (`env:prod`) and
+  ordered by name, status or a figure: each its status (reporting, late, gone; muted), what reports
+  it and its apps, its CPU, I/O wait, load, memory and disk (90% or more told apart); on a phone, its
+  name and a line of its status and figures. A host's page: its figures and platform, its CPU, load,
+  memory, disks and network over a range, its platform at length (CPU, kernel, cloud, the Agent's
+  and kiln's versions, what reports it), its tags by source, its apps, its containers, the Agent's
+  checks (a failing one's error by name), its logs a click away; muted from it (an hour, four, a day,
+  a week, or until unmuted, saying why) and unmuted.
 - **Delivery** (§10.7): DORA's four keys over 7, 30 or 90 days, narrowed to a service, an
   environment or a team: each its value, what it was taken from, and the 2024 report's four ranges
   beside it, the one it falls in marked in words (a change failure rate beside the clusters' own
@@ -3701,6 +3768,32 @@ read once each, indexed by the services their queries and tags name (`service:<n
 What is costly to know of every service (who sent traces in the last day, whose logs carry trace ids)
 is read once in five minutes; a service's page reads its own, narrowed to it.
 
+### 12.31 The hosts' list
+
+`cargo bench -p kiln-obs --bench hosts` (adacachy, 2026-10-22, release, pinned to one core, the
+machine's load some 70 on 32 cores): fleets of hosts each reporting as kiln's own figures or the
+Agent's System Check report one (50 series: CPU, load, memory, swap, two disks, two interfaces) and an
+app's ten; two samples a series in the last minute; every third a resource's `os.type`, every fifth
+its cloud.
+
+| hosts | series | each host's series, newest, apps, platform | the ten figures' queries in all |
+| --- | --- | --- | --- |
+| 1,000 | 55,000 | 0.67 ms (6.2 allocations a host) | 5.1 ms |
+| 5,000 | 275,000 | 6.2 ms | 43 ms |
+| 20,000 | 1,100,000 | 24 ms | 375 ms (35–64 ms a query; six allocations a series, its answer's) |
+
+A list of 20,000 hosts is made in some 400 ms, reused 15 seconds and made again while the last is
+answered: no request waits on it but the first. Each figure's query reads its metric's series of
+the last ten minutes through the query engine (its grid, its answer's series); a read of each
+series' newest sample alone, by host, would spare most of it. Not done.
+
+Beside it, the browser suite found a debug build's server dead of a stack overflow on a cloud's
+test (`hyper-rt-shard-2 has overflowed its stack`): at `-O0` a router's frame holds every arm's
+temporaries apart (kiln's `authorized` 676 KB, observe's `route` 412 KB, kiln's `route` 275 KB), and
+a cloud's pull nests under them past a shard's 2 MiB. In a release build the three are 6, 18 and
+55 KB. Observe's routes run as a task of their own now (kiln's `api.rs`): their handlers nest from
+the shard's loop, not under the routers.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -4297,6 +4390,29 @@ an email contact, a runbook link, in the dialog), its facts and owners shown, it
 contacts, docs, deployments tracked passed; SLOs failed), the API agreeing; the next deployment
 takes its team; its definition removed, it is seen again. Nothing on either page wider than a
 phone. 2026-10-22: passes in all four (2–4 s each; adacachy).
+
+**Infrastructure** (`crates/kiln/tests/observe_infra.rs`): a kiln server and a runner as processes
+of their own, the runner looking at its host every 2 s; Datadog's Agent 7.84's own payloads of its
+host, as it sent them (its host metadata and checks to `/intake/`, its inventory to
+`/api/v1/metadata`, the fixtures), and its series (`/api/v1/series`). Both listed as Datadog's list
+gives them: the runner from kiln (its own figures once it has looked twice, its platform from its
+facts), the Agent's from its series and its word (`sources: ["agent"]`, apps `agent`, `ntp`,
+`system`, its CPU 30%, I/O wait 2.5%, load 0.75, memory 40%, fullest disk 55%; its version, its 13
+checks, its tags `Datadog`, its cores and OS from its inventory; its newest sample in seconds); its
+metadata only when asked. Totals; found by a tag and by a part of its name; ordered by CPU, a page of
+one; an order kiln does not have refused. The host whole (its kernel from its inventory, no
+containers); one that is not, 404. A monitor of every host's `e2e.infra.hot`; the Agent's host muted
+for an hour (a downtime of every monitor scoped to it); muted again refused but with `override`
+(its end changed, one downtime still); both hosts hot: the muted one's alert held (its event naming
+the downtime, muted), the runner's told; unmuted, its downtime canceled; unmuted again refused.
+Datadog's host API refused the ingest token (403, reading and muting). The server killed and started
+again: what the Agent said kept. 2026-10-22: passes (117 s; adacachy). In a browser
+(`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): a host the Agent reports
+(its metadata, its checks, its series) listed with its figures, found by its name, opened: its
+figures and platform (its busy memory told apart), the Agent's failing check's error, its tags;
+muted for an hour from its page, saying why, the API agreeing; unmuted. Nothing on either page wider
+than a phone. 2026-10-22: passes in all four (14–18 s each, most of it the list's 15 seconds of
+reuse before its series show; adacachy); and the whole suite, 36 scenarios, in all four.
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,

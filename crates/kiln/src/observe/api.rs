@@ -750,6 +750,13 @@ fn reads_slo(m: &super::monitors::Monitor, id: &str) -> bool {
 pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
     let method = req.method().clone();
     match (&method, rest) {
+        // The infrastructure list (§10.9): Datadog's host list and totals, a host whole, a host
+        // muted and unmuted.
+        (&Method::GET, ["hosts"]) => super::infra::http::hosts(q).await,
+        (&Method::GET, ["hosts", "totals"]) => super::infra::http::totals(q).await,
+        (&Method::GET, ["hosts", name]) => super::infra::http::host(name).await,
+        (&Method::POST, ["hosts", name, "mute"]) => super::infra::http::mute(name, req).await,
+        (&Method::POST, ["hosts", name, "unmute"]) => super::infra::http::unmute(name).await,
         // The Service Catalog (§10.8): every service, one, definitions made and removed.
         (&Method::GET, ["catalog"]) => super::catalog::http::services().await,
         (&Method::POST, ["catalog", "definitions"]) => super::catalog::http::define(req).await,

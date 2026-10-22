@@ -1,0 +1,76 @@
+{
+ "apiKey": "",
+ "agentVersion": "7.84.4",
+ "uuid": "00000000-0000-4000-8000-000000000001",
+ "internalHostname": "probe-host",
+ "os": "linux",
+ "agent-flavor": "agent",
+ "python": "unused",
+ "systemStats": {
+  "cpuCores": 1,
+  "machine": "amd64",
+  "platform": "linux",
+  "pythonV": "unused",
+  "processor": "AMD Ryzen 9 9950X3D2 16-Core Processor",
+  "macV": [
+   "",
+   "",
+   ""
+  ],
+  "nixV": [
+   "ubuntu",
+   "24.04",
+   ""
+  ],
+  "fbsdV": [
+   "",
+   "",
+   ""
+  ],
+  "winV": [
+   "",
+   "",
+   ""
+  ]
+ },
+ "meta": {
+  "socket-hostname": "probe-host",
+  "timezones": [
+   "UTC"
+  ],
+  "socket-fqdn": "probe-host",
+  "ec2-hostname": "",
+  "hostname": "probe-host",
+  "host_aliases": [],
+  "instance-id": "",
+  "hostname-resolution-version": 1
+ },
+ "host-tags": {
+  "system": [
+   "env:capture",
+   "gpu_host:true",
+   "team:observe"
+  ]
+ },
+ "network": null,
+ "logs": {
+  "transport": "",
+  "auto_multi_line_detection_enabled": true
+ },
+ "install-method": {
+  "tool": "docker",
+  "tool_version": "docker",
+  "installer_version": "docker"
+ },
+ "proxy-info": {
+  "no-proxy-nonexact-match": false,
+  "proxy-behavior-changed": false,
+  "no-proxy-nonexact-match-explicitly-set": false
+ },
+ "otlp": {
+  "enabled": false
+ },
+ "fips_mode": false,
+ "fips_proxy_enabled": false,
+ "gohai": "{\"cpu\":{\"cache_size\":\"1024 KB\",\"cpu_cores\":\"16\",\"cpu_logical_processors\":\"32\",\"family\":\"26\",\"mhz\":\"5374.871\",\"model\":\"68\",\"model_name\":\"AMD Ryzen 9 9950X3D2 16-Core Processor\",\"stepping\":\"0\",\"vendor_id\":\"AuthenticAMD\"},\"filesystem\":[{\"kb_size\":\"488386584\",\"mounted_on\":\"/\",\"name\":\"/dev/nvme0n1p2\"}],\"memory\":{\"swap_total\":\"130859004kB\",\"total\":\"134000160768\"},\"network\":{\"ipaddress\":\"192.0.2.10\",\"ipaddressv6\":\"2001:db8::10\",\"macaddress\":\"\",\"interfaces\":[{\"ipv4\":[\"192.0.2.10\"],\"ipv6\":[\"2001:db8::10\"],\"name\":\"eth0\"}]},\"platform\":{\"GOOARCH\":\"amd64\",\"GOOS\":\"linux\",\"goV\":\"1.26.7\",\"hardware_platform\":\"x86_64\",\"hostname\":\"probe-host\",\"kernel_name\":\"Linux\",\"kernel_release\":\"7.2.9-2-cachyos\",\"kernel_version\":\"#1 SMP PREEMPT_DYNAMIC Thu, 08 Oct 2026 15:06:16 +0000\",\"machine\":\"x86_64\",\"os\":\"GNU/Linux\",\"processor\":\"x86_64\"}}"
+}

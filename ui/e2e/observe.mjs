@@ -1777,6 +1777,87 @@ const scenarios = {
     }
   },
 
+  /** A host Datadog's Agent reports (what it says of its host, its checks, its series): listed with
+   * its figures, found by its name, its page saying its platform, its figures (a busy memory told
+   * apart) and the Agent's checks (a failing one by name); muted from its page for an hour, saying
+   * so, then unmuted. */
+  async "a host the Agent reports is listed, read, muted and unmuted"() {
+    const ingest = process.env.KILN_INGEST_TOKEN;
+    if (!ingest) return "skipped: no KILN_INGEST_TOKEN";
+    const host = `e2e-host-${run}`;
+    const post = async (path, body) => {
+      const r = await fetch(`${BASE}${path}`, { method: "POST", headers: { "DD-API-KEY": ingest, "content-type": "application/json" }, body: JSON.stringify(body) });
+      expect(r.status === 202 || r.status === 200, `${path}: ${r.status}`);
+    };
+    await post("/intake/", {
+      internalHostname: host,
+      agentVersion: "7.84.4",
+      systemStats: { cpuCores: 8, machine: "amd64", platform: "linux", processor: "E2E CPU", nixV: ["debian", "13", ""] },
+      meta: { hostname: host, "socket-hostname": host, host_aliases: [`${host}.example.com`] },
+      "host-tags": { system: ["env:e2e", "team:hosts"] },
+      "install-method": { tool: "install_script", tool_version: "install_script", installer_version: "install_script-1.0" },
+    });
+    await post("/intake/", {
+      internalHostname: host,
+      agent_checks: [
+        ["cpu", "cpu", "cpu", "OK", "", "", []],
+        ["redisdb", "redisdb", "redisdb:1", "ERROR", "connection refused", "", []],
+      ],
+    });
+    const t = Date.now() / 1000;
+    const series = (metric, v) => ({
+      metric,
+      points: [
+        [t - 20, v],
+        [t - 5, v],
+      ],
+      type: "gauge",
+      host,
+      tags: ["env:e2e"],
+    });
+    await post("/api/v1/series", {
+      series: [
+        series("system.cpu.idle", 20),
+        series("system.cpu.iowait", 1),
+        series("system.load.15", 1.5),
+        series("system.mem.pct_usable", 0.05),
+        series("system.disk.in_use", 0.4),
+        series("redis.net.clients", 3),
+      ],
+    });
+    // Its series stored (the list is made again every 15 s; the page asks every 30).
+    await until("its figures stored", async () => (await api("GET", `/api/observe/v1/hosts?filter=${encodeURIComponent(host)}`)).body?.host_list?.[0]?.kiln?.figures?.memory === 95, 45_000);
+    await page.goto(`${BASE}/observe/hosts?q=${encodeURIComponent(host)}`);
+    const row = page.locator("table.data-table tbody tr").filter({ has: page.getByRole("link", { name: host, exact: true }) });
+    await until("listed with its figures", async () => /80%/.test((await row.textContent()) ?? "") && /95%/.test((await row.textContent()) ?? ""));
+    await fitsAcross("the hosts");
+    await row.getByRole("link", { name: host, exact: true }).click();
+    await page.waitForURL(new RegExp(`/observe/hosts/${host}$`));
+    const facts = page.locator("dl.facts");
+    await until("its figures and platform", async () => {
+      const text = (await facts.textContent()) ?? "";
+      return /80%/.test(text) && /95%/.test(text) && /debian|linux/.test(text) && /8 cores/.test(text);
+    });
+    expect((await facts.locator('[data-tone="fail"]').count()) >= 1, "its busy memory told apart");
+    await page.getByText("redisdb", { exact: true }).waitFor();
+    await page.getByText("connection refused", { exact: true }).waitFor();
+    await page.getByText("team:hosts", { exact: true }).waitFor();
+    await fitsAcross("a host's page");
+    // Muted for an hour, saying why; then unmuted.
+    await page.getByRole("button", { name: "Mute…", exact: true }).click();
+    const d = page.getByRole("dialog");
+    await fillIn(d.getByLabel("Why (optional)", { exact: true }), "e2e patching");
+    await d.getByRole("button", { name: "Mute", exact: true }).click();
+    await d.waitFor({ state: "detached" });
+    await page.getByText("e2e patching", { exact: false }).waitFor();
+    await page.getByRole("button", { name: "Unmute", exact: true }).waitFor();
+    const muted = (await api("GET", `/api/observe/v1/hosts/${host}`)).body;
+    expect(muted.is_muted === true && muted.mute_timeout > Date.now() / 1000 + 3000 && muted.kiln.mute?.message === "e2e patching", `muted for an hour: ${JSON.stringify(muted.kiln.mute)}`);
+    await page.getByRole("button", { name: "Unmute", exact: true }).click();
+    await page.getByRole("button", { name: "Mute…", exact: true }).waitFor();
+    expect((await api("GET", `/api/observe/v1/hosts/${host}`)).body.is_muted === false, "unmuted");
+  },
+
   /** A service seen by its deployment, defined from its page in the catalog (its team, a contact, a
    * runbook), scored by its rules, taking its team into the next deployment; its definition removed,
    * it is listed as it is seen again. */

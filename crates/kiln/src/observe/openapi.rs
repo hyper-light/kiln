@@ -1329,11 +1329,49 @@ fn schemas() -> Map<String, Value> {
         ("logs_traced", describe(integer(), "the last day's logs that carry a trace id")),
     ]);
     put("CatalogServiceDetail", object(&detail, &["service", "source", "score", "rules"]));
+    // The infrastructure list (§10.9): Datadog's host, kiln's own beside.
+    let figure = || nullable(number());
+    let host_fields = || {
+        vec![
+            ("name", string()),
+            ("host_name", string()),
+            ("id", describe(integer(), "a stable number of its name")),
+            ("aliases", array(string())),
+            ("apps", describe(array(string()), "its metrics' namespaces (the Agent's `agent`)")),
+            ("sources", describe(array(string()), "what reports it: kiln, agent, otel, a cloud")),
+            ("up", describe(boolean(), "a sample within two hours")),
+            ("is_muted", boolean()),
+            ("mute_timeout", describe(nullable(integer()), "when its mute ends, seconds since the epoch")),
+            ("last_reported_time", describe(nullable(integer()), "its newest sample, seconds since the epoch")),
+            ("metrics", describe(object(&[("cpu", figure()), ("iowait", figure()), ("load", figure())], &[]), "CPU in use (%), I/O wait (%), the load over 15 minutes")),
+            ("tags_by_source", map_of(array(string()))),
+            ("meta", describe(map_of(any()), "what the Agent says (include_hosts_metadata)")),
+            (
+                "kiln",
+                object(
+                    &[
+                        ("status", one_of(&["reporting", "late", "gone"])),
+                        ("seen", nullable(integer())),
+                        ("series", integer()),
+                        ("figures", object(&[("cpu", figure()), ("iowait", figure()), ("load", figure()), ("load_norm", figure()), ("memory", figure()), ("disk", figure())], &[])),
+                        ("platform", map_of(any())),
+                        ("runner", nullable(map_of(any()))),
+                        ("mute", nullable(object(&[("downtime", string()), ("end", nullable(integer())), ("message", string())], &["downtime"]))),
+                    ],
+                    &["status", "series", "figures", "platform"],
+                ),
+            ),
+        ]
+    };
+    put("Host", object(&host_fields(), &["name", "up", "is_muted", "metrics", "kiln"]));
+    let mut host_detail = host_fields();
+    host_detail.push(("containers", describe(array(map_of(any())), "its containers: id, name, image, pod, last reported, CPU (nanocores), memory (bytes)")));
+    put("HostDetail", object(&host_detail, &["name", "up", "is_muted", "metrics", "kiln"]));
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
         ("message", string()),
-        ("monitor_identifier", describe(object(&[("monitor_id", string()), ("monitor_tags", array(string()))], &[]), "the monitors held: one, or those that carry every tag")),
+        ("monitor_identifier", describe(object(&[("monitor_id", string()), ("monitor_tags", array(string()))], &[]), "the monitors held: one, or those that carry every tag (`*` every monitor)")),
         ("scope", describe(string(), "the groups held: env:prod host:(web-1 OR web-2) -region:eu; * every one")),
         (
             "schedule",
@@ -2201,6 +2239,68 @@ fn ops() -> Vec<Op<'static>> {
             Some(json!({ "required": true, "content": { "application/json": { "schema": object(&[("group_ids", array(string()))], &["group_ids"]) } } })),
             vec![no_content()],
         ),
+        // The infrastructure list (§10.9).
+        Op {
+            params: vec![
+                param("filter", "query", false, string(), "terms each a part of its name, an alias, an app or a source, or a tag (key:value, `*` for any part)"),
+                param("sort_field", "query", false, one_of(&["name", "status", "cpu", "iowait", "load", "memory", "disk", "apps", "last_reported"]), "name unless said"),
+                param("sort_dir", "query", false, one_of(&["asc", "desc"]), "asc unless said"),
+                param("start", "query", false, integer(), "the first host of the page"),
+                param("count", "query", false, integer(), "hosts a page: 100 unless said, 1,000 at the most"),
+                param("from", "query", false, integer(), "seconds since the epoch: hosts that reported since (three hours ago unless said)"),
+                param("include_hosts_metadata", "query", false, boolean(), "what the Agent says of each, as `meta`"),
+            ],
+            ..op(
+                "get",
+                "/hosts",
+                "Every host that reports, as Datadog's host list gives it",
+                "observe.read",
+                None,
+                vec![(
+                    "200",
+                    answer_of(
+                        "the hosts",
+                        object(&[("host_list", array(schema("Host"))), ("total_matching", integer()), ("total_returned", integer())], &["host_list", "total_matching", "total_returned"]),
+                    ),
+                )],
+            )
+        },
+        Op {
+            params: vec![param("from", "query", false, integer(), "seconds since the epoch: hosts that reported since")],
+            ..op(
+                "get",
+                "/hosts/totals",
+                "The hosts up (a sample within two hours) and active (one), as Datadog's totals",
+                "observe.read",
+                None,
+                vec![("200", answer_of("the totals", object(&[("total_up", integer()), ("total_active", integer())], &["total_up", "total_active"])))],
+            )
+        },
+        Op { params: vec![name()], ..op("get", "/hosts/{name}", "A host whole: its platform, what the Agent says, its runner, its containers", "observe.read", None, vec![ok("HostDetail")]) },
+        Op {
+            params: vec![name()],
+            ..op(
+                "post",
+                "/hosts/{name}/mute",
+                "Mutes a host: a downtime of every monitor's groups of it (Datadog's mute)",
+                "observe.write",
+                Some(
+                    json!({ "required": false, "content": { "application/json": { "schema": object(&[("end", describe(integer(), "seconds since the epoch; until unmuted when none")), ("message", string()), ("override", describe(boolean(), "replaces a mute it has"))], &[]) } } }),
+                ),
+                vec![("200", answer_of("muted", object(&[("action", string()), ("hostname", string()), ("end", nullable(integer())), ("message", string())], &["action", "hostname"])))],
+            )
+        },
+        Op {
+            params: vec![name()],
+            ..op(
+                "post",
+                "/hosts/{name}/unmute",
+                "Unmutes a host: its mute's downtime canceled",
+                "observe.write",
+                None,
+                vec![("200", answer_of("unmuted", object(&[("action", string()), ("hostname", string())], &["action", "hostname"])))],
+            )
+        },
         // The Service Catalog (§10.8).
         op(
             "get",

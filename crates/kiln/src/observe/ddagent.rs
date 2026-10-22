@@ -6,8 +6,9 @@
 //!   `/api/v1/series` the same as JSON (older Agents, or `use_v2_api.series: false`);
 //! - `POST /api/beta/sketches`: its distributions' sketches;
 //! - `POST /api/v1/check_run`: service checks, records as DogStatsD's are (`source:service_check`);
-//! - `POST /intake/`: events (kiln's events, `source:kiln.event`), and host metadata, taken and
-//!   passed over;
+//! - `POST /intake/`: events (kiln's events, `source:kiln.event`), and what it says of its host
+//!   (its host metadata, its checks), kept by the infrastructure list (`super::infra`);
+//! - `POST /api/v1/metadata`: its inventories, its host's kept by the infrastructure list;
 //! - `POST /api/v2/logs`: its logs, records, their `ddtags` attributes;
 //! - `POST /api/v0.2/traces`: its tracers' spans (its trace agent's, `apm_config.apm_dd_url`),
 //!   into the span store (`kiln_obs::ddtrace`);
@@ -15,8 +16,9 @@
 //! - `GET /api/v1/validate`: whether its key is one;
 //!
 //! zstd (what it compresses with), deflate or gzip, or none. Anything else under Datadog's paths
-//! (`/api/v1/metadata`, its products' intakes) is answered 202 and passed over, so an Agent neither
-//! retries nor complains. A node behind on its writes answers 503: the Agent keeps its payload and
+//! (its products' intakes) is answered 202 and passed over, so an Agent neither retries nor
+//! complains; Datadog's host API (`/api/v1/hosts`, `/api/v1/host/…`) is kiln's own, read with a
+//! session: the ingest token is refused there. A node behind on its writes answers 503: the Agent keeps its payload and
 //! sends it again.
 
 use std::io::Read as _;
@@ -101,6 +103,10 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
     if let ["api", "v2", "services", "definitions", rest @ ..] = path {
         return super::catalog::http::datadog(rest, req).await;
     }
+    // Datadog's host API (`super::infra`): a writer's token reads and mutes no host.
+    if matches!(path, ["api", "v1", "hosts", ..] | ["api", "v1", "host", ..]) {
+        return super::infra::http::datadog();
+    }
     if req.method() != Method::POST {
         return srv::json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "errors": ["Datadog's intake takes POST"] }));
     }
@@ -110,6 +116,7 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
         ["api", "beta", "sketches"] => What::Sketches,
         ["api", "v1", "check_run"] => What::Checks,
         ["intake", ..] => What::Intake,
+        ["api", "v1", "metadata"] => What::Metadata,
         ["api", "v2", "logs"] => What::Logs,
         ["api", "v0.2", "traces"] => What::Traces,
         ["api", "v0.2", "stats"] => What::Stats,
@@ -148,6 +155,7 @@ enum What {
     Sketches,
     Checks,
     Intake,
+    Metadata,
     Logs,
     Traces,
     Stats,
@@ -186,14 +194,27 @@ fn take(o: &Observe, what: What, body: &[u8]) -> srv::Response {
             Ok(checks) => offered(o.offer_logs(checks.iter().map(|c| c.record(now)).collect())),
             Err(e) => bad(&format!("{e}")),
         },
-        What::Intake => match serde_json::from_slice::<Intake>(body) {
-            Ok(i) => {
-                let records = i.records(now);
-                offered(records.is_empty() || o.offer_logs(records))
+        What::Intake => match serde_json::from_slice::<Value>(body) {
+            Ok(v) => {
+                // What it says of its host (its metadata, its checks), kept; its events taken.
+                super::infra::heard_agent(&v);
+                match Intake::deserialize(&v) {
+                    Ok(i) => {
+                        let records = i.records(now);
+                        offered(records.is_empty() || o.offer_logs(records))
+                    }
+                    Err(_) => accepted(),
+                }
             }
-            // Host metadata of a shape this does not read: passed over, as the rest is.
+            // A payload of a shape this does not read: passed over, as the rest is.
             Err(_) => accepted(),
         },
+        What::Metadata => {
+            if let Ok(v) = serde_json::from_slice::<Value>(body) {
+                super::infra::heard_agent(&v);
+            }
+            accepted()
+        }
         What::Logs => match serde_json::from_slice::<Vec<LogIn>>(body) {
             Ok(logs) => offered(o.offer_logs(logs.into_iter().map(|l| l.record(now)).collect())),
             Err(e) => bad(&format!("{e}")),

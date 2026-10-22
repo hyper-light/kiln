@@ -228,7 +228,8 @@ impl Downtime {
         let i = &self.monitor_identifier;
         match &i.monitor_id {
             Some(m) if !m.is_empty() => m == id,
-            _ => !i.monitor_tags.is_empty() && i.monitor_tags.iter().all(|t| tags.contains(t)),
+            // `*`: every monitor (Datadog's `monitor_tags: ["*"]`, what a host's mute makes).
+            _ => !i.monitor_tags.is_empty() && i.monitor_tags.iter().all(|t| t == "*" || tags.contains(t)),
         }
     }
 

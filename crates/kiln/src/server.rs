@@ -257,6 +257,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let catalog = crate::observe::catalog::Catalog::open(&cfg.data("observe"), Some(hub.clone()));
         crate::observe::catalog::set(catalog.clone());
         crate::rt::spawn(catalog.run(shutdown.clone()));
+        let infra = crate::observe::infra::Infra::open(&cfg.data("observe"), Some(hub.clone()));
+        crate::observe::infra::set(infra.clone());
+        crate::rt::spawn(infra.run(shutdown.clone()));
         // Logs collected: the sources kept here, the server's own read here, each runner told its
         // own.
         let sources = std::sync::Arc::new(crate::observe::collect::Sources::open(&cfg.data("observe")));

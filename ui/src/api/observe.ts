@@ -1165,6 +1165,86 @@ export interface CatalogScore {
   scorecards: { name: string; passed: number; total: number }[];
 }
 
+/** A host's figures, its newest of the last ten minutes: CPU in use, I/O wait, memory in use and its fullest disk's use (%), the load over 15 minutes (and a core's). */
+export interface HostFigures {
+  cpu: number | null;
+  iowait: number | null;
+  load: number | null;
+  load_norm: number | null;
+  memory: number | null;
+  disk: number | null;
+}
+
+/** A host's platform, from the best of what says it: its runner, the Agent, its resource's attributes, its metrics. */
+export interface HostPlatform {
+  os: string | null;
+  kernel: string | null;
+  arch: string | null;
+  cpu_model: string | null;
+  cores: number | null;
+  threads: number | null;
+  memory_bytes: number | null;
+  cloud: string | null;
+  instance_type: string | null;
+  region: string | null;
+  agent_version: string | null;
+  kiln_version: string | null;
+}
+
+/** A host as Datadog's host list gives it (times in seconds), kiln's own beside (docs/observe.md §10.9). */
+export interface Host {
+  name: string;
+  host_name: string;
+  id: number;
+  aliases: string[];
+  apps: string[];
+  sources: string[];
+  up: boolean;
+  is_muted: boolean;
+  mute_timeout: number | null;
+  last_reported_time: number | null;
+  metrics: { cpu: number | null; iowait: number | null; load: number | null };
+  tags_by_source: Record<string, string[]>;
+  meta?: Record<string, unknown>;
+  kiln: {
+    status: "reporting" | "late" | "gone";
+    seen: number | null;
+    series: number;
+    figures: HostFigures;
+    platform: HostPlatform;
+    runner: { name: string; connected: boolean; last_seen: number; version: string; labels: string[] } | null;
+    mute: { downtime: string; end: number | null; message: string } | null;
+    inventory?: Record<string, string | number>;
+    agent_updated?: number;
+    gpus?: { vendor: string; model: string; memory: number }[];
+  };
+}
+
+/** A container on a host: its name, image and pod, when it last reported, its CPU (nanocores) and memory (bytes). */
+export interface HostContainer {
+  id: string;
+  name: string | null;
+  image: string | null;
+  image_tag: string | null;
+  pod: string | null;
+  namespace: string | null;
+  last_reported: number;
+  series: number;
+  cpu_nanocores: number | null;
+  memory_bytes: number | null;
+}
+
+export interface HostDetail extends Host {
+  containers: HostContainer[];
+}
+
+export interface HostQuery {
+  filter?: string;
+  sort_field?: string;
+  sort_dir?: "asc" | "desc";
+  count?: number;
+}
+
 /** A service in the catalog: where its definition came from, who owns it, how it is doing. */
 export interface CatalogService {
   service: string;
@@ -1382,6 +1462,16 @@ export const observeApi = {
   createScanningGroup: (g: ScanningGroupIn) => request<ScanningGroup>("POST", `${BASE}/scanner/groups`, g),
   updateScanningGroup: (id: string, g: ScanningGroupIn) => request<ScanningGroup>("PUT", `${BASE}/scanner/groups/${enc(id)}`, g),
   deleteScanningGroup: (id: string) => request<void>("DELETE", `${BASE}/scanner/groups/${enc(id)}`),
+  hosts: (q: HostQuery, signal?: AbortSignal) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
+    return request<{ host_list: Host[]; total_matching: number; total_returned: number }>("GET", `${BASE}/hosts?${p}`, undefined, { signal });
+  },
+  hostTotals: (signal?: AbortSignal) => request<{ total_up: number; total_active: number }>("GET", `${BASE}/hosts/totals`, undefined, { signal }),
+  host: (name: string, signal?: AbortSignal) => request<HostDetail>("GET", `${BASE}/hosts/${enc(name)}`, undefined, { signal }),
+  /** Mutes a host until `end` (seconds since the epoch; until unmuted when none): a downtime of every monitor's groups of it. */
+  muteHost: (name: string, body: { end?: number; message?: string; override?: boolean }) => request<{ action: string; hostname: string }>("POST", `${BASE}/hosts/${enc(name)}/mute`, body),
+  unmuteHost: (name: string) => request<{ action: string; hostname: string }>("POST", `${BASE}/hosts/${enc(name)}/unmute`),
   catalog: (signal?: AbortSignal) => request<{ services: CatalogService[] }>("GET", `${BASE}/catalog`, undefined, { signal }).then((r) => r.services),
   catalogService: (name: string, signal?: AbortSignal) => request<CatalogServiceDetail>("GET", `${BASE}/catalog/${enc(name)}`, undefined, { signal }),
   /** Definitions as Datadog's API takes them: YAML (several `---` apart) or JSON. */

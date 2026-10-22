@@ -315,6 +315,23 @@ pub struct MetricSummary {
     pub last_ms: Option<i64>,
 }
 
+/// What the index says of one value of a tag (a host, a container): the series that carry it, its
+/// newest sample's time (ms), its metrics' namespaces (each name to its first dot, or a name of no
+/// dot to its first underscore; sorted), and the
+/// first value its series carry of each tag key asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagSeen {
+    pub value: String,
+    pub series: usize,
+    pub last_ms: i64,
+    pub namespaces: Vec<String>,
+    pub tags: Vec<(String, String)>,
+}
+
+/// The series of a value [`Store::tag_seen`] reads the asked tags of, at the most: what a host's
+/// resource or Agent says is on every series of it, so its first few say it.
+pub const SEEN_TAG_SERIES: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagSummary {
     pub key: String,
@@ -1762,6 +1779,69 @@ impl Store {
         all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| self.symbols.get(a.0).cmp(self.symbols.get(b.0))));
         all.truncate(limit);
         (matched, all.into_iter().map(|(m, _)| self.summarize(m, top_values)).collect())
+    }
+
+    /// [`TagSeen`] of each value of tag `key` with a sample at or after `since_ms`, sorted by value:
+    /// read from the index and each series' newest time alone, nothing from disk. `keep`'s tag keys
+    /// are read from the first [`SEEN_TAG_SERIES`] series of each value.
+    pub fn tag_seen(&self, key: &str, since_ms: i64, keep: &[&str]) -> Vec<TagSeen> {
+        let Some(k) = self.symbols.find(key) else { return Vec::new() };
+        let keep: Vec<Sym> = keep.iter().filter_map(|n| self.symbols.find(n)).collect();
+        // Each metric's namespace, by its symbol (a table as long as the symbols to the last
+        // metric's: one look a series).
+        let metrics = self.index.metrics();
+        let top = metrics.iter().map(|m| m.0 as usize + 1).max().unwrap_or(0);
+        let mut space_of = vec![u16::MAX; top];
+        let mut spaces: Vec<&str> = Vec::new();
+        for &m in metrics {
+            let name = self.symbols.get(m);
+            // To its first dot; a name of none (Prometheus's), to its first underscore.
+            let ns = if name.contains('.') { name.split('.').next() } else { name.split('_').next() }.unwrap_or(name);
+            let i = spaces.iter().position(|s| *s == ns).unwrap_or_else(|| {
+                spaces.push(ns);
+                spaces.len() - 1
+            });
+            if let Some(slot) = space_of.get_mut(m.0 as usize) {
+                *slot = u16::try_from(i).unwrap_or(u16::MAX);
+            }
+        }
+        let mut out = Vec::new();
+        let mut seen: Vec<u16> = Vec::new();
+        let mut tags: Vec<(Sym, Sym)> = Vec::new();
+        for &v in self.index.values_of_tag(k) {
+            let ids = self.index.series_tagged(k, v);
+            let last = ids.iter().map(|&id| self.last.get(id as usize).copied().unwrap_or(i64::MIN)).max().unwrap_or(i64::MIN);
+            if last < since_ms {
+                continue;
+            }
+            seen.clear();
+            tags.clear();
+            for (n, &id) in ids.iter().enumerate() {
+                let Some(info) = self.index.info(id) else { continue };
+                let ns = space_of.get(info.metric.0 as usize).copied().unwrap_or(u16::MAX);
+                if ns != u16::MAX && !seen.contains(&ns) {
+                    seen.push(ns);
+                }
+                if n < SEEN_TAG_SERIES && !keep.is_empty() {
+                    for &(tk, tv) in self.index.tags(&info) {
+                        if keep.contains(&tk) && !tags.iter().any(|(x, _)| *x == tk) {
+                            tags.push((tk, tv));
+                        }
+                    }
+                }
+            }
+            let mut namespaces: Vec<String> = seen.iter().filter_map(|&i| spaces.get(usize::from(i))).map(|s| (*s).to_owned()).collect();
+            namespaces.sort_unstable();
+            out.push(TagSeen {
+                value: self.symbols.get(v).to_owned(),
+                series: ids.len(),
+                last_ms: last,
+                namespaces,
+                tags: tags.iter().map(|&(k, v)| (self.symbols.get(k).to_owned(), self.symbols.get(v).to_owned())).collect(),
+            });
+        }
+        out.sort_by(|a, b| a.value.cmp(&b.value));
+        out
     }
 
     /// Every metric's samples applied since the store opened: what a rate is reckoned from.

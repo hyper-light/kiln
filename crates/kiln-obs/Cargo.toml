@@ -94,6 +94,10 @@ name = "zstd"
 harness = false
 
 [[bench]]
+name = "hosts"
+harness = false
+
+[[bench]]
 name = "group"
 harness = false
 

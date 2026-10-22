@@ -239,6 +239,16 @@ impl Index {
         self.postings(Owner::Metric(metric))
     }
 
+    /// Every value of tag `key` (a symbol), as the index keeps them.
+    pub fn values_of_tag(&self, key: Sym) -> &[Sym] {
+        self.values_of(key)
+    }
+
+    /// The series that carry tag `key:value`, by id, sorted.
+    pub fn series_tagged(&self, key: Sym, value: Sym) -> &[u32] {
+        self.postings(Owner::Tag(key, value))
+    }
+
     /// Every value of tag `key`.
     pub fn tag_values(&self, symbols: &Symbols, key: &str) -> Vec<Sym> {
         symbols.find(key).map(|k| self.values_of(k).to_vec()).unwrap_or_default()
