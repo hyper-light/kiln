@@ -169,14 +169,28 @@
 /* A subagent running: the prism sweeps through what says so (the activity line's "1 subagent",
    Mission Control's "Working"), painted into its own letters (background-clip: text). No layer of
    its own and no blending, so nothing beside it (shells, the queue, the Latest button) takes it. */
+/* Its own flow where it's given one (Shimmer's `flow`, signals.tsx `flowOf`): its colours, a sweep
+   back and forth or a drift one way, its pace, phase and depth of colour; else the one sweep. */
 .sg-shimmer {
-  background-image: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 18%, #b8a6d5 34%, #d6a2aa 50%, #b8a6d5 66%, #a6c4ed 82%, #b8d9d2 100%);
-  background-size: 300% 100%;
+  background-image: var(--sg-image, linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 18%, #b8a6d5 34%, #d6a2aa 50%, #b8a6d5 66%, #a6c4ed 82%, #b8d9d2 100%));
+  background-size: var(--sg-size, 300%) 100%;
+  background-repeat: repeat-x;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
   -webkit-text-fill-color: transparent;
-  animation: sg-shimmer-sweep 6s ease-in-out infinite alternate;
+  filter: saturate(var(--sg-depth, 1));
+  animation: var(--sg-motion, sg-shimmer-sweep) var(--sg-dur, 6s) var(--sg-ease, ease-in-out) var(--sg-delay, 0s) infinite var(--sg-dir, alternate);
+}
+/* A drift: the band moves one way without end, one width of it a period (its size 200%: the image is
+   twice the box, so 0% to 200% is exactly one image along, and the repeat joins it seamlessly). */
+@keyframes sg-shimmer-drift {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 200% 50%;
+  }
 }
 @keyframes sg-shimmer-sweep {
   from {

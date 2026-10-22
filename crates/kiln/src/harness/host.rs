@@ -151,6 +151,8 @@ impl Host {
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
         }
+        #[cfg(not(test))]
+        super::acp::warm_models();
         let files_dir = file.as_ref().and_then(|f| f.parent()).map_or_else(
             || std::env::temp_dir().join(format!("kiln-attachments-{}", crate::os::uid())),
             |d| d.join("attachments"),
@@ -959,6 +961,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         pause: None,
         last_turn: None,
         keep_off: false,
+        held: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,

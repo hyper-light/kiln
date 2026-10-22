@@ -11,7 +11,8 @@ export type MissionRow = { a: AgentInfo; stand: MissionStand };
 
 /** Where an agent stands (`seen`: when you last looked at it). Its turn over, a subagent it sent off still at work keeps it working (tasks.ts). */
 export function standOf(a: AgentInfo, seen: number | undefined): MissionStand {
-  if (a.approvals.length > 0 || a.status === "waiting") return "needs";
+  // A request, or goals it paused for you.
+  if (a.approvals.length > 0 || a.status === "waiting" || a.held) return "needs";
   if (a.status === "exited" && a.exit?.error) return "crashed";
   // Waiting for a usage limit to reset (its current turn, if any, finishes first).
   if (a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected") return "paused";

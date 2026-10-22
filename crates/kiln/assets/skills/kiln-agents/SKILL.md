@@ -5,7 +5,7 @@ description: Hand parts of your work to other coding agents through kiln (any ha
 
 # Agents that run agents
 
-kiln runs coding agents (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, Antigravity) on
+kiln runs coding agents (Claude Code, Codex, Devin, Gemini CLI, opencode, Goose, Amp, Antigravity) on
 every machine it has. You can start some yourself: each is your **child**, works on its own,
 and reports back. The tools are `agents_start`, `agents_wait`, `agents_result`, `agents_send`,
 `agents_list`, `agents_get`, `agents_children`, `agents_interrupt`, `agents_stop`,

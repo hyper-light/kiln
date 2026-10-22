@@ -5,7 +5,7 @@
 //! * [`core`] — a session's state plus what came out of the last step (updates, stdin lines).
 //! * [`claude`] — Claude Code over stream-json and the control protocol.
 //! * [`codex`] — Codex over its app-server (JSON-RPC v2).
-//! * [`acp`] — any Agent Client Protocol agent (Gemini CLI, opencode, Goose, Amp's adapter).
+//! * [`acp`] — any Agent Client Protocol agent (Devin, Gemini CLI, opencode, Goose, Amp's adapter).
 //! * [`diff`] — line diffs for edit previews.
 //! * [`handoff`] — a conversation carried from one harness to another (switching models across them).
 //! * [`kinds`] — the registry of harnesses and their adapters.

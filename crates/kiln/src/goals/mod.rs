@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 
 use crate::harness::model::{Command, SendMode, Status};
 use crate::harness::queued::{GOAL, Kept, Now};
-use crate::harness::session::Info;
+use crate::harness::session::{Held, Info};
 use crate::hub::Hub;
 
 /// Most goals a stack holds, those met or under way included: room for a program of a hundred
@@ -83,6 +83,11 @@ pub struct Stack {
     /// Paused for a while: when it resumes by itself (unix ms; 0: when someone resumes it).
     #[serde(skip_serializing_if = "is_zero")]
     pub resume_at: i64,
+    /// Paused by its agent for a person, until someone resumes it (what waits on you wherever you
+    /// are in kiln: `held`): "" for any such pause, a plan's id when it waits for you to look at
+    /// that plan first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_for: Option<String>,
     /// When kiln last cleared the goal in the agent itself (pause, skip, clear).
     #[serde(skip)]
     dropped_at: i64,
@@ -236,6 +241,8 @@ impl By {
 pub struct Pausing {
     pub why: Option<String>,
     pub until: Option<i64>,
+    /// The plan it waits for a person to look at first (`plans_ready` with `then: review`).
+    pub review: Option<String>,
 }
 
 /// The longest a stack pauses for by itself.
@@ -316,9 +323,9 @@ async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
-    let head: Option<(String, Option<String>, i64, i64, i64, i64)> = c
-        .query_row("SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+    let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>)> = c
+        .query_row("SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for FROM goal_stacks WHERE agent = ?1", params![agent], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
         })
         .optional()?;
     let mut st = c.prepare(
@@ -350,8 +357,8 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let (state, reason, updated_at, dropped_at, cleared, resume_at) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0));
-    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, dropped_at })
+    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None));
+    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, dropped_at })
 }
 
 /// What a goal stack last said to its agent through its queue (`say`): the message, while it may
@@ -583,7 +590,8 @@ fn renumber(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<()> {
 fn touch(c: &rusqlite::Connection, agent: &str, state: Option<&str>, reason: Option<&str>, now: i64) -> anyhow::Result<()> {
     c.execute(
         "INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, COALESCE(?2, 'paused'), ?3, ?4, ?4)
-         ON CONFLICT(agent) DO UPDATE SET state = COALESCE(?2, state), reason = CASE WHEN ?2 IS NULL THEN reason ELSE ?3 END, updated_at = ?4",
+         ON CONFLICT(agent) DO UPDATE SET state = COALESCE(?2, state), reason = CASE WHEN ?2 IS NULL THEN reason ELSE ?3 END,
+           held_for = CASE WHEN ?2 IS NULL THEN held_for ELSE NULL END, updated_at = ?4",
         params![agent, state, reason, now],
     )?;
     Ok(())
@@ -1027,6 +1035,14 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
     };
     let skipped_why = format!("Skipped by {}.", by.name());
     let until = pausing.until.unwrap_or(0);
+    // What waits on a person: a plan an agent (not you) wants you to look at first, or a pause its
+    // agent made with no time to resume; yours, a parent's or one for a while don't.
+    let held_for = match (by, &pausing.review) {
+        (By::You, _) => None,
+        (_, Some(plan)) => Some(plan.clone()),
+        (By::Itself, None) if until == 0 => Some(String::new()),
+        _ => None,
+    };
     let _one = CHANGING.lock().await;
     let stack = get(hub, agent).await?;
     if action == Action::Restore && stack.cleared == 0 {
@@ -1054,7 +1070,7 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
                 Action::Start => run_from_here(&tx, &agent_s, said_at, now)?,
                 Action::Pause => {
                     touch(&tx, &agent_s, Some("paused"), Some(&paused_why), now)?;
-                    tx.execute("UPDATE goal_stacks SET dropped_at = ?2, resume_at = ?3 WHERE agent = ?1", params![agent_s, now, until])?;
+                    tx.execute("UPDATE goal_stacks SET dropped_at = ?2, resume_at = ?3, held_for = ?4 WHERE agent = ?1", params![agent_s, now, until, held_for])?;
                 }
                 Action::Skip => {
                     skipped = tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE agent = ?1 AND status = 'active'", params![agent_s, now, skipped_why])?;
@@ -1369,6 +1385,9 @@ where
                 crate::harness::told::tick(hub, &all, now, &running, &quiet).await;
                 // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
                 crate::harness::elsewhere::tick(hub, &all, now);
+                // What agents' goals wait on a person for, on their info: Mission Control's Needs
+                // you, and a card wherever you are in kiln.
+                hub.harness.set_held(hub, &held_stacks(self.store).await);
             }
         }
     }
@@ -1624,7 +1643,7 @@ pub async fn planned(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans::Pl
     add_at(hub, agent, goals, false, &At::Before(goal.to_owned())).await?;
     if *then == Then::Review {
         let why = format!("plan \"{}\" is ready for you to look at: its steps go to the agent once you resume", plan.title);
-        control_as(hub, agent, Action::Pause, by, Pausing { why: Some(why), until: None }).await?;
+        control_as(hub, agent, Action::Pause, by, Pausing { why: Some(why), until: None, review: Some(plan.id.clone()) }).await?;
     }
     let stack = get(hub, agent).await?;
     let planning: Vec<String> = stack
@@ -1741,6 +1760,23 @@ fn ended(stack: &Stack, item: &Item, info: &Info, busy: bool) -> Option<Next> {
 }
 
 /// The agents whose stacks their program's usage paused (docs/programs.md).
+/// The goals agents paused for a person, until someone resumes them (`Stack::held_for`), by agent.
+pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
+    store
+        .call(|c| {
+            let mut st = c.prepare("SELECT agent, COALESCE(reason, ''), held_for, dropped_at FROM goal_stacks WHERE state = 'paused' AND held_for IS NOT NULL")?;
+            let v = st
+                .query_map([], |r| {
+                    let plan: String = r.get(2)?;
+                    Ok((r.get::<_, String>(0)?, Held { why: r.get(1)?, plan: Some(plan).filter(|p| !p.is_empty()), since: r.get(3)? }))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()?;
+            Ok(v)
+        })
+        .await
+        .unwrap_or_default()
+}
+
 async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
     let like = format!("{}%", crate::programs::PAUSED_FOR_USAGE);
     let paused = store
@@ -3201,9 +3237,9 @@ mod stack_tests {
             // Paused for a while, saying why: it says who paused it and when it resumes.
             add(&hub, id, strs(&["deploy"]), true).await?;
             let later = hub.clock.unix_ms() + 600_000;
-            let s = control_as(&hub, id, Action::Pause, &me, Pausing { why: Some("waiting for CI".into()), until: Some(later) }).await?;
+            let s = control_as(&hub, id, Action::Pause, &me, Pausing { why: Some("waiting for CI".into()), until: Some(later), review: None }).await?;
             assert_eq!((s.state.as_str(), s.reason.as_deref(), s.resume_at), ("paused", Some("Paused by the agent: waiting for CI"), later));
-            assert!(matches!(control_as(&hub, id, Action::Pause, &me, Pausing { why: None, until: Some(hub.clock.unix_ms() - 1) }).await, Err(Error::Bad(_))), "a pause for a while ends after now");
+            assert!(matches!(control_as(&hub, id, Action::Pause, &me, Pausing { why: None, until: Some(hub.clock.unix_ms() - 1), review: None }).await, Err(Error::Bad(_))), "a pause for a while ends after now");
             settled(&hub, id).await;
             let s: Stack = control(&hub, id, serde_json::from_value(serde_json::json!("resume"))?).await?;
             assert_eq!((s.state.as_str(), s.resume_at, s.reason.as_deref()), ("running", 0, None));
@@ -3211,6 +3247,44 @@ mod stack_tests {
             let s: Stack = control(&hub, id, serde_json::from_value(serde_json::json!("done"))?).await?;
             assert_eq!(words(&s).last().map(String::as_str), Some("met:deploy"));
             assert!(matches!(done(&hub, id, None, None, &me).await, Err(Error::Bad(_))), "nothing under way to say met");
+            Ok(())
+        })
+    }
+
+    /// What waits on a person: a pause its agent made with no time to resume, or a plan an agent
+    /// wants looked at first; not yours, nor one for a while. On the agent's info while it waits
+    /// (as each tick of the driver puts it), gone once it's resumed.
+    #[test]
+    fn goals_an_agent_pauses_for_you_are_on_its_info_until_resumed() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["tests pass", "ship it"]).await?;
+            let id = id.as_str();
+            settled(&hub, id).await;
+            let tick = async || {
+                hub.harness.set_held(&hub, &held_stacks(&hub.store).await);
+                hub.harness.info(id).and_then(|i| i.held)
+            };
+            // For a while: it resumes by itself.
+            let later = hub.clock.unix_ms() + 600_000;
+            let s = control_as(&hub, id, Action::Pause, &By::Itself, Pausing { why: Some("waiting for CI".into()), until: Some(later), review: None }).await?;
+            assert_eq!((s.state.as_str(), s.held_for), ("paused", None));
+            assert_eq!(tick().await, None);
+            // Until someone resumes it: it waits on you, saying why.
+            let s = control_as(&hub, id, Action::Pause, &By::Itself, Pausing { why: Some("I need the staging password".into()), until: None, review: None }).await?;
+            assert_eq!(s.held_for.as_deref(), Some(""));
+            let held = tick().await;
+            assert!(held.as_ref().is_some_and(|h| h.why == "Paused by the agent: I need the staging password" && h.plan.is_none() && h.since > 0), "{held:?}");
+            // Resumed: nothing waits.
+            let s: Stack = control(&hub, id, serde_json::from_value(serde_json::json!("resume"))?).await?;
+            assert_eq!((s.state.as_str(), s.held_for), ("running", None));
+            assert_eq!(tick().await, None);
+            // Yours doesn't wait on you.
+            let s = control_as(&hub, id, Action::Pause, &By::You, Pausing::default()).await?;
+            assert_eq!((s.state.as_str(), s.held_for), ("paused", None));
+            // A plan to look at first: its id, whichever agent asked.
+            let s = control_as(&hub, id, Action::Pause, &By::Agent("Release prep".into()), Pausing { why: Some("plan ready".into()), until: None, review: Some("pl_1".into()) }).await?;
+            assert_eq!(s.held_for.as_deref(), Some("pl_1"));
+            assert_eq!(tick().await.and_then(|h| h.plan).as_deref(), Some("pl_1"));
             Ok(())
         })
     }
@@ -3359,10 +3433,14 @@ mod stack_tests {
                 researched(&hub, &rid).await?;
                 plans.push(pid);
             }
-            // For review: its steps go in, and the stack pauses, saying why.
-            let r = call_ok(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": plans.first(), "then": "review"})).await)?;
+            // For review, as the agent itself says it's ready: its steps go in, and the stack pauses,
+            // saying why, waiting on you to look at the plan.
+            let mut itself = crate::authz::Caller::owner();
+            itself.agent = Some(id.to_owned());
+            let r = call_ok(crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: itself }, "plans.ready", serde_json::json!({"id": plans.first(), "then": "review"})).await)?;
             let s = get(&hub, id).await?;
             assert!(s.state == "paused" && s.reason.as_deref().is_some_and(|w| w.contains("is ready for you to look at")), "{r} {:?}", s.reason);
+            assert_eq!(s.held_for.as_deref(), plans.first().map(String::as_str), "it waits on you to look at the plan");
             assert_eq!(s.items.iter().filter(|i| i.part_of.as_deref() == Some(one.as_str()) && i.part_kind.as_deref() == Some("plan") && i.status == "pending").count(), 2);
             // Its steps met by hand: the goal is met; resumed, the next goal's planning goes on.
             for p in s.items.iter().filter(|i| i.part_of.as_deref() == Some(one.as_str()) && i.part_kind.as_deref() == Some("plan")) {
@@ -3372,6 +3450,7 @@ mod stack_tests {
             control(&hub, id, Action::Start).await?;
             let s = get(&hub, id).await?;
             assert_eq!(s.items.iter().find(|i| i.id == one).map(|i| i.status.as_str()), Some("met"), "{:?}", words(&s));
+            assert_eq!(s.held_for, None, "resumed, nothing waits on you");
             // With an agent per step: the goal waits on a part held for the run.
             settled(&hub, id).await;
             let r = call_ok(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": plans.get(1), "then": "agents"})).await)?;
