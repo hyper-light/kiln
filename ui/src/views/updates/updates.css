@@ -636,7 +636,13 @@
 .up-table th:last-child,
 .up-row > td:last-child {
   padding-right: 20px;
-  text-align: right;
+}
+/* A machine's checkbox stands by the first line of its name: its name and its line under it are
+   44px, centred in the row as every cell is, however tall the row grows. */
+.up-row > td.up-c-check .check {
+  display: block;
+  position: relative;
+  top: -11px;
 }
 /* A machine: its row, then what it needs said under it; one rule under both. */
 .up-machine {
@@ -670,7 +676,7 @@
   width: 150px;
 }
 .up-c-act {
-  width: 240px;
+  width: 340px;
 }
 .up-more > td {
   padding: 0 20px 0 76px;
@@ -793,11 +799,15 @@
   width: 100%;
   margin: 0;
 }
+/* What can be done about a machine, from its column's left edge as every column starts: a row led
+   by a bordered button starts at its border, one led by a plain one at its mark. */
 .up-acts {
-  display: inline-flex;
+  display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
   gap: 4px;
+}
+.up-acts:not([data-lead]) {
+  margin-left: -13px;
 }
 .up-saving {
   display: block;
@@ -1320,6 +1330,16 @@
   .up-c-check {
     grid-area: check;
   }
+  .up-row > td.up-c-check {
+    align-self: start;
+    padding-top: 3px;
+  }
+  .up-row > td.up-c-check .check {
+    top: 0;
+  }
+  .up-c-name {
+    align-self: start;
+  }
   .up-c-name {
     grid-area: name;
   }
@@ -1459,6 +1479,54 @@
   .up-wide {
     padding: 0 16px 14px;
   }
+  /* A machine on a phone: its checkbox in a column of its own, then its name, its build, its state
+     (the dot after its word), its updates and what can be done, each on a line of its own. */
+  .up-row {
+    grid-template-areas:
+      "check name"
+      ". build"
+      ". state"
+      ". policy"
+      ". act";
+    grid-template-columns: 28px minmax(0, 1fr);
+    align-items: start;
+  }
+  .up-row > td.up-c-state {
+    justify-self: stretch;
+    text-align: left;
+  }
+  .up-state {
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+  }
+  .up-track {
+    margin-left: 0;
+  }
+  .up-c-policy .up-select {
+    width: min(100%, 240px);
+  }
+  /* Its head lines up with its rows: Check for updates' mark in the checkboxes' column, as big as
+     a checkbox, its words where the names start; Upgrade all under them, on a line of its own. */
+  .up-fleet-actions {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .up-fleet-actions .up-check-updates {
+    gap: 24px;
+    margin-left: -1px;
+    padding: 0;
+  }
+  .up-fleet-actions .up-check-updates svg {
+    width: 16px;
+    height: 16px;
+  }
+  .up-fleet-actions .up-upgrade-all {
+    margin-left: 40px;
+  }
+  .up-acts:not([data-lead]) {
+    margin-left: -15px;
+  }
   .up-bulk,
   .up-upload {
     padding: 10px 16px;
@@ -1548,12 +1616,21 @@
     font-size: 9px;
   }
   .up-row {
-    grid-template-columns: 24px 148px minmax(0, 1fr) auto;
+    grid-template-columns: 24px minmax(0, 1fr);
     gap: 10px;
     padding: 14px 12px;
   }
   .up-more > td {
     padding-left: 46px;
+  }
+  .up-fleet-actions {
+    margin-left: -4px;
+  }
+  .up-fleet-actions .up-check-updates {
+    gap: 18px;
+  }
+  .up-fleet-actions .up-upgrade-all {
+    margin-left: 34px;
   }
 }
 
