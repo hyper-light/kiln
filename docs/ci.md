@@ -3368,7 +3368,11 @@ enforcement points to W18, agent isolation to W20.
     Miniforge (pinned, its checksum checked), so the image needs no Anaconda license; its base
     environment is the `runner` user's, as the Conda starter needs;
   - PowerShell 7.6 (`pwsh`) and the GitHub CLI (`gh`), pinned and checked against their
-    releases' sums.
+    releases' sums;
+  - the command-line tools of GitHub's image that scripts call: `python` (Python 3), fakeroot
+    (bat's Debian packages need it), Bison and Flex, patchelf, ShellCheck, the SQLite shell,
+    tree, lz4, pigz, 7-Zip, GNU parallel, Brotli, zsync, aria2, sshpass, dig, ping, netstat,
+    telnet, ftp, the ACL tools, SWIG, Texinfo, rpm, UPX, MediaInfo, Mercurial and Xvfb.
 
   On Ubuntu 24.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's image's
   does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.

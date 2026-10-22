@@ -152,8 +152,10 @@ pub fn host_user() -> Option<(u32, u32)> {
 /// kiln's runner images (W13-R04), built on the runner the first time a leg needs one: what
 /// GitHub's hosted Ubuntu runners have that most workflows count on. Besides the build and
 /// network basics and the headers native builds look for (OpenSSL's, which `openssl-sys` wants,
-/// zlib's, curl's, SQLite's, YAML's, libffi's, libxml2's), that's the toolchains workflows call
-/// without a `setup-*` action: CMake,
+/// zlib's, curl's, SQLite's, YAML's, libffi's, libxml2's), and the command-line tools of GitHub's
+/// image that scripts call (`python` for Python 3, fakeroot for Debian packages, ShellCheck, 7-Zip,
+/// GNU parallel, Xvfb, Mercurial and the like), that's the toolchains workflows call without a
+/// `setup-*` action: CMake,
 /// Ninja, the autotools and Clang; a JDK with Maven, Ant and sbt (`JAVA_HOME` set); PHP with
 /// Composer; Ruby and Bundler; Leiningen; pipx; Rust (rustup, with rustfmt and clippy); Node.js
 /// 22; the Docker CLI with buildx and compose (for legs given the host's Docker, W13-R04); conda at
@@ -190,6 +192,8 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              RUN printf 'APT::Get::Assume-Yes \"true\";\\nAcquire::Retries \"5\";\\n' > /etc/apt/apt.conf.d/90kiln-runner \\\n    \
              && apt-get update && apt-get install -y --no-install-recommends cmake ninja-build autoconf automake libtool gettext clang lld \\\n    \
              libssl-dev zlib1g-dev libcurl4-openssl-dev libsqlite3-dev libyaml-dev libffi-dev libxml2-dev \\\n    \
+             fakeroot python-is-python3 bison flex patchelf shellcheck sqlite3 tree lz4 pigz p7zip-full parallel brotli zsync aria2 sshpass \\\n    \
+             dnsutils iputils-ping net-tools telnet ftp acl swig texinfo rpm upx-ucl mediainfo mercurial xvfb \\\n    \
              default-jdk-headless maven ant php-cli php-xml php-mbstring php-curl php-zip php-intl php-sqlite3 composer ruby-full ruby-bundler leiningen pipx \\\n    \
              && rm -rf /var/lib/apt/lists/*\n\
              RUN curl -fsSL https://github.com/sbt/sbt/releases/download/v1.10.7/sbt-1.10.7.tgz | tar -xz -C /usr/local && ln -s /usr/local/sbt/bin/sbt /usr/local/bin/sbt\n\
@@ -1096,7 +1100,34 @@ mod tests {
         let full = runner_dockerfile("kiln/runner-ubuntu-24.04", None).unwrap_or_default();
         assert!(full.starts_with(&d), "the full image starts as the slim one");
         assert!(full.contains("libssl-dev") && !d.contains("libssl-dev"), "the headers native builds look for (openssl-sys)");
-        for tool in ["cmake", "clang", "maven", "ant", "sbt", "composer", "ruby-full", "ruby-bundler", "leiningen", "sh.rustup.rs", "nodejs.org/dist/latest-v22.x", "JAVA_HOME=", "Assume-Yes", "docker-buildx", "docker-compose", "CONDA=/usr/share/miniconda", "conda-forge/miniforge", "/usr/bin/pwsh", "libicu74", "cli/cli/releases", "break-system-packages"] {
+        for tool in [
+            "fakeroot",
+            "python-is-python3",
+            "shellcheck",
+            "p7zip-full",
+            "xvfb",
+            "cmake",
+            "clang",
+            "maven",
+            "ant",
+            "sbt",
+            "composer",
+            "ruby-full",
+            "ruby-bundler",
+            "leiningen",
+            "sh.rustup.rs",
+            "nodejs.org/dist/latest-v22.x",
+            "JAVA_HOME=",
+            "Assume-Yes",
+            "docker-buildx",
+            "docker-compose",
+            "CONDA=/usr/share/miniconda",
+            "conda-forge/miniforge",
+            "/usr/bin/pwsh",
+            "libicu74",
+            "cli/cli/releases",
+            "break-system-packages",
+        ] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
         assert!(full.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {full}");
