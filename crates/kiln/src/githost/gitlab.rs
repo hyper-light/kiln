@@ -122,6 +122,11 @@ impl Gitlab {
         self.name_of(repo).ok_or_else(|| anyhow!("{} isn't on {}", repo.name, self.web))
     }
 
+    /// The groups its token covers (none: every project there).
+    pub fn groups(&self) -> &[String] {
+        &self.groups
+    }
+
     /// One call to GitLab's API as kiln: its status and JSON (`null` when none).
     pub async fn call(&self, method: Method, path: &str, body: Option<&Value>) -> anyhow::Result<(u16, Value)> {
         self.call_as(&self.token, method, path, body).await
