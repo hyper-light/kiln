@@ -2880,6 +2880,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                         on_change();
                     }
+                    // Its threshold, set while it isn't running (a person's, or kiln's for a
+                    // program's worker): kept, and it holds from its next start.
+                    Command::PauseAt { percent } => {
+                        let mut core = s.core.lock();
+                        core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
+                        core.touch_state();
+                        drop(core);
+                        on_change();
+                    }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
                 // No process to hand over: the next image starts it from its record.

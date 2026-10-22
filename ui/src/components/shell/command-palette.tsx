@@ -142,6 +142,7 @@ function Palette() {
       { id: "p-sync", group: "Pages", label: "Synced folders", hint: "in Repositories: folders kept the same on several machines", icon: <FolderSync size={15} />, run: () => go("/repos?show=synced") },
       { id: "p-runners", group: "Pages", label: "Runners", icon: <Server size={15} />, run: () => go("/runners") },
       { id: "p-plans", group: "Pages", label: "Plans", hint: "kept plans: change, share, run on any agent", icon: <ListChecks size={15} />, run: () => go("/agents/plans") },
+      { id: "p-programs", group: "Pages", label: "Programs", hint: "multi-stack programs: each track's worker, goals, pass and usage", icon: <ListChecks size={15} />, run: () => go("/agents/programs") },
       { id: "p-agents", group: "Pages", label: "Agents", hint: "AI sessions", icon: <Bot size={15} />, run: () => go("/agents") },
       { id: "p-term", group: "Pages", label: "Terminal", icon: <SquareTerminal size={15} />, run: () => go("/terminal") },
       { id: "p-metrics", group: "Pages", label: "Metrics", icon: <Cpu size={15} />, run: () => go("/telemetry") },

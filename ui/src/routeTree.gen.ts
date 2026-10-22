@@ -40,6 +40,7 @@ import { Route as AppAgentsExperimentsIndexRouteImport } from './routes/_app.age
 import { Route as AppAgentsExperimentsIdRouteImport } from './routes/_app.agents.experiments.$id'
 import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
+import { Route as AppAgentsProgramsIndexRouteImport } from './routes/_app.agents.programs.index'
 import { Route as AppAgentsResearchIdRouteImport } from './routes/_app.agents.research.$id'
 import { Route as AppDeploymentsEnvironmentsIndexRouteImport } from './routes/_app.deployments.environments.index'
 import { Route as AppDeploymentsEnvironmentsNameRouteImport } from './routes/_app.deployments.environments.$name'
@@ -211,6 +212,11 @@ const AppAgentsPlansIdRoute = AppAgentsPlansIdRouteImport.update({
   path: '/agents/plans/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAgentsProgramsIndexRoute = AppAgentsProgramsIndexRouteImport.update({
+  id: '/agents/programs/',
+  path: '/agents/programs/',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppAgentsResearchIdRoute = AppAgentsResearchIdRouteImport.update({
   id: '/agents/research/$id',
   path: '/agents/research/$id',
@@ -333,6 +339,7 @@ export interface FileRoutesByFullPath {
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/experiments/': typeof AppAgentsExperimentsIndexRoute
   '/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/agents/programs/': typeof AppAgentsProgramsIndexRoute
   '/deployments/environments/': typeof AppDeploymentsEnvironmentsIndexRoute
   '/deployments/releases/': typeof AppDeploymentsReleasesIndexRoute
   '/runs/$id/': typeof AppRunsIdIndexRoute
@@ -380,6 +387,7 @@ export interface FileRoutesByTo {
   '/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/agents/experiments': typeof AppAgentsExperimentsIndexRoute
   '/agents/plans': typeof AppAgentsPlansIndexRoute
+  '/agents/programs': typeof AppAgentsProgramsIndexRoute
   '/deployments/environments': typeof AppDeploymentsEnvironmentsIndexRoute
   '/deployments/releases': typeof AppDeploymentsReleasesIndexRoute
   '/runs/$id': typeof AppRunsIdIndexRoute
@@ -429,6 +437,7 @@ export interface FileRoutesById {
   '/_app/runs/$id/compare': typeof AppRunsIdCompareRoute
   '/_app/agents/experiments/': typeof AppAgentsExperimentsIndexRoute
   '/_app/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/_app/agents/programs/': typeof AppAgentsProgramsIndexRoute
   '/_app/deployments/environments/': typeof AppDeploymentsEnvironmentsIndexRoute
   '/_app/deployments/releases/': typeof AppDeploymentsReleasesIndexRoute
   '/_app/runs/$id/': typeof AppRunsIdIndexRoute
@@ -478,6 +487,7 @@ export interface FileRouteTypes {
     | '/runs/$id/compare'
     | '/agents/experiments/'
     | '/agents/plans/'
+    | '/agents/programs/'
     | '/deployments/environments/'
     | '/deployments/releases/'
     | '/runs/$id/'
@@ -525,6 +535,7 @@ export interface FileRouteTypes {
     | '/runs/$id/compare'
     | '/agents/experiments'
     | '/agents/plans'
+    | '/agents/programs'
     | '/deployments/environments'
     | '/deployments/releases'
     | '/runs/$id'
@@ -573,6 +584,7 @@ export interface FileRouteTypes {
     | '/_app/runs/$id/compare'
     | '/_app/agents/experiments/'
     | '/_app/agents/plans/'
+    | '/_app/agents/programs/'
     | '/_app/deployments/environments/'
     | '/_app/deployments/releases/'
     | '/_app/runs/$id/'
@@ -808,6 +820,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppAgentsPlansIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/agents/programs/': {
+      id: '/_app/agents/programs/'
+      path: '/agents/programs'
+      fullPath: '/agents/programs/'
+      preLoaderRoute: typeof AppAgentsProgramsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/agents/research/$id': {
       id: '/_app/agents/research/$id'
       path: '/agents/research/$id'
@@ -952,6 +971,7 @@ interface AppRouteChildren {
   AppRunsIdCompareRoute: typeof AppRunsIdCompareRoute
   AppAgentsExperimentsIndexRoute: typeof AppAgentsExperimentsIndexRoute
   AppAgentsPlansIndexRoute: typeof AppAgentsPlansIndexRoute
+  AppAgentsProgramsIndexRoute: typeof AppAgentsProgramsIndexRoute
   AppDeploymentsEnvironmentsIndexRoute: typeof AppDeploymentsEnvironmentsIndexRoute
   AppDeploymentsReleasesIndexRoute: typeof AppDeploymentsReleasesIndexRoute
   AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
@@ -999,6 +1019,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppRunsIdCompareRoute: AppRunsIdCompareRoute,
   AppAgentsExperimentsIndexRoute: AppAgentsExperimentsIndexRoute,
   AppAgentsPlansIndexRoute: AppAgentsPlansIndexRoute,
+  AppAgentsProgramsIndexRoute: AppAgentsProgramsIndexRoute,
   AppDeploymentsEnvironmentsIndexRoute: AppDeploymentsEnvironmentsIndexRoute,
   AppDeploymentsReleasesIndexRoute: AppDeploymentsReleasesIndexRoute,
   AppRunsIdIndexRoute: AppRunsIdIndexRoute,

@@ -149,6 +149,25 @@ The server keeps the stacks and drives them, so they go on with no console open 
 restarts. A stack holds at most 500 goals, those met or under way included, so a program of a
 hundred goals and more fits, its met goals kept for the record.
 
+## Held or paused for usage
+
+An agent of a program (its coordinator, or a track's worker, as assigned:
+[programs.md](programs.md)) is held to the program's usage rule by the driver. Above 80% of a
+weekly window of the program's accounts no new goal starts; the goal under way goes on. Above
+95% its stack pauses ("Paused for usage: …") as a pause of yours does: its goal in the agent
+cleared, what waits in its queue for its goals withdrawn. It goes on again by itself once the window
+is at 80% or under, as when you resume it, its goal under way sent again (the clear the pause sent
+doesn't end it). A stack you paused stays paused. kiln doesn't prod an agent paused for usage, at a
+limit or at its threshold: it isn't kept going, and it hears of its children once it goes on (what
+others send it still reaches it).
+
+## A goal under way on another agent
+
+A program's coordinator can hand a goal of its stack to a track's worker
+([programs.md](programs.md), "Workers"). The stack shows it under way on that agent, and the driver
+doesn't start it here; while it's out, the stack isn't done. It's met, or comes back to the stack,
+when the coordinator says so.
+
 ## Keep going
 
 An agent with no goal stack under way is still kept at its work: when a turn stops part-way,
@@ -203,6 +222,9 @@ Each turn's end is in the agent's state as `last_turn` (`{at, how: "done" | "cut
 a row. Switch it off for an agent in its ⋯ menu (**Keep it going when it stops part-way**), or
 with the `keep_going` control (`{"type": "control", "id": "keep_going", "value": false}`); it
 holds across restarts.
+
+What the driver sends, and the goals it sees end, are counted on `/metrics`
+(`kiln_goals_sent_total`, `kiln_goals_ended_total`): docs/agents.md, "Metrics".
 
 ## API
 

@@ -77,6 +77,7 @@ pub fn own() -> &'static [Op] {
             .into_iter()
             .chain(crate::plans::ops::list_ops())
             .chain(crate::goals::ops::list_ops())
+            .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())
             .chain(crate::doctor::list_ops())
             .chain(crate::ci::attach::list_ops())
@@ -189,7 +190,7 @@ mod tests {
     /// runners' `runners.read` or `runners.manage`), and reads exactly when its route is a GET.
     #[test]
     fn kiln_s_own_operations_are_routes_of_the_table() {
-        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1", "user": "ada", "grant": "g1", "name": "auditor", "token": "t1"});
+        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1", "user": "ada", "grant": "g1", "name": "auditor", "token": "t1", "program": "p1", "track": "T1"});
         assert!(own().iter().any(|o| o.name == "agents.start") && own().iter().any(|o| o.name == "plans.run") && own().iter().any(|o| o.name == "goals.add"));
         for op in own() {
             let route = (op.route)(&probe);

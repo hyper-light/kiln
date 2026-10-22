@@ -829,21 +829,21 @@ mod end_to_end {
             crate::goals::add(&hub, &p, vec!["the lab program passes".into(), "the view loads in 300 ms".into()], true).await?;
             until(|| goals() == 1, "its first goal, queued").await?;
             let mut now = 1_792_000_000_000_i64;
-            crate::harness::told::tick(&hub, &hub.harness.list(), now, &[]).await;
+            crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
             for round in 0..6 {
                 // Each helper goes to work and ends a turn, and stands so a while.
                 for k in &kids {
                     report(k, Status::Running, String::new(), 0);
                 }
                 now += 1_000;
-                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[]).await;
+                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
                 for (n, k) in kids.iter().enumerate() {
                     report(k, Status::Idle, format!("Helper {} finished round {round}.", n + 1), now + i64::try_from(n).unwrap_or(0));
                 }
                 now += 1_000;
-                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[]).await;
+                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
                 now += 4_000;
-                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[]).await;
+                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
                 let latest = |q: &crate::harness::model::QueueItem| (1..=3).all(|n| q.text.contains(&format!("Helper {n} finished round {round}.")));
                 until(|| news().iter().any(latest), "the round's news, waiting").await?;
                 anyhow::ensure!(news().len() == 1, "round {round}: one message of news, not {:?}", news());
