@@ -520,10 +520,18 @@ impl Acp {
         self.config = options.to_vec();
         let mut known = std::mem::take(&mut core.meta.models);
         if self.account {
-            for model in super::kinds::models_of("devin") {
+            let keep_default = known.iter().any(|m| m.default);
+            for mut model in super::kinds::models_of("devin") {
+                if keep_default {
+                    model.default = false;
+                }
                 match known.iter_mut().find(|m| m.id == model.id) {
-                    Some(kept) if kept.efforts.is_empty() => kept.efforts = model.efforts,
-                    Some(_) => {}
+                    Some(kept) => {
+                        kept.default |= model.default;
+                        if kept.efforts.is_empty() {
+                            kept.efforts = model.efforts;
+                        }
+                    }
                     None => known.push(model),
                 }
             }

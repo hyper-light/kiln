@@ -1,6 +1,8 @@
 use super::*;
 use crate::harness::session::Spec;
 
+static MODEL_CACHE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 fn written(core: &mut Core) -> Vec<Value> {
     core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect()
 }
@@ -21,6 +23,7 @@ fn update(a: &mut Acp, core: &mut Core, options: Vec<Value>) {
 
 #[test]
 fn a_session_keeps_effort_choices_learned_after_it_started() -> anyhow::Result<()> {
+    let _cache = MODEL_CACHE.lock();
     let config = vec![
         json!({"id": "model", "category": "model", "type": "select", "currentValue": "catalog-current", "options": [{"value": "catalog-current", "name": "Current"}, {"value": "catalog-later", "name": "Later"}]}),
         json!({"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high", "options": [{"value": "high", "name": "High"}]}),
@@ -38,6 +41,28 @@ fn a_session_keeps_effort_choices_learned_after_it_started() -> anyhow::Result<(
     assert_eq!(core.meta.models.iter().find(|m| m.id == "catalog-later").map(|m| m.efforts.as_slice()), Some(["max".to_owned()].as_slice()));
     assert_eq!(core.meta.models.iter().find(|m| m.id == "catalog-current").map(|m| m.efforts.as_slice()), Some(["high".to_owned()].as_slice()));
     Ok(())
+}
+
+#[test]
+fn an_adopted_session_imports_a_learned_default_only_when_it_has_none() {
+    let _cache = MODEL_CACHE.lock();
+    super::super::kinds::note_models("devin", &[
+        ModelOption { id: "handoff-current".into(), efforts: vec!["low".into()], ..ModelOption::default() },
+        ModelOption { id: "handoff-native-default".into(), default: true, efforts: vec!["high".into(), "max".into()], ..ModelOption::default() },
+    ]);
+    for keep_default in [false, true] {
+        let mut a = Acp::from_spec(&Spec { kind: "devin".into(), ..Spec::default() });
+        let mut core = Core::new();
+        core.meta.models = vec![ModelOption { id: "handoff-current".into(), default: keep_default, efforts: vec!["low".into()], ..ModelOption::default() }];
+        if !keep_default {
+            core.meta.models.push(ModelOption { id: "handoff-native-default".into(), efforts: vec!["high".into(), "max".into()], ..ModelOption::default() });
+        }
+        update(&mut a, &mut core, vec![
+            json!({"id": "model", "category": "model", "type": "select", "currentValue": "handoff-current", "options": [{"value": "handoff-current", "name": "Current"}, {"value": "handoff-native-default", "name": "Native default"}]}),
+            json!({"id": "effort", "category": "thought_level", "type": "select", "currentValue": "low", "options": [{"value": "low", "name": "Low"}]}),
+        ]);
+        assert_eq!(core.meta.models.iter().filter(|m| m.default).map(|m| m.id.as_str()).collect::<Vec<_>>(), [if keep_default { "handoff-current" } else { "handoff-native-default" }]);
+    }
 }
 
 fn send(a: &mut Acp, core: &mut Core, id: &str) {

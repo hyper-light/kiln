@@ -1,9 +1,9 @@
 //! The installed Devin's catalog for the existing start dialog, before a person starts a session.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Acp, Command, Core};
 use crate::harness::kinds::Kind;
@@ -44,7 +44,8 @@ pub(super) fn warm_models() {
         return;
     };
     crate::rt::spawn(async move {
-        let models = discover(program, Duration::from_secs(20)).await.ok().filter(|m| !m.is_empty());
+        let config = crate::os::config_home().join("devin/config.json");
+        let models = discover(program, Duration::from_secs(20), &config).await.ok().filter(|m| !m.is_empty());
         if let Some(models) = &models {
             crate::harness::kinds::note_models("devin", models);
         }
@@ -52,15 +53,12 @@ pub(super) fn warm_models() {
     });
 }
 
-async fn discover(program: PathBuf, deadline: Duration) -> anyhow::Result<Vec<ModelOption>> {
+async fn discover(program: PathBuf, deadline: Duration, user_config: &Path) -> anyhow::Result<Vec<ModelOption>> {
     let dir = std::env::temp_dir().join(format!("kiln-devin-models-{}", crate::util::new_id()));
     let result = async {
         std::fs::create_dir(&dir)?;
         let config = dir.join("config.json");
-        std::fs::write(&config, json!({
-            "auto_update": false, "notify": "never",
-            "read_config_from": {"agents_standard": false, "cursor": false, "windsurf": false, "claude": false, "copilot": false, "opencode": false, "zed": false}
-        }).to_string())?;
+        std::fs::write(&config, probe_config(user_config).to_string())?;
         let spec = Spec { kind: "devin".into(), program: Some(program.to_string_lossy().into_owned()), cwd: Some(dir.to_string_lossy().into_owned()), reach: Some("off".into()), ..Spec::default() };
         let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
         let mut process = crate::proc::spawn_duplex(kind.cli(&spec, &["--config".into(), config.to_string_lossy().into_owned(), "acp".into()])?)?;
@@ -117,6 +115,21 @@ async fn discover(program: PathBuf, deadline: Duration) -> anyhow::Result<Vec<Mo
     result
 }
 
+fn probe_config(user: &Path) -> Value {
+    let mut config = serde_json::Map::from_iter([
+        ("auto_update".into(), json!(false)), ("notify".into(), json!("never")),
+        ("read_config_from".into(), json!({"agents_standard": false, "cursor": false, "windsurf": false, "claude": false, "copilot": false, "opencode": false, "zed": false})),
+    ]);
+    let model = std::fs::read_to_string(user)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&kiln_cd::jsonc::strip(&text)).ok())
+        .and_then(|v| v.pointer("/agent/model").and_then(Value::as_str).map(str::to_owned));
+    if let Some(model) = model {
+        config.insert("agent".into(), json!({"model": model}));
+    }
+    Value::Object(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +157,42 @@ mod tests {
         state.finish(start + Duration::from_secs(1), true);
         assert!(!state.begin(start + Duration::from_secs(60)));
         assert!(!state.begin(start + Duration::from_secs(86400)));
+    }
+
+    #[test]
+    fn the_probe_keeps_only_the_users_default_model_from_commented_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("devin/config.json");
+        std::fs::create_dir_all(dir.path().join("devin"))?;
+        std::fs::write(&config, r#"{
+            // Devin supports comments in the native user config.
+            "agent": {"model": "gpt-6-sol-medium", "subagent_model": "other"},
+            "auto_update": true, "notify": "always",
+            "read_config_from": {"claude": true},
+            "mcpServers": {"synthetic": {"command": "must-not-start"}},
+            "hooks": {"session_start": "must-not-run"},
+            "ignored": "https://example.test// /* stays quoted */",
+            /* A block comment, too. */
+            "permissions": {"allow": ["*"]}
+        }"#)?;
+        assert_eq!(probe_config(&config), json!({
+            "agent": {"model": "gpt-6-sol-medium"}, "auto_update": false, "notify": "never",
+            "read_config_from": {"agents_standard": false, "cursor": false, "windsurf": false, "claude": false, "copilot": false, "opencode": false, "zed": false}
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn absent_invalid_or_non_string_default_models_keep_the_native_fallback() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config.json");
+        let default = probe_config(&config);
+        assert!(default.get("agent").is_none());
+        for text in ["not json", "{}", r#"{"agent": {"model": null}}"#, r#"{"agent": {"model": 42}}"#, r#"{"model": "other", "mcpServers": {"model": "decoy"}}"#] {
+            std::fs::write(&config, text)?;
+            assert_eq!(probe_config(&config), default);
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -183,7 +232,7 @@ mod tests {
                 json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "catalog", "configOptions": options("default")}}),
                 json!({"jsonrpc": "2.0", "id": 3, "result": {"configOptions": options("careful")}}),
             ])?;
-            let models = discover(program, Duration::from_secs(5)).await?;
+            let models = discover(program, Duration::from_secs(5), &dir.path().join("user-config.json")).await?;
             assert_eq!(models.iter().map(|m| (m.id.as_str(), m.efforts.clone(), m.default)).collect::<Vec<_>>(), [
                 ("default", vec!["high".to_owned()], true),
                 ("careful", vec!["high".to_owned(), "max".to_owned()], false),
@@ -207,7 +256,7 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let program = agent(dir.path(), &[])?;
             let start = std::time::Instant::now();
-            assert!(discover(program, Duration::from_millis(200)).await.is_err());
+            assert!(discover(program, Duration::from_millis(200), &dir.path().join("user-config.json")).await.is_err());
             assert!(start.elapsed() < Duration::from_secs(5));
             cleaned(dir.path())?;
             Ok(())
@@ -226,7 +275,7 @@ mod tests {
                     {"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high", "options": [{"value": "high", "name": "High"}]}
                 ]}}),
             ])?;
-            let models = discover(program, Duration::from_millis(200)).await?;
+            let models = discover(program, Duration::from_millis(200), &dir.path().join("user-config.json")).await?;
             assert_eq!(models.iter().find(|m| m.default).map(|m| m.efforts.clone()), Some(vec!["high".into()]));
             assert!(models.iter().find(|m| m.id == "unknown").is_some_and(|m| m.efforts.is_empty()));
             cleaned(dir.path())?;
@@ -239,9 +288,17 @@ mod tests {
     fn installed_devin_lists_models_and_their_efforts_without_a_prompt() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let program = crate::os::which("devin").ok_or_else(|| anyhow::anyhow!("no Devin CLI"))?;
-            let models = discover(program, Duration::from_secs(20)).await?;
+            anyhow::ensure!(std::env::var_os("DEVIN_MODEL").is_none(), "unset DEVIN_MODEL to check the configured default");
+            let dir = tempfile::tempdir()?;
+            let config = dir.path().join("devin/config.json");
+            let models = discover(program.clone(), Duration::from_secs(20), &config).await?;
             anyhow::ensure!(!models.is_empty(), "Devin did not list any models");
             anyhow::ensure!(models.iter().any(|m| m.default && !m.efforts.is_empty()), "Devin did not list its default model's efforts");
+            let chosen = models.iter().find(|m| !m.default && !m.efforts.is_empty()).ok_or_else(|| anyhow::anyhow!("Devin did not list another model with efforts"))?;
+            std::fs::create_dir_all(dir.path().join("devin"))?;
+            std::fs::write(&config, format!("// Synthetic user default.\n{}\n", json!({"agent": {"model": chosen.id}})))?;
+            let configured = discover(program, Duration::from_secs(20), &config).await?;
+            anyhow::ensure!(configured.iter().any(|m| m.default && m.id == chosen.id && m.efforts == chosen.efforts), "Devin's configured default and its efforts were not kept");
             eprintln!("Devin listed {} models; {} have effort choices", models.len(), models.iter().filter(|m| !m.efforts.is_empty()).count());
             Ok(())
         })

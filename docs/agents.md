@@ -21,11 +21,14 @@ settings, interruption, queueing, resume and native terminal discovery were test
 Devin CLI 3000.11.92.
 
 Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
-in a temporary configuration, with imports, MCP servers and automatic updates off. It sends no
+in a temporary configuration that keeps its native default model, with imports, MCP servers and
+automatic updates off. It sends no
 prompts. Each model's effort choices are read from the agent and kept in the existing model
 cache for the start dialog. Shared effort choices are offered only when every listed model
-supports them; choosing a model shows its own levels. The native permission modes are available
-before discovery finishes.
+supports them. The start dialog uses the native default model's levels before a model is chosen,
+then the chosen model's own levels. Resuming keeps the conversation's model and sends a selected
+effort only if that model supports it. The native permission modes are available before discovery
+finishes.
 
 ACP sessions prefer [config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
 (`configOptions`) over the older `modes` and `models` fields. The first select
