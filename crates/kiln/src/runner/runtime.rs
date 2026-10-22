@@ -2098,7 +2098,14 @@ impl Leg {
         let open = a.network.is_none() || in_microvm();
         let job = match (&a.job_container, &a.executor.image) {
             (Some(c), _) => Some(super::docker::Spec { docker_socket: open, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
-            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: open && self.docker_inside(), ..super::docker::Spec::default() }),
+            (None, Some(image)) if a.executor.kind == "docker" => {
+                let socket = open && self.docker_inside();
+                // The leg's machine is a container whose files the host's daemon doesn't see, as a
+                // hosted runner's it would: what `cross` bind-mounts through it (the image's Rust
+                // toolchain) isn't there. Its remote mode copies them into volumes instead.
+                let env = if socket { vec![("CROSS_REMOTE".to_owned(), "1".to_owned())] } else { Vec::new() };
+                Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: socket, env, ..super::docker::Spec::default() })
+            }
             _ => None,
         };
         // A test build's full disk (W22-AC04): the job container's workspace, a volume that small.

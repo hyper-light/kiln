@@ -3872,7 +3872,10 @@ enforcement points to W18, agent isolation to W20.
   Docker CLI with buildx and compose. These legs keep the host's paths for the workspace, temp
   and action directories, so `docker run -v $GITHUB_WORKSPACE:/src` mounts what the step sees.
   Every docker leg on a runner has its workspace at the same depth, so a cache saved relative to
-  it restores in any other.
+  it restores in any other. What's only in the image (its Rust toolchain) isn't the host's to
+  mount, so `cross`, which mounts it, runs in its remote mode there (`CROSS_REMOTE=1`): it copies
+  what it needs into Docker volumes. Its in-container mode wants Docker's `overlay2` driver, and
+  an engine with the containerd image store has `overlayfs` (the corpus's ripgrep and bat).
 - *Done.* What a runner leaves behind goes:
   - A runner's legs' networks and containers and its pools' executors carry its label. The label
     comes from its work directory, so each runner on an engine has its own.
@@ -6785,12 +6788,13 @@ and AC02.
   each run's conclusion, its jobs' conclusions and their annotations, as JSON. `kiln` runs them on
   a server's native repository, `github` on a public repository the user owns (their token), and
   `compare` lists every difference (kiln's annotations counted as GitHub shows a job's, W06-R16).
-  - On kiln (the conformance lab at 3bc7547): matrix outputs take the last leg to finish; a
-    status function under cancellation runs as GitHub's do; 50 calls of different reusable
-    workflows run, and a 51st fails the run there; 51 of the same one run; 11 levels of
-    workflows run (the caller and ten nested); every annotation is kept (R16's 1,000); an
-    oversized step summary is a warning. Numbers interpolate as `12345678901234567000`, `1000`,
-    `0.1` and `16`.
+  - On kiln (the conformance lab at 860ff42): matrix outputs take the last leg to finish, and
+    an empty value written last leaves the one before it; a status function under cancellation
+    runs as GitHub's do, and a cancelled step (in its job container) gets SIGINT, then SIGTERM 7 s
+    on (7.5); 50 calls of different reusable workflows run, and a 51st fails the run there; 51 of
+    the same one run; 11 levels of workflows run (the caller and ten nested); every annotation is
+    kept (R16's 1,000); an oversized step summary is a warning. Numbers interpolate as
+    `12345678901234567000`, `1000`, `0.1` and `16`.
   - Found on the way, and fixed: a cancelled step in a job container was never signalled (W05's
     AC07 note), and the probes' own matrix one didn't test an empty value written last.
 - *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and

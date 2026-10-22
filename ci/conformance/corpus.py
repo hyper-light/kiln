@@ -12,7 +12,8 @@ written from all of them, with the reason for each run that didn't pass.
 
     python3 -I ci/conformance/corpus.py --server http://127.0.0.1:17070 \\
         --token-file <data_dir>/admin.token --work <a directory for the repositories> \\
-        --out <a directory for the results> [--only owner/name ...] [--timeout SECONDS]
+        --out <a directory for the results> [--only owner/name ...] [--timeout SECONDS] \\
+        [--pass NAME]
 
 The server's runners must route `ubuntu-latest` (`[ci] github_labels = true`) and give legs
 Docker, as for the starter workflows (ci/conformance/starters.py).
@@ -179,15 +180,21 @@ def wait_reason(w):
     return r.replace("-", " ")
 
 
+# A line that says what went wrong (not a shell's `set -x` trace of what ran after).
+ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|exception)\b")
+
+
 def leg_detail(api, leg):
-    """The failing step's name and its last useful line."""
+    """The failing step's name and its last useful line: the last that reads as an error, else
+    the last."""
     try:
         f = api.call("GET", f"/api/ci/legs/{leg['id']}/logs/failure")
     except RuntimeError:
         return "", ""
     lines = [re.sub(r"\x1b\[[0-9;]*m", "", x.get("text", "")).strip() for x in (f or {}).get("lines") or []]
     lines = [x for x in lines if x and not x.startswith("[command]")]
-    return (f or {}).get("step_name") or "", (lines[-1] if lines else "")[:300]
+    said = next((x for x in reversed(lines) if ERRORISH.search(x) and not x.startswith("+ ")), lines[-1] if lines else "")
+    return (f or {}).get("step_name") or "", said[:300]
 
 
 # The empty tree: git has it without its being stored.
@@ -196,19 +203,22 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 EVENTS = ("pull_request", "push")
 
 
-def commits(dest, repo):
+def commits(dest, repo, name=""):
     """An empty trunk and, on it, the tree with only F-03's workflows (kept as tags, so a second
-    invocation reads the runs of the first): their shas."""
-    have = [git(dest, "rev-parse", "--verify", "-q", f"refs/tags/kiln-corpus-{t}", check=False) for t in ("trunk", "tree")]
+    invocation reads the runs of the first): their shas. A pass with a `name` has commits of its
+    own (the name in their messages), so its runs are its own, not an earlier pass's."""
+    key = f"kiln-corpus-{name}-" if name else "kiln-corpus-"
+    have = [git(dest, "rev-parse", "--verify", "-q", f"refs/tags/{key}{t}", check=False) for t in ("trunk", "tree")]
     if all(have):
         return have[0], have[1]
     tree = git(dest, "rev-parse", only_corpus(dest, repo) + "^{tree}")
-    trunk = git(dest, "commit-tree", EMPTY_TREE, "-m", "F-03: an empty trunk")
+    stamp = f" (pass {name})" if name else ""
+    trunk = git(dest, "commit-tree", EMPTY_TREE, "-m", f"F-03: an empty trunk{stamp}")
     # A diff's commit names its change (W14-R03).
     change = "I" + hashlib.sha1(f"F-03 {repo}".encode()).hexdigest()
-    top = git(dest, "commit-tree", tree, "-p", trunk, "-m", f"F-03: {repo}, its corpus workflows alone\n\nChange-Id: {change}")
-    git(dest, "tag", "-f", "kiln-corpus-trunk", trunk)
-    git(dest, "tag", "-f", "kiln-corpus-tree", top)
+    top = git(dest, "commit-tree", tree, "-p", trunk, "-m", f"F-03: {repo}, its corpus workflows alone{stamp}\n\nChange-Id: {change}")
+    git(dest, "tag", "-f", f"{key}trunk", trunk)
+    git(dest, "tag", "-f", f"{key}tree", top)
     return trunk, top
 
 
@@ -294,7 +304,7 @@ def run_repo(api, args, repo, commit):
     (`push`). Their results, by event."""
     print(f"{repo}: preparing", flush=True)
     dest, branch = snapshot(args.work, repo, commit)
-    trunk, top = commits(dest, repo)
+    trunk, top = commits(dest, repo, args.pass_name or "")
     native(api, repo, branch)
     push(api, dest, repo, f"{trunk}:refs/heads/{branch}")
     corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
@@ -365,6 +375,7 @@ def main():
     ap.add_argument("--out", required=True, help="where each repository's results go")
     ap.add_argument("--only", nargs="*", help="these repositories (owner/name)")
     ap.add_argument("--timeout", type=int, default=7200, help="seconds to wait for one repository's runs")
+    ap.add_argument("--pass", dest="pass_name", help="a pass of its own (new commits, so new runs, as after a change to kiln); the same name and --out go on with it")
     args = ap.parse_args()
     api = Api(args.server, open(args.token_file).read().strip())
     os.makedirs(args.work, exist_ok=True)
