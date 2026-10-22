@@ -192,9 +192,10 @@ pub struct Copy {
     pub gone: HashSet<String>,
     /// The filesystem its folder is on (the machine's own; a simulated one in kiln-sim's models).
     pub fs: Arc<dyn Fs>,
-    /// Folders whose names this copy changed (a file renamed in or removed, a folder made or
-    /// removed) since its state was last saved: synced before it is ([`Copy::sync_dirs`]), so a
-    /// power loss can't undo what the saved state says the folder holds. One entry a folder.
+    /// Folders whose names changed since its state was last saved: its own (a file renamed in or
+    /// removed, a folder made or removed) and the contents store's its contents went into. Synced
+    /// before the state is ([`Copy::sync_dirs`]), so a power loss can't undo what the saved state
+    /// says the folder holds, or take the contents its steps carry. One entry a folder.
     pub touched: BTreeSet<PathBuf>,
     /// A test build's planted bug (kiln-sim's T-T6.1.1): what sync writes into the folder renamed
     /// in with its bytes unsynced and its folder never synced, as before the first bug kiln-sim
@@ -385,6 +386,10 @@ impl Copy {
             }
             changes.push(Change { path, to: here, base: expected });
         }
+        // The store's folders its new contents went into: synced with this copy's before the
+        // state that names them is saved, or a power loss could keep the steps and lose what they
+        // carry.
+        self.touched.extend(blobs.take_touched());
         self.state.seen = found;
         for c in &changes {
             self.state.pending.insert(c.path.clone(), c.to.clone());

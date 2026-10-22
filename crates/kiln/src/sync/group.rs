@@ -393,6 +393,8 @@ impl Feed {
     /// Takes what the log committed into the folder, as far as the contents here allow: empty when
     /// it is through, else the blobs it waits for.
     pub fn work(&mut self, blobs: &Blobs) -> io::Result<Vec<String>> {
+        // What came into the store since (fetched contents): its folders synced at the next save.
+        self.copy.touched.extend(blobs.take_touched());
         let mut moved = false;
         let lacking = |needs: Vec<String>| -> Vec<String> { needs.into_iter().filter(|h| !blobs.has(h)).collect() };
         if let Some(tree) = self.install.clone() {

@@ -196,6 +196,8 @@ struct Machine {
     /// The group's log on this machine's disk: kept across its runner's crashes.
     log: RamStore,
     runner: Option<Runner>,
+    /// Its runner's contents store, as the runner holds it (once, its clones sharing it).
+    blobs: Option<Blobs>,
     /// The person's last act on each path: when, and what it wrote (none: deleted).
     last: BTreeMap<String, (Duration, Option<Vec<u8>>)>,
     edits: u64,
@@ -361,6 +363,7 @@ impl Sim {
                 blobs_dir,
                 log: RamStore::new(),
                 runner: None,
+                blobs: None,
                 last: BTreeMap::new(),
                 edits: 0,
             });
@@ -575,7 +578,11 @@ impl Sim {
         match leg {
             Leg::Leaving { to, since } => {
                 let ready = !self.net.is_cut(now, node(Who::Server), node(Who::M(at)));
-                let Some(blobs) = self.blobs(at) else { return Ok(()) };
+                let Some(blobs) = self.blobs(at) else {
+                    // Its runner is down: it asks again.
+                    self.after(FILES_EVERY, Ev::SessionPoll);
+                    return Ok(());
+                };
                 let mut mark = None;
                 if let Some(rn) = self.machines.get_mut(at).and_then(|mc| mc.runner.as_mut()) {
                     let feed = rn.r.machine_mut();
@@ -696,7 +703,7 @@ impl Sim {
         let Some(mc) = self.machines.get_mut(m) else { return Ok(()) };
         mc.disk.thaw();
         let blobs = Blobs::on(Arc::clone(&mc.fs), &mc.blobs_dir).map_err(|err| format!("{}: its contents store wouldn't open after a restart: {err}", mc.name))?;
-        drop(blobs);
+        mc.blobs = Some(blobs);
         let feed = Feed::open_on(Arc::clone(&mc.fs), &mc.root, &mc.name, mc.member, Limits::default(), mc.state.clone())
             .map_err(|err| format!("{}'s copy wouldn't open after a restart: {err:#}", mc.name))?;
         let mut feed = feed;
@@ -726,6 +733,7 @@ impl Sim {
         let back = self.rng.span(Duration::from_secs(1), Duration::from_secs(20));
         let Some(mc) = self.machines.get_mut(m) else { return };
         let Some(mut rn) = mc.runner.take() else { return };
+        mc.blobs = None;
         mc.log = after_crash(rn.r.log_mut());
         drop(rn);
         if power {
@@ -740,9 +748,9 @@ impl Sim {
         }
     }
 
+    /// Machine `m`'s runner's contents store: none while it's down.
     fn blobs(&self, m: usize) -> Option<Blobs> {
-        let mc = self.machines.get(m)?;
-        Blobs::on(Arc::clone(&mc.fs), &mc.blobs_dir).ok()
+        self.machines.get(m)?.blobs.clone()
     }
 
     /// One drive of machine `m`'s runner, as `sync::runner`'s owner drives it.
@@ -1633,6 +1641,69 @@ mod tests {
         let got = disk.read("/home/m2/repo/a.txt").ok();
         if got.as_deref() != Some(&b"one!"[..]) {
             return Err(format!("the kept-back version never came: a.txt holds {got:?}"));
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, AC-T6.1.3: the sixth bug kiln-sim found, by its seeds: the contents store renamed
+    /// what a look put in it into its folders and never synced them, so a power loss on a disk
+    /// that keeps each folder's names apart, as POSIX allows, could lose them while the state
+    /// naming them, saved and synced, survived. The copy's steps carrying them could never be sent,
+    /// and its changes stayed pending for good (sync seeds 12 and 14, moves 12 and 14).
+    #[test]
+    fn the_seeds_where_contents_a_look_kept_were_lost_converge() -> Result<(), String> {
+        for seed in [12, 14] {
+            run(seed, 0, Plant::default(), Mode::Sync)?;
+            run(seed, 0, Plant::default(), Mode::Moves)?;
+        }
+        Ok(())
+    }
+
+    /// CP-T6.1, AC-T6.1.3: the sixth bug's contract: once a copy has saved the state that names
+    /// the contents a look put in its store, a power loss leaves the store holding every one its
+    /// unsent steps carry; on either way of journaling names.
+    #[test]
+    fn contents_a_look_kept_outlive_a_power_loss_once_the_state_naming_them_is_saved() -> Result<(), String> {
+        for seed in 0..200u64 {
+            let disk = Disk::new(SimClock::new(), Rng::new(seed), DiskFaults { fsync_commits_names: seed % 2 == 0, ..DiskFaults::none() });
+            let fs: Arc<dyn Fs> = Arc::new(SimFs::new(disk.clone()));
+            let (root, state, store) = (PathBuf::from("/home/m2/repo"), PathBuf::from("/state/m2/copy.json"), PathBuf::from("/state/m2/blobs"));
+            for dir in ["/home/m2/repo/docs/c", "/state/m2"] {
+                disk.create_dir_all(dir).map_err(e)?;
+                disk.make_durable(dir);
+            }
+            // A person's files, saved durably.
+            for (path, len) in [("a.txt", 10), ("src.rs", 5000), ("docs/c/d.md", 300)] {
+                let full = format!("/home/m2/repo/{path}");
+                disk.write(&full, &filled(path, len)).map_err(e)?;
+                disk.make_durable(&full);
+            }
+            let blobs = Blobs::on(Arc::clone(&fs), &store).map_err(e)?;
+            let mut feed = Feed::open_on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), state.clone()).map_err(e)?;
+            if feed.copy.propose(&blobs, SIM_EPOCH_MS).map_err(e)?.is_empty() {
+                return Err(format!("seed {seed}: the look proposed nothing"));
+            }
+            feed.save().map_err(e)?;
+            disk.power_loss();
+            let blobs = Blobs::on(Arc::clone(&fs), &store).map_err(e)?;
+            let feed = Feed::open_on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), state).map_err(e)?;
+            let carried: Vec<&String> = feed
+                .copy
+                .state
+                .sent
+                .iter()
+                .flat_map(|s| s.changes.iter())
+                .filter_map(|c| match &c.to {
+                    Some(Version::File { hash, .. }) => Some(hash),
+                    _ => None,
+                })
+                .collect();
+            if carried.len() != 3 {
+                return Err(format!("seed {seed}: the saved state's unsent steps carry {} contents, not 3", carried.len()));
+            }
+            if let Some(gone) = carried.iter().find(|h| !blobs.has(h)) {
+                return Err(format!("seed {seed}: after a power loss the store lacks {gone}, which the saved state's unsent steps carry"));
+            }
         }
         Ok(())
     }

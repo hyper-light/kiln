@@ -1,6 +1,7 @@
 //! Contents, addressed by their SHA-256: a step names a file's new contents by hash, and the copy
 //! that applies it reads them from here (fetched from a member that has them, when it doesn't).
 
+use std::collections::BTreeSet;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +19,10 @@ const CHUNK: usize = 64 * 1024;
 pub struct Blobs {
     dir: PathBuf,
     fs: Arc<dyn Fs>,
+    /// Its folders whose names changed (contents renamed in, a folder made for them) since a copy
+    /// last took them ([`Blobs::take_touched`]): synced with the copy's own before its state names
+    /// what's in them. Clones share it.
+    touched: Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,
 }
 
 impl std::fmt::Debug for Blobs {
@@ -60,7 +65,32 @@ impl Blobs {
     /// A store at `dir` on `fs`.
     pub fn on(fs: Arc<dyn Fs>, dir: &Path) -> io::Result<Self> {
         fs.create_dir_all(dir)?;
-        Ok(Self { dir: dir.to_owned(), fs })
+        Ok(Self { dir: dir.to_owned(), fs, touched: Arc::default() })
+    }
+
+    /// The folders whose names it changed since this was last asked: what a copy syncs with its
+    /// own before its state names what's in them (`Copy::sync_dirs`).
+    pub fn take_touched(&self) -> BTreeSet<PathBuf> {
+        std::mem::take(&mut *self.touched.lock())
+    }
+
+    /// Makes `dest`'s folder, noting the store's own when it's new: its name changed.
+    fn make_folder(&self, dest: &Path) -> io::Result<()> {
+        if let Some(dir) = dest.parent() {
+            let made = self.fs.meta(dir).is_err();
+            self.fs.create_dir_all(dir)?;
+            if made {
+                self.touched.lock().insert(self.dir.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes that a blob was renamed into `dest`'s folder.
+    fn renamed_in(&self, dest: &Path) {
+        if let Some(dir) = dest.parent() {
+            self.touched.lock().insert(dir.to_owned());
+        }
     }
 
     /// The filesystem it's on: what a copy beside it writes its folder on.
@@ -115,13 +145,12 @@ impl Blobs {
             let _ = self.fs.remove_file(&tmp);
             return Err(io::Error::other("a SHA-256 that isn't one"));
         };
-        if let Some(parent) = dest.parent() {
-            self.fs.create_dir_all(parent)?;
-        }
+        self.make_folder(&dest)?;
         if super::fs::is_file(self.fs.as_ref(), &dest) {
             self.fs.remove_file(&tmp)?;
         } else {
             self.fs.rename(&tmp, &dest)?;
+            self.renamed_in(&dest);
         }
         Ok(hash)
     }
@@ -147,10 +176,9 @@ impl Blobs {
             self.fs.remove_file(file)?;
             return Ok(false);
         }
-        if let Some(dir) = dest.parent() {
-            self.fs.create_dir_all(dir)?;
-        }
+        self.make_folder(&dest)?;
         self.fs.rename(file, &dest)?;
+        self.renamed_in(&dest);
         Ok(true)
     }
 
