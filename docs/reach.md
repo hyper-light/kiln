@@ -185,6 +185,7 @@ on its own machine, with its own tools. Its tools:
 | `stop` | stop a background run |
 | `agents_*` | kiln's agents operations (docs/agents.md, "Agents that run agents"): what it starts is its child |
 | `goals_*` | its goal stack (docs/goals.md): without `agent`, its own |
+| `research_*`, `conversations_search` | research it records, each finding graded by kiln from its sources (docs/research.md), and every agent's conversations kiln keeps |
 | `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
 
 **Code mode.** A program runs in the same bounded QuickJS sandbox as the server's code mode

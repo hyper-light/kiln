@@ -323,6 +323,8 @@ export function Inspector({
   // The folder its workspace of its own is laid over, once made (a string: Changes stays memoized).
   const volumeOver = useSession(store, (s) => (s.info?.workspace?.made ? (s.info.workspace.over ?? "") : undefined));
   const state = useSession(store, (s) => s.state);
+  // At work now: the goal under way shimmers.
+  const working = useSession(store, (s) => s.info?.status === "running");
   const meta = useSession(store, (s) => s.meta);
   // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
   const edits = useSameList(React.useMemo(() => (changes ? NO_EVENTS : editsOf(events)), [changes, events]));
@@ -393,7 +395,7 @@ export function Inspector({
                   <PlansHere session={agentId} />
                 </section>
               )}
-              {agentId && <Goals agent={agentId} harness={harness} />}
+              {agentId && <Goals agent={agentId} harness={harness} working={working} />}
             </PlanSourceContext.Provider>
           </div>
         )}

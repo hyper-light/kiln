@@ -144,11 +144,16 @@ fn command_schema(waits: bool) -> Value {
 
 /// The plans operations an agent has as tools: keeping plans, running them and following their
 /// runs (a plan's versions, and deleting one, are code mode's).
-const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
+const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.ready", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
 
 /// kiln's operations an agent uses most: `agents.*`, `goals.*` and most of `plans.*`.
 fn agent_ops() -> Vec<crate::ops::Op> {
-    crate::harness::ops::list_ops().into_iter().chain(crate::goals::ops::list_ops()).chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name))).collect()
+    crate::harness::ops::list_ops()
+        .into_iter()
+        .chain(crate::goals::ops::list_ops())
+        .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
+        .chain(crate::research::ops::list_ops())
+        .collect()
 }
 
 /// [`agent_ops`] as tools of their own (`agents_start`, `goals_add`, `plans_run`, …), asked of the

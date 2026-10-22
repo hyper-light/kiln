@@ -1,8 +1,11 @@
 /**
- * One plan: written or changed in place (each saved change a version), its steps as they will run,
- * run on an agent (one that runs, or a new one; as one message, step by step, or as goals), shared
- * by a link, exported, its versions and runs. Everything in the page's flow. A plan that isn't
- * there (deleted, or a wrong link) says so.
+ * One plan: written or changed in place (each saved change a version), its steps as they will run
+ * (as their graph: side by side where they don't wait for each other), its research (what its steps
+ * rest on, each finding graded), run on an agent (one that runs, or a new one; as one message, step
+ * by step, as goals, or an agent per step), shared by a link, exported, its versions and runs. A
+ * plan made from a goal is planned first: its agent researches it and writes its steps, and it runs
+ * once it's ready. Everything in the page's flow. A plan that isn't there (deleted, or a wrong link)
+ * says so.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
@@ -19,6 +22,9 @@ import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Prose } from "@/views/harness/parts";
+import { PrismLabel } from "@/views/harness/signals";
+import { ResearchPanel } from "@/views/research/research";
+import { effectiveNeeds, PlanGraph } from "./graph";
 import { PlanItemsEditor } from "./items";
 import { itemsMarkdown, planMarkdown, planSteps } from "./steps";
 import "./plans.css";
@@ -142,6 +148,8 @@ function PlanEditor({ id }: { id: string }) {
   if (plan && keyOf(plan) !== base?.key && !dirty) take(plan);
 
   const steps = items.length ? items.map((it) => it.title || "Untitled step") : planSteps(body);
+  // What each step waits for, as it'll run: as they say, or each the one before.
+  const waits = effectiveNeeds(items.map((x) => x.needs));
 
   const save = async () => {
     setBusy(true);
@@ -173,9 +181,26 @@ function PlanEditor({ id }: { id: string }) {
       <PlanCrumbs />
       {plan && (
         <p className="plan-dim plan-meta">
+          {plan.phase === "planning" && (
+            <>
+              <PrismLabel live sweep className="plan-phase">
+                Being planned
+              </PrismLabel>{" "}
+              ·{" "}
+            </>
+          )}
           v{plan.version} · changed {relativeTime(plan.updated_at)}
           {plan.runs ? ` · run ${plan.runs}×` : ""}
           {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
+          {plan.source?.goal && (
+            <>
+              {" · made from the goal "}
+              <Link to={`/agents/${encodeURIComponent(plan.source.goal.agent)}`}>
+                &ldquo;{plan.source.goal.text.length > 80 ? `${plan.source.goal.text.slice(0, 80)}…` : plan.source.goal.text}&rdquo;
+              </Link>
+              {", met once every step is"}
+            </>
+          )}
         </p>
       )}
       <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="From its text, or its first step, when left empty" />
@@ -204,13 +229,23 @@ function PlanEditor({ id }: { id: string }) {
           <div className="plan-preview">
             <div className="field-label">Preview</div>
             {body.trim() || items.length ? <Prose text={[body.trim(), itemsMarkdown(items)].filter(Boolean).join("\n\n")} /> : <p className="plan-dim">Nothing yet.</p>}
-            <div className="field-label plan-steps-label">{steps.length ? `${steps.length} step${steps.length === 1 ? "" : "s"}, as they run one by one` : "No steps: it runs as one message"}</div>
-            {steps.length > 0 && (
-              <ol className="plan-steps">
-                {steps.map((s, i) => (
-                  <li key={i}>{s}</li>
-                ))}
-              </ol>
+            <div className="field-label plan-steps-label">
+              {!steps.length
+                ? "No steps: it runs as one message"
+                : items.some((it) => it.needs?.length)
+                  ? `${steps.length} steps, side by side where they don't wait for each other`
+                  : `${steps.length} step${steps.length === 1 ? "" : "s"}, as they run one by one`}
+            </div>
+            {items.length > 1 ? (
+              <PlanGraph label="Its steps, as they'll run" steps={items.map((it, i) => ({ n: i + 1, title: it.title, needs: waits[i] ?? [] }))} />
+            ) : (
+              steps.length > 0 && (
+                <ol className="plan-steps">
+                  {steps.map((s, i) => (
+                    <li key={i}>{s}</li>
+                  ))}
+                </ol>
+              )
             )}
           </div>
         )}
@@ -230,11 +265,24 @@ function PlanEditor({ id }: { id: string }) {
         )}
         {error && <span className="plan-error">{error}</span>}
       </div>
+      {plan?.research && (
+        <section className="plan-section" aria-label="Research">
+          <h2 className="plan-h">Research</h2>
+          <ResearchPanel id={plan.research} live={plan.phase === "planning"} />
+        </section>
+      )}
       {plan && (
         <>
-          <Loadable label="where it can run" fallback={<RunHold />}>
-            <RunPlan plan={plan} dirty={dirty} onRan={() => invalidate(`plans/${plan.id}`)} />
-          </Loadable>
+          {plan.phase === "planning" ? (
+            <section className="plan-section" aria-label="Run the plan">
+              <h2 className="plan-h">Run it</h2>
+              <p className="plan-dim">Being planned: its agent is researching it and writing its steps. It runs once the agent says it&rsquo;s ready.</p>
+            </section>
+          ) : (
+            <Loadable label="where it can run" fallback={<RunHold />}>
+              <RunPlan plan={plan} dirty={dirty} onRan={() => invalidate(`plans/${plan.id}`)} />
+            </Loadable>
+          )}
           <SharePlan plan={plan} onChange={(p) => res.setData(() => p)} />
           <Loadable label="its versions and runs" fallback={<RowsHold rows={2} rowHeight={44} />}>
             <Versions
