@@ -1,6 +1,6 @@
 ---
 name: kiln-plans
-description: Turn a document, a list or a request into a kiln goal stack you pursue yourself (saying each goal met, splitting one into parts, pausing for a while), or into a plan kiln keeps and runs (as one message, a step a turn, as goals, or with an agent of its own for each step, steps that don't wait for each other side by side, its work coming back as a stack of changes). Use when asked to make a goal stack or a plan, to work through a list item by item until each is done, to turn a plan step's acceptance criteria and tests into goals, or to hand each step of a plan to its own agent.
+description: Turn a document, a list or a request into a kiln goal stack you pursue yourself (saying each goal met, splitting one into parts, pausing for a while), turn a goal into a researched plan (research inside and outside, each finding graded by kiln from its sources, then steps that rest on them), or into a plan kiln keeps and runs (as one message, a step a turn, as goals, or with an agent of its own for each step, steps that don't wait for each other side by side, its work coming back as a stack of changes). Use when asked to make a goal stack or a plan, to plan a goal, to research something and present what you found with its sources and how far to trust it, to work through a list item by item until each is done, to turn a plan step's acceptance criteria and tests into goals, or to hand each step of a plan to its own agent.
 ---
 
 # Goal stacks and plans
@@ -14,10 +14,12 @@ kiln keeps two things that carry work on past one turn:
   one gives it to an agent: as one message, a step a turn, each step a goal, or each step to an
   agent of its own.
 
-The tools are `goals_get`, `goals_add`, `goals_done`, `goals_split`, `goals_update`,
-`goals_set`, `goals_control`, and `plans_create`, `plans_list`, `plans_get`, `plans_update`,
-`plans_run`, `plans_runs_list`, `plans_runs_get`, `plans_runs_stop`, `plans_runs_retry` (in
-code mode `kiln.goals.*` and `kiln.plans.*`).
+The tools are `goals_get`, `goals_add`, `goals_done`, `goals_split`, `goals_plan`,
+`goals_update`, `goals_set`, `goals_control`; `plans_create`, `plans_list`, `plans_get`,
+`plans_update`, `plans_ready`, `plans_run`, `plans_runs_list`, `plans_runs_get`,
+`plans_runs_stop`, `plans_runs_retry`; and `research_start`, `research_add`, `research_get`,
+`research_list`, `conversations_search` (in code mode `kiln.goals.*`, `kiln.plans.*`,
+`kiln.research.*`).
 
 ## Your own goal stack
 
@@ -85,8 +87,68 @@ met: `goals_done`).
 
 A goal made from a plan's step (`step` in `goals_get`) needs no parts: `goals_split` alone
 splits it into the step's acceptance criteria and its tests, a goal each ("…, acceptance
-criterion 1 of 3: p99 latency is at most 200 ms"). Said met, a goal takes its parts still to go
-with it.
+criterion 1 of 3: p99 latency is at most 200 ms"), and once they're all met so is the step, with
+no check of its own. Said met, a goal takes its parts still to go with it.
+
+### Turning a goal into a plan: `goals_plan`
+
+A goal that needs thinking through before it's done becomes a plan kiln keeps: `goals_plan`
+(the goal under way, or `id`) makes a plan in its planning phase, with research of its own, and
+puts one part before the goal: planning it. Then, in this order:
+
+1. **Research it** (below): inside and outside, recording what you find as you go.
+2. **Write its steps** with `plans_update` (`items`): each with what to do, its acceptance
+   criteria and tests, the steps it waits for (`needs`) and the findings it rests on (`basis`:
+   `["f1", "f3"]`).
+3. **Say it's ready**: `plans_ready` `{id, then}`. It refuses with no steps, no sources inside or
+   outside (`skipped: {external: "why"}` when one truly can't apply), or a `basis` naming a finding
+   that isn't there. It answers with the research (`research`, its markdown) and warnings (steps
+   resting on nothing, or on findings graded D or F): **show the person the research in your
+   reply, as it is** (every claim with its grade, score and sources), and the warnings. `then`:
+   `goals` (the default: its steps become this goal's parts, here), `review` (the same, the stack
+   paused for the person to look first), `agents` (it runs with an agent per step; the goal waits
+   for the run).
+
+Once every step is met, so is the goal: you don't say it's met yourself.
+
+## Research: sources and grades
+
+Research is what you found out, kept in kiln with where you found it. `research_start`
+`{question}` begins it (a plan made with `goals_plan` has one already: its `research`), and
+`research_add` records sources and findings as you go:
+
+```js
+// research_add: each finding a claim, each citation the source, the exact words, where they are
+{ "id": "<research>", "findings": [
+  { "claim": "kiln's conversation store already searches every agent's events",
+    "cites": [{ "source": { "type": "code", "title": "store.rs", "locator": "crates/kiln/src/convo/store.rs:396" },
+                "quote": "pub fn search(&self, q: Query)" }] },
+  { "claim": "SQLite's trigram tokenizer finds substrings",
+    "cites": [{ "source": { "type": "docs", "title": "FTS5", "locator": "https://sqlite.org/fts5.html#the_trigram_tokenizer" },
+                "quote": "The experimental trigram tokenizer extends FTS5 to support substring matching" }],
+    "against": [{ "claim": "trigram indexes grow three to four times larger", "cites": [{ "source": "s3" }] }] }
+] }
+```
+
+- **Look inside and outside.** Inside: the files on your machine and others (code, docs, data,
+  pictures; frames of a video with ffmpeg), commands you run (a `measurement`: the command as its
+  locator, what it printed as the quote), and kiln's own records: `conversations_search` for what
+  agents tried, decided or found before (cite a hit as `record`, locator `agent:<id>`), plans, CI
+  runs, deployments. Outside: the web, standards and official docs, papers (arXiv, Semantic
+  Scholar, Crossref, PubMed), books, news, blogs, forums.
+- **Quote exactly**, and say where: kiln looks for each quote where you cite it (a file or page
+  read from your machine, a measurement in your own tool output) and a quote it can't find there
+  counts for little. Say what kind each source is (`type`): code, docs, a paper, a blog and a forum
+  are taken at their word to different degrees.
+- **Record counterclaims** you find, with their sources: they weigh against the claim. Mark a
+  claim you infer (`inferred: true`) rather than read.
+- **Never grade it yourself.** kiln grades each finding A to F (out of 100) the same way every
+  time, from its sources' kinds, how far its citations hold up, how many independent sources agree
+  and what's against it.
+- **Present it with its sources and grades, always.** When you tell a person what you found, in a
+  plan or in conversation, give every claim with its grade, score and sources, as
+  `research_get`'s markdown has them: never a claim without where it comes from and how far it's
+  to be trusted.
 
 ### Changing one goal, pausing, resuming
 

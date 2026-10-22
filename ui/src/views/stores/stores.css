@@ -314,18 +314,105 @@
   }
 }
 
-/* Each store's dashboard. */
-.cv-table td.cv-key {
-  max-width: 260px;
+/* The stores' table: its columns fixed and its figures one width each, so nothing moves as the
+   values change every two seconds; what doesn't fit its column ends in an ellipsis. Each column is
+   left out below the width its cells are (Tailwind's sm, md, lg and xl). */
+.cv-table {
+  table-layout: fixed;
+  font-variant-numeric: tabular-nums;
 }
+.cv-table col.cv-c-dot {
+  width: 40px;
+}
+.cv-table col.cv-c-state {
+  width: 196px;
+}
+.cv-table col.cv-c-file {
+  width: 84px;
+}
+.cv-table col.cv-c-free {
+  width: 64px;
+}
+.cv-table col.cv-c-writes {
+  width: 168px;
+}
+.cv-table col.cv-c-rows {
+  width: 124px;
+}
+.cv-table col.cv-c-heard {
+  width: 92px;
+}
+.cv-table col.cv-c-kiln {
+  width: 112px;
+}
+.cv-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cv-writes {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.cv-rate {
+  width: 7ch;
+  text-align: right;
+}
+@media (max-width: 1279px) {
+  .cv-table col.cv-c-kiln {
+    display: none;
+  }
+}
+@media (max-width: 1023px) {
+  .cv-table col.cv-c-rows {
+    display: none;
+  }
+  .cv-table col.cv-c-state {
+    width: 168px;
+  }
+}
+/* A tablet's width holds the writes and when each was heard, but not a store's name beside them:
+   the table scrolls in its frame, as it always has there, rather than cut the names short. */
+@media (min-width: 768px) and (max-width: 1023px) {
+  .cv-table {
+    min-width: 800px;
+  }
+}
+@media (max-width: 767px) {
+  .cv-table col.cv-c-writes,
+  .cv-table col.cv-c-heard {
+    display: none;
+  }
+}
+@media (max-width: 639px) {
+  .cv-table col.cv-c-free {
+    display: none;
+  }
+  .cv-table col.cv-c-dot {
+    width: 30px;
+  }
+  .cv-table col.cv-c-state {
+    width: 132px;
+  }
+  .cv-table col.cv-c-file {
+    width: 72px;
+  }
+}
+
+/* Each store's dashboard. */
 .cv-table tr[data-selected="true"] td {
   background: #121820;
 }
 .cv-table tr button.cv-row {
   all: unset;
-  display: block;
+  display: flex;
+  align-items: center;
   min-width: 0;
   cursor: pointer;
+}
+.cv-row > :not(:first-child) {
+  flex: none;
 }
 /* A store's KPI footers say a little more than a phone's half-width holds: they wrap, never cut. */
 .cv-kpis .kpi-foot {

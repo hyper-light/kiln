@@ -45,8 +45,8 @@ export interface PagesCtx {
   err: (res: http.ServerResponse, status: number, message: string) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
   emit?: (ev: ServerEvent) => void;
-  /** kiln's release pipeline in the simulation: Build every platform starts it. */
-  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null };
+  /** kiln's release pipeline in the simulation: Build every platform starts it; `past`, the runs the kept builds came from, newest first. */
+  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null; past: () => Run[] };
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -661,6 +661,36 @@ const PLANS = [
     updated_at: T0 - 3_600 * 5,
     steps: ["Freeze main", "Run the full bench", "Tag and publish"],
     runs: 2,
+    phase: "ready",
+    research: null,
+  },
+  {
+    id: "pl_quic",
+    title: "QUIC replication",
+    body: "Goal: Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    items: [
+      { title: "Replicate over QUIC", description: "Carry the metadata store's raft log over hyper-quic.", examples: "", acceptance: [{ kind: "qualitative", text: "The replication suite passes on three nodes." }], testing: [], basis: ["f1", "f2"] },
+      {
+        title: "Bench with replication on",
+        description: "",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "Fills stay at least 4x ahead of RocksDB." }, { kind: "qualitative", text: "Gets and seeks stay at least 4x ahead of Splinter." }],
+        testing: [],
+        needs: [1],
+        basis: ["f3"],
+      },
+      { title: "Document the replication protocol", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: ["f1"] },
+    ],
+    tags: ["from a goal"],
+    source: { session: "fam-orch", agent: "Release prep", goal: { agent: "fam-orch", id: "g-quic", text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB" } },
+    share: null,
+    version: 1,
+    created_at: T0 - 3 * 3600,
+    updated_at: T0 - 2 * 3600,
+    steps: ["Replicate over QUIC", "Bench with replication on", "Document the replication protocol"],
+    runs: 1,
+    phase: "planning",
+    research: "rs_quic",
   },
   {
     id: "pl_parser",
@@ -675,6 +705,8 @@ const PLANS = [
     updated_at: T0 - 86_400 * 2,
     steps: ["Read the failing test", "Fix the parser", "Run the suite"],
     runs: 0,
+    phase: "ready",
+    research: null,
   },
   {
     id: "pl_docs",
@@ -689,8 +721,72 @@ const PLANS = [
     updated_at: T0 - 86_400 * 3,
     steps: [],
     runs: 1,
+    phase: "ready",
+    research: null,
   },
 ];
+
+const conf = (score: number, why: string, extra: Record<string, number> = {}) => {
+  const grade = score >= 85 ? "A" : score >= 70 ? "B" : score >= 50 ? "C" : score >= 30 ? "D" : "F";
+  const words = { A: "high", B: "good", C: "moderate", D: "low", F: "very low" }[grade];
+  return { score, grade, words, support: score / 100, against: 0, reliability: 0.9, citation: 1, independent: 2, cites: 2, found: 2, failed: 0, why, ...extra };
+};
+
+/** Research (docs/research.md), as the server answers it: a plan's planning, its findings graded. */
+const RESEARCH = {
+  rs_quic: {
+    id: "rs_quic",
+    question: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    agent: "fam-orch",
+    by: "agent:Release prep",
+    plan: "pl_quic",
+    sources: [
+      { id: "s1", type: "code", title: "hyper-raft's log transport", locator: "crates/hyper-raft/src/transport.rs:88-140", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s2", type: "measurement", title: "the replication suite", locator: "cargo test -p meta-store --test replication", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s3", type: "standard", title: "RFC 9000: QUIC", locator: "https://www.rfc-editor.org/rfc/rfc9000#section-2.2", published: "2021-05", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s4", type: "blog", title: "QUIC under load", locator: "https://example.dev/quic-under-load", published: "2023", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s5", type: "forum", title: "a thread on QUIC and head-of-line blocking", locator: "https://forum.example.org/t/4812", published: "2022", retrieved_at: Date.now() - 3 * 3600_000 },
+    ],
+    findings: [
+      {
+        id: "f1",
+        claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is.",
+        cites: [
+          { source: "s1", quote: "pub trait LogStream: AsyncRead + AsyncWrite + Unpin + Send", at: "line 88", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+          { source: "s3", quote: "Streams in QUIC provide a lightweight, ordered byte-stream abstraction", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+        ],
+        against: [],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(98, "2 independent sources (code, a standard); 2 of 2 quotes found where cited"),
+        against_weights: [],
+      },
+      {
+        id: "f2",
+        claim: "The replication suite passes over QUIC on three nodes today.",
+        cites: [{ source: "s2", quote: "test result: ok. 48 passed; 0 failed", check: { state: "found", at: Date.now() - 2 * 3600_000, said: "in the agent's own tool output" } }],
+        against: [],
+        at: Date.now() - 2 * 3600_000,
+        confidence: conf(95, "1 independent source (a measurement); 1 of 1 quotes found where cited", { independent: 1, cites: 1, found: 1, reliability: 0.95 }),
+        against_weights: [],
+      },
+      {
+        id: "f3",
+        claim: "QUIC's per-stream ordering keeps tail latency within 10% of TCP under load.",
+        cites: [
+          { source: "s4", quote: "p99 stayed within 8% of TCP at 40k req/s", check: { state: "not_found", at: Date.now() - 3 * 3600_000, said: "the page doesn't hold those words" } },
+        ],
+        against: [{ claim: "Head-of-line blocking returns when one stream carries everything.", cites: [{ source: "s5", check: { state: "found", at: Date.now() - 3 * 3600_000 } }] }],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(13, "1 independent source (a blog); 0 of 1 quotes found where cited, 1 not; 1 counterclaim, the strongest moderate", { independent: 1, cites: 1, found: 0, failed: 1, reliability: 0.5, citation: 0.3, against: 0.2, support: 0.15 }),
+        against_weights: [0.2],
+      },
+    ],
+    skipped: {},
+    summary: { findings: 3, grades: { A: 2, F: 1 }, sources: 5, internal: 2, external: 3, checking: 0 },
+    created_at: Date.now() - 3 * 3600_000,
+    updated_at: Date.now() - 2 * 3600_000,
+  },
+} as Record<string, unknown>;
 
 /* ------------------------------------------------------------------ the rest */
 
@@ -705,9 +801,10 @@ const started = new Map<string, UpdateJob>();
 const upgraded = new Set<string>();
 /** Update policies chosen on the page, by runner (else automatic). */
 const policies = new Map<string, UpdatePolicy>();
-/** Binaries removed, and uploaded, on the page. */
-const removed = new Set<string>();
+/** When each platform's kept binary was removed on the page (unix seconds), and what was uploaded, or a machine built of itself, for a platform since. */
+const removedAt = new Map<string, number>();
 const uploaded = new Map<string, KilnBinary>();
+const machineBuilt = new Map<string, KilnBinary>();
 /** The platforms each job of the release pipeline builds (`.kiln/release.yaml`), as the mock's targets name them. */
 const RELEASE_TARGETS: Record<string, string[]> = { linux: ["aarch64-unknown-linux-gnu"], windows: ["x86_64-pc-windows-msvc"], macos: ["aarch64-apple-darwin"] };
 
@@ -746,6 +843,13 @@ function tickUpgrades(ctx: PagesCtx) {
       if (t >= lines[lines.length - 1]![0] + 2) {
         Object.assign(job, { state: "done", ended_at: now(), reached: true });
         upgraded.add(job.target);
+        // A machine that built kiln of itself hands the binary back: others of its platform download it.
+        const a = job.method === "build" ? ctx.agents().find((x) => x.name === job.target) : undefined;
+        if (a) {
+          const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
+          const sha256 = hex(mulberry32(hashStr(`${target}:${job.id}`)), 64);
+          machineBuilt.set(target, { target, sha256, size: 36_400_000, build: sha256.slice(0, 12), origin: "machine", at: now(), sha: NEWEST, by: a.name });
+        }
         ctx.emit?.({ type: "updates" });
       }
       ctx.emit?.({ type: "update_job", job: { ...job, log: [...job.log] } });
@@ -836,18 +940,43 @@ function failedJobs(ctx: PagesCtx): UpdateJob[] {
   return out;
 }
 
-/** The binaries kept here: the server's own and one the release pipeline built, then what the page's release run, uploads and removals made of them. */
+/**
+ * The binaries kept here: the server's own, then one for each platform, the newest of what kiln's
+ * release pipeline built, a machine built of itself or was uploaded (crate::updates::stored). An
+ * older release build of the server's own platform stays kept beside the server's own, which
+ * runners of it get instead. The page's release runs, uploads and removals change them.
+ */
 function binariesOf(ctx: PagesCtx): KilnBinary[] {
-  const base: KilnBinary[] = [
-    { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
-    { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
+  const [recent, older] = ctx.release?.past() ?? [];
+  const own: KilnBinary = { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 };
+  const kept: KilnBinary[] = [
+    {
+      target: "aarch64-unknown-linux-gnu",
+      sha256: "cd".repeat(32),
+      size: 36_900_000,
+      build: "0.1.0+a1b2c3d",
+      origin: "built",
+      at: recent?.finished_at ?? T0 - 80_000,
+      run: recent?.number ?? 412,
+      sha: recent?.sha ?? "a1b2c3d4e5",
+    },
+    {
+      target: "x86_64-unknown-linux-gnu",
+      sha256: "ef".repeat(32),
+      size: 37_500_000,
+      build: "0.0.9+df17c34",
+      origin: "built",
+      at: older?.finished_at ?? T0 - 205_000,
+      run: older?.number ?? 380,
+      sha: older?.sha ?? "df17c34639ecbf9d5c9caefb6af28aa67ee01257",
+    },
   ];
+  // A release run of the server's own commit keeps its builds of the other platforms (crate::updates::adopts); one of any other commit, none.
   const rel = ctx.release?.latest();
-  const built = new Map<string, KilnBinary>();
-  for (const j of rel?.jobs ?? []) {
+  for (const j of rel && rel.run.sha === NEWEST ? rel.jobs : []) {
     if (j.status !== "succeeded") continue;
     for (const t of RELEASE_TARGETS[j.key] ?? []) {
-      built.set(t, {
+      kept.push({
         target: t,
         sha256: hex(mulberry32(hashStr(t)), 64),
         size: t.includes("windows") ? 43_000_000 : t.includes("darwin") ? 36_100_000 : 39_600_000,
@@ -855,26 +984,24 @@ function binariesOf(ctx: PagesCtx): KilnBinary[] {
         origin: "built",
         at: j.finished_at ?? now(),
         run: rel!.run.number,
-        sha: NEWEST,
+        sha: rel!.run.sha,
       });
     }
   }
-  const out = base.filter((b) => b.origin === "server" || !built.has(b.target)).concat([...built.values()]);
-  for (const [t, b] of uploaded) {
-    const i = out.findIndex((x) => x.target === t && x.origin !== "server");
-    if (i >= 0) out.splice(i, 1);
-    out.push(b);
-  }
-  return out.filter((b) => !removed.has(`${b.target}:${b.at}`));
+  kept.push(...machineBuilt.values(), ...uploaded.values());
+  const newest = new Map<string, KilnBinary>();
+  for (const b of kept) if (b.at > (removedAt.get(b.target) ?? 0) && b.at >= (newest.get(b.target)?.at ?? 0)) newest.set(b.target, b);
+  return [own, ...newest.values()];
 }
 
 function updates(ctx: PagesCtx): UpdatesOverview {
   const binaries = binariesOf(ctx);
   const rel = ctx.release?.latest() ?? null;
   const darwin = binaries.find((b) => b.target === "aarch64-apple-darwin" && b.sha === NEWEST);
-  // While the page's release run goes, what it builds and isn't built from the newest yet; else the Mac's platform, as before.
+  // While a release run of the server's commit goes, what it builds and isn't built from it yet; else the Mac's platform, until a build of it is kept.
   const releaseTargets = Object.values(RELEASE_TARGETS).flat();
-  const behind = rel ? releaseTargets.filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST)) : ["aarch64-apple-darwin"];
+  const behind = (rel && rel.run.sha === NEWEST ? releaseTargets : ["aarch64-apple-darwin"]).filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST));
+  const recent = ctx.release?.past()[0];
   const runners = ctx
     .agents()
     .filter((a) => !a.ephemeral)
@@ -887,7 +1014,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         name: a.name,
         policy: policies.get(a.name) ?? ("auto" as const),
         locked: false,
-        from: up || mac ? null : "built by release run #412",
+        from: up || mac ? null : `built by release run #${recent?.number ?? 412}`,
         hostname: a.hostname,
         os: a.os,
         arch: a.arch,
@@ -1124,7 +1251,8 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   if ((mm = p.match(/^\/api\/updates\/binaries\/([^/]+)$/)) && m === "DELETE") {
     const target = decodeURIComponent(mm[1] ?? "");
     uploaded.delete(target);
-    for (const b of binariesOf(ctx)) if (b.target === target && b.origin !== "server") removed.add(`${b.target}:${b.at}`);
+    machineBuilt.delete(target);
+    removedAt.set(target, now());
     ctx.emit?.({ type: "updates" });
     res.statusCode = 204;
     res.end();
@@ -1224,6 +1352,12 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     return (err(res, 404, `no route for ${p}`), true);
   }
 
+  // Research
+  if (p === "/api/research" && m === "GET") return (void json(res, 200, { research: Object.values(RESEARCH) }), true);
+  if ((mm = p.match(/^\/api\/research\/([^/]+)$/)) && m === "GET") {
+    const r = RESEARCH[decodeURIComponent(mm[1]!)];
+    return (r ? json(res, 200, r) : err(res, 404, "no such research"), true);
+  }
   // Plans
   if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {

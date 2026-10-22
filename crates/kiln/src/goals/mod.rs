@@ -127,6 +127,19 @@ pub struct Item {
     /// The plan step it was made from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<StepRef>,
+    /// Who made it a part: `own` (the agent split its goal itself: that goal comes back for its own
+    /// check after its parts), or kiln: `checks` (a plan step's acceptance criteria and tests),
+    /// `plan` (the steps of the plan its goal became), `planning` (the planning of that plan),
+    /// `run` (waiting for that plan's run). A goal whose parts kiln made is met once they all are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part_kind: Option<String>,
+    /// The plan it became ([`plan`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_as: Option<String>,
+    /// The plan run it waits for (a `run` part): nothing goes to the agent for it, and it's met
+    /// once the run is done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waits_on: Option<String>,
 }
 
 /// The plan step a goal was made from (`crate::plans`): its plan, the version run, its number (from
@@ -146,11 +159,16 @@ pub struct StepRef {
 pub struct NewGoal {
     pub text: String,
     pub step: Option<StepRef>,
+    /// The goal it's a part of, and who made it so (`Item::part_kind`).
+    pub part_of: Option<String>,
+    pub kind: Option<&'static str>,
+    /// The plan run it waits for.
+    pub waits_on: Option<String>,
 }
 
 impl From<String> for NewGoal {
     fn from(text: String) -> Self {
-        Self { text, step: None }
+        Self { text, ..Self::default() }
     }
 }
 
@@ -299,7 +317,7 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
         })
         .optional()?;
     let mut st = c.prepare(
-        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id FROM goal_items WHERE agent = ?1 ORDER BY pos",
+        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on FROM goal_items WHERE agent = ?1 ORDER BY pos",
     )?;
     let items = st
         .query_map(params![agent], |r| {
@@ -319,6 +337,9 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
                 busy_at: r.get(10)?,
                 part_of: r.get(11)?,
                 sent_id: r.get(16)?,
+                planned_as: r.get(17)?,
+                part_kind: r.get(18)?,
+                waits_on: r.get(19)?,
                 step: plan.map(|plan| StepRef { plan, version: version.unwrap_or(0), n: at.and_then(|i| usize::try_from(i).ok()).unwrap_or(0) + 1, run }),
             })
         })?
@@ -472,15 +493,50 @@ where
     }
 }
 
-/// Notes goals `ids` as parts of goal `part_of` and as made from plan step `step`.
-fn note(c: &rusqlite::Connection, ids: &[String], part_of: Option<&str>, step: Option<&StepRef>) -> anyhow::Result<()> {
+/// What a goal is beside its words: the goal it's a part of and who made it so, the plan step
+/// it's made from, the plan run it waits for.
+#[derive(Debug, Clone, Copy, Default)]
+struct Noted<'a> {
+    part_of: Option<&'a str>,
+    kind: Option<&'a str>,
+    step: Option<&'a StepRef>,
+    waits_on: Option<&'a str>,
+}
+
+/// Notes goals `ids` as `n` says.
+fn note(c: &rusqlite::Connection, ids: &[String], n: Noted<'_>) -> anyhow::Result<()> {
+    let step = n.step;
     for id in ids {
         c.execute(
-            "UPDATE goal_items SET part_of = ?2, plan_id = ?3, plan_version = ?4, plan_step = ?5, plan_run = ?6 WHERE id = ?1",
-            params![id, part_of, step.map(|s| s.plan.clone()), step.map(|s| s.version), step.map(|s| i64::try_from(s.n.saturating_sub(1)).unwrap_or(0)), step.and_then(|s| s.run.clone())],
+            "UPDATE goal_items SET part_of = ?2, plan_id = ?3, plan_version = ?4, plan_step = ?5, plan_run = ?6, part_kind = ?7, waits_on = ?8 WHERE id = ?1",
+            params![
+                id,
+                n.part_of,
+                step.map(|s| s.plan.clone()),
+                step.map(|s| s.version),
+                step.map(|s| i64::try_from(s.n.saturating_sub(1)).unwrap_or(0)),
+                step.and_then(|s| s.run.clone()),
+                n.kind,
+                n.waits_on
+            ],
         )?;
     }
     Ok(())
+}
+
+/// The goals that are parts of goal `id`, and parts of those, as far as they go.
+fn descendants(items: &[Item], id: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier = vec![id.to_owned()];
+    while let Some(p) = frontier.pop() {
+        for i in items.iter().filter(|i| i.part_of.as_deref() == Some(p.as_str())) {
+            if !out.contains(&i.id) && i.id != id {
+                out.push(i.id.clone());
+                frontier.push(i.id.clone());
+            }
+        }
+    }
+    out
 }
 
 /// The goals still to go, in order (the one under way first), each by its id: what `set_locked`
@@ -685,7 +741,7 @@ pub async fn add(hub: &Hub, agent: &str, texts: Vec<String>, start: bool) -> R<S
 /// goes next, as `set` does it), each saying the plan step it's made from; `start` runs the stack.
 pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at: &At) -> R<Stack> {
     let info = known(hub, agent)?;
-    let goals = goals.into_iter().map(|g| Ok(NewGoal { text: clean(&g.text)?, step: g.step })).collect::<R<Vec<_>>>()?;
+    let goals = goals.into_iter().map(|g| Ok(NewGoal { text: clean(&g.text)?, ..g })).collect::<R<Vec<_>>>()?;
     let stack = {
         let _one = CHANGING.lock().await;
         let now = get(hub, agent).await?;
@@ -699,12 +755,12 @@ pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at
         let before: Vec<String> = now.items.iter().map(|i| i.id.clone()).collect();
         let s = set_locked(hub, &info, agent, given).await?;
         // Each new one, in the order given, with the step it's made from.
-        if goals.iter().any(|g| g.step.is_some()) {
-            let pairs: Vec<(String, StepRef)> = added(&s, &before).into_iter().zip(&goals).filter_map(|(id, g)| g.step.clone().map(|st| (id, st))).collect();
+        if goals.iter().any(|g| g.step.is_some() || g.part_of.is_some() || g.kind.is_some() || g.waits_on.is_some()) {
+            let pairs: Vec<(String, NewGoal)> = added(&s, &before).into_iter().zip(goals).collect();
             hub.store
                 .call(move |c| {
-                    for (id, st) in &pairs {
-                        note(c, std::slice::from_ref(id), None, Some(st))?;
+                    for (id, g) in &pairs {
+                        note(c, std::slice::from_ref(id), Noted { part_of: g.part_of.as_deref(), kind: g.kind, step: g.step.as_ref(), waits_on: g.waits_on.as_deref() })?;
                     }
                     Ok(())
                 })
@@ -738,12 +794,14 @@ pub async fn done(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&st
         return Ok(stack);
     }
     let target_id = target.id.clone();
-    let ending = |i: &Item| i.id == target_id || (i.part_of.as_deref() == Some(target_id.as_str()) && matches!(i.status.as_str(), "pending" | "active"));
+    let parts = descendants(&stack.items, &target_id);
+    let ending = |i: &Item| i.id == target_id || (parts.contains(&i.id) && matches!(i.status.as_str(), "pending" | "active"));
+    let ended_parts: Vec<String> = stack.items.iter().filter(|i| i.id != target_id && ending(i)).map(|i| i.id.clone()).collect();
     let was_active = stack.items.iter().any(|i| i.status == "active" && ending(i));
     if was_active {
         clear_in_agent(hub, &info, &stack.items, now_ms(hub)).await;
     }
-    withdraw(hub, agent, &stack.items, ending).await;
+    withdraw(hub, agent, &stack.items, &ending).await;
     let reason = format!("{} said so{}", by.name(), evidence.map(|e| format!(": {e}")).unwrap_or_default());
     let (agent_s, now) = (agent.to_owned(), now_ms(hub));
     let running = hub
@@ -751,10 +809,9 @@ pub async fn done(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&st
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
             tx.execute("UPDATE goal_items SET status = 'met', reason = ?2, ended_at = ?3 WHERE id = ?1", params![target_id, reason, now])?;
-            tx.execute(
-                "UPDATE goal_items SET status = 'met', reason = 'Met with the goal it is a part of.', ended_at = ?3 WHERE agent = ?1 AND part_of = ?2 AND status IN ('pending', 'active')",
-                params![agent_s, target_id, now],
-            )?;
+            for id in &ended_parts {
+                tx.execute("UPDATE goal_items SET status = 'met', reason = 'Met with the goal it is a part of.', ended_at = ?2 WHERE id = ?1", params![id, now])?;
+            }
             renumber(&tx, &agent_s)?;
             touch(&tx, &agent_s, None, None, now)?;
             // What the agent's harness still has of it doesn't join the stack again (`adopt`).
@@ -804,7 +861,9 @@ pub async fn update(hub: &Hub, agent: &str, id: &str, change: Change, by: &By) -
         if active {
             clear_in_agent(hub, &info, &stack.items, now_ms(hub)).await;
         }
-        withdraw(hub, agent, &stack.items, |i| i.id == id || (i.part_of.as_deref() == Some(id) && i.status == "pending")).await;
+        let parts = descendants(&stack.items, id);
+        let gone_parts: Vec<String> = stack.items.iter().filter(|i| parts.contains(&i.id) && i.status == "pending").map(|i| i.id.clone()).collect();
+        withdraw(hub, agent, &stack.items, |i| i.id == id || (parts.contains(&i.id) && i.status == "pending")).await;
         let running = hub
             .store
             .call(move |c| {
@@ -813,7 +872,10 @@ pub async fn update(hub: &Hub, agent: &str, id: &str, change: Change, by: &By) -
                     tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1", params![gone, now, format!("Taken out by {who}.")])?;
                     tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
                 } else {
-                    tx.execute("DELETE FROM goal_items WHERE id = ?1 OR (part_of = ?1 AND status = 'pending')", params![gone])?;
+                    tx.execute("DELETE FROM goal_items WHERE id = ?1", params![gone])?;
+                    for p in &gone_parts {
+                        tx.execute("DELETE FROM goal_items WHERE id = ?1", params![p])?;
+                    }
                 }
                 renumber(&tx, &agent_s)?;
                 touch(&tx, &agent_s, None, None, now)?;
@@ -861,9 +923,11 @@ pub async fn split(hub: &Hub, agent: &str, id: Option<&str>, parts: Vec<String>)
     if !matches!(target.status.as_str(), "pending" | "active") {
         return Err(Error::Bad(format!("that goal is {} already: there's nothing left of it to split", target.status)));
     }
-    if target.part_of.is_some() {
+    // A part splits only when it's a plan's step (into its criteria and tests, or parts of its own).
+    if target.part_of.is_some() && target.part_kind.as_deref() != Some("plan") {
         return Err(Error::Bad("that goal is a part of another already: add goals before it instead (goals_add with `before`)".into()));
     }
+    let kind = if given_parts.is_empty() { "checks" } else { "own" };
     let parts = if given_parts.is_empty() {
         let Some(s) = &target.step else {
             return Err(Error::Bad("say its parts in `goals`, a goal each (a goal made from a plan's step splits into its acceptance criteria and tests by itself)".into()));
@@ -885,7 +949,7 @@ pub async fn split(hub: &Hub, agent: &str, id: Option<&str>, parts: Vec<String>)
     let (target_id, step) = (target.id.clone(), target.step.clone());
     let s = set_locked(hub, &info, agent, given).await?;
     let new = added(&s, &before);
-    hub.store.call(move |c| note(c, &new, Some(&target_id), step.as_ref())).await?;
+    hub.store.call(move |c| note(c, &new, Noted { part_of: Some(&target_id), kind: Some(kind), step: step.as_ref(), waits_on: None })).await?;
     get(hub, agent).await
 }
 
@@ -1027,7 +1091,7 @@ fn restore(c: &rusqlite::Connection, agent: &str, said_at: i64, now: i64) -> any
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![i.id, agent, i64::try_from(pos).unwrap_or(i64::MAX), i.text, i.status, i.reason, i.how, i.prior_at, i.started_at, i.ended_at, i.reminders, i.reminded_at, i.busy_at],
         )?;
-        note(c, std::slice::from_ref(&i.id), i.part_of.as_deref(), i.step.as_ref())?;
+        note(c, std::slice::from_ref(&i.id), Noted { part_of: i.part_of.as_deref(), kind: i.part_kind.as_deref(), step: i.step.as_ref(), waits_on: i.waits_on.as_deref() })?;
     }
     let left = c.query_row("SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status IN ('pending', 'active')", params![agent], |r| r.get::<_, i64>(0))?;
     touch(c, agent, Some(if left > 0 { "running" } else { "done" }), None, now)?;
@@ -1364,6 +1428,162 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
         .await
 }
 
+/// The goal next to start whose parts kiln made (a plan's steps, its planning and its run; a
+/// step's criteria and tests) are all met, and why it's met with them; none while a goal is under
+/// way. A goal whose planning is its only part met isn't: its steps come next.
+fn met_by_parts(stack: &Stack) -> Option<(String, String)> {
+    if stack.items.iter().any(|i| i.status == "active") {
+        return None;
+    }
+    let next = stack.items.iter().find(|i| i.status == "pending")?;
+    let parts: Vec<&Item> = stack.items.iter().filter(|i| i.part_of.as_deref() == Some(next.id.as_str())).collect();
+    let kiln_made = |i: &&Item| matches!(i.part_kind.as_deref(), Some("plan" | "planning" | "run" | "checks"));
+    if parts.is_empty() || !parts.iter().all(kiln_made) || !parts.iter().all(|i| i.status == "met") || parts.iter().all(|i| i.part_kind.as_deref() == Some("planning")) {
+        return None;
+    }
+    let count = |k: &str| parts.iter().filter(|i| i.part_kind.as_deref() == Some(k)).count();
+    let why = if count("run") > 0 {
+        "Met with its plan: its run is done, every step met.".to_owned()
+    } else if count("plan") > 0 {
+        let n = count("plan");
+        format!("Met with its plan: its {n} step{} met.", if n == 1 { " is" } else { "s are" })
+    } else {
+        "Met: each of its acceptance criteria and tests is met.".to_owned()
+    };
+    Some((next.id.clone(), why))
+}
+
+/// A goal turned into a plan ([`plan`]): the plan, its research, the goal, and the part of the
+/// goal its planning is.
+#[derive(Debug, Clone, Serialize)]
+pub struct Planned {
+    pub plan: String,
+    pub research: String,
+    pub goal: String,
+    pub part: String,
+}
+
+/// Goal `id` (without: the one under way) of agent `agent` turned into a plan, its planning begun:
+/// a plan in its planning phase (the goal's words its brief, saying the goal it came from), its
+/// research, and a first part of the goal: plan it (research it inside and out, write its steps,
+/// say it's ready). The goal under way waits after that part, which goes to the agent now. A goal
+/// being planned already answers with the plan it's becoming.
+pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str) -> R<Planned> {
+    let info = known(hub, agent)?;
+    let _one = CHANGING.lock().await;
+    let stack = get(hub, agent).await?;
+    let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
+        Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
+        None => stack.items.iter().find(|i| i.status == "active").ok_or_else(|| Error::Bad("no goal is under way here: say which to plan by its `id` (goals_get lists them)".into()))?,
+    };
+    if !matches!(target.status.as_str(), "pending" | "active") {
+        return Err(Error::Bad(format!("that goal is {} already: there's nothing left of it to plan", target.status)));
+    }
+    if matches!(target.part_kind.as_deref(), Some("checks" | "planning" | "run" | "own")) {
+        return Err(Error::Bad("that goal is a part of another: plan the goal it's a part of".into()));
+    }
+    let as_plan_error = |e: crate::plans::Error| match e {
+        crate::plans::Error::Bad(m) | crate::plans::Error::Refused(_, m) => Error::Bad(m),
+        crate::plans::Error::Missing => Error::Bad("no such plan".into()),
+        crate::plans::Error::Other(e) => Error::Other(e),
+    };
+    // Being planned already: that plan.
+    if let Some(pid) = target.planned_as.clone()
+        && let Ok(p) = crate::plans::get(hub, &pid).await
+        && p.phase == "planning"
+    {
+        let part = stack.items.iter().find(|i| i.part_of.as_deref() == Some(target.id.as_str()) && i.part_kind.as_deref() == Some("planning")).map(|i| i.id.clone()).unwrap_or_default();
+        let research = crate::research::of_plan(hub, &pid).await.unwrap_or_default();
+        return Ok(Planned { plan: pid, research, goal: target.id.clone(), part });
+    }
+    let words = target.text.clone();
+    let title = title.map(str::trim).filter(|t| !t.is_empty()).map_or_else(|| words.chars().take(80).collect::<String>(), str::to_owned);
+    let source = crate::plans::Source {
+        session: Some(agent.to_owned()),
+        goal: Some(crate::plans::GoalOf { agent: agent.to_owned(), id: target.id.clone(), text: words.clone() }),
+        ..crate::plans::Source::default()
+    };
+    let new = crate::plans::New { title, body: format!("Goal: {words}"), items: Vec::new(), tags: vec!["from a goal".to_owned()], source: Some(source) };
+    let p = crate::plans::create_in(hub, new, by, "planning").await.map_err(as_plan_error)?;
+    let research = crate::research::start(hub, &words, Some(agent), by, Some(&p.id)).await.map_err(|e| Error::Bad(e.to_string()))?;
+    let part_text = clean(&format!(
+        "Plan \"{}\" (plan {}, research {}) is ready: researched inside and outside with each claim's sources (research_add), its steps written with their acceptance criteria, tests and the findings each rests on (plans_update), and said ready (plans_ready)",
+        p.title, p.id, research.id
+    ))?;
+    let (target_id, pid) = (target.id.clone(), p.id.clone());
+    {
+        let (t, pid) = (target_id.clone(), pid.clone());
+        hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET planned_as = ?2 WHERE id = ?1", params![t, pid]).map(|_| ())?)).await?;
+    }
+    let mut given = to_go(&stack.items);
+    let k = given.iter().position(|(g, _)| g.as_deref() == Some(target_id.as_str())).unwrap_or(given.len());
+    given.insert(k, (None, part_text));
+    let before: Vec<String> = stack.items.iter().map(|i| i.id.clone()).collect();
+    let s = set_locked(hub, &info, agent, given).await?;
+    let new_ids = added(&s, &before);
+    let t = target_id.clone();
+    let ids = new_ids.clone();
+    hub.store.call(move |c| note(c, &ids, Noted { part_of: Some(&t), kind: Some("planning"), step: None, waits_on: None })).await?;
+    Ok(Planned { plan: pid, research: research.id, goal: target_id, part: new_ids.first().cloned().unwrap_or_default() })
+}
+
+/// What a goal does once the plan it became is ready ([`planned`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Then {
+    /// Its steps become its parts, here.
+    Goals,
+    /// Its steps become its parts, and the stack pauses for a person to look at the plan first.
+    Review,
+    /// The plan runs with an agent per step (this run): the goal waits for it.
+    Run(String),
+}
+
+/// Plan `plan` (with run `run`, kiln's record of it running here) made from goal `goal` of agent
+/// `agent` is ready: the goal goes on as `then` says, its planning part met. Its steps (or the
+/// part waiting for its run) go in before the goal, then the planning part ends, so what comes next
+/// is its first step; once every part is met, so is the goal ([`met_by_parts`]).
+pub async fn planned(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans::Plan, run: &str, then: &Then, by: &By) -> R<Stack> {
+    let stack = get(hub, agent).await?;
+    if !stack.items.iter().any(|i| i.id == goal && matches!(i.status.as_str(), "pending" | "active")) {
+        return Err(Error::Bad("the goal this plan was made from has ended, or gone: run the plan another way (plans_run)".into()));
+    }
+    let n = plan.steps.len();
+    let goals: Vec<NewGoal> = match then {
+        Then::Run(r) => vec![NewGoal {
+            text: format!("Every step of the plan \"{}\" is met: its run {r}, an agent per step (kiln marks this met when the run is done)", plan.title),
+            part_of: Some(goal.to_owned()),
+            kind: Some("run"),
+            waits_on: Some(r.clone()),
+            step: None,
+        }],
+        Then::Goals | Then::Review => (0..n)
+            .map(|i| NewGoal {
+                text: crate::plans::agents::goal_of(plan, i, n),
+                step: Some(StepRef { plan: plan.id.clone(), version: plan.version, n: i + 1, run: Some(run.to_owned()) }),
+                part_of: Some(goal.to_owned()),
+                kind: Some("plan"),
+                waits_on: None,
+            })
+            .collect(),
+    };
+    add_at(hub, agent, goals, false, &At::Before(goal.to_owned())).await?;
+    if *then == Then::Review {
+        let why = format!("plan \"{}\" is ready for you to look at: its steps go to the agent once you resume", plan.title);
+        control_as(hub, agent, Action::Pause, by, Pausing { why: Some(why), until: None }).await?;
+    }
+    let stack = get(hub, agent).await?;
+    let planning: Vec<String> = stack
+        .items
+        .iter()
+        .filter(|i| i.part_of.as_deref() == Some(goal) && i.part_kind.as_deref() == Some("planning") && matches!(i.status.as_str(), "pending" | "active"))
+        .map(|i| i.id.clone())
+        .collect();
+    for id in planning {
+        done(hub, agent, Some(&id), Some("the plan is ready"), by).await?;
+    }
+    get(hub, agent).await
+}
+
 /// What a running stack does next.
 #[derive(Debug)]
 enum Next {
@@ -1469,10 +1689,39 @@ where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let (store, port) = (d.store, d.port);
-    let stack = stack_of(store, agent).await?;
+    let mut stack = stack_of(store, agent).await?;
     // Paused or done since it was found running: left as it is.
     if stack.state != "running" {
         return Ok(());
+    }
+    // A part waiting for a plan run: met once the run is done; until then nothing goes to the
+    // agent (the run's agents do the work, and it's told as each settles).
+    if let Some(run) = stack.items.iter().find(|i| i.status == "active").and_then(|i| i.waits_on.clone().map(|r| (i.id.clone(), r))) {
+        let (id, run) = run;
+        let r = run.clone();
+        let state: Option<String> = store.call(move |c| Ok(c.query_row("SELECT state FROM plan_runs WHERE id = ?1", params![r], |x| x.get(0)).optional()?)).await?;
+        if state.as_deref() != Some("done") {
+            return Ok(());
+        }
+        let (a, now) = (agent.to_owned(), d.clock.unix_ms());
+        store
+            .call(move |c| {
+                c.execute("UPDATE goal_items SET status = 'met', reason = 'Its plan run is done: every step met.', ended_at = ?2 WHERE id = ?1", params![id, now])?;
+                touch(c, &a, None, None, now)
+            })
+            .await?;
+        stack = stack_of(store, agent).await?;
+    }
+    // A goal whose parts kiln made are all met: met itself, at once, with no check of its own.
+    while let Some((id, why)) = met_by_parts(&stack) {
+        let (a, now) = (agent.to_owned(), d.clock.unix_ms());
+        store
+            .call(move |c| {
+                c.execute("UPDATE goal_items SET status = 'met', reason = ?2, ended_at = ?3 WHERE id = ?1", params![id, why, now])?;
+                touch(c, &a, None, None, now)
+            })
+            .await?;
+        stack = stack_of(store, agent).await?;
     }
     let all = port.agents();
     let children = crate::harness::told::children_working(&all, agent);
@@ -1497,6 +1746,14 @@ where
         }
         Next::Done => {
             store.call(move |c| touch(c, &a, Some("done"), None, now)).await?;
+        }
+        Next::Start { id, .. } if stack.items.iter().any(|i| i.id == id && i.waits_on.is_some()) => {
+            store
+                .call(move |c| {
+                    c.execute("UPDATE goal_items SET status = 'active', how = 'run', started_at = ?2, reminded_at = ?2, reminders = 0, busy_at = 0 WHERE id = ?1", params![id, now])?;
+                    touch(c, &a, None, None, now)
+                })
+                .await?;
         }
         Next::Start { id, text } => {
             let how = how(port, agent);
@@ -2475,6 +2732,184 @@ mod stack_tests {
             let s: Stack = control(&hub, id, serde_json::from_value(serde_json::json!("done"))?).await?;
             assert_eq!(words(&s).last().map(String::as_str), Some("met:deploy"));
             assert!(matches!(done(&hub, id, None, None, &me).await, Err(Error::Bad(_))), "nothing under way to say met");
+            Ok(())
+        })
+    }
+
+    /// The text at `path` in `v`, if there's text there.
+    fn at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+        path.iter().try_fold(v, |v, k| v.get(*k)).and_then(serde_json::Value::as_str)
+    }
+
+    /// A hub and an agent on it (no harness runs) with a goal stack: `goals`, started.
+    async fn agent_with_goals(goals: &[&str]) -> anyhow::Result<(Arc<Hub>, String, tempfile::TempDir)> {
+        let hub = crate::hub::tests::scratch_hub_with(|c| {
+            c.terminal.enabled = true;
+            c.conversations.off = true;
+        })
+        .await?;
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::registry::Registry::run_local(h).await;
+        });
+        hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+        let folder = tempfile::tempdir()?;
+        let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+        let ask = Ask {
+            kind: "claude".into(),
+            on: Some("local".into()),
+            cwd: Some(folder.path().to_string_lossy().into_owned()),
+            mode: Some("default".into()),
+            name: Some("A".into()),
+            count: Some(1),
+            ..Ask::default()
+        };
+        let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent started"))?;
+        settled(&hub, &a.id).await;
+        add(&hub, &a.id, strs(goals), true).await?;
+        Ok((hub, a.id, folder))
+    }
+
+    /// Its research: an internal finding and an external one (no page fetched: a book).
+    async fn researched(hub: &Arc<Hub>, research: &str) -> anyhow::Result<()> {
+        let add: crate::research::Add = serde_json::from_value(serde_json::json!({"findings": [
+            {"claim": "the store already searches", "cites": [{"source": {"type": "code", "title": "store.rs", "locator": "store.rs:1"}, "quote": "fn search"}]},
+            {"claim": "trigram indexes find substrings", "cites": [{"source": {"type": "book", "title": "SQLite internals", "locator": "ISBN 978-0-00-000000-0"}, "quote": "trigram"}]}
+        ]}))?;
+        crate::research::add(hub, research, add).await?;
+        Ok(())
+    }
+
+    fn call_ok(r: Result<serde_json::Value, crate::ops::Fail>) -> anyhow::Result<serde_json::Value> {
+        r.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))
+    }
+
+    /// A goal turned into a plan: its planning comes first (the goal waits after it), the plan isn't
+    /// run while it's planned, and isn't ready without steps or without research inside and out;
+    /// ready, its steps become the goal's parts, a step splits into its acceptance criteria and
+    /// tests and is met once they are, and once every step is met so is the goal, at once.
+    #[test]
+    fn a_goal_becomes_a_plan_whose_steps_are_its_parts_and_is_met_once_they_all_are() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["agents can search conversations", "ship it"]).await?;
+            let id = id.as_str();
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            settled(&hub, id).await;
+            let planned = call_ok(crate::ops::call(cx.clone(), "goals.plan", serde_json::json!({"agent": id})).await)?;
+            let (pid, rid) = (at(&planned, &["plan"]).unwrap_or_default().to_owned(), at(&planned, &["research"]).unwrap_or_default().to_owned());
+            let s = get(&hub, id).await?;
+            let goal = s.items.iter().find(|i| i.text == "agents can search conversations").cloned().unwrap_or_default();
+            assert_eq!(goal.planned_as.as_deref(), Some(pid.as_str()));
+            let first = s.items.iter().find(|i| i.status == "active").cloned().unwrap_or_default();
+            assert!(
+                first.part_of.as_deref() == Some(goal.id.as_str()) && first.part_kind.as_deref() == Some("planning") && first.text.starts_with("Plan \"agents can search conversations\""),
+                "{first:?}"
+            );
+            assert_eq!(goal.status, "pending", "the goal waits after its planning");
+            // Asked again: the same plan.
+            let again = call_ok(crate::ops::call(cx.clone(), "goals.plan", serde_json::json!({"agent": id, "id": goal.id})).await)?;
+            assert_eq!(at(&again, &["plan"]), Some(pid.as_str()));
+            // Not run, and not ready, while it has no steps or research.
+            let code = |r: Result<serde_json::Value, crate::ops::Fail>| r.err().map(|(c, m)| (c.as_u16(), m));
+            let refused = code(crate::ops::call(cx.clone(), "plans.run", serde_json::json!({"id": pid, "session": id, "mode": "message"})).await);
+            assert!(refused.as_ref().is_some_and(|(c, m)| *c == 400 && m.contains("still being planned")), "{refused:?}");
+            let refused = code(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": pid})).await);
+            assert!(refused.as_ref().is_some_and(|(_, m)| m.contains("no steps yet")), "{refused:?}");
+            let crit = |t: &str| crate::plans::Criterion::Qualitative { text: t.into() };
+            let items = vec![
+                crate::plans::Item { title: "Search the store".into(), acceptance: vec![crit("a query finds an event")], basis: vec!["f1".into()], ..crate::plans::Item::default() },
+                crate::plans::Item { title: "An op for agents".into(), needs: vec![1], basis: vec!["f1".into(), "f2".into()], ..crate::plans::Item::default() },
+            ];
+            crate::plans::update(&hub, &pid, crate::plans::Patch { items: Some(items), ..crate::plans::Patch::default() }, "admin").await?;
+            let refused = code(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": pid})).await);
+            assert!(refused.as_ref().is_some_and(|(_, m)| m.contains("no internal sources")), "{refused:?}");
+            researched(&hub, &rid).await?;
+            settled(&hub, id).await;
+            let ready = call_ok(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": pid})).await)?;
+            assert_eq!((at(&ready, &["then"]), at(&ready, &["plan", "phase"])), (Some("goals"), Some("ready")), "{ready}");
+            // It answers with its research for the agent to show the person: each claim graded, its sources numbered.
+            let shown = at(&ready, &["research"]).unwrap_or_default();
+            assert!(shown.contains("the store already searches") && shown.contains(" · ") && shown.contains("**Sources**") && shown.contains("store.rs (code, internal)"), "{shown}");
+            assert!(at(&ready, &["say"]).is_some_and(|s| s.starts_with("Show the person this research")), "{ready}");
+            // Its steps, the goal's parts, the first under way; the planning met.
+            settled(&hub, id).await;
+            let s = get(&hub, id).await?;
+            let parts: Vec<&Item> = s.items.iter().filter(|i| i.part_of.as_deref() == Some(goal.id.as_str())).collect();
+            let kinds: Vec<(&str, &str)> = parts.iter().map(|i| (i.part_kind.as_deref().unwrap_or(""), i.status.as_str())).collect();
+            assert_eq!(kinds, [("planning", "met"), ("plan", "active"), ("plan", "pending")], "{:?}", words(&s));
+            let step1 = parts.get(1).map(|i| i.id.clone()).unwrap_or_default();
+            assert!(parts.get(1).is_some_and(|i| i.step.as_ref().is_some_and(|st| st.plan == pid && st.n == 1) && i.text.starts_with("Step 1 of 2 of the plan")));
+            // The step splits into its acceptance criterion, and is met once it is.
+            settled(&hub, id).await;
+            let s = split(&hub, id, Some(&step1), Vec::new()).await?;
+            let check = s.items.iter().find(|i| i.part_of.as_deref() == Some(step1.as_str())).cloned().unwrap_or_default();
+            assert_eq!((check.part_kind.as_deref(), check.status.as_str()), (Some("checks"), "active"), "{:?}", words(&s));
+            settled(&hub, id).await;
+            let s = done(&hub, id, Some(&check.id), Some("a query found it"), &By::Itself).await?;
+            let step = s.items.iter().find(|i| i.id == step1).cloned().unwrap_or_default();
+            assert_eq!((step.status.as_str(), step.reason.as_deref()), ("met", Some("Met: each of its acceptance criteria and tests is met.")), "{:?}", words(&s));
+            // The last step met: the goal too, and the next goal goes on.
+            let step2 = s.items.iter().find(|i| i.status == "active").map(|i| i.id.clone()).unwrap_or_default();
+            settled(&hub, id).await;
+            let s = done(&hub, id, Some(&step2), None, &By::Itself).await?;
+            let g = s.items.iter().find(|i| i.id == goal.id).cloned().unwrap_or_default();
+            assert_eq!((g.status.as_str(), g.reason.as_deref()), ("met", Some("Met with its plan: its 2 steps are met.")), "{:?}", words(&s));
+            assert_eq!(under_way(&s).map(|u| u.0), Some("ship it".to_owned()));
+            Ok(())
+        })
+    }
+
+    /// Ready for review, the plan's steps wait in a paused stack, saying so; run with an agent per
+    /// step, the goal waits for the run (nothing sent to its agent for it) and is met once the run
+    /// is done.
+    #[test]
+    fn a_planned_goal_waits_for_review_or_for_its_run() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["one", "two"]).await?;
+            let id = id.as_str();
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let s = get(&hub, id).await?;
+            let (one, two) = (s.items.first().map(|i| i.id.clone()).unwrap_or_default(), s.items.get(1).map(|i| i.id.clone()).unwrap_or_default());
+            let step = |t: &str| crate::plans::Item { title: t.into(), basis: vec!["f1".into()], ..crate::plans::Item::default() };
+            let mut plans = Vec::new();
+            for goal in [&one, &two] {
+                settled(&hub, id).await;
+                let p = call_ok(crate::ops::call(cx.clone(), "goals.plan", serde_json::json!({"agent": id, "id": goal})).await)?;
+                let (pid, rid) = (at(&p, &["plan"]).unwrap_or_default().to_owned(), at(&p, &["research"]).unwrap_or_default().to_owned());
+                crate::plans::update(&hub, &pid, crate::plans::Patch { items: Some(vec![step("a"), step("b")]), ..crate::plans::Patch::default() }, "admin").await?;
+                researched(&hub, &rid).await?;
+                plans.push(pid);
+            }
+            // For review: its steps go in, and the stack pauses, saying why.
+            let r = call_ok(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": plans.first(), "then": "review"})).await)?;
+            let s = get(&hub, id).await?;
+            assert!(s.state == "paused" && s.reason.as_deref().is_some_and(|w| w.contains("is ready for you to look at")), "{r} {:?}", s.reason);
+            assert_eq!(s.items.iter().filter(|i| i.part_of.as_deref() == Some(one.as_str()) && i.part_kind.as_deref() == Some("plan") && i.status == "pending").count(), 2);
+            // Its steps met by hand: the goal is met; resumed, the next goal's planning goes on.
+            for p in s.items.iter().filter(|i| i.part_of.as_deref() == Some(one.as_str()) && i.part_kind.as_deref() == Some("plan")) {
+                done(&hub, id, Some(&p.id), None, &By::You).await?;
+            }
+            settled(&hub, id).await;
+            control(&hub, id, Action::Start).await?;
+            let s = get(&hub, id).await?;
+            assert_eq!(s.items.iter().find(|i| i.id == one).map(|i| i.status.as_str()), Some("met"), "{:?}", words(&s));
+            // With an agent per step: the goal waits on a part held for the run.
+            settled(&hub, id).await;
+            let r = call_ok(crate::ops::call(cx.clone(), "plans.ready", serde_json::json!({"id": plans.get(1), "then": "agents"})).await)?;
+            let run = at(&r, &["run"]).unwrap_or_default().to_owned();
+            let s = get(&hub, id).await?;
+            let held = s.items.iter().find(|i| i.part_of.as_deref() == Some(two.as_str()) && i.part_kind.as_deref() == Some("run")).cloned().unwrap_or_default();
+            assert_eq!((held.status.as_str(), held.how.as_deref(), held.waits_on.as_deref()), ("active", Some("run"), Some(run.as_str())), "{:?}", words(&s));
+            // Not done: it waits. Done: the part is met, and with it the goal.
+            push(&hub, id).await;
+            assert_eq!(get(&hub, id).await?.items.iter().find(|i| i.id == held.id).map(|i| i.status.clone()).as_deref(), Some("active"));
+            let r2 = run.clone();
+            hub.store.call(move |c| Ok(c.execute("UPDATE plan_runs SET state = 'done' WHERE id = ?1", params![r2]).map(|_| ())?)).await?;
+            push(&hub, id).await;
+            let s = get(&hub, id).await?;
+            assert_eq!(s.items.iter().find(|i| i.id == held.id).map(|i| i.status.as_str()), Some("met"), "{:?}", words(&s));
+            let g = s.items.iter().find(|i| i.id == two).cloned().unwrap_or_default();
+            assert_eq!((g.status.as_str(), g.reason.as_deref()), ("met", Some("Met with its plan: its run is done, every step met.")), "{:?}", words(&s));
             Ok(())
         })
     }

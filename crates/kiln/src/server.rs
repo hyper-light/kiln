@@ -157,6 +157,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
         child!("land-queue", h => crate::ci::land::run_loop(h));
         child!("github-checks", h => crate::githost::github::checks_loop(h));
+        child!("host-statuses", h => crate::githost::statuses::statuses_loop(h));
         child!("ci-providers", h => crate::ci::providers::sync_loop(h));
         child!("diff-runs", h => crate::ci::review::runs_loop(h));
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));

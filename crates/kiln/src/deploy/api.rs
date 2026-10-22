@@ -268,6 +268,9 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         // For linked servers (§11): where this one is and what it signs with, and what runs of an
         // app in one of its environments, signed for the server asking (`audience`, its issuer).
         (&Method::GET, ["link"]) => ok(&link::about(&d.hub)),
+        // Where release repositories may be (§7): kiln's own git server, GitHub through kiln's App,
+        // each GitLab with the groups its token covers.
+        (&Method::GET, ["git-hosts"]) => ok(&json!({ "hosts": boxed(|| git_hosts(&d.hub)).await })),
         (&Method::GET, ["apps", app, "environments", env, "statement"]) => {
             let audience = q.get("audience").map(|a| a.trim()).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
             match boxed(|| link::statement(&d, app, env, audience)).await.map_err(internal)? {
@@ -322,6 +325,19 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
 
 /// Every registration with what runs and what's in flight, and what waits for people: the
 /// environments board, in one answer.
+/// The git hosts release repositories may be on (docs/deploy-api.md §7).
+async fn git_hosts(hub: &Hub) -> Vec<Value> {
+    use super::model::{GITHUB_HOST, GITLAB_HOST, KILN_HOST};
+    let mut out = vec![json!({ "host": KILN_HOST, "name": "kiln's own git server" })];
+    if let Some(app) = crate::githost::github::app(hub).await {
+        out.push(json!({ "host": GITHUB_HOST, "name": "GitHub", "web": app.web }));
+    }
+    for g in crate::githost::gitlab::hosts(hub).await {
+        out.push(json!({ "host": GITLAB_HOST, "name": "GitLab", "web": g.web, "groups": g.groups() }));
+    }
+    out
+}
+
 async fn board(d: &Deploy) -> Result<Value, Fail> {
     let st = &d.hub.store;
     let environments = store::environments(st).await.map_err(internal)?;
@@ -593,7 +609,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
-            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), github: Default::default(), hub: Arc::clone(&hub) };
+            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub: Arc::clone(&hub) };
             let st = &hub.store;
             store::put_environment(st, &env("staging", KILNCD)).await?;
             store::put_environment(st, &env("argo", "argocd/prod")).await?;

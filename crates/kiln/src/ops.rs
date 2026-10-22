@@ -71,7 +71,16 @@ pub fn path(parts: &[&str]) -> Vec<String> {
 /// kiln's own operations: agents', plans', goal stacks', runners' and attachments', in the order they're listed.
 pub fn own() -> &'static [Op] {
     static OPS: std::sync::OnceLock<Vec<Op>> = std::sync::OnceLock::new();
-    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).chain(crate::doctor::list_ops()).chain(crate::ci::attach::list_ops()).collect())
+    OPS.get_or_init(|| {
+        crate::harness::ops::list_ops()
+            .into_iter()
+            .chain(crate::plans::ops::list_ops())
+            .chain(crate::goals::ops::list_ops())
+            .chain(crate::research::ops::list_ops())
+            .chain(crate::doctor::list_ops())
+            .chain(crate::ci::attach::list_ops())
+            .collect()
+    })
 }
 
 /// Every operation this server has: CI's, deployments' when they're on, and kiln's own.
@@ -93,7 +102,7 @@ pub fn listed(cd: bool) -> Vec<Info> {
 
 /// Operations on one agent that an agent calling them without `agent` means for itself: its own
 /// goal stack, and putting its own work up for review.
-const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "goals.done", "goals.update", "goals.split", "agents.change"];
+const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "goals.done", "goals.update", "goals.split", "goals.plan", "agents.change"];
 
 /// `input` to operation `name` as `caller` means it: an agent's own id where it left out `agent`
 /// on one of [`YOURS`].

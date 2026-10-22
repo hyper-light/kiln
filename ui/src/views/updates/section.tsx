@@ -18,7 +18,22 @@ import { PlatformsPanel } from "./builds";
 import { RolloutFigure } from "./figure";
 import { MachinesHead, MachinesPanel } from "./runners";
 import { readAgainSoon, useMinute, usePending, usePicked, useUploadPicker, useUploading } from "./state";
-import { fleetOf, fleetSummary, headline, isBuilding, latestJob, platformCable, platformLine, platformsOf, readoutAll, readoutPlatform, readoutRunner, readoutServer, serverView } from "./words";
+import {
+  archWords,
+  fleetOf,
+  fleetSummary,
+  headline,
+  isBuilding,
+  latestJob,
+  platformCable,
+  platformLine,
+  platformsOf,
+  readoutAll,
+  readoutPlatform,
+  readoutRunner,
+  readoutServer,
+  serverView,
+} from "./words";
 import "./updates.css";
 
 const UPDATES_LEAD = "Upgrade kiln and its runners. A runner keeps what it runs while it's upgraded.";
@@ -105,7 +120,16 @@ function UpdatesBody() {
     <>
       <RolloutFigure
         input={{
-          builds: platforms.map((p) => ({ key: `build:${p.key}`, label: p.label, line: platformLine(p, last), tone: p.tone, cable: platformCable(p), lit: p.lit, building: p.state === "building" })),
+          builds: platforms.map((p) => ({
+            key: `build:${p.key}`,
+            os: p.os,
+            arch: archWords(p),
+            line: platformLine(p, last),
+            tone: p.tone,
+            cable: platformCable(p),
+            lit: p.lit,
+            building: p.state === "building",
+          })),
           server: { line: server.scene, tone: server.tone },
           runners: fleet.runners.map(({ r, view }) => ({
             key: `runner:${r.name}`,
@@ -136,6 +160,7 @@ function UpdatesBody() {
 
 function BuildsBody() {
   const data = useRes(updatesRes).data;
+  const live = useUpdateJobs();
   const nowMs = useMinute();
   const last = data.build?.last ?? null;
   const releaseId = React.useDeferredValue(last && isBuilding(last) ? last.id : null);
@@ -143,13 +168,23 @@ function BuildsBody() {
   const picked = usePicked((s) => s.picked);
   const uploads = useUploadPicker();
   const uploading = useUploading((s) => s.target);
+  const jobs = React.useMemo(() => mergeJobs(data, live), [data, live]);
   return (
     <>
       {uploads.input}
-      <PlatformsPanel data={data} platforms={platformsOf(data, releaseJobs)} picked={picked} nowMs={nowMs} uploading={uploading} onChoose={uploads.choose} />
+      <PlatformsPanel
+        data={data}
+        platforms={platformsOf(data, releaseJobs)}
+        releaseJobs={releaseJobs}
+        updateJobs={jobs}
+        picked={picked}
+        nowMs={nowMs}
+        uploading={uploading}
+        onChoose={uploads.choose}
+      />
       <p className="up-foot">
         <span>Select a machine or a build in the picture to see it here; its row lights below.</span>
-        <span>Light follows downloads and new builds · idle paths stay still</span>
+        <span>Light follows downloads and new builds · a faint pulse marks a live link</span>
       </p>
     </>
   );

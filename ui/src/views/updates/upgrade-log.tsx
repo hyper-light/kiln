@@ -11,6 +11,8 @@ import "./upgrade-log.css";
 interface UpgradeLogProps {
   job: UpdateJob;
   onChangeWaits?: () => void;
+  /** Its output shows from the start, finished or not (else only while it runs). */
+  defaultOpen?: boolean;
 }
 
 /** A new upgrade gets its own disclosure and scroll state, even in the same runner row. */
@@ -18,9 +20,9 @@ export function UpgradeLog(props: UpgradeLogProps) {
   return <UpgradeLogView key={props.job.id} {...props} />;
 }
 
-function UpgradeLogView({ job, onChangeWaits }: UpgradeLogProps) {
+function UpgradeLogView({ job, onChangeWaits, defaultOpen = false }: UpgradeLogProps) {
   const running = job.state === "running";
-  const [open, setOpen] = React.useState(running);
+  const [open, setOpen] = React.useState(running || defaultOpen);
   const [expanded, setExpanded] = React.useState(false);
   const [following, setFollowing] = React.useState(true);
   const [copiedAt, setCopiedAt] = React.useState(0);

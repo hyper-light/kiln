@@ -591,6 +591,28 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "incidents.report", body)).await
         }
         // A plan run as one agent per step (docs/plans.md): its own page's routes.
+        // Research (docs/research.md): each operation is its route.
+        (&Method::GET, ["api", "research"]) => boxed(|| own_op(&hub, &caller, "research.list", query_value(&q))).await,
+        (&Method::POST, ["api", "research"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "research.start", body)).await
+        }
+        (&Method::GET, ["api", "research", id]) => {
+            let mut input = query_value(&q);
+            if let Some(o) = input.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "research.get", input)).await
+        }
+        (&Method::POST, ["api", "research", id, "findings"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "research.add", body)).await
+        }
+        (&Method::GET, ["api", "harness", "conversations", "search"]) => boxed(|| own_op(&hub, &caller, "conversations.search", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
         (&Method::POST, ["api", "plans", "runs", run, "stop"]) => boxed(|| own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run }))).await,
@@ -619,6 +641,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "plans.run", body)).await
         }
         (&Method::POST, ["api", "plans", id, "share"]) => boxed(|| plans_share(&hub, id, req)).await,
+        (&Method::POST, ["api", "plans", id, "ready"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
+        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -758,6 +788,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let (name, field) = match *what {
                 "done" => ("goals.done", None),
                 "split" => ("goals.split", None),
+                "plan" => ("goals.plan", None),
                 action => ("goals.control", Some(("action", (*action).to_owned()))),
             };
             let mut body = boxed(|| body_value(req)).await?;

@@ -64,7 +64,7 @@ pub async fn webhook(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
             if matches!(event.as_str(), "push" | "pull_request")
                 && let Some(d) = crate::deploy::get()
             {
-                crate::deploy::github::on_event(&d, &event, &v).await;
+                crate::deploy::remote::on_github_event(&d, &event, &v).await;
             }
             let hub2 = Arc::clone(hub);
             let delivery = (!delivery.is_empty()).then_some(delivery);
