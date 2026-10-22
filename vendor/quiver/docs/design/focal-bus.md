@@ -6,7 +6,7 @@ sources, its evidence and what would falsify it.
 
 ## What is taken
 
-- **Focal's bus,** branch `bus-replicated` at `0d1fab4` (2026-10-21), into `vendor/focal-bus`: the
+- **Focal's bus,** branch `bus-replicated` at `b408a3b` (2026-10-21), into `vendor/focal-bus`: the
   crates `focal-bus` (Focal's docs 32 to 34: the batch, a part's log and streams, the node over
   QUIC, the replicated part over hyper-durable), `focal-memory` (the budget every byte is charged
   to), `focal-seal` and `focal-platform` (the node log's keys, the files a part's image is installed
@@ -73,8 +73,14 @@ subscribers, or if any subscriber that keeps up loses a frame in the hour's soak
 
 The plan's target (docs/design/README.md): the write-ahead log is mandatory, hyper-durable's
 `GroupStore` on a real device with the full flush, `RamStore` test-only. Focal's bus already fixes
-its replica to `GroupStore<DeviceFile>` (`member.rs`). Quiver keeps it so: a compile-fail test
-fails the build where `RamStore` is named outside `cfg(test)` (T-T2.1.2).
+its replica to `GroupStore<DeviceFile>` (`member.rs`), and nothing in it names `RamStore`. What
+Quiver's own code could add stops short of the test (T-T2.1.2: `RamStore` outside `cfg(test)` fails
+the build): hyper-durable exports `RamStore` to every crate that depends on it. So Quiver's copy of
+hyper-raft compiles it only for hyper-durable's own tests or where a dev-dependency asks for its
+`test-store` feature (`vendor/hyper-raft/UPSTREAM.md`), and `crates/quiver/tests/ram_store.rs`
+builds a program that names it outside a test and expects the build to fail, beside one naming
+`GroupStore` that builds. Kiln holds the same copy, its sync tests asking for the feature. Focal's
+tree is untouched.
 
 ## Offered back to Focal
 
@@ -85,5 +91,28 @@ own crate; whether Focal wants it in `focal-bus` is Focal's agent's to say (belo
 
 ## What Focal's agent said
 
-Asked on 2026-10-22 (kiln message `01a161a8ffc470c5b61fa33dfb14baa6`): the commit to take, the API
-to build on, the in-process host, and GroupStore. Its answers are recorded here as they come.
+Asked on 2026-10-22 (kiln message `01a161a8ffc470c5b61fa33dfb14baa6`); answered the same day,
+checked against Focal's tree:
+
+1. **The commit: `b408a3b`, not `0d1fab4`.** CI on `0d1fab4`'s Rust contracts was red (a Windows
+   clippy `result_large_err` and two Linux test flakes), and `b408a3b` fixes all three. In the crates
+   Quiver takes the two differ by four lines of a `focal-platform` test (unlock before drop), so
+   production code is identical. `b408a3b` vendors hyper-raft `1af65f7` (its `vendor/*/SNAPSHOT`),
+   the pairing Quiver takes. Quiver moved to it.
+   - **Ahead:** Focal's next `bus-replicated` landing re-vendors hyper-raft to `64acd86` (the
+     fate-commit head), which changes hyper-transport's and hyper-rt's APIs the bus uses
+     (`hyper_transport::Limits` gains `retry_bytes: Option<u64>`; `CONNECTION_STATE` gives way to
+     `state_charge::<C>(limits)` and a charge learned at runtime) and adds a crate, `hyper-heap`.
+     Focal and hyper-raft always move together, hyper-raft at the revision the Focal commit's
+     `vendor/*/SNAPSHOT` names. Focal's agent says when that landing is pushed.
+2. **The API.** `focal_bus::part::Part`, `focal_bus::log::{SegmentPool, Position}`,
+   `focal_bus::batch::{Batch, BatchBuilder, Producing}` and `focal_memory::MemoryBudget` exist, are
+   public and reasonable to build on, but Focal publishes no stable API: they are internal surfaces
+   that change as Focal needs (its event-bus rewrite is under way). Pin by commit, re-vendor
+   deliberately.
+3. **The in-process host stays Quiver's own** (`crates/quiver/src/ephemeral.rs`): Focal's hosts are
+   its node and `serve`, and it won't add an in-process one speculatively; if Quiver's proves
+   general, offer it back.
+4. **GroupStore mandated: no objection.** It matches `focal-bus`, whose `member.rs` fixes the part
+   replica's store as `Replica<GroupStore<DeviceFile>, PartMachine, MemberBudget>` and names no
+   `RamStore` anywhere.

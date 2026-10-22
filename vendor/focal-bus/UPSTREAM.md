@@ -3,7 +3,7 @@
 The bus Quiver is built on (docs/design/focal-bus.md, kiln's CP-T2.1).
 
 - **Upstream:** https://github.com/hyper-light/focal, branch `bus-replicated`, commit
-  `0d1fab4d6eea2fbc1013f20ebf27bb4621588e05` (2026-10-21), MIT (`LICENSE`). The commit was agreed with Focal's agent
+  `b408a3b1592ec754dfcfb6a6547111428629761a` (2026-10-21), MIT (`LICENSE`). The commit was agreed with Focal's agent
   (docs/design/focal-bus.md, "What Focal's agent said").
 - **What is here:** the bus and the crates of Focal's it builds on, laid out as upstream lays them
   out:

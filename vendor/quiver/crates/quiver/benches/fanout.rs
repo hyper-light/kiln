@@ -55,6 +55,9 @@ struct Args {
     seed: u64,
     /// Refuse to start above this load average (CLAUDE.md §7: under 2).
     max_load: f64,
+    /// How long a worker with nothing to take keeps looking before it waits on the topic (0: it
+    /// waits at once): a consumer that polls a while, as low-latency consumers do, wakes no one.
+    spin_us: u64,
 }
 
 fn args() -> Args {
@@ -71,6 +74,7 @@ fn args() -> Args {
         runs: 3,
         seed: 0x5eed,
         max_load: 2.0,
+        spin_us: 0,
     };
     let given: Vec<String> = std::env::args_os()
         .skip(1)
@@ -97,8 +101,9 @@ fn args() -> Args {
             "--runs" => a.runs = value().parse().unwrap(),
             "--seed" => a.seed = value().parse().unwrap(),
             "--max-load" => a.max_load = value().parse().unwrap(),
+            "--spin-us" => a.spin_us = value().parse().unwrap(),
             other => panic!(
-                "unknown argument {other:?}: [fanout|soak] --rate --subscribers --workers --seconds --warmup --payload --retain --runs --seed --max-load"
+                "unknown argument {other:?}: [fanout|soak] --rate --subscribers --workers --seconds --warmup --payload --retain --runs --seed --max-load --spin-us"
             ),
         }
     }
@@ -215,7 +220,8 @@ struct Shared {
     stop: AtomicBool,
 }
 
-fn worker(index: usize, mut subs: Vec<Follow>, shared: Arc<Shared>) -> Seen {
+fn worker(index: usize, mut subs: Vec<Follow>, shared: Arc<Shared>, spin: Duration) -> Seen {
+    let mut idle_since: Option<Instant> = None;
     let mut seen = Seen {
         latency: Histogram::new(),
         deliveries: 0,
@@ -272,7 +278,18 @@ fn worker(index: usize, mut subs: Vec<Follow>, shared: Arc<Shared>) -> Seen {
         if ended || shared.stop.load(Ordering::Acquire) {
             break;
         }
-        if !took && let Some(first) = subs.first_mut() {
+        if took {
+            idle_since = None;
+            continue;
+        }
+        // Nothing to take: look again until the spin is over, then wait on the topic.
+        let since = *idle_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < spin {
+            std::hint::spin_loop();
+            continue;
+        }
+        idle_since = None;
+        if let Some(first) = subs.first_mut() {
             futures::executor::block_on(first.sub.ready());
         }
     }
@@ -345,9 +362,10 @@ fn run(a: &Args, seed: u64, mut minute: impl FnMut(u64, &Shared, u64)) -> Run {
         .enumerate()
         .map(|(i, subs)| {
             let shared = Arc::clone(&shared);
+            let spin = Duration::from_micros(a.spin_us);
             std::thread::Builder::new()
                 .name(format!("sub-{i}"))
-                .spawn(move || worker(i, subs, shared))
+                .spawn(move || worker(i, subs, shared, spin))
                 .unwrap()
         })
         .collect();
@@ -530,8 +548,8 @@ fn main() {
         a.rate, a.payload, a.retain
     );
     println!(
-        "- subscribers: {} over {} worker threads; window {} s after {} s of warm-up; seed {:#x}",
-        a.subscribers, a.workers, a.seconds, a.warmup, a.seed
+        "- subscribers: {} over {} worker threads, each looking {} µs before it waits; window {} s after {} s of warm-up; seed {:#x}",
+        a.subscribers, a.workers, a.spin_us, a.seconds, a.warmup, a.seed
     );
     println!();
     if a.soak {
