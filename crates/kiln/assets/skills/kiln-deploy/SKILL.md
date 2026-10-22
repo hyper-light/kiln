@@ -93,9 +93,9 @@ knows the app, release it this way; the tools are `deploy_*` (code mode: `kiln.d
      approve your own request.
    - `committing` with "waits for its pull request #N to be merged" ("merge request !N" on
      GitLab): the environment releases as pull requests (`via: pull-request`). A person merges it
-     on GitHub or GitLab, and that's the approval: tell the person who asked, with its link (the
-     release's `provider.pull_request.url`); never merge it yourself. Closed unmerged, the release
-     is cancelled.
+     on GitHub, GitLab or Bitbucket, and that's the approval: tell the person who asked, with its
+     link (the release's `provider.pull_request.url`); never merge it yourself. Closed unmerged
+     (declined, on Bitbucket), the release is cancelled.
    - `failed`: read `message` and `provider`. Its commit was reverted: what ran before runs
      again. Fix forward and release again.
 4. **Promote.** `kiln.deploy.releases.create({ app, environment: "production", promote_from: "staging" })`

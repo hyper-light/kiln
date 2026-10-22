@@ -269,7 +269,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         // app in one of its environments, signed for the server asking (`audience`, its issuer).
         (&Method::GET, ["link"]) => ok(&link::about(&d.hub)),
         // Where release repositories may be (§7): kiln's own git server, GitHub through kiln's App,
-        // each GitLab with the groups its token covers.
+        // each GitLab with the groups its token covers, Bitbucket with its workspaces.
         (&Method::GET, ["git-hosts"]) => ok(&json!({ "hosts": boxed(|| git_hosts(&d.hub)).await })),
         (&Method::GET, ["apps", app, "environments", env, "statement"]) => {
             let audience = q.get("audience").map(|a| a.trim()).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
@@ -323,11 +323,9 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
     }
 }
 
-/// Every registration with what runs and what's in flight, and what waits for people: the
-/// environments board, in one answer.
 /// The git hosts release repositories may be on (docs/deploy-api.md §7).
 async fn git_hosts(hub: &Hub) -> Vec<Value> {
-    use super::model::{GITHUB_HOST, GITLAB_HOST, KILN_HOST};
+    use super::model::{BITBUCKET_HOST, GITHUB_HOST, GITLAB_HOST, KILN_HOST};
     let mut out = vec![json!({ "host": KILN_HOST, "name": "kiln's own git server" })];
     if let Some(app) = crate::githost::github::app(hub).await {
         out.push(json!({ "host": GITHUB_HOST, "name": "GitHub", "web": app.web }));
@@ -335,9 +333,14 @@ async fn git_hosts(hub: &Hub) -> Vec<Value> {
     for g in crate::githost::gitlab::hosts(hub).await {
         out.push(json!({ "host": GITLAB_HOST, "name": "GitLab", "web": g.web, "groups": g.groups() }));
     }
+    if let Some(b) = crate::githost::bitbucket::host(hub).await {
+        out.push(json!({ "host": BITBUCKET_HOST, "name": "Bitbucket", "web": b.web, "groups": b.workspaces() }));
+    }
     out
 }
 
+/// Every registration with what runs and what's in flight, and what waits for people: the
+/// environments board, in one answer.
 async fn board(d: &Deploy) -> Result<Value, Fail> {
     let st = &d.hub.store;
     let environments = store::environments(st).await.map_err(internal)?;

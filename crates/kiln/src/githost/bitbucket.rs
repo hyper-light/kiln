@@ -5,8 +5,11 @@
 //!   token, whose user is an email, `x-bitbucket-api-token-auth`; else the user).
 //! - **Commits** are made here, in the repository's mirror, and pushed with a lease on the head they
 //!   were made on.
-//! - **Pull requests**, build statuses (a release's too: Bitbucket has no deployments API outside
-//!   Pipelines), push webhooks (`X-Hub-Signature`), and new repositories with a template's history.
+//! - **Pull requests** (opened, found by their branch, followed, declined with a comment), build
+//!   statuses (a release's too: Bitbucket has no deployments API outside Pipelines), push webhooks
+//!   (`X-Hub-Signature`), new repositories (empty, or with a template's history).
+//! - **Deploy keys**: an SSH key that only reads one repository, made for a reader of kiln's
+//!   (Argo CD): Bitbucket's API makes no token that only reads.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -40,6 +43,8 @@ pub struct Bitbucket {
     pub webhook_secret: Option<String>,
     /// The workspaces it covers (none: every one).
     workspaces: Vec<String>,
+    /// Where git reads over SSH (`ssh://git@bitbucket.org`).
+    ssh: String,
 }
 
 fn cache() -> &'static parking_lot::Mutex<Option<(Instant, Option<Arc<Bitbucket>>)>> {
@@ -78,7 +83,9 @@ async fn load(c: &crate::config::ci::BitbucketHost) -> anyhow::Result<Bitbucket>
         Some(f) => super::read_secret(f).await?,
         None => None,
     };
-    Ok(Bitbucket { web: c.web_url.trim_end_matches('/').to_owned(), api: c.api_url.trim_end_matches('/').to_owned(), cred, webhook_secret, workspaces: c.workspaces.clone() })
+    let web = c.web_url.trim_end_matches('/').to_owned();
+    let ssh = c.ssh_url.as_deref().map_or_else(|| format!("ssh://git@{}", super::host_of(&web)), |u| u.trim_end_matches(['/', ':']).to_owned());
+    Ok(Bitbucket { web, api: c.api_url.trim_end_matches('/').to_owned(), cred, webhook_secret, workspaces: c.workspaces.clone(), ssh })
 }
 
 /// git's `http.<url>.extraheader` settings for Bitbucket: `[ci.bitbucket]`'s credentials for what
@@ -238,11 +245,90 @@ impl Bitbucket {
         if st != 200 {
             bail!("pull request #{number} ({st}): {}", said(&v));
         }
-        Ok(match v.get("state").and_then(Value::as_str).unwrap_or_default() {
-            "MERGED" => ChangeState::Merged { commit: v.pointer("/merge_commit/hash").and_then(Value::as_str).map(str::to_owned), by: v.pointer("/closed_by/nickname").and_then(Value::as_str).map(str::to_owned) },
-            "DECLINED" | "SUPERSEDED" => ChangeState::Closed,
-            _ => ChangeState::Open,
-        })
+        Ok(pr_state(&v))
+    }
+
+    /// The pull request from the branch `head` of the repository, open or not, if there is one
+    /// (the newest).
+    pub async fn find_change(&self, repo: &Repo, head: &str) -> anyhow::Result<Option<(ChangeRef, ChangeState)>> {
+        let name = self.name(repo)?;
+        let q = crate::ci::cli::enc(&format!("source.branch.name=\"{head}\""));
+        let (st, v) = self.call(Method::Get, &format!("/repositories/{name}/pullrequests?q={q}&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED"), None).await?;
+        if st != 200 {
+            bail!("the pull requests from {head} ({st}): {}", said(&v));
+        }
+        let newest = v.get("values").and_then(Value::as_array).and_then(|l| l.iter().max_by_key(|p| p.get("id").and_then(Value::as_u64).unwrap_or(0)));
+        Ok(newest.map(|p| (ChangeRef { number: p.get("id").and_then(Value::as_u64).unwrap_or(0), url: p.pointer("/links/html/href").and_then(Value::as_str).unwrap_or_default().to_owned() }, pr_state(p))))
+    }
+
+    /// Declines pull request `number`, saying why (a comment) first.
+    pub async fn close_change(&self, repo: &Repo, number: u64, why: &str) -> anyhow::Result<()> {
+        let name = self.name(repo)?;
+        if !why.is_empty() {
+            let (st, v) = self.call(Method::Post, &format!("/repositories/{name}/pullrequests/{number}/comments"), Some(&json!({ "content": { "raw": why } }))).await?;
+            if st != 201 {
+                tracing::debug!(pull = number, status = st, said = %said(&v), "Bitbucket took no comment on a pull request kiln declines");
+            }
+        }
+        let (st, v) = self.call(Method::Post, &format!("/repositories/{name}/pullrequests/{number}/decline"), None).await?;
+        anyhow::ensure!(st == 200, "Bitbucket didn't decline pull request #{number} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// Deletes a branch (gone already is fine). Its name's `/`s stay as they are in the path, as
+    /// Bitbucket reads it.
+    pub async fn delete_branch(&self, repo: &Repo, branch: &str) -> anyhow::Result<()> {
+        let name = self.name(repo)?;
+        let path: Vec<String> = branch.split('/').map(seg).collect();
+        let (st, v) = self.call(Method::Delete, &format!("/repositories/{name}/refs/branches/{}", path.join("/")), None).await?;
+        anyhow::ensure!(matches!(st, 204 | 404), "Bitbucket didn't delete {branch} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// The repository `workspace/slug` as Bitbucket shows it to kiln (`None`: there's none it sees).
+    pub async fn repository(&self, name: &str) -> anyhow::Result<Option<Value>> {
+        let (st, v) = self.call(Method::Get, &format!("/repositories/{name}"), None).await?;
+        match st {
+            200 => Ok(Some(v)),
+            404 => Ok(None),
+            _ => bail!("Bitbucket didn't say whether {name} is there ({st}): {}", said(&v)),
+        }
+    }
+
+    /// Makes `workspace/slug`, private and empty.
+    pub async fn create_repository(&self, name: &str, description: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(name.split('/').count() == 2, "`{name}`: workspace/slug");
+        let (st, v) = self.call(Method::Post, &format!("/repositories/{name}"), Some(&json!({ "scm": "git", "is_private": true, "description": description }))).await?;
+        anyhow::ensure!(st == 200 || st == 201, "Bitbucket made no repository {name} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// The workspaces kiln's credentials cover (none: every one).
+    pub fn workspaces(&self) -> &[String] {
+        &self.workspaces
+    }
+
+    /// Where git reads `workspace/slug` over SSH, as a deploy key does.
+    pub fn ssh_url(&self, name: &str) -> String {
+        format!("{}/{name}.git", self.ssh)
+    }
+
+    /// A deploy key of the repository `workspace/slug` (an SSH key that only reads it), for one
+    /// reader: its id on Bitbucket, and its private key (OpenSSH's format), which kiln keeps
+    /// nowhere. Making one takes the repository's admin.
+    pub async fn deploy_key(&self, name: &str, label: &str) -> anyhow::Result<(u64, String)> {
+        let (public, private) = ssh_key("kiln")?;
+        let (st, v) = self.call(Method::Post, &format!("/repositories/{name}/deploy-keys"), Some(&json!({ "key": public, "label": label }))).await?;
+        anyhow::ensure!(st == 200 || st == 201, "Bitbucket made no deploy key for {name} ({st}): {}", said(&v));
+        let id = v.get("id").and_then(Value::as_u64).ok_or_else(|| anyhow!("Bitbucket's deploy key for {name} has no id"))?;
+        Ok((id, private))
+    }
+
+    /// Deletes a deploy key (gone already is fine).
+    pub async fn revoke_deploy_key(&self, name: &str, id: u64) -> anyhow::Result<()> {
+        let (st, v) = self.call(Method::Delete, &format!("/repositories/{name}/deploy-keys/{id}"), None).await?;
+        anyhow::ensure!(matches!(st, 204 | 404), "Bitbucket didn't delete deploy key {id} of {name} ({st}): {}", said(&v));
+        Ok(())
     }
 
     /// A build status, in Bitbucket's words (`INPROGRESS`, `SUCCESSFUL`, `FAILED`, `STOPPED`).
@@ -288,6 +374,60 @@ impl Bitbucket {
     }
 }
 
+/// An Ed25519 key for SSH: its public key as `authorized_keys` has it (`ssh-ed25519 AAAA… <comment>`),
+/// and its private key in OpenSSH's format (unencrypted).
+fn ssh_key(comment: &str) -> anyhow::Result<(String, String)> {
+    use aws_lc_rs::rand::SecureRandom as _;
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
+    fn string(out: &mut Vec<u8>, b: &[u8]) {
+        out.extend_from_slice(&u32::try_from(b.len()).unwrap_or(u32::MAX).to_be_bytes());
+        out.extend_from_slice(b);
+    }
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let (mut seed, mut check) = ([0u8; 32], [0u8; 4]);
+    rng.fill(&mut seed).map_err(|_| anyhow!("no SSH key could be made"))?;
+    rng.fill(&mut check).map_err(|_| anyhow!("no SSH key could be made"))?;
+    let pair = Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| anyhow!("no SSH key could be made"))?;
+    let public = pair.public_key().as_ref();
+    let mut blob = Vec::new();
+    string(&mut blob, b"ssh-ed25519");
+    string(&mut blob, public);
+    // The private section: a check number twice, the key (its seed, then its public half), the
+    // comment, padded to 8 bytes with 1, 2, 3 …
+    let mut private = Vec::new();
+    private.extend_from_slice(&check);
+    private.extend_from_slice(&check);
+    string(&mut private, b"ssh-ed25519");
+    string(&mut private, public);
+    string(&mut private, &[seed.as_slice(), public].concat());
+    string(&mut private, comment.as_bytes());
+    for pad in 1..=7u8 {
+        if private.len().is_multiple_of(8) {
+            break;
+        }
+        private.push(pad);
+    }
+    let mut key = b"openssh-key-v1\0".to_vec();
+    string(&mut key, b"none");
+    string(&mut key, b"none");
+    string(&mut key, b"");
+    key.extend_from_slice(&1u32.to_be_bytes());
+    string(&mut key, &blob);
+    string(&mut key, &private);
+    let text = B64.encode(&key);
+    let lines: Vec<&str> = text.as_bytes().chunks(70).filter_map(|c| std::str::from_utf8(c).ok()).collect();
+    Ok((format!("ssh-ed25519 {} {comment}", B64.encode(&blob)), format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n", lines.join("\n"))))
+}
+
+/// Where a pull request (Bitbucket's JSON for one) is.
+fn pr_state(v: &Value) -> ChangeState {
+    match v.get("state").and_then(Value::as_str).unwrap_or_default() {
+        "MERGED" => ChangeState::Merged { commit: v.pointer("/merge_commit/hash").and_then(Value::as_str).map(str::to_owned), by: v.pointer("/closed_by/nickname").and_then(Value::as_str).map(str::to_owned) },
+        "DECLINED" | "SUPERSEDED" => ChangeState::Closed,
+        _ => ChangeState::Open,
+    }
+}
+
 /// A push webhook's ref update (`repo:push`; its first change).
 pub fn push_event(headers: &http::HeaderMap, body: &[u8]) -> Option<Push> {
     if headers.get("x-event-key").and_then(|v| v.to_str().ok()) != Some("repo:push") {
@@ -314,7 +454,8 @@ mod tests {
 
     #[test]
     fn w23_r05_names_and_logins() {
-        let b = Bitbucket { web: "https://bitbucket.org".into(), api: "https://api.bitbucket.org/2.0".into(), cred: Cred::Token("t".into()), webhook_secret: None, workspaces: vec!["acme".into()] };
+        let b = Bitbucket { web: "https://bitbucket.org".into(), api: "https://api.bitbucket.org/2.0".into(), cred: Cred::Token("t".into()), webhook_secret: None, workspaces: vec!["acme".into()], ssh: "ssh://git@bitbucket.org".into() };
+        assert_eq!(b.ssh_url("acme/releases"), "ssh://git@bitbucket.org/acme/releases.git");
         assert_eq!(b.name_of(&repo("https://bitbucket.org/acme/app.git")).as_deref(), Some("acme/app"));
         assert_eq!(b.name_of(&repo("git@bitbucket.org:acme/app.git")).as_deref(), Some("acme/app"));
         assert_eq!(b.name_of(&repo("https://bitbucket.org/other/app.git")), None);
@@ -323,6 +464,40 @@ mod tests {
         assert_eq!(api.git_login().0, "x-bitbucket-api-token-auth");
         assert!(api.api_auth().starts_with("Basic "));
         assert_eq!(seg("{0f0f}"), "%7B0f0f%7D");
+    }
+
+    #[test]
+    fn deploy_keys_are_openssh_ed25519() -> anyhow::Result<()> {
+        let (public, private) = ssh_key("kiln")?;
+        let mut parts = public.split(' ');
+        assert_eq!(parts.next(), Some("ssh-ed25519"));
+        let blob = B64.decode(parts.next().unwrap_or_default())?;
+        assert_eq!(parts.next(), Some("kiln"));
+        // `string "ssh-ed25519"`, then the 32-byte key.
+        assert_eq!(blob.len(), 4 + 11 + 4 + 32);
+        assert_eq!(blob.get(4..15), Some(b"ssh-ed25519".as_slice()));
+        let body: String = private.lines().filter(|l| !l.starts_with("-----")).collect();
+        assert!(private.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n") && private.ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+        assert!(private.lines().all(|l| l.len() <= 70));
+        let key = B64.decode(body)?;
+        assert!(key.starts_with(b"openssh-key-v1\0"));
+        // The public key in it is the one Bitbucket gets.
+        assert!(key.windows(blob.len()).any(|w| w == blob.as_slice()));
+        assert_ne!(ssh_key("kiln")?.0, public, "a new key each time");
+        // OpenSSH reads it, where it's here to: the public key it makes from it is the same.
+        #[cfg(unix)]
+        if let Ok(dir) = tempfile::tempdir() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file = dir.path().join("key");
+            std::fs::write(&file, &private)?;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+            if let Ok(out) = std::process::Command::new("ssh-keygen").arg("-y").arg("-f").arg(&file).output() {
+                assert!(out.status.success(), "ssh-keygen: {}", String::from_utf8_lossy(&out.stderr));
+                let derived = String::from_utf8_lossy(&out.stdout);
+                assert_eq!(derived.split(' ').take(2).collect::<Vec<_>>(), public.split(' ').take(2).collect::<Vec<_>>());
+            }
+        }
+        Ok(())
     }
 
     #[test]

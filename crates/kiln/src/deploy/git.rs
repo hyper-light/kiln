@@ -1,12 +1,12 @@
 //! An environment's release repository, wherever it is (docs/deploy-api.md §7): one of kiln's own
-//! ([`super::host`]), or one on GitHub or GitLab ([`super::remote`]). What a release reads and
-//! writes there, the same either way.
+//! ([`super::host`]), or one on GitHub, a GitLab or Bitbucket ([`super::remote`]). What a release
+//! reads and writes there, the same either way.
 
 use std::time::Duration;
 
 use super::Deploy;
 use super::host::{Author, Change, CommitError, Committed, Hosted, LoggedCommit};
-use super::model::{GITHUB_HOST, GITLAB_HOST, KILN_HOST, RepoRef};
+use super::model::{BITBUCKET_HOST, GITHUB_HOST, GITLAB_HOST, KILN_HOST, RepoRef};
 use super::remote::{self, Remote};
 
 /// A release repository and the branch releases go to.
@@ -19,8 +19,8 @@ pub enum Repo {
 pub async fn open(d: &Deploy, rr: &RepoRef) -> Result<Repo, String> {
     match rr.host.as_str() {
         KILN_HOST => Ok(Repo::Kiln { hosted: d.hosted.clone(), repo: rr.repo.clone(), branch: rr.branch.clone() }),
-        GITHUB_HOST | GITLAB_HOST => Ok(Repo::Remote(Box::new(remote::open(d, rr).await?))),
-        other => Err(format!("{other}: a release repository is on kiln's own git server (`kiln`), on GitHub (`github`) or on a GitLab (`gitlab`)")),
+        GITHUB_HOST | GITLAB_HOST | BITBUCKET_HOST => Ok(Repo::Remote(Box::new(remote::open(d, rr).await?))),
+        other => Err(format!("{other}: a release repository is on kiln's own git server (`kiln`), on GitHub (`github`), on a GitLab (`gitlab`) or on Bitbucket (`bitbucket`)")),
     }
 }
 

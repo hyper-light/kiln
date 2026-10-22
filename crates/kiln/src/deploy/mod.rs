@@ -7,8 +7,8 @@
 //! - [`store`]: where the records are kept (kiln's store, until KilnDB).
 //! - [`repo`]: the release repository's layout.
 //! - [`git`]: an environment's release repository, wherever it is: [`host`], kiln's own git
-//!   server, or [`remote`], GitHub through kiln's GitHub App or a GitLab with its token (their pull
-//!   and merge requests, deployments and webhooks too).
+//!   server, or [`remote`], GitHub through kiln's GitHub App, a GitLab with its token or Bitbucket
+//!   (their pull and merge requests, deployments and webhooks too).
 //! - [`kilncd`], [`argocd`]: the CD providers, KilnCD and Argo CD ([`appset`]: an environment's
 //!   ApplicationSet there); [`provider`]: what they answer; [`moves`]: an environment moved from one
 //!   to the other.
@@ -66,7 +66,8 @@ pub struct Deploy {
     pub changes: crate::rt::Broadcast<i64>,
     /// What each Argo CD's stream says of the Applications kiln made.
     pub argo: argocd::Watches,
-    /// Release repositories on GitHub or GitLab: their mirrors, and the releases reported there.
+    /// Release repositories on GitHub, a GitLab or Bitbucket: their mirrors, and the releases
+    /// reported there.
     pub remote: Arc<remote::Mirrors>,
 }
 

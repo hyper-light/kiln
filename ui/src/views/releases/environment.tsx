@@ -119,13 +119,13 @@ function Settings({ e }: { e: Environment }) {
   const [pulls, setPulls] = React.useState(g.via === "pull-request");
   const [busy, setBusy] = React.useState(false);
   // Pull requests (GitLab's merge requests) where the release repository is on another host.
-  const onGithub = e.release_repo.host === "github" || e.release_repo.host === "gitlab";
+  const onHost = e.release_repo.host !== "kiln";
   const count = Number(approvals);
   const wrong =
     !Number.isInteger(count) || count < 0
       ? "Approvals: a whole number, 0 for none."
       : pulls && count > 0
-        ? "With pull requests, merging one is the approval: set approvals to 0 (who may merge is the branch's protection on GitHub)."
+        ? "With pull requests, merging one is the approval: set approvals to 0 (who may merge is the branch's protection on its host)."
       : windows.some((w) => !w.cron.trim() || !w.duration.trim())
         ? "Each window needs its schedule and how long it lasts."
         : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
@@ -149,7 +149,7 @@ function Settings({ e }: { e: Environment }) {
       checks: [...builtIn, ...external.map(checkSpec)],
       require_provenance: provenance ? { builder: g.require_provenance?.builder, workflows: names(provWorkflows), branches: names(provBranches) } : undefined,
       freeze: g.freeze,
-      via: onGithub && pulls ? "pull-request" : undefined,
+      via: onHost && pulls ? "pull-request" : undefined,
     };
     setBusy(true);
     try {
@@ -183,7 +183,7 @@ function Settings({ e }: { e: Environment }) {
         <label className="cd-new-check">
           <input type="checkbox" className="check" checked={provenance} onChange={(ev) => setProvenance(ev.target.checked)} /> Only what kiln's CI built and signed (provenance)
         </label>
-        {onGithub && (
+        {onHost && (
           <label className="cd-new-check">
             <input type="checkbox" className="check" checked={pulls} onChange={(ev) => setPulls(ev.target.checked)} /> Releases as pull requests: merging one releases it, closing it cancels it
           </label>
@@ -506,7 +506,10 @@ function Here({ env }: { env: string }) {
   );
 }
 
-/** Where an environment's releases go: its release repository, linked where it's GitHub's or GitLab's. */
+/** Another git host's name, as its repositories are called. */
+const HOSTS_OF: Record<string, string> = { github: "GitHub's", gitlab: "GitLab's", bitbucket: "Bitbucket's" };
+
+/** Where an environment's releases go: its release repository, linked where it's on another host. */
 function RepoLine({ e }: { e: Environment }) {
   const hosts = useSuspenseResource("deploy/git-hosts", (s) => deployApi.gitHosts(s)).data;
   const where = `${e.release_repo.repo}@${e.release_repo.branch}${e.release_repo.root ? `/${e.release_repo.root}` : ""}`;
@@ -517,7 +520,7 @@ function RepoLine({ e }: { e: Environment }) {
       releases {e.gates.via === "pull-request" ? `proposed as ${proposals} on` : "committed to"}{" "}
       {url ? (
         <>
-          {e.release_repo.host === "gitlab" ? "GitLab's" : "GitHub's"}{" "}
+          {HOSTS_OF[e.release_repo.host] ?? "its host's"}{" "}
           <a href={url} target="_blank" rel="noreferrer">
             <code>{where}</code>
           </a>
