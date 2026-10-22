@@ -223,6 +223,9 @@ a row. Switch it off for an agent in its ⋯ menu (**Keep it going when it stops
 with the `keep_going` control (`{"type": "control", "id": "keep_going", "value": false}`); it
 holds across restarts.
 
+What the driver sends, and the goals it sees end, are counted on `/metrics`
+(`kiln_goals_sent_total`, `kiln_goals_ended_total`): docs/agents.md, "Metrics".
+
 ## API
 
 | Method | Path | |

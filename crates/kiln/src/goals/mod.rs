@@ -665,7 +665,7 @@ async fn set_locked(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
         .await?;
     // A running stack whose goal under way changed: what's first now goes to the agent at once.
     if moved && running {
-        push(hub, agent).await;
+        push(hub, agent, crate::metrics::agents()).await;
     }
     get(hub, agent).await
 }
@@ -785,6 +785,11 @@ pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at
 /// next goes to the agent at once. A goal skipped or not met can be said met after all; one met
 /// already stays as it is.
 pub async fn done(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&str>, by: &By) -> R<Stack> {
+    done_counted(hub, agent, id, evidence, by, crate::metrics::agents()).await
+}
+
+/// [`done`], the goals it ends (the one said met and its parts still to go) counted into `metrics`.
+async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&str>, by: &By, metrics: &crate::metrics::AgentMetrics) -> R<Stack> {
     let info = known(hub, agent)?;
     let evidence = evidence.map(|e| e.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|e| !e.is_empty());
     if evidence.as_ref().is_some_and(|e| e.chars().count() > TEXT) {
@@ -814,9 +819,9 @@ pub async fn done(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&st
         .store
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
-            tx.execute("UPDATE goal_items SET status = 'met', reason = ?2, ended_at = ?3 WHERE id = ?1", params![target_id, reason, now])?;
+            let mut met = tx.execute("UPDATE goal_items SET status = 'met', reason = ?2, ended_at = ?3 WHERE id = ?1", params![target_id, reason, now])?;
             for id in &ended_parts {
-                tx.execute("UPDATE goal_items SET status = 'met', reason = 'Met with the goal it is a part of.', ended_at = ?2 WHERE id = ?1", params![id, now])?;
+                met += tx.execute("UPDATE goal_items SET status = 'met', reason = 'Met with the goal it is a part of.', ended_at = ?2 WHERE id = ?1", params![id, now])?;
             }
             renumber(&tx, &agent_s)?;
             touch(&tx, &agent_s, None, None, now)?;
@@ -826,11 +831,15 @@ pub async fn done(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&st
             }
             let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![agent_s], |r| r.get(0))?;
             tx.commit()?;
-            Ok(state == "running")
+            Ok((state == "running", met))
         })
         .await?;
+    let (running, met) = running;
+    for _ in 0..met {
+        metrics.goal_ended(true);
+    }
     if running && was_active {
-        push(hub, agent).await;
+        push(hub, agent, metrics).await;
     }
     get(hub, agent).await
 }
@@ -841,6 +850,11 @@ pub async fn done(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option<&st
 /// taken out (the goal under way ends as skipped, its harness's own goal cleared; one to come goes,
 /// with its parts).
 pub async fn update(hub: &Hub, agent: &str, id: &str, change: Change, by: &By) -> R<Stack> {
+    update_counted(hub, agent, id, change, by, crate::metrics::agents()).await
+}
+
+/// [`update`], the goal under way taken out (it ends, skipped) counted into `metrics`.
+async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &By, metrics: &crate::metrics::AgentMetrics) -> R<Stack> {
     let info = known(hub, agent)?;
     let text = change.text.as_deref().map(clean).transpose()?;
     let at = match (change.before.clone(), change.after.clone(), change.next) {
@@ -890,8 +904,11 @@ pub async fn update(hub: &Hub, agent: &str, id: &str, change: Change, by: &By) -
                 Ok(state == "running")
             })
             .await?;
+        if active {
+            metrics.goal_ended(false);
+        }
         if running && active {
-            push(hub, agent).await;
+            push(hub, agent, metrics).await;
         }
         return get(hub, agent).await;
     }
@@ -981,8 +998,13 @@ pub async fn control(hub: &Hub, agent: &str, action: Action) -> R<Stack> {
 /// resumes by itself then (the driver resumes it: [`Driver::drive`]); a goal skipped says who
 /// skipped it.
 pub async fn control_as(hub: &Hub, agent: &str, action: Action, by: &By, pausing: Pausing) -> R<Stack> {
+    control_counted(hub, agent, action, by, pausing, crate::metrics::agents()).await
+}
+
+/// [`control_as`], the goals it ends (skipped, or said met) counted into `metrics`.
+async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausing: Pausing, metrics: &crate::metrics::AgentMetrics) -> R<Stack> {
     if action == Action::Done {
-        return done(hub, agent, None, None, by).await;
+        return done_counted(hub, agent, None, None, by, metrics).await;
     }
     let info = known(hub, agent)?;
     let now = now_ms(hub);
@@ -1023,10 +1045,11 @@ pub async fn control_as(hub: &Hub, agent: &str, action: Action, by: &By, pausing
     // What the agent last said of its goal: a verdict from before you resume doesn't count.
     let said_at = info.objective.as_ref().map_or(0, |o| o.at);
     let agent_s = agent.to_owned();
-    let running = hub
+    let (running, skipped) = hub
         .store
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
+            let mut skipped = 0;
             match action {
                 Action::Start => run_from_here(&tx, &agent_s, said_at, now)?,
                 Action::Pause => {
@@ -1034,7 +1057,7 @@ pub async fn control_as(hub: &Hub, agent: &str, action: Action, by: &By, pausing
                     tx.execute("UPDATE goal_stacks SET dropped_at = ?2, resume_at = ?3 WHERE agent = ?1", params![agent_s, now, until])?;
                 }
                 Action::Skip => {
-                    tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE agent = ?1 AND status = 'active'", params![agent_s, now, skipped_why])?;
+                    skipped = tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE agent = ?1 AND status = 'active'", params![agent_s, now, skipped_why])?;
                     touch(&tx, &agent_s, None, None, now)?;
                     tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
                 }
@@ -1054,14 +1077,17 @@ pub async fn control_as(hub: &Hub, agent: &str, action: Action, by: &By, pausing
             }
             let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![agent_s], |r| r.get(0))?;
             tx.commit()?;
-            Ok(state == "running")
+            Ok((state == "running", skipped))
         })
         .await
         .map_err(|e| if e.to_string().contains("at most") { Error::Bad(e.to_string()) } else { Error::Other(e) })?;
+    for _ in 0..skipped {
+        metrics.goal_ended(false);
+    }
     // You started or resumed it, skipped its goal or brought its goals back: what's next goes to
     // the agent now, whatever it's doing (behind a turn under way, by its harness's queue).
     if running && matches!(action, Action::Start | Action::Skip | Action::Restore) {
-        push(hub, agent).await;
+        push(hub, agent, metrics).await;
     }
     get(hub, agent).await
 }
@@ -1131,9 +1157,10 @@ fn merged(now: Vec<Item>, back: Vec<Item>, said_at: i64) -> Vec<Item> {
 
 /// What's next on a running stack goes to the agent now (`step` pushed): a failure is only logged,
 /// since the change it follows stands. The driver's step, on the hub's parts: its clock, its store
-/// and its agents (`hub: None`: a step tells no parents and moves no sessions).
-async fn push(hub: &Hub, agent: &str) {
-    let d = Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub, hub: None };
+/// and its agents (`hub: None`: a step tells no parents and moves no sessions), what it sends
+/// counted into `metrics`.
+async fn push(hub: &Hub, agent: &str, metrics: &crate::metrics::AgentMetrics) {
+    let d = Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub, hub: None, metrics };
     if let Err(e) = step(&d, agent, true).await {
         tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
     }
@@ -1237,7 +1264,7 @@ where
 /// way to how it came out, and sends it again when the agent stops short of it. Goals set in an
 /// agent directly join its stack first.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: Some(&hub) }.drive().await
+    Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: Some(&hub), metrics: crate::metrics::agents() }.drive().await
 }
 
 /// What the goal driver works with: the stacks' store, its clock, what stops it, and its agents.
@@ -1250,6 +1277,8 @@ pub struct Driver<'a, P> {
     /// on elsewhere (`harness::elsewhere`): none for the driver alone (its tests), and for a step
     /// of yours that goes at once (`push`).
     pub hub: Option<&'a Arc<Hub>>,
+    /// What it counts its sends and the goals it saw end into (kiln's, `metrics::agents()`).
+    pub metrics: &'a crate::metrics::AgentMetrics,
 }
 
 impl<P> Driver<'_, P>
@@ -1784,9 +1813,11 @@ where
 /// nothing changed, when `item` isn't a goal of the stack still to come.
 pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, item: Option<&str>, on: Option<&str>, met: bool, now: i64) -> anyhow::Result<bool> {
     let _one = CHANGING.lock().await;
+    // A goal said met through it (programs.assign) ends, and counts as one said met does.
+    let saying_met = met && item.is_some();
     let (agent, item, on) = (agent.to_owned(), item.map(str::to_owned), on.map(str::to_owned));
     let like = format!("{}%", track.replace(['%', '_'], ""));
-    store
+    let done = store
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
             tx.execute("UPDATE goal_items SET delegated_to = NULL WHERE agent = ?1 AND delegated_to IS NOT NULL AND text LIKE ?2", params![agent, like])?;
@@ -1806,7 +1837,11 @@ pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, ite
             tx.commit()?;
             Ok(true)
         })
-        .await
+        .await?;
+    if done && saying_met {
+        crate::metrics::agents().goal_ended(true);
+    }
+    Ok(done)
 }
 
 /// One step of a running stack (`decide`), by the driver's clock and through its port; `push`:
@@ -1837,6 +1872,7 @@ where
                 touch(c, &a, None, None, now)
             })
             .await?;
+        d.metrics.goal_ended(true);
         stack = stack_of(store, agent).await?;
     }
     // A goal whose parts kiln made are all met: met itself, at once, with no check of its own.
@@ -1848,6 +1884,7 @@ where
                 touch(c, &a, None, None, now)
             })
             .await?;
+        d.metrics.goal_ended(true);
         stack = stack_of(store, agent).await?;
     }
     let all = port.agents();
@@ -1895,6 +1932,7 @@ where
                     touch(c, &a, None, None, now)
                 })
                 .await?;
+            d.metrics.goal_ended(status == "met");
         }
         Next::Done => {
             store.call(move |c| touch(c, &a, Some("done"), None, now)).await?;
@@ -1916,6 +1954,7 @@ where
             let (went, sent) = say(port, agent, Some(id.as_str()), c, now).await;
             match went {
                 Sent::Delivered => {
+                    d.metrics.goal_sent(false);
                     store
                         .call(move |c| {
                             c.execute(
@@ -1936,6 +1975,8 @@ where
             let (went, sent) = say(port, agent, Some(id.as_str()), c, now).await;
             match went {
                 Sent::Delivered => {
+                    // Afresh (resumed, or reworded) it goes as a goal goes first: a start.
+                    d.metrics.goal_sent(!fresh);
                     tracing::info!(%agent, worked, stopped, fresh, "goal sent again");
                     store
                         .call(move |c| {
@@ -2144,6 +2185,104 @@ mod tests {
         assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS, false, false), Next::Remind { worked: true, .. }));
     }
 
+    /// CP-M2's counters move (a non-vacuity check; docs/agents.md, "Metrics"): a goal's first send
+    /// counts as a start, a send again as a reminder, and a goal its agent's harness says is met, or
+    /// that's cleared in the agent, as ended, met or skipped. Each exactly once, into the driver's
+    /// own counts, so nothing else running moves them.
+    #[test]
+    fn each_goal_counter_moves_once_for_each_send_and_end_the_driver_makes() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let id = "goals-metrics";
+            assert!(port.open(id, Info { id: id.into(), status: Status::Idle, ..Info::default() }));
+            assert!(port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]})));
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            store
+                .call(move |c| {
+                    for (pos, (g, text)) in [("g1", "the first goal"), ("g2", "the second goal")].into_iter().enumerate() {
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES (?1, ?2, ?3, ?4)", params![g, id, i64::try_from(pos)?, text])?;
+                    }
+                    touch(c, id, Some("running"), None, 0)
+                })
+                .await?;
+            let counts = || (metrics.goals_sent.get(&["start"]), metrics.goals_sent.get(&["reminder"]), metrics.goals_ended.get(&["met"]), metrics.goals_ended.get(&["skipped"]));
+            let says = |status: &str, text: &str| {
+                let objective = Objective { text: text.into(), status: status.into(), reason: None, at: clock.unix_ms() };
+                port.update(id, |i| i.objective = Some(objective))
+            };
+            // The first goal goes to the agent, idle: a start.
+            step(&driver, id, false).await?;
+            assert_eq!(counts(), (1, 0, 0, 0));
+            // It stops short of it: 30 s on, the goal goes again.
+            clock.advance(std::time::Duration::from_secs(30));
+            step(&driver, id, false).await?;
+            assert_eq!(counts(), (1, 1, 0, 0));
+            // Its harness says it's met: it ended, met; the second one starts.
+            clock.advance(std::time::Duration::from_secs(1));
+            assert!(says("met", "the first goal"));
+            step(&driver, id, false).await?;
+            assert_eq!(counts(), (1, 1, 1, 0));
+            step(&driver, id, false).await?;
+            assert_eq!(counts(), (2, 1, 1, 0));
+            // Cleared in the agent: it ended, skipped.
+            clock.advance(std::time::Duration::from_secs(1));
+            assert!(says("cleared", "the second goal"));
+            step(&driver, id, false).await?;
+            assert_eq!(counts(), (2, 1, 1, 1));
+            // What was counted is what the agent was sent: two goals and a reminder.
+            assert_eq!(port.heard(id).len(), 3);
+            Ok(())
+        })
+    }
+
+    /// A goal skipped through goal control counts as ended, skipped, once; a skip with no goal
+    /// under way counts nothing; a goal said met counts as ended, met; one taken out while under way
+    /// as ended, skipped (CP-M2's counters, a non-vacuity check).
+    #[test]
+    fn a_goal_skipped_said_met_or_taken_out_counts_as_ended_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            let dir = tempfile::tempdir()?;
+            let spec = crate::harness::session::Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            let opened = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+            set(&hub, &id, vec![Given { id: None, text: "a goal to skip".into() }]).await?;
+            let a = id.clone();
+            hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'active' WHERE agent = ?1", params![a]).map(|_| ())?)).await?;
+            let metrics = crate::metrics::AgentMetrics::default();
+            control_counted(&hub, &id, Action::Skip, &By::You, Pausing::default(), &metrics).await?;
+            assert_eq!(metrics.goals_ended.get(&["skipped"]), 1);
+            control_counted(&hub, &id, Action::Skip, &By::You, Pausing::default(), &metrics).await?;
+            assert_eq!((metrics.goals_ended.get(&["skipped"]), metrics.goals_ended.get(&["met"])), (1, 0), "nothing under way: nothing ended");
+            // Said met by the agent: ended, met. Taken out while under way: ended, skipped.
+            let under_way = |text: &'static str| {
+                let (hub, a) = (Arc::clone(&hub), id.clone());
+                async move { hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'active' WHERE agent = ?1 AND text = ?2", params![a, text]).map(|_| ())?)).await }
+            };
+            add(&hub, &id, vec!["a goal said met".into(), "a goal taken out".into()], false).await?;
+            under_way("a goal said met").await?;
+            done_counted(&hub, &id, None, Some("its tests pass"), &By::Itself, &metrics).await?;
+            assert_eq!(metrics.goals_ended.get(&["met"]), 1);
+            under_way("a goal taken out").await?;
+            let out = get(&hub, &id).await?.items.into_iter().find(|i| i.text == "a goal taken out").map(|i| i.id).unwrap_or_default();
+            update_counted(&hub, &id, &out, Change { remove: true, ..Change::default() }, &By::Itself, &metrics).await?;
+            assert_eq!((metrics.goals_ended.get(&["met"]), metrics.goals_ended.get(&["skipped"])), (1, 2));
+            Ok(())
+        })
+    }
+
     /// CP-M2's test, T-M2.1 (and AC-M2.1: the goal driver on the simulated clock in tests): the
     /// driver's reminder back-off, under the simulated clock. An
     /// agent stops short of its goal again and again: it's sent the goal 30 s after the goal joined
@@ -2165,7 +2304,8 @@ mod tests {
             let objective = Objective { text: goal.into(), status: "active".into(), reason: None, at: clock.unix_ms() };
             assert!(port.open(id, Info { id: id.into(), status: Status::Idle, objective: Some(objective), ..Info::default() }));
             port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
             let sent = || port.heard(id).iter().map(|d| d.at_ms).collect::<Vec<i64>>();
             let test = async {
                 clock.sleeping_since(0, 1).await;
@@ -2225,7 +2365,8 @@ mod tests {
             let id = "goals-push";
             assert!(port.open(id, Info { id: id.into(), status: Status::Disconnected, ..Info::default() }));
             assert!(port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]})));
-            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+            let metrics = crate::metrics::AgentMetrics::default();
+            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
             // A running stack, its goal under way just resumed.
             let (a, now) = (id.to_owned(), clock.unix_ms());
             store
@@ -2312,7 +2453,8 @@ mod tests {
             let lint = Objective { text: "lint passes".into(), status: "active".into(), reason: None, at: clock.unix_ms() };
             assert!(port.open(id, Info { id: id.into(), status: Status::Running, objective: Some(lint), ..Info::default() }));
             port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
-            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+            let metrics = crate::metrics::AgentMetrics::default();
+            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
             let a = id.to_owned();
             store
                 .call(move |c| {
@@ -2442,7 +2584,8 @@ mod tests {
                     Ok(())
                 })
                 .await?;
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
             let test = async {
                 clock.sleeping_since(0, 1).await;
                 clock.advance_and_settle(Duration::from_secs(60).saturating_sub(TICK)).await;
@@ -2493,7 +2636,8 @@ mod tests {
                     Ok(())
                 })
                 .await?;
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
             let test = async {
                 clock.sleeping_since(0, 1).await;
                 clock.advance_and_settle(TICK).await;
@@ -2848,7 +2992,8 @@ mod stack_tests {
             assert!(port.open(id, Info { id: id.into(), name: "Hex T7".into(), status: Status::Idle, limits: weekly(85.0), ..Info::default() }));
             assert!(port.open("loose", Info { id: "loose".into(), status: Status::Idle, parent: Some("coord".into()), limits: weekly(85.0), ..Info::default() }));
             assert!(port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]})));
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
             store
                 .call(|c| {
                     c.execute("INSERT INTO plans (id, title, body, tags, items, created_at, updated_at) VALUES ('m', 'A program', '', '[\"lab\",\"master\"]', '[]', 1, 1)", [])?;
@@ -2904,6 +3049,35 @@ mod stack_tests {
             store.call(|c| touch(c, "hex-t7", Some("paused"), Some(PAUSED_BY_YOU), 1)).await?;
             resume_lifted(&driver).await;
             assert_eq!(state().await?.0, "paused");
+            Ok(())
+        })
+    }
+
+    /// CP-M2's counters with goal-to-plan's endings: a goal met with its plan (its kiln-made parts
+    /// all met) counts as ended, met, once (a non-vacuity check).
+    #[test]
+    fn a_goal_met_with_its_plan_counts_as_ended_met() -> anyhow::Result<()> {
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let id = "planned-a";
+            assert!(port.open(id, Info { id: id.into(), status: Status::Idle, ..Info::default() }));
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            store
+                .call(|c| {
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES ('g1', 'planned-a', 0, 'the planned goal', 'pending')", [])?;
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status, part_of, part_kind) VALUES ('p1', 'planned-a', 1, 'its step', 'met', 'g1', 'plan')", [])?;
+                    touch(c, "planned-a", Some("running"), None, 0)
+                })
+                .await?;
+            step(&driver, id, false).await?;
+            let met = stack_of(&store, id).await?.items.into_iter().find(|i| i.id == "g1").map(|i| i.status);
+            assert_eq!((met.as_deref(), metrics.goals_ended.get(&["met"])), (Some("met"), 1), "met with its plan, counted once");
             Ok(())
         })
     }
@@ -3205,16 +3379,20 @@ mod stack_tests {
             let s = get(&hub, id).await?;
             let held = s.items.iter().find(|i| i.part_of.as_deref() == Some(two.as_str()) && i.part_kind.as_deref() == Some("run")).cloned().unwrap_or_default();
             assert_eq!((held.status.as_str(), held.how.as_deref(), held.waits_on.as_deref()), ("active", Some("run"), Some(run.as_str())), "{:?}", words(&s));
-            // Not done: it waits. Done: the part is met, and with it the goal.
-            push(&hub, id).await;
+            // Not done: it waits. Done: the part is met, and with it the goal, each counted once as
+            // ended, met (CP-M2's counters).
+            let metrics = crate::metrics::AgentMetrics::default();
+            push(&hub, id, &metrics).await;
             assert_eq!(get(&hub, id).await?.items.iter().find(|i| i.id == held.id).map(|i| i.status.clone()).as_deref(), Some("active"));
             let r2 = run.clone();
+            assert_eq!(metrics.goals_ended.get(&["met"]), 0, "nothing ended while the run goes on");
             hub.store.call(move |c| Ok(c.execute("UPDATE plan_runs SET state = 'done' WHERE id = ?1", params![r2]).map(|_| ())?)).await?;
-            push(&hub, id).await;
+            push(&hub, id, &metrics).await;
             let s = get(&hub, id).await?;
             assert_eq!(s.items.iter().find(|i| i.id == held.id).map(|i| i.status.as_str()), Some("met"), "{:?}", words(&s));
             let g = s.items.iter().find(|i| i.id == two).cloned().unwrap_or_default();
             assert_eq!((g.status.as_str(), g.reason.as_deref()), ("met", Some("Met with its plan: its run is done, every step met.")), "{:?}", words(&s));
+            assert_eq!(metrics.goals_ended.get(&["met"]), 2, "the run's part and its goal");
             Ok(())
         })
     }

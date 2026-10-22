@@ -1043,6 +1043,20 @@ mock-up, a small tool) as a page: see docs/previews.md.
 - kiln never lets a harness CLI it runs open a browser on the machine; sign-in pages are shown in
   the console, wherever the person is.
 
+## Metrics
+
+On the server's `/metrics` (Prometheus; Observe reads it): its goal driver's counts, and its own
+harness host's (the sessions on the server's machine). A runner's host counts its own in its
+process, which serves no `/metrics`. Every series is there from the start, at 0. The table is
+the code's (`metrics::AGENTS`): a test holds the two together.
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `kiln_goals_sent_total` | counter | `kind`: `start`, `reminder` | Goals the goal driver sent an agent: a goal's first send, or afresh once resumed or reworded (start), or again after the agent stopped short of it (reminder). |
+| `kiln_goals_ended_total` | counter | `status`: `met`, `skipped` | Goals that ended: met (as its harness, the agent or you said, or with its plan's steps or run), or skipped (cleared in the agent, skipped through goal control, or taken out while under way). |
+| `kiln_harness_polls_total` | counter | | Looks the harness host's watch took at what its harnesses run (every 10 s). |
+| `kiln_harness_records_written_total` | counter | | Writes of the harness host's record of its sessions. |
+
 ## Capability matrix
 
 Checked end to end against the real CLIs with scripted model APIs and isolated configuration
