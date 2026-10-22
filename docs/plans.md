@@ -126,14 +126,14 @@ The goal gets one part first, planning it; the plan isn't run until it's ready.
    agree and what's against it.
 2. **Steps.** It writes the plan's steps (`plans_update`): each with what to do, its acceptance
    criteria and tests, the steps it waits for (`needs`), and the findings it rests on (`basis`).
-3. **Presented.** It presents the research as `research_get`'s markdown gives it: every claim with
-   its sources and grade. The plan's page shows it too (**Being planned**, then **Research** under
-   its steps), live while it's planned.
-4. **Ready.** `plans_ready` ends the planning phase. It refuses while the plan has no steps, its
+3. **Ready.** `plans_ready` ends the planning phase. It refuses while the plan has no steps, its
    research has no sources inside or outside (unless the agent says why: `skipped`), or a step
-   rests on a finding that isn't there; and it answers with what's weak (a step resting on nothing,
-   or on findings graded D or F; quotes still being checked), which the agent says. Then, as
-   `then` says:
+   rests on a finding that isn't there. It answers with the research, as `research_get`'s markdown
+   gives it, and with what's weak (a step resting on nothing, or on findings graded D or F; quotes
+   still being checked): the agent shows the person the research in its reply, as it is, every
+   claim with its sources and grade, and says what's weak. The plan's page shows the research too
+   (**Being planned**, then **Research** under its steps), live while it's planned. Then, as `then`
+   says:
    - `goals` (the default): the plan's steps become the goal's parts on the same agent, each a
      goal saying the step it's made from (`goals_split` turns one into its acceptance criteria and
      tests);
@@ -168,7 +168,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
-| POST | `/api/plans/:id/ready` | `{then?: goals \| review \| agents, skipped?: {internal?, external?}}`: its planning phase ended (a plan made from a goal goes on as `then` says); answers `{plan, warnings, then?, goal?, run?, stack?}` |
+| POST | `/api/plans/:id/ready` | `{then?: goals \| review \| agents, skipped?: {internal?, external?}}`: its planning phase ended (a plan made from a goal goes on as `then` says); answers `{plan, warnings, research?, say?, then?, goal?, run?, stack?}` (`research`: its research's markdown, for the agent to show) |
 | POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}` |
 | GET | `/api/plans/:id/runs` | runs, newest first |
 | GET | `/api/plans/runs` | runs of one agent per step (`?active=1`: those under way) |

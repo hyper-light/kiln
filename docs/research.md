@@ -96,7 +96,8 @@ blog post linked without a quote an F (25).
 ## Presenting it
 
 `research_get` answers with `markdown`: each finding with its grade, score and why, its quotes and
-how kiln's look for each came out, its counterclaims, then its sources, numbered. Agents present
+how kiln's look for each came out, its counterclaims, then its sources, numbered; `plans_ready`
+answers with it too, for the agent to show the person as its plan is ready. Agents present
 research that way whenever they present it (in a conversation, in a plan): every claim with its
 sources and its grade, never an unweighed one. A plan's page shows its research under its steps,
 live while it's planned; research has a page of its own (`/agents/research/<id>`).
