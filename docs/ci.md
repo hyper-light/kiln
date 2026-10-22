@@ -3381,15 +3381,23 @@ enforcement points to W18, agent isolation to W20.
   Docker CLI with buildx and compose. These legs keep the host's paths for the workspace, temp
   and action directories, so `docker run -v $GITHUB_WORKSPACE:/src` mounts what the step sees.
   Every docker leg on a runner has its workspace at the same depth, so a cache saved relative to
-  it restores in any other. What's only in the image (its Rust toolchain) isn't the host's to
-  mount, so `cross`, which mounts it, runs in its remote mode there (`CROSS_REMOTE=1`): it copies
-  what it needs into Docker volumes. Its in-container mode wants Docker's `overlay2` driver, and
-  an engine with the containerd image store has `overlayfs` (the corpus's ripgrep and bat). In
-  ripgrep's legs `cross` builds and tests that way now. Not every step: remote,
-  `cross test --manifest-path crates/cli/Cargo.toml` can't make its target directory (permission
-  denied; a workspace of two crates doesn't reproduce it), and a step can lose cross's own
-  container ("is not running"). The lasting fix is the image's toolchains at paths the host has
-  (as a hosted runner's are), so `cross` mounts them as it does there; that's left.
+  it restores in any other. The rest of the leg's machine is a container the daemon doesn't look
+  into, so these legs get a socket of their own in the host's place (`runner/docker_sock.rs`). It
+  passes every request on and translates the bind mounts of the containers a step creates:
+  - a path the leg has from the host (its workspace, temporary and action directories) stays that
+    path;
+  - the kernel's (`/proc`, `/sys`, `/dev`, `/lib/modules`) stay the host's;
+  - everything else goes to the leg container's own root as the host has it mounted: the graph
+    driver's merged directory, or with containerd's image store, `<root dir>/rootfs/<driver>/<id>`.
+
+  So `docker run -v ~/.cargo:/cargo` mounts the leg's own `~/.cargo`, as on a hosted runner, and
+  `cross` runs in its own mode, mounting the image's Rust toolchain:
+  `w13_r04_cross_in_a_docker_leg` runs ripgrep's `cross test --manifest-path … -- --nocapture`.
+  Before, `cross` ran in its remote mode (`CROSS_REMOTE=1`, which copies into volumes). That mode
+  puts `--target-dir` after a `--`, so cargo made `/target` and was denied, and it lost its own
+  named container from one step to the next ("is not running"): the corpus's ripgrep and bat.
+  Remote mode is left only for a runner that can't listen beside the leg's directory. The socket
+  is for fidelity, not containment: a leg given the host's Docker is trusted.
 - *Done.* What a runner leaves behind goes:
   - A runner's legs' networks and containers and its pools' executors carry its label. The label
     comes from its work directory, so each runner on an engine has its own.

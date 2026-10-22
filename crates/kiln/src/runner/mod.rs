@@ -10,6 +10,7 @@ pub mod cache;
 pub mod chaos;
 pub mod credential;
 pub mod docker;
+pub mod docker_sock;
 pub mod pool;
 pub mod egress;
 #[cfg(target_os = "linux")]

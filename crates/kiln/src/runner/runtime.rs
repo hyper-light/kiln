@@ -447,6 +447,8 @@ struct State {
     server_url: String,
     /// The leg's containers (W13-R08): its network, services and job container.
     containers: Option<super::docker::Containers>,
+    /// The Docker socket a `docker` executor's container has in the host's place (W13-R04).
+    docker_sock: Option<std::sync::Arc<super::docker_sock::Socket>>,
     /// In a `k8s` pod made for the leg (W13-R07): its services, the pod's sidecars, as
     /// `job.services` says them.
     pod_services: Option<serde_json::Value>,
@@ -1216,6 +1218,7 @@ impl Leg {
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
             containers: None,
+            docker_sock: None,
             pod_services: None,
             matchers: matchers::Job::default(),
             stop: None,
@@ -1971,7 +1974,7 @@ impl Leg {
             Some(o) => Some(st.render(o, site, "options")?),
             None => None,
         };
-        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, user: None, workspace_size: None })
+        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, docker_proxy: None, user: None, workspace_size: None })
     }
 
     /// "Initialize containers" (W13-R08): the leg's network, services and job container, before
@@ -2096,15 +2099,18 @@ impl Leg {
         // A leg with a network policy never gets the host's Docker socket: it would get around it.
         // In a microVM the socket is the guest's own, and the microVM is what contains it.
         let open = a.network.is_none() || in_microvm();
+        // The leg's machine is a container whose files the host's daemon doesn't see, as a hosted
+        // runner's it would: given Docker, it gets a socket of the leg's own in the host's place,
+        // which finds what its steps bind-mount (`cross` mounts the image's Rust toolchain).
+        let socket = open && self.docker_inside();
+        let proxy = if socket && Path::new("/var/run/docker.sock").exists() { self.leg_socket(idx, &st.layout).await } else { None };
         let job = match (&a.job_container, &a.executor.image) {
             (Some(c), _) => Some(super::docker::Spec { docker_socket: open, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
             (None, Some(image)) if a.executor.kind == "docker" => {
-                let socket = open && self.docker_inside();
-                // The leg's machine is a container whose files the host's daemon doesn't see, as a
-                // hosted runner's it would: what `cross` bind-mounts through it (the image's Rust
-                // toolchain) isn't there. Its remote mode copies them into volumes instead.
-                let env = if socket { vec![("CROSS_REMOTE".to_owned(), "1".to_owned())] } else { Vec::new() };
-                Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: socket, env, ..super::docker::Spec::default() })
+                // Without one, `cross`'s remote mode copies what it mounts into volumes instead.
+                let env = if socket && proxy.is_none() { vec![("CROSS_REMOTE".to_owned(), "1".to_owned())] } else { Vec::new() };
+                let docker_proxy = proxy.as_ref().map(|p| p.path().to_owned());
+                Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: socket, docker_proxy, env, ..super::docker::Spec::default() })
             }
             _ => None,
         };
@@ -2149,6 +2155,17 @@ impl Leg {
             self.log(idx, format!("{}\r\n", st.masker.mask(&line)).into_bytes()).await;
         }
         let started = started?;
+        if let (Some(p), Some(j)) = (proxy, started.job.as_ref()) {
+            match super::docker_sock::paths_of(&started.cli, &j.id).await {
+                Ok(paths) if paths.has_root() => p.set_paths(paths),
+                Ok(paths) => {
+                    self.note(idx, "Docker can't see this leg's own files: a step's bind mounts find only its workspace, temporary and action directories.").await;
+                    p.set_paths(paths);
+                }
+                Err(e) => self.note(idx, &format!("The leg container's mounts: {e:#}")).await,
+            }
+            st.docker_sock = Some(std::sync::Arc::new(p));
+        }
         if let (Some((e, n)), Some((_, port))) = (egress, started.relay.as_ref()) {
             st.egress = Some(std::sync::Arc::new(super::egress::Pool::start(*port, e.token, self.egress_policy(&n))));
             st.env.extend(super::docker::proxy_env(keys.iter().map(String::as_str)));
@@ -2156,6 +2173,21 @@ impl Leg {
         }
         st.containers = Some(started);
         Ok(())
+    }
+
+    /// The leg's Docker socket (W13-R04), beside its directory; `None`, and said, when it can't
+    /// listen there, and the leg gets the host's own.
+    async fn leg_socket(&self, idx: u32, l: &Layout) -> Option<super::docker_sock::Socket> {
+        let path = l.runner_workspace.with_extension("docker.sock");
+        // One a runner that stopped short left behind.
+        let _ = std::fs::remove_file(&path);
+        match super::docker_sock::Socket::listen(path, PathBuf::from("/var/run/docker.sock")).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                self.note(idx, &format!("The leg gets the host's Docker socket as it is ({e:#}): a step's bind mounts find only its workspace, temporary and action directories.")).await;
+                None
+            }
+        }
     }
 
     /// What the leg's network policy lets it reach: kiln's server always, as this runner reaches it.

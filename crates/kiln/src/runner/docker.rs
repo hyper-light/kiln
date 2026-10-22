@@ -115,6 +115,9 @@ pub struct Spec {
     /// The host's Docker socket inside: GitHub mounts it in job containers. A `docker`
     /// executor's container doesn't get it (W13-R04: Docker access is opt-in per pool).
     pub docker_socket: bool,
+    /// For a `docker` executor's container given Docker: the leg's own socket in the host's
+    /// place, which finds what its steps bind-mount ([`super::docker_sock`]).
+    pub docker_proxy: Option<PathBuf>,
     /// For a `docker` executor's container: the host user (uid, gid) its steps run as, through
     /// the image's `runner` user.
     pub user: Option<(u32, u32)>,
@@ -747,7 +750,8 @@ impl Containers {
                     }
                 }
                 if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
-                    args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
+                    let socket = spec.docker_proxy.as_ref().map_or_else(|| s("/var/run/docker.sock"), |p| p.to_string_lossy().into_owned());
+                    args.extend([s("-v"), format!("{socket}:/var/run/docker.sock")]);
                     // The runner user reaches it through the socket's group, as the host's user does.
                     if user.is_some()
                         && let Some(gid) = socket_group()
