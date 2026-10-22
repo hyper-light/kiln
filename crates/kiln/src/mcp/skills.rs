@@ -121,9 +121,23 @@ mod tests {
         for part in ["## When to fan out", "## Briefing a child", "## Waiting and reading results", "## Keeping children's permissions low", "## Merging their work", "## Putting work up for review", "## Never answering for the person"] {
             assert!(agents.contains(part), "kiln-agents: {part}");
         }
-        // Goal stacks and plans: one's own stack (and ending the turn after lining it up), plans, an agent per step.
+        // Goal stacks and plans: one's own stack (and ending the turn after lining it up, saying each goal met, splitting
+        // one, pausing for a while), plans (steps that wait for others), an agent per step (side by side, a step for the
+        // main agent).
         let plans = read("skill://kiln-plans/SKILL.md").and_then(|f| f.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
-        for part in ["## Your own goal stack", "**end your turn**", "## Plans", "## One agent per step", "## What a person decides"] {
+        for part in [
+            "## Your own goal stack",
+            "**end your turn**",
+            "### When a goal is met: `goals_done`",
+            "**Never skip a goal you met**",
+            "### Splitting a goal: `goals_split`",
+            "resume_in_s",
+            "## Plans",
+            "`needs`",
+            "## One agent per step",
+            "{agent: \"main\"}",
+            "## What a person decides",
+        ] {
             assert!(plans.contains(part), "kiln-plans: {part}");
         }
         assert!(get("skill://kiln-diagnose/SKILL.md").is_some());

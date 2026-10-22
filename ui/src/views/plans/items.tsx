@@ -20,6 +20,40 @@ function filledParts(it: PlanItem): string[] {
   const out = PARTS.filter((p) => it[p.key].trim()).map((p) => p.label.toLowerCase());
   if (it.acceptance.length) out.push(`${it.acceptance.length} criteri${it.acceptance.length === 1 ? "on" : "a"}`);
   if (it.testing.length) out.push(`${it.testing.length} test${it.testing.length === 1 ? "" : "s"}`);
+  if (it.needs?.length) out.push(`after ${it.needs.join(", ")}`);
+  return out;
+}
+
+/** The steps once steps `i` and `j` change places: what each waits for follows them. */
+function swapped(items: PlanItem[], i: number, j: number): PlanItem[] {
+  const [a, b] = [i + 1, j + 1];
+  return items.map((it) => (it.needs?.length ? { ...it, needs: it.needs.map((n) => (n === a ? b : n === b ? a : n)).sort((x, y) => x - y) } : it));
+}
+
+/** The steps once step `i` goes: none waits for it any more, and those after it are a number less. */
+function without(items: PlanItem[], i: number): PlanItem[] {
+  const gone = i + 1;
+  return items
+    .filter((_, j) => j !== i)
+    .map((it) => {
+      if (!it.needs?.length) return it;
+      const needs = it.needs.filter((n) => n !== gone).map((n) => (n > gone ? n - 1 : n));
+      return { ...it, needs: needs.length ? needs : undefined };
+    });
+}
+
+/** The steps that wait for step `n`, themselves or through others: it can't wait for those. */
+function waitingFor(items: PlanItem[], n: number): Set<number> {
+  const out = new Set<number>();
+  for (let grew = true; grew;) {
+    grew = false;
+    items.forEach((it, k) => {
+      if (!out.has(k + 1) && (it.needs ?? []).some((d) => d === n || out.has(d))) {
+        out.add(k + 1);
+        grew = true;
+      }
+    });
+  }
   return out;
 }
 
@@ -29,14 +63,14 @@ export function PlanItemsEditor({ items, onChange, idPrefix }: { items: PlanItem
   const move = (i: number, by: -1 | 1) => {
     const j = i + by;
     if (j < 0 || j >= items.length) return;
-    const next = [...items];
+    const next = swapped(items, i, j);
     const [it] = next.splice(i, 1);
     if (it) next.splice(j, 0, it);
     onChange(next);
     setOpen((o) => (o === i ? j : o === j ? i : o));
   };
   const remove = (i: number) => {
-    onChange(items.filter((_, j) => j !== i));
+    onChange(without(items, i));
     setOpen(null);
   };
   const add = () => {
@@ -99,6 +133,7 @@ export function PlanItemsEditor({ items, onChange, idPrefix }: { items: PlanItem
                       <TestsEditor tests={it.testing} onChange={(testing) => set(i, { testing })} idPrefix={`${idPrefix}-${i}-ts`} />
                       <div className="field-hint">Each a scenario, and what it passes by.</div>
                     </div>
+                    {items.length > 1 && <RunsAfter items={items} i={i} onChange={(needs) => set(i, { needs: needs.length ? needs : undefined })} />}
                     <div className="pi-actions">
                       <button type="button" className="pi-text" onClick={() => setOpen(null)}>
                         Done
@@ -117,6 +152,39 @@ export function PlanItemsEditor({ items, onChange, idPrefix }: { items: PlanItem
       <button type="button" className="pi-add" onClick={add}>
         <Plus size={13} aria-hidden="true" /> Add a step
       </button>
+    </div>
+  );
+}
+
+/** The steps step `i` waits for: run with an agent per step, it starts once each is met. Those that wait for it can't be picked. */
+function RunsAfter({ items, i, onChange }: { items: PlanItem[]; i: number; onChange: (needs: number[]) => void }) {
+  const needs = items[i]?.needs ?? [];
+  const blocked = waitingFor(items, i + 1);
+  return (
+    <div role="group" aria-label={`Step ${i + 1} runs after`}>
+      <div className="field-label">Runs after</div>
+      <div className="pi-needs">
+        {items.map((other, k) =>
+          k === i ? null : (
+            <label key={k} className="pi-need" data-blocked={blocked.has(k + 1) ? "" : undefined}>
+              <input
+                type="checkbox"
+                className="check"
+                checked={needs.includes(k + 1)}
+                disabled={blocked.has(k + 1)}
+                onChange={(e) => onChange(e.target.checked ? [...needs, k + 1].sort((a, b) => a - b) : needs.filter((n) => n !== k + 1))}
+              />
+              <span className="pi-n">{k + 1}</span>
+              <span className="pi-need-title">{other.title.trim() || "Untitled step"}</span>
+              {blocked.has(k + 1) && <span className="pi-need-why">waits for this one</span>}
+            </label>
+          ),
+        )}
+      </div>
+      <div className="field-hint">
+        With an agent per step, this one starts once each step ticked is met, and steps that don&rsquo;t wait for each other run side by side. Tick none in every step and each runs after the one
+        before.
+      </div>
     </div>
   );
 }

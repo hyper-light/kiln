@@ -1,25 +1,7 @@
-/* What waits on you, wherever you are (approval-toasts.tsx): cards at the top right, under the
-   header (on a phone, across the top), so they never cover a composer or kiln's passing words. */
+/* Requests share the bottom toast position, above any passing notifications. */
 .rq-viewport {
-  position: fixed;
   z-index: 121;
-  top: 76px;
-  right: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: min(400px, calc(100vw - 32px));
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-@media (max-width: 640px) {
-  .rq-viewport {
-    top: calc(env(safe-area-inset-top, 0px) + 8px);
-    right: 8px;
-    left: 8px;
-    width: auto;
-  }
+  bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + var(--toast-stack-height, 0px));
 }
 .toast.rq {
   padding: 12px 8px 12px 14px;

@@ -986,6 +986,49 @@ html[data-motion="paused"] .ms-pick {
   padding: 8px 12px 0;
   font-size: 12px;
 }
+/* The settings the agents are held to, after who they are: Any until one is chosen, then only the
+   agents that have it are sent to, and given it. */
+.ms-tune {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+.ms-tune-select {
+  height: 28px;
+  max-width: 190px;
+  padding: 0 24px 0 10px;
+  border: 1px solid #26282e;
+  border-radius: 999px;
+  background: transparent
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E") right 9px
+    center / 9px no-repeat;
+  color: #9a9da6;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  appearance: none;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+.ms-tune-select:hover {
+  border-color: #3a3d45;
+  color: #e3e4e9;
+}
+.ms-tune-select[data-set] {
+  border-color: rgb(186 176 227 / 45%);
+  color: #e3dcfb;
+}
+.ms-tune-select:focus-visible {
+  outline: 2px solid rgb(165 160 191 / 35%);
+  outline-offset: 2px;
+}
+@media (pointer: coarse) {
+  .ms-tune-select {
+    height: 34px;
+  }
+}
 .ms-to-label {
   margin-right: 2px;
   font-family: var(--font-mono);

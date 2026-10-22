@@ -191,6 +191,10 @@ pub struct Conversations {
     /// while the store has nothing else to do, then put in its place. Runners and mirrors compact
     /// theirs.
     pub compact: bool,
+    /// No conversation store for this server: tests that don't use one (`KILN_CONVERSATIONS=off`
+    /// does it for a whole process). Never read from a config file.
+    #[serde(skip)]
+    pub off: bool,
 }
 
 /// `[agents]`: how far agents may start agents (docs/agents.md, "Agents that run agents").
@@ -453,7 +457,7 @@ impl Default for Terminal {
 
 impl Default for Conversations {
     fn default() -> Self {
-        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, compact: true }
+        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30, compact: true, off: false }
     }
 }
 
@@ -546,7 +550,7 @@ pub struct Updates {
     /// server shows it so.
     pub accept: bool,
     /// Minutes a runner has to switch to its new build and report in, counted once it has no
-    /// jobs running. Settings → Updates can change it, and the two below.
+    /// jobs running. System → Updates can change it, and the two below.
     pub upgrade_minutes: u64,
     /// Minutes kiln keeps an upgrade open while the runner finishes the jobs it is running (it
     /// switches only once they are done).

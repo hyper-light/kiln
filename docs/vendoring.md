@@ -23,8 +23,8 @@ revision.
   lives at `vendor/<project>`, and every hyper-light product is one: a product that vendors another
   takes it at kiln's revision with kiln's recorded changes, and kiln's copy of the product leaves
   the product's own copy out (`exclude`), its dependency on it pointed at kiln's copy by `[patch]`.
-  Third-party code only one product vendors stays inside that product's copy, as Turso will inside
-  Amphora's (`vendor/amphora/vendor/turso`): that copy is kiln's one. The re-vendor checks all of
+  Third-party code only one product vendors stays inside that product's copy
+  (`vendor/<product>/vendor/<project>`): that copy is kiln's one. The re-vendor checks all of
   this against the product's own `vendor/MANIFEST.toml` and `vendor/patches/`.
 - **One revision linked.** `crates/kiln/tests/vendored.rs` fails the gate when `Cargo.lock` links a
   crate a vendored project provides more than once, or from crates.io or git instead of its folder.
@@ -99,10 +99,14 @@ path = "vendor/amphora"
 scripts/vendor.py amphora <commit> --from ~/Projects/amphora
 ```
 
-When Turso moves into Amphora (CP-T1.1), its entry and its recorded changes move with it:
-`[projects.turso]` goes into Amphora's `vendor/MANIFEST.toml` at the same commit,
-`vendor/patches/turso/` into Amphora's `vendor/patches/turso/`, and kiln's entry, folder and
-patches go, so `vendor/amphora/vendor/turso` is kiln's one copy.
+Amphora's engine isn't a vendored Turso: since 2026-10-20 it's Amphora's own code. The four Turso
+crates (from upstream 3e09a82) are Amphora's `crates/engine*`, named `amphora-engine`,
+`amphora-engine-parser`, `amphora-engine-macros` and `amphora-engine-ext`, and
+`crates/engine/ORIGIN.md` records where they came from and every change; Amphora's manifest has no
+`[projects.turso]`. When kiln vendors Amphora, the engine comes as part of it, under its own names,
+so it can't collide with kiln's `turso_core`. kiln's `vendor/turso` stays kiln's own copy, for
+kiln's conversation store, until that store moves onto Amphora (T1); then its entry, folder and
+patches go.
 
 ## The manifest
 

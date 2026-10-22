@@ -99,7 +99,7 @@ counted.
 | WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands may be sent on it too |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
-| POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear}` | run, pause, skip the goal under way, or empty its goal stack |
+| POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
@@ -158,7 +158,7 @@ session says whether:
 | `"ready"` | it runs in a kiln terminal: taking it over ends that terminal and continues the conversation as an agent session | offer it |
 | `"stop"` | it runs outside kiln: taking it over ends it there (asked to quit, killed after 10 s), then continues the conversation as an agent session | offer it, saying so; confirm with `{"stop": true}` |
 | `"outside"` | it runs outside kiln as an ACP agent, which might start anew rather than resume it: it must be quit there first | explain; once it has ended, resume it with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` |
-| `"upgrade"` | the machine's runner is too old for this take-over | link to Settings → Updates |
+| `"upgrade"` | the machine's runner is too old for this take-over | link to System → Updates |
 | `"no_id"` | it has no conversation to continue yet (still starting) | wait |
 | `"unsupported"` | kiln cannot run that harness as an agent session | — |
 
@@ -571,7 +571,7 @@ while its attachment is paused, past its limit for the day, or when its agent co
 **Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
 its workflows' and environments' too. Mission Control lists the agents an attachment woke with
 the other agents; their questions come to Needs you and to notifications as any agent's do. A runner doctor's
-open incident shows in the runner's row in Settings → Updates.
+open incident shows in the runner's row in System → Updates.
 
 | Operation | Route | |
 |---|---|---|
@@ -903,7 +903,28 @@ view. Tracking never starts, resumes or attaches another executor to the child (
 one working with other permissions than the session's: see permission modes above). Its messages,
 commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
 finishing does not mean the child has finished, and unavailable child history does not end the
-parent.
+parent. As in Codex's own TUI, a message to a child (`send_message`, `followup_task`) doesn't
+change whether it runs: a message queued for an idle child starts no turn, and a follow-up's turn
+is heard from the child itself (its notifications, and the reads that follow the message). A
+child kiln never read whose session went on in another harness (no Codex to ask) has its turns
+read from Codex's own record of its thread (its rollout) instead, off the event loop.
+
+A Codex terminal (unified exec, also when code mode starts it) runs on past its call and its turn,
+interrupted or not, as in Codex's own TUI, and ends when Codex says its process ended. At each
+turn's end, and every 30 s while some show running, kiln also asks Codex which it still runs
+(`thread/backgroundTerminals/list`): one it no longer runs reads "completed", without an exit
+code, until Codex's own word on it comes.
+
+Claude Code's list of live background tasks (`background_tasks_changed`) ends any task kiln shows
+left running that the list leaves out, should its end never have come.
+
+Nothing a harness ran outlives its process: when it ends (a switch to another harness, a stop, a
+restart, a crash), its live tasks end "stopped" and its calls still under way are cancelled, all
+of them kept to read; a new process starts with nothing of an earlier one's running. What kiln
+took back over (`left-<pid>`: "What an agent left running") is the exception. The state keeps
+the newest 200 tasks (the oldest finished go first, with the output kiln kept of them), and a
+finished task keeps 2,000 characters of a long command (its call keeps it whole), so the state
+always reaches viewers whole.
 
 The task output endpoint projects a native Codex child's assistant messages and tool results,
 scoped to that child and its original spawning call. Its stored final result remains readable
@@ -916,7 +937,8 @@ exited): shells, monitors, workflows, background calls and subagents sent to the
 
 Ending an agent (`DELETE /api/harness/sessions/:id`) stops what it left running: each live task
 through the harness (`stop_task`), then anything still under the harness process (commands that
-left its process group included), then the harness. A console can warn first with `left_behind`.
+left its process group included), then the harness. Its last state, what the ended agent shows,
+has every task stopped. A console can warn first with `left_behind`.
 No harness offers pausing a task: Claude Code reports a workflow it restored as "paused", with no
 way to resume it from outside.
 

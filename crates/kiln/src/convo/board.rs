@@ -21,6 +21,8 @@ const COARSE: (i64, usize) = (60_000, 1440);
 const DAY_MS: i64 = COARSE.0 * COARSE.1 as i64;
 /// What happened lately, at most.
 const NOTES: usize = 200;
+/// The replication log's lines, at most.
+const LOG: usize = 5_000;
 /// A runner's report older than this isn't current (it reports every few seconds).
 const STALE_MS: i64 = 30_000;
 /// A store whose feed said anything this recently is alive (one a runner too old to report).
@@ -146,6 +148,33 @@ pub struct Note {
     /// `info`, `warn` or `error`.
     pub level: &'static str,
     pub text: String,
+}
+
+/// A line of the replication log (`GET /api/conversations/log`): what moved between the stores
+/// since the sample before (`kind` "batch": from a runner's store into the server's; "restore":
+/// from a mirror's copy sent back; "ship": from the server's store to a mirror's copy), or what
+/// happened to one (`kind` "note", as the board notes it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogLine {
+    pub at: i64,
+    /// Its store's key on the board (`fedora/abc`, `server`, `mirror:adacachy`).
+    pub key: String,
+    pub kind: &'static str,
+    /// `info`, `warn` or `error`.
+    pub level: &'static str,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved: Option<Moved>,
+}
+
+/// What a feed moved since the sample before: batches, their rows and their bytes on the wire,
+/// and where it stands after (through which row of its feed; for a mirror, what it acknowledged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Moved {
+    pub batches: u64,
+    pub rows: u64,
+    pub bytes: u64,
+    pub rev: Option<u64>,
 }
 
 /// The board, as `GET /api/conversations/status` answers.
@@ -321,6 +350,11 @@ pub struct Board {
     heard: Mutex<HashMap<String, Heard>>,
     series: Mutex<HashMap<String, Series>>,
     notes: Mutex<VecDeque<Note>>,
+    /// The replication log, oldest first.
+    log: Mutex<VecDeque<LogLine>>,
+    /// Each feed's counters (batches, rows, bytes since kiln started) at the last sample: what came
+    /// into the server's store by store, what went to each mirror by its key.
+    counts: Mutex<HashMap<String, (u64, u64, u64)>>,
     /// The last sample's briefs (None: it hasn't sampled yet), and its restore.
     last: Mutex<Option<(HashMap<String, Brief>, serde_json::Value)>>,
     /// The server's store's peers, as last read.
@@ -404,6 +438,16 @@ impl Board {
         }
         *last = Some((briefs, seen.restore.clone()));
         drop(last);
+        // The log: what moved between the stores since the last sample, and what was noted.
+        let mut lines = self.traffic(seen);
+        lines.extend(new.iter().map(|n| LogLine { at: n.at, key: n.key.clone(), kind: "note", level: n.level, text: n.text.clone(), moved: None }));
+        if !lines.is_empty() {
+            let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+            log.extend(lines);
+            while log.len() > LOG {
+                log.pop_front();
+            }
+        }
         if !new.is_empty() {
             let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
             notes.extend(new);
@@ -412,6 +456,42 @@ impl Board {
             }
         }
         self.status(seen)
+    }
+
+    /// The replication log, newest first: the lines after `since` (unix ms) that have `q` in their
+    /// words or their store's key (any case; empty: every line), at most `limit`.
+    pub fn log(&self, since: i64, q: &str, limit: usize) -> Vec<LogLine> {
+        let q = q.trim().to_lowercase();
+        let has = |l: &LogLine| q.is_empty() || l.text.to_lowercase().contains(&q) || l.key.to_lowercase().contains(&q);
+        self.log.lock().unwrap_or_else(PoisonError::into_inner).iter().rev().take_while(|l| l.at > since).filter(|l| has(l)).take(limit).cloned().collect()
+    }
+
+    /// How many lines the replication log holds, and how many of them have `q` (as [`Board::log`]).
+    pub fn log_len(&self, q: &str) -> (usize, usize) {
+        let q = q.trim().to_lowercase();
+        let log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        let matched = if q.is_empty() { log.len() } else { log.iter().filter(|l| l.text.to_lowercase().contains(&q) || l.key.to_lowercase().contains(&q)).count() };
+        (log.len(), matched)
+    }
+
+    /// What moved since the last sample: the batches each store's feed brought the server's store,
+    /// and what the server's store sent each mirror. A feed seen for the first time is only counted.
+    fn traffic(&self, seen: &Seen) -> Vec<LogLine> {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out = Vec::new();
+        for v in &seen.intake {
+            let key = peer_name(&v.machine, &v.store);
+            let Some(m) = moved(&mut counts, &key, (v.batches, v.rows, v.bytes)) else { continue };
+            let (kind, from) = if v.copy { ("restore", format!("{}'s copy", v.machine)) } else { ("batch", v.machine.clone()) };
+            out.push(LogLine { at: seen.now, key, kind, level: "info", text: format!("{from} → server: {} · through {}", said(m), v.rev), moved: Some(Moved { rev: Some(v.rev), ..m }) });
+        }
+        for (mirror, ship) in &seen.mirrors {
+            let key = format!("{MIRROR}{}", mirror.machine);
+            let Some(m) = moved(&mut counts, &key, (ship.batches, ship.rows, ship.bytes)) else { continue };
+            let acked = ship.acked.map_or_else(|| "not acknowledged yet".to_owned(), |a| format!("acknowledged through {a}"));
+            out.push(LogLine { at: seen.now, key, kind: "ship", level: "info", text: format!("server → {}: {} · {acked}", mirror.machine, said(m)), moved: Some(Moved { rev: ship.acked, ..m }) });
+        }
+        out
     }
 
     /// Store `key`'s series over the last `window_s` seconds (an hour or less: at 5 s; more: at a
@@ -662,6 +742,32 @@ fn gb(bytes: u64) -> String {
     if bytes >= 1 << 30 { format!("{:.2} GB", bytes as f64 / f64::from(1u32 << 30)) } else { format!("{:.0} MB", bytes as f64 / f64::from(1u32 << 20)) }
 }
 
+/// What a feed's counters (batches, rows, bytes since kiln started) moved since they were last
+/// counted (`counts`, by key), now counted: None when nothing did, or when they're first seen.
+fn moved(counts: &mut HashMap<String, (u64, u64, u64)>, key: &str, now: (u64, u64, u64)) -> Option<Moved> {
+    let was = counts.insert(key.to_owned(), now)?;
+    // Below what they were: they started counting again (the server or the runner restarted).
+    let was = if now.0 < was.0 { (0, 0, 0) } else { was };
+    let batches = now.0 - was.0;
+    (batches > 0).then(|| Moved { batches, rows: now.1.saturating_sub(was.1), bytes: now.2.saturating_sub(was.2), rev: None })
+}
+
+/// "3 batches · 142 rows · 48 KB".
+fn said(m: Moved) -> String {
+    let (batches, rows) = (if m.batches == 1 { "batch" } else { "batches" }, if m.rows == 1 { "row" } else { "rows" });
+    format!("{} {batches} · {} {rows} · {}", m.batches, m.rows, size(m.bytes))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.2} GB", b as f64 / f64::from(1u32 << 30)),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / f64::from(1u32 << 20)),
+        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{b} B"),
+    }
+}
+
 /// What changed of store `s` since the last sample (`was`; None: it wasn't on the board then).
 fn notes_of(s: &StoreStatus, was: Option<&Brief>, now_b: &Brief, at: i64, out: &mut Vec<Note>) {
     let mut note = |level: &'static str, text: String| out.push(Note { at, key: s.key.clone(), level, text });
@@ -823,6 +929,47 @@ mod tests {
             b.sample(&s);
         }
         assert_eq!(b.status(&s).notes.len(), before);
+        Ok(())
+    }
+
+    /// The replication log says what moved between the stores at each sample (batches into the
+    /// server's store from each feed, and out to each mirror) and what was noted, newest first. A
+    /// feed first seen is only counted; counters that started again count from nothing.
+    #[test]
+    fn the_log_says_what_moved_between_the_stores_and_what_was_noted() -> anyhow::Result<()> {
+        let b = Board::default();
+        let mut s = seen(0);
+        let feed = |batches, rows, bytes, rev| PeerView { machine: "fedora".into(), store: "abc".into(), rev, batches, rows, bytes, last_batch: 1, ..PeerView::default() };
+        let mirror = MirrorView { machine: "adacachy".into(), connected: true, chosen_at: 0, last_seen: 0 };
+        let ship = |batches, rows, bytes, acked| ShipView { up: true, acked: Some(acked), batches, rows, bytes, ..ShipView::default() };
+        s.intake = vec![feed(10, 400, 40_000, 400)];
+        s.mirrors = vec![(mirror.clone(), ship(10, 400, 40_000, 400))];
+        b.sample(&s);
+        assert!(b.log(0, "", 100).iter().all(|l| l.kind == "note"), "first seen, only counted: {:?}", b.log(0, "", 100));
+        s.now = 5_000;
+        s.intake = vec![feed(13, 542, 89_152, 542)];
+        s.mirrors = vec![(mirror.clone(), ship(12, 500, 60_000, 500))];
+        b.sample(&s);
+        let log = b.log(0, "", 100);
+        let batch = log.iter().find(|l| l.kind == "batch").ok_or_else(|| anyhow::anyhow!("no batch line: {log:?}"))?;
+        assert_eq!((batch.key.as_str(), batch.text.as_str()), ("fedora/abc", "fedora → server: 3 batches · 142 rows · 48 KB · through 542"));
+        assert_eq!(batch.moved, Some(Moved { batches: 3, rows: 142, bytes: 49_152, rev: Some(542) }));
+        let shipped = log.iter().find(|l| l.kind == "ship").ok_or_else(|| anyhow::anyhow!("no ship line: {log:?}"))?;
+        assert_eq!((shipped.key.as_str(), shipped.text.as_str()), ("mirror:adacachy", "server → adacachy: 2 batches · 100 rows · 20 KB · acknowledged through 500"));
+        // Newest first, and only what came after `since`.
+        assert_eq!(log.first().map(|l| l.at), Some(5_000));
+        assert!(b.log(5_000, "", 100).is_empty());
+        // Searched: any case, in its words or its store's key.
+        let found = b.log(0, "ADACACHY", 100);
+        assert!(found.iter().all(|l| l.text.contains("adacachy")) && found.iter().any(|l| l.kind == "ship"), "{found:?}");
+        assert!(found.len() < b.log(0, "", 100).len());
+        assert_eq!(b.log(0, "fedora/abc", 100).iter().filter(|l| l.kind == "batch").count(), 1);
+        // fedora's runner started again: its counters count from nothing; the mirror moved nothing.
+        s.now = 10_000;
+        s.intake = vec![feed(2, 30, 3_000, 572)];
+        b.sample(&s);
+        let moved: Vec<String> = b.log(5_000, "", 100).into_iter().filter(|l| l.kind != "note").map(|l| l.text).collect();
+        assert_eq!(moved, ["fedora → server: 2 batches · 30 rows · 3 KB · through 572"]);
         Ok(())
     }
 }

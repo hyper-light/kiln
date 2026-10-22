@@ -1,5 +1,5 @@
 import { apiPath } from "@/lib/peer-base";
-import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, ConvoLog, ConvoSeries, ConvoStatus, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, RunnerDiagnosis, RunnerRepair, SyncActivity, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview, UpgradeWaits, UpgradeWay } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -219,6 +219,8 @@ export const api = {
   convoStatus: (signal?: AbortSignal) => get<ConvoStatus>("/api/conversations/status", signal),
   /** One store's series over the last `window` seconds. */
   convoSeries: (key: string, window: number, signal?: AbortSignal) => get<ConvoSeries>(`/api/conversations/series${qs({ key, window })}`, signal),
+  /** The replication log, newest first: lines with `q` in them (any case), at most `limit`. */
+  convoLog: (filters: { q?: string; limit?: number; since?: number }, signal?: AbortSignal) => get<ConvoLog>(`/api/conversations/log${qs(filters)}`, signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
   /** Reach's directory: every runner, whether it takes commands from other runners, how busy it is. */
   reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>("/api/reach/runners", signal),
@@ -236,7 +238,7 @@ export const api = {
   /** The audit log, filtered by any of its fields (exact values, comma-separated for any of), `q` and `since`. */
   audit: (filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit: 300, ...filters })}`, signal),
 
-  /** Settings → Updates: the server, every runner, recent upgrades and the binaries kiln has. */
+  /** System → Updates: the server, every runner, recent upgrades and the binaries kiln has. */
   updates: (signal?: AbortSignal) => get<UpdatesOverview>("/api/updates", signal),
   /** Ask GitHub (and, in Kubernetes, the image on the node) again; an `updates` event follows. */
   checkUpdates: () => post<UpdatesOverview>("/api/updates/check"),

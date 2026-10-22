@@ -112,16 +112,20 @@ export function ChangeBar({ agentId }: { agentId: string }) {
   };
   if (!c) {
     return (
-      <div className="hx-change-bar">
-        <GitPullRequestArrow size={14} aria-hidden="true" className="hx-dim" />
-        <span className="hx-change-what">Its work isn&apos;t up for review yet.</span>
-        <label className="hx-change-opt">
-          <input type="checkbox" className="check" checked={fix} onChange={(e) => setFix(e.target.checked)} />
-          Fix failing checks by itself
-        </label>
-        <Button size="xs" variant="secondary" disabled={busy} onClick={() => void push()}>
-          {busy ? "Opening…" : "Open change request"}
-        </Button>
+      <div className="hx-change-bar hx-change-new">
+        <div className="hx-change-grid">
+          <GitPullRequestArrow size={14} aria-hidden="true" className="hx-dim hx-change-icon" />
+          <span className="hx-change-what">Its work isn&apos;t up for review yet.</span>
+          <div className="hx-change-do">
+            <label className="hx-change-opt">
+              <input type="checkbox" className="check" checked={fix} onChange={(e) => setFix(e.target.checked)} />
+              Fix failing checks by itself
+            </label>
+            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void push()}>
+              {busy ? "Opening…" : "Open change request"}
+            </Button>
+          </div>
+        </div>
       </div>
     );
   }

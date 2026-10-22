@@ -1692,7 +1692,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     tracing::warn!(%instance, terminals = n, "the older runner process still holds terminals; leaving it running");
                                 }
                                 Ok(Ok(crate::upgrade::Retired::Nothing)) => {
-                                    tracing::info!(%instance, "an older runner process of this machine can be stopped; this one did not start it, so it is left to whoever did");
+                                    tracing::info!(%instance, "an older runner process of this machine can be stopped; no instance here started its service, so it is left to whoever did");
                                 }
                                 Ok(Err(e)) | Err(e) => tracing::warn!(%instance, error = %format!("{e:#}"), "could not retire the older runner process"),
                             }
@@ -2069,9 +2069,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::StreamOpen { stream, session, json } => {
                         crate::rt::spawn(crate::browser::stream::serve_open(o.state_dir.clone(), stream, session, json, uplink.0.clone()));
                     }
-                    ServerMsg::StreamControl { stream, session: _, json } => {
-                        crate::rt::spawn(crate::browser::stream::serve_control(stream, json));
-                    }
+                    ServerMsg::StreamControl { stream, session: _, json } => crate::browser::stream::serve_control(&stream, &json),
                     ServerMsg::StreamInput { stream, session: _, json } => crate::browser::stream::serve_input(&stream, &json),
                     ServerMsg::StreamClose { stream, session: _ } => {
                         crate::rt::spawn(async move { crate::browser::stream::streams().close(&stream).await });
@@ -2434,8 +2432,9 @@ const HARNESS_FRAME: usize = 512 * 1024;
 /// An agent-session update as frames that fit: a long run of events goes in parts (events are
 /// upserts by id, so the parts mean what the whole did), and an event too large on its own has
 /// its longest texts cut, saying so. Anything else too large (a state, the changeset) is cut the
-/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck.
-/// Only what still doesn't fit is dropped, and logged.
+/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck. A
+/// state still too large sheds its finished tasks, the oldest first. Only what still doesn't fit
+/// is dropped, and logged.
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
@@ -2443,16 +2442,32 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
         return vec![json];
     }
     let Update::Events { events } = u else {
-        let fitted = serde_json::to_value(u).ok().map(|v| cut_value(v, HARNESS_FRAME - 1024)).and_then(|v| serde_json::to_string(&v).ok());
+        let budget = HARNESS_FRAME - 1024;
+        // A state still too large once cut sheds its finished tasks first (their calls stay in
+        // the timeline): dropped whole, its page would go on showing ended work as running.
+        let fitted = serde_json::to_value(u)
+            .ok()
+            .map(|v| cut_value(v, budget))
+            .map(|v| if json_len(&v) > budget { cut_value(shed_ended_tasks(v, budget), budget) } else { v })
+            .and_then(|v| serde_json::to_string(&v).ok());
         return match fitted {
             Some(j) if j.len() <= HARNESS_FRAME => {
                 tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session update cut to fit");
                 vec![j]
             }
-            _ => {
-                tracing::warn!(session, bytes = json.len(), "agent session update too large to send, even cut; dropped");
-                Vec::new()
-            }
+            _ => match essentials(u, budget) {
+                // Still too large (its live tasks, or lists of many short entries, no text cut
+                // shortens): what a viewer can't do without, rather than nothing. Dropped whole, the
+                // page went on without its state at all: no effort, a switch never shown done.
+                Some(j) if j.len() <= HARNESS_FRAME => {
+                    tracing::warn!(session, bytes = json.len(), sent = j.len(), "agent session update too large to send whole; sent what it can't do without");
+                    vec![j]
+                }
+                _ => {
+                    tracing::warn!(session, bytes = json.len(), "agent session update too large to send, even cut; dropped");
+                    Vec::new()
+                }
+            },
         };
     };
     let one = HARNESS_FRAME - 1024;
@@ -2484,6 +2499,48 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
 
 fn json_len<T: Serialize>(v: &T) -> usize {
     serde_json::to_vec(v).map_or(usize::MAX, |b| b.len())
+}
+
+/// A state update too large even cut, down to what a viewer can't do without: how the session
+/// runs (status, harness, model, permissions, effort), what waits on a person, its queue, what it
+/// has going (its live tasks, cut), its usage and limits. Its lists of what it can use (servers'
+/// tools, skills, plugins, commands) and its finished tasks wait for an update that fits. None:
+/// not a state, or still too large.
+fn essentials(u: &crate::harness::core::Update, budget: usize) -> Option<String> {
+    let crate::harness::core::Update::State { state } = u else { return None };
+    let mut s = (**state).clone();
+    s.tasks.retain(crate::harness::model::Task::live);
+    s.mcp.clear();
+    s.skills.clear();
+    s.plugins.clear();
+    s.inventory = Default::default();
+    let v = serde_json::to_value(crate::harness::core::Update::State { state: Box::new(s) }).ok()?;
+    serde_json::to_string(&cut_value(v, budget)).ok()
+}
+
+/// A state update (`{"t":"state","state":{..}}`) without as many of its finished tasks, the oldest
+/// first, as it takes to come within `budget` bytes of JSON (when finished tasks can).
+fn shed_ended_tasks(mut v: serde_json::Value, budget: usize) -> serde_json::Value {
+    let excess = json_len(&v).saturating_sub(budget);
+    let Some(tasks) = v.pointer_mut("/state/tasks").and_then(serde_json::Value::as_array_mut) else { return v };
+    let live = |t: &serde_json::Value| matches!(t.get("status").and_then(serde_json::Value::as_str), Some("running" | "pending" | "paused"));
+    let mut freed = 0usize;
+    let mut drop = std::collections::HashSet::new();
+    for (i, t) in tasks.iter().enumerate() {
+        if freed >= excess {
+            break;
+        }
+        if !live(t) {
+            freed = freed.saturating_add(json_len(t).saturating_add(1));
+            drop.insert(i);
+        }
+    }
+    let mut i = 0;
+    tasks.retain(|_| {
+        i += 1;
+        !drop.contains(&(i - 1))
+    });
+    v
 }
 
 /// An event cut to about `budget` bytes of JSON: its longest texts shortened, each saying so.
@@ -2799,5 +2856,55 @@ mod tests {
         assert!(state.as_ref().is_some_and(|s| s.status == Status::Idle), "the state, whole");
         let summary = state.map(|s| s.summary).unwrap_or_default();
         assert!(summary.starts_with("begin ") && summary.ends_with("bytes cut by kiln to fit]"));
+    }
+
+    #[test]
+    fn a_state_too_large_for_its_tasks_sheds_the_oldest_finished_ones_not_the_update() {
+        use crate::harness::model::{State, Status, Task};
+        // A long Codex session's state: thousands of finished terminals, none long enough to cut.
+        // Dropped, its console showed a finished command running for 37 minutes, and missed two
+        // subagents that started after it.
+        let ended =
+            |i: usize| Task { id: format!("terminal-{i}"), description: "d".repeat(200), command: Some("c".repeat(200)), status: "completed".into(), class: Some("shell".into()), ..Task::default() };
+        let mut tasks: Vec<Task> = (0..3000).map(ended).collect();
+        tasks.insert(1, Task { id: "server".into(), status: "running".into(), class: Some("shell".into()), ..Task::default() });
+        let state = State { status: Status::Running, tasks, ..State::default() };
+        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        assert_eq!(frames.len(), 1);
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
+            Ok(Update::State { state }) => Some(state),
+            _ => None,
+        };
+        let ids: Vec<String> = state.as_ref().map(|s| s.tasks.iter().map(|t| t.id.clone()).collect()).unwrap_or_default();
+        assert!(state.as_ref().is_some_and(|s| s.status == Status::Running));
+        assert!(ids.iter().any(|id| id == "server") && ids.iter().any(|id| id == "terminal-2999"), "the live and the newest stay");
+        assert!(!ids.iter().any(|id| id == "terminal-0"), "the oldest finished go first");
+    }
+
+    #[test]
+    fn a_state_too_large_even_shed_still_says_how_the_session_runs() {
+        use crate::harness::model::{McpServer, State, Status, Task};
+        // Too large for a list of thousands of short entries (a server's tools) beside its live
+        // tasks: no text long enough to cut, no finished task to shed. Dropped whole, its page went
+        // on without its state at all: no effort, a harness switch never shown done.
+        let tools: Vec<serde_json::Value> = (0..12_000).map(|i| serde_json::json!({ "name": format!("tool_{i:05}"), "description": "d".repeat(40) })).collect();
+        let server = serde_json::from_value::<McpServer>(serde_json::json!({ "name": "big", "scope": "user", "transport": "stdio", "status": "connected", "enabled": true, "tools": tools }));
+        assert!(server.is_ok(), "{server:?}");
+        let Ok(server) = server else { return };
+        let live = |i: usize| Task { id: format!("bg-{i}"), status: "running".into(), class: Some("shell".into()), command: Some(format!("serve {i}")), ..Task::default() };
+        let state = State { status: Status::Running, model: "gpt-6.1-sol".into(), mode: "full-access".into(), effort: "ultra".into(), tasks: (0..7).map(live).collect(), mcp: vec![server], ..State::default() };
+        assert!(json_len(&state) > HARNESS_FRAME);
+        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        assert_eq!(frames.len(), 1, "sent, not dropped");
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let got = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
+            Ok(Update::State { state }) => Some(state),
+            _ => None,
+        };
+        let got = got.as_deref();
+        assert_eq!(got.map(|s| (s.model.as_str(), s.mode.as_str(), s.effort.as_str(), s.status)), Some(("gpt-6.1-sol", "full-access", "ultra", Status::Running)));
+        assert_eq!(got.map(|s| s.tasks.len()), Some(7), "its live tasks stay");
+        assert!(got.is_some_and(|s| s.mcp.is_empty()), "its lists wait for an update that fits");
     }
 }

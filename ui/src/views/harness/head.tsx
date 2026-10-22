@@ -122,26 +122,29 @@ export function AgentHeader({
   const permissionsLive = features.includes("permissions_live");
   const nextTurn = info?.kind === "codex" ? { mode: !permissionsLive, model: true, effort: true } : undefined;
   // How it runs, as one line; with the other harnesses' models on its machine where it can go on in them.
+  // While a switch to another harness waits, how it will run there: the permissions and effort it
+  // carries over, named by that harness, set once it's there; the old harness's limits aren't its.
+  const switching = state?.switching;
   const line: RunSettingsProps = {
     className: "ag-run",
-    modes: meta?.modes ?? [],
-    mode: state?.mode ?? info?.mode ?? "",
-    onMode: features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined,
+    modes: switching ? (switching.modes ?? []) : (meta?.modes ?? []),
+    mode: switching ? (switching.mode ?? "") : (state?.mode ?? info?.mode ?? ""),
+    onMode: !switching && features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined,
     modeCanReapply: permissionsLive && running,
     models: meta?.models ?? [],
-    model: state?.switching?.model ?? state?.model ?? info?.model ?? "",
+    model: switching?.model ?? state?.model ?? info?.model ?? "",
     onModel: features.includes("set_model") ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m }) : undefined,
-    harness: info?.kind,
+    harness: switching?.kind ?? info?.kind,
     modelLabel,
-    efforts: meta?.efforts ?? [],
-    effort: state?.effort ?? "",
-    onEffort: features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0 ? (e) => send({ type: "set_effort", effort: e }) : undefined,
+    efforts: switching ? (switching.efforts ?? []) : (meta?.efforts ?? []),
+    effort: switching ? (switching.effort ?? "") : (state?.effort ?? ""),
+    onEffort: !switching && (features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0) ? (e) => send({ type: "set_effort", effort: e }) : undefined,
     appliesNextTurn: nextTurn,
     running,
   };
   const switchTarget = features.includes("switch_harness") ? info?.target : undefined;
   // The plan's limits open in place under the line, from the usage badge.
-  const limits = state?.limits ?? info?.limits ?? [];
+  const limits = switching ? [] : (state?.limits ?? info?.limits ?? []);
   const [usage, setUsage] = React.useState(false);
   const usageId = React.useId();
   const top = topLimit(limits);

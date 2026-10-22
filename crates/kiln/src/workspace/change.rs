@@ -129,7 +129,7 @@ pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Val
             .await
             .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
         match got {
-            None => return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (Settings → Updates)"))),
+            None => return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)"))),
             Some(text) => text.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null),
         }
     };

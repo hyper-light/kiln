@@ -20,11 +20,13 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
+import { handleGoals } from "./goals.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleDoctor } from "./doctor.ts";
@@ -632,6 +634,47 @@ function startRun(repo: Repo, opts: { branch?: string; event?: string; pipeline?
   sjobs.forEach((s) => jobsById.set(s.job.id, s));
   emit({ type: "run", run });
   sjobs.forEach((s) => emit({ type: "job", job: s.job }));
+  return run;
+}
+
+/** kiln's release pipeline (`.kiln/release.yaml`), as System → Builds' Build every platform runs it: a job per platform family, each on a machine of its own. */
+const RELEASE_UI = { name: "ui", run: "npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build", dur: [5, 8] as [number, number], kind: "npm" };
+const RELEASE_JOBS: JobTpl[] = [
+  {
+    key: "linux",
+    needs: [],
+    labels: ["baremetal", "linux"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl", dur: [14, 20], kind: "compile" }],
+  },
+  {
+    key: "windows",
+    needs: [],
+    labels: ["baremetal", "linux"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh x86_64-pc-windows-msvc", dur: [18, 26], kind: "compile" }],
+  },
+  {
+    key: "macos",
+    needs: [],
+    labels: ["baremetal", "macos"],
+    toolchain: "rust",
+    steps: [RELEASE_UI, { name: "build", run: "nice -n 10 ci/release/build.sh aarch64-apple-darwin x86_64-apple-darwin", dur: [24, 32], kind: "compile" }],
+  },
+];
+let releaseRun: Run | null = null;
+
+function startRelease(commit: string): Run {
+  const repo = repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!;
+  const { run } = makeRun(repo, { created: now(), branch: "main", event: "manual", pipeline: "release" });
+  Object.assign(run, { sha: commit, message: "Build every platform", author: "admin" });
+  const sjobs = RELEASE_JOBS.map((tpl, i) => newSimJob(run, tpl, i));
+  runs.unshift(run);
+  jobsByRun.set(run.id, sjobs);
+  sjobs.forEach((s) => jobsById.set(s.job.id, s));
+  emit({ type: "run", run });
+  sjobs.forEach((s) => emit({ type: "job", job: s.job }));
+  releaseRun = run;
   return run;
 }
 
@@ -1283,8 +1326,10 @@ const server = http.createServer(async (req, res) => {
     const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
     if (opened && m === "GET") return json(res, 200, []);
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
+    // ---- goal stacks ----
+    if (await handleGoals(req, res, url)) return;
     // ---- agents that run agents ----
-    if (await handleFamily(req, res, url, () => [longInfo()])) return;
+    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
@@ -1614,7 +1659,20 @@ const server = http.createServer(async (req, res) => {
     if (await handleStores(req, res, url, { json, err, runners: () => [...agents.values()].filter((a) => !a.ephemeral).map((a) => ({ name: a.name, connected: a.connected, version: a.version, last_seen: a.last_seen })) })) return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
-    if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
+    if (
+      await handlePages(req, res, url, {
+        agents: () => [...agents.values()],
+        runs: () => runs,
+        version: VERSION,
+        hostname: HOSTNAME,
+        json,
+        err,
+        body,
+        emit,
+        release: { start: startRelease, latest: () => (releaseRun ? { run: releaseRun, jobs: (jobsByRun.get(releaseRun.id) ?? []).map((s) => s.job) } : null) },
+      })
+    )
+      return;
 
     return err(res, 404, `no route for ${m} ${p}`);
   } catch (e) {
@@ -1652,7 +1710,14 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleFamilySession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))) return;
+    if (
+      hm &&
+      (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
+        handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
+        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))
+    )
+      return;
     ws.close(1008, "no such socket");
   });
 });

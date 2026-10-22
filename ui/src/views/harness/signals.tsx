@@ -30,11 +30,13 @@ export function Optic({ state, size = 14, className }: { state: OpticState; size
   );
 }
 
-/** A mono eyebrow; live text carries the prism gradient sweeping through it. */
-export function PrismLabel({ live = false, className, children }: { live?: boolean; className?: string; children: React.ReactNode }) {
+/** A mono eyebrow; live text carries the prism gradient sweeping through it (`sweep`: the thinking
+ *  line's, a strip of the prism the GPU slides across its words; signals.css). */
+export function PrismLabel({ live = false, sweep = false, className, children }: { live?: boolean; sweep?: boolean; className?: string; children: React.ReactNode }) {
   return (
-    <span className={cn("sg-label", className)} data-live={live ? "true" : "false"}>
+    <span className={cn("sg-label", className)} data-live={live ? "true" : "false"} data-sweep={live && sweep ? "" : undefined}>
       {children}
+      {live && sweep && <span className="sg-sweep" aria-hidden="true" />}
     </span>
   );
 }
@@ -54,7 +56,7 @@ export function ThinkingLabel({ since, doing }: { since?: number; doing?: string
   const [observed] = React.useState(Date.now);
   const seconds = Math.max(0, (now - (since ?? observed)) / 1000);
   const what = doing && /^(compact|retr|wait|summar)/i.test(doing) ? doing : thinkingWords(seconds);
-  return <><PrismLabel live>{what}</PrismLabel><span className="sg-num">{formatThought(seconds)}</span></>;
+  return <><PrismLabel live sweep>{what}</PrismLabel><span className="sg-num">{formatThought(seconds)}</span></>;
 }
 
 /** The toggle above a thinking block: live it breathes ("Thinking"); settled it reads "Thought · 12s" with a chevron. */
@@ -133,6 +135,32 @@ export function Beam({ status, className }: { status: BeamStatus; className?: st
         </span>
       )}
     </span>
+  );
+}
+
+const PRISM = ["#b8d9d2", "#a6c4ed", "#b8a6d5", "#d6a2aa", "#d8cbb0"];
+
+/**
+ * A conversation loading: hyperlight's mark, a short spectral light travelling the loop, changing
+ * hue as it goes, and leaving through the refraction. Only one is ever on the page, so its moving
+ * dash costs little (a tool call's Beam turns a gradient instead: there are many of those).
+ */
+export function LoadingMark({ className }: { className?: string }) {
+  // useId's punctuation isn't safe inside url(#…).
+  const gradient = `sg-load-${React.useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  return (
+    <svg className={cn("sg-load", className)} viewBox="0 0 32 32" aria-hidden="true">
+      <defs>
+        <linearGradient id={gradient} x1="5" y1="27" x2="27" y2="5" gradientUnits="userSpaceOnUse">
+          {PRISM.map((c, i) => (
+            <stop key={c} offset={i / (PRISM.length - 1)} stopColor={c} />
+          ))}
+        </linearGradient>
+      </defs>
+      <path className="sg-load-loop" d={LOOP} pathLength={100} />
+      <path className="sg-load-light" d={LOOP} pathLength={100} stroke={`url(#${gradient})`} />
+      <path className="sg-load-tail" d={TAIL} />
+    </svg>
   );
 }
 

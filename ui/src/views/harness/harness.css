@@ -764,6 +764,10 @@ textarea.hx-input {
   visibility: hidden;
 }
 .hx-turn {
+  /* Each turn is painted as one piece (a layer of its own, nothing moves): while the last one
+     streams, the browser reuses what it painted of the turns before it instead of painting the
+     whole conversation again for every word. */
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -780,10 +784,6 @@ textarea.hx-input {
   border: 1px solid #23252b;
   border-radius: 14px 14px 14px 4px;
   background: #0f1013;
-}
-.hx-prompt[data-origin]:not([data-origin="human"]) {
-  border-style: dashed;
-  background: transparent;
 }
 .hx-prompt-meta {
   display: flex;
@@ -1085,6 +1085,12 @@ textarea.hx-input {
   margin-left: 3px;
   vertical-align: -0.18em;
   background: linear-gradient(180deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa);
+}
+/* After a list, a code block, a quote or a table, the caret stands where the next line would start
+   without making that line: the reply doesn't grow a line for it, to lose it again when the block
+   or the reply is done. */
+.hx-streaming > :not(p):last-child::after {
+  position: absolute;
 }
 .hx-outcome {
   padding: 14px 16px;
@@ -1768,6 +1774,49 @@ textarea.hx-input {
   align-items: center;
   gap: 6px;
   color: #b4b5ba;
+}
+/* No change request yet: what it is on one line; below it, under the words, the option and then
+   the action at the end (on a line of its own when both don't fit). With room, one line. */
+.hx-change-new {
+  display: block;
+  padding: 10px 10px 10px 12px;
+  container-type: inline-size;
+}
+.hx-change-grid {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  grid-template-areas:
+    "icon what"
+    ". do";
+  align-items: center;
+  gap: 10px;
+}
+.hx-change-icon {
+  grid-area: icon;
+}
+.hx-change-grid > .hx-change-what {
+  grid-area: what;
+  min-width: 0;
+}
+.hx-change-do {
+  display: flex;
+  flex-wrap: wrap;
+  grid-area: do;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  min-width: 0;
+}
+@container (min-width: 600px) {
+  .hx-change-grid {
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    grid-template-areas: "icon what do";
+    column-gap: 14px;
+  }
+  .hx-change-do {
+    flex-wrap: nowrap;
+    gap: 14px;
+  }
 }
 .hx-files {
   display: flex;
@@ -3157,10 +3206,6 @@ textarea.hx-input {
   border: 0;
   border-radius: 0;
   background: none;
-}
-.hx-prompt[data-origin]:not([data-origin="human"]) {
-  border: 0;
-  opacity: 0.8;
 }
 .hx-prompt-meta .hx-eyebrow {
   color: #cbc3ea;

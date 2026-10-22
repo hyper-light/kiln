@@ -126,8 +126,25 @@ export function Toaster() {
     () => items,
   );
   const navigate = useNavigate();
+  // Persistent requests share this corner and sit immediately above passing notifications.
+  const viewport = React.useCallback((el: HTMLOListElement | null) => {
+    if (!el) return;
+    const root = document.documentElement;
+    const measure = () => {
+      const height = el.getBoundingClientRect().height;
+      root.style.setProperty("--toast-stack-height", `${height > 0 ? height + 8 : 0}px`);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      root.style.removeProperty("--toast-stack-height");
+    };
+  }, []);
   return (
     <ol
+      ref={viewport}
       className="toast-viewport"
       aria-label="Notifications"
       aria-live="polite"

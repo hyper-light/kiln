@@ -6,7 +6,7 @@
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::{Action, Error, Given};
+use super::{Action, At, By, Change, Error, Given, NewGoal, Pausing};
 use crate::ops::{Cx, Fail, Op, Out, path};
 
 fn fail(e: Error) -> Fail {
@@ -30,6 +30,48 @@ fn schema(props: Value, required: &[&str]) -> Value {
 }
 
 const AGENT: &str = "The agent's id (as agents_list gives it); leave it out for your own goal stack.";
+const GOAL_ID: &str = "A goal's id, as goals_get gives it.";
+
+/// A string field of an input, when it's given and not empty.
+fn opt(v: &Value, k: &str) -> Option<String> {
+    v.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+/// Where goals added go, from `before`, `after` or `next`.
+fn at_of(v: &Value) -> Result<At, Fail> {
+    match (opt(v, "before"), opt(v, "after"), v.get("next").and_then(Value::as_bool).unwrap_or(false)) {
+        (None, None, false) => Ok(At::End),
+        (Some(b), None, false) => Ok(At::Before(b)),
+        (None, Some(a), false) => Ok(At::After(a)),
+        (None, None, true) => Ok(At::Next),
+        _ => Err((StatusCode::BAD_REQUEST, "say one place for them: `before`, `after` or `next`".into())),
+    }
+}
+
+/// When a pause ends by itself, from `resume_in_s` (seconds from now) or `resume_at` (unix ms, or
+/// an RFC 3339 time): unix ms.
+fn until_of(v: &Value, now: i64) -> Result<Option<i64>, Fail> {
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_owned());
+    match (v.get("resume_in_s").filter(|x| !x.is_null()), v.get("resume_at").filter(|x| !x.is_null())) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(bad("say when it resumes one way: `resume_in_s` or `resume_at`")),
+        (Some(s), None) => {
+            let secs = s.as_f64().filter(|x| x.is_finite() && *x > 0.0).ok_or_else(|| bad("`resume_in_s` is a number of seconds, more than 0"))?;
+            // At most a pause's longest, checked by the stack.
+            #[allow(clippy::cast_possible_truncation)]
+            let ms = (secs.min(1e12) * 1000.0) as i64;
+            Ok(Some(now.saturating_add(ms)))
+        }
+        (None, Some(t)) => match (t.as_i64(), t.as_str()) {
+            (Some(ms), _) => Ok(Some(ms)),
+            (None, Some(text)) => time::OffsetDateTime::parse(text.trim(), &time::format_description::well_known::Rfc3339)
+                .map(|d| i64::try_from(d.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX))
+                .map(Some)
+                .map_err(|_| bad("`resume_at` is unix ms, or a time like 2026-10-21T15:00:00Z")),
+            _ => Err(bad("`resume_at` is unix ms, or a time like 2026-10-21T15:00:00Z")),
+        },
+    }
+}
 
 async fn get(cx: Cx, v: Value) -> Out {
     json_of(&super::get(&cx.hub, &agent_of(&v)?).await.map_err(fail)?)
@@ -43,7 +85,7 @@ async fn add(cx: Cx, v: Value) -> Out {
         return Err((StatusCode::BAD_REQUEST, "`goals` is a list of at least one goal".into()));
     }
     let start = v.get("start").and_then(Value::as_bool).unwrap_or(true);
-    let s = super::add(&cx.hub, &agent, goals, start).await.map_err(fail)?;
+    let s = super::add_at(&cx.hub, &agent, goals.into_iter().map(NewGoal::from).collect(), start, &at_of(&v)?).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.add".into(), agent).await;
     json_of(&s)
 }
@@ -60,9 +102,44 @@ async fn set(cx: Cx, v: Value) -> Out {
 async fn control(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
-    let action: Action = serde_json::from_value(v.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| (StatusCode::BAD_REQUEST, "`action` is start, pause, skip or clear".into()))?;
-    let s = super::control(&cx.hub, &agent, action).await.map_err(fail)?;
+    let action: Action =
+        serde_json::from_value(v.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| (StatusCode::BAD_REQUEST, "`action` is start (or resume), pause, skip, done, clear or restore".into()))?;
+    let until = until_of(&v, cx.hub.clock.unix_ms())?;
+    if action != Action::Pause && (until.is_some() || opt(&v, "why").is_some()) {
+        return Err((StatusCode::BAD_REQUEST, "`why`, `resume_in_s` and `resume_at` go with pause".into()));
+    }
+    let by = By::of(&cx.hub, &cx.caller, &agent);
+    let s = super::control_as(&cx.hub, &agent, action, &by, Pausing { why: opt(&v, "why"), until }).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.control".into(), format!("{agent}: {action:?}")).await;
+    json_of(&s)
+}
+
+async fn done(cx: Cx, v: Value) -> Out {
+    let agent = agent_of(&v)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    let by = By::of(&cx.hub, &cx.caller, &agent);
+    let s = super::done(&cx.hub, &agent, opt(&v, "id").as_deref(), opt(&v, "evidence").as_deref(), &by).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.done".into(), format!("{agent}: {}", opt(&v, "id").unwrap_or_else(|| "the goal under way".into()))).await;
+    json_of(&s)
+}
+
+async fn update(cx: Cx, v: Value) -> Out {
+    let agent = agent_of(&v)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    let id = opt(&v, "id").ok_or_else(|| (StatusCode::BAD_REQUEST, "`id` is the goal's id (goals_get lists them)".to_owned()))?;
+    let change: Change = serde_json::from_value(v.clone()).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let by = By::of(&cx.hub, &cx.caller, &agent);
+    let s = super::update(&cx.hub, &agent, &id, change, &by).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.update".into(), format!("{agent}: {id}")).await;
+    json_of(&s)
+}
+
+async fn split(cx: Cx, v: Value) -> Out {
+    let agent = agent_of(&v)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    let parts: Vec<String> = v.get("goals").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    let s = super::split(&cx.hub, &agent, opt(&v, "id").as_deref(), parts).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.split".into(), format!("{agent}: {}", opt(&v, "id").unwrap_or_else(|| "the goal under way".into()))).await;
     json_of(&s)
 }
 
@@ -71,7 +148,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "goals.get",
-            summary: "An agent's goal stack (yours, without `agent`): its goals in order (pending, active, met, unmet, skipped), and whether it runs, is paused (and why) or is done. The goal under way is sent again whenever the agent stops short of it, until it's met; an agent without goals of its own says it's met by ending its reply with the line GOAL MET.",
+            summary: "An agent's goal stack (yours, without `agent`): its goals in order, each with its id and status (pending, active, met, unmet, skipped), the goal it's a part of (`part_of`) and the plan step it's made from (`step`); and whether the stack runs, is paused (why, and `resume_at` when it resumes by itself) or is done; `cleared`: how many goals were cleared from it last (goals_control restore brings them back). The goal under way is sent again whenever the agent stops short of it, until it's met: say so with goals_done.",
             read_only: true,
             destructive: false,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &[]),
@@ -80,7 +157,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.add",
-            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has: each goes to it once the one before is met (its harness's own /goal where it has one), like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, in order, each saying what done is.",
+            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id): each goes to it once the one before is met (its harness's own /goal where it has one), like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, in order, each saying what done is.",
             read_only: false,
             destructive: false,
             input: || {
@@ -88,7 +165,10 @@ pub fn list_ops() -> Vec<Op> {
                     json!({
                         "agent": {"type": "string", "description": AGENT},
                         "goals": {"type": "array", "items": {"type": "string"}, "description": "Each a condition or objective, one line."},
-                        "start": {"type": "boolean"}
+                        "start": {"type": "boolean"},
+                        "next": {"type": "boolean", "description": "Right after the goal under way, before the rest."},
+                        "before": {"type": "string", "description": "Before this goal still to go (its id). Before the goal under way, they go first and it waits after them."},
+                        "after": {"type": "string", "description": "After this goal still to go (its id)."}
                     }),
                     &["goals"],
                 )
@@ -98,7 +178,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.set",
-            summary: "Replace an agent's goals not yet started (reordered, edited, removed, added): `goals` is the list as it should be, existing ones by `id`.",
+            summary: "Replace an agent's goals still to go (reordered, edited, removed, added): `goals` is the list as it should be, existing ones by `id` (one given by its words alone is the goal still to go with those words). The goal under way may be in it: first, it stays under way (with other words, it goes to the agent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done are left as they are.",
             read_only: false,
             destructive: true,
             input: || {
@@ -115,12 +195,81 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.control",
-            summary: "Start (or resume), pause, skip the goal under way, or clear an agent's goal stack.",
+            summary: "Start or resume, pause, skip the goal under way (left unmet: to say it's met, use goals_done), or clear an agent's goal stack; restore brings back the goals cleared last, as they were, and runs it. Starting, resuming or skipping sends what's next to the agent at once. A pause can say `why` and resume by itself: `resume_in_s` (seconds from now) or `resume_at` (unix ms, or a time like 2026-10-21T15:00:00Z); paused, the agent isn't held to its goal (its harness's own goal is cleared) and nothing is sent until it resumes.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "action": {"type": "string", "enum": ["start", "pause", "skip", "clear"]}}), &["action"]),
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "action": {"type": "string", "enum": ["start", "resume", "pause", "skip", "done", "clear", "restore"]},
+                        "why": {"type": "string", "description": "pause: why, shown with the stack (what it waits for)."},
+                        "resume_in_s": {"type": "number", "description": "pause: resume by itself this many seconds from now (at most 30 days)."},
+                        "resume_at": {"type": ["integer", "string"], "description": "pause: resume by itself then: unix ms, or an RFC 3339 time."}
+                    }),
+                    &["action"],
+                )
+            },
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", v.get("action").and_then(Value::as_str).unwrap_or("start")]))),
             run: |cx, v| Box::pin(control(cx, v)),
+        },
+        Op {
+            name: "goals.done",
+            summary: "Say a goal is met: the goal under way (or the one `id` names), with `evidence`, what shows it (the tests that passed, the numbers measured, where it's live). It ends as met, its harness's own goal is cleared, and the next goes to the agent at once. Use this when you've met your goal rather than skipping it (skip leaves a goal unmet); a goal split into parts that's said met takes its parts still to go with it, and a goal skipped earlier can be said met after all.",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "id": {"type": "string", "description": "The goal that's met; left out, the goal under way."},
+                        "evidence": {"type": "string", "description": "What shows it's met, a line or two: kept with the goal for the person to see."}
+                    }),
+                    &[],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "done"]))),
+            run: |cx, v| Box::pin(done(cx, v)),
+        },
+        Op {
+            name: "goals.update",
+            summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `remove` takes it out (the goal under way ends as skipped; one to come goes, with its parts).",
+            read_only: false,
+            destructive: true,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "id": {"type": "string", "description": GOAL_ID},
+                        "text": {"type": "string", "description": "Its new words: a condition or objective, one line."},
+                        "next": {"type": "boolean", "description": "Move it right after the goal under way."},
+                        "before": {"type": "string", "description": "Move it before this goal still to go (its id)."},
+                        "after": {"type": "string", "description": "Move it after this goal still to go (its id)."},
+                        "remove": {"type": "boolean", "description": "Take it out."}
+                    }),
+                    &["id"],
+                )
+            },
+            route: |v| Ok((Method::PATCH, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", &opt(v, "id").unwrap_or_default()]))),
+            run: |cx, v| Box::pin(update(cx, v)),
+        },
+        Op {
+            name: "goals.split",
+            summary: "Split a goal (the one under way, or the one `id` names) into a goal stack of its own: its parts (`goals`, a goal each, one line saying what done is) go right before it and are pursued first, each in turn, then the goal itself comes back for its own check. A goal made from a plan's step (its `step` in goals_get), given no parts, splits into its acceptance criteria and its tests, a goal each. The goal under way split waits after its parts, and the first part goes now.",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "id": {"type": "string", "description": "The goal to split; left out, the goal under way."},
+                        "goals": {"type": "array", "items": {"type": "string"}, "description": "Its parts, in order. Left out for a plan step's goal: its acceptance criteria and tests."}
+                    }),
+                    &[],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "split"]))),
+            run: |cx, v| Box::pin(split(cx, v)),
         },
     ]
 }
@@ -150,10 +299,17 @@ mod tests {
         }
     }
 
+    /// On a hub with a simulated clock: goals' times are its (CP-M2, AC-M2.1).
     #[test]
     fn an_agent_steers_the_goals_and_plans_of_itself_and_its_own_only() -> anyhow::Result<()> {
         within(async {
-            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            // On a simulated clock (goals' times are its), with no conversation store: what's
+            // steered is goals and plans, not conversations.
+            let hub = crate::hub::tests::scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |c| {
+                c.terminal.enabled = true;
+                c.conversations.off = true;
+            })
+            .await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;

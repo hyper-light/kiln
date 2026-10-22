@@ -176,6 +176,9 @@ pub struct Hub {
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
     pub gitops_kick: Notify,
     pub shutdown: Shutdown,
+    /// Time, as the goal driver and what else moves onto it take it: kiln's runtime in production,
+    /// a simulated clock in tests (kiln-seams' `Clock`, docs/seams.md).
+    pub clock: Arc<dyn kiln_seams::Clock>,
     /// Agents that have been sent Cancel for a job, with when (for the timeout escalation).
     cancel_sent: Mutex<HashMap<String, Instant>>,
     /// (job, agent) pairs recently declined: not offered again until DECLINE_BACKOFF passes.
@@ -189,7 +192,7 @@ pub struct Hub {
     /// Runner processes that went away while their machine stayed connected through another
     /// one, with when and the jobs they held (requeued if they do not come back in time).
     lost_instances: Mutex<HashMap<PeerId, (String, Instant, Vec<String>)>>,
-    /// Upgrades of runners and of this server, started from Settings → Updates.
+    /// Upgrades of runners and of this server, started from System → Updates.
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
@@ -221,11 +224,27 @@ impl Hub {
         join_token: String,
         shutdown: Shutdown,
     ) -> Arc<Self> {
+        Self::new_on(crate::rt::clock(), cfg, store, logs, net, pki, admin_token, join_token, shutdown)
+    }
+
+    /// A hub whose time is `clock`'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_on(
+        clock: Arc<dyn kiln_seams::Clock>,
+        cfg: Arc<Config>,
+        store: Store,
+        logs: Logs,
+        net: NetHandle,
+        pki: Arc<crate::pki::Pki>,
+        admin_token: String,
+        join_token: String,
+        shutdown: Shutdown,
+    ) -> Arc<Self> {
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
-        let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations);
+        let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock));
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
@@ -261,6 +280,7 @@ impl Hub {
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
             shutdown,
+            clock,
             cancel_sent: Mutex::new(HashMap::new()),
             declined: Mutex::new(HashMap::new()),
             discovery,
@@ -1088,7 +1108,12 @@ impl Hub {
             }
             // A streamed page's chunks and events (`crate::harness::streams`): to its viewers.
             AgentMsg::StreamFrame { stream, data } => self.harness.streams.chunk(&agent, &stream, data),
-            AgentMsg::StreamEvent { stream, json } => self.harness.streams.event(&agent, &stream, json),
+            AgentMsg::StreamEvent { stream, json } => {
+                // Opened: the size its viewer asked for while it was being set up, asked again.
+                if let Some((live, again)) = self.harness.streams.event(&agent, &stream, json) {
+                    live.control(self, &again).await;
+                }
+            }
             // Connections to its ports (`crate::harness::opened`).
             AgentMsg::PortOpened { conn, error } => self.harness.ports.opened(&agent, conn, error),
             AgentMsg::PortData { conn, data } => self.harness.ports.data(&agent, conn, data),
@@ -1547,7 +1572,7 @@ impl Hub {
         self.runner_processes(name)
     }
 
-    /// Every runner process of a machine and what each one holds (Settings → Updates lists
+    /// Every runner process of a machine and what each one holds (System → Updates lists
     /// them always; agent views only while a machine has more than one).
     /// What a machine's newest runner process says it can do ([`crate::proto::CAP_UPGRADE`] …);
     /// 0 for runners from before builds were announced.
@@ -2113,17 +2138,34 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn scratch_hub_with(f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_on(crate::rt::clock(), f).await
+    }
+
+    /// A scratch hub whose time is `clock`'s (a `kiln_seams::clock::SimClock`, mostly).
+    pub(crate) async fn scratch_hub_on(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
         let dir = tempfile::tempdir()?.keep();
         let mut cfg = Config::default();
         cfg.server.data_dir = dir.clone();
         cfg.terminal.enabled = false;
         f(&mut cfg);
-        let pki = Arc::new(crate::pki::Pki::open(&dir.join("pki"))?);
-        let leaf = pki.server_leaf(&[])?;
+        // Its slowest parts, and apart: the store's migrations (about 20 ms) and its keys (the
+        // process's first key starts the crypto library, about as long), made side by side on the
+        // blocking pool, not on the runtime's threads, so the tests beside it go on meanwhile. The
+        // keys are throwaway: written without waiting for the disk.
+        let pki_dir = dir.join("pki");
+        let (store, keys) = futures::join!(
+            crate::rt::blocking(Store::in_memory),
+            crate::rt::blocking(move || -> anyhow::Result<_> {
+                let pki = crate::pki::Pki::open_scratch(&pki_dir)?;
+                let leaf = pki.server_leaf(&[])?;
+                Ok((pki, leaf))
+            })
+        );
+        let (store, (pki, leaf)) = (store??, keys??);
+        let pki = Arc::new(pki);
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
-        let store = Store::in_memory()?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
-        Ok(Hub::new(Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
+        Ok(Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
     }
 
     #[test]

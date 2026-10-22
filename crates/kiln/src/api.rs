@@ -274,6 +274,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let id = (*id).to_owned();
             return boxed(|| put_artifacts(&hub, &id, req)).await;
         }
+        // An upload in pieces (`crate::exec`): how much of it came, and its end, checked.
+        (&Method::GET, ["api", "jobs", id, "artifacts", "upload"]) => {
+            let id = (*id).to_owned();
+            return boxed(|| artifacts_had(&hub, &id, req.headers())).await;
+        }
+        (&Method::POST, ["api", "jobs", id, "artifacts", "upload"]) => {
+            let id = (*id).to_owned();
+            return boxed(|| artifacts_done(&hub, &id, req)).await;
+        }
         (&Method::POST, ["api", "hooks", "github"]) => return boxed(|| github_hook(&hub, req)).await,
         // The GitHub App's events and GitHub's return from making it (W14-R10): open, they carry
         // their own proof (a signature; a state kiln handed out).
@@ -720,8 +729,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 Err(err(StatusCode::NOT_FOUND, "no such opening"))
             }
         }
-        (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => boxed(|| preview_look(&hub, id, "look")).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => boxed(|| preview_look(&hub, id, "stop")).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "preview"]) => {
+            let refusal = personal_refusal(&req);
+            boxed(|| preview_look(&hub, id, "look", refusal)).await
+        }
+        (&Method::POST, ["api", "harness", "sessions", id, "preview", "stop"]) => boxed(|| preview_look(&hub, id, "stop", None)).await,
         (&Method::DELETE, ["api", "harness", "sessions", id, "streams", sid]) => {
             let me = person(&req);
             let ours = hub.harness.streams.get(sid).is_some_and(|l| l.session == *id && l.for_whom(me.as_deref()));
@@ -735,7 +747,32 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
         (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
         (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => boxed(|| goals_control(&hub, &caller, id, action)).await,
+        // Said met, split, one goal changed, or the stack started, paused (for a while, too) …: each
+        // its operation (`goals.*`), the body its input.
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", what]) => {
+            let (name, field) = match *what {
+                "done" => ("goals.done", None),
+                "split" => ("goals.split", None),
+                action => ("goals.control", Some(("action", (*action).to_owned()))),
+            };
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+                if let Some((k, v)) = field {
+                    o.insert(k.into(), json!(v));
+                }
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
+        }
+        (&Method::PATCH, ["api", "harness", "sessions", id, "goals", goal]) => {
+            let (id, goal) = ((*id).to_owned(), (*goal).to_owned());
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+                o.insert("id".into(), json!(goal));
+            }
+            boxed(|| own_op(&hub, &caller, "goals.update", body)).await
+        }
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -753,6 +790,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // page; docs/conversations.md, "Telemetry").
         (&Method::GET, ["api", "conversations", "status"]) => Ok(srv::json(StatusCode::OK, &crate::harness::stores::status(&hub))),
         (&Method::GET, ["api", "conversations", "series"]) => conversation_series(&hub, &q),
+        (&Method::GET, ["api", "conversations", "log"]) => conversation_log(&hub, &q),
         // Files the conversation's messages mention: kept by the server, or read on its machine now.
         (&Method::GET, ["api", "harness", "sessions", id, "files", sha]) => boxed(|| harness_kept_file(&hub, id, sha, &req)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "file"]) => boxed(|| harness_file(&hub, id, q.get("path").cloned(), &req)).await,
@@ -1214,7 +1252,7 @@ async fn ai_takeover(hub: &Hub, machine: &str, pid: &str, q: &HashMap<String, St
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): taking it over ends it there, so ask with {{\"stop\": true}}")));
         }
         (TakeOver::Upgrade, _) => {
-            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in Settings → Updates first")));
+            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in System → Updates first")));
         }
         (TakeOver::Outside, _) => {
             return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}), as a harness kiln might not resume: quit it there first, then continue it")));
@@ -1241,7 +1279,7 @@ async fn ai_fork(hub: &Hub, machine: &str, pid: &str) -> R {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
     if !forks_on(hub, machine) {
-        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in Settings → Updates first")));
+        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in System → Updates first")));
     }
     let Some(spec) = found.fork_spec() else {
         return Err(if !found.started() {
@@ -2188,20 +2226,143 @@ pub(crate) fn artifact_path(hub: &Hub, job: &str) -> std::path::PathBuf {
     hub.cfg.data("artifacts").join(format!("{safe}.tar"))
 }
 
+/// The most one piece of an upload in pieces may be.
+const ARTIFACT_PIECE: usize = 64 << 20;
+
+/// A query's `name`, as a number.
+fn query_u64(req: &Request, name: &str) -> Option<u64> {
+    req.uri().query()?.split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))?.parse().ok()
+}
+
+/// `PUT /api/jobs/:id/artifacts/upload`: a job's artifacts (a tar), whole; or, with `?at=n`, the
+/// piece of them at byte `n` (`put_artifacts_piece`).
 async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
     if !job_token_ok(hub, req.headers(), id) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
     }
+    if let Some(at) = query_u64(&req, "at") {
+        return put_artifacts_piece(hub, id, at, req).await;
+    }
     let path = artifact_path(hub, id);
-    let (sink, done) = crate::rt::file_sink(path, 8 << 30)?;
+    // Kept only once all of it came: an upload that broke off leaves nothing a release would take
+    // its binaries from (a tar cut short reads as shorter files, with no error).
+    let part = path.with_extension("part");
+    let (sink, done) = crate::rt::file_sink(part.clone(), 8 << 30)?;
     let mut body = req.into_body();
-    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
-        if sink.send(chunk).await.is_err() {
-            break; // the writer failed; its error is reported below
+    let mut broke = None;
+    loop {
+        match srv::next_chunk(&mut body).await {
+            Ok(Some(chunk)) => {
+                if sink.send(chunk).await.is_err() {
+                    break; // the writer failed; its error is reported below
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                broke = Some(e.to_string());
+                break;
+            }
         }
     }
     drop(sink);
-    done.await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let written = done.await;
+    if let Some(e) = broke {
+        let _ = std::fs::remove_file(&part);
+        return Err(err(StatusCode::BAD_REQUEST, format!("the upload broke off: {e}")));
+    }
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&part);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+    }
+    std::fs::rename(&part, &path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("keep {}: {e}", path.display())))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// One piece of a job's artifacts, at byte `at`: taken only where the pieces so far end (the first
+/// starts them afresh), so a piece that broke off costs only itself. One elsewhere is refused with
+/// where they end (`409 {"have": n}`), for the upload to go on from there.
+async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
+    let part = artifact_path(hub, id).with_extension("part");
+    let piece = srv::body_bytes(req.into_body(), ARTIFACT_PIECE).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("the piece broke off: {e:#}")))?;
+    let had = crate::rt::blocking(move || -> anyhow::Result<Result<u64, u64>> {
+        if let Some(dir) = part.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if at == 0 {
+            let _ = std::fs::remove_file(&part);
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&part)?;
+        let len = f.metadata()?.len();
+        if len != at {
+            return Ok(Err(len));
+        }
+        std::io::Write::write_all(&mut f, &piece)?;
+        Ok(Ok(len.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX))))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(match had {
+        Ok(have) => srv::json(StatusCode::OK, &serde_json::json!({"have": have})),
+        Err(have) => srv::json(StatusCode::CONFLICT, &serde_json::json!({"have": have})),
+    })
+}
+
+/// `GET /api/jobs/:id/artifacts/upload`: how much of an upload in pieces has come (`{"have": n}`;
+/// a server that answers so takes them in pieces).
+async fn artifacts_had(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
+    if !job_token_ok(hub, headers, id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
+    }
+    let part = artifact_path(hub, id).with_extension("part");
+    let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({"have": have})))
+}
+
+/// `POST /api/jobs/:id/artifacts/upload?size=n&sha256=hex`: the pieces' end. They're the job's
+/// artifacts only if they come to its size and digest; else they're let go of (`409`), and nothing
+/// a release would take its binaries from is kept.
+async fn artifacts_done(hub: &Hub, id: &str, req: Request) -> R {
+    if !job_token_ok(hub, req.headers(), id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
+    }
+    let size = query_u64(&req, "size").ok_or_else(|| err(StatusCode::BAD_REQUEST, "how big? (`size`)"))?;
+    let want = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("sha256=")))
+        .map(str::to_ascii_lowercase)
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "its digest? (`sha256`, hex)"))?;
+    let path = artifact_path(hub, id);
+    let part = path.with_extension("part");
+    let checked = crate::rt::blocking(move || -> anyhow::Result<Result<(), String>> {
+        use anyhow::Context as _;
+        use sha2::Digest as _;
+        use std::io::Read as _;
+        let mut f = std::fs::File::open(&part).context("no pieces came")?;
+        let len = f.metadata()?.len();
+        let mut h = sha2::Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(buf.get(..n).unwrap_or_default());
+        }
+        let got = hex::encode(h.finalize());
+        if len != size || got != want {
+            let _ = std::fs::remove_file(&part);
+            return Ok(Err(format!("the pieces came to {len} bytes, digest {got}; the upload was {size} bytes, digest {want}")));
+        }
+        std::fs::rename(&part, &path).with_context(|| format!("keep {}", path.display()))?;
+        Ok(Ok(()))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    checked.map_err(|why| err(StatusCode::CONFLICT, why))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -2755,7 +2916,7 @@ async fn download_binary() -> R {
 }
 
 /// The binary for `target`: this server's own when it was built for that target, one uploaded
-/// or fetched here (Settings → Updates), otherwise a redirect to the release build of the same
+/// or fetched here (System → Builds), otherwise a redirect to the release build of the same
 /// version on GitHub.
 async fn download_for(hub: &Hub, target: &str) -> R {
     if target == TARGET {
@@ -2815,7 +2976,7 @@ async fn build_binary(hub: &Arc<Hub>, id: &str, q: &HashMap<String, String>, req
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
-// ------------------------------------------------------------------ updates (Settings → Updates)
+// ------------------------------------------------------------------ updates (System → Updates)
 
 /// `GET /api/updates`: this server and how it is upgraded, every machine's runner, the latest
 /// upgrades and the binaries kiln can hand out. `POST /api/updates/check` asks GitHub (and, in
@@ -3479,6 +3640,18 @@ fn conversation_series(hub: &Hub, q: &HashMap<String, String>) -> R {
     Ok(srv::json(StatusCode::OK, &series))
 }
 
+/// `GET /api/conversations/log?since=&q=&limit=`: the replication log, newest first: what moved
+/// between the conversation stores, sample by sample, and what happened to them; after `since`
+/// (unix ms), with `q` in the line (any case). `total`: every line it holds; `matched`: those with `q`.
+fn conversation_log(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let since = q.get("since").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1_000).clamp(1, 5_000);
+    let words = q.get("q").map_or("", String::as_str);
+    let board = &hub.harness.board;
+    let (total, matched) = board.log_len(words);
+    Ok(srv::json(StatusCode::OK, &json!({ "at": crate::util::now_ms(), "total": total, "matched": matched, "lines": board.log(since, words, limit) })))
+}
+
 fn goals_err(e: crate::goals::Error) -> ApiError {
     match e {
         crate::goals::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
@@ -3520,15 +3693,6 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
-    Ok(srv::json(StatusCode::OK, &s))
-}
-
-/// Start, pause, skip or clear an agent's goal stack.
-async fn goals_control(hub: &Hub, caller: &crate::authz::Caller, id: &str, action: &str) -> R {
-    let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
-    may_steer_goals(hub, caller, id)?;
-    let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
-    hub.store.audit(caller.name.clone(), "goals.control".into(), format!("{id}: {action}")).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
 
@@ -3647,7 +3811,7 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
 
 /// Who a broadcast to `to` would reach (the same picking as the broadcast itself), the machines
 /// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts)
-/// merged, each entry with `count`, how many of them have it.
+/// merged, each entry with `count`, how many of them have it, and `agents`, which.
 async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     #[derive(serde::Deserialize)]
     struct Body {
@@ -3656,8 +3820,8 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
     let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let picked = crate::harness::broadcast::pick(&hub.harness.list(), &b.to);
     let mut machines: Vec<String> = Vec::new();
-    // (field in each agent's meta, the key naming an entry, the entries seen with their counts)
-    let mut merged: [(&str, &str, Vec<(serde_json::Value, usize)>); 4] =
+    // (field in each agent's meta, the key naming an entry, the entries seen with the agents that have them)
+    let mut merged: [(&str, &str, Vec<(serde_json::Value, Vec<String>)>); 4] =
         [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new())];
     for info in &picked {
         let machine = info.target.strip_prefix("agent:").unwrap_or(&info.target).to_owned();
@@ -3669,17 +3833,18 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
             for entry in meta.get(*field).and_then(serde_json::Value::as_array).into_iter().flatten() {
                 let Some(name) = entry.get(*key).and_then(serde_json::Value::as_str) else { continue };
                 match seen.iter_mut().find(|(v, _)| v.get(*key).and_then(serde_json::Value::as_str) == Some(name)) {
-                    Some((_, n)) => *n += 1,
-                    None => seen.push((entry.clone(), 1)),
+                    Some((_, ids)) => ids.push(info.id.clone()),
+                    None => seen.push((entry.clone(), vec![info.id.clone()])),
                 }
             }
         }
     }
-    let counted = |seen: Vec<(serde_json::Value, usize)>| -> Vec<serde_json::Value> {
+    let counted = |seen: Vec<(serde_json::Value, Vec<String>)>| -> Vec<serde_json::Value> {
         seen.into_iter()
-            .map(|(mut v, n)| {
+            .map(|(mut v, ids)| {
                 if let Some(o) = v.as_object_mut() {
-                    o.insert("count".into(), json!(n));
+                    o.insert("count".into(), json!(ids.len()));
+                    o.insert("agents".into(), json!(ids));
                 }
                 v
             })
@@ -3753,10 +3918,34 @@ fn person(req: &Request) -> Option<String> {
     }
 }
 
+/// Why this caller can't have a browser profile of its own (`None`: it can). A profile of one's
+/// own keeps a person's sign-ins, so it's theirs alone: signed in as themselves, not through an
+/// agent, a job, or a token allowed less than its owner.
+fn personal_refusal(req: &Request) -> Option<String> {
+    if person(req).is_some() {
+        return None;
+    }
+    let as_whom = match req.extensions().get::<crate::authz::Caller>() {
+        Some(c) if c.agent.is_some() => format!("an agent ({})", c.name),
+        Some(c) if matches!(c.kind, crate::authz::gate::Kind::Job) => format!("a CI job ({})", c.name),
+        Some(c) => format!("a token allowed less than its owner ({})", c.name),
+        None => "someone kiln can't name".to_owned(),
+    };
+    Some(format!(
+        "Your own profile keeps your sign-ins, so only you can use it, signed in to kiln as yourself. This browser is signed in as {as_whom}. Pick Conversation (kept with this conversation) or Clean (fresh each time), or sign in to kiln as yourself (your password, or the admin token)."
+    ))
+}
+
 async fn stream_open(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "owner".to_owned(), |c| c.name.clone());
     let me = person(&req);
+    let refusal = personal_refusal(&req);
     let mut spec: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if spec.get("profile").and_then(serde_json::Value::as_str) == Some("personal")
+        && let Some(why) = refusal
+    {
+        return Err(err(StatusCode::FORBIDDEN, why));
+    }
     // `{"start": true}`: the project's app first (its `.kiln/preview.yaml`), then its page.
     if spec.get("start").and_then(serde_json::Value::as_bool) == Some(true) {
         let started = crate::harness::streams::preview(hub, id, "start").await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
@@ -3814,10 +4003,17 @@ async fn open_on_device(hub: &Arc<Hub>, id: &str, req: Request) -> R {
 /// `GET /api/harness/sessions/:id/preview`: what a person may open live from the session (the
 /// ports its machine serves, its agent's first; its project's app); `POST .../preview/stop` stops
 /// that app.
-async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str) -> R {
-    let v = crate::harness::streams::preview(hub, id, op).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str, personal_refused: Option<String>) -> R {
+    let mut v = crate::harness::streams::preview(hub, id, op).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     if op == "stop" && v.get("stopped").and_then(serde_json::Value::as_bool) == Some(true) {
         hub.store.audit("admin".into(), "agent.app.stop".into(), id.to_owned()).await;
+    }
+    // Whether the one asking may have a profile of their own, and why not (the form says so
+    // before they choose it).
+    if op == "look"
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("personal".into(), serde_json::json!({"ok": personal_refused.is_none(), "why": personal_refused}));
     }
     Ok(srv::json(StatusCode::OK, &v))
 }
@@ -3881,16 +4077,18 @@ async fn stream_view(hub: Arc<Hub>, live: Arc<crate::harness::streams::Live>, so
         Stream(Result<ToViewer, async_channel::RecvError>),
     }
     let (mut tx, mut rx) = socket.split();
-    let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
     let rtc = &hub.harness.webrtc;
+    // Said first, before joining (which waits on the stream's runner): a viewer that can show the
+    // stream only over WebRTC knows at once whether it can.
+    if rtc.on() {
+        tx.send(ws::text(serde_json::json!({"webrtc": {"can": true}}).to_string())).await?;
+    }
+    let (me, from_stream) = hub.harness.streams.join(&hub, &live).await;
     // The viewer's WebRTC peer, and whether it shows the stream (its chunks then go there alone).
     let mut peer: Option<Peer> = None;
     let mut playing = false;
     let mut keyed: Option<std::time::Instant> = None;
     let r: anyhow::Result<()> = async {
-        if rtc.on() {
-            tx.send(ws::text(serde_json::json!({"webrtc": {"can": true}}).to_string())).await?;
-        }
         loop {
             let next = {
                 let said = async {

@@ -48,6 +48,8 @@ export interface PlanItem {
   acceptance: Criterion[];
   /** How it's tested. */
   testing: PlanTest[];
+  /** The steps it waits for, by number (from 1): run with an agent per step, it starts once each is met. */
+  needs?: number[];
 }
 
 export const emptyItem = (): PlanItem => ({ title: "", description: "", examples: "", acceptance: [], testing: [] });
@@ -129,6 +131,10 @@ export interface RunStep {
   /** What its agent is held to. */
   goal: string;
   stand: StepStand;
+  /** The steps it waits for, by number. */
+  needs: number[];
+  /** Given to an agent that was there already (its goal on that agent's stack), not one of its own. */
+  given: boolean;
   agent: AgentBrief | null;
   agent_id: string | null;
   started_at: number | null;

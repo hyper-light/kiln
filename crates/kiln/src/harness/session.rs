@@ -679,6 +679,36 @@ async fn stop_left(s: &Arc<Session>, task: Option<&str>) {
     core.touch_state();
 }
 
+/// Native Codex subagents whose work kiln never read, in a session that runs another harness now
+/// (it switched before kiln read them): their work comes from Codex's own record of their threads,
+/// read off the event loop; no Codex is asked. It shows at the next flush.
+fn read_unread_children(s: &Arc<Session>) {
+    let unread = super::codex::unread_children(&s.core.lock());
+    if unread.is_empty() {
+        return;
+    }
+    let home = super::handoff::codex_home(&s.spec.lock().env);
+    let s = Arc::clone(s);
+    crate::rt::spawn(async move {
+        let Ok(read) = crate::rt::blocking(move || super::codex::read_rollouts(&home, unread)).await else { return };
+        let mut core = s.core.lock();
+        for (thread, records) in read {
+            super::codex::child_from_rollout(&mut core, &thread, &super::codex::rollout_turns(&records));
+        }
+    });
+}
+
+/// The agent ended: what its harness ran ended with it, and so did what kiln took back over for it
+/// (stopped with the rest). Its last state, what an ended agent shows, says so.
+fn end_tasks(core: &mut Core) {
+    core.end_harness_work();
+    for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+        t.status = "stopped".to_owned();
+        t.ended.get_or_insert_with(Core::now);
+    }
+    core.touch_state();
+}
+
 /// Whether a turn is under way once a session's status is `status`: one starts it, its end ends it,
 /// and the harness ending or starting again leaves it as it was (a turn cut short stays open).
 pub fn turn_open(status: Status, was: bool) -> bool {
@@ -1382,6 +1412,8 @@ fn settled_core(core: &Core) -> bool {
 fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<Switch> {
     let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
     let installed = target.is_some_and(Kind::available);
+    // Its spec before its core: never the one lock inside the other.
+    let allow_bypass = s.spec.lock().allow_bypass;
     let mut core = s.core.lock();
     let Some(target) = target else {
         core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("A conversation can't be carried from {} to {to}.", from.name) });
@@ -1392,7 +1424,9 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
         return None;
     }
     core.hold = true;
-    core.state.switching = Some(super::model::Switching { kind: target.id.to_owned(), model: model.clone() });
+    // What it will run with there, shown while the switch waits.
+    let (mode, effort, modes, efforts) = carried_choices(from, target, &core.state.mode, &core.state.effort, allow_bypass, &model);
+    core.state.switching = Some(super::model::Switching { kind: target.id.to_owned(), model: model.clone(), mode, effort, modes, efforts });
     core.touch_state();
     if !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited) {
         let text = format!("Switching to {} ({}) when this turn ends — the conversation carries over", model_label(target, &model), target.name);
@@ -1459,16 +1493,7 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
     let Some(mut conv) = read else { return Err(format!("kiln could not read {}'s record of this conversation", from.name)) };
     let dropped = handoff::fit(&mut conv, CARRY_MAX);
     let empty = conv.entries.is_empty() && conv.summary.is_none();
-    // The same latitude (never more) and the nearest effort the new model takes.
-    let offered: Vec<String> = to.modes().0.into_iter().filter(|m| !m.dangerous || allow_bypass).map(|m| m.id).collect();
-    let mode = handoff::mode_for(from.id, mode, to.id, &offered);
-    let levels: Vec<String> = super::kinds::models_of(to.id)
-        .into_iter()
-        .find(|m| m.id == model)
-        .map(|m| m.efforts)
-        .filter(|e| !e.is_empty())
-        .unwrap_or_else(|| to.efforts().into_iter().map(|e| e.id).collect());
-    let effort = handoff::effort_for(effort, &levels);
+    let (mode, effort) = carried_settings(from, to, mode, effort, allow_bypass, model);
     let mut note = handoff::note(from.name, old_model, to.name, &conv.todos, dropped);
     if let Some(more) = more {
         note.push(' ');
@@ -1485,6 +1510,30 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
         Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => Record::Nothing,
     };
     Ok(Carried { record, mode, effort, dropped, empty })
+}
+
+/// The permission mode and effort a session goes on with in harness `to`, carried from `from`: the
+/// same latitude (never more; a mode that asks nothing only where `allow_bypass`) and the nearest
+/// effort `model` takes there. With `to`'s choices of each, for a page to say them by their names.
+fn carried_settings(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypass: bool, model: &str) -> (Option<String>, Option<String>) {
+    let (mode, effort, _, _) = carried_choices(from, to, mode, effort, allow_bypass, model);
+    (mode, effort)
+}
+
+fn carried_choices(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypass: bool, model: &str) -> (Option<String>, Option<String>, Vec<super::model::ModeOption>, Vec<super::model::ControlOption>) {
+    use super::handoff;
+    let modes: Vec<super::model::ModeOption> = to.modes().0.into_iter().filter(|m| !m.dangerous || allow_bypass).collect();
+    let offered: Vec<String> = modes.iter().map(|m| m.id.clone()).collect();
+    let mode = handoff::mode_for(from.id, mode, to.id, &offered);
+    let efforts: Vec<super::model::ControlOption> = super::kinds::models_of(to.id)
+        .into_iter()
+        .find(|m| m.id == model)
+        .map(|m| m.efforts)
+        .filter(|e| !e.is_empty())
+        .map(|levels| levels.iter().map(|e| super::model::ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect())
+        .unwrap_or_else(|| to.efforts());
+    let levels: Vec<String> = efforts.iter().map(|e| e.id.clone()).collect();
+    (mode, handoff::effort_for(effort, &levels), modes, efforts)
 }
 
 /// The session's state for the harness it goes on in (`session`: its conversation's id there):
@@ -2316,8 +2365,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 *s.pid.lock() = Some(p.pid);
                 if adopted {
                     let mut core = s.core.lock();
+                    // An older image may have left what the harness before a switch ran looking live.
+                    core.settle_foreign();
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
+                    }
+                    drop(core);
+                    if kind.protocol != super::kinds::Protocol::CodexAppServer {
+                        read_unread_children(&s);
                     }
                 } else {
                     let mut core = s.core.lock();
@@ -2330,6 +2385,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
+                    }
+                    drop(core);
+                    if kind.protocol != super::kinds::Protocol::CodexAppServer {
+                        read_unread_children(&s);
                     }
                 }
                 on_change();
@@ -2605,6 +2664,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
                                 (files.release)(&s.id);
                             } else {
+                                // Its last state, what an ended agent shows, says all of it stopped
+                                // (the harness's own word on it was never read).
+                                {
+                                    let mut core = s.core.lock();
+                                    adapter.exited(&mut core, None, None);
+                                    end_tasks(&mut core);
+                                }
+                                let _ = flush(&s, &sink, None).await;
                                 let _ = sink.send((s.id.clone(), Update::Closed)).await;
                             }
                             on_change();
@@ -2825,6 +2892,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
                         (files.release)(&s.id);
                     } else {
+                        end_tasks(&mut s.core.lock());
+                        let _ = flush(&s, &sink, None).await;
                         let _ = sink.send((s.id.clone(), Update::Closed)).await;
                     }
                     on_change();
@@ -2844,6 +2913,31 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
 
 #[cfg(test)]
 mod tests {
+
+    /// A switch carries the same latitude (never more) and the nearest effort the new model takes,
+    /// named by the new harness's own choices: what its page shows while the switch waits, rather
+    /// than the old harness's (Opus shown with Codex's Full access, an empty effort, Codex's limit).
+    #[test]
+    fn a_switch_carries_the_same_latitude_and_the_nearest_effort_named_by_the_new_harness() -> anyhow::Result<()> {
+        use super::{Kind, carried_choices};
+        let codex = Kind::get("codex").ok_or_else(|| anyhow::anyhow!("no codex"))?;
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+        let (mode, effort, modes, efforts) = carried_choices(codex, claude, "full-access", "ultra", true, "opus");
+        // Claude offers asking nothing only where Claude Code allows it (not as root outside a
+        // sandbox, as CI's containers run): else the most it may.
+        let top = if modes.iter().any(|m| m.id == "bypassPermissions") { "bypassPermissions" } else { "auto" };
+        assert_eq!((mode.as_deref(), effort.as_deref()), (Some(top), Some("max")));
+        assert!(modes.iter().all(|m| m.id != "bypassPermissions" || m.label == "Bypass"), "{modes:?}");
+        assert!(efforts.iter().any(|e| e.id == "max"), "{efforts:?}");
+        // Without leave to ask nothing: the most it may. Codex's auto: Claude's accept-edits.
+        assert_eq!(carried_choices(codex, claude, "full-access", "", false, "opus").0.as_deref(), Some("auto"));
+        assert_eq!(carried_choices(codex, claude, "auto", "high", true, "sonnet").0.as_deref(), Some("acceptEdits"));
+        // And back: Claude's max is the highest Codex's model takes.
+        let (_, effort, _, efforts) = carried_choices(claude, codex, "acceptEdits", "max", true, "gpt-6.1-sol");
+        let top = ["max", "xhigh", "high"].into_iter().find(|l| efforts.iter().any(|e| e.id == *l));
+        assert_eq!(effort.as_deref(), top, "{efforts:?}");
+        Ok(())
+    }
 
     #[test]
     fn a_turn_stays_open_until_it_ends_not_when_its_harness_does() {
@@ -2869,6 +2963,77 @@ mod tests {
         assert_eq!(super::resolve_cwd(Some("/srv/repo")), "/srv/repo");
     }
     use super::*;
+
+    /// A session that went on in Claude Code with a Codex subagent kiln never read: its work comes
+    /// from Codex's own record of its thread, off the event loop, into the running session.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_child_never_read_is_read_from_its_rollout_in_the_harness_after_a_switch() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let quiet = dir.path().join("quiet-claude");
+            std::fs::write(&quiet, "#!/bin/sh\nexec sleep 30\n")?;
+            std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755))?;
+            let thread = "01a15b9d-5652-7722-8f9b-c750ebfe6940";
+            let day = dir.path().join("codex/sessions/2026/10/20");
+            std::fs::create_dir_all(&day)?;
+            let ev = |payload: serde_json::Value| serde_json::json!({"type": "event_msg", "payload": payload}).to_string();
+            let rollout = [
+                serde_json::json!({"type": "session_meta", "payload": {"id": thread}}).to_string(),
+                ev(serde_json::json!({"type": "task_started", "turn_id": "own", "turn_attribution": {"initiating_agent_path": "/root"}, "started_at": 100})),
+                ev(serde_json::json!({"type": "item_completed", "turn_id": "own", "item": {"type": "AgentMessage", "id": "msg_answer", "content": [{"type": "Text", "text": "Fits."}]}})),
+                ev(serde_json::json!({"type": "task_complete", "turn_id": "own", "completed_at": 103, "duration_ms": 3000})),
+            ];
+            std::fs::write(day.join(format!("rollout-2026-10-20T16-20-00-{thread}.jsonl")), rollout.join("\n"))?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = super::super::host::Host::new(tx, None, super::super::host::Limits::default());
+            let home = dir.path().join("codex").to_string_lossy().into_owned();
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(quiet.to_string_lossy().into_owned()),
+                env: vec![("CODEX_HOME".into(), home)],
+                ..Spec::default()
+            };
+            let s = host.open(Some("switched".into()), spec)?;
+            let started = crate::rt::timeout(Duration::from_secs(10), async {
+                while s.core.lock().meta.features.is_empty() {
+                    crate::rt::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(started.is_ok(), "the harness never started");
+            s.core.lock().state.tasks.push(Task { id: thread.into(), tool_id: Some("call_spawn".into()), class: Some("agent".into()), status: "completed".into(), ..Task::default() });
+            read_unread_children(&s);
+            let read = crate::rt::timeout(Duration::from_secs(10), async {
+                while s.core.lock().get(&format!("child:{thread}:msg_answer")).is_none() {
+                    crate::rt::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(read.is_ok(), "its work never came");
+            let core = s.core.lock();
+            assert_eq!(core.get(&format!("child:{thread}:msg_answer")).and_then(|e| e.parent.clone()).as_deref(), Some("call_spawn"));
+            assert_eq!(core.state.tasks.iter().find(|t| t.id == thread).and_then(|t| t.summary.clone()).as_deref(), Some("Fits."));
+            drop(core);
+            host.close("switched");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_ended_agent_shows_nothing_still_running() {
+        let row = |id: &str, status: &str| Task { id: id.into(), tool_id: Some(format!("call-{id}")), class: Some("shell".into()), status: status.into(), ..Task::default() };
+        let mut core = Core::new();
+        core.state.tasks = vec![row("terminal-dev", "running"), row("left-4242", "running"), Task { ended: Some(7), ..row("terminal-done", "completed") }];
+        core.upsert("call-terminal-dev", None, super::super::model::Body::Assistant { text: "Serving".into(), streaming: true });
+        end_tasks(&mut core);
+        assert_eq!(core.state.tasks.iter().map(|t| (t.status.as_str(), t.ended.is_some())).collect::<Vec<_>>(), [("stopped", true), ("stopped", true), ("completed", true)]);
+        assert_eq!(core.state.tasks.last().and_then(|t| t.ended), Some(7));
+        assert!(core.get("call-terminal-dev").is_some_and(|e| matches!(&e.body, super::super::model::Body::Assistant { streaming: false, .. })));
+        assert!(core.take_out().iter().any(|u| matches!(u, Update::State { state } if state.tasks.iter().all(|t| !t.live()))));
+    }
 
     #[test]
     fn info_lists_native_subagents_and_keeps_their_finished_work() -> anyhow::Result<()> {

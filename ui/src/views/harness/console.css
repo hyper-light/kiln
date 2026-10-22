@@ -70,12 +70,10 @@
   justify-content: center;
   gap: 14px;
 }
-.ag-loading .sg-trace {
-  width: 44px;
-  height: 44px;
-}
-.ag-loading .sg-trace path {
-  stroke-width: 1.1;
+/* Its words carry the prism's sweep, as the thinking line's do (one on the page). */
+.ag-loading .sg-label[data-live="true"] {
+  background-size: 250% 100%;
+  animation: sg-prism-current 6s ease-in-out infinite alternate;
 }
 :root[data-motion="paused"] .ag-ready {
   animation: none;
@@ -772,9 +770,6 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   height: 1px;
   background: linear-gradient(90deg, transparent, #a7aed070, #b9a6c560, transparent);
   content: "";
-}
-.hx-turn .hx-prompt[data-origin]:not([data-origin="human"]) {
-  background: #0d0d10;
 }
 .hx-turn .hx-prompt-text {
   font-size: 15px;

@@ -14,7 +14,7 @@ import { SelectField } from "@/components/ui/misc";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Live } from "./live";
-import type { LiveStream } from "./live-of";
+import { typedUrl, type LiveStream } from "./live-of";
 import "./live.css";
 
 type Profile = "conversation" | "clean" | "personal";
@@ -66,16 +66,10 @@ function programOf(command: string): string {
   return program;
 }
 
-/** A typed address, as one: a scheme when it has none (`localhost:3000` is http). */
-function urlOf(typed: string): string {
-  const t = typed.trim();
-  return /^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? t : `http://${t}`;
-}
-
 /** A typed address on the agent's machine itself (`localhost:3000/x`): its port and page. */
 function localOf(typed: string): { port: number; path: string } | undefined {
   try {
-    const u = new URL(urlOf(typed));
+    const u = new URL(typedUrl(typed));
     if (!["localhost", "127.0.0.1", "[::1]"].includes(u.hostname) || !u.port) return undefined;
     return { port: Number(u.port), path: `${u.pathname}${u.search}` };
   } catch {
@@ -142,6 +136,10 @@ function Pages({ session }: { session: string }) {
   // What WebKit is there: an iPhone or iPad a Mac's iOS Simulator (the real Mobile Safari), else
   // Safari's own window on that Mac, or WebKitGTK elsewhere.
   const mac = look.data.look.platform === "macos";
+  // A profile of your own is yours alone: signed in as yourself (the server says when not).
+  const personal = look.data.look.personal ?? { ok: true };
+  const profiles = PROFILES.map((p) => (p.value === "personal" && !personal.ok ? { ...p, label: "Your own (sign in as yourself)", disabled: true } : p));
+  const profileNow: Profile = profile === "personal" && !personal.ok ? "conversation" : profile;
   const ios = (look.data.look.devices ?? []).some((d) => d.name === layout && d.mobile && /iPhone|iPad/.test(d.agent ?? ""));
   const webkitSays =
     runIn !== "webkit"
@@ -160,7 +158,7 @@ function Pages({ session }: { session: string }) {
 
   const open = async () => {
     const starting = chosen === "app";
-    const url = port ? addressOf(port) : urlOf(address);
+    const url = port ? addressOf(port) : typedUrl(address);
     if (!starting && !port && !address.trim()) {
       setError("Which address? Type one, like localhost:3000.");
       return;
@@ -168,7 +166,7 @@ function Pages({ session }: { session: string }) {
     setBusy(starting ? "start" : "open");
     setError(null);
     try {
-      const v = await harnessApi.openStream(session, { ...(starting ? { start: true } : { url }), profile, engine: runIn === "chromium" ? undefined : runIn, device: layout || undefined, title: starting ? "The app" : port ? `localhost:${port.port}` : undefined });
+      const v = await harnessApi.openStream(session, { ...(starting ? { start: true } : { url }), profile: profileNow, engine: runIn === "chromium" ? undefined : runIn, device: layout || undefined, title: starting ? "The app" : port ? `localhost:${port.port}` : undefined });
       setHere((h) => [v, ...h]);
       setOpened(v.id);
       listed.setData((l) => [v, ...l.filter((x) => x.id !== v.id)]);
@@ -289,15 +287,16 @@ function Pages({ session }: { session: string }) {
         )}
         <SelectField label="Engine" value={runIn} onChange={setEngine} options={engines} className="lp-half" />
         <SelectField label="Device" value={layout} onChange={setLayout} options={devices} className="lp-half" />
-        <SelectField label="Browser profile" value={profile} onChange={(v) => setProfile(v as Profile)} options={PROFILES} className="lp-profile" />
+        <SelectField label="Browser profile" value={profileNow} onChange={(v) => setProfile(v as Profile)} options={profiles} className="lp-profile" />
         <Button size="sm" type="submit" className="lp-go" disabled={busy !== ""}>
           {busy === "start" ? "Starting the app" : busy === "open" ? "Opening" : chosen === "app" ? "Start and open" : "Open"}
         </Button>
       </form>
       <p className="field-hint lp-says">
-        {PROFILE_SAYS[profile]} {webkitSays}
+        {PROFILE_SAYS[profileNow]} {webkitSays}
         {runIn !== "chromium" ? " It streams without sound." : ""}
       </p>
+      {!personal.ok && personal.why && <p className="field-hint lp-says">{personal.why}</p>}
       <div className="lp-device">
         <span className="lp-device-what">On your device</span>
         <Button size="sm" variant="secondary" disabled={!device || deviceBusy} onClick={() => void onDevice("here")}>

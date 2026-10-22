@@ -1,6 +1,6 @@
 /**
- * What waits on you, wherever you are in kiln: each agent's oldest request as a card at the top of
- * the window (kiln's passing words keep the bottom), answered right there: allow or deny a tool
+ * What waits on you, wherever you are in kiln: each agent's oldest request in the bottom toast
+ * stack, above any passing notifications, answered right there: allow or deny a tool
  * call, or open the agent to answer its question or review its plan. Not on Mission control, nor on
  * the page of the agent that asks: those show its requests themselves. × (or a swipe, on a touch
  * screen) puts one away until that agent asks for something else.
