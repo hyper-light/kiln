@@ -283,7 +283,7 @@ are still to come in Shards. Until then New agents shows Shards with why it isn'
 
 ## C: From changes to landed
 
-**C1 Into review.** **Open change request** in an agent's Changes (or the agent itself, through
+**C1 Into review.** **Open PR** in an agent's Changes (or the agent itself, through
 `agents.change`): its work, from its volume or folder, committed on `agents/<name>` and pushed to
 kiln's git as a change request (W14-R04). The author is `agent:<id>`, on behalf of its person.
 For a repository whose provider is elsewhere (GitHub, GitLab, Bitbucket), a branch pushed there
@@ -295,7 +295,7 @@ run's steps go up as a stack, one diff per step (P4).
 
 **C2 CI comes back to the agent.** The checks on its change show in its Changes; a failure goes to
 the agent as a message with the failure excerpt (W20-R10's bundle) when its person allows it
-("Fix failing checks by itself").
+(**Auto-Fix**).
 
 **C3 Review comes back to the agent.** A comment on its change goes to it as a queued message with
 the file, the lines, the version and a link; it answers, amends and pushes a new version

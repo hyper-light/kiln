@@ -62,6 +62,11 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Its process group with it: what it started (its UI server) is never left running.
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -150,6 +155,8 @@ enabled = true
     for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG"] {
         cmd.env_remove(var);
     }
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let child = cmd.spawn()?;
     let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf() };
     let deadline = Instant::now() + Duration::from_secs(60);

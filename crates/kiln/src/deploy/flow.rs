@@ -15,12 +15,12 @@ use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{appset, argocd, git, github};
+use super::{appset, argocd, git, remote};
 use super::host::{Author, Change, CommitError};
 use super::kilncd;
 use super::provider::{Landed, Undelivered};
 use super::gates::{self, Verdict};
-use super::model::{App, Approval, Artifact, Concurrency, Contacts, Environment, GITHUB_HOST, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template, Via};
+use super::model::{App, Approval, Artifact, Concurrency, Contacts, Environment, GITHUB_HOST, GITLAB_HOST, KILN_HOST, KILNCD, Kind, Origin, Package, Registration, Release, ReleaseFile, State, Template, Via};
 use super::{Deploy, repo, store};
 
 /// An error and the status that says what went wrong.
@@ -74,8 +74,8 @@ pub(super) fn emit_release(d: &Deploy, r: &Release) {
     }
     d.hub.emit(&e);
     d.changes.send(r.id);
-    // GitHub's deployment of its commit, where the release repository is GitHub's (§7).
-    github::report(d, r);
+    // The host's deployment of its commit, where the release repository is GitHub's or GitLab's (§7).
+    remote::report(d, r);
     // Chat, paging and webhooks: the server's rules, and the app's own channels.
     let event = match r.state {
         State::WaitingApproval => Some("release.waiting_approval"),
@@ -208,22 +208,20 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
     }
     match e.release_repo.host.as_str() {
         KILN_HOST => {}
-        GITHUB_HOST => {
-            github::name_ok(&e.release_repo.repo).map_err(bad)?;
-            if crate::githost::github::app(&d.hub).await.is_none() {
-                return Err(bad("a release repository on GitHub is written through kiln's GitHub App, and kiln has none: make one in Settings (GitHub), or give `[ci.github]` its id and key"));
-            }
+        // GitHub through kiln's App, a GitLab with its token: one reaches it, or it's refused.
+        GITHUB_HOST | GITLAB_HOST => {
+            remote::open(d, &e.release_repo).await.map_err(bad)?;
         }
-        other => return Err(bad(format!("{other}: a release repository is on kiln's own git server (`kiln`) or on GitHub (`github`); GitLab and Bitbucket come later"))),
+        other => return Err(bad(format!("{other}: a release repository is on kiln's own git server (`kiln`), on GitHub (`github`) or on a GitLab (`gitlab`); Bitbucket comes later"))),
     }
     // The merge of a pull request is its approval (docs/deploy-api.md §9.1), and only a host with
     // pull requests has one.
     if e.gates.via == Via::PullRequest {
-        if e.release_repo.host != GITHUB_HOST {
-            return Err(bad("gates.via: pull-request: releases as pull requests need a release repository on GitHub (host: github)"));
+        if !matches!(e.release_repo.host.as_str(), GITHUB_HOST | GITLAB_HOST) {
+            return Err(bad("gates.via: pull-request: releases as pull requests need a release repository on GitHub (host: github) or GitLab (host: gitlab)"));
         }
         if e.gates.approvals.is_some() {
-            return Err(bad("gates.via: pull-request: the merge of a release's pull request is its approval; leave out gates.approvals (who may merge is the branch's protection on GitHub)"));
+            return Err(bad("gates.via: pull-request: the merge of a release's pull request is its approval; leave out gates.approvals (who may merge is the branch's protection on the host)"));
         }
     }
     let branch = &e.release_repo.branch;
@@ -300,8 +298,8 @@ pub async fn put_environment(d: &Deploy, who: &Who, e: Environment) -> Result<En
 /// to readers with a token, its review rules hold, and people change it in diffs as any
 /// repository's; on GitHub, the repository, made through kiln's GitHub App if it isn't there.
 pub async fn ensure_release_repo(d: &Deploy, rr: &super::model::RepoRef) -> Result<(), String> {
-    if rr.host == GITHUB_HOST {
-        return github::ensure(d, rr).await;
+    if matches!(rr.host.as_str(), GITHUB_HOST | GITLAB_HOST) {
+        return remote::ensure(d, rr).await;
     }
     if crate::ci::hosting::path_of(&d.hub, &rr.repo).is_none() {
         return Err(format!("{}: a release repository on kiln's git server is `owner/name`, of letters, digits, '-', '_' and '.'", rr.repo));
@@ -1303,9 +1301,9 @@ pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
         }
         if now - last_readers >= READERS_SECS {
             last_readers = now;
-            github::refresh_readers(d).await;
+            remote::refresh_readers(d).await;
         }
-        if now - last_scan >= SCAN_SECS || d.github.take_scan() {
+        if now - last_scan >= SCAN_SECS || d.remote.take_scan() {
             last_scan = now;
             if let Err(e) = scan_git(d).await {
                 tracing::warn!(error = %format!("{e:#}"), "deploy: release repositories can't be scanned");
@@ -1394,10 +1392,9 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 store::schedule(st, id, now + PROPOSAL_LOOK).await?;
             }
             // The merge is its approval (§9.1), and its commit.
-            Ok(Committed::Merged { commit, by, secrets, irreversible }) => {
-                let number = r.provider.pointer("/pull_request/number").and_then(Value::as_u64).unwrap_or(0);
+            Ok(Committed::Merged { commit, by, merged, secrets, irreversible }) => {
                 if let Some(by) = by {
-                    r.approvals.push(Approval { by: format!("{by} on GitHub"), at: now, approved: true, note: Some(format!("merged pull request #{number}")) });
+                    r.approvals.push(Approval { by, at: now, approved: true, note: Some(merged) });
                 }
                 committed(d, r, commit, secrets, irreversible, now).await?;
             }
@@ -1594,30 +1591,31 @@ async fn withdraw(d: &Deploy, r: &mut Release) -> String {
     };
     let env = match store::environment(&d.hub.store, &r.environment).await {
         Ok(Some(e)) => e,
-        _ => return format!("its environment is gone: close pull request #{number} on GitHub"),
+        _ => return format!("its environment is gone: close its pull request ({number}) on its host"),
     };
+    let (it, on) = (remote::change_name(&env.release_repo.host, number), remote::host_label(&env.release_repo.host));
     let at = match git::open(d, &env.release_repo).await {
         Ok(at) => at,
-        Err(e) => return format!("its pull request #{number} couldn't be closed ({e}): close it on GitHub"),
+        Err(e) => return format!("its {it} couldn't be closed ({e}): close it on {on}"),
     };
-    let Some(gh) = at.github() else { return format!("its release repository isn't on GitHub any more: close pull request #{number} there") };
+    let Some(gh) = at.remote() else { return format!("its release repository isn't where its {it} is any more: close it there") };
     let why = r.message.clone().unwrap_or_else(|| "cancelled".to_owned());
     match gh.proposal(number).await {
-        Ok(crate::githost::ChangeState::Open) => match gh.withdraw(number, &branch, &format!("kiln's release {} is {why}: this pull request goes with it.", r.id)).await {
-            Ok(()) => format!("its pull request #{number} is closed"),
-            Err(e) => format!("its pull request #{number} couldn't be closed ({e:#}): close it on GitHub"),
+        Ok(crate::githost::ChangeState::Open) => match gh.withdraw(number, &branch, &format!("kiln's release {} is {why}: this {} goes with it.", r.id, if env.release_repo.host == GITLAB_HOST { "merge request" } else { "pull request" })).await {
+            Ok(()) => format!("its {it} is closed"),
+            Err(e) => format!("its {it} couldn't be closed ({e:#}): close it on {on}"),
         },
         Ok(crate::githost::ChangeState::Merged { commit: Some(sha), .. }) => {
             gh.drop_branch(&branch).await;
             r.commit = Some(sha);
-            format!("its pull request #{number} was merged meanwhile; {}", undo(d, r, &format!("{why} (release {} was proposed)", r.id)).await)
+            format!("its {it} was merged meanwhile; {}", undo(d, r, &format!("{why} (release {} was proposed)", r.id)).await)
         }
-        Ok(crate::githost::ChangeState::Merged { commit: None, .. }) => format!("its pull request #{number} was merged meanwhile, into a commit GitHub hasn't said: roll back to undo it"),
+        Ok(crate::githost::ChangeState::Merged { commit: None, .. }) => format!("its {it} was merged meanwhile, into a commit {on} hasn't said: roll back to undo it"),
         Ok(crate::githost::ChangeState::Closed) => {
             gh.drop_branch(&branch).await;
-            format!("its pull request #{number} was closed already")
+            format!("its {it} was closed already")
         }
-        Err(e) => format!("its pull request #{number} couldn't be looked at ({e:#}): close it on GitHub"),
+        Err(e) => format!("its {it} couldn't be looked at ({e:#}): close it on {on}"),
     }
 }
 
@@ -1633,16 +1631,17 @@ enum Committed {
     Proposed(Value, String),
     /// Its pull request is open: what it waits for.
     Waiting(String),
-    /// Its pull request merged: the merge, who merged it, and what it was proposed with (its
-    /// secrets' changes, what it runs that a revert couldn't undo).
-    Merged { commit: String, by: Option<String>, secrets: Option<String>, irreversible: Option<String> },
+    /// Its pull request merged: the merge, who merged it (`ada on GitHub`), what that was (`merged
+    /// pull request #3`), and what it was proposed with (its secrets' changes, what it runs that a
+    /// revert couldn't undo).
+    Merged { commit: String, by: Option<String>, merged: String, secrets: Option<String>, irreversible: Option<String> },
     /// Its pull request closed unmerged: why it's cancelled.
     Closed(String),
 }
 
-/// What a release proposed as a pull request waits for.
-fn waits_for(number: u64, url: &str) -> String {
-    format!("waits for its pull request #{number} to be merged: {url}")
+/// What a release proposed as a pull request waits for (`kind`: its release repository's host).
+fn waits_for(kind: &str, number: u64, url: &str) -> String {
+    format!("waits for its {} to be merged: {url}", remote::change_name(kind, number))
 }
 
 /// Commits a release to its environment's release repository, once its preflight finds nothing
@@ -1703,10 +1702,10 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
         changes.push(Change { path: values_path, content: Some(v.clone().into_bytes()) });
     }
     if env.gates.via == Via::PullRequest {
-        let gh = at.github().ok_or("gates.via: pull-request needs a release repository on GitHub")?;
-        let p = gh.propose(&github::proposal_branch(r), changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
+        let gh = at.remote().ok_or("gates.via: pull-request needs a release repository on GitHub or GitLab")?;
+        let p = gh.propose(&remote::proposal_branch(r), changes, repo::message(&a, &env.name, r), author(&r.requested_by), &proposal_body(d, r, &env)).await.map_err(e)?;
         let kept = json!({ "number": p.number, "url": p.url, "branch": p.branch, "secrets": changed, "irreversible": found.irreversible });
-        return Ok(Committed::Proposed(kept, waits_for(p.number, &p.url)));
+        return Ok(Committed::Proposed(kept, waits_for(&rr.host, p.number, &p.url)));
     }
     let sha = commit_files(d, &env, changes, repo::message(&a, &env.name, r), &r.requested_by).await?;
     Ok(Committed::Done(sha, Some(changed), found.irreversible))
@@ -1715,20 +1714,22 @@ async fn commit_release(d: &Deploy, r: &Release) -> Result<Committed, String> {
 /// Where a release proposed as a pull request is: merged, its merge is its commit; closed
 /// unmerged, it's cancelled; open, it waits. A merged or closed one's branch goes.
 async fn proposed(at: &git::Repo, pr: &Value) -> Result<Committed, String> {
-    let gh = at.github().ok_or("its pull request is on GitHub, and its release repository isn't any more")?;
+    let gh = at.remote().ok_or("its pull request is on another host, and its release repository isn't any more")?;
     let number = pr.get("number").and_then(Value::as_u64).ok_or("its pull request has no number")?;
     let (url, branch) = (pr.get("url").and_then(Value::as_str).unwrap_or_default(), pr.get("branch").and_then(Value::as_str).unwrap_or_default());
     let text = |key: &str| pr.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (kind, on) = (gh.host.kind(), gh.host.label());
+    let it = remote::change_name(kind, number);
     match gh.proposal(number).await.map_err(|e| format!("{e:#}"))? {
-        crate::githost::ChangeState::Open => Ok(Committed::Waiting(waits_for(number, url))),
+        crate::githost::ChangeState::Open => Ok(Committed::Waiting(waits_for(kind, number, url))),
         crate::githost::ChangeState::Merged { commit: Some(commit), by } => {
             gh.drop_branch(branch).await;
-            Ok(Committed::Merged { commit, by, secrets: text("secrets"), irreversible: text("irreversible") })
+            Ok(Committed::Merged { commit, by: by.map(|b| format!("{b} on {on}")), merged: format!("merged {it}"), secrets: text("secrets"), irreversible: text("irreversible") })
         }
-        crate::githost::ChangeState::Merged { commit: None, .. } => Ok(Committed::Waiting(format!("its pull request #{number} is merged; GitHub hasn't said into which commit yet"))),
+        crate::githost::ChangeState::Merged { commit: None, .. } => Ok(Committed::Waiting(format!("its {it} is merged; {on} hasn't said into which commit yet"))),
         crate::githost::ChangeState::Closed => {
             gh.drop_branch(branch).await;
-            Ok(Committed::Closed(format!("its pull request #{number} was closed without merging ({url})")))
+            Ok(Committed::Closed(format!("its {it} was closed without merging ({url})")))
         }
     }
 }
@@ -2412,7 +2413,7 @@ mod tests {
                 wake: crate::rt::Notify::new(),
                 changes: crate::rt::Broadcast::new(16),
                 argo: Default::default(),
-                github: Default::default(),
+                remote: Default::default(),
                 hub: Arc::clone(&hub),
             };
             let st = &hub.store;
@@ -2461,7 +2462,7 @@ mod tests {
                 wake: crate::rt::Notify::new(),
                 changes: crate::rt::Broadcast::new(16),
                 argo: Default::default(),
-                github: Default::default(),
+                remote: Default::default(),
                 hub: Arc::clone(&hub),
             };
             let mut e = env(false);

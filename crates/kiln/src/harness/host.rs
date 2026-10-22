@@ -621,7 +621,7 @@ impl Host {
         let cut = s.cut;
         // What it started that still runs, taken back over (its stopped harness not among it).
         let mut alive = apart;
-        for r in super::survivors::alive(&s.ran) {
+        for r in super::survivors::alive(&s.ran).into_iter().filter(|r| !super::survivors::login_agent(&r.command)) {
             if !alive.iter().any(|a| a.pid == r.pid) {
                 alive.push(r);
             }
@@ -678,9 +678,19 @@ impl Host {
                 let sessions: Vec<Arc<Session>> = h.sessions.lock().values().cloned().collect();
                 let which: Vec<(String, Option<u32>)> = sessions.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect();
                 let known: Vec<super::survivors::Ran> = sessions.iter().flat_map(|s| s.ran.lock().1.clone()).collect();
-                let Ok((seen, alive)) = crate::rt::blocking(move || (super::survivors::scan(&which), super::survivors::alive(&known))).await else { continue };
-                let alive: HashMap<u32, u64> = alive.into_iter().map(|r| (r.pid, r.started)).collect();
                 let now_s = u64::try_from(clock.unix_s()).unwrap_or(0);
+                let look = move || {
+                    let seen = super::survivors::scan(&which);
+                    // Shells' ssh-agents are no session's work: stopped once old enough.
+                    let agents = super::survivors::agents_to_stop(&seen, now_s);
+                    if !agents.is_empty() {
+                        tracing::info!(count = agents.len(), "stopping the ssh-agents shells' startup files left in agents' sessions");
+                        super::survivors::stop(&agents);
+                    }
+                    (seen, super::survivors::alive(&known))
+                };
+                let Ok((seen, alive)) = crate::rt::blocking(look).await else { continue };
+                let alive: HashMap<u32, u64> = alive.into_iter().map(|r| (r.pid, r.started)).collect();
                 let mut changed = false;
                 for s in &sessions {
                     if h.note(s, seen.get(&s.id).cloned().unwrap_or_default(), &alive, now_s) {
@@ -705,7 +715,7 @@ impl Host {
         let under: std::collections::HashSet<u32> = seen.under.iter().map(|r| r.pid).collect();
         let mut apart = seen.apart;
         // As recorded, still running, neither under it nor marked (it cleared its environment).
-        for r in ran.1.iter().filter(|r| !under.contains(&r.pid) && still(r)) {
+        for r in ran.1.iter().filter(|r| !under.contains(&r.pid) && still(r) && !super::survivors::login_agent(&r.command)) {
             if !apart.iter().any(|a| a.pid == r.pid) {
                 apart.push(r.clone());
             }

@@ -10,6 +10,7 @@ pub mod github;
 pub mod gitlab;
 pub mod hooks;
 pub mod pulls;
+pub mod statuses;
 pub mod web;
 
 use std::sync::Arc;
