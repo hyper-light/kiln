@@ -451,8 +451,8 @@ clause!(c28, f, b, {
 
 clause!(c29, f, b, {
     put(b, "a", b"alpha").await?;
-    not_found("a with a trailing space", b.head("a ").await)?;
-    not_found("a with a leading space", b.head(" a").await)
+    not_found("a with a leading space", b.head(" a").await)?;
+    invalid("a with a trailing space", b.head("a ").await)
 });
 
 clause!(c30, f, b, {
@@ -1614,7 +1614,7 @@ pub fn cases<F: BlobsFixture>() -> Vec<Case<F>> {
         Case { id: "BLOBS-26", says: "a key's bytes are counted, not its characters: 960 bytes, most of them two-byte characters, are taken, one byte more refused Invalid", check: c26::<F> },
         Case { id: "BLOBS-27", says: "every request that names a key refuses a bad one Invalid: get, head, delete, start_upload and presign as put does", check: c27::<F> },
         Case { id: "BLOBS-28", says: "a key refused stores nothing: nothing is listed after", check: c28::<F> },
-        Case { id: "BLOBS-29", says: "keys are exact: \"a \" and \" a\" aren't \"a\"", check: c29::<F> },
+        Case { id: "BLOBS-29", says: "keys are exact: \" a\" isn't \"a\", and \"a \" is no key at all (a segment doesn't end in a space)", check: c29::<F> },
         Case { id: "BLOBS-30", says: "objects are apart: a put to one key changes no other, however alike their keys ('a', 'a/b', 'ab', 'a b')", check: c30::<F> },
         Case { id: "BLOBS-31", says: "an empty object is kept: its size is 0, its etag the SHA-256 of nothing, and a get gives no bytes", check: c31::<F> },
         Case { id: "BLOBS-32", says: "every byte value round-trips: 0 to 255 and back down are got back exactly", check: c32::<F> },

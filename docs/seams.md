@@ -184,7 +184,7 @@ Methods: `put`, `get`, `head`, `delete`, `list`, `start_upload`, `upload_part`, 
 - **BLOBS-26** a key's bytes are counted, not its characters: 960 bytes, most of them two-byte characters, are taken, one byte more refused Invalid
 - **BLOBS-27** every request that names a key refuses a bad one Invalid: get, head, delete, start_upload and presign as put does
 - **BLOBS-28** a key refused stores nothing: nothing is listed after
-- **BLOBS-29** keys are exact: "a " and " a" aren't "a"
+- **BLOBS-29** keys are exact: " a" isn't "a", and "a " is no key at all (a segment doesn't end in a space)
 - **BLOBS-30** objects are apart: a put to one key changes no other, however alike their keys ('a', 'a/b', 'ab', 'a b')
 - **BLOBS-31** an empty object is kept: its size is 0, its etag the SHA-256 of nothing, and a get gives no bytes
 - **BLOBS-32** every byte value round-trips: 0 to 255 and back down are got back exactly

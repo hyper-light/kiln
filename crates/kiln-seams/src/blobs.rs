@@ -744,10 +744,10 @@ mod tests {
     /// takes, every store takes.
     #[test]
     fn keys_ranges_and_lifetimes_are_checked_alike() {
-        for good in ["a", "a/b", "ü/日本/😀.txt", "q?x=1&y=2", "a.b/..c/...", "k".repeat(255).as_str()] {
+        for good in ["a", "a/b", " a", "a b/c", "ü/日本/😀.txt", "q?x=1&y=2", "a.b/..c/...", "k".repeat(254).as_str()] {
             assert_eq!(check_key(good), Ok(()), "{good:?}");
         }
-        for bad in ["", "/a", "a/", "a//b", ".", "a/../b", "a\\b", "a\0b", "tab\there", "del\u{7f}", "c1\u{85}", "k".repeat(256).as_str(), vec!["k".repeat(200); 5].join("/").as_str()] {
+        for bad in ["", "/a", "a/", "a//b", ".", "a/../b", "a\\b", "a\0b", "tab\there", "del\u{7f}", "c1\u{85}", "a ", "a /b", " ", "k".repeat(255).as_str(), vec!["k".repeat(200); 5].join("/").as_str()] {
             assert!(matches!(check_key(bad), Err(Refusal::Invalid { .. })), "{bad:?}");
         }
         assert_eq!(byte_range(Range { start: 2, end: Some(100) }, 10), Ok((2, 9)));
