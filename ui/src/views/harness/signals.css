@@ -2,6 +2,7 @@
 
 .sg-optic,
 .sg-label,
+.sg-shimmer,
 .sg-think,
 .sg-trace,
 .sg-caret {
@@ -164,6 +165,16 @@
   to {
     transform: translateX(-60%);
   }
+}
+/* A subagent running: the same sweep through what says so (the activity line's "1 subagent" with its
+   mark, Mission Control's "Working" with its dot), drawn white on black and screened onto the page. */
+.sg-shimmer {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  color: #fff;
+  background: #000;
+  mix-blend-mode: screen;
 }
 /* The same sweep painted every frame (the conversation loader's words). */
 @keyframes sg-prism-current {
@@ -479,7 +490,8 @@
 /* Clipped-gradient text would vanish under forced colours; fall back to the system text colour. */
 @media (forced-colors: active) {
   .sg-label[data-live="true"],
-  .sg-label[data-live="true"][data-sweep] {
+  .sg-label[data-live="true"][data-sweep],
+  .sg-shimmer {
     color: CanvasText;
     background: none;
     mix-blend-mode: normal;

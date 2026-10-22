@@ -129,7 +129,7 @@ function ReleaseView({ id }: { id: number }) {
     { label: "Asked", value: <RelTime ts={r.created_at} /> },
     ...(r.committed_at ? [{ label: "Committed", value: <RelTime ts={r.committed_at} /> }] : []),
     ...(r.ended_at ? [{ label: "Ended", value: <RelTime ts={r.ended_at} /> }] : []),
-    ...(pr ? [{ label: "Pull request", value: <a href={pr.url} target="_blank" rel="noreferrer">#{pr.number}</a> }] : []),
+    ...(pr ? [{ label: pr.name.startsWith("merge") ? "Merge request" : "Pull request", value: <a href={pr.url} target="_blank" rel="noreferrer">{pr.name.replace(/^\w+ request /, "")}</a> }] : []),
     ...(r.commit ? [{ label: "Commit", value: <code title={r.commit}>{r.commit.slice(0, 12)}</code> }] : []),
     ...(r.promoted_from ? [{ label: "Promotes", value: <Link to={releaseHref(r.promoted_from)}>release {r.promoted_from}</Link> }] : []),
     ...(r.rollback_of ? [{ label: "Back to", value: <Link to={releaseHref(r.rollback_of)}>release {r.rollback_of}</Link> }] : []),
@@ -182,7 +182,7 @@ function ReleaseView({ id }: { id: number }) {
           r.state === "delivering"
             ? "It is being delivered: its commit is reverted, and its provider goes back to what ran before."
             : pr
-              ? `Its pull request #${pr.number} is closed without merging.`
+              ? `Its ${pr.name} is closed without merging.`
               : "It hasn't been committed: nothing changes."
         }
         confirmLabel="Cancel the release"

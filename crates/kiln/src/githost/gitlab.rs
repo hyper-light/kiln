@@ -4,8 +4,9 @@
 //! - **Reading and pushing**: git over HTTPS with the token (`oauth2` as git's user).
 //! - **Commits** are made here, in the repository's mirror, and pushed with a lease on the head they
 //!   were made on: GitLab's commits API builds on whatever the branch holds by then.
-//! - **Merge requests**, commit statuses, deployments, push webhooks (`X-Gitlab-Token`), and new
-//!   projects forked from a template (and unlinked from it).
+//! - **Merge requests** (opened, found by their branch, followed, closed with a note), commit
+//!   statuses, deployments, push webhooks (`X-Gitlab-Token`), new projects (empty in a group, or
+//!   forked from a template and unlinked from it), and deploy tokens that read one project.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -121,6 +122,11 @@ impl Gitlab {
         self.name_of(repo).ok_or_else(|| anyhow!("{} isn't on {}", repo.name, self.web))
     }
 
+    /// The groups its token covers (none: every project there).
+    pub fn groups(&self) -> &[String] {
+        &self.groups
+    }
+
     /// One call to GitLab's API as kiln: its status and JSON (`null` when none).
     pub async fn call(&self, method: Method, path: &str, body: Option<&Value>) -> anyhow::Result<(u16, Value)> {
         self.call_as(&self.token, method, path, body).await
@@ -191,11 +197,81 @@ impl Gitlab {
         if st != 200 {
             bail!("merge request !{number} ({st}): {}", said(&v));
         }
-        Ok(match v.get("state").and_then(Value::as_str).unwrap_or_default() {
-            "merged" => ChangeState::Merged { commit: v.get("merge_commit_sha").and_then(Value::as_str).or_else(|| v.get("squash_commit_sha").and_then(Value::as_str)).map(str::to_owned), by: v.pointer("/merged_by/username").and_then(Value::as_str).map(str::to_owned) },
-            "closed" => ChangeState::Closed,
-            _ => ChangeState::Open,
-        })
+        Ok(mr_state(&v))
+    }
+
+    /// The merge request from the branch `head` of the project, open or not, if there is one (the
+    /// newest).
+    pub async fn find_change(&self, repo: &Repo, head: &str) -> anyhow::Result<Option<(ChangeRef, ChangeState)>> {
+        let name = self.name(repo)?;
+        let (st, v) = self.call(Method::Get, &format!("/projects/{}/merge_requests?source_branch={}&state=all&per_page=5", id(&name), enc(head)), None).await?;
+        if st != 200 {
+            bail!("the merge requests from {head} ({st}): {}", said(&v));
+        }
+        let newest = v.as_array().and_then(|l| l.iter().max_by_key(|m| m.get("iid").and_then(Value::as_u64).unwrap_or(0)));
+        Ok(newest.map(|m| (ChangeRef { number: m.get("iid").and_then(Value::as_u64).unwrap_or(0), url: m.get("web_url").and_then(Value::as_str).unwrap_or_default().to_owned() }, mr_state(m))))
+    }
+
+    /// Closes merge request `number` unmerged, saying why (a note) first.
+    pub async fn close_change(&self, repo: &Repo, number: u64, why: &str) -> anyhow::Result<()> {
+        let name = self.name(repo)?;
+        if !why.is_empty() {
+            let (st, v) = self.call(Method::Post, &format!("/projects/{}/merge_requests/{number}/notes", id(&name)), Some(&json!({ "body": why }))).await?;
+            if st != 201 {
+                tracing::debug!(merge_request = number, status = st, said = %said(&v), "GitLab took no note on a merge request kiln closes");
+            }
+        }
+        let (st, v) = self.call(Method::Put, &format!("/projects/{}/merge_requests/{number}", id(&name)), Some(&json!({ "state_event": "close" }))).await?;
+        anyhow::ensure!(st == 200, "GitLab didn't close merge request !{number} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// Deletes a branch (gone already is fine).
+    pub async fn delete_branch(&self, repo: &Repo, branch: &str) -> anyhow::Result<()> {
+        let name = self.name(repo)?;
+        let (st, v) = self.call(Method::Delete, &format!("/projects/{}/repository/branches/{}", id(&name), enc(branch)), None).await?;
+        anyhow::ensure!(matches!(st, 204 | 404), "GitLab didn't delete {branch} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// The project `group/…/name` as GitLab shows it to kiln's token (`None`: there's none it sees).
+    pub async fn project(&self, name: &str) -> anyhow::Result<Option<Value>> {
+        let (st, v) = self.call(Method::Get, &format!("/projects/{}", id(name)), None).await?;
+        match st {
+            200 => Ok(Some(v)),
+            404 => Ok(None),
+            _ => bail!("GitLab didn't say whether {name} is there ({st}): {}", said(&v)),
+        }
+    }
+
+    /// Makes `group/…/name`, private and empty, in its group.
+    pub async fn create_project(&self, name: &str, description: &str) -> anyhow::Result<()> {
+        let (ns, path) = name.rsplit_once('/').ok_or_else(|| anyhow!("`{name}`: group/name"))?;
+        let (st, v) = self.call(Method::Get, &format!("/namespaces/{}", id(ns)), None).await?;
+        anyhow::ensure!(st == 200, "kiln's GitLab token reaches no group {ns} ({st}): {}", said(&v));
+        let namespace = v.get("id").and_then(Value::as_u64).ok_or_else(|| anyhow!("GitLab's group {ns} has no id"))?;
+        let body = json!({ "name": path, "path": path, "namespace_id": namespace, "visibility": "private", "description": description, "initialize_with_readme": false });
+        let (st, v) = self.call(Method::Post, "/projects", Some(&body)).await?;
+        anyhow::ensure!(st == 201, "GitLab made no project {name} ({st}): {}", said(&v));
+        Ok(())
+    }
+
+    /// A deploy token of the project `name` that reads its repository and nothing else: its id,
+    /// its username and the token (GitLab shows a token once, as it's made).
+    pub async fn deploy_token(&self, name: &str, label: &str) -> anyhow::Result<(u64, String, String)> {
+        let (st, v) = self.call(Method::Post, &format!("/projects/{}/deploy_tokens", id(name)), Some(&json!({ "name": label, "scopes": ["read_repository"] }))).await?;
+        anyhow::ensure!(st == 201, "GitLab made no deploy token for {name} ({st}): {} (it takes a Maintainer of the project)", said(&v));
+        let token_id = v.get("id").and_then(Value::as_u64).ok_or_else(|| anyhow!("GitLab's deploy token has no id"))?;
+        let user = v.get("username").and_then(Value::as_str).ok_or_else(|| anyhow!("GitLab's deploy token has no username"))?.to_owned();
+        let token = v.get("token").and_then(Value::as_str).ok_or_else(|| anyhow!("GitLab's deploy token has no token"))?.to_owned();
+        Ok((token_id, user, token))
+    }
+
+    /// A deploy token revoked (gone already is fine).
+    pub async fn revoke_deploy_token(&self, name: &str, token_id: u64) -> anyhow::Result<()> {
+        let (st, v) = self.call(Method::Delete, &format!("/projects/{}/deploy_tokens/{token_id}", id(name)), None).await?;
+        anyhow::ensure!(matches!(st, 204 | 404), "GitLab didn't revoke deploy token {token_id} ({st}): {}", said(&v));
+        Ok(())
     }
 
     /// A commit status, in GitLab's words (`pending`, `running`, `success`, `failed`, `canceled`).
@@ -263,6 +339,18 @@ impl Gitlab {
             tracing::warn!(project = name, status = st, said = %said(&v), "the new project is still linked to its template");
         }
         Ok(())
+    }
+}
+
+/// Where a merge request (GitLab's JSON for one) is.
+fn mr_state(v: &Value) -> ChangeState {
+    match v.get("state").and_then(Value::as_str).unwrap_or_default() {
+        "merged" => ChangeState::Merged {
+            commit: v.get("merge_commit_sha").and_then(Value::as_str).or_else(|| v.get("squash_commit_sha").and_then(Value::as_str)).map(str::to_owned),
+            by: v.pointer("/merge_user/username").or_else(|| v.pointer("/merged_by/username")).and_then(Value::as_str).map(str::to_owned),
+        },
+        "closed" => ChangeState::Closed,
+        _ => ChangeState::Open,
     }
 }
 

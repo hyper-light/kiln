@@ -34,6 +34,12 @@ pub async fn gitlab(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         return Err((StatusCode::UNAUTHORIZED, "bad token".into()));
     }
     let path = v.pointer("/project/path_with_namespace").and_then(Value::as_str).unwrap_or_default().to_owned();
+    // A release repository's push, or a release's merge request (docs/deploy-api.md §7).
+    if matches!(event.as_str(), "Push Hook" | "Merge Request Hook")
+        && let Some(d) = crate::deploy::get()
+    {
+        crate::deploy::remote::on_gitlab_event(&d, &event, &v).await;
+    }
     let Some(repo) = repo_named(hub, &path, |r| host.name_of(r)).await else {
         hub.gitops_kick.notify();
         return Ok(srv::status(StatusCode::ACCEPTED));

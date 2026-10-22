@@ -15,6 +15,9 @@ pub const KILN_HOST: &str = "kiln";
 /// GitHub, through kiln's GitHub App (docs/deploy-api.md §7).
 pub const GITHUB_HOST: &str = "github";
 
+/// A GitLab `[[ci.gitlab]]` names, with its token (docs/deploy-api.md §7).
+pub const GITLAB_HOST: &str = "gitlab";
+
 /// A stage apps are released to (docs/deploy-api.md §4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

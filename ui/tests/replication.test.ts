@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ConvoStatus, ConvoStore } from "../src/api/types.ts";
 import { ACTIVE_MS, plateName, stateText } from "../src/views/stores/scene.ts";
-import { healthOf, marksOf, metricsOf, periodOf, replicationScene } from "../src/views/stores/replication-scene.ts";
+import { cylinder, healthOf, marksOf, metricsOf, paceOf, periodOf, replicationScene } from "../src/views/stores/replication-scene.ts";
 
 const NOW = 1_800_000_000_000;
 
@@ -106,6 +106,39 @@ test("a light runs on a cable only while batches move on it, about once a batch"
   assert.equal(scene.sources.find((n) => n.key.startsWith("pi/"))?.cable.tone, "off");
   assert.equal(periodOf(0.5), 2);
   assert.equal(periodOf(null), null);
+});
+
+test("a cable batches moved on lately flows even before its rate is known: at the slowest pace", () => {
+  const fresh = runner("fedora", { rates: { writes: null, batches: null, wire: null, busy: null } }, NOW - 1000);
+  assert.equal(paceOf(fresh, NOW), 6);
+  assert.equal(paceOf(runner("fedora", { rates: { writes: 4, batches: 2, wire: 1000, busy: 0.1 } }, NOW - 1000), NOW), 1.2);
+  assert.equal(paceOf(runner("fedora", {}, NOW - ACTIVE_MS - 1000), NOW), null);
+  const scene = replicationScene(status([fresh, mirror({ rates: { writes: 2, batches: 0.25, wire: 1000, busy: 0 } })]), false);
+  assert.equal(scene.sources[0]?.cable.period, 6);
+  assert.equal(scene.mirror?.cable.period, 4, "the mirror feed flows too, at its own pace");
+});
+
+test("the server's and the mirror's headings stand just over their databases, on a phone too, inside the picture", () => {
+  for (const n of [1, 2, 5]) {
+    const stores = Array.from({ length: n }, (_, i) => runner(`m${i}`));
+    for (const portrait of [false, true]) {
+      const scene = replicationScene(status([...stores, mirror()]), portrait);
+      const heads = Object.fromEntries([...scene.headings, ...(scene.mirror?.heading ? [scene.mirror.heading] : [])].map((h) => [h.text, h]));
+      for (const [text, node] of [
+        ["SERVER", scene.server],
+        ["MIRROR", scene.mirror!],
+      ] as const) {
+        const h = heads[text]!;
+        const d = cylinder(node.plate);
+        const cap = d.top - d.ry;
+        assert.ok(h.at[1] < cap && cap - h.at[1] <= 24, `${portrait} ${n}: ${text} at ${h.at[1]}, its cap at ${cap}`);
+        assert.equal(h.at[0], node.plate.x, "over its middle");
+        assert.equal(h.anchor, "middle");
+        assert.ok(h.at[1] > 12, `${portrait} ${n}: ${text} inside the picture`);
+      }
+      if (portrait) assert.ok(heads.MIRROR!.at[1] - 12 > scene.server.sub.at[1], `${n}: the mirror's heading clear of the server's words`);
+    }
+  }
 });
 
 test("rows to come wait at a cable's start, more marks for ten times as many", () => {

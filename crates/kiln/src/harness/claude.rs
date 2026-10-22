@@ -2473,6 +2473,10 @@ impl Claude {
             let what = between(part, "<event>", "</event>").or_else(|| between(part, "<summary>", "</summary>")).unwrap_or("").trim();
             t.events += 1;
             t.last_event = Some(clip_middle(what.lines().last().unwrap_or(""), 300).0).filter(|e| !e.is_empty());
+            // Its events are its output: Claude Code keeps no file for a monitor, so kiln keeps them.
+            if !what.is_empty() {
+                core.task_output.entry(id.trim().to_owned()).or_default().append(format!("{what}\n").as_bytes());
+            }
             core.touch_state();
         }
     }
@@ -5070,6 +5074,8 @@ mod tests {
         c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": "<system-reminder>\n<task-notification>\n<task-id>m9</task-id>\n<status>running</status>\n<summary>ERROR db down</summary>\n</task-notification>\n</system-reminder>"}, "parent_tool_use_id": null, "session_id": "s", "uuid": "e1"}).to_string());
         let mon = core.state.tasks.iter().find(|t| t.id == "m9").cloned().unwrap_or_default();
         assert_eq!((mon.events, mon.last_event.as_deref()), (1, Some("ERROR db down")));
+        // And they are its output, which Claude Code keeps no file of.
+        assert_eq!(core.task_output.get("m9").map(|o| String::from_utf8_lossy(&o.data.iter().copied().collect::<Vec<u8>>()).into_owned()).as_deref(), Some("ERROR db down\n"));
         // The turn is over; both are left running.
         c.line(&mut core, r#"{"type":"system","subtype":"session_state_changed","state":"idle","uuid":"u","session_id":"s"}"#);
         core.set_status(Status::Idle);

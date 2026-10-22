@@ -4,7 +4,8 @@ import { alongCubic, clip, iso, isoBox, rolloutScene, spread, type SceneBuild, t
 
 const build = (key: string, over: Partial<SceneBuild> = {}): SceneBuild => ({
   key,
-  label: "linux · x86_64",
+  os: "linux",
+  arch: "x86_64 · musl",
   line: "b0de36d · run #412",
   tone: "ok",
   cable: undefined,
@@ -44,6 +45,63 @@ test("the study's layout: four builds and five runners sit where the design drew
   assert.deepEqual(
     s.headings.map((h) => h.text),
     ["BUILDS", "SERVER", "RUNNERS"],
+  );
+});
+
+test("the server's heading stands just above its box, not up with the columns' headings", () => {
+  for (const runners of [1, 5, 12]) {
+    const s = rolloutScene({ builds: ["a", "b"].map((k) => build(k)), server, runners: Array.from({ length: runners }, (_, i) => runner(`r${i}`)) }, false);
+    const sy = s.server.name.y - 80;
+    const heading = s.headings.find((h) => h.text === "SERVER")!;
+    // The box's top: its far corner, the highest point of any of its faces.
+    const top = Math.min(...[s.server.box.top, s.server.box.left, s.server.box.right].flatMap((d) => nums(d).filter((_, i) => i % 2 === 1)));
+    assert.ok(Math.abs(top - (sy - 79.5)) < 0.01, `the box's top is where the heading reckons it (${top})`);
+    assert.ok(heading.y < top && top - heading.y <= 16, `${runners} runners: the heading at ${heading.y}, the box's top at ${top}`);
+    assert.ok(heading.y > s.headings.find((h) => h.text === "BUILDS")!.y, "below the columns' headings");
+    assert.equal(heading.x, 480);
+  }
+  // On a phone, over its box too.
+  const p = rolloutScene({ builds: [], server, runners: [runner("a")] }, true);
+  const ph = p.headings.find((h) => h.text === "SERVER")!;
+  const ptop = Math.min(...nums(p.server.box.top).filter((_, i) => i % 2 === 1));
+  assert.ok(ph.y < ptop && ptop - ph.y <= 12 && ph.y > 8, `the phone's heading at ${ph.y}, its box's top at ${ptop}`);
+  assert.equal(ph.anchor, "middle");
+});
+
+test("a build is named by its target: its OS, then its arch and ABI after it", () => {
+  const s = rolloutScene({ builds: [build("a"), build("b", { os: "macos", arch: "aarch64" }), build("c", { os: "linux", arch: "x86_64 · gnu" })], server, runners: [] }, false);
+  assert.deepEqual(
+    s.builds.map((b) => [b.name.text, b.name.tail]),
+    [
+      ["linux", "x86_64 · musl"],
+      ["macos", "aarch64"],
+      ["linux", "x86_64 · gnu"],
+    ],
+  );
+  assert.equal(s.builds[0]!.title, "linux x86_64 · musl build: b0de36d · run #412");
+});
+
+test("a connected runner's cable pulses now and then; one upgrading flows instead; an offline one does neither", () => {
+  const s = rolloutScene(
+    {
+      builds: [],
+      server,
+      runners: [runner("idle"), runner("moving", { lit: true, tone: "run" }), runner("away", { offline: true, cable: "off", tone: "off" }), runner("failed", { tone: "bad", cable: "bad" })],
+    },
+    false,
+  );
+  const by = Object.fromEntries(s.runners.map((r) => [r.key, r]));
+  assert.equal(by.idle!.pulse, true);
+  assert.equal(by.failed!.pulse, true, "still connected: its link is live");
+  assert.equal(by.moving!.pulse, false);
+  assert.equal(by.moving!.cable.lit, true);
+  assert.equal(by.away!.pulse, false);
+  assert.equal(by.away!.cable.lit, false);
+  // The same on a phone.
+  const phone = rolloutScene({ builds: [], server, runners: [runner("idle"), runner("away", { offline: true })] }, true);
+  assert.deepEqual(
+    phone.runners.map((r) => r.pulse),
+    [true, false],
   );
 });
 

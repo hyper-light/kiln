@@ -19,6 +19,7 @@ import {
   readoutAll,
   readoutRunner,
   runnerView,
+  runProgress,
   serverView,
   upgradeOffer,
   wayLabel,
@@ -163,7 +164,12 @@ test("every platform in step: ordered linux, macos, windows, x86_64 first, the s
   const ps = platformsOf(overview(), null);
   assert.deepEqual(
     ps.map((p) => p.label),
-    ["linux · x86_64", "linux · aarch64", "macos · aarch64"],
+    ["linux · x86_64 · gnu", "linux · aarch64 · musl", "macos · aarch64"],
+  );
+  assert.deepEqual(
+    ps.map((p) => p.key),
+    ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "aarch64-apple-darwin"],
+    "one platform a target, keyed by it",
   );
   assert.ok(ps.every((p) => p.state === "current" && p.tone === "ok"));
   assert.equal(platformLine(ps[0]!, null), "b0de36d · server's own", "the server's own build runs the newest commit");
@@ -201,7 +207,9 @@ test("a release run under way: each platform says what its job does, and only a 
   ] as unknown as Job[];
   const ps = platformsOf(data, jobs);
   const by = Object.fromEntries(ps.map((p) => [p.target, p]));
-  assert.equal(by["x86_64-unknown-linux-gnu"]!.state, "current");
+  // The Linux job builds every Linux target, the server's own platform's too.
+  assert.equal(by["x86_64-unknown-linux-gnu"]!.state, "building");
+  assert.equal(by["x86_64-unknown-linux-gnu"]!.lit, true);
   assert.equal(by["aarch64-unknown-linux-musl"]!.state, "building");
   assert.equal(by["aarch64-unknown-linux-musl"]!.lit, true);
   assert.equal(by["aarch64-apple-darwin"]!.state, "queued");
@@ -209,13 +217,80 @@ test("a release run under way: each platform says what its job does, and only a 
   assert.equal(platformCable(by["aarch64-apple-darwin"]!), "off");
   assert.equal(by["x86_64-pc-windows-msvc"]!.state, "failed", "a platform without a build, whose job failed");
   assert.equal(by["x86_64-pc-windows-msvc"]!.binary, null);
-  assert.equal(platformLine(by["aarch64-unknown-linux-musl"]!, data.build!.last!), "building · run #413");
-  const s = buildStatus(data.build!, ps, NOW);
+  assert.equal(platformLine(by["aarch64-unknown-linux-musl"]!, data.build!.last!), "building b0de36d · run #413");
+  assert.equal(platformLine(by["aarch64-apple-darwin"]!, data.build!.last!), "queued · run #413");
+  const s = buildStatus(data.build!, ps, NOW, jobs);
   assert.equal(s.tone, "run");
-  assert.equal(`${s.before}run #${s.run?.number}${s.after}`, "Release run #413 · 0 of 3 built");
+  assert.equal(`${s.before}run #${s.run?.number}${s.after}`, "Release run #413 building b0de36d · 1 of 3 running · 1 failed");
+  assert.equal(buildStatus(data.build!, ps, NOW).after, " building b0de36d", "its jobs not read yet: what it builds");
   // Without the run's jobs read yet: building, but nothing lit.
   const blind = platformsOf(data, null);
   assert.ok(blind.filter((p) => p.target !== "x86_64-unknown-linux-gnu").every((p) => p.state === "building" && !p.lit));
+});
+
+test("one platform a target: the server's own shadows an older build kept for its platform", () => {
+  const data = overview({
+    binaries: [
+      bin("x86_64-unknown-linux-musl", { origin: "server", sha: NEWEST, run: undefined, at: 0 }),
+      bin("x86_64-unknown-linux-musl", { origin: "built", run: 525, sha: OLD, at: S - 90_000 }),
+      bin("aarch64-unknown-linux-musl"),
+    ],
+  });
+  const ps = platformsOf(data, null);
+  assert.deepEqual(
+    ps.map((p) => p.key),
+    ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"],
+  );
+  assert.equal(ps[0]!.binary?.origin, "server", "runners of it get the server's own");
+  assert.deepEqual(
+    ps[0]!.shadowed.map((b) => b.run),
+    [525],
+  );
+  assert.equal(ps[0]!.label, "linux · x86_64 · musl");
+  assert.equal(platformLine(ps[0]!, null), "b0de36d · server's own");
+  assert.equal(ps[1]!.shadowed.length, 0);
+  // Without the server's own, the newest kept is what runners get.
+  const two = platformsOf(overview({ binaries: [bin("aarch64-apple-darwin", { at: S - 50 }), bin("aarch64-apple-darwin", { origin: "upload", at: S - 10, run: undefined, sha: undefined })] }), null);
+  assert.equal(two[0]!.binary?.origin, "upload");
+});
+
+test("a push builds a newer commit than the server's: each platform its job builds says so, and the head says how far", () => {
+  const NEWER = "25159ff8b2d4c6e0a1f3b5d7c9e1a3f5b7d9c1e3";
+  const data = overview({
+    binaries: [bin("x86_64-unknown-linux-musl", { origin: "server", sha: NEWEST, run: undefined }), bin("aarch64-unknown-linux-musl"), bin("aarch64-apple-darwin"), bin("x86_64-pc-windows-msvc")],
+    build: { repo: "hyper-light/kiln", pipeline: "release", last: run({ number: 709, sha: NEWER, event: "push" }), commit: NEWEST, in_step: true, behind: [], keeps_in_step: true },
+  });
+  const jobs = [
+    { key: "linux", status: "queued", steps: [] },
+    { key: "macos", status: "running", steps: [] },
+    { key: "windows", status: "queued", steps: [] },
+  ] as unknown as Job[];
+  const ps = platformsOf(data, jobs);
+  assert.deepEqual(
+    ps.map((p) => [p.target, p.state, p.lit]),
+    [
+      ["x86_64-unknown-linux-musl", "queued", false],
+      ["aarch64-unknown-linux-musl", "queued", false],
+      ["aarch64-apple-darwin", "building", true],
+      ["x86_64-pc-windows-msvc", "queued", false],
+    ],
+  );
+  assert.equal(platformLine(ps[2]!, data.build!.last!), "building 25159ff · run #709");
+  assert.equal(platformLine(ps[0]!, data.build!.last!), "queued · run #709");
+  const s = buildStatus(data.build!, ps, NOW, jobs);
+  assert.equal(s.tone, "run");
+  assert.equal(`${s.before}run #${s.run?.number}${s.after}`, "Release run #709 building 25159ff · 1 of 3 running");
+  // Its Linux job done: those platforms read as they stand again (a build of another commit isn't kept).
+  const done = platformsOf(data, [{ key: "linux", status: "succeeded", steps: [] }, ...jobs.slice(1)] as unknown as Job[]);
+  assert.deepEqual(
+    done.slice(0, 2).map((p) => [p.state, p.job]),
+    [
+      ["current", null],
+      ["current", null],
+    ],
+  );
+  assert.equal(runProgress([{ status: "succeeded" }, { status: "succeeded" }, { status: "queued" }] as unknown as Job[]), "1 of 3 queued");
+  assert.equal(runProgress([{ status: "succeeded" }, { status: "failed" }, { status: "succeeded" }] as unknown as Job[]), "2 of 3 built · 1 failed");
 });
 
 test("behind, failed, never built: what the Builds section says", () => {

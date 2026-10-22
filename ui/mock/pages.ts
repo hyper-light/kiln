@@ -45,8 +45,8 @@ export interface PagesCtx {
   err: (res: http.ServerResponse, status: number, message: string) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
   emit?: (ev: ServerEvent) => void;
-  /** kiln's release pipeline in the simulation: Build every platform starts it. */
-  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null };
+  /** kiln's release pipeline in the simulation: Build every platform starts it; `past`, the runs the kept builds came from, newest first. */
+  release?: { start: (commit: string) => Run; latest: () => { run: Run; jobs: Job[] } | null; past: () => Run[] };
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -705,9 +705,10 @@ const started = new Map<string, UpdateJob>();
 const upgraded = new Set<string>();
 /** Update policies chosen on the page, by runner (else automatic). */
 const policies = new Map<string, UpdatePolicy>();
-/** Binaries removed, and uploaded, on the page. */
-const removed = new Set<string>();
+/** When each platform's kept binary was removed on the page (unix seconds), and what was uploaded, or a machine built of itself, for a platform since. */
+const removedAt = new Map<string, number>();
 const uploaded = new Map<string, KilnBinary>();
+const machineBuilt = new Map<string, KilnBinary>();
 /** The platforms each job of the release pipeline builds (`.kiln/release.yaml`), as the mock's targets name them. */
 const RELEASE_TARGETS: Record<string, string[]> = { linux: ["aarch64-unknown-linux-gnu"], windows: ["x86_64-pc-windows-msvc"], macos: ["aarch64-apple-darwin"] };
 
@@ -746,6 +747,13 @@ function tickUpgrades(ctx: PagesCtx) {
       if (t >= lines[lines.length - 1]![0] + 2) {
         Object.assign(job, { state: "done", ended_at: now(), reached: true });
         upgraded.add(job.target);
+        // A machine that built kiln of itself hands the binary back: others of its platform download it.
+        const a = job.method === "build" ? ctx.agents().find((x) => x.name === job.target) : undefined;
+        if (a) {
+          const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
+          const sha256 = hex(mulberry32(hashStr(`${target}:${job.id}`)), 64);
+          machineBuilt.set(target, { target, sha256, size: 36_400_000, build: sha256.slice(0, 12), origin: "machine", at: now(), sha: NEWEST, by: a.name });
+        }
         ctx.emit?.({ type: "updates" });
       }
       ctx.emit?.({ type: "update_job", job: { ...job, log: [...job.log] } });
@@ -836,18 +844,43 @@ function failedJobs(ctx: PagesCtx): UpdateJob[] {
   return out;
 }
 
-/** The binaries kept here: the server's own and one the release pipeline built, then what the page's release run, uploads and removals made of them. */
+/**
+ * The binaries kept here: the server's own, then one for each platform, the newest of what kiln's
+ * release pipeline built, a machine built of itself or was uploaded (crate::updates::stored). An
+ * older release build of the server's own platform stays kept beside the server's own, which
+ * runners of it get instead. The page's release runs, uploads and removals change them.
+ */
 function binariesOf(ctx: PagesCtx): KilnBinary[] {
-  const base: KilnBinary[] = [
-    { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
-    { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
+  const [recent, older] = ctx.release?.past() ?? [];
+  const own: KilnBinary = { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 };
+  const kept: KilnBinary[] = [
+    {
+      target: "aarch64-unknown-linux-gnu",
+      sha256: "cd".repeat(32),
+      size: 36_900_000,
+      build: "0.1.0+a1b2c3d",
+      origin: "built",
+      at: recent?.finished_at ?? T0 - 80_000,
+      run: recent?.number ?? 412,
+      sha: recent?.sha ?? "a1b2c3d4e5",
+    },
+    {
+      target: "x86_64-unknown-linux-gnu",
+      sha256: "ef".repeat(32),
+      size: 37_500_000,
+      build: "0.0.9+df17c34",
+      origin: "built",
+      at: older?.finished_at ?? T0 - 205_000,
+      run: older?.number ?? 380,
+      sha: older?.sha ?? "df17c34639ecbf9d5c9caefb6af28aa67ee01257",
+    },
   ];
+  // A release run of the server's own commit keeps its builds of the other platforms (crate::updates::adopts); one of any other commit, none.
   const rel = ctx.release?.latest();
-  const built = new Map<string, KilnBinary>();
-  for (const j of rel?.jobs ?? []) {
+  for (const j of rel && rel.run.sha === NEWEST ? rel.jobs : []) {
     if (j.status !== "succeeded") continue;
     for (const t of RELEASE_TARGETS[j.key] ?? []) {
-      built.set(t, {
+      kept.push({
         target: t,
         sha256: hex(mulberry32(hashStr(t)), 64),
         size: t.includes("windows") ? 43_000_000 : t.includes("darwin") ? 36_100_000 : 39_600_000,
@@ -855,26 +888,24 @@ function binariesOf(ctx: PagesCtx): KilnBinary[] {
         origin: "built",
         at: j.finished_at ?? now(),
         run: rel!.run.number,
-        sha: NEWEST,
+        sha: rel!.run.sha,
       });
     }
   }
-  const out = base.filter((b) => b.origin === "server" || !built.has(b.target)).concat([...built.values()]);
-  for (const [t, b] of uploaded) {
-    const i = out.findIndex((x) => x.target === t && x.origin !== "server");
-    if (i >= 0) out.splice(i, 1);
-    out.push(b);
-  }
-  return out.filter((b) => !removed.has(`${b.target}:${b.at}`));
+  kept.push(...machineBuilt.values(), ...uploaded.values());
+  const newest = new Map<string, KilnBinary>();
+  for (const b of kept) if (b.at > (removedAt.get(b.target) ?? 0) && b.at >= (newest.get(b.target)?.at ?? 0)) newest.set(b.target, b);
+  return [own, ...newest.values()];
 }
 
 function updates(ctx: PagesCtx): UpdatesOverview {
   const binaries = binariesOf(ctx);
   const rel = ctx.release?.latest() ?? null;
   const darwin = binaries.find((b) => b.target === "aarch64-apple-darwin" && b.sha === NEWEST);
-  // While the page's release run goes, what it builds and isn't built from the newest yet; else the Mac's platform, as before.
+  // While a release run of the server's commit goes, what it builds and isn't built from it yet; else the Mac's platform, until a build of it is kept.
   const releaseTargets = Object.values(RELEASE_TARGETS).flat();
-  const behind = rel ? releaseTargets.filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST)) : ["aarch64-apple-darwin"];
+  const behind = (rel && rel.run.sha === NEWEST ? releaseTargets : ["aarch64-apple-darwin"]).filter((t) => !binaries.some((b) => b.target === t && b.sha === NEWEST));
+  const recent = ctx.release?.past()[0];
   const runners = ctx
     .agents()
     .filter((a) => !a.ephemeral)
@@ -887,7 +918,7 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         name: a.name,
         policy: policies.get(a.name) ?? ("auto" as const),
         locked: false,
-        from: up || mac ? null : "built by release run #412",
+        from: up || mac ? null : `built by release run #${recent?.number ?? 412}`,
         hostname: a.hostname,
         os: a.os,
         arch: a.arch,
@@ -1124,7 +1155,8 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   if ((mm = p.match(/^\/api\/updates\/binaries\/([^/]+)$/)) && m === "DELETE") {
     const target = decodeURIComponent(mm[1] ?? "");
     uploaded.delete(target);
-    for (const b of binariesOf(ctx)) if (b.target === target && b.origin !== "server") removed.add(`${b.target}:${b.at}`);
+    machineBuilt.delete(target);
+    removedAt.set(target, now());
     ctx.emit?.({ type: "updates" });
     res.statusCode = 204;
     res.end();

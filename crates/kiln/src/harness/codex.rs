@@ -579,6 +579,17 @@ impl Codex {
     /// Stop a subagent's turn: it keeps the permissions it started with, and works under other
     /// ones than the session's. What it asked goes with the turn. False: it can't be (kiln
     /// tried for that turn, and Codex refused).
+    /// A person stops subagent `thread` (its row's Stop): the turn it works on is interrupted. Its
+    /// parent isn't told to start it again (that's for the permission change above). False: it
+    /// has no turn under way.
+    fn stop_child_asked(&mut self, core: &mut Core, thread: &str) -> bool {
+        let Some(turn) = self.children.get(thread).and_then(|c| c.turn.clone()) else { return false };
+        let name = core.state.tasks.iter().find(|t| t.id == thread).map(|t| t.description.trim().to_owned()).filter(|d| !d.is_empty()).unwrap_or_else(|| thread.to_owned());
+        self.notice(core, Level::Info, format!("Stopping subagent {name}, as asked."));
+        self.request(core, Pending::ChildInterrupt(thread.to_owned()), "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        true
+    }
+
     fn stop_child(&mut self, core: &mut Core, thread: &str, turn: Option<String>) -> bool {
         let Some(turn) = turn.or_else(|| self.children.get(thread).and_then(|c| c.turn.clone())) else { return false };
         let child = self.children.entry(thread.to_owned()).or_default();
@@ -1088,6 +1099,12 @@ impl Codex {
             Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
+            // A subagent: its turn under way is interrupted, as a person asked.
+            Command::StopTask { task } if self.children.contains_key(&task) => {
+                if !self.stop_child_asked(core, &task) {
+                    self.notice(core, Level::Info, "That subagent has no turn under way to stop.".to_owned());
+                }
+            }
             Command::StopTask { task } => self.stop_terminal(core, &task),
             Command::StopTasks => {
                 let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).map(|t| t.id.clone()).collect();
@@ -1857,11 +1874,16 @@ impl Codex {
                 // Not stopped (its turn may have just ended): what it asked is the person's after
                 // all. It isn't tried again for that turn.
                 Pending::ChildInterrupt(thread) => {
+                    // Not a permission change's stop (that one is `stopping`): a person asked.
+                    let asked = self.children.get(&thread).is_some_and(|c| c.stopping.is_none());
                     if let Some(child) = self.children.get_mut(&thread) {
                         child.unstoppable = child.stopping.take();
                     }
                     self.stopped.retain(|s| *s != thread);
                     self.show_withheld(core, Some(&thread));
+                    if asked {
+                        self.notice(core, Level::Warn, format!("Codex couldn't stop that subagent: {msg}"));
+                    }
                 }
                 Pending::Models | Pending::Interrupt | Pending::PermissionInterrupt(_) | Pending::Hooks | Pending::Account => {}
                 // An older Codex can't list its terminals (the method is experimental): kiln
@@ -4057,6 +4079,8 @@ fn subagent(core: &mut Core, id: &str, tool: &str, desc: &str, status: &str, spa
             parent_task: parent_task.map(str::to_owned),
             started: Core::now(),
             ended: (!matches!(status, "running" | "pending" | "paused")).then(Core::now),
+            // Its turn under way can be interrupted (`stop_child_asked`).
+            stoppable: true,
             ..Task::default()
         }),
     }
@@ -5132,6 +5156,22 @@ mod tests {
         assert!(said.contains("Continue the work") && said.contains("kiln stopped your subagents") && said.contains("(kid)") && said.contains("(grandkid)"), "{said}");
         assert!(c.stopped.is_empty());
         Ok(())
+    }
+
+    /// A person stops a subagent from its row: its turn is interrupted, and its parent isn't told
+    /// to start it again (that's only for a permission change's stop).
+    #[test]
+    fn a_person_stops_a_subagent_from_its_row() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        assert!(core.state.tasks.iter().find(|t| t.id == "kid").is_some_and(|t| t.stoppable), "a subagent's row can stop it");
+        let _ = written(&mut core);
+        c.command(&mut core, Command::StopTask { task: "kid".into() });
+        assert_eq!(interrupts(&written(&mut core)), [pair("kid", "kid-turn")]);
+        assert!(c.stopped.is_empty(), "its parent isn't asked to start it again");
     }
 
     #[test]
