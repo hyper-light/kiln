@@ -306,6 +306,8 @@ pub struct Duplex {
     pub exit: oneshot::Receiver<Option<i32>>,
     /// The pipes' descriptors (stdin, stdout, stderr), for [`Duplex::detach`].
     fds: [i32; 3],
+    /// The process came from another runner: its exit is watched, not reaped.
+    foreign: bool,
     /// Taken by [`Duplex::detach`], `stopped` set first, to stop the readers: they read nothing
     /// more. Dropped otherwise (the `Duplex` let go of with its stdout taken elsewhere), the
     /// readers read on to the end, as they always did.
@@ -378,7 +380,7 @@ impl Duplex {
             let _ = crate::rt::timeout(Duration::from_secs(5), r.recv()).await;
         }
         use std::os::fd::IntoRawFd as _;
-        Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: false })
+        Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: self.foreign })
     }
     /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here).
     pub fn terminate(&self, grace: Duration) {
@@ -408,7 +410,7 @@ pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
         let code = wait_child(&mut child).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });
-    pump(pid, input, out, err, exit_rx)
+    pump(pid, input, out, err, exit_rx, false)
 }
 
 /// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): the process joins
@@ -440,7 +442,7 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
             wait_foreign_exit(pid).await;
             let _ = exit_tx.send(None);
         });
-        return pump(pid, input, out, err, exit_rx);
+        return pump(pid, input, out, err, exit_rx, d.foreign);
     }
     crate::rt::spawn(async move {
         let p = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw);
@@ -456,7 +458,7 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
         .await;
         let _ = exit_tx.send(status.ok().flatten());
     });
-    pump(pid, input, out, err, exit_rx)
+    pump(pid, input, out, err, exit_rx, d.foreign)
 }
 
 /// Wait for `pid` to end when it isn't this process's child (another runner of this machine
@@ -493,7 +495,7 @@ fn started_at(pid: u32) -> Option<u64> {
 }
 
 /// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin.
-fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>) -> anyhow::Result<Duplex> {
+fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool) -> anyhow::Result<Duplex> {
     for fd in [&input, &out, &err] {
         nonblocking(fd)?;
     }
@@ -550,7 +552,7 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         let _ = written_tx.send(());
         // Dropping the fd here closes the child's stdin (unless it was handed over: a copy holds it).
     });
-    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, fds, stop: Some(stop_tx), stopped, written: Some(written_rx), read: Some(read_rx) })
+    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, fds, foreign, stop: Some(stop_tx), stopped, written: Some(written_rx), read: Some(read_rx) })
 }
 
 #[cfg(test)]
@@ -600,6 +602,41 @@ mod tests {
             // It ends when its stdin closes, as before.
             q.stdin.close();
             crate::rt::timeout(Duration::from_secs(5), &mut q.exit).await??;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_foreign_harness_process_stays_foreign_when_handed_over_again() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "exec 3<&0; cat <&3 & child=$!; printf '%s\\n' \"$child\" >&2; wait \"$child\""]);
+            let mut parent = spawn_duplex(cmd)?;
+            struct Stop(i32);
+            impl Drop for Stop {
+                fn drop(&mut self) {
+                    let _ = killpg(Pid::from_raw(self.0), Signal::SIGKILL);
+                }
+            }
+            let _stop = Stop(i32::try_from(parent.pid)?);
+            let said = crate::rt::timeout(Duration::from_secs(5), parent.stderr.recv()).await??;
+            let pid: u32 = std::str::from_utf8(&said)?.trim().parse()?;
+            let mut d = parent.detach().await.context("couldn't detach the parent's pipes")?;
+            d.pid = pid;
+            d.foreign = true;
+            let mut p = adopt_duplex(d)?;
+            p.stdin.send(b"one\n".to_vec()).await?;
+            assert_eq!(crate::rt::timeout(Duration::from_secs(5), p.stdout.recv()).await??, b"one\n");
+            let d = p.detach().await.context("couldn't detach the foreign process")?;
+            assert!(d.foreign, "a process received from another runner is still not our child");
+            drop(p);
+            let mut q = adopt_duplex(d)?;
+            q.stdin.send(b"two\n".to_vec()).await?;
+            assert_eq!(crate::rt::timeout(Duration::from_secs(5), q.stdout.recv()).await??, b"two\n");
+            assert!(matches!(q.exit.try_recv(), Ok(None)), "the foreign process is still running");
+            q.stdin.close();
+            crate::rt::timeout(Duration::from_secs(5), &mut q.exit).await??;
+            crate::rt::timeout(Duration::from_secs(5), &mut parent.exit).await??;
             Ok(())
         })
     }
