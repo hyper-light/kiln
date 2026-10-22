@@ -1,26 +1,8 @@
-/* Requests share the bottom toast position, above any passing notifications; on a phone they sit
-   at the top, under kiln's header, since the bottom is the message box's. */
+/* Requests share the bottom toast position with kiln's other notifications, on every screen, above
+   any passing ones. */
 .rq-viewport {
   z-index: 121;
   bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + var(--toast-stack-height, 0px));
-}
-@media (max-width: 640px) {
-  .rq-viewport {
-    top: calc(var(--header-h) + 8px);
-    right: 8px;
-    bottom: auto;
-    left: 8px;
-    width: auto;
-  }
-  .rq-viewport .toast.rq {
-    animation-name: rq-in-from-top;
-  }
-}
-@keyframes rq-in-from-top {
-  from {
-    opacity: 0;
-    transform: translateY(-12px);
-  }
 }
 .toast.rq {
   padding: 12px 8px 12px 14px;

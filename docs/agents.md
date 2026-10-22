@@ -126,9 +126,9 @@ usage, with the workers, slots and weights the person sets there ([programs.md](
   allowed or denied there, a question or plan opens the agent); goals it paused for you
   (**Review the plan**, when they wait on one, and **Resume**); a stop of its own, its harness
   ended with an error (**Restart**); a usage limit it reached, only said, with when it goes on.
-  Two at once (one on a phone), then a line for the rest. At the bottom right, above kiln's
-  passing notifications; on a phone at the top, under kiln's header, since the bottom is the
-  message box's. ×, or a swipe, puts one away until there's something new.
+  Two at once (one on a phone), then a line for the rest. Where kiln's other notifications are,
+  on every screen: at the bottom, above any passing ones. ×, or a swipe, puts one away until
+  there's something new.
 - **Answers at once.** An answer shows as given wherever its request showed (its row, its card, the
   agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
