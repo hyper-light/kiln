@@ -44,6 +44,7 @@ pub enum Protocol {
 const KINDS: &[Kind] = &[
     Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson, screen: &["claude"], screen_takes_command: true },
     Kind { id: "codex", name: "Codex", program: "codex", verified: true, protocol: Protocol::CodexAppServer, screen: &["codex"], screen_takes_command: false },
+    Kind { id: "devin", name: "Devin", program: "devin", verified: true, protocol: Protocol::Acp(&["acp"]), screen: &["devin"], screen_takes_command: false },
     Kind { id: "gemini", name: "Gemini CLI", program: "gemini", verified: false, protocol: Protocol::Acp(&["--acp"]), screen: &["gemini"], screen_takes_command: false },
     Kind { id: "opencode", name: "opencode", program: "opencode", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["opencode"], screen_takes_command: false },
     Kind { id: "goose", name: "Goose", program: "goose", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["goose", "session"], screen_takes_command: false },
@@ -76,7 +77,7 @@ impl Kind {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
             Protocol::AgyStreamJson => Adapter::Agy(Box::new(Agy::new(spec))),
-            Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::new(spec.resume.clone()).with_mode(spec.mode.as_deref()))),
+            Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::from_spec(spec))),
         }
     }
 
@@ -357,7 +358,7 @@ impl Adapter {
             Self::Claude(a) => a.tick(core),
             Self::Codex(a) => a.tick(core),
             Self::Agy(a) => a.tick(core),
-            Self::Acp(_) => {}
+            Self::Acp(a) => a.tick(core),
         }
     }
 
@@ -422,8 +423,7 @@ pub struct KindInfo {
     pub verified: bool,
     pub available: bool,
     /// Its permission modes, those that skip every check marked `dangerous` (a choice that takes
-    /// a confirmation, never a default). ACP agents announce theirs per session, so theirs are
-    /// empty here.
+    /// a confirmation, never a default). ACP agents other than Devin announce theirs per session.
     #[serde(default)]
     pub modes: Vec<super::model::ModeOption>,
     #[serde(default)]
@@ -467,6 +467,19 @@ impl Kind {
             }
             Protocol::CodexAppServer => (super::codex::modes(true), "auto"),
             Protocol::AgyStreamJson => (super::antigravity::modes(), super::antigravity::DEFAULT_MODE),
+            Protocol::Acp(_) if self.id == "devin" => (
+                [
+                    ("accept-edits", "Code", "Write and edit code", false),
+                    ("smart", "Smart", "Auto-approve actions the model judges safe", false),
+                    ("ask", "Ask", "Answer questions without code changes", false),
+                    ("plan", "Plan", "Plan changes before implementing", false),
+                    ("bypass", "Bypass Permissions", "Auto-approve all tool calls unless your organization's policy requires approval", true),
+                ]
+                .into_iter()
+                .map(|(id, label, description, dangerous)| super::model::ModeOption { id: id.into(), label: label.into(), description: description.into(), dangerous })
+                .collect(),
+                "accept-edits",
+            ),
             Protocol::Acp(_) | Protocol::Terminal => (Vec::new(), ""),
         }
     }
@@ -478,12 +491,13 @@ impl Kind {
     }
 
     /// The effort levels a new session can start at, before the harness says which its model has:
-    /// Codex's, those of its default model on this machine.
+    /// Codex's default model; Devin's common levels, safe for a model not learned yet too.
     pub fn efforts(&self) -> Vec<super::model::ControlOption> {
         let levels: Vec<String> = match self.protocol {
             Protocol::ClaudeStreamJson => super::claude::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
             Protocol::CodexAppServer => super::codex::default_efforts(),
             Protocol::AgyStreamJson => super::antigravity::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
+            Protocol::Acp(_) if self.id == "devin" => common_efforts(&models_of("devin")),
             Protocol::Acp(_) | Protocol::Terminal => Vec::new(),
         };
         levels
@@ -493,7 +507,13 @@ impl Kind {
     }
 }
 
+fn common_efforts(models: &[super::model::ModelOption]) -> Vec<String> {
+    models.first().map(|first| first.efforts.iter().filter(|e| models.iter().all(|m| m.efforts.contains(e))).cloned().collect()).unwrap_or_default()
+}
+
 pub fn offered() -> Vec<KindInfo> {
+    #[cfg(not(test))]
+    super::acp::warm_models();
     KINDS
         .iter()
         .map(|k| {
@@ -596,6 +616,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn devin_runs_its_acp_protocol_and_keeps_its_terminal_interface() -> anyhow::Result<()> {
+        let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
+        assert_eq!(kind.protocol, Protocol::Acp(&["acp"]));
+        assert_eq!(kind.screen, &["devin"]);
+        assert!(!kind.screen_takes_command);
+        let cwd = tempfile::tempdir()?;
+        let spec = Spec {
+            kind: "devin".into(),
+            program: Some("/path/to/devin".into()),
+            cwd: Some(cwd.path().to_string_lossy().into_owned()),
+            model: Some("default".into()),
+            mode: Some("plan".into()),
+            effort: Some("high".into()),
+            resume: Some("conversation".into()),
+            env: vec![("DEVIN_SESSION_TEST".into(), "kept".into()), ("CLAUDECODE".into(), "scrubbed".into())],
+            ..Spec::default()
+        };
+        let launch = kind.launch(&spec, "session")?;
+        assert_eq!(launch.get_program(), "/path/to/devin");
+        assert_eq!(launch.get_args().collect::<Vec<_>>(), ["acp"]);
+        assert_eq!(launch.get_current_dir(), Some(cwd.path()));
+        let env: std::collections::HashMap<_, _> = launch.get_envs().collect();
+        assert_eq!(env.get(std::ffi::OsStr::new("DEVIN_SESSION_TEST")), Some(&Some(std::ffi::OsStr::new("kept"))));
+        assert_eq!(env.get(std::ffi::OsStr::new("CLAUDECODE")), Some(&None));
+        assert_eq!(Kind::get("claude").map(|k| k.protocol), Some(Protocol::ClaudeStreamJson));
+        assert_eq!(Kind::get("codex").map(|k| k.protocol), Some(Protocol::CodexAppServer));
+        let (modes, default) = kind.modes();
+        assert_eq!(default, "accept-edits");
+        assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("accept-edits", false), ("smart", false), ("ask", false), ("plan", false), ("bypass", true)]);
+        Ok(())
+    }
+
+    #[test]
+    fn common_efforts_never_offers_a_level_missing_from_another_model() {
+        use super::super::model::ModelOption;
+        let mut models = vec![
+            ModelOption { efforts: vec!["low".into(), "high".into()], ..ModelOption::default() },
+            ModelOption { efforts: vec!["medium".into(), "high".into()], ..ModelOption::default() },
+        ];
+        assert_eq!(common_efforts(&models), ["high"]);
+        models.push(ModelOption::default());
+        assert!(common_efforts(&models).is_empty());
+        assert!(common_efforts(&[]).is_empty());
+    }
+
+    #[test]
     fn codex_offers_every_effort_its_default_model_takes() {
         let known = known_models("codex");
         let default = known.iter().find(|m| m.default);
@@ -609,7 +675,7 @@ mod tests {
     /// back whole: what an in-place upgrade hands the next image of the runner.
     #[test]
     fn every_adapter_is_written_out_and_read_back_whole() -> anyhow::Result<()> {
-        for id in ["claude", "codex", "gemini"] {
+        for id in ["claude", "codex", "gemini", "devin"] {
             let kind = Kind::get(id).ok_or_else(|| anyhow::anyhow!("no kind {id}"))?;
             let mut adapter = kind.adapter(&Spec { kind: id.to_owned(), ..Spec::default() });
             let mut core = Core::new();

@@ -3907,7 +3907,7 @@ fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
     }
 }
 
-/// A machine's past conversations to continue (`?target=local|agent:<name>`, `kind=claude|codex`,
+/// A machine's past conversations to continue (`?target=local|agent:<name>`, `kind=claude|codex|devin`,
 /// `limit=`): newest first; resume one with `spec.resume = id`.
 async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
     let target = q.get("target").map_or("local", String::as_str);
@@ -3915,8 +3915,8 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         return Err(err(StatusCode::BAD_REQUEST, "target is \"local\" or \"agent:<name>\""));
     }
     let kind = q.get("kind").filter(|k| !k.is_empty()).cloned();
-    if kind.as_deref().is_some_and(|k| k != "claude" && k != "codex") {
-        return Err(err(StatusCode::BAD_REQUEST, "kind is \"claude\" or \"codex\""));
+    if kind.as_deref().is_some_and(|k| k != "claude" && k != "codex" && k != "devin") {
+        return Err(err(StatusCode::BAD_REQUEST, "kind is \"claude\", \"codex\" or \"devin\""));
     }
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(50);
     match hub.harness.history(hub, target, kind, limit).await {

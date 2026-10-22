@@ -151,6 +151,10 @@ const fleet: AgentInfo[] = !FLEET
       },
       { ...base("fleet-docs", "Docs for reach", "local", "codex", 30), status: "running", activity: "Editing docs/reach.md", doing: "Editing docs/reach.md" },
       { ...base("fleet-ui", "Phone layout for Runs", "agent:metal-mac-mini", "claude", 25), status: "running", doing: "Running npx vite build" },
+      {
+        ...base("fleet-plan", "Plan QUIC replication", "agent:metal-mac-mini", "claude", 24),
+        held: { why: 'Paused by the agent: plan "QUIC replication" is ready for you to look at: its steps go to the agent once you resume', plan: "pl_quic", since: t0 - 4 * 60_000 },
+      },
       { ...base("fleet-crash", "Upgrade hyper-rt", "agent:metal-epyc-01", "codex", 22), status: "exited", exit: { code: 127, error: "codex: command not found" } },
       {
         ...base("fleet-limit", "Port the scheduler", "agent:metal-ryzen-01", "claude", 20),

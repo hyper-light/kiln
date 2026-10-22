@@ -32,6 +32,7 @@ pub mod engine;
 pub mod git;
 pub mod harness;
 pub mod health;
+pub mod jsonc;
 pub mod lua;
 pub mod kube;
 pub mod model;

@@ -101,7 +101,9 @@ export function PlanGraph({ steps, label }: { steps: GraphStep[]; label: string 
                   <span className="pg-text">
                     <span className="pg-title">
                       <span className="pg-n">{s.n}</span>
-                      <StandTitle stand={st}>{s.title || "Untitled step"}</StandTitle>
+                      <StandTitle stand={st} flow={`${s.n}:${s.title}`}>
+                        {s.title || "Untitled step"}
+                      </StandTitle>
                     </span>
                     {s.stand && <span className="pg-word">{STAND_WORDS[st]}</span>}
                     {s.who && <span className="pg-who">{s.who}</span>}
