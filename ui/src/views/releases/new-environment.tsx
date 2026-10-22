@@ -1,8 +1,9 @@
 /**
  * A new environment apps are released to (docs/deploy-api.md §4): its name, its provider (KilnCD,
  * or one of kiln's Argo CD integrations), the release repository its releases are committed to
- * (kiln's own, or one on GitHub through kiln's GitHub App, where releases may go as pull
- * requests), and the clusters it deploys to. Its gates are set on its page once it's made.
+ * (kiln's own, or one on GitHub through kiln's GitHub App, a GitLab or Bitbucket, where releases
+ * may go as pull requests), and the clusters it deploys to. Its gates are set on its page once
+ * it's made.
  */
 import * as React from "react";
 import { Plus } from "lucide-react";
@@ -83,6 +84,7 @@ function Form({ onDone }: { onDone: () => void }) {
             { value: "kiln", label: "kiln's own git server" },
             ...(hosts.some((h) => h.host === "github") ? [{ value: "github", label: "GitHub, through kiln's GitHub App" }] : []),
             ...(hosts.some((h) => h.host === "gitlab") ? [{ value: "gitlab", label: `GitLab (${hosts.filter((h) => h.host === "gitlab").map((h) => h.web).join(", ")})` }] : []),
+            ...(hosts.some((h) => h.host === "bitbucket") ? [{ value: "bitbucket", label: "Bitbucket" }] : []),
           ]}
         />
       )}
@@ -98,7 +100,9 @@ function Form({ onDone }: { onDone: () => void }) {
               ? "On GitHub: kiln's App makes it in an organization if it isn't there."
               : host === "gitlab"
                 ? "On GitLab (group/name): made in its group if it isn't there, with kiln's token for that group."
-                : "One of kiln's own: made if it isn't there."
+                : host === "bitbucket"
+                  ? "On Bitbucket (workspace/name): made in its workspace if it isn't there; Argo CD reads it with a deploy key kiln makes."
+                  : "One of kiln's own: made if it isn't there."
           }
         />
         <TextField label="Branch" value={branch} spellCheck={false} onChange={(e) => setBranch(e.target.value)} />

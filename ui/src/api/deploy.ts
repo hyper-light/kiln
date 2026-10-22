@@ -114,13 +114,13 @@ export interface Gates {
   via?: "commit" | "pull-request";
 }
 
-/** A git host release repositories may be on (docs/deploy-api.md §7): kiln's own, GitHub through kiln's App, a GitLab with the groups its token covers. */
+/** A git host release repositories may be on (docs/deploy-api.md §7): kiln's own, GitHub through kiln's App, a GitLab with the groups its token covers, Bitbucket with its workspaces. */
 export interface GitHost {
-  host: "kiln" | "github" | "gitlab";
+  host: "kiln" | "github" | "gitlab" | "bitbucket";
   name: string;
   /** Its web origin. */
   web?: string;
-  /** A GitLab's: the groups its token covers (none: every project there). */
+  /** A GitLab's: the groups its token covers; Bitbucket's: the workspaces kiln's credentials cover (none: every one). */
   groups?: string[];
 }
 
@@ -521,7 +521,7 @@ export function repoHost(e: Environment, hosts: GitHost[]): GitHost | null {
   return hosts.find((h) => h.host === host && (!h.groups?.length || h.groups.some((g) => repo.startsWith(`${g.replace(/\/$/, "")}/`)))) ?? null;
 }
 
-/** Where a release repository is seen: its page on GitHub or GitLab, none for kiln's own. */
+/** Where a release repository is seen: its page on GitHub, GitLab or Bitbucket, none for kiln's own. */
 export function releaseRepoUrl(e: Environment, hosts: GitHost[]): string | null {
   const h = repoHost(e, hosts);
   return h?.web ? `${h.web.replace(/\/$/, "")}/${e.release_repo.repo}` : null;
