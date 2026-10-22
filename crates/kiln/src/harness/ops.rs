@@ -421,13 +421,13 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.start",
-            summary: "Start agents to do part of the work: `kind` (claude, codex, gemini, opencode, goose, amp, antigravity), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
+            summary: "Start agents to do part of the work: `kind` (claude, codex, devin, gemini, opencode, goose, amp, antigravity), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
             read_only: false,
             destructive: false,
             input: || {
                 schema(
                     json!({
-                        "kind": {"type": "string", "description": "The harness: claude, codex, gemini, opencode, goose, amp or antigravity."},
+                        "kind": {"type": "string", "description": "The harness: claude, codex, devin, gemini, opencode, goose, amp or antigravity."},
                         "on": {"type": "string", "description": "A machine's name (local for the server), or what it needs: linux/amd64, macos, arm64, +gpu, cpus>=16, mem>=32g."},
                         "cwd": {"type": "string", "description": "Its folder there (a path, or ~/…)."},
                         "prompt": {"type": "string", "description": "Its first message: the task."},

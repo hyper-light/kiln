@@ -1,4 +1,4 @@
-//! Live AI coding-agent sessions on this machine: the Claude Code, Codex and Gemini CLI processes
+//! Live AI coding-agent sessions on this machine: the Claude Code, Codex, Devin and Gemini CLI processes
 //! running right now, summarized from the transcripts those tools write.
 //!
 //! - Claude Code keeps a `~/.claude/sessions/<pid>.json` record per running session (its id,
@@ -6,6 +6,8 @@
 //! - Codex writes `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, matched to its process by
 //!   directory and start time.
 //! - Gemini CLI is found by its process alone.
+//! - Devin keeps sessions and their main message chains in `devin/cli/sessions.db`; a held
+//!   `session_locks/<id>.lock` identifies the process that owns a conversation.
 //!
 //! A session whose process runs inside one of kiln's terminals is linked to that terminal, so any
 //! device can attach and drive it; the others can only be watched. Only transcript tails are read,
@@ -22,6 +24,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+mod devin;
+#[cfg(all(test, unix))]
+mod live_tests;
 
 /// Bytes read from the end of a transcript for its summary.
 const TAIL: u64 = 256 * 1024;
@@ -61,6 +67,7 @@ const CODEX_BATCH: &[&str] = &[
 enum Tool {
     Claude,
     Codex,
+    Devin,
     Gemini,
 }
 
@@ -69,6 +76,7 @@ impl Tool {
         match self {
             Tool::Claude => "claude",
             Tool::Codex => "codex",
+            Tool::Devin => "devin",
             Tool::Gemini => "gemini",
         }
     }
@@ -79,9 +87,9 @@ impl Tool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PastSession {
-    /// "claude" or "codex".
+    /// The harness (`"claude"`, `"codex"`, `"devin"`).
     pub kind: String,
-    /// The harness's own id: Claude Code's session, Codex's thread.
+    /// The harness's own conversation id.
     pub id: String,
     /// Its name (Claude Code's custom or generated title, Codex's thread name), else its last
     /// prompt's first line.
@@ -103,7 +111,7 @@ pub struct PastSession {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AiSession {
-    /// "claude", "codex" or "gemini".
+    /// "claude", "codex", "devin" or "gemini".
     pub tool: String,
     /// The tool's own session id (empty when it has none).
     pub id: String,
@@ -160,7 +168,7 @@ impl AiSession {
             TakeOver::NoId
         } else if held && self.terminal.is_some() {
             TakeOver::Ready
-        } else if native(kind) {
+        } else if native(kind) || kind.id == "devin" {
             TakeOver::Stop
         } else {
             TakeOver::Outside
@@ -378,6 +386,7 @@ pub struct Scanner {
     /// (`CODEX_HOME`, else `~/.codex`), as the sessions this machine starts use them.
     claude: PathBuf,
     codex: PathBuf,
+    devin: PathBuf,
     sys: System,
     /// Summaries by transcript, with the length and mtime they were read at.
     summaries: HashMap<PathBuf, (u64, SystemTime, Summary)>,
@@ -389,6 +398,9 @@ pub struct Scanner {
     codex_meta: HashMap<PathBuf, CodexHead>,
     /// Each reported session's transcript by pid, for [`Scanner::transcript`].
     open: HashMap<u32, (Tool, PathBuf)>,
+    /// Devin's database-backed conversations, by the interactive process that owns them.
+    devin_open: HashMap<u32, String>,
+    devin_running: HashSet<String>,
     /// Past sessions by transcript, with the length and mtime they were read at (`None`: not a
     /// conversation, e.g. nothing was ever asked).
     past: HashMap<PathBuf, (u64, SystemTime, Option<PastSession>)>,
@@ -400,12 +412,15 @@ impl Scanner {
         Self {
             claude: dir("CLAUDE_CONFIG_DIR", ".claude"),
             codex: dir("CODEX_HOME", ".codex"),
+            devin: if cfg!(windows) { dir("LOCALAPPDATA", "AppData/Local") } else { dir("XDG_DATA_HOME", ".local/share") }.join("devin/cli"),
             sys: System::new(),
             summaries: HashMap::new(),
             claude_files: HashMap::new(),
             codex_files: HashMap::new(),
             codex_meta: HashMap::new(),
             open: HashMap::new(),
+            devin_open: HashMap::new(),
+            devin_running: HashSet::new(),
             past: HashMap::new(),
         }
     }
@@ -430,6 +445,12 @@ impl Scanner {
         let mut out = Vec::new();
         let mut open = HashMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
+        let locks = devin::locks(&self.devin);
+        self.devin_running = locks.iter().filter(|(pid, _)| self.sys.process(Pid::from_u32(*pid)).and_then(tool_of) == Some(Tool::Devin)).map(|(_, id)| id.clone()).collect();
+        let owners = devin_owners(&self.sys, &locks);
+        let ids: Vec<String> = owners.values().cloned().collect();
+        let mut devin_records: HashMap<String, devin::Record> = devin::records(&self.devin, &ids).into_iter().map(|r| (r.id.clone(), r)).collect();
+        self.devin_open.clear();
 
         // Claude Code: one record per running session.
         let records_dir = self.claude.join("sessions");
@@ -491,12 +512,29 @@ impl Scanner {
                 Tool::Codex => self.codex_file(&p, &taken),
                 Tool::Claude => self.claude_file_by_cwd(&p, &taken),
                 Tool::Gemini => None,
+                Tool::Devin => None,
             };
             if let Some(f) = &file {
                 taken.insert(f.clone());
             }
             let summary = file.as_deref().and_then(|f| self.summary(tool, f));
             let mut s = self.session(tool, &p, file.as_deref(), summary, terminals);
+            if tool == Tool::Devin && let Some(record) = owners.get(&p.pid).and_then(|id| devin_records.remove(id)) {
+                let meta = Meta { id: record.id.clone(), title: record.title.clone(), cwd: record.cwd, model: record.model, ..Meta::default() };
+                let summary = summarize(meta, &record.entries);
+                s.id = record.id.clone();
+                s.name = record.title;
+                s.title = if summary.meta.title.is_empty() { first_line(&summary.last_prompt, 80) } else { summary.meta.title };
+                s.cwd = summary.meta.cwd;
+                s.model = summary.meta.model;
+                s.last_activity = record.last_activity.max(record.created_at).max(s.started_at);
+                s.last_prompt = clip(&summary.last_prompt, SNIPPET);
+                s.last_reply = clip(&summary.last_reply, SNIPPET);
+                s.transcript = !record.entries.is_empty();
+                let stalled = time::OffsetDateTime::now_utc().unix_timestamp().saturating_sub(s.last_activity) > STALLED.as_secs() as i64;
+                s.state = if !s.transcript { "starting" } else if summary.turn_ended || stalled { "waiting" } else { "working" }.into();
+                self.devin_open.insert(p.pid, record.id);
+            }
             // Claude Code without its record has not started a session yet.
             if tool == Tool::Claude && have_records {
                 s.state = "starting".into();
@@ -535,6 +573,9 @@ impl Scanner {
 
     /// Recent messages of the transcript of the session running as `pid` (as of the last scan).
     pub fn transcript(&self, pid: u32) -> Option<Vec<Entry>> {
+        if let Some(id) = self.devin_open.get(&pid) {
+            return devin::transcript(&self.devin, id, OPEN_ENTRIES);
+        }
         let (tool, file) = self.open.get(&pid)?;
         let len = std::fs::metadata(file).ok()?.len();
         let mut tail = OPEN_TAIL;
@@ -608,6 +649,7 @@ impl Scanner {
         let found = self.scan(&HashMap::new());
         let open: HashSet<PathBuf> = self.open.values().map(|(_, f)| f.clone()).collect();
         let mut skip: HashSet<String> = running.clone();
+        skip.extend(self.devin_running.iter().cloned());
         skip.extend(found.into_iter().map(|s| s.id).filter(|id| !id.is_empty()));
         for r in claude_records(&self.claude.join("sessions")) {
             if self.sys.process(Pid::from_u32(r.pid)).is_some_and(|p| tool_of(p) == Some(Tool::Claude)) {
@@ -660,6 +702,11 @@ impl Scanner {
         }
         if self.past.len() > HISTORY_CACHE {
             self.past.clear();
+        }
+        if want("devin") {
+            out.extend(devin::history(&self.devin, limit, &skip));
+            out.sort_by_key(|p| std::cmp::Reverse(p.last_activity));
+            out.truncate(limit);
         }
         out
     }
@@ -883,6 +930,7 @@ fn tool_of(p: &Process) -> Option<Tool> {
     let by_name = |n: &str| match n {
         "claude" => Some(Tool::Claude),
         "codex" => Some(Tool::Codex),
+        "devin" => Some(Tool::Devin),
         "gemini" => Some(Tool::Gemini),
         _ => None,
     };
@@ -909,7 +957,39 @@ fn tool_of(p: &Process) -> Option<Tool> {
     None
 }
 
-/// Whether `pid` runs the harness `kind` (`"claude"`, `"codex"` or `"gemini"`), as a scan would
+/// A native Devin REPL owns its ACP child's lock. A nested agent's lock and a process with
+/// several conversations do not identify which conversation a terminal is showing.
+fn devin_owners(sys: &System, locks: &[(u32, String)]) -> HashMap<u32, String> {
+    let mut owners: HashMap<u32, Vec<String>> = HashMap::new();
+    for (owner, id) in locks {
+        let mut pid = Pid::from_u32(*owner);
+        if sys.process(pid).and_then(tool_of) != Some(Tool::Devin) {
+            continue;
+        }
+        for _ in 0..MAX_DEPTH {
+            let Some(p) = sys.process(pid) else { break };
+            if tool_of(p) == Some(Tool::Devin) {
+                if interactive(Tool::Devin, &args_of(p)) {
+                    owners.entry(pid.as_u32()).or_default().push(id.clone());
+                    break;
+                }
+                if pid.as_u32() != *owner {
+                    break;
+                }
+            }
+            let Some(parent) = p.parent() else { break };
+            pid = parent;
+        }
+    }
+    owners.into_iter().filter_map(|(pid, ids)| {
+        if ids.len() != 1 {
+            return None;
+        }
+        ids.into_iter().next().map(|id| (pid, id))
+    }).collect()
+}
+
+/// Whether `pid` runs the harness `kind`, as a scan would
 /// find it.
 pub fn runs(pid: u32, kind: &str) -> bool {
     let p = Pid::from_u32(pid);
@@ -963,6 +1043,23 @@ fn interactive(tool: Tool, args: &[String]) -> bool {
         Tool::Claude => !rest.iter().any(|a| matches!(*a, "-p" | "--print")),
         Tool::Codex => rest.first().is_none_or(|a| !CODEX_BATCH.contains(a)),
         Tool::Gemini => !rest.iter().any(|a| matches!(*a, "-p" | "--prompt")),
+        Tool::Devin => {
+            let mut args = rest.into_iter().peekable();
+            while let Some(a) = args.next() {
+                match a {
+                    "--" => return true,
+                    "-p" | "--print" | "-h" | "--help" | "-V" | "--version" => return false,
+                    "--config" | "--model" | "--permission-mode" | "--prompt-file" | "--respect-workspace-trust" => { args.next(); }
+                    "--export" | "-r" | "--resume" => {
+                        if args.peek().is_some_and(|a| !a.starts_with('-')) { args.next(); }
+                    }
+                    a if a.starts_with("--print=") || a.starts_with("-p") => return false,
+                    a if a.starts_with('-') => {}
+                    a => return !["acp", "auth", "mcp", "models", "doctor", "rules", "skills", "plugins", "cloud", "desktop", "list", "ls", "rm", "ssh", "forward", "update", "version", "migrate", "sandbox", "setup", "uninstall", "help"].contains(&a),
+                }
+            }
+            true
+        }
     }
 }
 
@@ -1126,7 +1223,7 @@ fn parse(tool: Tool, lines: &[String]) -> (Meta, Vec<Entry>) {
     match tool {
         Tool::Claude => parse_claude(lines),
         Tool::Codex => parse_codex(lines),
-        Tool::Gemini => (Meta::default(), Vec::new()),
+        Tool::Gemini | Tool::Devin => (Meta::default(), Vec::new()),
     }
 }
 
@@ -1313,6 +1410,17 @@ mod tests {
     }
 
     #[test]
+    fn devin_native_sessions_exclude_helpers_and_print_runs() {
+        let is = |args: &[&str]| interactive(Tool::Devin, &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>());
+        for args in [vec!["devin"], vec!["devin", "-r", "auth"], vec!["devin", "--model", "codex", "--", "fix the build"], vec!["devin", "--", "auth"]] {
+            assert!(is(&args), "{args:?}");
+        }
+        for args in [vec!["devin", "acp"], vec!["devin", "auth", "status"], vec!["devin", "--config", "/tmp/config", "list"], vec!["devin", "--model", "opus", "-p", "hello"], vec!["devin", "--export", "-p", "hello"], vec!["devin", "--resume", "--print=hello"], vec!["devin", "--print=hello"], vec!["devin", "--help"]] {
+            assert!(!is(&args), "{args:?}");
+        }
+    }
+
+    #[test]
     fn claude_transcript() {
         let (meta, entries) = parse_claude(&lines(concat!(
             r#"{"type":"ai-title","aiTitle":"Fix flaky test","sessionId":"abc"}"#, "\n",
@@ -1413,6 +1521,54 @@ mod tests {
         let _ = child.wait();
         let found = found.map(|f| (f.tool, f.terminal));
         assert_eq!(found, Some(("claude".to_owned(), Some("t-elsewhere".to_owned()))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_native_devin_session_uses_its_held_lock_and_enters_history_once_ended() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use rusqlite::params;
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("data");
+        let locks = root.join("session_locks");
+        std::fs::create_dir_all(&locks)?;
+        let program = home.path().join("devin");
+        std::fs::write(&program, "#!/bin/sh\nsleep 30\n")?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+        let db = rusqlite::Connection::open(root.join("sessions.db"))?;
+        db.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, model TEXT, title TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER); CREATE TABLE message_nodes (session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, UNIQUE(session_id, node_id));")?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        db.execute("INSERT INTO sessions VALUES ('native', '/work', 'model', 'Native conversation', ?1, ?1, 2, 0)", params![now])?;
+        for (id, parent, role, text) in [(1, None, "user", "native question"), (2, Some(1), "assistant", "native answer")] {
+            db.execute("INSERT INTO message_nodes VALUES ('native', ?1, ?2, ?3)", params![id, parent, serde_json::json!({"role": role, "content": text}).to_string()])?;
+        }
+        let mut child = std::process::Command::new(&program).env("KILN_TERM_SESSION", "native-terminal").spawn()?;
+        let mut lock = std::fs::File::create(locks.join("native.lock"))?;
+        writeln!(lock, "{}", child.id())?;
+        lock.lock()?;
+        let mut sc = Scanner::new(home.path().to_owned());
+        sc.devin = root;
+        let mut found = None;
+        for _ in 0..50 {
+            found = sc.scan(&HashMap::new()).into_iter().find(|s| s.pid == child.id() && s.id == "native");
+            if found.is_some() { break }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let entries = sc.transcript(child.id());
+        let active_history = sc.history(Some("devin"), 10, &HashSet::new());
+        let ambiguous = devin_owners(&sc.sys, &[(child.id(), "native".into()), (child.id(), "another".into())]);
+        let _ = end(child.id(), true);
+        let _ = child.wait();
+        let past = sc.history(Some("devin"), 10, &HashSet::new());
+        let found = found.ok_or_else(|| anyhow::anyhow!("native session not found"))?;
+        assert_eq!((found.tool.as_str(), found.title.as_str(), found.model.as_str(), found.last_prompt.as_str(), found.last_reply.as_str()), ("devin", "Native conversation", "model", "native question", "native answer"));
+        assert_eq!(found.terminal.as_deref(), Some("native-terminal"));
+        assert_eq!(found.takeover(true), TakeOver::Ready);
+        assert_eq!(entries.unwrap_or_default().iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), ["native question", "native answer"]);
+        assert!(active_history.is_empty() && ambiguous.is_empty());
+        assert_eq!(past.iter().map(|p| (p.id.as_str(), p.last_prompt.as_str())).collect::<Vec<_>>(), [("native", "native question")]);
+        Ok(())
     }
 
     #[test]
@@ -1539,6 +1695,10 @@ mod tests {
         let acp = AiSession { tool: "gemini".into(), terminal: None, ..s.clone() };
         assert_eq!(acp.takeover(true), TakeOver::Outside);
         assert!(acp.takeover_spec(true).is_none());
+        let devin = AiSession { tool: "devin".into(), terminal: None, ..s.clone() };
+        assert_eq!(devin.takeover(true), TakeOver::Stop);
+        assert!(devin.takeover_spec(true).is_some_and(|s| s.takeover_stop && s.kind == "devin"));
+        assert!(!devin.forkable() && devin.fork_spec().is_none());
         // A copy leaves it running: a branch of its conversation, with no process to wait for.
         let fork = s.fork_spec().unwrap_or_default();
         assert_eq!((fork.fork, fork.takeover_pid, fork.resume.as_deref(), fork.name.as_deref()), (true, None, Some("8b2c"), Some("fix the build (branch)")));

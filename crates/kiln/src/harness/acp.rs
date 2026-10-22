@@ -7,23 +7,27 @@
 //! kiln advertises no file-system or terminal capabilities, so agents use their own tools.
 //! ACP has no way into a running turn: a "steer" waits for the turn like a queued message.
 //!
-//! Written against the ACP specification (protocol version 1); not yet run against a real
-//! install of any of these harnesses (they are marked unverified).
+//! Devin CLI (`devin acp`) uses this adapter too, including ACP's session config options.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::core::{Baseline, Core};
+use super::core::{Baseline, Core, Effect};
 use super::model::{
-    AlwaysOption, Approval, Body, Command, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, QueueItem, SendMode,
+    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, QueueItem, SendMode,
     Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
 };
 
+#[cfg(test)]
+mod config_tests;
+#[cfg(test)]
+mod live_tests;
+
 /// kiln's own commands for an ACP agent.
-fn acp_extras() -> Vec<SlashCommand> {
-    vec![
+fn acp_extras(account: bool) -> Vec<SlashCommand> {
+    let mut commands = vec![
         SlashCommand::control("export", "The conversation as Markdown", "", "Session", json!({"type": "control", "id": "export", "value": {"client": "{client}"}})),
         SlashCommand::view("status", "The agent and what it can do", "Session", "status"),
         SlashCommand::view("model", "The model and mode", "Model & mode", "model"),
@@ -33,7 +37,12 @@ fn acp_extras() -> Vec<SlashCommand> {
         SlashCommand::view("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
         SlashCommand::view("screen", "The agent's own terminal interface, in its folder", "Kiln", "screen"),
         SlashCommand::view("goals", "Goals one after another: each sent once the one before is done", "Kiln", "goals"),
-    ]
+    ];
+    if account {
+        commands.push(SlashCommand::view("login", "Sign in to the harness on this machine", "Session", "login"));
+        commands.push(SlashCommand::view("logout", "Sign out of the harness on this machine", "Session", "logout"));
+    }
+    commands
 }
 
 /// What an ACP agent cannot do from kiln.
@@ -65,9 +74,12 @@ fn status_rows(init: &Value) -> Vec<StatusItem> {
 enum Pending {
     Initialize,
     Session,
+    Refresh,
+    RefreshNew,
     Prompt(String),
     SetMode(String),
     SetModel(String),
+    SetConfig(Option<String>, bool),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +125,45 @@ pub struct Acp {
     /// went on here from another machine, `super::moving`).
     #[serde(default)]
     context: Option<String>,
+    /// Config options replace the older model and mode setters when the agent offers them.
+    #[serde(default)]
+    config: Vec<Value>,
+    #[serde(default)]
+    has_config: bool,
+    /// Requested settings, applied one by one before the first prompt (model before effort).
+    #[serde(default)]
+    settings: Vec<(String, String)>,
+    /// Later startup setters can reset the mode; no prompt may escape its requested permission.
+    #[serde(default)]
+    startup_mode: Option<String>,
+    /// Settings received together wait for each reply, since one can change the next's choices.
+    #[serde(default)]
+    changes: Vec<(String, Value)>,
+    #[serde(default)]
+    configuring: Option<u64>,
+    /// A rejected startup value is retried after signing in, when its choices can change.
+    #[serde(default)]
+    applying: Option<(String, String)>,
+    #[serde(default)]
+    failed_setting: Option<String>,
+    /// Older images handed over sessions that were already open.
+    #[serde(default = "ready")]
+    ready: bool,
+    #[serde(default)]
+    replaying: bool,
+    /// Its account can be managed through kiln's existing account card.
+    #[serde(default)]
+    account: bool,
+    /// A sign-in reloads credentials once the current turn and its requests have finished.
+    #[serde(default)]
+    refresh: bool,
+    /// Only a new conversation with no prompt or history may be replaced after signing in.
+    #[serde(default)]
+    empty: bool,
+}
+
+fn ready() -> bool {
+    true
 }
 
 /// kiln's own permission modes, for agents whose own all keep their checks: kiln asks you, or
@@ -130,6 +181,7 @@ fn kiln_bypass() -> ModeOption {
 
 impl Acp {
     pub fn new(resume: Option<String>) -> Self {
+        let empty = resume.is_none();
         Self {
             next_id: 0,
             pending: HashMap::new(),
@@ -150,7 +202,31 @@ impl Acp {
             bypass: false,
             mcp: Vec::new(),
             context: None,
+            config: Vec::new(),
+            has_config: false,
+            settings: Vec::new(),
+            startup_mode: None,
+            changes: Vec::new(),
+            configuring: None,
+            applying: None,
+            failed_setting: None,
+            ready: false,
+            replaying: false,
+            account: false,
+            refresh: false,
+            empty,
         }
+    }
+
+    pub fn from_spec(spec: &super::session::Spec) -> Self {
+        let mut a = Self::new(spec.resume.clone()).with_mode(spec.mode.as_deref());
+        a.account = spec.kind == "devin";
+        for (category, value) in [("model", &spec.model), ("thought_level", &spec.effort)] {
+            if let Some(v) = value.as_ref().filter(|v| !v.is_empty()) {
+                a.settings.push((category.into(), v.clone()));
+            }
+        }
+        a
     }
 
     /// The conversation so far, in words, to give with the first message it sends.
@@ -166,6 +242,10 @@ impl Acp {
     /// Starts in this mode: kiln's Bypass goes on at once (the agent's own modes it is told of).
     pub fn with_mode(mut self, mode: Option<&str>) -> Self {
         self.bypass = mode == Some(KILN_BYPASS);
+        if let Some(m) = mode.filter(|m| !m.is_empty() && *m != KILN_BYPASS && *m != KILN_ASK) {
+            self.startup_mode = Some(m.into());
+            self.settings.push(("mode".into(), m.into()));
+        }
         self
     }
 
@@ -185,7 +265,7 @@ impl Acp {
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.prompting.is_some() || !core.state.approvals.is_empty()
+        self.prompting.is_some() || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _))) || !core.state.approvals.is_empty()
     }
 
     fn settle(&self, core: &mut Core) {
@@ -205,11 +285,12 @@ impl Acp {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        self.replaying = self.resume.is_some() && core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
         core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments"].iter().map(|s| (*s).to_owned()).collect();
         core.touch_meta();
         // kiln's commands until the agent lists its own.
         if core.meta.commands.is_empty() {
-            core.meta.commands = sort_catalog(acp_extras());
+            core.meta.commands = sort_catalog(acp_extras(self.account));
         }
         // ACP has no way to report MCP servers, skills, plugins or plan limits.
         core.state.inventory = Inventory { mcp: Known::Unsupported, skills: Known::Unsupported, plugins: Known::Unsupported, limits: Known::Unsupported };
@@ -220,7 +301,7 @@ impl Acp {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
+                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}}},
                 "clientInfo": {"name": "kiln", "version": env!("CARGO_PKG_VERSION")},
             }),
         );
@@ -273,37 +354,28 @@ impl Acp {
             Command::QueueSteer { .. } => {}
             Command::Approve { id, decision, message, always, .. } => self.answer(core, &id, decision, message, always),
             Command::Interrupt => self.cancel(core),
-            Command::SetMode { mode } => {
-                if mode == KILN_BYPASS || mode == KILN_ASK {
-                    // kiln's own: the agent's mode stays as it is.
-                    self.bypass = mode == KILN_BYPASS;
-                    core.state.mode = mode;
-                    core.touch_state();
-                    if self.bypass {
-                        // What waits for you now goes ahead too.
-                        let waiting: Vec<String> = self.asks.keys().cloned().collect();
-                        for id in waiting {
-                            self.answer(core, &id, Decision::Allow, None, None);
-                        }
-                    }
-                } else if let Some(s) = self.session.clone() {
-                    self.bypass = false;
-                    self.request(core, Pending::SetMode(mode.clone()), "session/set_mode", json!({"sessionId": s, "modeId": mode}));
-                }
-            }
-            Command::SetModel { model, .. } => {
-                if let Some(s) = self.session.clone() {
-                    self.request(core, Pending::SetModel(model.clone()), "session/set_model", json!({"sessionId": s, "modelId": model}));
-                }
-            }
+            Command::SetMode { mode } => self.change(core, "mode".into(), json!(mode)),
+            Command::SetModel { model, .. } => self.change(core, "model".into(), json!(model)),
+            Command::SetEffort { effort } => self.change(core, "thought_level".into(), json!(effort)),
             Command::Suggest { client, .. } => core.reply(client, json!({"suggestions": []})),
-            // ACP has no effort setting and no other controls than modes and models; kiln exports
-            // the conversation from its timeline.
+            // kiln exports the conversation from its timeline.
             Command::Control { id, value } if id == "export" => {
                 let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("").to_owned();
                 core.reply(client, json!({"title": "Conversation", "text": core.export(), "format": "markdown", "filename": "conversation.md"}));
             }
-            Command::SetEffort { .. } | Command::Control { .. } => {}
+            Command::Control { id, .. } if id == "account" && self.account => {
+                if core.state.status != Status::Exited {
+                    self.refresh = true;
+                    self.next(core);
+                }
+            }
+            Command::Control { id, value } => {
+                if id.starts_with("acp:")
+                    && let Some(value) = value
+                {
+                    self.change(core, id, value);
+                }
+            }
             Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
@@ -333,6 +405,286 @@ impl Acp {
     /// Nothing runs beside an ACP agent.
     pub fn run_done(&mut self, _core: &mut Core, _job: &str, _code: Option<i32>, _output: &str) {}
 
+    fn account_refresh(&mut self, core: &mut Core) -> bool {
+        if !self.refresh {
+            return false;
+        }
+        if self.busy(core) || core.state.status == Status::Exited {
+            return true;
+        }
+        self.refresh = false;
+        if self.ready && self.startup_mode.is_none() && !core.state.mode.is_empty() && core.state.mode != KILN_ASK && core.state.mode != KILN_BYPASS {
+            self.startup_mode = Some(core.state.mode.clone());
+        }
+        self.ready = false;
+        self.replaying = core.events().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
+        let cwd = core.state.cwd.clone();
+        match self.session.clone() {
+            Some(s) if self.can_load => self.request(core, Pending::Refresh, "session/load", json!({"sessionId": s, "cwd": cwd, "mcpServers": self.mcp})),
+            Some(_) => self.notice(core, Level::Error, "This agent cannot reload its account in an open session."),
+            None => self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp})),
+        }
+        true
+    }
+
+    fn change(&mut self, core: &mut Core, id: String, value: Value) {
+        if !self.ready && let Some(category) = self.failed_setting.as_deref()
+            && (id == category || id.strip_prefix("acp:").is_some_and(|id| self.config_id(category).as_deref() == Some(id)))
+            && let Some(value) = value.as_str()
+        {
+            self.applying = Some((category.into(), value.into()));
+            if category == "mode" {
+                self.startup_mode = Some(value.into());
+            }
+        }
+        self.changes.push((id, value));
+        self.next_change(core);
+    }
+
+    fn next_change(&mut self, core: &mut Core) -> bool {
+        if self.changes.is_empty() {
+            return false;
+        }
+        if self.refresh || self.session.is_none() || (!self.ready && self.failed_setting.is_none()) || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _))) {
+            return true;
+        }
+        while !self.changes.is_empty() {
+            let (id, value) = self.changes.remove(0);
+            if let Some(config) = id.strip_prefix("acp:") {
+                if self.set_option(core, config, value) {
+                    return true;
+                }
+                continue;
+            }
+            let Some(value) = value.as_str() else { continue };
+            if id == "mode" {
+                if self.local_mode(core, value) {
+                    if !self.ready && self.failed_setting.as_deref() == Some("mode") && self.startup_mode.as_deref() == Some(value) {
+                        self.failed_setting = None;
+                        self.applying = None;
+                        self.configured(core);
+                        return true;
+                    }
+                    continue;
+                }
+                self.bypass = false;
+            }
+            if self.config_id(&id).is_some() {
+                if self.set_config(core, &id, value) {
+                    return true;
+                }
+            } else if !self.has_config && let Some(s) = self.session.clone() {
+                match id.as_str() {
+                    "mode" => self.request(core, Pending::SetMode(value.into()), "session/set_mode", json!({"sessionId": s, "modeId": value})),
+                    "model" => self.request(core, Pending::SetModel(value.into()), "session/set_model", json!({"sessionId": s, "modelId": value})),
+                    _ => continue,
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn local_mode(&mut self, core: &mut Core, mode: &str) -> bool {
+        if mode != KILN_BYPASS && mode != KILN_ASK {
+            return false;
+        }
+        // kiln's own: the agent's mode stays as it is.
+        self.bypass = mode == KILN_BYPASS;
+        core.state.mode = mode.into();
+        core.touch_state();
+        if self.bypass {
+            core.effects.push(Effect::AllowBypass);
+            let waiting: Vec<String> = self.asks.keys().cloned().collect();
+            for id in waiting {
+                self.answer(core, &id, Decision::Allow, None, None);
+            }
+        }
+        true
+    }
+
+    fn config_id(&self, category: &str) -> Option<String> {
+        self.config.iter().filter(|c| c.get("category").and_then(Value::as_str) == Some(category) && c.get("type").and_then(Value::as_str) == Some("select") && c.get("currentValue").and_then(Value::as_str).is_some()).find_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
+    }
+
+    /// The category picks the prominent selector; every other option remains a regular control.
+    fn config_options(&mut self, core: &mut Core, options: &[Value]) {
+        self.has_config = true;
+        self.config = options.to_vec();
+        core.meta.models.clear();
+        core.meta.modes.clear();
+        core.meta.efforts.clear();
+        core.meta.controls.retain(|c| !c.id.starts_with("acp:"));
+        core.state.control_values.retain(|id, _| !id.starts_with("acp:"));
+        core.meta.features.retain(|f| f != "set_model" && f != "set_effort");
+        let mut primary = std::collections::HashSet::new();
+        for c in options {
+            let Some(id) = c.get("id").and_then(Value::as_str) else { continue };
+            let category = c.get("category").and_then(Value::as_str).unwrap_or("");
+            let current = c.get("currentValue").cloned().unwrap_or(Value::Null);
+            let kind = match c.get("type").and_then(Value::as_str) {
+                Some("select") if current.is_string() => ControlKind::Select,
+                Some("boolean") if current.is_boolean() => ControlKind::Toggle,
+                _ => continue,
+            };
+            let choices = config_choices(c);
+            let prominent = kind == ControlKind::Select && matches!(category, "model" | "mode" | "thought_level") && primary.insert(category);
+            if prominent {
+                match category {
+                    "model" => {
+                        core.meta.models = choices.iter().map(|o| ModelOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), ..ModelOption::default() }).collect();
+                        core.state.model = current.as_str().unwrap_or_default().to_owned();
+                        core.meta.features.push("set_model".into());
+                    }
+                    "mode" => {
+                        core.meta.modes = choices.iter().map(|o| ModeOption { id: o.id.clone(), label: o.label.clone(), description: o.description.clone(), dangerous: o.dangerous }).collect();
+                        if !self.bypass {
+                            core.state.mode = current.as_str().unwrap_or_default().to_owned();
+                        }
+                    }
+                    "thought_level" => {
+                        core.meta.efforts = choices;
+                        core.state.effort = current.as_str().unwrap_or_default().to_owned();
+                        core.meta.features.push("set_effort".into());
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let key = format!("acp:{id}");
+            core.state.control_values.insert(key.clone(), current.clone());
+            core.meta.controls.push(Control {
+                id: key,
+                group: match category { "mode" => "Permissions", "thought_level" => "Thinking", "model" | "model_config" => "Model", _ => "Session" }.into(),
+                label: c.get("name").and_then(Value::as_str).unwrap_or(id).into(),
+                description: c.get("description").and_then(Value::as_str).unwrap_or_default().into(),
+                kind,
+                options: choices,
+                value: Some(current),
+                dangerous: false,
+                per_turn: false,
+                requires: None,
+                scope: Default::default(),
+                input: None,
+            });
+        }
+        if !primary.contains("model") {
+            core.state.model.clear();
+        }
+        if !primary.contains("thought_level") {
+            core.state.effort.clear();
+        }
+        if !primary.contains("mode") {
+            core.meta.modes.push(kiln_ask());
+            core.state.mode = KILN_ASK.into();
+        }
+        if !core.meta.modes.iter().any(|m| m.dangerous) {
+            core.meta.modes.push(kiln_bypass());
+        }
+        if self.bypass {
+            core.state.mode = KILN_BYPASS.into();
+        }
+        core.touch_meta();
+        core.touch_state();
+    }
+
+    fn set_option(&mut self, core: &mut Core, id: &str, value: Value) -> bool {
+        let Some(s) = self.session.clone() else { return false };
+        let Some(c) = self.config.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(id)) else { return false };
+        let boolean = match c.get("type").and_then(Value::as_str) {
+            Some("boolean") if c.get("currentValue").is_some_and(Value::is_boolean) => true,
+            Some("select") if c.get("currentValue").is_some_and(Value::is_string) => false,
+            _ => return false,
+        };
+        let valid = if boolean { value.is_boolean() } else { value.as_str().is_some_and(|v| config_choices(c).iter().any(|o| o.id == v)) };
+        if !valid {
+            self.notice(core, Level::Warn, format!("The agent does not offer that value for {id}."));
+            return false;
+        }
+        let params = if boolean {
+            json!({"sessionId": s, "configId": id, "type": "boolean", "value": value})
+        } else {
+            json!({"sessionId": s, "configId": id, "value": value})
+        };
+        let category = c.get("category").and_then(Value::as_str).filter(|category| self.config_id(category).as_deref() == Some(id)).map(str::to_owned);
+        let bypass = category.as_deref() == Some("mode") && value.as_str().is_some_and(|mode| super::lineage::acp_level(mode) == Some(super::lineage::Level::Bypass));
+        self.request(core, Pending::SetConfig(category, bypass), "session/set_config_option", params);
+        true
+    }
+
+    fn set_config(&mut self, core: &mut Core, category: &str, value: &str) -> bool {
+        let Some(id) = self.config_id(category) else { return false };
+        self.set_option(core, &id, json!(value))
+    }
+
+    fn configured(&mut self, core: &mut Core) {
+        self.configuring = None;
+        while !self.settings.is_empty() {
+            let (category, value) = self.settings.remove(0);
+            self.applying = Some((category.clone(), value.clone()));
+            if category == "mode" && self.local_mode(core, &value) {
+                self.applying = None;
+                continue;
+            }
+            if self.config_id(&category).is_some() {
+                if self.set_config(core, &category, &value) {
+                    self.configuring = Some(self.next_id);
+                }
+            } else if !self.has_config {
+                let Some(s) = self.session.clone() else { return };
+                match category.as_str() {
+                    "mode" => self.request(core, Pending::SetMode(value.clone()), "session/set_mode", json!({"sessionId": s, "modeId": value})),
+                    "model" => self.request(core, Pending::SetModel(value.clone()), "session/set_model", json!({"sessionId": s, "modelId": value})),
+                    _ => {
+                        self.applying = None;
+                        continue;
+                    }
+                }
+                self.configuring = Some(self.next_id);
+            }
+            if self.configuring.is_none() {
+                self.failed_setting = Some(category.clone());
+                self.notice(core, Level::Error, format!("The agent could not apply the requested {category}; no prompt was sent."));
+                self.next(core);
+            }
+            return;
+        }
+        if let Some(mode) = &self.startup_mode && core.state.mode != *mode {
+            self.failed_setting = Some("mode".into());
+            self.applying = Some(("mode".into(), mode.clone()));
+            self.notice(core, Level::Error, format!("The agent did not keep the requested mode {mode}; no prompt was sent. Choose a mode to continue."));
+            self.next(core);
+            return;
+        }
+        self.startup_mode = None;
+        self.ready = true;
+        core.set_status(Status::Idle);
+        self.next(core);
+    }
+
+    fn setting_done(&mut self, core: &mut Core, id: &Value, category: Option<&str>) {
+        let corrected = !self.ready && self.configuring.is_none() && category.is_some() && category == self.failed_setting.as_deref();
+        if (self.configuring.is_some() && id.as_u64() == self.configuring) || corrected {
+            self.failed_setting = None;
+            self.applying = None;
+            self.configured(core);
+        } else {
+            self.next(core);
+        }
+    }
+
+    fn setting_failed(&mut self, core: &mut Core, id: &Value, category: Option<&str>, message: &str) {
+        if self.configuring.is_some() && id.as_u64() == self.configuring {
+            self.configuring = None;
+            self.failed_setting = category.map(str::to_owned);
+            self.notice(core, Level::Error, format!("The agent could not apply the requested settings: {message}. No prompt was sent."));
+            self.next(core);
+        } else {
+            self.notice(core, Level::Warn, message);
+            self.next(core);
+        }
+    }
+
     fn cancel(&mut self, core: &mut Core) {
         let Some(s) = self.session.clone() else { return };
         if self.prompting.is_none() {
@@ -354,7 +706,7 @@ impl Acp {
         if core.state.goal.is_empty() {
             core.state.goal = clip_middle(&m.text, 600).0;
         }
-        if self.session.is_none() {
+        if !self.ready || self.session.is_none() {
             self.show(core, &m, Delivery::Queued);
             self.waiting.push(m);
             return;
@@ -376,6 +728,7 @@ impl Acp {
 
     fn prompt(&mut self, core: &mut Core, m: QueueItem) {
         let Some(s) = self.session.clone() else { return };
+        self.empty = false;
         self.close_streams(core);
         // Images inline where the agent takes them; everything else as a link to the file. The
         // conversation so far comes first, once, when it went on here from another machine.
@@ -410,7 +763,13 @@ impl Acp {
     }
 
     fn next(&mut self, core: &mut Core) {
-        if self.busy(core) || self.session.is_none() || core.state.status == Status::Exited {
+        if self.account_refresh(core) {
+            return;
+        }
+        if self.next_change(core) {
+            return;
+        }
+        if self.busy(core) || !self.ready || self.session.is_none() || core.state.status == Status::Exited {
             return;
         }
         // A pause (or a switch) holds what waits, and the stop point may start one here.
@@ -472,6 +831,9 @@ impl Acp {
             self.waiting.insert(0, m);
         }
         self.settle(core);
+        if self.refresh {
+            self.next(core);
+        }
     }
 
     // ------------------------------------------------------------------ stdout
@@ -502,6 +864,7 @@ impl Acp {
 
     fn response(&mut self, core: &mut Core, id: &Value, v: &Value) {
         let Some(kind) = id.as_u64().and_then(|n| self.pending.remove(&n)) else { return };
+        let refreshed = matches!(&kind, Pending::Refresh | Pending::RefreshNew);
         let result = v.get("result").cloned().unwrap_or(Value::Null);
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("request failed").to_owned();
@@ -528,13 +891,28 @@ impl Acp {
                     self.notice(core, Level::Error, format!("The agent could not open a session: {msg}{hint}"));
                     core.set_status(Status::Idle);
                 }
+                Pending::Refresh if self.empty && err.get("code").and_then(Value::as_i64) == Some(-32016) => {
+                    self.session = None;
+                    core.state.harness_session = None;
+                    self.replaying = false;
+                    core.touch_state();
+                    self.request(core, Pending::RefreshNew, "session/new", json!({"cwd": core.state.cwd, "mcpServers": self.mcp}));
+                }
+                Pending::Refresh | Pending::RefreshNew => {
+                    self.replaying = false;
+                    self.notice(core, Level::Error, format!("The agent could not reload its account: {msg}. Sign in again to retry."));
+                    core.set_status(Status::Idle);
+                }
                 Pending::Initialize => self.notice(core, Level::Error, format!("The agent did not start: {msg}")),
-                Pending::SetMode(_) | Pending::SetModel(_) => self.notice(core, Level::Warn, msg),
+                Pending::SetMode(_) => self.setting_failed(core, id, Some("mode"), &msg),
+                Pending::SetModel(_) => self.setting_failed(core, id, Some("model"), &msg),
+                Pending::SetConfig(category, _) => self.setting_failed(core, id, category.as_deref(), &msg),
             }
             return;
         }
         match kind {
             Pending::Initialize => {
+                self.ready = false;
                 self.can_load = result.pointer("/agentCapabilities/loadSession").and_then(Value::as_bool).unwrap_or(false);
                 self.images = result.pointer("/agentCapabilities/promptCapabilities/image").and_then(Value::as_bool).unwrap_or(false);
                 if let Some(info) = result.get("agentInfo") {
@@ -558,8 +936,9 @@ impl Acp {
                     }
                 }
             }
-            Pending::Session => {
+            Pending::Session | Pending::Refresh | Pending::RefreshNew => {
                 self.close_streams(core);
+                self.replaying = false;
                 if let Some(s) = result.get("sessionId").and_then(Value::as_str) {
                     self.session = Some(s.to_owned());
                     core.state.harness_session = Some(s.to_owned());
@@ -618,10 +997,35 @@ impl Acp {
                         core.state.model = c.to_owned();
                     }
                     core.touch_meta();
+                    if !core.meta.features.iter().any(|f| f == "set_model") {
+                        core.meta.features.push("set_model".into());
+                    }
                 }
-                core.set_status(Status::Idle);
+                if let Some(options) = result.get("configOptions").and_then(Value::as_array) {
+                    self.config_options(core, options);
+                } else if self.has_config {
+                    self.config_options(core, &self.config.clone());
+                }
                 core.touch_state();
-                self.next(core);
+                if refreshed {
+                    if self.applying.as_ref().is_some_and(|(category, _)| Some(category) == self.failed_setting.as_ref()) && let Some(setting) = self.applying.take() {
+                        self.settings.insert(0, setting);
+                        self.failed_setting = None;
+                    }
+                    if let Some(mode) = &self.startup_mode {
+                        if core.state.mode != *mode && !self.settings.iter().any(|(category, _)| category == "mode") {
+                            self.settings.insert(0, ("mode".into(), mode.clone()));
+                        }
+                        if self.failed_setting.as_deref() == Some("mode") {
+                            self.failed_setting = None;
+                        }
+                    }
+                    if self.failed_setting.is_some() {
+                        self.next(core);
+                        return;
+                    }
+                }
+                self.configured(core);
             }
             Pending::Prompt(id) => {
                 self.close_streams(core);
@@ -649,6 +1053,11 @@ impl Acp {
                     }
                 }
                 core.state.usage.turns += 1;
+                if let Some(usage) = result.get("usage") {
+                    core.state.usage.input_tokens += usage.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
+                    core.state.usage.output_tokens += usage.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
+                    core.state.usage.cache_read_tokens += usage.get("cachedReadTokens").and_then(Value::as_u64).unwrap_or(0);
+                }
                 // How it ended, for kiln's keep-going.
                 let how = match stop {
                     "end_turn" => "done",
@@ -664,12 +1073,33 @@ impl Acp {
                 self.next(core);
             }
             Pending::SetMode(m) => {
-                core.state.mode = m;
-                core.touch_state();
+                let bypass = super::lineage::acp_level(&m) == Some(super::lineage::Level::Bypass);
+                if !self.has_config {
+                    core.state.mode = m;
+                    core.touch_state();
+                }
+                if bypass && super::lineage::acp_level(&core.state.mode) == Some(super::lineage::Level::Bypass) {
+                    core.effects.push(Effect::AllowBypass);
+                }
+                self.setting_done(core, id, Some("mode"));
             }
             Pending::SetModel(m) => {
-                core.state.model = m;
-                core.touch_state();
+                if !self.has_config {
+                    core.state.model = m;
+                    core.touch_state();
+                }
+                self.setting_done(core, id, Some("model"));
+            }
+            Pending::SetConfig(category, bypass) => {
+                if let Some(options) = result.get("configOptions").and_then(Value::as_array) {
+                    self.config_options(core, options);
+                    if bypass && super::lineage::acp_level(&core.state.mode) == Some(super::lineage::Level::Bypass) {
+                        core.effects.push(Effect::AllowBypass);
+                    }
+                    self.setting_done(core, id, category.as_deref());
+                } else {
+                    self.setting_failed(core, id, category.as_deref(), "The agent returned no configuration after changing a setting");
+                }
             }
         }
     }
@@ -756,9 +1186,19 @@ impl Acp {
     }
 
     fn update(&mut self, core: &mut Core, u: &Value) {
+        let history = matches!(u.get("sessionUpdate").and_then(Value::as_str), Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update"));
+        if history {
+            self.empty = false;
+        }
+        if self.replaying && history {
+            return;
+        }
         match u.get("sessionUpdate").and_then(Value::as_str).unwrap_or("") {
             "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" => {
                 let kind = u.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+                if (kind == "user_message_chunk" && (self.cur_agent.is_some() || self.cur_thought.is_some())) || (kind != "user_message_chunk" && self.cur_user.is_some()) {
+                    self.close_streams(core);
+                }
                 let text = content_text(u.get("content"));
                 if text.is_empty() {
                     return;
@@ -850,25 +1290,64 @@ impl Acp {
                             .collect()
                     })
                     .unwrap_or_default();
-                cmds.extend(acp_extras());
+                if self.account {
+                    cmds.retain(|c| c.name != "login" && c.name != "logout");
+                }
+                cmds.extend(acp_extras(self.account));
                 core.meta.commands = sort_catalog(cmds);
                 core.touch_meta();
             }
             "current_mode_update" => {
-                if let Some(m) = u.get("currentModeId").and_then(Value::as_str) {
+                if !self.has_config && !self.bypass && let Some(m) = u.get("currentModeId").and_then(Value::as_str) {
                     core.state.mode = m.to_owned();
                     core.touch_state();
                 }
+            }
+            "config_option_update" => {
+                if let Some(options) = u.get("configOptions").and_then(Value::as_array) {
+                    self.config_options(core, options);
+                }
+            }
+            "usage_update" => {
+                core.state.usage.context_tokens = u.get("used").and_then(Value::as_u64);
+                core.state.usage.context_window = u.get("size").and_then(Value::as_u64);
+                if let Some(cost) = u.get("cost").filter(|c| c.get("currency").and_then(Value::as_str) == Some("USD")).and_then(|c| c.get("amount")).and_then(Value::as_f64) {
+                    core.state.usage.cost_usd = cost;
+                }
+                core.touch_state();
             }
             _ => {}
         }
     }
 }
 
+/// ACP selects are flat or grouped; kiln's existing selectors keep each group's name in its labels.
+fn config_choices(c: &Value) -> Vec<ControlOption> {
+    let mut choices = Vec::new();
+    for option in c.get("options").and_then(Value::as_array).into_iter().flatten() {
+        let (group, values) = match option.get("options").and_then(Value::as_array) {
+            Some(values) => (option.get("name").and_then(Value::as_str), values.as_slice()),
+            None => (None, std::slice::from_ref(option)),
+        };
+        for value in values {
+            let Some(id) = value.get("value").and_then(Value::as_str) else { continue };
+            let name = value.get("name").and_then(Value::as_str).unwrap_or(id);
+            choices.push(ControlOption {
+                id: id.into(),
+                label: group.map_or_else(|| name.to_owned(), |g| format!("{g} · {name}")),
+                description: value.get("description").and_then(Value::as_str).unwrap_or_default().into(),
+                dangerous: super::lineage::acp_level(id) == Some(super::lineage::Level::Bypass),
+            });
+        }
+    }
+    choices
+}
+
 fn content_text(c: Option<&Value>) -> String {
     match c {
         Some(Value::Object(o)) if o.get("type").and_then(Value::as_str) == Some("text") => o.get("text").and_then(Value::as_str).unwrap_or("").to_owned(),
         Some(Value::Object(o)) if o.get("type").and_then(Value::as_str) == Some("resource_link") => o.get("uri").and_then(Value::as_str).map(|u| format!("[{u}]")).unwrap_or_default(),
+        Some(Value::Object(o)) if o.get("type").and_then(Value::as_str) == Some("resource") => o.get("resource").and_then(|r| r.get("text")).and_then(Value::as_str).unwrap_or_default().to_owned(),
         Some(Value::Array(a)) => a.iter().map(|x| content_text(Some(x))).collect::<Vec<_>>().join(""),
         _ => String::new(),
     }
@@ -949,13 +1428,15 @@ fn merge(known: Option<ToolCall>, u: &Value, cwd: &str) -> ToolCall {
         t.status = match s {
             "in_progress" => ToolStatus::Running,
             "completed" => ToolStatus::Done,
+            "failed" if t.status == ToolStatus::Denied => ToolStatus::Denied,
             "failed" => ToolStatus::Error,
             _ => ToolStatus::Pending,
         };
-        if matches!(t.status, ToolStatus::Done | ToolStatus::Error) {
+        if matches!(t.status, ToolStatus::Done | ToolStatus::Error | ToolStatus::Denied) {
             t.ended = Some(Core::now());
         }
     }
+    let mut content_output = false;
     if let Some(content) = u.get("content").and_then(Value::as_array) {
         let mut diffs: Vec<FileDiff> = Vec::new();
         let mut text = String::new();
@@ -978,16 +1459,19 @@ fn merge(known: Option<ToolCall>, u: &Value, cwd: &str) -> ToolCall {
             t.diffs = diffs;
         }
         if !text.is_empty() {
+            content_output = true;
             let (o, cut) = clip_middle(&text, OUTPUT_MAX);
             t.output = Some(o);
             t.truncated = cut;
         }
     }
-    if t.output.is_none()
-        && let Some(raw) = u.get("rawOutput")
+    if !content_output
+        && let Some(raw) = u.get("rawOutput").filter(|v| !v.is_null())
     {
         let text = raw.get("output").or_else(|| raw.get("stdout")).and_then(Value::as_str).map_or_else(|| raw.to_string(), str::to_owned);
-        t.output = Some(clip_middle(&text, OUTPUT_MAX).0);
+        let (output, truncated) = clip_middle(&text, OUTPUT_MAX);
+        t.output = Some(output);
+        t.truncated = truncated;
     }
     if t.title.is_empty() {
         t.title = t.name.clone();
@@ -1198,6 +1682,61 @@ mod tests {
         let w = written(&mut core);
         assert!(w.iter().any(|v| v.pointer("/params/prompt/0/text").and_then(Value::as_str) == Some("then tests")));
         Ok(())
+    }
+
+    #[test]
+    fn resumed_turns_stay_separate_and_a_kept_replay_is_not_appended_again() {
+        let mut core = Core::new();
+        let replay = [
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "first question"}}),
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "first answer"}}),
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "second question"}}),
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "second answer"}}),
+        ];
+        for _ in 0..2 {
+            let mut a = Acp::new(Some("saved".into()));
+            a.start(&mut core);
+            feed(&mut a, &mut core, &[json!({"id": 1, "result": {"agentCapabilities": {"loadSession": true}}})]);
+            for update in &replay {
+                a.update(&mut core, update);
+            }
+            feed(&mut a, &mut core, &[json!({"id": 2, "result": null})]);
+            let messages: Vec<&str> = core.events().filter_map(|e| match &e.body { Body::User { text, .. } | Body::Assistant { text, .. } => Some(text.as_str()), _ => None }).collect();
+            assert_eq!(messages, ["first question", "first answer", "second question", "second answer"]);
+            assert!(a.ready);
+        }
+    }
+
+    #[test]
+    fn context_updates_replace_occupancy_and_prompt_usage_is_counted_once() {
+        let mut core = Core::new();
+        let mut a = Acp::new(None);
+        a.start(&mut core);
+        feed(&mut a, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "hello".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        for _ in 0..2 {
+            a.update(&mut core, &json!({"sessionUpdate": "usage_update", "used": 120, "size": 2000, "cost": {"amount": 2.5, "currency": "USD"}, "_meta": {"cognition.ai/inputTokens": 100}}));
+        }
+        assert_eq!(core.state.usage.context_tokens, Some(120));
+        assert_eq!(core.state.usage.input_tokens, 0);
+        let response = json!({"id": 3, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 100, "outputTokens": 20, "cachedReadTokens": 10}}});
+        feed(&mut a, &mut core, &[response.clone(), response]);
+        assert_eq!((core.state.usage.input_tokens, core.state.usage.output_tokens, core.state.usage.cache_read_tokens, core.state.usage.turns), (100, 20, 10, 1));
+        a.update(&mut core, &json!({"sessionUpdate": "usage_update", "used": 80, "size": 2000, "cost": {"amount": 999, "currency": "credits"}}));
+        assert_eq!(core.state.usage.context_tokens, Some(80));
+        assert_eq!(core.state.usage.cost_usd, 2.5);
+    }
+
+    #[test]
+    fn rejected_calls_keep_their_denial_and_embedded_previews_are_readable() {
+        let mut call = merge(None, &json!({"toolCallId": "t1", "kind": "execute", "title": "Run", "content": [{"type": "content", "content": {"type": "resource", "resource": {"uri": "tool://preview", "mimeType": "text/x-shellscript", "text": "printf hello"}}}]}), "/w");
+        assert_eq!(call.output.as_deref(), Some("printf hello"));
+        call.status = ToolStatus::Denied;
+        let call = merge(Some(call), &json!({"toolCallId": "t1", "status": "failed"}), "/w");
+        assert_eq!(call.status, ToolStatus::Denied);
+        assert!(call.ended.is_some());
+        let call = merge(Some(call), &json!({"toolCallId": "t1", "rawOutput": {"stdout": "the actual result"}}), "/w");
+        assert_eq!(call.output.as_deref(), Some("the actual result"));
     }
 
     #[test]

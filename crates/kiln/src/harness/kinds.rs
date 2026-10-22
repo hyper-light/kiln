@@ -44,6 +44,7 @@ pub enum Protocol {
 const KINDS: &[Kind] = &[
     Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson, screen: &["claude"], screen_takes_command: true },
     Kind { id: "codex", name: "Codex", program: "codex", verified: true, protocol: Protocol::CodexAppServer, screen: &["codex"], screen_takes_command: false },
+    Kind { id: "devin", name: "Devin", program: "devin", verified: true, protocol: Protocol::Acp(&["acp"]), screen: &["devin"], screen_takes_command: false },
     Kind { id: "gemini", name: "Gemini CLI", program: "gemini", verified: false, protocol: Protocol::Acp(&["--acp"]), screen: &["gemini"], screen_takes_command: false },
     Kind { id: "opencode", name: "opencode", program: "opencode", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["opencode"], screen_takes_command: false },
     Kind { id: "goose", name: "Goose", program: "goose", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["goose", "session"], screen_takes_command: false },
@@ -76,7 +77,7 @@ impl Kind {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
             Protocol::AgyStreamJson => Adapter::Agy(Box::new(Agy::new(spec))),
-            Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::new(spec.resume.clone()).with_mode(spec.mode.as_deref()))),
+            Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::from_spec(spec))),
         }
     }
 
@@ -596,6 +597,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn devin_runs_its_acp_protocol_and_keeps_its_terminal_interface() -> anyhow::Result<()> {
+        let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
+        assert_eq!(kind.protocol, Protocol::Acp(&["acp"]));
+        assert_eq!(kind.screen, &["devin"]);
+        assert!(!kind.screen_takes_command);
+        let cwd = tempfile::tempdir()?;
+        let spec = Spec {
+            kind: "devin".into(),
+            program: Some("/path/to/devin".into()),
+            cwd: Some(cwd.path().to_string_lossy().into_owned()),
+            model: Some("default".into()),
+            mode: Some("plan".into()),
+            effort: Some("high".into()),
+            resume: Some("conversation".into()),
+            env: vec![("DEVIN_SESSION_TEST".into(), "kept".into()), ("CLAUDECODE".into(), "scrubbed".into())],
+            ..Spec::default()
+        };
+        let launch = kind.launch(&spec, "session")?;
+        assert_eq!(launch.get_program(), "/path/to/devin");
+        assert_eq!(launch.get_args().collect::<Vec<_>>(), ["acp"]);
+        assert_eq!(launch.get_current_dir(), Some(cwd.path()));
+        let env: std::collections::HashMap<_, _> = launch.get_envs().collect();
+        assert_eq!(env.get(std::ffi::OsStr::new("DEVIN_SESSION_TEST")), Some(&Some(std::ffi::OsStr::new("kept"))));
+        assert_eq!(env.get(std::ffi::OsStr::new("CLAUDECODE")), Some(&None));
+        assert_eq!(Kind::get("claude").map(|k| k.protocol), Some(Protocol::ClaudeStreamJson));
+        assert_eq!(Kind::get("codex").map(|k| k.protocol), Some(Protocol::CodexAppServer));
+        Ok(())
+    }
+
+    #[test]
     fn codex_offers_every_effort_its_default_model_takes() {
         let known = known_models("codex");
         let default = known.iter().find(|m| m.default);
@@ -609,7 +640,7 @@ mod tests {
     /// back whole: what an in-place upgrade hands the next image of the runner.
     #[test]
     fn every_adapter_is_written_out_and_read_back_whole() -> anyhow::Result<()> {
-        for id in ["claude", "codex", "gemini"] {
+        for id in ["claude", "codex", "gemini", "devin"] {
             let kind = Kind::get(id).ok_or_else(|| anyhow::anyhow!("no kind {id}"))?;
             let mut adapter = kind.adapter(&Spec { kind: id.to_owned(), ..Spec::default() });
             let mut core = Core::new();
