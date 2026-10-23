@@ -384,6 +384,17 @@ fn addresses(ctx: &str, nodes: &[Value]) -> Vec<String> {
     out
 }
 
+/// The first port from `from` nothing listens on here, for a port forward (another kiln may have
+/// `from`). Nothing answers on it, and it can be had: on macOS a bind can share a port another
+/// server holds on every address.
+fn free_port(from: u16) -> u16 {
+    let free = |p: u16| {
+        let at = std::net::SocketAddr::from(([127, 0, 0, 1], p));
+        std::net::TcpStream::connect_timeout(&at, Duration::from_millis(200)).is_err() && std::net::TcpListener::bind(at).is_ok()
+    };
+    (from..from.saturating_add(100)).find(|p| free(*p)).unwrap_or(from)
+}
+
 /// `http://host:port`, an IPv6 address in brackets.
 fn url_of(host: &str, port: u64) -> String {
     if host.contains(':') { format!("http://[{host}]:{port}") } else { format!("http://{host}:{port}") }
@@ -472,10 +483,11 @@ async fn install_in(cluster: &Cluster, ctx: &str, ns: &str, image: (&str, &str),
         }
         None => {
             let runners = verify(&Via::Proxy(cluster, proxy_base(ns)), READY_TIME).await?;
+            let local = free_port(7070);
             say("address     no node of the cluster can be reached from here: it was checked through the cluster's API server");
-            say(format!("            open it from here with: kubectl --context {ctx} -n {ns} port-forward svc/{APP} 7070:7070"));
-            let url = "http://localhost:7070";
-            opened(url, token, runners, &later(url, token, &token_from));
+            say(format!("            open it from here with: kubectl --context {ctx} -n {ns} port-forward svc/{APP} {local}:7070"));
+            let url = format!("http://localhost:{local}");
+            opened(&url, token, runners, &later(&url, token, &token_from));
         }
     }
     say(format!("in cluster  kubectl --context {ctx} -n {ns} get pods"));
@@ -685,6 +697,14 @@ mod tests {
         assert_eq!(addresses("gke", &nodes), ["34.1.2.3", "10.0.0.2", "10.0.0.3"]);
         assert_eq!(addresses("docker-desktop", &nodes[..1]), ["localhost", "10.0.0.2"]);
         assert_eq!(url_of("fd00::2", 30070), "http://[fd00::2]:30070");
+    }
+
+    #[test]
+    fn a_port_forward_takes_a_port_nothing_listens_on() -> anyhow::Result<()> {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = taken.local_addr()?.port();
+        assert_ne!(free_port(port), port);
+        Ok(())
     }
 
     #[test]
