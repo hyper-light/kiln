@@ -3563,10 +3563,14 @@ enforcement points to W18, agent isolation to W20.
       comes).
   - A terminal into a pod's leg (W17-R01) is the pod's own shell: the leg is recorded as `k8s`,
     so it needs `runs.debug`, not `runners.terminal`.
+  - An executor's pod is the pool's to reap alone: the reaper of v1 jobs' pods leaves a pod that
+    carries no job. (It took one for a finished job's, so a leg that ran past the reaper's next
+    turn, within 15 s, lost its pod mid-leg, was tried again in another and lost again.)
   - Checked against a stand-in for Kubernetes's API that runs each pod's job container on the
     machine, as a kubelet would, with no container engine but a Docker sidecar's
     (`w13_r07_k8s_pool_runs_each_leg_in_a_pod`: three legs on a pool of at most two pods, each
     leg on a pod's runner of its own, the pods gone after;
+    `w13_r07_a_long_leg_in_a_pod_runs_to_its_end`: a 15-second leg runs once, in its one pod;
     `w13_r07_a_leg_with_containers_runs_in_a_pod_made_for_it`: the pod's job container from the
     leg's matrix, its service a sidecar, its steps run in place with the service's ports;
     `w13_r07_docker_actions_in_pods_need_the_pools_sidecar`: KCI4032 on a pool without one, and
