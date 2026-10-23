@@ -18,8 +18,8 @@ open: the metric names Kiln Metrics hasn't answered and the decisions that are A
 - **Not measured.** AC-T2.1.2 to AC-T2.1.4 (Quiver's fan-out bench and its hour's soak) and the
   comparison with NATS, Redis and Kafka wait for a quiet window on fedora.
 - **Quiver** is at df068e4. Its gate passed in kiln CI (run 5: fmt, clippy on Linux, macOS and
-  Windows, the production check, the tests, the vendor check). Its branch `cp/t2-quiver` is on
-  hyper-light/quiver, whose main fast-forwards to it on Ada's word.
+  Windows, the production check, the tests, the vendor check), and hyper-light/quiver's main is
+  df068e4 (fast-forwarded on Ada's word, 2026-10-23), the commit kiln vendors.
 
 ## What it delivers
 
