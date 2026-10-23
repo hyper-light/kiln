@@ -16,8 +16,11 @@ jobs:
     # Compiling kiln's own crate takes 7 GiB and more, and `cargo test` compiles it twice at once
     # (the library, and the library as its tests): 8Gi ran out, rustc killed. Cargo runs a rustc
     # per CPU the machine has, not per CPU asked for, unless told; line tables are the debug info
-    # a test's backtrace needs, at far less memory.
-    resources: { cpu: "4", memory: 16Gi }
+    # a test's backtrace needs, at far less memory. Its CPUs are what it asks for to be placed, not
+    # a cap (the pod has no CPU limit): the jobs namespace's quota (18 CPUs, 36Gi, every
+    # repository's jobs together) refuses a pod that asks more than is left, and it waits until
+    # others' jobs end; it uses whatever's free once it runs.
+    resources: { cpu: "2", memory: 16Gi }
     env:
       CARGO_BUILD_JOBS: "4"
       RUST_TEST_THREADS: "4"
@@ -32,8 +35,9 @@ jobs:
       # at once (the library, and the library as its tests) still ran out of 16Gi now and then.
       - name: build the libraries' tests
         run: cargo test --locked --lib --no-run
+      # Every test binary, whatever fails before it: each failing test shows in one run.
       - name: test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
 
   ui:
     name: ui typecheck + lint + build
