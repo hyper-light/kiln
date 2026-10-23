@@ -152,7 +152,7 @@ fn any_value(i: &Incident, key: &str, f: impl Fn(&str) -> bool) -> bool {
 }
 
 /// Whether `hay` holds `needle` (lowercased), case aside: nothing allocated for ASCII.
-fn contains_folded(hay: &str, needle: &str) -> bool {
+pub(crate) fn contains_folded(hay: &str, needle: &str) -> bool {
     if hay.is_ascii() && needle.is_ascii() {
         let (h, n) = (hay.as_bytes(), needle.as_bytes());
         n.is_empty() || h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))

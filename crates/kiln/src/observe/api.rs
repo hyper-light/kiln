@@ -769,6 +769,13 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::DELETE, ["incidents", id, "attachments", attachment]) => super::incidents::http::remove_attachment(id, attachment, &req).await,
         (&Method::GET, ["incidents", id, "timeline"]) => super::incidents::http::timeline(id),
         (&Method::POST, ["incidents", id, "timeline"]) => super::incidents::http::note(id, req).await,
+        (&Method::POST, ["incidents", id, "postmortem"]) => super::notebooks::http::postmortem_of(id, req).await,
+        // Notebooks (§11.1): Datadog's API (made, listed, read, changed whole, removed).
+        (&Method::GET, ["notebooks"]) => super::notebooks::http::list(q).await,
+        (&Method::POST, ["notebooks"]) => super::notebooks::http::create(req).await,
+        (&Method::GET, ["notebooks", id]) => super::notebooks::http::get_one(id).await,
+        (&Method::PUT, ["notebooks", id]) => super::notebooks::http::update(id, req).await,
+        (&Method::DELETE, ["notebooks", id]) => super::notebooks::http::remove(id).await,
         // The infrastructure list (§10.9): Datadog's host list and totals, a host whole, a host
         // muted and unmuted.
         (&Method::GET, ["hosts"]) => super::infra::http::hosts(q).await,

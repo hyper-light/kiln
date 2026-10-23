@@ -40,6 +40,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-26 | Service Catalog (§10.8), Datadog's: service definitions (v2.2) from Datadog's API and from `service.datadog.yaml` in the repositories kiln mirrors, services seen by their traces and deployments, each one's facts (requests, errors, latency, issues, monitors, SLOs, deployments, logs correlated) and Datadog's three scorecards; teams for DORA; the API, OpenAPI, its pages | done |
 | O-27 | Infrastructure (§10.9), Datadog's host list: every host that reports (kiln's runners, Datadog's Agent, OpenTelemetry's resources, any series tagged `host:<name>`), whether it is up, its CPU, I/O wait, load, memory and disk, its apps, its platform and tags by source, its containers; what the Agent says of its host (its host metadata, checks and inventory) kept; a host muted (a downtime of every monitor's groups of it); the API (Datadog's list and totals), its pages; checked live and in browsers (§13), measured (§12.31) | done |
 | O-28 | Incident management (§9.5), Datadog's: incidents declared (from kiln's pages, Datadog's v2 API, or a monitor naming `@incident`), their severity and state, commander, customer impact and fields; their timeline (notes, each change, their monitor's alerts and recoveries), todos and attachments (a postmortem, links); Datadog's figures of each (time to detect, respond, repair, resolve); told to the integrations they name (PagerDuty's incident and Opsgenie's alert closed as one is resolved); searched with Datadog's syntax, counted by facet; kept a file each within bounds; the API, OpenAPI, its pages; checked live and in browsers (§13), measured (§12.32) | done |
+| O-29 | Notebooks (§11.1), Datadog's: Markdown and graph cells (Datadog's widget definitions, drawn as the dashboards draw them) over a time, fixed or the last of a span, cells' own times and sizes, types and templates; kept a file each, their heads alone read at the start; Datadog's v1 API (made, listed with its filters, order and pages, read, changed whole, removed); postmortems made of a template and an incident (Datadog's incident variables, kiln's template after the Google SRE book's) and attached to it; the charts on fixed times; their pages; checked live and in browsers (§13) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -609,6 +610,7 @@ its schema (§13). Built:
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
 | `GET/POST incidents`, `GET incidents/search?query=`, `GET/PATCH/DELETE incidents/{id}`, `GET/POST incidents/{id}/relationships/todos`, `GET/PATCH/DELETE …/todos/{todo}`, `GET/POST incidents/{id}/attachments`, `PATCH/DELETE …/attachments/{id}`, `GET/POST incidents/{id}/timeline` | incidents (§9.5), Datadog's v2 API at kiln's paths (`{id}` its id or its public id): declared, listed, searched (Datadog's syntax; what matched counted by facet), read, changed and removed; their todos and attachments; their timeline (kiln's), a note put on it |
+| `GET/POST notebooks`, `GET/PUT/DELETE notebooks/{id}`, `POST incidents/{id}/postmortem` | notebooks (§11.1), Datadog's v1 API at kiln's paths: made, listed (Datadog's filters, order and pages), read (each graph cell with kiln's drawing of it), changed whole, removed; an incident's postmortem made of a template and attached to it |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET synthetics`, `PUT/DELETE synthetics/{name}`, `POST synthetics/{name}/test`, `POST synthetics/{name}/run` | Synthetic tests (§10.4), each with how each location goes (passed, its last run's time, status, certificate's minutes, tries, failures; a runner's as of its last status) and the monitor it owns; a token left out of a `PUT` (or `"…"`) is the one kept, never shown; `test` runs one once from the server, nothing written; `run` runs it now at every location |
@@ -1664,7 +1666,8 @@ integrations it names.
   monitor's alerts and recoveries (each its state, value and message). 1,000 cells at the most: past
   them its first 100 (its declaring and first notes) stay, and the oldest after them go.
 - **Its todos** (Datadog's: what is to do, its assignees, a due date, done or not; 200 at the most)
-  and **attachments** (a postmortem, one an incident, and links; HTTP(S) alone; 100).
+  and **attachments** (a postmortem, one an incident, and links; HTTP(S) alone; 100). Its
+  postmortem written by kiln is a notebook made of a template with its variables filled (§11.1).
 - **Datadog's figures of it**, seconds, none below zero: time to detect (from the customers' impact
   starting to its detection), to respond (from its detection to its declaring), to repair (from its
   detection to the impact's end) and to resolve (from its declaring to its resolving), and the
@@ -2413,9 +2416,77 @@ time range and the search in the address (a page is a link).
 - **Live**: the hosts' samples of the last hour at 5 s, streamed (what the Metrics page was); before
   that, the Hosts dashboard.
 
-Every chart is uPlot, already kiln's, but the heatmap and the distribution, drawn on a canvas. To
+Every chart is uPlot, already kiln's, but the heatmap and the distribution, drawn on a canvas. A
+series sent less often than its chart's grid (a metric every minute on an hour's grid of 15 s:
+OpenTelemetry's SDKs export every 60 s unless told otherwise) is drawn across its empty buckets: a
+run of them no wider than twice its usual spacing (the median between its samples: one sample
+missed) is joined, a wider one left a gap, a lone value drawn as a point; as first drawn, a line was
+broken at every empty bucket, and such a series drew nothing (a notebook's graph found it). To
 come: series reduced to the chart's width with largest-triangle-three-buckets (Steinarsson 2013) when a range holds more
 buckets than pixels (today the query's `points` bounds them: 240 a chart).
+
+### 11.1 Notebooks
+
+Datadog's notebooks (`crate::observe::notebooks`): a document of cells over a time, each cell
+Markdown or a graph as Datadog's notebooks have them (a timeseries, a top list, a heatmap, a
+distribution, a log stream: their definitions Datadog's dashboards' widgets'), a graph its size
+(`xs` to `xl`) and, if it says, a time of its own; the notebook's time the last of a span
+(Datadog's: `1h`, `1w`, `1mo`, …) or from one time to another; its type (an investigation, a
+runbook, a postmortem, documentation, a report) and whether it is a template.
+
+- **Drawn** as the dashboards draw Datadog's widgets: each graph cell read by the dashboards'
+  importer (§11) and answered beside its definition (`kiln.widget`, and what kiln said where it
+  draws one otherwise), on the notebook's time or its own: the charts take a fixed time as well as
+  the last of a range (a postmortem's is fixed, the incident's).
+- **Kept** by the server, each a file of its own (`<observe>/notebooks/<id>.json`, written whole
+  and atomically as it changes); in memory only what lists them (its name, author, type, template
+  or not, times, size, its incident): a notebook's cells are read from its file when it is read,
+  and at the start only each file's head is read (serde skips the cells). 10,000 notebooks and
+  1 GiB of their files at the most, a notebook 500 cells and 4 MiB; none let go (a document is not
+  dropped): past a bound, none more is made, saying why. Ids go on past a removed one's
+  (`next.json`), and past a file that does not read (left as it is, said).
+- **The API** (kiln's, a session's; reading `observe.read`, the rest `observe.write`): Datadog's v1
+  notebooks API at kiln's paths (`/api/observe/v1/notebooks…`): made (200, as Datadog's), listed
+  (`author_handle`, `exclude_author_handle`, `query` a part of the name or the author's handle,
+  `is_template`: templates or not, false unless said; `type`; `sort_field` of `modified`, `name` or
+  `created`, `sort_dir`; `start`, `count` 100 unless said and 1,000 at the most; `include_cells`, its
+  cells and time read from each file, true unless said; `meta.page`: `total_count`,
+  `total_filtered_count`), read, changed whole (Datadog's `PUT`: a cell sent with an id it has kept,
+  one without a new one) and removed. What Datadog's API refuses refused, saying why (a name past 80
+  characters, a cell of a kind it has not, a graph without its requests, a heatmap or a distribution
+  of more than one, a span or a size it has not, a time that ends before it starts, a type it has
+  not). At Datadog's own paths (`/api/v1/notebooks…`) the ingest token, a writer of data, reads and
+  changes none (403).
+- **Postmortems**: an incident's postmortem written (`POST /api/observe/v1/incidents/{id}/postmortem`,
+  kiln's; `template_id` a notebook that is a template, kiln's own unless said) is a notebook of type
+  postmortem made of the template, each Markdown cell's variables filled with what the incident
+  says, Datadog's names (the Incident Variables Reference): `{{incident.id}}`, `title`,
+  `severity`, `status`, `created`, `detected`, `resolved`, `commander` (and its `_name`, `_handle`,
+  `_email`), `created_by_name` (`_handle`, `_email`), `responders_summary` and
+  `responders_full_list` (its commander, then who wrote on its timeline), `customer_impacted`,
+  `customer_impact`, `scope_of_impact`, `customer_impact_start`, `_end`, `_duration`,
+  `timeline` (every cell, its time, who, what), `card` (its facts as a table), and its fields by
+  name (`{{incident.root_cause}}`); kiln's own besides: `url`, `todos` (a task list), `links`,
+  `time_to_detect`, `time_to_internal_response`, `time_to_repair`, `time_to_resolve`. Channels and
+  meetings kiln does not open (Slack's, Teams', Zoom's) and what an AI would write (`ai_*`) are
+  empty; a variable neither knows is left as written. A graph keeps its definition and takes the
+  notebook's time: the incident's, from 30 minutes before it was detected or its impact began to
+  30 minutes after it was resolved or its impact ended (or now). The notebook is attached as the
+  incident's postmortem (its link the notebook's page at the server's public URL); an incident with
+  a postmortem is refused another (409), and a notebook made as another was attached is removed.
+  kiln's own template follows the Google SRE book's example postmortem (Beyer et al., *Site
+  Reliability Engineering*, O'Reilly 2016, appendix D): its facts, summary, impact, root causes,
+  trigger, resolution, detection (and Datadog's four times), action items (its todos), lessons
+  learned (what went well, what went wrong, where we got lucky), timeline, supporting information
+  (its links).
+- **Pages**: the list (notebooks or templates, by type, found by a part of the name or the author),
+  a new one made there (opened to be written); a notebook's page: its cells drawn over its time
+  (picked in place, saved with it), its type and author, its incident if a postmortem; written in
+  place: its name, type and whether a template; a cell's text, a graph's query and display, or its
+  definition as Datadog's JSON where it has more than one query, its size; cells added (text, a
+  graph, logs), moved and removed; deleted. An incident's page writes its postmortem (of a template
+  picked, if any are kept) and opens it; a postmortem kiln keeps opens in place, whatever host its
+  link names.
 
 ## 12. Measurements
 
@@ -3923,6 +3994,32 @@ bytes formatted, `time` 0.3.55's `format_into` counts a fraction of a second sho
 `.1`): the length written is taken from how far the writer went, and a test holds every fraction's
 form to `format`'s.
 
+### 12.33 The notebooks' store
+
+`cargo bench -p kiln --bench notebooks` (adacachy, 2026-10-22, release; the files on its NVMe disk;
+the machine's load some 20 on 32 cores): 10,000 notebooks as a team's years of them (one to three
+Markdown cells of a few hundred words, three to eight timeseries of Datadog's definitions, a log
+stream; investigations, runbooks, postmortems, reports; one in fifty a template), 54.4 MiB of files,
+5.7 KB each.
+
+| what | time | allocations |
+| --- | --- | --- |
+| opened: each file's head (the store's start) | 37–41 ms, 2.97 MiB held | |
+| each file read whole, as a notebook | 106–114 ms | 1,898,317 |
+| listed: every notebook, a page of 100 | 0.17–0.19 ms | 315 |
+| listed: runbooks | 0.07–0.08 ms | 312 |
+| listed: a part of the name | 0.38 ms | 313 (27,988 as first written) |
+| listed: by name, case aside, a page of 100 | 4.0 ms | 303 |
+| one read and answered, its graphs drawn by the importer | 0.03 ms | 747 |
+| a postmortem of kiln's template, a timeline of 1,000 cells (71 KiB of Markdown) | 0.2 ms | 7,248 |
+
+The store holds a notebook's summary alone (its name, author, type, times, size, incident: some 300
+bytes) and reads its cells from its file when it is read: at the start, each file's head is read and
+its cells skipped, a third of reading each whole and none of its 190 allocations a notebook, and a
+store of 10,000 holds 3 MiB rather than its 54 MiB of cells made into JSON. A list's page is copied
+out of the lock, nothing else: a part of the name is found case aside without a lowercase copy of
+each name (as first written, two a notebook), and names are ordered case aside a byte at a time.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -4579,6 +4676,39 @@ Nothing on either page wider than a phone. A todo done, a state or a severity pi
 put back if the server refuses it (the first run found the checkbox waiting on the server's answer).
 2026-10-22: passes in all four (3–7 s each; adacachy); and the whole suite's other 36 scenarios in
 all four, Incidents among Observe's tabs.
+
+**Notebooks and postmortems** (`crates/kiln/tests/observe_notebooks.rs`): a kiln server as a process
+of its own. A notebook made with Datadog's body (a heading, a timeseries, a log stream on a time of
+its own): id 1, its cells `c1` to `c3`, the timeseries and the log stream each with kiln's drawing
+of it beside (the query its own), Markdown without; read back the same. Changed whole: its first
+cell kept by its id (its text changed), the graph dropped, a cell added (`c4`), its time a day, its
+type cleared (Datadog's `PUT` is whole). A runbook and a template made; listed as Datadog's list
+asks: the newest changed first, templates apart; templates alone, a type, a part of the name (case
+aside), by name; a page of one without cells or time, `total_count` 3 and `total_filtered_count` 2.
+Refused, saying why: a name past 80 characters, a cell of a kind it has not, a type it has not, a
+span it has not; a notebook that is not, 404. An incident declared (SEV-2, a commander, its
+customers' impact, its services and root cause, a note), a todo, resolved; its postmortem written:
+201, of type postmortem, named after it, its incident's; its Markdown with its facts (severity,
+commander, services), root cause, impact, action item (the todo, its assignee), timeline (the note,
+its resolving), no variable left; on the incident's time; attached as its postmortem (the
+notebook's link, its name); a second refused (409), one postmortem made. A template of one's own
+(its heading of `{{incident.title}}`, `{{incident.commander}}` and `{{incident.status}}`, a graph on
+a time of its own): a runbook named as a template refused (404); another incident's postmortem of
+it: `## Search slow, led by  (Active)`, its graph kept on the notebook's time. A viewer reads and is
+refused making, removing and writing a postmortem (403); Datadog's notebooks API refused to the
+ingest token (403). The server killed and started again: the postmortem the same, all five kept,
+the next made 6; one removed, then 404. 2026-10-22: passes (43 s; adacachy). In a browser
+(`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): a notebook made from
+the list, named, typed, a heading and a sentence written and a graph of the seeded latencies by
+service added, saved: its heading and its bold drawn, the graph's services in its legend, the API
+agreeing; its time changed in place and kept. An incident declared with a note; its postmortem
+written from its page: its notebook opened (its name the incident's, its note in it, a link to
+its incident), the incident's postmortem it; opened again from the incident's page, in place.
+Nothing on either page wider than a phone. 2026-10-22: passes in all four (4.6–5.6 s each;
+adacachy); and the whole suite, 38 scenarios, in all four. Looking at its pages found two things the
+scenarios could not: the seeded latencies (a point a minute) drew no line on an hour's grid of 15 s
+(§11: now drawn across their empty buckets), and a notebook's Markdown went unstyled where no
+dashboard had been opened first (its styles were the dashboards' alone).
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,

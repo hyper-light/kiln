@@ -123,3 +123,7 @@ harness = false
 [[bench]]
 name = "incidents"
 harness = false
+
+[[bench]]
+name = "notebooks"
+harness = false

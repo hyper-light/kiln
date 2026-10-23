@@ -9,6 +9,10 @@ export interface SeriesSpec {
   dash?: number[];
   /** Show its points where they're sparse (8px, ringed by the surface), so a lone value between gaps reads. */
   points?: boolean;
+  /** Its samples' usual spacing, in the grid's buckets: a run of empty buckets no wider than twice it
+   * (a sample missed) is drawn across; a wider one is a gap. A metric sent every minute on a grid of
+   * 15 s is four; one sent every grid step, one. */
+  spacing?: number;
   /** custom legend value: receives the raw data arrays */
   value?: (data: ArrayLike<ArrayLike<number | null | undefined>>, v: number | null, seriesIdx: number, idx: number) => string;
 }

@@ -29,7 +29,7 @@ import {
   seriesLabel,
   when,
   within,
-  type Range,
+  type Span,
 } from "./parts";
 
 import { DistributionChart, HeatmapChart } from "./heatmap";
@@ -59,7 +59,7 @@ export const KIND_WORDS: Record<Widget["kind"], string> = {
 };
 
 /** What a widget shows, its queries' template variables filled (`fill`). */
-export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: Range; fill: (q: string) => string; fillSearch: (q: string) => string }) {
+export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: Span; fill: (q: string) => string; fillSearch: (q: string) => string }) {
   const height = Math.max(ROW, w.layout.h * ROW - FRAME);
   const unit = w.options?.unit;
   const queries = w.queries.map(fill).filter((q) => q.trim());
@@ -102,7 +102,7 @@ export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: R
 }
 
 /** The first query's heatmap over the range. */
-function Heat({ query, range, height, unit }: { query: string; range: Range; height: number; unit?: string }) {
+function Heat({ query, range, height, unit }: { query: string; range: Span; height: number; unit?: string }) {
   const h = useRes(heatmapRes(query, range)).data;
   return <HeatmapChart h={h} height={height} unit={unit} day={range === "7d" || range === "30d"} />;
 }
@@ -118,7 +118,7 @@ export function asPercentile(query: string, p: string): string | null {
 
 /** The first query's values over the whole range, counted by their row, its median and 99th
  * percentile the server's. */
-function Spread({ query, range, height, unit }: { query: string; range: Range; height: number; unit?: string }) {
+function Spread({ query, range, height, unit }: { query: string; range: Span; height: number; unit?: string }) {
   const h = useRes(heatmapRes(query, range, 40, 1)).data;
   const asked = ["p50", "p99"].map((p) => asPercentile(query, p));
   const plain = asked.filter((q): q is string => q !== null);
@@ -150,7 +150,7 @@ function Empty({ height, what }: { height: number; what: string }) {
 }
 
 /** One number: the first query's series, each summed over the range, and those summed. */
-function QueryValue({ queries, range, height, unit, how }: { queries: string[]; range: Range; height: number; unit?: string; how: string }) {
+function QueryValue({ queries, range, height, unit, how }: { queries: string[]; range: Span; height: number; unit?: string; how: string }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const a = answers[0];
   const values = (a?.series ?? []).map((s) => aggregate(dataOf(s), how)).filter((v): v is number => v !== null);
@@ -174,7 +174,7 @@ function QueryValue({ queries, range, height, unit, how }: { queries: string[]; 
 
 /** Each series summed over the range, the largest first (the least, `ascending`), as bars: `limit`
  * of them, 25 unless the widget says. */
-function TopList({ queries, range, height, unit, how, limit, ascending }: { queries: string[]; range: Range; height: number; unit?: string; how: string; limit?: number; ascending?: boolean }) {
+function TopList({ queries, range, height, unit, how, limit, ascending }: { queries: string[]; range: Span; height: number; unit?: string; how: string; limit?: number; ascending?: boolean }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const rows = answers
     .flatMap((a) => a.series.map((s) => ({ label: seriesLabel(s.tags), v: aggregate(dataOf(s), how) })))
@@ -206,7 +206,7 @@ const SLICES = PIE_HUES.length + 1;
 
 /** Each series over the range (summed unless the widget says) as its share of a ring, each slice
  * named in the legend with its value and share; a slice's hue follows its series, not its rank. */
-function Pie({ queries, range, height, unit, how }: { queries: string[]; range: Range; height: number; unit?: string; how: string }) {
+function Pie({ queries, range, height, unit, how }: { queries: string[]; range: Span; height: number; unit?: string; how: string }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const rows = answers
     .flatMap((a) => a.series.map((s) => ({ label: seriesLabel(s.tags), v: aggregate(dataOf(s), how) })))
@@ -263,7 +263,7 @@ function ring(outer: number, inner: number, a: number, b: number): string {
 }
 
 /** Each series' last, average, least and most over the range. */
-function SeriesTable({ queries, range, height, unit }: { queries: string[]; range: Range; height: number; unit?: string }) {
+function SeriesTable({ queries, range, height, unit }: { queries: string[]; range: Span; height: number; unit?: string }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const rows = answers.flatMap((a) =>
     a.series.map((s) => ({ label: seriesLabel(s.tags), last: aggregate(dataOf(s), "last"), avg: aggregate(dataOf(s), "avg"), min: aggregate(dataOf(s), "min"), max: aggregate(dataOf(s), "max") })),
@@ -298,7 +298,7 @@ function SeriesTable({ queries, range, height, unit }: { queries: string[]; rang
 }
 
 /** The newest records a search finds. */
-export function Stream({ query, range, height, kind }: { query: string; range: Range; height: number; kind: "logs" | "events" }) {
+export function Stream({ query, range, height, kind }: { query: string; range: Span; height: number; kind: "logs" | "events" }) {
   const found = useRes(recordsRes(query, range, 50)).data;
   if (found.records.length === 0) return <Empty height={height} what={kind === "events" ? "events in this range" : "records in this range"} />;
   return (
@@ -319,7 +319,7 @@ const CHECK_ORDER: CheckState[] = ["CRITICAL", "WARNING", "UNKNOWN", "OK"];
 
 /** A check widget: its tags' template variables filled (one of a variable stands for its value, or
  * for any: `*`, left out). */
-function CheckStatusView({ w, range, height, fill }: { w: Widget; range: Range; height: number; fill: (q: string) => string }) {
+function CheckStatusView({ w, range, height, fill }: { w: Widget; range: Span; height: number; fill: (q: string) => string }) {
   const o = w.options ?? {};
   const one = o.grouping === "check";
   const tags = (o.tags ?? []).map((t) => fill(t).trim()).filter((t) => t && t !== "*");
@@ -329,7 +329,7 @@ function CheckStatusView({ w, range, height, fill }: { w: Widget; range: Range; 
 /** A service check's status over the range (Datadog's check status widget's): of every group, the
  * worst, how many are in each status, and those not OK by name; or (`one`) one group's, and when it
  * last ran. */
-export function CheckRuns({ ask, range, height, one }: { ask: CheckStatusAsk; range: Range; height: number; one?: boolean }) {
+export function CheckRuns({ ask, range, height, one }: { ask: CheckStatusAsk; range: Span; height: number; one?: boolean }) {
   const s = useRes(checkStatusRes(ask, range)).data;
   if (!s.status) return <Empty height={height} what={`runs of ${s.check}`} />;
   const named = (t: Record<string, string>) =>

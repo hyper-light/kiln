@@ -2423,6 +2423,73 @@ const scenarios = {
       if (receiver) await api("DELETE", `/api/observe/v1/integrations/${hook}`);
     }
   },
+
+  /** A notebook written from the list (its name, its type, a heading, a graph of the seeded
+   * latencies), saved, drawn, its time changed; then an incident's postmortem written from its page,
+   * of kiln's template: its notebook opened, its incident's note and facts in it, the incident's
+   * postmortem it. What each did checked through the API. */
+  async "a notebook is written with text and a graph, and an incident's postmortem made of a template"() {
+    const name = `E2E latency ${run}`;
+    let id;
+    let incident;
+    let postmortem;
+    try {
+      await page.goto(`${BASE}/observe/notebooks`);
+      await page.getByRole("button", { name: "New notebook", exact: true }).click();
+      await page.waitForURL(/\/observe\/notebooks\/\d+\?edit=1$/);
+      id = Number(new URL(page.url()).pathname.split("/").pop());
+      await fillIn(page.getByLabel("Its name", { exact: true }), name);
+      await page.getByLabel("Type", { exact: true }).selectOption("investigation");
+      await fillIn(page.getByLabel("Cell 1's text", { exact: true }), "# Why checkout slowed\n\nThe **p95** by service.");
+      await page.getByRole("button", { name: "Add a graph", exact: true }).click();
+      await fillIn(page.getByLabel("Cell 2's query", { exact: true }), "avg:app.latency.p95{*} by {service}");
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await page.waitForURL(new RegExp(`/observe/notebooks/${id}$`));
+      // Markdown's headings are kiln's (`.hx-h`), not the page's.
+      await page.locator(".obs-note .hx-h", { hasText: "Why checkout slowed" }).waitFor();
+      await page.locator(".obs-note strong", { hasText: "p95" }).waitFor();
+      // The graph drawn: the seeded latencies' services named in its legend.
+      await page.getByText("service:api", { exact: false }).first().waitFor();
+      let n = (await api("GET", `/api/observe/v1/notebooks/${id}`)).body.data;
+      expect(n.attributes.name === name && n.attributes.metadata.type === "investigation" && n.attributes.cells.length === 2, `saved as written: ${JSON.stringify(n.attributes)}`);
+      expect(n.attributes.cells[1].attributes.definition.requests[0].q === "avg:app.latency.p95{*} by {service}", "its graph's query");
+      await fitsAcross("a notebook");
+      await page.getByRole("group", { name: "Time", exact: true }).getByRole("button", { name: "4h", exact: true }).click();
+      await until("its time saved", async () => (await api("GET", `/api/observe/v1/notebooks/${id}`)).body.data.attributes.time.live_span === "4h");
+      // An incident's postmortem, written from its page.
+      const declared = await api("POST", "/api/observe/v1/incidents", {
+        data: {
+          type: "incidents",
+          attributes: {
+            title: `E2E gateway ${run}`,
+            fields: { severity: { type: "dropdown", value: "SEV-3" } },
+            initial_cells: [{ cell_type: "markdown", content: { content: "Rolled back the gateway." } }],
+          },
+          relationships: { commander_user: { data: { type: "users", id: "ada" } } },
+        },
+      });
+      expect(declared.status === 201, `declared: ${declared.status}`);
+      incident = declared.body.data.attributes.public_id;
+      await page.goto(`${BASE}/observe/incidents/${incident}`);
+      await page.getByRole("button", { name: "Write the postmortem", exact: true }).click();
+      await page.waitForURL(/\/observe\/notebooks\/\d+$/);
+      postmortem = Number(new URL(page.url()).pathname.split("/").pop());
+      await page.getByRole("heading", { name: `Postmortem: #${incident} E2E gateway ${run}`, level: 1 }).waitFor();
+      await page.getByText("Rolled back the gateway.", { exact: false }).first().waitFor();
+      await page.getByRole("link", { name: "its incident", exact: true }).waitFor();
+      await fitsAcross("a postmortem");
+      const i = (await api("GET", `/api/observe/v1/incidents/${incident}`)).body.data;
+      expect(i.attributes.kiln.postmortem?.url.endsWith(`/observe/notebooks/${postmortem}`), `its postmortem attached: ${JSON.stringify(i.attributes.kiln)}`);
+      // From the incident's page, its postmortem opens here.
+      await page.goto(`${BASE}/observe/incidents/${incident}`);
+      await page.getByRole("link", { name: `Postmortem: #${incident} E2E gateway ${run}`, exact: true }).click();
+      await page.waitForURL(new RegExp(`/observe/notebooks/${postmortem}$`));
+    } finally {
+      await page.goto(`${BASE}/observe/notebooks`).catch(() => undefined);
+      for (const n of [id, postmortem]) if (n) await api("DELETE", `/api/observe/v1/notebooks/${n}`);
+      if (incident) await api("DELETE", `/api/observe/v1/incidents/${incident}`);
+    }
+  },
 };
 
 let failed = 0;

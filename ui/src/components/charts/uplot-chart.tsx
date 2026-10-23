@@ -89,6 +89,9 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
   dataRef.current = data;
   const bandsRef = React.useRef(bands);
   bandsRef.current = bands;
+  // Its series as they are now (their spacing changes with the data, not the plot's structure).
+  const seriesRef = React.useRef(series);
+  seriesRef.current = series;
 
   // A stable key for structural changes (series set, formatters by identity are ignored).
   const structKey = JSON.stringify([series.map((s) => [s.label, s.color, s.bars, s.scale, s.fill, s.dash, s.points]), height, yRange, timeFormat, legend, Boolean(y2Format), bands.length > 0]);
@@ -169,6 +172,16 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
             // uPlot shows them where there's room between them.
             points: s.points ? { size: 8, width: 2, stroke: "#08090a", fill: s.color } : { show: false },
             spanGaps: false,
+            // A run of empty buckets no wider than twice its spacing (a sample missed) drawn across.
+            gaps: (u: uPlot, si: number, _i0: number, _i1: number, nullGaps: uPlot.Series.Gaps) => {
+              const spacing = seriesRef.current[si - 1]?.spacing ?? 1;
+              const xs = u.data[0];
+              const a = xs[0];
+              const b = xs[1];
+              if (a === undefined || b === undefined) return nullGaps;
+              const step = Math.abs(u.valToPos(b, "x", true) - u.valToPos(a, "x", true));
+              return nullGaps.filter(([from, to]) => to - from > step * (2 * spacing + 0.5));
+            },
             value: s.value ? (u, v, si, i) => s.value!(u.data, v, si, i ?? 0) : (_u, v) => (v == null ? "—" : s.scale === "y2" && y2Format ? y2Format(v) : yFormat(v)),
           })),
         ],

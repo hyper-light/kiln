@@ -183,6 +183,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         // integrations.
         let incidents = crate::observe::incidents::Incidents::open(&cfg.data("observe"));
         crate::observe::incidents::set(incidents.clone());
+        // Notebooks (`crate::observe::notebooks`), postmortems among them, linked at the server's
+        // public URL.
+        crate::observe::notebooks::set(crate::observe::notebooks::Notebooks::open(&cfg.data("observe"), &cfg.server.public_url));
         match crate::http::client::Client::public() {
             Ok(http) => {
                 let ms = crate::observe::monitors::Monitors::open(&cfg.data("observe"), std::sync::Arc::new(http), &cfg.server.public_url);

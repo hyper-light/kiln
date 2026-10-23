@@ -59,6 +59,8 @@ import { Route as AppObserveIncidentsIndexRouteImport } from './routes/_app.obse
 import { Route as AppObserveIncidentsIdRouteImport } from './routes/_app.observe.incidents.$id'
 import { Route as AppObserveMonitorsIndexRouteImport } from './routes/_app.observe.monitors.index'
 import { Route as AppObserveMonitorsIdRouteImport } from './routes/_app.observe.monitors.$id'
+import { Route as AppObserveNotebooksIndexRouteImport } from './routes/_app.observe.notebooks.index'
+import { Route as AppObserveNotebooksIdRouteImport } from './routes/_app.observe.notebooks.$id'
 import { Route as AppObservePipelinesIndexRouteImport } from './routes/_app.observe.pipelines.index'
 import { Route as AppObservePipelinesIdRouteImport } from './routes/_app.observe.pipelines.$id'
 import { Route as AppObserveScannerIndexRouteImport } from './routes/_app.observe.scanner.index'
@@ -325,6 +327,17 @@ const AppObserveMonitorsIdRoute = AppObserveMonitorsIdRouteImport.update({
   path: '/observe/monitors/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppObserveNotebooksIndexRoute =
+  AppObserveNotebooksIndexRouteImport.update({
+    id: '/observe/notebooks/',
+    path: '/observe/notebooks/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppObserveNotebooksIdRoute = AppObserveNotebooksIdRouteImport.update({
+  id: '/observe/notebooks/$id',
+  path: '/observe/notebooks/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppObservePipelinesIndexRoute =
   AppObservePipelinesIndexRouteImport.update({
     id: '/observe/pipelines/',
@@ -436,6 +449,7 @@ export interface FileRoutesByFullPath {
   '/observe/hosts/$name': typeof AppObserveHostsNameRoute
   '/observe/incidents/$id': typeof AppObserveIncidentsIdRoute
   '/observe/monitors/$id': typeof AppObserveMonitorsIdRoute
+  '/observe/notebooks/$id': typeof AppObserveNotebooksIdRoute
   '/observe/pipelines/$id': typeof AppObservePipelinesIdRoute
   '/observe/scanner/$id': typeof AppObserveScannerIdRoute
   '/observe/slos/$id': typeof AppObserveSlosIdRoute
@@ -449,6 +463,7 @@ export interface FileRoutesByFullPath {
   '/observe/hosts/': typeof AppObserveHostsIndexRoute
   '/observe/incidents/': typeof AppObserveIncidentsIndexRoute
   '/observe/monitors/': typeof AppObserveMonitorsIndexRoute
+  '/observe/notebooks/': typeof AppObserveNotebooksIndexRoute
   '/observe/pipelines/': typeof AppObservePipelinesIndexRoute
   '/observe/scanner/': typeof AppObserveScannerIndexRoute
   '/observe/slos/': typeof AppObserveSlosIndexRoute
@@ -500,6 +515,7 @@ export interface FileRoutesByTo {
   '/observe/hosts/$name': typeof AppObserveHostsNameRoute
   '/observe/incidents/$id': typeof AppObserveIncidentsIdRoute
   '/observe/monitors/$id': typeof AppObserveMonitorsIdRoute
+  '/observe/notebooks/$id': typeof AppObserveNotebooksIdRoute
   '/observe/pipelines/$id': typeof AppObservePipelinesIdRoute
   '/observe/scanner/$id': typeof AppObserveScannerIdRoute
   '/observe/slos/$id': typeof AppObserveSlosIdRoute
@@ -513,6 +529,7 @@ export interface FileRoutesByTo {
   '/observe/hosts': typeof AppObserveHostsIndexRoute
   '/observe/incidents': typeof AppObserveIncidentsIndexRoute
   '/observe/monitors': typeof AppObserveMonitorsIndexRoute
+  '/observe/notebooks': typeof AppObserveNotebooksIndexRoute
   '/observe/pipelines': typeof AppObservePipelinesIndexRoute
   '/observe/scanner': typeof AppObserveScannerIndexRoute
   '/observe/slos': typeof AppObserveSlosIndexRoute
@@ -566,6 +583,7 @@ export interface FileRoutesById {
   '/_app/observe/hosts/$name': typeof AppObserveHostsNameRoute
   '/_app/observe/incidents/$id': typeof AppObserveIncidentsIdRoute
   '/_app/observe/monitors/$id': typeof AppObserveMonitorsIdRoute
+  '/_app/observe/notebooks/$id': typeof AppObserveNotebooksIdRoute
   '/_app/observe/pipelines/$id': typeof AppObservePipelinesIdRoute
   '/_app/observe/scanner/$id': typeof AppObserveScannerIdRoute
   '/_app/observe/slos/$id': typeof AppObserveSlosIdRoute
@@ -579,6 +597,7 @@ export interface FileRoutesById {
   '/_app/observe/hosts/': typeof AppObserveHostsIndexRoute
   '/_app/observe/incidents/': typeof AppObserveIncidentsIndexRoute
   '/_app/observe/monitors/': typeof AppObserveMonitorsIndexRoute
+  '/_app/observe/notebooks/': typeof AppObserveNotebooksIndexRoute
   '/_app/observe/pipelines/': typeof AppObservePipelinesIndexRoute
   '/_app/observe/scanner/': typeof AppObserveScannerIndexRoute
   '/_app/observe/slos/': typeof AppObserveSlosIndexRoute
@@ -632,6 +651,7 @@ export interface FileRouteTypes {
     | '/observe/hosts/$name'
     | '/observe/incidents/$id'
     | '/observe/monitors/$id'
+    | '/observe/notebooks/$id'
     | '/observe/pipelines/$id'
     | '/observe/scanner/$id'
     | '/observe/slos/$id'
@@ -645,6 +665,7 @@ export interface FileRouteTypes {
     | '/observe/hosts/'
     | '/observe/incidents/'
     | '/observe/monitors/'
+    | '/observe/notebooks/'
     | '/observe/pipelines/'
     | '/observe/scanner/'
     | '/observe/slos/'
@@ -696,6 +717,7 @@ export interface FileRouteTypes {
     | '/observe/hosts/$name'
     | '/observe/incidents/$id'
     | '/observe/monitors/$id'
+    | '/observe/notebooks/$id'
     | '/observe/pipelines/$id'
     | '/observe/scanner/$id'
     | '/observe/slos/$id'
@@ -709,6 +731,7 @@ export interface FileRouteTypes {
     | '/observe/hosts'
     | '/observe/incidents'
     | '/observe/monitors'
+    | '/observe/notebooks'
     | '/observe/pipelines'
     | '/observe/scanner'
     | '/observe/slos'
@@ -761,6 +784,7 @@ export interface FileRouteTypes {
     | '/_app/observe/hosts/$name'
     | '/_app/observe/incidents/$id'
     | '/_app/observe/monitors/$id'
+    | '/_app/observe/notebooks/$id'
     | '/_app/observe/pipelines/$id'
     | '/_app/observe/scanner/$id'
     | '/_app/observe/slos/$id'
@@ -774,6 +798,7 @@ export interface FileRouteTypes {
     | '/_app/observe/hosts/'
     | '/_app/observe/incidents/'
     | '/_app/observe/monitors/'
+    | '/_app/observe/notebooks/'
     | '/_app/observe/pipelines/'
     | '/_app/observe/scanner/'
     | '/_app/observe/slos/'
@@ -1141,6 +1166,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppObserveMonitorsIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/observe/notebooks/': {
+      id: '/_app/observe/notebooks/'
+      path: '/observe/notebooks'
+      fullPath: '/observe/notebooks/'
+      preLoaderRoute: typeof AppObserveNotebooksIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/observe/notebooks/$id': {
+      id: '/_app/observe/notebooks/$id'
+      path: '/observe/notebooks/$id'
+      fullPath: '/observe/notebooks/$id'
+      preLoaderRoute: typeof AppObserveNotebooksIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/observe/pipelines/': {
       id: '/_app/observe/pipelines/'
       path: '/observe/pipelines'
@@ -1276,6 +1315,7 @@ interface AppRouteChildren {
   AppObserveHostsNameRoute: typeof AppObserveHostsNameRoute
   AppObserveIncidentsIdRoute: typeof AppObserveIncidentsIdRoute
   AppObserveMonitorsIdRoute: typeof AppObserveMonitorsIdRoute
+  AppObserveNotebooksIdRoute: typeof AppObserveNotebooksIdRoute
   AppObservePipelinesIdRoute: typeof AppObservePipelinesIdRoute
   AppObserveScannerIdRoute: typeof AppObserveScannerIdRoute
   AppObserveSlosIdRoute: typeof AppObserveSlosIdRoute
@@ -1289,6 +1329,7 @@ interface AppRouteChildren {
   AppObserveHostsIndexRoute: typeof AppObserveHostsIndexRoute
   AppObserveIncidentsIndexRoute: typeof AppObserveIncidentsIndexRoute
   AppObserveMonitorsIndexRoute: typeof AppObserveMonitorsIndexRoute
+  AppObserveNotebooksIndexRoute: typeof AppObserveNotebooksIndexRoute
   AppObservePipelinesIndexRoute: typeof AppObservePipelinesIndexRoute
   AppObserveScannerIndexRoute: typeof AppObserveScannerIndexRoute
   AppObserveSlosIndexRoute: typeof AppObserveSlosIndexRoute
@@ -1340,6 +1381,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveHostsNameRoute: AppObserveHostsNameRoute,
   AppObserveIncidentsIdRoute: AppObserveIncidentsIdRoute,
   AppObserveMonitorsIdRoute: AppObserveMonitorsIdRoute,
+  AppObserveNotebooksIdRoute: AppObserveNotebooksIdRoute,
   AppObservePipelinesIdRoute: AppObservePipelinesIdRoute,
   AppObserveScannerIdRoute: AppObserveScannerIdRoute,
   AppObserveSlosIdRoute: AppObserveSlosIdRoute,
@@ -1353,6 +1395,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveHostsIndexRoute: AppObserveHostsIndexRoute,
   AppObserveIncidentsIndexRoute: AppObserveIncidentsIndexRoute,
   AppObserveMonitorsIndexRoute: AppObserveMonitorsIndexRoute,
+  AppObserveNotebooksIndexRoute: AppObserveNotebooksIndexRoute,
   AppObservePipelinesIndexRoute: AppObservePipelinesIndexRoute,
   AppObserveScannerIndexRoute: AppObserveScannerIndexRoute,
   AppObserveSlosIndexRoute: AppObserveSlosIndexRoute,

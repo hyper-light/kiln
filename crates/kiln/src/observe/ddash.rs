@@ -63,6 +63,14 @@ pub fn import(v: &Value) -> Result<(Dashboard, Report), String> {
     Ok((Dashboard { id: String::new(), title: title.to_owned(), description, template_variables, widgets: out, builtin: false, created: 0, modified: 0 }, report))
 }
 
+/// A notebook's graph cell (its definition, Datadog's widget's) as kiln draws it, and what kiln
+/// said of it where it draws it otherwise or not at all (a note that says why, then).
+pub fn cell_widget(definition: &Value) -> (Option<Widget>, Report) {
+    let mut report = Report::default();
+    let w = widget(&json!({ "definition": definition }), &Scale::ORDERED, false, &[], &mut report);
+    (w, report)
+}
+
 /// Where a widget goes on kiln's grid (see the module's notes).
 #[derive(Debug, Clone, Copy)]
 struct Scale {

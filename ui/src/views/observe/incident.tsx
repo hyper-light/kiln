@@ -6,7 +6,17 @@
  */
 import * as React from "react";
 import { X } from "lucide-react";
-import { observeApi, type Incident, type IncidentAttachment, type IncidentChange, type IncidentField, type IncidentState as State, type IncidentTodo, type TimelineCell } from "@/api/observe";
+import {
+  observeApi,
+  type Notebook,
+  type Incident,
+  type IncidentAttachment,
+  type IncidentChange,
+  type IncidentField,
+  type IncidentState as State,
+  type IncidentTodo,
+  type TimelineCell,
+} from "@/api/observe";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Hold, RowsHold } from "@/components/ui/hold";
@@ -21,6 +31,7 @@ import { invalidate } from "@/lib/resource";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { Handles, IncidentState, SEVERITIES, STATE_WORDS, Severity, ranFor } from "./incidents";
 import { StateBadge } from "./parts";
+import "./observe.css";
 
 // Markdown's renderer is big: only a page with a note loads it.
 const MarkdownBody = React.lazy(() => import("@/lib/markdown").then((m) => ({ default: m.MarkdownBody })));
@@ -389,14 +400,17 @@ function Attachments({ id, incident }: { id: string; incident: string }) {
   const sorted = [...all].sort((x, y) => Number(y.attributes.attachment_type === "postmortem") - Number(x.attributes.attachment_type === "postmortem"));
   return (
     <>
+      {!has && (
+        <Loadable label="the postmortem templates" fallback={null}>
+          <WritePostmortem incident={incident} />
+        </Loadable>
+      )}
       {sorted.length > 0 && (
         <ul className="mb-3 space-y-2">
           {sorted.map((x) => (
             <li key={x.id} className="flex min-w-0 items-center gap-2 text-[13px]">
               {x.attributes.attachment_type === "postmortem" && <span className="chip">postmortem</span>}
-              <a href={x.attributes.attachment.documentUrl} target="_blank" rel="noopener noreferrer" className="text-link min-w-0 flex-1 truncate">
-                {x.attributes.attachment.title}
-              </a>
+              <AttachmentLink url={x.attributes.attachment.documentUrl} title={x.attributes.attachment.title} />
               <button
                 type="button"
                 className="icon-btn -my-1"
@@ -435,6 +449,70 @@ function Attachments({ id, incident }: { id: string; incident: string }) {
         )}
       </form>
     </>
+  );
+}
+
+/** An attachment's link: a notebook of kiln's opened here (whatever host its link names: the
+ * server's public URL may not be the one the page was opened at); another site's in a tab of its own. */
+function AttachmentLink({ url, title }: { url: string; title: string }) {
+  let path: string | null = null;
+  try {
+    const u = new URL(url, "http://kiln.invalid");
+    if (/^\/observe\/notebooks\/\d+$/.test(u.pathname)) path = u.pathname;
+  } catch {
+    path = null;
+  }
+  return path ? (
+    <Link to={path} className="text-link min-w-0 flex-1 truncate">
+      {title}
+    </Link>
+  ) : (
+    <a href={url} target="_blank" rel="noopener noreferrer" className="text-link min-w-0 flex-1 truncate">
+      {title}
+    </a>
+  );
+}
+
+const templatesRes: Res<Notebook[]> = {
+  key: "observe/notebooks/templates/postmortem",
+  fetch: (s) => observeApi.notebooks({ is_template: true, type: "postmortem", count: 100 }, s).then((r) => r.data),
+};
+
+/** Its postmortem written: a notebook of a template (kiln's own unless one is picked) with what the
+ * incident says filled in, attached as its postmortem, then opened. */
+function WritePostmortem({ incident }: { incident: string }) {
+  const templates = useRes(templatesRes).data;
+  const navigate = useNavigate();
+  const [template, setTemplate] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const write = async () => {
+    setBusy(true);
+    try {
+      const n = await observeApi.writePostmortem(incident, template ? Number(template) : undefined);
+      invalidate("observe/incidents");
+      invalidate("observe/notebooks");
+      navigate(`/observe/notebooks/${n.id}`);
+    } catch (e) {
+      toast({ title: "Couldn't write the postmortem", description: errorMessage(e), tone: "failed" });
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="mb-4 flex flex-wrap items-end gap-2">
+      {templates.length > 0 && (
+        <SelectField
+          label="Its template"
+          hideLabel
+          value={template}
+          onChange={setTemplate}
+          options={[{ value: "", label: "kiln's template" }, ...templates.map((t) => ({ value: String(t.id), label: t.attributes.name || "Untitled" }))]}
+          className="min-w-[10rem] flex-1"
+        />
+      )}
+      <Button size="sm" onClick={() => void write()} disabled={busy}>
+        Write the postmortem
+      </Button>
+    </div>
   );
 }
 

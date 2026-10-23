@@ -24,6 +24,7 @@ pub mod kafka;
 pub mod kiln;
 pub mod logmetrics;
 pub mod monitors;
+pub mod notebooks;
 pub mod notify;
 pub mod openapi;
 pub mod ingest;

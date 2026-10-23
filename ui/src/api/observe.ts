@@ -1165,6 +1165,72 @@ export interface CatalogScore {
   scorecards: { name: string; passed: number; total: number }[];
 }
 
+/** A notebook's time, Datadog's: the last of a span, or from one time to another. */
+export type NotebookTime = { live_span: string } | { start: string; end: string; live?: boolean };
+export type NotebookType = "postmortem" | "runbook" | "investigation" | "documentation" | "report";
+export type GraphSize = "xs" | "s" | "m" | "l" | "xl";
+
+/** A cell's definition: Markdown's text, or one of Datadog's widgets' (its requests, a log stream's query). */
+export interface CellDefinition {
+  type: "markdown" | "timeseries" | "toplist" | "heatmap" | "distribution" | "log_stream";
+  text?: string;
+  title?: string;
+  requests?: { q?: string; display_type?: string; [k: string]: unknown }[];
+  query?: string;
+  [k: string]: unknown;
+}
+
+export interface NotebookCellAttributes {
+  definition: CellDefinition;
+  graph_size?: GraphSize;
+  split_by?: unknown;
+  time?: NotebookTime | null;
+}
+
+/** A notebook's cell (docs/observe.md §11.1), kiln's drawing of a graph beside. */
+export interface NotebookCell {
+  id: string;
+  type: "notebook_cells";
+  attributes: NotebookCellAttributes;
+  kiln?: { widget: Widget | null; said?: { title: string; type: string; why: string }[] };
+}
+
+/** A notebook as Datadog's API gives one (a list's without its cells and time). */
+export interface Notebook {
+  id: number;
+  type: "notebooks";
+  attributes: {
+    author: { handle: string; name: string };
+    cells?: NotebookCell[];
+    created: string;
+    modified: string;
+    name: string;
+    status: "published";
+    time?: NotebookTime;
+    metadata: { is_template: boolean; take_snapshots: boolean; type: NotebookType | null };
+    template_variables: unknown[] | null;
+    kiln: { incident: string | null };
+  };
+}
+
+/** What a notebook made or changed says: Datadog's attributes, a kept cell its id. */
+export interface NotebookBody {
+  name: string;
+  cells: { id?: string; type: "notebook_cells"; attributes: NotebookCellAttributes }[];
+  time: NotebookTime;
+  metadata?: { is_template?: boolean; take_snapshots?: boolean; type?: NotebookType | null };
+}
+
+export interface NotebookQuery {
+  query?: string;
+  type?: NotebookType;
+  is_template?: boolean;
+  start?: number;
+  count?: number;
+  sort_field?: "modified" | "name" | "created";
+  sort_dir?: "asc" | "desc";
+}
+
 /** An incident's field: Datadog's, a text or a list of texts (docs/observe.md §9.5). */
 export interface IncidentField {
   type: string;
@@ -1571,6 +1637,19 @@ export const observeApi = {
   createScanningGroup: (g: ScanningGroupIn) => request<ScanningGroup>("POST", `${BASE}/scanner/groups`, g),
   updateScanningGroup: (id: string, g: ScanningGroupIn) => request<ScanningGroup>("PUT", `${BASE}/scanner/groups/${enc(id)}`, g),
   deleteScanningGroup: (id: string) => request<void>("DELETE", `${BASE}/scanner/groups/${enc(id)}`),
+  /** Notebooks, as Datadog's list gives them, without their cells. */
+  notebooks: (q: NotebookQuery, signal?: AbortSignal) => {
+    const p = new URLSearchParams({ include_cells: "false" });
+    for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
+    return request<{ data: Notebook[]; meta: { page: { total_count: number; total_filtered_count: number } } }>("GET", `${BASE}/notebooks?${p}`, undefined, { signal });
+  },
+  notebook: (id: string | number, signal?: AbortSignal) => request<{ data: Notebook }>("GET", `${BASE}/notebooks/${enc(String(id))}`, undefined, { signal }).then((r) => r.data),
+  createNotebook: (body: NotebookBody) => request<{ data: Notebook }>("POST", `${BASE}/notebooks`, { data: { type: "notebooks", attributes: body } }).then((r) => r.data),
+  updateNotebook: (id: number, body: NotebookBody) => request<{ data: Notebook }>("PUT", `${BASE}/notebooks/${id}`, { data: { type: "notebooks", attributes: body } }).then((r) => r.data),
+  removeNotebook: (id: number) => request<void>("DELETE", `${BASE}/notebooks/${id}`),
+  /** An incident's postmortem: a notebook of `template` (a template's id; kiln's own unless said), attached to it. */
+  writePostmortem: (incident: string, template?: number) =>
+    request<{ data: Notebook }>("POST", `${BASE}/incidents/${enc(incident)}/postmortem`, template ? { template_id: template } : {}).then((r) => r.data),
   /** Incidents `query` matches (Datadog's search syntax), the newest first: a page of `size` from `offset`, with what matched counted by facet. */
   incidentSearch: (query: string, offset: number, size: number, signal?: AbortSignal) =>
     request<{ data: { attributes: { incidents: { data: Incident }[]; total: number; facets: IncidentFacets } } }>(

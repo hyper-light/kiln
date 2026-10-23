@@ -1521,6 +1521,104 @@ fn schemas() -> Map<String, Value> {
             &["id", "created", "cell_type"],
         ),
     );
+    // Notebooks (§11.1): Datadog's v1.
+    let notebook_time = describe(
+        object(&[("live_span", one_of(&super::notebooks::LIVE_SPANS.map(|(n, _)| n))), ("start", string()), ("end", string()), ("live", boolean())], &[]),
+        "the last of a span, or from start to end (RFC 3339)",
+    );
+    let notebook_metadata = object(&[("is_template", boolean()), ("take_snapshots", boolean()), ("type", nullable(one_of(&super::notebooks::TYPES)))], &[]);
+    let cell_attributes = describe(
+        object(
+            &[
+                (
+                    "definition",
+                    describe(
+                        object(&[("type", one_of(&super::notebooks::CELL_TYPES)), ("text", string()), ("requests", array(any())), ("query", string())], &["type"]),
+                        "Datadog's widget definition, or Markdown's",
+                    ),
+                ),
+                ("graph_size", one_of(&super::notebooks::GRAPH_SIZES)),
+                ("split_by", any()),
+                ("time", nullable(notebook_time.clone())),
+            ],
+            &["definition"],
+        ),
+        "a cell: Markdown, or a timeseries, top list, heatmap, distribution or log stream",
+    );
+    put(
+        "Notebook",
+        object(
+            &[
+                ("id", integer()),
+                ("type", one_of(&["notebooks"])),
+                (
+                    "attributes",
+                    object(
+                        &[
+                            ("author", object(&[("handle", string()), ("name", string())], &[])),
+                            (
+                                "cells",
+                                array(object(
+                                    &[
+                                        ("id", string()),
+                                        ("type", one_of(&["notebook_cells"])),
+                                        ("attributes", cell_attributes.clone()),
+                                        ("kiln", describe(any(), "how kiln draws a graph cell: its widget, and what it said of it")),
+                                    ],
+                                    &["id", "type", "attributes"],
+                                )),
+                            ),
+                            ("created", string()),
+                            ("modified", string()),
+                            ("name", string()),
+                            ("status", one_of(&["published"])),
+                            ("time", notebook_time.clone()),
+                            ("metadata", notebook_metadata.clone()),
+                            ("template_variables", nullable(array(any()))),
+                            ("kiln", describe(object(&[("incident", nullable(string()))], &[]), "the incident it is the postmortem of")),
+                        ],
+                        &["name"],
+                    ),
+                ),
+            ],
+            &["id", "type", "attributes"],
+        ),
+    );
+    put(
+        "NotebookBody",
+        object(
+            &[(
+                "data",
+                object(
+                    &[
+                        ("type", one_of(&["notebooks"])),
+                        (
+                            "attributes",
+                            object(
+                                &[
+                                    ("name", describe(string(), "80 characters at the most")),
+                                    (
+                                        "cells",
+                                        array(object(
+                                            &[("id", describe(string(), "a cell kept, a change's")), ("type", one_of(&["notebook_cells"])), ("attributes", cell_attributes)],
+                                            &["type", "attributes"],
+                                        )),
+                                    ),
+                                    ("time", notebook_time),
+                                    ("status", one_of(&["published"])),
+                                    ("metadata", notebook_metadata),
+                                    ("template_variables", nullable(array(any()))),
+                                ],
+                                &["name", "cells", "time"],
+                            ),
+                        ),
+                    ],
+                    &["type", "attributes"],
+                ),
+            )],
+            &["data"],
+        ),
+    );
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
@@ -2559,6 +2657,61 @@ fn ops() -> Vec<Op<'static>> {
                 vec![("201", answer_of("put", object(&[("data", schema("TimelineCell"))], &["data"])))],
             )
         },
+        Op {
+            params: vec![id()],
+            ..op(
+                "post",
+                "/incidents/{id}/postmortem",
+                "Makes an incident's postmortem: a notebook of a template (kiln's own unless one is named) with the incident's variables filled, attached as its postmortem",
+                "observe.write",
+                Some(json!({ "required": false, "content": { "application/json": { "schema": object(&[("template_id", describe(integer(), "a notebook that is a template"))], &[]) } } })),
+                vec![("201", answer_of("made", object(&[("data", schema("Notebook"))], &["data"])))],
+            )
+        },
+        // Notebooks (§11.1).
+        Op {
+            params: vec![
+                param("author_handle", "query", false, string(), "theirs alone"),
+                param("exclude_author_handle", "query", false, string(), "not theirs"),
+                param("query", "query", false, string(), "a part of the name or of the author's handle"),
+                param("is_template", "query", false, boolean(), "templates alone (false unless said: none)"),
+                param("type", "query", false, one_of(&super::notebooks::TYPES), "of that type"),
+                param("sort_field", "query", false, one_of(&["modified", "name", "created"]), "modified unless said"),
+                param("sort_dir", "query", false, one_of(&["asc", "desc"]), "desc unless said"),
+                param("start", "query", false, integer(), "the first of the page"),
+                param("count", "query", false, integer(), "100 unless said, 1,000 at the most"),
+                param("include_cells", "query", false, boolean(), "each one's cells and time (true unless said)"),
+            ],
+            ..op(
+                "get",
+                "/notebooks",
+                "Notebooks, as Datadog's API lists them",
+                "observe.read",
+                None,
+                vec![("200", answer_of("a page of them", object(&[("data", array(schema("Notebook"))), ("meta", any())], &["data", "meta"])))],
+            )
+        },
+        op(
+            "post",
+            "/notebooks",
+            "Makes a notebook (Datadog's body)",
+            "observe.write",
+            Some(body("NotebookBody")),
+            vec![("200", answer_of("made", object(&[("data", schema("Notebook"))], &["data"])))],
+        ),
+        Op { params: vec![id()], ..op("get", "/notebooks/{id}", "A notebook", "observe.read", None, vec![("200", answer_of("the notebook", object(&[("data", schema("Notebook"))], &["data"])))]) },
+        Op {
+            params: vec![id()],
+            ..op(
+                "put",
+                "/notebooks/{id}",
+                "Changes a notebook whole (its cells' ids kept where given)",
+                "observe.write",
+                Some(body("NotebookBody")),
+                vec![("200", answer_of("changed", object(&[("data", schema("Notebook"))], &["data"])))],
+            )
+        },
+        Op { params: vec![id()], ..op("delete", "/notebooks/{id}", "Removes a notebook", "observe.write", None, vec![no_content()]) },
         // The infrastructure list (§10.9).
         Op {
             params: vec![

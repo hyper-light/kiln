@@ -43,6 +43,7 @@ import { formatBytes, formatDuration } from "@/lib/format";
 const SECTIONS = [
   { to: "/observe", label: "Overview", end: true },
   { to: "/observe/dashboards", label: "Dashboards" },
+  { to: "/observe/notebooks", label: "Notebooks" },
   { to: "/observe/metrics", label: "Metrics" },
   { to: "/observe/hosts", label: "Hosts" },
   { to: "/observe/logs", label: "Logs" },
@@ -127,52 +128,59 @@ export function RangePicker({ value, onChange }: { value: Range; onChange: (r: R
 /** How often a range's answers are read again while shown: a 120th of it, between 15 s and 5 min. */
 export const pollFor = (r: Range) => Math.max(15_000, Math.min(300_000, RANGES[r] / 120));
 
+/** A time: the last of a range, or from one time to another (ms: a notebook's, a postmortem's). */
+export type Span = Range | { from: number; to: number };
+export const spanKey = (s: Span) => (typeof s === "string" ? s : `${s.from}-${s.to}`);
+export const spanMs = (s: Span) => (typeof s === "string" ? RANGES[s] : s.to - s.from);
+/** Its ends now: the last of a range ends now; a fixed time is as it is. */
+export function spanOf(s: Span): { from: number; to: number } {
+  if (typeof s !== "string") return s;
+  const now = Date.now();
+  return { from: now - RANGES[s], to: now };
+}
+/** A range's answers are read again as it moves on; a fixed time's are not. */
+const pollOf = (s: Span) => (typeof s === "string" ? pollFor(s) : undefined);
+
 /** What `query` answers over the last `range`, read again as the range moves on. */
 /** How far past now a chart of these queries reaches: half its range when one forecasts (a day's
  * chart its next twelve hours), unless asked; none else. */
-export function aheadOf(queries: string[], range: Range, ask?: number): number {
+export function aheadOf(queries: string[], range: Span, ask?: number): number {
   if (!queries.some((q) => /\bforecast\s*\(/i.test(q))) return 0;
-  return ask ?? RANGES[range] / 2;
+  return ask ?? (typeof range === "string" ? RANGES[range] / 2 : 0);
 }
 
-export const queryRes = (query: string, range: Range, points = 240): Res<QueryAnswer> => ({
-  key: `observe/query/${range}/${points}/${query}`,
+export const queryRes = (query: string, range: Span, points = 240): Res<QueryAnswer> => ({
+  key: `observe/query/${spanKey(range)}/${points}/${query}`,
   fetch: (signal) => {
-    const now = Date.now();
-    return observeApi.query({ query, from: now - RANGES[range], to: now + aheadOf([query], range), points }, signal);
+    const { from, to } = spanOf(range);
+    return observeApi.query({ query, from, to: to + aheadOf([query], range), points }, signal);
   },
-  opts: { pollMs: pollFor(range) },
+  opts: { pollMs: pollOf(range) },
 });
 
 /** A query's heatmap over the last `range`: `rows` rows at the most, `points` buckets of time. */
-export const heatmapRes = (query: string, range: Range, rows = 40, points = 120): Res<HeatmapAnswer> => ({
-  key: `observe/heatmap/${range}/${rows}/${points}/${query}`,
-  fetch: (signal) => {
-    const now = Date.now();
-    return observeApi.heatmap({ query, from: now - RANGES[range], to: now, points, heatmap: rows }, signal);
-  },
-  opts: { pollMs: pollFor(range) },
+export const heatmapRes = (query: string, range: Span, rows = 40, points = 120): Res<HeatmapAnswer> => ({
+  key: `observe/heatmap/${spanKey(range)}/${rows}/${points}/${query}`,
+  fetch: (signal) => observeApi.heatmap({ query, ...spanOf(range), points, heatmap: rows }, signal),
+  opts: { pollMs: pollOf(range) },
 });
 
 /** A service check's status over the last `range` (a check widget's): each group's latest. */
-export const checkStatusRes = (ask: CheckStatusAsk, range: Range): Res<CheckStatus> => ({
-  key: `observe/checks/${range}/${JSON.stringify(ask)}`,
-  fetch: (signal) => {
-    const now = Date.now();
-    return observeApi.checkStatus({ ...ask, from: now - RANGES[range], to: now }, signal);
-  },
-  opts: { pollMs: pollFor(range) },
+export const checkStatusRes = (ask: CheckStatusAsk, range: Span): Res<CheckStatus> => ({
+  key: `observe/checks/${spanKey(range)}/${JSON.stringify(ask)}`,
+  fetch: (signal) => observeApi.checkStatus({ ...ask, ...spanOf(range) }, signal),
+  opts: { pollMs: pollOf(range) },
 });
 
 /** What several queries answer over one range, read together (a widget's, the explorer's). */
-export const queriesRes = (queries: string[], range: Range, points = 240, ahead?: number): Res<QueryAnswer[]> => ({
-  key: `observe/queries/${range}/${points}/${ahead ?? ""}/${queries.join("\n")}`,
+export const queriesRes = (queries: string[], range: Span, points = 240, ahead?: number): Res<QueryAnswer[]> => ({
+  key: `observe/queries/${spanKey(range)}/${points}/${ahead ?? ""}/${queries.join("\n")}`,
   fetch: (signal) => {
-    const now = Date.now();
-    const to = now + aheadOf(queries, range, ahead);
-    return Promise.all(queries.map((query) => observeApi.query({ query, from: now - RANGES[range], to, points }, signal)));
+    const { from, to } = spanOf(range);
+    const until = to + aheadOf(queries, range, ahead);
+    return Promise.all(queries.map((query) => observeApi.query({ query, from, to: until, points }, signal)));
   },
-  opts: { pollMs: pollFor(range) },
+  opts: { pollMs: pollOf(range) },
 });
 
 /** A series' data: its values up to where a forecast starts (all of them, without one). */
@@ -182,13 +190,10 @@ export function dataOf(s: QueryAnswer["series"][number]): (number | null)[] {
 }
 
 /** A log search's records over the range, by status, in about 60 buckets of a round size. */
-export const histogramRes = (query: string, range: Range): Res<LogHistogram> => ({
-  key: `observe/histogram/${range}/${query}`,
-  fetch: (signal) => {
-    const to = Date.now();
-    return observeApi.histogram({ query, from: to - RANGES[range], to, step: niceStep(RANGES[range] / 60), by: ["status"] }, signal);
-  },
-  opts: { pollMs: pollFor(range) },
+export const histogramRes = (query: string, range: Span): Res<LogHistogram> => ({
+  key: `observe/histogram/${spanKey(range)}/${query}`,
+  fetch: (signal) => observeApi.histogram({ query, ...spanOf(range), step: niceStep(spanMs(range) / 60), by: ["status"] }, signal),
+  opts: { pollMs: pollOf(range) },
 });
 
 /** A span search's spans over the range, by status, as `histogramRes` has a log search's. */
@@ -277,7 +282,7 @@ export function aggregate(values: (number | null)[], how: string = "avg"): numbe
 }
 
 /** The time axis a range (or a span of ms) reads best in. */
-const timeFormat = (r: Range | number) => ((typeof r === "number" ? r : RANGES[r]) > 2 * 86_400_000 ? "day" : "time");
+const timeFormat = (r: Span | number) => ((typeof r === "number" ? r : spanMs(r)) > 2 * 86_400_000 ? "day" : "time");
 
 /** Answers drawn as uPlot takes them: the first answer's buckets, and every series on them. */
 /** Whether an `anomalies()` score is past its band, on the side it watches. */
@@ -305,6 +310,20 @@ const bucketTime = (g: QueryAnswer["grid"], i: number) => g.times?.[i] ?? g.from
 
 /** Answers as a chart's columns: each series as a line; a `forecast()` series as two, its data
  * and, from its last point on, its forecast (drawn dashed, its band about it). */
+/** A series' samples' usual spacing in buckets: the median between neighbours (one when dense, or a
+ * lone value). */
+export function spacingOf(values: (number | null)[]): number {
+  const apart: number[] = [];
+  let last = -1;
+  values.forEach((v, i) => {
+    if (v === null) return;
+    if (last >= 0) apart.push(i - last);
+    last = i;
+  });
+  apart.sort((a, b) => a - b);
+  return apart[Math.floor(apart.length / 2)] ?? 1;
+}
+
 export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; labels: string[]; bands: Band[]; drawn: Drawn[] } {
   const first = answers[0];
   if (!first) return { data: [[]], labels: [], bands: [], drawn: [] };
@@ -369,7 +388,7 @@ export function QueryChart({
   ahead,
 }: {
   queries: string[];
-  range: Range;
+  range: Span;
   height?: number;
   unit?: string;
   display?: "line" | "bars" | "area";
@@ -380,6 +399,9 @@ export function QueryChart({
 }) {
   const answers = useRes(queriesRes(queries, range, 240, ahead)).data;
   const { data, labels, bands, drawn } = React.useMemo(() => chartData(answers), [answers]);
+  // Each series' spacing (a metric sent less often than the grid's step drawn across its empty
+  // buckets), and whether it has one value alone (a point, there being no line).
+  const sparse = React.useMemo(() => data.slice(1).map((ys) => ({ spacing: spacingOf(ys), lone: ys.filter((v) => v !== null).length === 1 })), [data]);
   if (labels.length === 0)
     return (
       <p className="empty-line flex items-center justify-center" style={{ minHeight: height }}>
@@ -397,11 +419,13 @@ export function QueryChart({
       legend={legend ?? labels.length + marks.length <= 6}
       bands={bands}
       series={[
-        ...drawn.map((d) => ({
+        ...drawn.map((d, i) => ({
           label: d.label,
           color: drawnColor(d),
           bars: display === "bars" && !d.forecast,
           fill: display === "area" && !d.forecast,
+          spacing: sparse[i]?.spacing,
+          points: sparse[i]?.lone,
           ...(d.forecast ? { dash: [6, 4] } : {}),
         })),
         ...marks.map((m) => ({ label: m.label, color: m.color, dash: [4, 4], width: 1 })),
@@ -427,7 +451,7 @@ export const STATUS_COLOR: Record<string, string> = {
  * worse than it, the mildest first, so each one shows as its own segment; the legend says each
  * one's own count.
  */
-export function Histogram({ h, range, height = 120 }: { h: LogHistogram; range: Range | number; height?: number }) {
+export function Histogram({ h, range, height = 120 }: { h: LogHistogram; range: Span | number; height?: number }) {
   const { data, series } = React.useMemo(() => {
     const xs = Array.from({ length: h.grid.n }, (_, i) => (h.grid.from + i * h.grid.step) / 1000);
     const groups = [...h.series].sort((a, b) => STATUS_ORDER.indexOf(a.group.status ?? "") - STATUS_ORDER.indexOf(b.group.status ?? ""));
@@ -480,13 +504,10 @@ export const dashboardRes = (id: string): Res<Dashboard> => ({ key: `observe/das
 export const tagValuesRes = (tag: string): Res<string[]> => ({ key: `observe/tags/${tag}`, fetch: (s) => observeApi.tagValues(tag, s).then((r) => r.values), opts: { pollMs: 300_000 } });
 
 /** The newest records a search finds over the range (a dashboard's log and event widgets). */
-export const recordsRes = (query: string, range: Range, limit: number): Res<LogSearch> => ({
-  key: `observe/logs/${range}/${limit}/${query}`,
-  fetch: (signal) => {
-    const to = Date.now();
-    return observeApi.logs({ query, from: to - RANGES[range], to, limit }, signal);
-  },
-  opts: { pollMs: pollFor(range) },
+export const recordsRes = (query: string, range: Span, limit: number): Res<LogSearch> => ({
+  key: `observe/logs/${spanKey(range)}/${limit}/${query}`,
+  fetch: (signal) => observeApi.logs({ query, ...spanOf(range), limit }, signal),
+  opts: { pollMs: pollOf(range) },
 });
 
 /**
