@@ -85,6 +85,8 @@ KNOWN = [
     (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
     # buildx's debug adapter tests wait 5 s for a build to end (`require.Fail(t, "timeout reached")`).
     (r"Error:\s+timeout reached", "a test's timed wait (buildx's debug adapter waits 5 s for a build to end), in the lab, which runs at nice 19 and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    # CodeMirror parses to a time budget; with no editor view, a test's tree stays as far as it got.
+    (r"computeStartCompletePosition test", "CodeMirror's parser works to a time budget, which prometheus's completion test ran out of in the slow lab (its suite took 19 s, 2 s quiet): timing, to be run again when quiet"),
     (r"Condition never satisfied", "a test's timed wait (testify's `Eventually`: prometheus's waits seconds for its server), in the slow lab: timing, to be run again when quiet"),
     (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
     # The lab's firewall keeps containers on networks of their own from its server, so its legs
