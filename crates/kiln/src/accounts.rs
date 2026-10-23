@@ -309,6 +309,7 @@ async fn drive(hub: &Arc<Hub>, cli: &'static Cli, id: &str, target: &str, sessio
     let signed_in = account.as_ref().and_then(|a| a.signed_in);
     let lines = get(id).map(|f| f.lines).unwrap_or_default();
     let mut ok = false;
+    let told = account.clone();
     finish(hub, id, |f| {
         if f.state != "cancelled" {
             ok = failed.is_none() && code == Some(0) && signed_in == Some(true);
@@ -321,7 +322,7 @@ async fn drive(hub: &Arc<Hub>, cli: &'static Cli, id: &str, target: &str, sessio
     });
     // Signed in (perhaps as someone else): the machine's sessions of this harness take it up.
     if ok {
-        hub.harness.signed_in(hub, target, cli.kind).await;
+        hub.harness.signed_in(hub, target, cli.kind, told.as_ref()).await;
     }
 }
 

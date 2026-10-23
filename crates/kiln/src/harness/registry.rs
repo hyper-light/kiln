@@ -1348,10 +1348,13 @@ impl Registry {
     /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is
     /// told, to take up the account (Claude Code starts again with it once its turn ends; Codex reads
     /// it again).
-    pub async fn signed_in(&self, hub: &Hub, target: &str, kind: &str) {
+    pub async fn signed_in(&self, hub: &Hub, target: &str, kind: &str, account: Option<&crate::accounts::Account>) {
+        // Who it's signed in as now, so each session takes it at once rather than when it next
+        // starts (its page would show the old account, and that account's usage, until then).
+        let value = account.map(|a| serde_json::json!({"email": a.email, "org": a.org, "plan": a.plan, "method": a.method}));
         let ids: Vec<String> = self.list().into_iter().filter(|i| i.target == target && i.kind == kind).map(|i| i.id).collect();
         for id in ids {
-            let _ = self.command(hub, &id, Command::Control { id: "account".into(), value: None }).await;
+            let _ = self.command(hub, &id, Command::Control { id: "account".into(), value: value.clone() }).await;
         }
     }
 
