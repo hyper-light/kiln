@@ -118,6 +118,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
         ("gcp-functions", Some(n)) => super::gcp_functions::adopt(&tcx, n).await,
         ("gcp-run", None) => super::gcp_run::discover(&tcx).await,
         ("gcp-run", Some(n)) => super::gcp_run::adopt(&tcx, n).await,
+        ("digitalocean", None) => super::digitalocean::discover(&tcx).await,
+        ("digitalocean", Some(n)) => super::digitalocean::adopt(&tcx, n).await,
         ("render", None) => super::render::discover(&tcx).await,
         ("render", Some(n)) => super::render::adopt(&tcx, n).await,
         ("vercel", None) => super::vercel::discover(&tcx).await,

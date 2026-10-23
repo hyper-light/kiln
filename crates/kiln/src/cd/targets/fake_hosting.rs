@@ -1,4 +1,4 @@
-//! A fake of the hosting platforms' APIs for tests (Render), in memory, behaving as each
+//! A fake of the hosting platforms' APIs for tests (Render, DigitalOcean App Platform), in memory, behaving as each
 //! documents it where kiln depends on it: a deploy builds and goes live, the one before serving
 //! until it does, and one that fails leaves it serving; a rollback re-deploys an earlier deploy.
 //! Every request carries the platform's token.
@@ -26,10 +26,21 @@ pub struct RenderService {
     pub busy: u32,
 }
 
+/// An App Platform app as the fake keeps it: its spec, and its deployments, newest first.
+#[derive(Clone, Debug, Default)]
+pub struct DoApp {
+    pub spec: Value,
+    pub deployments: Vec<Value>,
+    /// Reads left before the newest deployment is done.
+    pub busy: u32,
+}
+
 #[derive(Default)]
 pub struct HostingState {
     pub base: String,
     pub render: BTreeMap<String, RenderService>,
+    /// App Platform's apps, by id.
+    pub apps: BTreeMap<String, DoApp>,
     /// Every change, in order: `Deploy shop-web …`.
     pub calls: Vec<String>,
     pub next: u64,
@@ -77,6 +88,7 @@ impl srv::Handler for FakeHosting {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         match parts.as_slice() {
             ["v1", "services", rest @ ..] => render(&mut st, &method, rest, &query, &body),
+            ["v2", "apps", rest @ ..] => digitalocean(&mut st, &method, rest, &body),
             _ => err(404, "not_found", &format!("the fake has no {method} {path}")),
         }
     }
@@ -173,6 +185,121 @@ fn render(st: &mut HostingState, method: &http::Method, rest: &[&str], query: &B
             }
         }
         _ => err(404, "not_found", "the fake has no such Render call"),
+    }
+}
+
+// ------------------------------------------------------------------ DigitalOcean App Platform
+
+/// App Platform's defaults, filled into a spec as it keeps it.
+fn do_defaulted(spec: &Value) -> Value {
+    let mut s = spec.clone();
+    if let Some(m) = s.as_object_mut() {
+        m.entry("region").or_insert(json!("nyc"));
+        if let Some(Value::Array(svcs)) = m.get_mut("services") {
+            for v in svcs.iter_mut().filter_map(Value::as_object_mut) {
+                v.entry("instance_count").or_insert(json!(1));
+                v.entry("instance_size_slug").or_insert(json!("basic-xxs"));
+            }
+        }
+    }
+    s
+}
+
+/// A read: the newest deployment goes on, through its phases, to active (the one before
+/// superseded), or to an error.
+fn do_step(a: &mut DoApp) {
+    if a.busy == 0 {
+        return;
+    }
+    a.busy -= 1;
+    let broken = a.deployments.first().is_some_and(|d| d.to_string().contains("broken"));
+    let phase = match a.busy {
+        2 => "BUILDING",
+        1 => "DEPLOYING",
+        _ if broken => "ERROR",
+        _ => "ACTIVE",
+    };
+    if phase == "ACTIVE" {
+        for d in a.deployments.iter_mut().skip(1).filter(|d| d.get("phase").and_then(Value::as_str) == Some("ACTIVE")) {
+            set(d, "phase", json!("SUPERSEDED"));
+        }
+    }
+    if let Some(d) = a.deployments.first_mut() {
+        set(d, "phase", json!(phase));
+    }
+}
+
+fn do_answer(id: &str, a: &DoApp) -> Value {
+    let active = a.deployments.iter().find(|d| d.get("phase").and_then(Value::as_str) == Some("ACTIVE")).cloned();
+    let moving = a.deployments.first().filter(|d| matches!(d.get("phase").and_then(Value::as_str), Some("PENDING_BUILD" | "BUILDING" | "DEPLOYING"))).cloned();
+    let name = a.spec.get("name").and_then(Value::as_str).unwrap_or_default();
+    json!({ "id": id, "spec": a.spec, "live_url": format!("https://{name}-abc.ondigitalocean.app"), "updated_at": "2026-10-23T00:00:00Z",
+        "active_deployment": active, "in_progress_deployment": moving, "pending_deployment": moving })
+}
+
+fn digitalocean(st: &mut HostingState, method: &http::Method, rest: &[&str], body: &Value) -> Response {
+    let n = next(st);
+    match (method.as_str(), rest) {
+        ("GET", []) => ok(json!({ "apps": st.apps.iter().map(|(id, a)| do_answer(id, a)).collect::<Vec<_>>() })),
+        ("POST", []) => {
+            let Some(spec) = body.get("spec").filter(|s| s.get("name").is_some()) else { return err(422, "unprocessable_entity", "the spec needs a name") };
+            let id = format!("app-{n}");
+            let spec = do_defaulted(spec);
+            let d = json!({ "id": format!("dep-{n}"), "phase": "PENDING_BUILD", "cause": "app created", "spec": spec });
+            let a = DoApp { spec, deployments: vec![d], busy: 3 };
+            st.calls.push(format!("CreateApp {}", a.spec.get("name").and_then(Value::as_str).unwrap_or_default()));
+            let answer = do_answer(&id, &a);
+            st.apps.insert(id, a);
+            ok(json!({ "app": answer }))
+        }
+        (_, [id, rest @ ..]) => {
+            let id = (*id).to_owned();
+            let Some(a) = st.apps.get_mut(&id) else { return err(404, "not_found", "The resource you were accessing could not be found.") };
+            let name = a.spec.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            match (method.as_str(), rest) {
+                ("GET", []) => {
+                    do_step(a);
+                    ok(json!({ "app": do_answer(&id, a) }))
+                }
+                ("PUT", []) => {
+                    let Some(spec) = body.get("spec") else { return err(422, "unprocessable_entity", "a spec") };
+                    a.spec = do_defaulted(spec);
+                    a.deployments.insert(0, json!({ "id": format!("dep-{n}"), "phase": "PENDING_BUILD", "cause": "app spec updated", "spec": a.spec }));
+                    a.busy = 3;
+                    let answer = do_answer(&id, a);
+                    st.calls.push(format!("UpdateApp {name}"));
+                    ok(json!({ "app": answer }))
+                }
+                ("DELETE", []) => {
+                    st.apps.remove(&id);
+                    st.calls.push(format!("DeleteApp {name}"));
+                    ok(json!({ "id": id }))
+                }
+                ("GET", ["deployments"]) => {
+                    do_step(a);
+                    ok(json!({ "deployments": a.deployments }))
+                }
+                ("GET", ["deployments", did]) => {
+                    do_step(a);
+                    match a.deployments.iter().find(|d| d.get("id").and_then(Value::as_str) == Some(*did)) {
+                        Some(d) => ok(json!({ "deployment": d })),
+                        None => err(404, "not_found", "no such deployment"),
+                    }
+                }
+                ("POST", ["rollback"]) => {
+                    let target = body.get("deployment_id").and_then(Value::as_str).unwrap_or_default();
+                    let Some(before) = a.deployments.iter().find(|d| d.get("id").and_then(Value::as_str) == Some(target)).cloned() else { return err(404, "not_found", "no such deployment") };
+                    a.spec = before.get("spec").cloned().unwrap_or(Value::Null);
+                    let d = json!({ "id": format!("dep-{n}"), "phase": "DEPLOYING", "cause": "rollback", "spec": a.spec });
+                    a.deployments.insert(0, d.clone());
+                    a.busy = 1;
+                    st.calls.push(format!("RollbackApp {name} {target}"));
+                    ok(json!({ "deployment": d }))
+                }
+                _ => err(404, "not_found", "the fake has no such App Platform call"),
+            }
+        }
+        _ => err(404, "not_found", "the fake has no such App Platform call"),
     }
 }
 

@@ -25,6 +25,7 @@ pub mod azure_vmss;
 pub mod azure_web;
 pub mod cloudflare_workers;
 pub mod cloudformation;
+pub mod digitalocean;
 pub mod gcp_appengine;
 pub mod gcp_compute;
 pub mod gcp_functions;
@@ -549,11 +550,17 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "digitalocean",
         place: &[],
         scope: None,
-        settings: &[s("app", true, "the app"), s("spec", false, "the app spec: .do/app.yaml in the source (found by default), or an object")],
+        settings: &[
+            s("app", true, "the app"),
+            s("spec", false, "the app spec: .do/app.yaml in the source (found by default), or an object"),
+            s("image", false, "a service's image (${{ release.artifacts.<name>.digest }}): DOCR, Docker Hub or GHCR"),
+            s("component", false, "the service the image is for (the first, by default)"),
+            s("set", false, "values to set in the spec by path"),
+        ],
         kinds: &[kind("apps.digitalocean.kiln.dev", "App", "App"), child(kind("apps.digitalocean.kiln.dev", "Deployment", "Deployment"))],
-        capabilities: &[Versions, Logs, Drift, Adopt],
+        capabilities: &[Versions, Drift, Adopt],
         reads: &[".do/app.yaml"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "nomad",
@@ -761,6 +768,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "azure-vmss" => azure_vmss::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
         "cloudformation" => cloudformation::render(input),
+        "digitalocean" => digitalocean::render(input),
         "gcp-appengine" => gcp_appengine::render(input),
         "gcp-compute" => gcp_compute::render(input),
         "gcp-functions" => gcp_functions::render(input),
@@ -789,6 +797,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "azure-vmss" => azure_vmss::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
         "cloudformation" => cloudformation::files(spec),
+        "digitalocean" => digitalocean::files(spec),
         "gcp-appengine" => gcp_appengine::files(spec),
         "gcp-compute" => gcp_compute::files(spec),
         "gcp-functions" => gcp_functions::files(spec),
@@ -819,6 +828,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "azure-vmss" => azure_vmss::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
         "cloudformation" => cloudformation::health(obj),
+        "digitalocean" => digitalocean::health(obj),
         "gcp-appengine" => gcp_appengine::health(obj),
         "gcp-compute" => gcp_compute::health(obj),
         "gcp-functions" => gcp_functions::health(obj),
