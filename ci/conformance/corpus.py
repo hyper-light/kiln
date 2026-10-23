@@ -50,9 +50,9 @@ FINISHED = {"succeeded", "failed", "cancelled", "timed_out", "skipped"}
 # Failures that aren't kiln's, by what their notes say: the reason the table gives.
 KNOWN = [
     (r"deploy-pages|Failed to create deployment \(status: 501\)", "GitHub Pages is outside kiln (docs/ci.md §1.3)"),
-    # `persist-credentials: false`, then a fetch of the repository: GitHub's public repositories
-    # answer anyone, kiln's only those signed in.
-    (r"could not read Username for", "the job drops its credentials and fetches again: kiln's repositories aren't read anonymously, as a public one on GitHub is"),
+    # The corpus submits the whole tree against an empty trunk: a check that compares a pull
+    # request with its base finds nothing there to compare.
+    (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
 ]
 
 
