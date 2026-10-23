@@ -100,12 +100,18 @@ Events go on target `kiln.blobs`, where `event` is put, get, list, adopt, collec
 given_up. A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.rs, docs/blobs.md
 ("Watching it") and the dashboard's Blobs row. Nothing else reads the names.
 
-**One change Kiln Metrics asked for,** in T10's next goal (it needs a gate): once Observe's span
-bridge keeps `kiln.blobs`, it makes an Observe event of every line that has an `event` field. So:
-- per-request lines lose the field: refusals at debug, and the CAS's "kept" on every put;
+**Two lines change in T10's next goal,** which needs a gate. When observe merges, Observe's span
+bridge makes an Observe event of each `kiln.blobs` line at INFO and up that has an `event` field,
+so routine puts, gets and lists stay below INFO (Kiln Metrics, 2026-10-23):
 - the per-request warning for an unavailable store says `event = "unavailable"`, not `refused`;
-- every other event keeps its field: the adopt and collect summaries, given_up, a piece archived,
-  and the warnings for a failed put, get or list. Kiln Metrics confirmed this list.
+- the line for each archived piece of a transcript (`event = "put"`, at info) moves to debug.
+
+Nothing else changes:
+- per-request refusals and the CAS's "kept" are at debug already;
+- the adopt and collect summaries are at info;
+- given_up, and failures that need a look, are at warn.
+
+Observe's built-in Blobs dashboard (`builtin:blobs`, on the observe branch) lands with observe.
 
 ## Risks
 
