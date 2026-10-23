@@ -329,6 +329,16 @@ pub fn checked(core: &mut Core, now: i64) -> Option<Pause> {
         hold(core, LIMIT, "account", ask.hit, None);
     }
     let p = core.state.pause.as_ref()?;
+    // A limit the account no longer has (it was signed out of, or its limit started over early):
+    // the window waited for resets at another time now and isn't full. It goes on now rather than
+    // at a reset that won't come.
+    if p.checking.is_none() && !core.state.manual_resume && gone(&core.state.limits, p, cap_of(p, core.state.pause_at)) {
+        let why = match p.label.as_deref() {
+            Some(l) => format!("The {l} limit it waited for is gone; going on."),
+            None => "The limit it waited for is gone; going on.".to_owned(),
+        };
+        return release(core, &why);
+    }
     p.checking?;
     let cap = cap_of(p, core.state.pause_at);
     let reached = still_reached(&core.state.limits, p.window.as_deref(), cap, now);
@@ -353,6 +363,13 @@ pub fn checked(core: &mut Core, now: i64) -> Option<Pause> {
         None => "The limit reset; going on.".to_owned(),
     };
     release(core, &why)
+}
+
+/// Whether the window pause `p` waits for is gone: the usage now says it resets at another time
+/// than the pause waits for, and isn't full.
+fn gone(limits: &[Limit], p: &Pause, cap: f64) -> bool {
+    let (Some(window), Some(until)) = (p.window.as_deref(), p.until) else { return false };
+    limits.iter().filter(|l| l.id == window && l.unit.is_none()).any(|l| l.used_percent.is_some_and(|u| u < cap) && l.resets_at.is_some_and(|r| r.abs_diff(until) > SAME_RESET_MS.unsigned_abs()))
 }
 
 /// Whether the window a pause waits for is still as full as it may get: Some(true) yes,
@@ -674,6 +691,28 @@ mod tests {
         core.state.limits = vec![window("five_hour", 3.0, later + 5 * 3_600_000)];
         assert!(checked(&mut core, later).is_some());
         assert!(core.state.pause.is_none());
+    }
+
+    #[test]
+    fn a_pause_for_a_window_that_started_over_at_another_time_goes_on_at_the_next_usage() {
+        let mut core = Core::new();
+        let now = Core::now();
+        let until = now + 3 * 86_400_000;
+        core.state.limits = vec![window("seven_day", 100.0, until)];
+        hold(&mut core, LIMIT, "account", Hit { window: Some("seven_day".into()), until: Some(until), said: String::new() }, None);
+        assert!(checked(&mut core, now).is_none() && core.state.pause.is_some());
+        // The week it waits for, a little less full or its reset said a little differently: it waits.
+        core.state.limits = vec![window("seven_day", 97.0, until + 60_000)];
+        assert!(checked(&mut core, now).is_none() && core.state.pause.is_some());
+        // Its usage says the week starts over days later, and has room (another account now, or
+        // the limit started over early): it goes on.
+        core.state.limits = vec![window("seven_day", 67.0, until + 3 * 86_400_000)];
+        let ended = checked(&mut core, now);
+        assert!(ended.is_some() && core.state.pause.is_none());
+        // One a person resumes by hand waits for the person, whatever the usage says.
+        core.state.manual_resume = true;
+        hold(&mut core, LIMIT, "account", Hit { window: Some("seven_day".into()), until: Some(until), said: String::new() }, None);
+        assert!(checked(&mut core, now).is_none() && core.state.pause.is_some());
     }
 
     #[test]
