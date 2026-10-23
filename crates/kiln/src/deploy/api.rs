@@ -266,10 +266,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
             ok(&boxed(|| secret_delete(&d, &who, app, env, name, how)).await?)
         }
         (&Method::GET, ["apps", app, "environments", env, "secrets", name, "versions"]) => ok(&boxed(|| secret_versions(&d, &who, app, env, name)).await?),
-        (&Method::POST, ["secret-keys", "rotate"]) => {
-            let n = secrets::of(&d.hub).rotate(&caller(&who)).await.map_err(refused)?;
-            ok(&json!({ "resealed": n }))
-        }
+        (&Method::POST, ["secret-keys", "rotate"]) => ok(&boxed(|| rotate_keys(&d, &who)).await?),
         (&Method::GET, ["apps", app, "environments", env, "secret-uses"]) => {
             let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
             ok(&boxed(|| secret_uses(&d, &who, app, env, limit)).await?)
@@ -281,13 +278,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         // Where release repositories may be (§7): kiln's own git server, GitHub through kiln's App,
         // each GitLab with the groups its token covers, Bitbucket with its workspaces.
         (&Method::GET, ["git-hosts"]) => ok(&json!({ "hosts": boxed(|| git_hosts(&d.hub)).await })),
-        (&Method::GET, ["apps", app, "environments", env, "statement"]) => {
-            let audience = q.get("audience").map(|a| a.trim()).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
-            match boxed(|| link::statement(&d, app, env, audience)).await.map_err(internal)? {
-                Some(statement) => ok(&json!({ "statement": statement })),
-                None => Err((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}"))),
-            }
-        }
+        (&Method::GET, ["apps", app, "environments", env, "statement"]) => ok(&boxed(|| statement(&d, app, env, q.get("audience").map(String::as_str))).await?),
 
         (&Method::GET, ["releases"]) => {
             let state = match q.get("state") {
@@ -338,8 +329,24 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
     }
 }
 
+/// What runs of `app` in `env` and what's on its way, signed for the linked server whose issuer is
+/// `audience` (§11).
+pub(super) async fn statement(d: &Deploy, app: &str, env: &str, audience: Option<&str>) -> Result<Value, Fail> {
+    let audience = audience.map(str::trim).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
+    match link::statement(d, app, env, audience).await.map_err(internal)? {
+        Some(statement) => Ok(json!({ "statement": statement })),
+        None => Err((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}"))),
+    }
+}
+
+/// Every app's secrets sealed again under a new data key (§3.5): how many were.
+pub(super) async fn rotate_keys(d: &Deploy, who: &Who) -> Result<Value, Fail> {
+    let n = secrets::of(&d.hub).rotate(&caller(who)).await.map_err(refused)?;
+    Ok(json!({ "resealed": n }))
+}
+
 /// The git hosts release repositories may be on (docs/deploy-api.md §7).
-async fn git_hosts(hub: &Hub) -> Vec<Value> {
+pub(super) async fn git_hosts(hub: &Hub) -> Vec<Value> {
     use super::model::{BITBUCKET_HOST, GITHUB_HOST, GITLAB_HOST, KILN_HOST};
     let mut out = vec![json!({ "host": KILN_HOST, "name": "kiln's own git server" })];
     if let Some(app) = crate::githost::github::app(hub).await {
@@ -356,7 +363,7 @@ async fn git_hosts(hub: &Hub) -> Vec<Value> {
 
 /// Every registration with what runs and what's in flight, and what waits for people: the
 /// environments board, in one answer.
-async fn board(d: &Deploy) -> Result<Value, Fail> {
+pub(super) async fn board(d: &Deploy) -> Result<Value, Fail> {
     let st = &d.hub.store;
     let environments = store::environments(st).await.map_err(internal)?;
     let apps = store::apps(st).await.map_err(internal)?;
@@ -482,7 +489,13 @@ async fn secret_value(body: Incoming) -> Result<secrets::Value, Fail> {
     }
     let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
     let put: Put = serde_json::from_slice(&bytes).map_err(|_| bad("a secret is set with `{\"value\": \"…\"}`, or `{\"base64\": \"…\"}` for bytes"))?;
-    match (put.value, put.base64) {
+    secret_value_of(put.value, put.base64)
+}
+
+/// A secret's value from its text (`value`) or its bytes (`base64`): one of them. What doesn't
+/// read is refused without saying what it was.
+pub(super) fn secret_value_of(value: Option<String>, base64: Option<String>) -> Result<secrets::Value, Fail> {
+    match (value, base64) {
         (Some(v), None) => Ok(secrets::Value::new(v.into_bytes())),
         (None, Some(b)) => {
             use base64::Engine as _;
@@ -503,7 +516,7 @@ pub(super) async fn secrets_list(d: &Deploy, who: &Who, app: &str, env: &str) ->
 
 /// Sets a secret's next version, and releases it unless `release` is false: the version, and the
 /// release that delivers it (made, or joined) with what happens next.
-async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, value: secrets::Value, how: Change) -> Result<Value, Fail> {
+pub(super) async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, value: secrets::Value, how: Change) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     let meta = secrets::of(&d.hub).put(&at, name, value, &caller(who)).await.map_err(refused)?;
     let (release, next) = released(d, who, app, env, format!("{name} v{}", meta.version), how).await;
@@ -515,7 +528,7 @@ async fn secret_put(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, val
     Ok(v)
 }
 
-async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, how: Change) -> Result<Value, Fail> {
+pub(super) async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, how: Change) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     secrets::of(&d.hub).delete(&at, name, &caller(who)).await.map_err(refused)?;
     let (release, next) = released(d, who, app, env, format!("{name} deleted"), how).await;
@@ -529,9 +542,9 @@ async fn secret_delete(d: &Deploy, who: &Who, app: &str, env: &str, name: &str, 
 /// asks that the release delivering it isn't reverted if it fails (a rotation after a leak: a
 /// revert would deliver the old value again).
 #[derive(Debug, Clone, Copy)]
-struct Change {
-    release: bool,
-    revert: bool,
+pub(super) struct Change {
+    pub(super) release: bool,
+    pub(super) revert: bool,
 }
 
 impl Change {
@@ -578,13 +591,13 @@ async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how
     }
 }
 
-async fn secret_versions(d: &Deploy, who: &Who, app: &str, env: &str, name: &str) -> Result<Value, Fail> {
+pub(super) async fn secret_versions(d: &Deploy, who: &Who, app: &str, env: &str, name: &str) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     let versions = secrets::of(&d.hub).versions(&at, name, &caller(who)).await.map_err(refused)?;
     Ok(json!({ "name": name, "versions": versions }))
 }
 
-async fn secret_uses(d: &Deploy, who: &Who, app: &str, env: &str, limit: usize) -> Result<Value, Fail> {
+pub(super) async fn secret_uses(d: &Deploy, who: &Who, app: &str, env: &str, limit: usize) -> Result<Value, Fail> {
     let at = secret_scope(d, app, env).await?;
     let reads = secrets::of(&d.hub).reads(&at, limit, &caller(who)).await.map_err(refused)?;
     Ok(json!({ "reads": reads }))

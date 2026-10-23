@@ -382,6 +382,68 @@ export interface SecretRead {
   at: number;
 }
 
+/** A version a registration has run: when it first and last landed, how often, and whether it runs now. */
+export interface VersionRun {
+  version: string;
+  runs_now: boolean;
+  releases: number;
+  last_release: number | null;
+  first_landed: number | null;
+  last_landed: number | null;
+}
+
+/** This server as the servers linked to it see it (docs/deploy-api.md §11): where it is, and the issuer its statements are signed by. */
+export interface LinkInfo {
+  server: string;
+  issuer: string;
+}
+
+/** A fleet change as asked for (docs/deploy-api.md §3.3): a version or values released to many apps of an environment, or (`source`) a change in each app's source repository. */
+export interface FleetAsk {
+  environment: string;
+  apps?: string[];
+  template?: string;
+  project?: string;
+  owner?: string;
+  version?: string;
+  set?: Record<string, string>;
+  source?: { base?: string; set?: Record<string, string>; chart?: string; values?: string };
+  idempotency_key?: string;
+}
+
+/** A source change's proposal in one repository: a pull request on its host, or a branch on kiln's own git server. */
+export interface Proposal {
+  fleet: string;
+  /** kiln's name for the repository. */
+  repo: string;
+  host: string;
+  name: string;
+  into: string;
+  branch: string;
+  apps: string[];
+  files: string[];
+  number?: number;
+  url?: string;
+  commit?: string;
+  parent?: string;
+  state: "open" | "merged" | "closed" | "unchanged" | "failed";
+  note?: string;
+  by: string;
+  at: number;
+  /** On kiln's own git server, while it's open: its diff. */
+  diff?: string;
+}
+
+/** A fleet change as it stands: its releases, or (one in apps' sources) each repository's proposal. */
+export interface Fleet {
+  fleet: string;
+  source?: boolean;
+  done: boolean;
+  states: Record<string, number>;
+  releases?: Release[];
+  proposals?: Proposal[];
+}
+
 /** What a release asks for: exactly one of a version, values, enabled, or a promotion. */
 export interface ReleaseAsk {
   app: string;
@@ -401,7 +463,12 @@ const reg = (app: string, env: string) => `/api/deploy/apps/${enc(app)}/environm
 
 export const deployApi = {
   board: (signal?: AbortSignal) => request<Board>("GET", "/api/deploy/board", undefined, { signal }),
+  apps: (signal?: AbortSignal) => request<{ apps: App[] }>("GET", "/api/deploy/apps", undefined, { signal }).then((r) => r.apps),
   app: (name: string, signal?: AbortSignal) => request<AppDetail>("GET", `/api/deploy/apps/${enc(name)}`, undefined, { signal }),
+  /** The app replaced, all of it, by what's given. */
+  putApp: (a: App) => request<App>("PUT", `/api/deploy/apps/${enc(a.name)}`, a),
+  /** The app as Backstage's catalog reads it. */
+  catalogInfo: (name: string, signal?: AbortSignal) => request<string>("GET", `/api/deploy/apps/${enc(name)}/catalog-info.yaml`, undefined, { raw: true, signal }),
   registration: (app: string, env: string, signal?: AbortSignal) => request<RegistrationDetail>("GET", reg(app, env), undefined, { signal }),
   candidates: (app: string, env: string) => request<{ candidates: Release[] }>("GET", `${reg(app, env)}/candidates`).then((r) => r.candidates),
   releases: (q: { app?: string; environment?: string; state?: ReleaseState; limit?: number }, signal?: AbortSignal) => {
@@ -420,10 +487,16 @@ export const deployApi = {
     return request<Metrics>("GET", `/api/deploy/metrics${qs ? `?${qs}` : ""}`, undefined, { signal });
   },
   create: (ask: ReleaseAsk) => request<Release>("POST", "/api/deploy/releases", ask),
+  /** A rollback of release `id`'s app in its environment: to `to`, or the newest release that succeeded before what runs. */
+  rollbackRelease: (id: number, to?: number) => request<Release>("POST", `/api/deploy/releases/${id}/rollback`, to === undefined ? {} : { to }),
   cancel: (id: number) => request<Release>("POST", `/api/deploy/releases/${id}/cancel`, {}),
   approve: (id: number, note?: string) => request<Release>("POST", `/api/deploy/releases/${id}/approve`, { note }),
   reject: (id: number, note?: string) => request<Release>("POST", `/api/deploy/releases/${id}/reject`, { note }),
   templates: (signal?: AbortSignal) => request<{ templates: Template[] }>("GET", "/api/deploy/templates", undefined, { signal }).then((r) => r.templates),
+  template: (name: string, signal?: AbortSignal) => request<Template>("GET", `/api/deploy/templates/${enc(name)}`, undefined, { signal }),
+  createTemplate: (t: Template) => request<Template>("POST", "/api/deploy/templates", t),
+  putTemplate: (t: Template) => request<Template>("PUT", `/api/deploy/templates/${enc(t.name)}`, t),
+  deleteTemplate: (name: string) => request<void>("DELETE", `/api/deploy/templates/${enc(name)}`),
   environments: (signal?: AbortSignal) => request<{ environments: Environment[] }>("GET", "/api/deploy/environments", undefined, { signal }).then((r) => r.environments),
   nameFree: (name: string) => request<{ name: string; available: boolean; why?: string | null }>("GET", `/api/deploy/app-names/${enc(name)}`),
   createApp: (ask: AppAsk) => request<App>("POST", "/api/deploy/apps", ask),
@@ -431,6 +504,8 @@ export const deployApi = {
   deleteApp: (name: string, o: { everywhere: boolean; keep: boolean }) => request<void>("DELETE", `/api/deploy/apps/${enc(name)}?everywhere=${o.everywhere}&keep=${o.keep}`),
   environment: (name: string, signal?: AbortSignal) => request<Environment>("GET", `/api/deploy/environments/${enc(name)}`, undefined, { signal }),
   putEnvironment: (e: Environment) => request<Environment>("PUT", `/api/deploy/environments/${enc(e.name)}`, e),
+  /** Refused while apps are registered there. */
+  deleteEnvironment: (name: string) => request<void>("DELETE", `/api/deploy/environments/${enc(name)}`),
   /** A new environment: what isn't given is the server's default (no gates, one release at a time, no agents). */
   createEnvironment: (e: { name: string; provider: string; release_repo: { host?: string; repo: string; branch: string; root: string }; targets: { kubernetes: string[] }; gates?: Gates; argocd?: { applications: boolean } }) =>
     request<Environment>("POST", "/api/deploy/environments", e),
@@ -438,6 +513,8 @@ export const deployApi = {
   githubApp: (signal?: AbortSignal) => request<GithubApp>("GET", "/api/ci/github/app", undefined, { signal }),
   /** The git hosts release repositories may be on. */
   gitHosts: (signal?: AbortSignal) => request<{ hosts: GitHost[] }>("GET", "/api/deploy/git-hosts", undefined, { signal }).then((r) => r.hosts),
+  /** This server, for the servers linked to it. */
+  link: (signal?: AbortSignal) => request<LinkInfo>("GET", "/api/deploy/link", undefined, { signal }),
   /** How an environment's move between providers stands; `null` when it hasn't moved. */
   move: (env: string, signal?: AbortSignal) =>
     request<Move>("GET", `/api/deploy/environments/${enc(env)}/move`, undefined, { signal }).catch((err: unknown) => {
@@ -456,6 +533,11 @@ export const deployApi = {
   runAction: (app: string, env: string, t: ActionTarget, action: string, params: Record<string, string> = {}) =>
     request<{ done: string }>("POST", `${reg(app, env)}/actions`, { ...t, action, params }),
   register: (app: string, env: string) => request<Registration>("POST", reg(app, env), {}),
+  /** What it runs there goes with it, unless `keep`. */
+  deregister: (app: string, env: string, keep: boolean) => request<void>("DELETE", `${reg(app, env)}?keep=${keep}`),
+  versions: (app: string, env: string, signal?: AbortSignal) => request<{ versions: VersionRun[] }>("GET", `${reg(app, env)}/versions`, undefined, { signal }).then((r) => r.versions),
+  /** What runs of it there, signed for the linked server whose issuer is `audience`. */
+  statement: (app: string, env: string, audience: string) => request<{ statement: string }>("GET", `${reg(app, env)}/statement?audience=${enc(audience)}`).then((r) => r.statement),
   resources: (app: string, env: string, signal?: AbortSignal) => request<{ resources: RunningObject[] }>("GET", `${reg(app, env)}/resources`, undefined, { signal }).then((r) => r.resources),
   manifests: (app: string, env: string, version?: string, signal?: AbortSignal) =>
     request<{ manifests: { key: CdResourceKey; yaml: string }[] }>("GET", `${reg(app, env)}/manifests${version ? `?version=${enc(version)}` : ""}`, undefined, { signal }).then((r) => r.manifests),
@@ -477,6 +559,14 @@ export const deployApi = {
   secretVersions: (app: string, env: string, name: string, signal?: AbortSignal) =>
     request<{ versions: SecretVersion[] }>("GET", `${reg(app, env)}/secrets/${enc(name)}/versions`, undefined, { signal }).then((r) => r.versions),
   secretUses: (app: string, env: string, signal?: AbortSignal) => request<{ reads: SecretRead[] }>("GET", `${reg(app, env)}/secret-uses?limit=20`, undefined, { signal }).then((r) => r.reads),
+  /** Every app's secrets sealed again under new keys: how many values were. */
+  rotateSecretKeys: () => request<{ resealed: number }>("POST", "/api/deploy/secret-keys/rotate", {}),
+  createFleet: (f: FleetAsk) => request<{ fleet: string }>("POST", "/api/deploy/fleets", f),
+  fleet: (id: string, signal?: AbortSignal) => request<Fleet>("GET", `/api/deploy/fleets/${enc(id)}`, undefined, { signal }),
+  /** A source change's proposals on kiln's own git server merged: `repo`'s, or each open one. */
+  mergeFleet: (id: string, repo?: string) => request<Fleet>("POST", `/api/deploy/fleets/${enc(id)}/merge`, repo ? { repo } : {}),
+  /** A source change's open proposals withdrawn. */
+  withdrawFleet: (id: string) => request<Fleet>("DELETE", `/api/deploy/fleets/${enc(id)}`),
 };
 
 export const boardHref = "/deployments/releases";
@@ -485,6 +575,10 @@ export const releaseHref = (id: number) => `/deployments/releases/${id}`;
 export const releaseAppHref = (app: string) => `/deployments/releases/apps/${enc(app)}`;
 export const releaseEnvHref = (env: string) => `/deployments/releases/environments/${enc(env)}`;
 export const registrationHref = (app: string, env: string) => `/deployments/releases/apps/${enc(app)}/environments/${enc(env)}`;
+export const templatesHref = "/deployments/releases/templates";
+export const templateHref = (name: string) => `/deployments/releases/templates/${enc(name)}`;
+export const newFleetHref = "/deployments/releases/fleets/new";
+export const fleetHref = (id: string) => `/deployments/releases/fleets/${enc(id)}`;
 
 /** The status dot a release's state shows as. */
 export const STATE_DOT: Record<ReleaseState, string> = {

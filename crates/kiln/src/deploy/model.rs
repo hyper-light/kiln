@@ -650,7 +650,7 @@ pub enum Package {
         set: BTreeMap<String, String>,
     },
     /// A platform KilnCD deploys to beyond Kubernetes (docs/cd-targets.md §3): its provider
-    /// (`aws-lambda`, `aws-ecs`, `cloudflare-workers`, `vercel`) and its definition, as the
+    /// (`aws-lambda`, `gcp-run`, `fly`: one of KilnCD's that's built) and its definition, as the
     /// provider's key in `.kiln/deploy.yaml` holds it, with `${{ release.* }}`, `${{ env.name }}`
     /// and `${{ app.name }}` filled for each release (KilnCD's `${{ git.* }}` and
     /// `${{ artifacts.* }}` left to it). The platform's own files (a task definition,

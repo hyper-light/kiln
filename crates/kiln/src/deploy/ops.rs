@@ -40,6 +40,8 @@ const WAIT_MAX_SECS: u64 = 600;
 const APP: &str = "The app's name.";
 const ENV: &str = "The environment's name.";
 const RELEASE: &str = "The release's number.";
+const TEMPLATE: &str = "The template's name.";
+const SECRET: &str = "The secret's name (`DB_PASSWORD`).";
 const KEY: &str = "Any string: asked for again with the same key, it is the same release (a retry after a timeout releases nothing twice).";
 
 fn bad(msg: impl Into<String>) -> Fail {
@@ -56,6 +58,22 @@ fn text(v: &Value, k: &str) -> Result<String, Fail> {
 
 fn opt_text(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+/// A string as given, empty or not (a secret's value may be empty).
+fn given(v: &Value, k: &str) -> Option<String> {
+    v.get(k).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// How a secret's change goes out, as its route's query says it: `release=false` keeps it for a
+/// later release, `revert=false` keeps the release delivering it from being reverted.
+fn change_query(v: &Value) -> HashMap<String, String> {
+    ["release", "revert"].into_iter().filter(|k| v.get(*k).and_then(Value::as_bool) == Some(false)).map(|k| (k.to_owned(), "false".to_owned())).collect()
+}
+
+fn change(v: &Value) -> api::Change {
+    let yes = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(true);
+    api::Change { release: yes("release"), revert: yes("revert") }
 }
 
 fn id(v: &Value) -> Result<i64, Fail> {
@@ -96,6 +114,10 @@ pub fn ops() -> &'static [Op] {
     static OPS: std::sync::OnceLock<Vec<Op>> = std::sync::OnceLock::new();
     OPS.get_or_init(|| {
         vec![
+            op!("deploy.board", "The environments board in one answer: every environment and app, each registration with the release that runs there and the one on its way, and the releases waiting for approval.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["board"]), HashMap::new())),
+                run: |_cx: Cx, _v: Value| async move { api::board(&*service()?).await }),
             op!("deploy.environments.list", "The environments apps are released to: each one's CD provider (KilnCD, or an Argo CD), release repository, targets, sync and watch settings, and what agents may do there.", ro: true, destructive: false,
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["environments"]), HashMap::new())),
@@ -117,6 +139,22 @@ pub fn ops() -> &'static [Op] {
                     let e: Environment = serde_json::from_value(v.get("environment").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the environment doesn't read: {e}")))?;
                     answer(flow::put_environment(&*service()?, &Who::of(&cx.caller), e).await?)
                 }),
+            op!("deploy.environments.delete", "Delete an environment: refused while apps are registered there (deregister them first). Its ApplicationSet on Argo CD and its apps' secrets there go with it; its release repository is kept.", ro: false, destructive: true,
+                input: || schema(json!({"environment": {"type": "string", "description": ENV}}), &["environment"]),
+                route: |v| Ok((Method::DELETE, path(&["environments", &text(v, "environment")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let name = text(&v, "environment")?;
+                    flow::delete_environment(&*service()?, &cx.caller.name, &name).await?;
+                    Ok(json!({ "deleted": name }))
+                }),
+            op!("deploy.git_hosts.list", "Where an environment's release repository may be (§7): kiln's own git server, GitHub through kiln's App, each GitLab with the groups its token covers, Bitbucket with its workspaces.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["git-hosts"]), HashMap::new())),
+                run: |_cx: Cx, _v: Value| async move { Ok(json!({ "hosts": api::git_hosts(&service()?.hub).await })) }),
+            op!("deploy.link", "This server as the servers linked to it see it (§11): where it is, and the issuer its statements are signed by.", ro: true, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::GET, path(&["link"]), HashMap::new())),
+                run: |_cx: Cx, _v: Value| async move { Ok(super::link::about(&service()?.hub)) }),
             op!("deploy.templates.list", "The templates apps are made from (txst's app types): each one's package, namespace pattern, checks, properties and environments.", ro: true, destructive: false,
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["templates"]), HashMap::new())),
@@ -131,6 +169,21 @@ pub fn ops() -> &'static [Op] {
                     let t: Template = serde_json::from_value(v.get("template").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the template doesn't read: {e}")))?;
                     answer(flow::put_template(&*service()?, &cx.caller.name, t, cx.caller.can("settings.manage", &crate::authz::Scope::Server)).await?)
                 }),
+            op!("deploy.templates.get", "One template.", ro: true, destructive: false,
+                input: || schema(json!({"template": {"type": "string", "description": TEMPLATE}}), &["template"]),
+                route: |v| Ok((Method::GET, path(&["templates", &text(v, "template")?]), HashMap::new())),
+                run: |_cx: Cx, v: Value| async move {
+                    let name = text(&v, "template")?;
+                    answer(store::template(&service()?.hub.store, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no template {name}")))?)
+                }),
+            op!("deploy.templates.delete", "Delete a template: refused while apps are made from it.", ro: false, destructive: true,
+                input: || schema(json!({"template": {"type": "string", "description": TEMPLATE}}), &["template"]),
+                route: |v| Ok((Method::DELETE, path(&["templates", &text(v, "template")?]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let name = text(&v, "template")?;
+                    flow::delete_template(&*service()?, &cx.caller.name, &name).await?;
+                    Ok(json!({ "deleted": name }))
+                }),
             op!("deploy.apps.create", "Create an app: its name, owner teams, and how it is deployed, or a template that says how (its package, namespace and checks follow, and the source repository it makes, from its starter). `source` names an existing kiln repository instead (`\"\"`: none). Then register it in environments.", ro: false, destructive: false,
                 input: || schema(json!({"app": {"type": "object", "description": "{name, project?, owners?, template?, package?, namespace?, properties?, contacts?, source?}"}}), &["app"]),
                 route: |_| Ok((Method::POST, path(&["apps"]), HashMap::new())),
@@ -138,6 +191,10 @@ pub fn ops() -> &'static [Op] {
                     let ask: flow::AppAsk = serde_json::from_value(v.get("app").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("the app doesn't read: {e}")))?;
                     answer(flow::create_app(&*service()?, &Who::of(&cx.caller), ask).await?)
                 }),
+            op!("deploy.app_names.get", "Whether a name is free for a new app: a DNS label no app has yet, and why not when it isn't.", ro: true, destructive: false,
+                input: || schema(json!({"name": {"type": "string", "description": "The name a new app would have."}}), &["name"]),
+                route: |v| Ok((Method::GET, path(&["app-names", &text(v, "name")?]), HashMap::new())),
+                run: |_cx: Cx, v: Value| async move { flow::app_name_free(&*service()?, &text(&v, "name")?).await }),
             op!("deploy.apps.patch", "Change some of an app: owners, properties (null removes one), contacts (on call, channels, links), template, package, namespace, source (a kiln repository, `\"\"` for none), archived. A package's change reaches each environment with its next release.", ro: false, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "patch": {"type": "object"}}), &["app", "patch"]),
                 route: |v| Ok((Method::PATCH, path(&["apps", &text(v, "app")?]), HashMap::new())),
@@ -173,7 +230,7 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"app": {"type": "string", "description": APP}}), &["app"]),
                 route: |v| Ok((Method::GET, path(&["apps", &text(v, "app")?]), HashMap::new())),
                 run: |_cx: Cx, v: Value| async move { api::app_json(&*service()?, &text(&v, "app")?).await }),
-            op!("deploy.apps.put", "Create or replace an app: its project, owner teams, package (a Helm chart, or a path in a git repository) and the values a release sets.", ro: false, destructive: false,
+            op!("deploy.apps.put", "Create or replace an app: its project, owner teams, package (a Helm chart, a path in a git repository, or a platform: its provider and its definition, as its key in .kiln/deploy.yaml holds it) and the values a release sets.", ro: false, destructive: false,
                 input: || schema(json!({"app": {"type": "object", "description": "The app, as deploy.apps.get shows one."}}), &["app"]),
                 route: |v| {
                     let name = v.pointer("/app/name").and_then(Value::as_str).ok_or_else(|| bad("`app.name` is required"))?;
@@ -342,10 +399,52 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
                 route: |v| Ok((Method::GET, registration_path(v, &["versions"])?, HashMap::new())),
                 run: |_cx: Cx, v: Value| async move { answer(json!({ "versions": api::versions(&*service()?, &text(&v, "app")?, &text(&v, "environment")?).await? })) }),
-            op!("deploy.secrets.list", "An app's secrets in an environment: each one's name, version, size, who set it and when. Never their values: no one reads them back, and agents neither set nor delete secrets (a person does, with `kiln app secret set`).", ro: true, destructive: false,
+            op!("deploy.registrations.statement", "What runs of an app in an environment here and what's on its way, as a statement signed for a linked server (§11): a JWT whose audience is that server's issuer (`audience`), checked there against this server's (deploy.link).", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "audience": {"type": "string", "description": "The issuer of the server asking."}}), &["app", "environment", "audience"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["statement"])?, HashMap::from([("audience".to_owned(), text(v, "audience")?)]))),
+                run: |_cx: Cx, v: Value| async move { api::statement(&*service()?, &text(&v, "app")?, &text(&v, "environment")?, opt_text(&v, "audience").as_deref()).await }),
+            op!("deploy.secrets.list", "An app's secrets in an environment: each one's name, version, size, who set it and when. Never their values: no one reads them back, and agents neither set nor delete secrets (a person does: deploy.secrets.put, `kiln app secret set`, or the app's page).", ro: true, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}}), &["app", "environment"]),
                 route: |v| Ok((Method::GET, registration_path(v, &["secrets"])?, HashMap::new())),
                 run: |cx: Cx, v: Value| async move { api::secrets_list(&*service()?, &Who::of(&cx.caller), &text(&v, "app")?, &text(&v, "environment")?).await }),
+            op!("deploy.secrets.versions", "A secret's versions, newest first: each one's number, size, who set it and when. Never the values.", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "name": {"type": "string", "description": SECRET}}), &["app", "environment", "name"]),
+                route: |v| Ok((Method::GET, registration_path(v, &["secrets", &text(v, "name")?, "versions"])?, HashMap::new())),
+                run: |cx: Cx, v: Value| async move { api::secret_versions(&*service()?, &Who::of(&cx.caller), &text(&v, "app")?, &text(&v, "environment")?, &text(&v, "name")?).await }),
+            op!("deploy.secrets.uses", "Each read of an app's secrets in an environment for a delivery, newest first: who read them, for which release, and which versions (`DB_PASSWORD@3`).", ro: true, destructive: false,
+                input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}), &["app", "environment"]),
+                route: |v| {
+                    let q = v.get("limit").and_then(Value::as_u64).map(|l| ("limit".to_owned(), l.to_string())).into_iter().collect();
+                    Ok((Method::GET, registration_path(v, &["secret-uses"])?, q))
+                },
+                run: |cx: Cx, v: Value| async move {
+                    let limit = v.get("limit").and_then(Value::as_u64).and_then(|l| usize::try_from(l).ok()).unwrap_or(100).clamp(1, 1000);
+                    api::secret_uses(&*service()?, &Who::of(&cx.caller), &text(&v, "app")?, &text(&v, "environment")?, limit).await
+                }),
+            op!("deploy.secrets.put", "Set a secret of an app in an environment: its next version, from `value` (text) or `base64` (bytes), sealed and never read back. It is released to what runs there (a release still waiting takes it instead) unless `release` is false; `revert: false` keeps the release that delivers it from being reverted if it fails (a rotation after a leak). A person sets secrets: agents are refused.", ro: false, destructive: true,
+                input: || schema(json!({
+                    "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "name": {"type": "string", "description": SECRET},
+                    "value": {"type": "string", "description": "The value, as text."}, "base64": {"type": "string", "description": "The value's bytes, in base64."},
+                    "release": {"type": "boolean", "description": "Release it to what runs there (true, the default), or keep it for a later release."},
+                    "revert": {"type": "boolean", "description": "Whether the release delivering it is reverted if it fails (true, the default)."}
+                }), &["app", "environment", "name"]),
+                route: |v| Ok((Method::PUT, registration_path(v, &["secrets", &text(v, "name")?])?, change_query(v))),
+                run: |cx: Cx, v: Value| async move {
+                    let value = api::secret_value_of(given(&v, "value"), given(&v, "base64"))?;
+                    api::secret_put(&*service()?, &Who::of(&cx.caller), &text(&v, "app")?, &text(&v, "environment")?, &text(&v, "name")?, value, change(&v)).await
+                }),
+            op!("deploy.secrets.delete", "Delete a secret of an app in an environment (its history stays), released to what runs there unless `release` is false. A person deletes secrets: agents are refused.", ro: false, destructive: true,
+                input: || schema(json!({
+                    "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "name": {"type": "string", "description": SECRET},
+                    "release": {"type": "boolean", "description": "Release the change to what runs there (true, the default), or keep it for a later release."},
+                    "revert": {"type": "boolean", "description": "Whether the release delivering it is reverted if it fails (true, the default)."}
+                }), &["app", "environment", "name"]),
+                route: |v| Ok((Method::DELETE, registration_path(v, &["secrets", &text(v, "name")?])?, change_query(v))),
+                run: |cx: Cx, v: Value| async move { api::secret_delete(&*service()?, &Who::of(&cx.caller), &text(&v, "app")?, &text(&v, "environment")?, &text(&v, "name")?, change(&v)).await }),
+            op!("deploy.secret_keys.rotate", "Seal every app's secrets again under new keys (§3.5): how many values were. A person rotates keys: agents are refused.", ro: false, destructive: false,
+                input: || schema(json!({}), &[]),
+                route: |_| Ok((Method::POST, path(&["secret-keys", "rotate"]), HashMap::new())),
+                run: |cx: Cx, _v: Value| async move { api::rotate_keys(&*service()?, &Who::of(&cx.caller)).await }),
             op!("deploy.releases.get", "One release: its kind, state, version, artifacts, commit, who asked, its message, and what its provider last said.", ro: true, destructive: false,
                 input: || schema(json!({"id": {"type": "integer", "description": RELEASE}}), &["id"]),
                 route: |v| Ok((Method::GET, path(&["releases", &id(v)?.to_string()]), HashMap::new())),
@@ -370,21 +469,38 @@ pub fn ops() -> &'static [Op] {
                     let ask: Ask = serde_json::from_value(v).map_err(|e| bad(format!("the request doesn't read: {e}")))?;
                     answer(flow::release(&*service()?, &Who::of(&cx.caller), ask).await?)
                 }),
-            op!("deploy.releases.rollback", "Go back to an earlier release of an app in an environment, as a new release: its version, artifacts and values. By default the newest that succeeded before what runs (see deploy.registrations.candidates).", ro: false, destructive: true,
+            op!("deploy.releases.rollback", "Go back to an earlier release of an app in an environment, as a new release: its version, artifacts and values. By default the newest that succeeded before what runs (see deploy.registrations.candidates); `to` names one. The app and environment are named, or are those of release `id`.", ro: false, destructive: true,
                 input: || schema(json!({
                     "app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV},
+                    "id": {"type": "integer", "description": "A release of the app in the environment, in place of naming them."},
                     "to": {"type": "integer", "description": "The release to go back to."}, "idempotency_key": {"type": "string", "description": KEY}
-                }), &["app", "environment"]),
-                route: |_| Ok((Method::POST, path(&["releases"]), HashMap::new())),
+                }), &[]),
+                route: |v| match v.get("id").filter(|x| !x.is_null()) {
+                    Some(_) => Ok((Method::POST, path(&["releases", &id(v)?.to_string(), "rollback"]), HashMap::new())),
+                    None => {
+                        text(v, "app")?;
+                        text(v, "environment")?;
+                        Ok((Method::POST, path(&["releases"]), HashMap::new()))
+                    }
+                },
                 run: |cx: Cx, v: Value| async move {
+                    let d = service()?;
+                    let (app, environment) = match v.get("id").filter(|x| !x.is_null()) {
+                        Some(_) => {
+                            let n = id(&v)?;
+                            let of = store::release(&d.hub.store, n).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no release {n}")))?;
+                            (of.app, of.environment)
+                        }
+                        None => (text(&v, "app")?, text(&v, "environment")?),
+                    };
                     let ask = Ask {
-                        app: text(&v, "app")?,
-                        environment: text(&v, "environment")?,
+                        app,
+                        environment,
                         rollback: Some(RollbackAsk { to: v.get("to").and_then(Value::as_i64) }),
                         idempotency_key: opt_text(&v, "idempotency_key"),
                         ..Ask::default()
                     };
-                    answer(flow::release(&*service()?, &Who::of(&cx.caller), ask).await?)
+                    answer(flow::release(&d, &Who::of(&cx.caller), ask).await?)
                 }),
             op!("deploy.releases.cancel", "Stop a release that is waiting, or being delivered: one being delivered is reverted in git, and its provider goes back to what ran before.", ro: false, destructive: false,
                 input: || schema(json!({"id": {"type": "integer", "description": RELEASE}, "idempotency_key": {"type": "string", "description": "With one, a release cancelled already is no error."}}), &["id"]),
@@ -529,7 +645,7 @@ mod tests {
 
     #[test]
     fn every_operation_is_a_route_of_its_own_kind() -> Result<(), Fail> {
-        let input = json!({ "app": "web", "environment": "staging", "id": 7 });
+        let input = json!({ "app": "web", "environment": "staging", "id": 7, "name": "DB_PASSWORD", "template": "service", "audience": "https://eu.kiln.test" });
         for op in ops() {
             let v = match op.name {
                 "deploy.environments.put" => json!({ "environment": { "name": "staging" } }),
@@ -549,5 +665,135 @@ mod tests {
         let release = ops().iter().find(|o| o.name == "deploy.releases.create").ok_or_else(|| bad("deploy.releases.create"))?;
         assert!(release.destructive, "a release changes what runs");
         Ok(())
+    }
+
+    /// A row of docs/deploy-api.md §12.4: a call, the operations that are it, and its page.
+    struct Row {
+        method: String,
+        path: String,
+        ops: Vec<String>,
+        page: String,
+    }
+
+    /// What a table cell holds in backticks.
+    fn ticked(cell: &str) -> Vec<String> {
+        cell.split('`').skip(1).step_by(2).map(str::to_owned).collect()
+    }
+
+    fn doc_rows() -> Result<Vec<Row>, Fail> {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/deploy-api.md")).map_err(|e| bad(format!("docs/deploy-api.md: {e}")))?;
+        let section = doc.split("\n### 12.4 ").nth(1).and_then(|s| s.split("\n## ").next()).ok_or_else(|| bad("docs/deploy-api.md has no §12.4"))?;
+        Ok(section
+            .lines()
+            .filter_map(|l| {
+                let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+                let (method, path) = cells.get(1)?.strip_prefix('`')?.strip_suffix('`')?.split_once(' ')?;
+                Some(Row {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    ops: ticked(cells.get(2)?).into_iter().filter(|t| t.starts_with("deploy.")).collect(),
+                    page: ticked(cells.get(3)?).into_iter().find(|t| t.starts_with("/deployments"))?,
+                })
+            })
+            .collect())
+    }
+
+    /// A path's shape: its segments, `*` for each that names something (`{app}`, `$app`).
+    fn shape(path: &str) -> String {
+        path.trim_matches('/').split('/').map(|s| if s.starts_with('{') || s.starts_with('$') { "*" } else { s }).collect::<Vec<_>>().join("/")
+    }
+
+    /// `/api/deploy`'s routes as api.rs matches them, each `METHOD shape`; an arm matching one of
+    /// several words (`what @ ("resources" | "manifests")`) is a route for each.
+    fn routes() -> Vec<String> {
+        let mut out = Vec::new();
+        for arm in include_str!("api.rs").split("(&Method::").skip(1) {
+            let Some((method, rest)) = arm.split_once(", [") else { continue };
+            let Some((pattern, _)) = rest.split_once("])") else { continue };
+            let mut shapes = vec![String::new()];
+            for seg in pattern.split(", ") {
+                let words: Vec<String> = match seg.split_once(" @ ") {
+                    Some((_, alts)) => alts.trim_matches(|c| c == '(' || c == ')').split(" | ").map(|w| w.trim_matches('"').to_owned()).collect(),
+                    None if seg.starts_with('"') => vec![seg.trim_matches('"').to_owned()],
+                    None => vec!["*".to_owned()],
+                };
+                shapes = shapes.iter().flat_map(|s| words.iter().map(move |w| if s.is_empty() { w.clone() } else { format!("{s}/{w}") })).collect();
+            }
+            out.extend(shapes.into_iter().map(|s| format!("{method} {s}")));
+        }
+        out
+    }
+
+    /// The UI's pages, as shapes: each route file's (`/_app/deployments/releases/apps/$app_/…`).
+    fn ui_pages() -> Result<Vec<String>, Fail> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/routes");
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(&dir).map_err(|e| bad(format!("{}: {e}", dir.display())))? {
+            let text = std::fs::read_to_string(e.map_err(|e| bad(e.to_string()))?.path()).unwrap_or_default();
+            let Some(id) = text.split("createFileRoute(\"").nth(1).and_then(|s| s.split('"').next()) else { continue };
+            let path: Vec<&str> = id.split('/').filter(|s| !s.is_empty() && *s != "_app").map(|s| s.trim_end_matches('_')).collect();
+            out.push(shape(&path.join("/")));
+        }
+        Ok(out)
+    }
+
+    /// Whether a route an operation gives is the call `method path`.
+    fn is_call(m: &Method, rest: &[String], method: &str, path: &str) -> bool {
+        let want: Vec<&str> = path.trim_matches('/').split('/').collect();
+        m.as_str() == method && rest.len() == want.len() && rest.iter().zip(&want).all(|(got, w)| w.starts_with('{') || got == w)
+    }
+
+    /// Calls that are another's, through the same flow: their operation is that one's.
+    const SAME: &[(&str, &str, &str)] = &[("POST /environments", "PUT", "/environments/{env}"), ("POST /templates", "PUT", "/templates/{name}")];
+
+    /// Every route `/api/deploy` has is a row of docs/deploy-api.md §12.4, with the operations that
+    /// are it and its page in the UI; every operation is one of them.
+    #[test]
+    fn every_call_has_its_operation_and_its_page() -> Result<(), Fail> {
+        let rows = doc_rows()?;
+        let routes = routes();
+        assert!(routes.len() > 50, "api.rs's routes read: {routes:?}");
+        let listed: Vec<String> = rows.iter().map(|r| format!("{} {}", r.method, shape(&r.path))).collect();
+        for r in &routes {
+            assert!(listed.contains(r), "docs/deploy-api.md §12.4 doesn't list {r}");
+        }
+        for l in &listed {
+            assert!(routes.contains(l), "§12.4 lists {l}, which /api/deploy doesn't route");
+        }
+        let samples = [
+            json!({ "app": "web", "environment": "staging", "id": 7, "name": "DB_PASSWORD", "template": "service", "audience": "https://eu.kiln.test", "to": "kilncd" }),
+            json!({ "app": "web", "environment": "staging", "name": "DB_PASSWORD", "template": "service" }),
+            json!({ "id": "f1" }),
+            json!({ "environment": { "name": "staging" } }),
+            json!({ "app": { "name": "web" } }),
+            json!({ "template": { "name": "service" } }),
+        ];
+        let pages = ui_pages()?;
+        for row in &rows {
+            let call = format!("{} {}", row.method, row.path);
+            assert!(!row.ops.is_empty(), "{call} has no operation");
+            let (method, path) = SAME.iter().find(|(c, _, _)| *c == call).map_or((row.method.as_str(), row.path.as_str()), |(_, m, p)| (*m, *p));
+            for name in &row.ops {
+                let op = ops().iter().find(|o| o.name == name).ok_or_else(|| bad(format!("{call}: no operation {name}")))?;
+                let routed = samples.iter().any(|v| (op.route)(v).is_ok_and(|(m, rest, _)| is_call(&m, &rest, method, path)));
+                assert!(routed, "{name} isn't {method} {path}");
+            }
+            assert!(pages.contains(&shape(&row.page)), "{call}: the UI has no page {}", row.page);
+        }
+        for op in ops() {
+            assert!(rows.iter().any(|r| r.ops.iter().any(|o| o == op.name)), "§12.4 doesn't list {}", op.name);
+        }
+        Ok(())
+    }
+
+    /// The skill agents read (kiln-deploy) names every operation, as code mode calls it.
+    #[test]
+    fn the_skill_names_every_operation() {
+        let skill = include_str!("../../assets/skills/kiln-deploy/SKILL.md");
+        for op in ops() {
+            let full = format!("kiln.{}", op.name);
+            let named = skill.match_indices(&full).any(|(i, _)| skill.get(i + full.len()..).is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')));
+            assert!(named, "the kiln-deploy skill doesn't name {full}");
+        }
     }
 }

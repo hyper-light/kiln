@@ -495,7 +495,10 @@ async fn check_app(d: &Deploy, a: &App) -> Result<(), Fail> {
         super::model::Package::Git { repo, .. } if repo.is_empty() => return Err(bad("a git package names its repository")),
         super::model::Package::Platform { provider, spec, .. } => {
             match kiln_cd::providers::get(provider) {
-                None => return Err(bad(format!("kiln deploys to no platform {provider} (aws-ecs, aws-lambda, cloudflare-workers, vercel)"))),
+                None => {
+                    let built: Vec<&str> = kiln_cd::providers::CATALOG.iter().filter(|p| p.built).map(|p| p.name).collect();
+                    return Err(bad(format!("kiln deploys to no platform {provider}: it deploys to {}", built.join(", "))));
+                }
                 Some(def) if !def.built => return Err(bad(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", def.title))),
                 Some(_) => {}
             }

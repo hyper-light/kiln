@@ -1,29 +1,36 @@
 /**
  * One app across its environments, side by side: what runs in each, what is on its way, what its
  * provider says; and from each, a release: a new version, new values, a promotion of what another
- * environment runs, or a rollback to one of the releases before. Below, its latest releases.
+ * environment runs, or a rollback to one of the releases before. Below, its latest releases, what
+ * it is, and how it deploys: a Helm chart, a path in git, or a platform with its definition.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { Pause, Play, Plus, Rocket } from "lucide-react";
 
-import { boardHref, deployApi, describe, packageWords, providerName, registrationHref, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type Registries, type ReleaseAsk } from "@/api/deploy";
+import { cdApi } from "@/api/cd";
+import { boardHref, deployApi, describe, packageWords, providerName, registrationHref, releaseHref, STATE_DOT, STATE_WORDS, type App, type AppPatch, type Package, type Registries, type ReleaseAsk } from "@/api/deploy";
+import type { CdProvider } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
-import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
+import { CopyButton, Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
-import { useRes } from "@/lib/data";
+import { useRes, type Res } from "@/lib/data";
 import { DEPLOY_EVENTS, environmentsRes, ReleaseState, templatesRes } from "./index";
+import { toYaml, yamlMap, YamlEditor } from "./yaml";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
 type Mode = "version" | "values" | "promote" | "rollback";
+
+/** The platforms KilnCD deploys to, each with what its definition takes. */
+const providersRes: Res<{ providers: CdProvider[] }> = { key: "cd/providers", fetch: (s) => cdApi.providers(s) };
 
 /** `repository:tag` or `repository@sha256:…` as an artifact. */
 function artifactOf(text: string) {
@@ -302,7 +309,17 @@ function Settings({ a, registered }: { a: App; registered: string[] }) {
     }
   };
   return (
-    <Panel eyebrow="Settings" title="What it is" description="Owners, who to reach and its source change here; its package and template, by API or kiln app set.">
+    <Panel
+      eyebrow="Settings"
+      title="What it is"
+      description="Owners, who to reach and its source change here; how it deploys, below."
+      actions={
+        <>
+          <CatalogInfo app={a.name} />
+          <AsYaml a={a} />
+        </>
+      }
+    >
       <div className="cd-new-grid">
         <TextField label="Project" value={project} spellCheck={false} onChange={(e) => setProject(e.target.value)} />
         <TextField label="Owner teams" value={owners} placeholder="payments, platform" onChange={(e) => setOwners(e.target.value)} />
@@ -350,13 +367,97 @@ function Settings({ a, registered }: { a: App; registered: string[] }) {
   );
 }
 
-/** How it deploys: its template, and its package (a Helm chart, or a path in git) with the values
- * each release sets. A change reaches each environment with its next release there. */
-function Deploys({ a }: { a: App }) {
+/** The app as Backstage's catalog reads it: its catalog-info.yaml, to copy into its repository. */
+function CatalogInfo({ app }: { app: string }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <>
+      <Button size="sm" variant="ghost" onClick={() => setOpen(true)}>
+        catalog-info.yaml
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent eyebrow="Backstage" title={`${app}'s catalog-info.yaml`} description="The app as Backstage's catalog reads it: its owner, system and lifecycle, and who to reach.">
+          {open && (
+            <Loadable label="its catalog-info.yaml">
+              <CatalogYaml app={app} />
+            </Loadable>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function CatalogYaml({ app }: { app: string }) {
+  const text = useSuspenseResource(`deploy/catalog/${app}`, (s) => deployApi.catalogInfo(app, s), { on: DEPLOY_EVENTS }).data;
+  return (
+    <div className="cd-manifest">
+      <div className="cd-manifest-bar">
+        <span className="cd-meta">catalog-info.yaml</span>
+        <CopyButton text={text} className="cd-copy" />
+      </div>
+      <pre className="cd-yaml">{text}</pre>
+    </div>
+  );
+}
+
+/** The whole app as YAML, saved whole: what isn't in it is gone. */
+function AsYaml({ a }: { a: App }) {
+  const [open, setOpen] = React.useState(false);
+  const [text, setText] = React.useState(() => toYaml(a));
+  const [busy, setBusy] = React.useState(false);
+  const read = yamlMap(text);
+  const wrong = read.error ?? (read.value?.name !== a.name ? `Its name stays ${a.name}: another name is another app.` : null);
+  const save = async () => {
+    if (!read.value) return;
+    setBusy(true);
+    try {
+      await deployApi.putApp(read.value as unknown as App);
+      toast({ title: `${a.name} is saved`, description: "Each environment takes a change to how it deploys with its next release.", tone: "succeeded" });
+      invalidate("deploy/");
+      setOpen(false);
+    } catch (e) {
+      toast({ title: "Not saved", description: errorMessage(e), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <Button size="sm" variant="ghost" onClick={() => setOpen(true)}>
+        Edit as YAML
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent eyebrow={a.name} title="The app, as YAML" description="Saved whole, as kiln keeps it: what isn't in it is gone.">
+          <div className="rel-dialog">
+            <YamlEditor value={text} onChange={setText} label={`${a.name}, as YAML`} />
+            {wrong && <p className="rel-msg">{wrong}</p>}
+            <div className="rel-dialog-actions">
+              <Button variant="ghost" onClick={() => setOpen(false)}>
+                Close
+              </Button>
+              <Button disabled={busy || !!wrong} onClick={() => void save()}>
+                Save
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+/** How it deploys: its template, and its package with the values each release sets: a Helm chart,
+ * a path in git, or a platform KilnCD deploys to (docs/cd-targets.md §3) with its definition, as
+ * its key in `.kiln/deploy.yaml` holds it. A change reaches each environment with its next release
+ * there. */
+function Deploys({ a, registered }: { a: App; registered: string[] }) {
   const templates = useRes(templatesRes).data;
+  const platforms = useRes(providersRes).data.providers.filter((x) => x.built);
+  const environments = useRes(environmentsRes).data;
   const p = a.package;
   const [template, setTemplate] = React.useState(a.template ?? "");
-  const [kind, setKind] = React.useState<"helm" | "git">(p.kind === "git" ? "git" : "helm");
+  const [kind, setKind] = React.useState<Package["kind"]>(p.kind);
   const [repo, setRepo] = React.useState(p.kind === "platform" ? "" : p.repo);
   const [chart, setChart] = React.useState(p.kind === "helm" ? p.chart : "");
   const [chartVersion, setChartVersion] = React.useState(p.kind === "helm" ? (p.chart_version ?? "") : "");
@@ -366,25 +467,51 @@ function Deploys({ a }: { a: App }) {
       .map(([k, v]) => `${k}=${v}`)
       .join("\n"),
   );
+  const [provider, setProvider] = React.useState(p.kind === "platform" ? p.provider : (platforms[0]?.name ?? ""));
+  const [spec, setSpec] = React.useState(p.kind === "platform" ? toYaml(p.spec) : "");
+  // Where a platform's own files are: its repository and path, apart from a chart's or git's.
+  const [filesRepo, setFilesRepo] = React.useState(p.kind === "platform" ? (p.repo ?? "") : "");
+  const [filesPath, setFilesPath] = React.useState(p.kind === "platform" ? (p.path ?? "") : "");
   const [busy, setBusy] = React.useState(false);
-  if (p.kind === "platform") {
-    return (
-      <Panel eyebrow="How it deploys" title={`To ${p.provider}`} description="Its definition changes by API or kiln app set; each environment takes it with its next release.">
-        <p className="rel-quiet">From template {a.template ?? "none"}.</p>
-      </Panel>
-    );
-  }
+  const def = platforms.find((x) => x.name === provider);
   const lines = set
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
-  const wrong = lines.find((l) => !l.includes("=")) ? "Each value is name=value, one a line." : !repo.trim() || (kind === "helm" && !chart.trim()) ? "Its repository, and a chart's name." : null;
+  const read: ReturnType<typeof yamlMap> = kind === "platform" ? yamlMap(spec) : {};
+  const given = read.value ?? {};
+  const missing = kind === "platform" && def && read.value ? def.settings.filter((x) => x.required && !(x.name in given)) : [];
+  const unknown = kind === "platform" && def && read.value ? Object.keys(given).filter((k) => !def.settings.some((x) => x.name === k)) : [];
+  // The environments it's registered in that can't run it on this platform.
+  const lacking =
+    kind === "platform"
+      ? registered.filter((name) => {
+          const e = environments.find((x) => x.name === name);
+          return !e || e.provider.startsWith("argocd/") || !e.targets.platforms?.[provider];
+        })
+      : [];
+  const wrong =
+    kind === "platform"
+      ? !def
+        ? "A platform kiln deploys to."
+        : read.error
+          ? `Its definition doesn't read: ${read.error}`
+          : missing.length
+            ? `${def.title} needs ${missing.map((x) => x.name).join(", ")}.`
+            : null
+      : lines.find((l) => !l.includes("="))
+        ? "Each value is name=value, one a line."
+        : !repo.trim() || (kind === "helm" && !chart.trim())
+          ? "Its repository, and a chart's name."
+          : null;
   const save = async () => {
     const values = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]));
-    const pkg: AppPatch["package"] =
+    const pkg: Package =
       kind === "helm"
         ? { kind: "helm", repo: repo.trim(), chart: chart.trim(), chart_version: chartVersion.trim() || undefined, set: values }
-        : { kind: "git", repo: repo.trim(), path: path.trim(), set: values };
+        : kind === "git"
+          ? { kind: "git", repo: repo.trim(), path: path.trim(), set: values }
+          : { kind: "platform", provider, spec: given, repo: filesRepo.trim() || undefined, path: filesPath.trim() || undefined };
     setBusy(true);
     try {
       await deployApi.patchApp(a.name, { template, package: pkg });
@@ -397,7 +524,7 @@ function Deploys({ a }: { a: App }) {
     }
   };
   return (
-    <Panel eyebrow="How it deploys" title="Its package" description="A change reaches each environment with its next release there.">
+    <Panel eyebrow="How it deploys" title={kind === "platform" ? `To ${def?.title ?? provider}` : "Its package"} description="A change reaches each environment with its next release there.">
       <div className="cd-new-grid">
         <SelectField label="Template" value={template} onChange={setTemplate} options={[{ value: "", label: "None" }, ...templates.map((t) => ({ value: t.name, label: t.name }))]} />
         <Segmented
@@ -407,41 +534,79 @@ function Deploys({ a }: { a: App }) {
           options={[
             { value: "helm", label: "A Helm chart" },
             { value: "git", label: "A path in git" },
+            ...(platforms.length || p.kind === "platform" ? [{ value: "platform" as const, label: "A platform" }] : []),
           ]}
         />
       </div>
-      <div className="cd-new-grid">
-        <TextField label={kind === "helm" ? "Chart repository" : "Git repository"} value={repo} spellCheck={false} onChange={(e) => setRepo(e.target.value)} />
-        {kind === "helm" ? (
-          <>
-            <TextField label="Chart" value={chart} spellCheck={false} onChange={(e) => setChart(e.target.value)} />
+      {kind === "platform" ? (
+        <>
+          <div className="cd-new-grid">
+            <SelectField label="Platform" value={provider} onChange={setProvider} options={platforms.map((x) => ({ value: x.name, label: `${x.title} · ${x.name}` }))} />
             <TextField
-              label="Chart version"
-              placeholder="each release's"
-              value={chartVersion}
+              label="Its files' repository"
+              placeholder="none"
+              value={filesRepo}
               spellCheck={false}
-              onChange={(e) => setChartVersion(e.target.value)}
-              hint="Empty: each release's version."
+              onChange={(e) => setFilesRepo(e.target.value)}
+              hint="Where its own files are (a task definition, wrangler.jsonc), if it has any."
             />
-          </>
-        ) : (
-          <TextField label="Path" value={path} spellCheck={false} onChange={(e) => setPath(e.target.value)} hint="At each release's version." />
-        )}
-      </div>
-      <div className="rel-gap">
-        <label className="field-label" htmlFor={`set-${a.name}`}>
-          Values a release sets
-        </label>
-        <textarea
-          id={`set-${a.name}`}
-          className="rel-textarea"
-          rows={4}
-          spellCheck={false}
-          value={set}
-          onChange={(e) => setSet(e.target.value)}
-          placeholder={"image.tag=${{ release.artifacts.image.tag }}"}
-        />
-      </div>
+            <TextField label="Path" value={filesPath} spellCheck={false} onChange={(e) => setFilesPath(e.target.value)} hint="In that repository, at each release's version." />
+          </div>
+          <div className="rel-gap">
+            <span className="field-label">Its definition, as its key in .kiln/deploy.yaml holds it</span>
+            <YamlEditor value={spec} onChange={setSpec} label={`${a.name}'s ${provider} definition`} />
+            <p className="field-hint">
+              <code>{"${{ release.version }}"}</code>, <code>{"${{ release.artifacts.<name>.digest }}"}</code>, <code>{"${{ env.name }}"}</code> and <code>{"${{ app.name }}"}</code> are each release's.
+            </p>
+          </div>
+          {def && def.settings.length > 0 && <Facts className="rel-gap" items={def.settings.map((x) => ({ label: `${x.name}${x.required ? " · needed" : ""}`, value: x.help, tone: missing.includes(x) ? "fail" : undefined }))} />}
+          {unknown.length > 0 && def && (
+            <p className="rel-quiet">
+              {unknown.join(", ")}: not one of {def.title}'s settings.
+            </p>
+          )}
+          {lacking.length > 0 && (
+            <p className="rel-msg">
+              {lacking.join(", ")} can't run it yet: a KilnCD environment with a {provider} target (<code>targets.platforms.{provider}</code>, an account and its place) runs it.
+            </p>
+          )}
+        </>
+      ) : (
+        <div className="cd-new-grid">
+          <TextField label={kind === "helm" ? "Chart repository" : "Git repository"} value={repo} spellCheck={false} onChange={(e) => setRepo(e.target.value)} />
+          {kind === "helm" ? (
+            <>
+              <TextField label="Chart" value={chart} spellCheck={false} onChange={(e) => setChart(e.target.value)} />
+              <TextField
+                label="Chart version"
+                placeholder="each release's"
+                value={chartVersion}
+                spellCheck={false}
+                onChange={(e) => setChartVersion(e.target.value)}
+                hint="Empty: each release's version."
+              />
+            </>
+          ) : (
+            <TextField label="Path" value={path} spellCheck={false} onChange={(e) => setPath(e.target.value)} hint="At each release's version." />
+          )}
+        </div>
+      )}
+      {kind !== "platform" && (
+        <div className="rel-gap">
+          <label className="field-label" htmlFor={`set-${a.name}`}>
+            Values a release sets
+          </label>
+          <textarea
+            id={`set-${a.name}`}
+            className="rel-textarea"
+            rows={4}
+            spellCheck={false}
+            value={set}
+            onChange={(e) => setSet(e.target.value)}
+            placeholder={"image.tag=${{ release.artifacts.image.tag }}"}
+          />
+        </div>
+      )}
       {wrong && <p className="rel-msg">{wrong}</p>}
       <div className="rel-settings-actions">
         <Button size="sm" disabled={busy || !!wrong} onClick={() => void save()}>
@@ -567,8 +732,8 @@ function AppView({ name }: { name: string }) {
           <Latest app={a.name} />
         </Loadable>
         <Settings key={JSON.stringify(a)} a={a} registered={envs} />
-        <Loadable label="its templates">
-          <Deploys key={JSON.stringify(a)} a={a} />
+        <Loadable label="how it deploys">
+          <Deploys key={JSON.stringify(a)} a={a} registered={envs} />
         </Loadable>
       </div>
     </>

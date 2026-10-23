@@ -54,6 +54,10 @@ import { Route as AppAgentsPlansRunsRunRouteImport } from './routes/_app.agents.
 import { Route as AppDeploymentsAppsProjectNameRouteImport } from './routes/_app.deployments.apps.$project.$name'
 import { Route as AppDeploymentsReleasesAppsAppRouteImport } from './routes/_app.deployments.releases.apps.$app'
 import { Route as AppDeploymentsReleasesEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.environments.$env'
+import { Route as AppDeploymentsReleasesFleetsIdRouteImport } from './routes/_app.deployments.releases.fleets.$id'
+import { Route as AppDeploymentsReleasesFleetsNewRouteImport } from './routes/_app.deployments.releases.fleets.new'
+import { Route as AppDeploymentsReleasesTemplatesIndexRouteImport } from './routes/_app.deployments.releases.templates.index'
+import { Route as AppDeploymentsReleasesTemplatesNameRouteImport } from './routes/_app.deployments.releases.templates.$name'
 import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
 import { Route as AppDeploymentsReleasesAppsAppEnvironmentsEnvRouteImport } from './routes/_app.deployments.releases.apps.$app_.environments.$env'
 
@@ -290,6 +294,30 @@ const AppDeploymentsReleasesEnvironmentsEnvRoute =
     path: '/deployments/releases/environments/$env',
     getParentRoute: () => AppRoute,
   } as any)
+const AppDeploymentsReleasesFleetsIdRoute =
+  AppDeploymentsReleasesFleetsIdRouteImport.update({
+    id: '/deployments/releases/fleets/$id',
+    path: '/deployments/releases/fleets/$id',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesFleetsNewRoute =
+  AppDeploymentsReleasesFleetsNewRouteImport.update({
+    id: '/deployments/releases/fleets/new',
+    path: '/deployments/releases/fleets/new',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesTemplatesIndexRoute =
+  AppDeploymentsReleasesTemplatesIndexRouteImport.update({
+    id: '/deployments/releases/templates/',
+    path: '/deployments/releases/templates/',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppDeploymentsReleasesTemplatesNameRoute =
+  AppDeploymentsReleasesTemplatesNameRouteImport.update({
+    id: '/deployments/releases/templates/$name',
+    path: '/deployments/releases/templates/$name',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
   id: '/runs/$id/jobs/$jobId',
   path: '/runs/$id/jobs/$jobId',
@@ -347,7 +375,11 @@ export interface FileRoutesByFullPath {
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
   '/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRoutesByTo {
@@ -395,7 +427,11 @@ export interface FileRoutesByTo {
   '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
   '/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/deployments/releases/templates': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/deployments/releases/apps/$app/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRoutesById {
@@ -445,7 +481,11 @@ export interface FileRoutesById {
   '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
   '/_app/deployments/releases/apps/$app': typeof AppDeploymentsReleasesAppsAppRoute
   '/_app/deployments/releases/environments/$env': typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  '/_app/deployments/releases/fleets/$id': typeof AppDeploymentsReleasesFleetsIdRoute
+  '/_app/deployments/releases/fleets/new': typeof AppDeploymentsReleasesFleetsNewRoute
+  '/_app/deployments/releases/templates/$name': typeof AppDeploymentsReleasesTemplatesNameRoute
   '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
+  '/_app/deployments/releases/templates/': typeof AppDeploymentsReleasesTemplatesIndexRoute
   '/_app/deployments/releases/apps/$app_/environments/$env': typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 export interface FileRouteTypes {
@@ -495,7 +535,11 @@ export interface FileRouteTypes {
     | '/deployments/apps/$project/$name'
     | '/deployments/releases/apps/$app'
     | '/deployments/releases/environments/$env'
+    | '/deployments/releases/fleets/$id'
+    | '/deployments/releases/fleets/new'
+    | '/deployments/releases/templates/$name'
     | '/runs/$id/jobs/$jobId'
+    | '/deployments/releases/templates/'
     | '/deployments/releases/apps/$app/environments/$env'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -543,7 +587,11 @@ export interface FileRouteTypes {
     | '/deployments/apps/$project/$name'
     | '/deployments/releases/apps/$app'
     | '/deployments/releases/environments/$env'
+    | '/deployments/releases/fleets/$id'
+    | '/deployments/releases/fleets/new'
+    | '/deployments/releases/templates/$name'
     | '/runs/$id/jobs/$jobId'
+    | '/deployments/releases/templates'
     | '/deployments/releases/apps/$app/environments/$env'
   id:
     | '__root__'
@@ -592,7 +640,11 @@ export interface FileRouteTypes {
     | '/_app/deployments/apps/$project/$name'
     | '/_app/deployments/releases/apps/$app'
     | '/_app/deployments/releases/environments/$env'
+    | '/_app/deployments/releases/fleets/$id'
+    | '/_app/deployments/releases/fleets/new'
+    | '/_app/deployments/releases/templates/$name'
     | '/_app/runs/$id/jobs/$jobId'
+    | '/_app/deployments/releases/templates/'
     | '/_app/deployments/releases/apps/$app_/environments/$env'
   fileRoutesById: FileRoutesById
 }
@@ -918,6 +970,34 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppDeploymentsReleasesEnvironmentsEnvRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/deployments/releases/fleets/$id': {
+      id: '/_app/deployments/releases/fleets/$id'
+      path: '/deployments/releases/fleets/$id'
+      fullPath: '/deployments/releases/fleets/$id'
+      preLoaderRoute: typeof AppDeploymentsReleasesFleetsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/fleets/new': {
+      id: '/_app/deployments/releases/fleets/new'
+      path: '/deployments/releases/fleets/new'
+      fullPath: '/deployments/releases/fleets/new'
+      preLoaderRoute: typeof AppDeploymentsReleasesFleetsNewRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/templates/': {
+      id: '/_app/deployments/releases/templates/'
+      path: '/deployments/releases/templates'
+      fullPath: '/deployments/releases/templates/'
+      preLoaderRoute: typeof AppDeploymentsReleasesTemplatesIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/releases/templates/$name': {
+      id: '/_app/deployments/releases/templates/$name'
+      path: '/deployments/releases/templates/$name'
+      fullPath: '/deployments/releases/templates/$name'
+      preLoaderRoute: typeof AppDeploymentsReleasesTemplatesNameRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/runs/$id/jobs/$jobId': {
       id: '/_app/runs/$id/jobs/$jobId'
       path: '/runs/$id/jobs/$jobId'
@@ -979,7 +1059,11 @@ interface AppRouteChildren {
   AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
   AppDeploymentsReleasesAppsAppRoute: typeof AppDeploymentsReleasesAppsAppRoute
   AppDeploymentsReleasesEnvironmentsEnvRoute: typeof AppDeploymentsReleasesEnvironmentsEnvRoute
+  AppDeploymentsReleasesFleetsIdRoute: typeof AppDeploymentsReleasesFleetsIdRoute
+  AppDeploymentsReleasesFleetsNewRoute: typeof AppDeploymentsReleasesFleetsNewRoute
+  AppDeploymentsReleasesTemplatesNameRoute: typeof AppDeploymentsReleasesTemplatesNameRoute
   AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
+  AppDeploymentsReleasesTemplatesIndexRoute: typeof AppDeploymentsReleasesTemplatesIndexRoute
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute: typeof AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute
 }
 
@@ -1028,7 +1112,13 @@ const AppRouteChildren: AppRouteChildren = {
   AppDeploymentsReleasesAppsAppRoute: AppDeploymentsReleasesAppsAppRoute,
   AppDeploymentsReleasesEnvironmentsEnvRoute:
     AppDeploymentsReleasesEnvironmentsEnvRoute,
+  AppDeploymentsReleasesFleetsIdRoute: AppDeploymentsReleasesFleetsIdRoute,
+  AppDeploymentsReleasesFleetsNewRoute: AppDeploymentsReleasesFleetsNewRoute,
+  AppDeploymentsReleasesTemplatesNameRoute:
+    AppDeploymentsReleasesTemplatesNameRoute,
   AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
+  AppDeploymentsReleasesTemplatesIndexRoute:
+    AppDeploymentsReleasesTemplatesIndexRoute,
   AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute:
     AppDeploymentsReleasesAppsAppEnvironmentsEnvRoute,
 }

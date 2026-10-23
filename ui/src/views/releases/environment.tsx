@@ -6,12 +6,13 @@
  * provider here (§8.4): the new one compares in shadow, then takes over with nothing made again.
  */
 import * as React from "react";
-import { Link, useParams } from "@/lib/router";
+import { Link, useNavigate, useParams } from "@/lib/router";
 import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
 import { api } from "@/api/client";
 import { boardHref, checkName, deployApi, describe, providerName, releaseAppHref, releaseHref, releaseRepoUrl, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
@@ -510,6 +511,41 @@ function Here({ env }: { env: string }) {
   );
 }
 
+/** The environment deleted, once no app is registered there: its release repository is kept. */
+function DeleteEnvironment({ e }: { e: Environment }) {
+  const navigate = useNavigate();
+  const apps = useRes(boardRes)
+    .data.cells.filter((c) => c.registration.environment === e.name)
+    .map((c) => c.registration.app);
+  const [asking, setAsking] = React.useState(false);
+  const remove = async () => {
+    try {
+      await deployApi.deleteEnvironment(e.name);
+      toast({ title: `${e.name} is deleted`, description: `Its release repository ${e.release_repo.repo} is kept.`, tone: "succeeded" });
+      invalidate("deploy/");
+      navigate(boardHref);
+    } catch (err) {
+      toast({ title: "Not deleted", description: errorMessage(err), tone: "failed" });
+    }
+  };
+  return (
+    <>
+      <Button size="sm" variant="ghost-danger" disabled={apps.length > 0} title={apps.length ? `Registered here: ${apps.join(", ")}. Deregister them first.` : undefined} onClick={() => setAsking(true)}>
+        <Trash2 /> Delete
+      </Button>
+      <ConfirmDialog
+        open={asking}
+        onOpenChange={setAsking}
+        title={`Delete ${e.name}?`}
+        description={`No app is registered here. ${e.provider.startsWith("argocd/") ? "Its ApplicationSet goes with it. " : ""}Its release repository ${e.release_repo.repo} is kept, and its releases stay in the history.`}
+        confirmLabel="Delete the environment"
+        danger
+        onConfirm={remove}
+      />
+    </>
+  );
+}
+
 /** Another git host's name, as its repositories are called. */
 const HOSTS_OF: Record<string, string> = { github: "GitHub's", gitlab: "GitLab's", bitbucket: "Bitbucket's" };
 
@@ -547,7 +583,14 @@ function EnvView({ name }: { name: string }) {
     <>
       <header className="cd-head">
         <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: e.name }]} />
-        <h1 className="cd-title">{e.name}</h1>
+        <div className="rel-head-row">
+          <h1 className="cd-title">{e.name}</h1>
+          <div className="rel-head-actions">
+            <Loadable label="what's registered here">
+              <DeleteEnvironment e={e} />
+            </Loadable>
+          </div>
+        </div>
         <p className="cd-note">
           {providerName(e.provider)} · <RepoLine e={e} />
           {e.gates.freeze && " · frozen"}

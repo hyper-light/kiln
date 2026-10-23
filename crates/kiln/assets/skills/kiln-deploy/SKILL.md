@@ -123,8 +123,9 @@ return { id: r.id, state: w.release.state, done: w.done, message: w.release.mess
 **Rolling back.** `kiln.deploy.releases.rollback({ app, environment })` goes back to the newest
 release that succeeded before what runs (`to: <release id>` picks one of
 `kiln.deploy.registrations.candidates({ app, environment })`), as a new release with that one's
-version, artifacts and values. `kiln.deploy.releases.cancel({ id })` stops one still waiting or
-being delivered (a delivery is reverted).
+version, artifacts and values; `{ id }` in place of the app and environment names them by one of
+their releases. `kiln.deploy.releases.cancel({ id })` stops one still waiting or being delivered
+(a delivery is reverted).
 
 **Fleet changes.** `kiln.deploy.fleets.create({ environment, apps | template | project | owner,
 version | set, idempotency_key })` releases many apps of an environment at once, each through its
@@ -134,6 +135,59 @@ request per repository, and on kiln's own git server a branch and its diff. Foll
 `kiln.deploy.fleets.get({ id })`. Merging a pull request is a person's, on its host; on kiln's own,
 `kiln.deploy.fleets.merge({ id })` merges what a person asked you to merge.
 `kiln.deploy.fleets.withdraw({ id })` closes what's open.
+
+**Every operation**, as code mode names it (the MCP tools are the same with `_`:
+`deploy_releases_create`):
+
+- Where things stand: `kiln.deploy.board()` is every app in every environment, what runs and
+  what's on its way, and what waits for approval. `kiln.deploy.releases.list({ app, environment,
+  state })` and `kiln.deploy.releases.get({ id })` are releases; `kiln.deploy.metrics({ app,
+  environment, days })` how often changes land, their lead time, how often they fail, and how
+  long a restore takes.
+- What runs, as its provider sees it: `kiln.deploy.registrations.get({ app, environment })` (the
+  release that runs, the one on its way, what the provider says),
+  `kiln.deploy.registrations.resources`, `kiln.deploy.registrations.manifests`,
+  `kiln.deploy.registrations.diff` and `kiln.deploy.registrations.logs({ app, environment, kind,
+  name })`; `kiln.deploy.registrations.versions` what it has run there.
+- Releases: `kiln.deploy.releases.create`, `kiln.deploy.releases.wait`,
+  `kiln.deploy.releases.rollback`, `kiln.deploy.releases.cancel`, as above;
+  `kiln.deploy.releases.approve({ id, note })` and `kiln.deploy.releases.reject({ id, note })`
+  answer one waiting for approval, where the environment lets agents (`agents.approve`) and never
+  for your own request.
+- Acting on what runs: `kiln.deploy.registrations.actions` and `kiln.deploy.registrations.action`,
+  as above; `kiln.deploy.registrations.pause` and `kiln.deploy.registrations.resume` turn its
+  provider's automation off (hand edits survive) and on again (its next release resumes it too).
+- Apps: `kiln.deploy.apps.list()`, `kiln.deploy.apps.get({ app })`. Making and changing them is
+  what a person asked you for: `kiln.deploy.app_names.get({ name })` says whether a name is free,
+  `kiln.deploy.apps.create({ app: { name, template, owners } })` makes one (its template makes
+  its source repository and registries), `kiln.deploy.apps.patch({ app, patch })` changes some of
+  it (owners, contacts, template, its package: a chart, a path in git, or a platform's `{ kind:
+  "platform", provider, spec }` with `spec` its definition as `.kiln/deploy.yaml` holds it),
+  `kiln.deploy.apps.put({ app })` replaces it whole, `kiln.deploy.apps.delete({ app, everywhere,
+  keep })` deletes it. `kiln.deploy.apps.catalog_info({ app })` is its catalog-info.yaml for
+  Backstage.
+- Registrations: `kiln.deploy.registrations.create({ app, environment })` registers an app in an
+  environment, ready for its first release; `kiln.deploy.registrations.delete({ app, environment,
+  keep })` takes it out, what it runs there going with it unless `keep`.
+- Environments: `kiln.deploy.environments.list()`, `kiln.deploy.environments.get({ environment
+  })`; a person's to make, change or delete: `kiln.deploy.environments.put({ environment })` (its
+  provider, release repository, targets, gates; what agents may do there only a person changes)
+  and `kiln.deploy.environments.delete({ environment })` (refused while apps are registered
+  there). `kiln.deploy.git_hosts.list()` says where a release repository may be. Moving one to
+  another provider is a person's: `kiln.deploy.environments.move`,
+  `kiln.deploy.environments.move_status`, `kiln.deploy.environments.move_cancel`.
+- Templates, what apps are made from: `kiln.deploy.templates.list()`,
+  `kiln.deploy.templates.get({ template })`, `kiln.deploy.templates.put({ template })`,
+  `kiln.deploy.templates.delete({ template })` (refused while apps are made from it).
+- Fleet changes: `kiln.deploy.fleets.create`, `kiln.deploy.fleets.get`, `kiln.deploy.fleets.merge`,
+  `kiln.deploy.fleets.withdraw`, as above.
+- Linked servers: `kiln.deploy.link()` is this server as the servers linked to it see it;
+  `kiln.deploy.registrations.statement({ app, environment, audience })` what one of them is told
+  of an app here (signed for it alone).
+- Secrets: `kiln.deploy.secrets.list`, `kiln.deploy.secrets.versions({ app, environment, name })`
+  and `kiln.deploy.secrets.uses({ app, environment })` (which deliveries read which versions) are
+  yours to read. `kiln.deploy.secrets.put`, `kiln.deploy.secrets.delete` and
+  `kiln.deploy.secret_keys.rotate` refuse agents: they're a person's (see below).
 
 **Rules for agents.**
 - You release only where the environment lets agents (its `agents.deploy`); approve only where
