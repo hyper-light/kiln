@@ -168,8 +168,11 @@ pub fn session_of(pid: u32, sessions: &[(String, Option<u32>)]) -> Option<String
 pub struct Seen {
     /// Its harness, when it runs.
     pub harness: Option<Ran>,
-    /// What runs under the harness now.
+    /// What runs under the harness now (the first [`MAX_RAN`], its helpers left out).
     pub under: Vec<Ran>,
+    /// Every process under the harness now, by pid, however many, its helpers' included: what
+    /// isn't left running.
+    pub below: HashSet<u32>,
     /// What it started that runs apart from it (marked as its, not under it): left running.
     pub apart: Vec<Ran>,
     /// The `ssh-agent`s shells' startup files started for it, apart from it ([`login_agent`]).
@@ -223,15 +226,17 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
             let mut seen = Seen { harness: harness.and_then(|h| ran_of(&sys, Pid::from_u32(h))), ..Seen::default() };
             let mut below: HashSet<Pid> = HashSet::new();
             if let Some(h) = harness {
-                let root = Pid::from_u32(*h);
-                let mut todo = vec![root];
-                while let Some(p) = todo.pop() {
+                // All of it is followed (a helper's browser too); what runs under a helper isn't noted.
+                let mut todo = vec![(Pid::from_u32(*h), false)];
+                while let Some((p, helping)) = todo.pop() {
                     for c in kids.get(&p).into_iter().flatten() {
-                        if !below.insert(*c) || skip(*c) {
+                        if !below.insert(*c) {
                             continue;
                         }
-                        todo.push(*c);
-                        if seen.under.len() < MAX_RAN
+                        let helping = helping || skip(*c);
+                        todo.push((*c, helping));
+                        if !helping
+                            && seen.under.len() < MAX_RAN
                             && let Some(r) = ran_of(&sys, *c)
                         {
                             seen.under.push(r);
@@ -250,6 +255,7 @@ pub fn scan(sessions: &[(String, Option<u32>)]) -> HashMap<String, Seen> {
                     into.push(r);
                 }
             }
+            seen.below = below.into_iter().map(|p| p.as_u32()).collect();
             (id.clone(), seen)
         })
         .collect()
@@ -527,6 +533,27 @@ mod tests {
         let marked = s1.apart.iter().find(|r| r.pid == apart).cloned().ok_or_else(|| anyhow::anyhow!("not found apart"))?;
         stop_tree(&marked);
         assert!(alive(&[marked]).is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_a_harness_s_helper_runs_is_the_harness_s_and_never_left_running() -> anyhow::Result<()> {
+        // An MCP server (as its command names it) under this process, running a command that runs
+        // another (as a browser's processes do), all marked as session "helped"'s.
+        let mut helper = std::process::Command::new("sh").arg("-c").arg("sh -c 'sleep 33; true' & wait").arg("mcp-server-lab").env(MARK, "helped").spawn()?;
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while under(helper.id()).len() < 2 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let theirs = under(helper.id());
+        let seen = scan(&[("helped".to_owned(), Some(std::process::id()))]).remove("helped").unwrap_or_default();
+        stop(&[vec![helper.id()], theirs.clone()].concat());
+        let _ = helper.wait();
+        assert!(theirs.len() >= 2, "the helper's command and what it runs: {theirs:?}");
+        assert!(theirs.iter().all(|p| seen.below.contains(p)), "{theirs:?} under the harness: {:?}", seen.below);
+        assert!(seen.apart.is_empty(), "{:?}", seen.apart);
+        assert!(!seen.under.iter().any(|r| r.pid == helper.id() || theirs.contains(&r.pid)), "a helper's work isn't noted as the agent's: {:?}", seen.under);
         Ok(())
     }
 }

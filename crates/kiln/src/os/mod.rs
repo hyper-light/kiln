@@ -97,6 +97,19 @@ pub fn have(name: &str) -> bool {
     which(name).is_some()
 }
 
+/// This kiln's binary, as a path another process can start. On Linux, once an upgrade has put a new
+/// binary in its place (and until this process takes it up, once its jobs are done), the path
+/// reads `<path> (deleted)`: the kiln at `<path>` is the one to start.
+pub fn this_kiln() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(replaced(&exe).unwrap_or(exe))
+}
+
+/// The binary now at a running binary's path that was replaced (`<path> (deleted)`).
+fn replaced(exe: &Path) -> Option<PathBuf> {
+    exe.to_str()?.strip_suffix(" (deleted)").map(PathBuf::from).filter(|p| p.is_file())
+}
+
 /// Where [`add_to_user_path`] put a folder on the user's PATH.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathAdded {
@@ -288,6 +301,19 @@ mod tests {
         assert_eq!(program_stem("/usr/bin/bash"), "bash");
         assert_eq!(program_stem(r"C:\Program Files\PowerShell\7\pwsh.exe"), "pwsh");
         assert_eq!(program_stem("CMD.EXE"), "cmd");
+    }
+
+    #[test]
+    fn a_replaced_binary_s_path_names_the_new_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let kiln = dir.path().join("kiln");
+        std::fs::write(&kiln, b"new")?;
+        let gone = |p: &Path| PathBuf::from(format!("{} (deleted)", p.display()));
+        assert_eq!(replaced(&gone(&kiln)), Some(kiln.clone()));
+        assert_eq!(replaced(&kiln), None, "not replaced");
+        assert_eq!(replaced(&gone(&dir.path().join("uninstalled"))), None, "nothing in its place");
+        assert!(this_kiln()?.is_file());
+        Ok(())
     }
 
     #[test]
