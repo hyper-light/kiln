@@ -3903,7 +3903,12 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     corpus's elixir; its repositories are public, as on GitHub), and so does a token of kiln's
     that may not read it (a job's whose `permissions` leave `contents` out, as elixir's CodeQL
     jobs' do). A token that isn't kiln's is refused, public or not, and a push always needs one
-    that may (`w14_r01_public_repositories_read_without_a_token`);
+    that may (`w14_r01_public_repositories_read_without_a_token`). A mirrored repository that's
+    public reads so too, and so does the REST facade (R11): a job's read of its public
+    repository needs none of its `permissions`, as on GitHub, where CodeQL's `actions: read` is
+    "only required for workflows in private repositories". Code scanning alerts aren't public,
+    and need `security-events: read` (`w10_r04_a_public_repositorys_reads_need_no_permission`;
+    the corpus's prometheus, whose CodeQL job reads its run);
   - a leg's fetch of a repository kiln doesn't have (`actions/checkout`'s `repository:`, ORT's
     configuration) goes on to where kiln takes that owner's actions (`[[ci.actions.sources]]`,
     else GitHub), without the leg's token, so a public repository there is fetched as anyone

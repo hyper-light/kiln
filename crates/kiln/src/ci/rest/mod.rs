@@ -64,6 +64,14 @@ fn message(status: StatusCode, msg: &str) -> Response {
     srv::json(status, &json!({ "message": msg, "documentation_url": DOCS }))
 }
 
+/// Whether the repository `rest` names (`repos/<owner>/<repo>/…`) is public.
+async fn public(hub: &Hub, rest: &[&str]) -> bool {
+    let ["repos", owner, repo, ..] = rest else { return false };
+    let name = format!("{owner}/{repo}");
+    let Some(r) = hub.store.repos().await.ok().and_then(|repos| repos.into_iter().find(|r| r.name.eq_ignore_ascii_case(&name))) else { return false };
+    hub.store.repo_public(r.id).await.unwrap_or(false)
+}
+
 fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
@@ -98,8 +106,12 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::GET, ["repos", _, _, "code-scanning", ..]) => Some(("security-events", Level::Read)),
         _ => None,
     };
+    // A public repository's reads are anyone's, a token's that may not as well, as on GitHub
+    // (CodeQL's `actions: read` is "only required for workflows in private repositories"); its
+    // code scanning alerts aren't public.
     if let Some((scope, level)) = need
         && !claims.may(scope, level)
+        && !(level == Level::Read && scope != "security-events" && public(hub, rest).await)
     {
         let word = if level == Level::Write { "write" } else { "read" };
         return Ok(message(StatusCode::FORBIDDEN, &format!("Resource not accessible by integration: the job's token lacks `{scope}: {word}`")));
