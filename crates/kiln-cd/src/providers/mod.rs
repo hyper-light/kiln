@@ -21,6 +21,7 @@ pub mod aws_lambda;
 pub mod aws_static;
 pub mod cloudflare_workers;
 pub mod cloudformation;
+pub mod gcp_run;
 pub mod vercel;
 
 use serde::Serialize;
@@ -259,11 +260,16 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "gcp",
         place: &["project", "region"],
         scope: None,
-        settings: &[s("service", true, "the service"), s("spec", false, "the service: a service.yaml in the source, or an object"), s("image", false, "the image (${{ artifacts.* }})")],
-        kinds: &[kind("run.gcp.kiln.dev", "Service", "Service"), kind("run.gcp.kiln.dev", "Job", "Job"), child(kind("run.gcp.kiln.dev", "Revision", "Revision"))],
-        capabilities: &[Traffic, Versions, Previews, Logs, Events, Drift, Adopt],
+        settings: &[
+            s("service", true, "the service"),
+            s("image", false, "the image it runs (${{ release.artifacts.<name>.digest }}): the template's first container's"),
+            s("spec", false, "the service: a service.yaml in the source (Knative's, as gcloud run services replace takes it, or Cloud Run's v2 Service), or an object"),
+            s("set", false, "values to set by path: {\"template.containers[0].env[name=MODE].value\": \"prod\"}"),
+        ],
+        kinds: &[kind("run.gcp.kiln.dev", "Service", "Service"), child(kind("run.gcp.kiln.dev", "Revision", "Revision"))],
+        capabilities: &[Versions, Drift, Adopt],
         reads: &["service.yaml"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "gcp-functions",
@@ -683,6 +689,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "aws-static" => aws_static::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
         "cloudformation" => cloudformation::render(input),
+        "gcp-run" => gcp_run::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
             Some(p) => Err(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", p.title)),
@@ -702,6 +709,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "aws-static" => aws_static::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
         "cloudformation" => cloudformation::files(spec),
+        "gcp-run" => gcp_run::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
     }
@@ -723,6 +731,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "aws-static" => aws_static::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
         "cloudformation" => cloudformation::health(obj),
+        "gcp-run" => gcp_run::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,
     }

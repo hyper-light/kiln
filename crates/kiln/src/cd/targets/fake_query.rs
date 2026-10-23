@@ -812,14 +812,21 @@ pub async fn start(fake: Arc<FakeQuery>) -> anyhow::Result<String> {
 /// by the release) at `version` makes KilnCD apply: the definition kiln's deploy makes of the
 /// release (`crate::deploy::kilncd::definition`), rendered for its target as KilnCD renders it,
 /// its source's files read from `files`, tracked as the app's, in wave order. The target is
-/// `<provider>/aws-test/us-east-1`.
+/// `<provider>/aws-test/us-east-1` ([`released_to`] another).
 /// `artifacts` are the release's (its release.json's `artifacts`, by name: their digests).
 pub fn released(provider: &str, spec: Value, version: &str, files: &[(&str, &str)], artifacts: &[(&str, &str)]) -> anyhow::Result<Vec<Value>> {
+    released_to(provider, &json!({ "account": "aws-test", "region": "us-east-1" }), spec, version, files, artifacts)
+}
+
+/// [`released`], to the environment's target `place` says: `{ account, project, region }`.
+pub fn released_to(provider: &str, place: &Value, spec: Value, version: &str, files: &[(&str, &str)], artifacts: &[(&str, &str)]) -> anyhow::Result<Vec<Value>> {
     use crate::deploy::model::{App, Artifact, Contacts, Environment, Package, Registration, ReleaseFile, RepoRef, SCHEMA, Targets};
     let package = Package::Platform { provider: provider.to_owned(), spec, repo: None, path: String::new() };
     let app = App { name: "shop".into(), project: "acme".into(), owners: vec![], package: package.clone(), namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
+    let place = place.as_object().cloned().unwrap_or_default();
+    let (target, _) = kiln_cd::providers::target_of(provider, &place).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut platforms = BTreeMap::new();
-    platforms.insert(provider.to_owned(), json!({ "account": "aws-test", "region": "us-east-1" }).as_object().cloned().unwrap_or_default());
+    platforms.insert(provider.to_owned(), place);
     let env = Environment {
         name: "staging".into(),
         provider: "kilncd".into(),
@@ -854,7 +861,7 @@ pub fn released(provider: &str, spec: Value, version: &str, files: &[(&str, &str
         helm: None,
     };
     let def = crate::deploy::kilncd::definition(&app, &env, &reg, &file, &format!("c0ffee{version}"), "file:///data/releases.git", false).map_err(|e| anyhow::anyhow!("{e}"))?;
-    anyhow::ensure!(def.destination.cluster == format!("{provider}/aws-test/us-east-1"), "the release's target: {}", def.destination.cluster);
+    anyhow::ensure!(def.destination.cluster == target.name(), "the release's target: {}", def.destination.cluster);
     let source = def.sources.first().ok_or_else(|| anyhow::anyhow!("no source"))?;
     let kiln_cd::apps::Engine::Provider(p) = &source.engine else { anyhow::bail!("not a provider's source") };
     let files: Map<String, Value> = files.iter().map(|(k, v)| ((*k).to_owned(), Value::String((*v).to_owned()))).collect();

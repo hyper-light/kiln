@@ -102,6 +102,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
         ("cloudflare-workers", Some(n)) => super::cloudflare_workers::adopt(&tcx, n).await,
         ("cloudformation", None) => super::cloudformation::discover(&tcx).await,
         ("cloudformation", Some(n)) => super::cloudformation::adopt(&tcx, n).await,
+        ("gcp-run", None) => super::gcp_run::discover(&tcx).await,
+        ("gcp-run", Some(n)) => super::gcp_run::adopt(&tcx, n).await,
         ("vercel", None) => super::vercel::discover(&tcx).await,
         ("vercel", Some(n)) => super::vercel::adopt(&tcx, n).await,
         (other, _) => return Err(bad(format!("no discovery for {other} yet"))),

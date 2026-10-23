@@ -28,9 +28,13 @@ pub mod aws_s3;
 pub mod aws_static;
 pub mod cloudflare_workers;
 pub mod cloudformation;
+pub mod gcp;
+pub mod gcp_run;
 pub mod vercel;
 #[cfg(test)]
 pub mod fake;
+#[cfg(test)]
+pub mod fake_gcp;
 #[cfg(test)]
 pub mod fake_query;
 
@@ -195,6 +199,19 @@ impl Cx<'_> {
             Creds::Aws(a) => Ok(a),
             _ => bail!("{} isn't an AWS target", self.conn.target.name()),
         }
+    }
+
+    /// Google Cloud's APIs, for `gcp-*` providers.
+    pub fn gcp(&self) -> Result<integrations::gcp::Gcp<'_>> {
+        match &self.creds {
+            Creds::Bearer(token) if self.conn.def.integration == "gcp" => Ok(integrations::gcp::Gcp { token }),
+            _ => bail!("{} isn't a Google Cloud target", self.conn.target.name()),
+        }
+    }
+
+    /// The target's place value `key` (`project`, `region`, `zone`).
+    pub fn place(&self, key: &str) -> Result<&str> {
+        self.conn.target.place_value(key).ok_or_else(|| anyhow::anyhow!("{} has no {key}", self.conn.target.name()))
     }
 
     /// A token platform's token and its integration's configuration.
@@ -556,6 +573,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "aws-ecs" => aws_ecs::list(cx, kind, names).await?,
         "cloudflare-workers" => cloudflare_workers::list(cx, kind, names).await?,
         "cloudformation" => cloudformation::list(cx, kind, names).await?,
+        "gcp-run" => gcp_run::list(cx, kind, names).await?,
         "vercel" => vercel::list(cx, kind, names).await?,
         other => bail!("no reading {other} yet"),
     };
@@ -577,6 +595,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "aws-ecs" => aws_ecs::apply(cx, desired).await,
         "cloudflare-workers" => cloudflare_workers::apply(cx, desired).await,
         "cloudformation" => cloudformation::apply(cx, desired).await,
+        "gcp-run" => gcp_run::apply(cx, desired).await,
         "vercel" => vercel::apply(cx, desired).await,
         other => bail!("no applying to {other} yet"),
     }
@@ -593,6 +612,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "aws-ecs" => aws_ecs::delete(cx, key).await,
         "cloudflare-workers" => cloudflare_workers::delete(cx, key).await,
         "cloudformation" => cloudformation::delete(cx, key).await,
+        "gcp-run" => gcp_run::delete(cx, key).await,
         "vercel" => vercel::delete(cx, key).await,
         other => bail!("no deleting from {other} yet"),
     }
