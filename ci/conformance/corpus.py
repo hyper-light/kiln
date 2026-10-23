@@ -80,8 +80,11 @@ KNOWN = [
     # A test that waits a few seconds for a message, or a minute for a release to boot, run while
     # the lab's pacer froze its work (the machine's disks busy): to be run again quietly.
     (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
-    # The lab's runner has two slots and one Docker daemon; a hosted runner, a machine a job.
-    (r'The container name "/cargo_test_\d+" is already in use|previous docker build failed, unable to run test', "two of its legs ran at once on the lab's one Docker daemon, and its tests name their containers (`cargo_test_0`): a hosted runner gives each job a daemon of its own (docs/ci.md W13-R04)"),
+    (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    # The lab's firewall keeps containers on networks of their own from its server, so its legs
+    # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
+    # answers. Prometheus's Triton test expects nothing at 127.0.0.1:443.
+    (r"an error occurred unmarshaling the discovery response json: invalid character '<'", "the lab's legs share the host's network, where a server listens on 443; a hosted runner's own machine has nothing there"),
 ]
 
 
@@ -210,6 +213,37 @@ def snapshot(work, repo, commit):
         f.write("submodules kept\n")
     shutil.rmtree(fetched, ignore_errors=True)
     return dest, branch
+
+
+def nearest_tag(work, repo, commit):
+    """The upstream's tag nearest `commit`, as `git describe --tags --abbrev=0` finds it in a
+    checkout of the whole history there (`fetch-depth: 0`), or None. Only the commits are fetched,
+    none of their files."""
+    d = os.path.join(work, "describe", repo.replace("/", "_") + ".git")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    try:
+        git(work, "clone", "-q", "--bare", "--filter=tree:0", f"https://github.com/{repo}.git", d)
+        if not git(d, "rev-parse", "-q", "--verify", commit + "^{commit}", check=False):
+            git(d, "fetch", "-q", "--filter=tree:0", "origin", commit)
+        return git(d, "describe", "--tags", "--abbrev=0", commit, check=False) or None
+    except RuntimeError as e:
+        print(f"{repo}: no tag of the upstream's found ({e})", flush=True)
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def version_tag(work, repo, commit, dest):
+    """`nearest_tag`, kept with the snapshot at `dest`."""
+    mark = os.path.join(dest, ".git", "kiln-snapshot-tag")
+    if os.path.exists(mark):
+        with open(mark) as f:
+            return f.read().strip() or None
+    tag = nearest_tag(work, repo, commit)
+    with open(mark, "w") as f:
+        f.write((tag or "") + "\n")
+    return tag
 
 
 def only_corpus(dest, repo):
@@ -392,6 +426,14 @@ def run_repo(api, args, repo, commit):
     trunk, top = commits(dest, repo, args.pass_name or "")
     native(api, repo, branch)
     push(api, dest, repo, f"{trunk}:refs/heads/{branch}")
+    # The upstream's nearest tag, on the trunk: a build that says its version by `git describe`
+    # (buildx's, which compose checks) says `<tag>-1-g<sha>`, as a checkout of the whole history
+    # says `<tag>-<n>-g<sha>` on GitHub, not a bare sha. Annotated, so a `describe` without
+    # `--tags` finds it too. The trunk has no workflows: its push runs nothing.
+    tag = version_tag(args.work, repo, commit, dest)
+    if tag:
+        git(dest, "tag", "-f", "-a", "-m", f"F-03: {repo}'s nearest tag upstream", tag, trunk)
+        push(api, dest, repo, f"refs/tags/{tag}:refs/tags/{tag}")
     corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
     out = {"repo": repo, "commit": commit, "branch": branch, "sha": top, "events": {}}
     for event in EVENTS:
