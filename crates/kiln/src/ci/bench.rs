@@ -6,9 +6,12 @@
 //! - Against a hub of its own (an in-memory store, the CI engine running, no runners or HTTP):
 //!   run creation (W03-AC09: 1,000 pushes, each from its event to its run in the store, git
 //!   stubbed by workflows already read), log ingest (§1.5: 16 legs' output at once, and a line's way
-//!   to a live viewer) and the cache's store (W08-AC08: a 1 GiB entry saved, then restored). The
-//!   network's part of those (the runner's link, HTTP, the browser) is the live cluster's to
-//!   confirm, as §1.5 says.
+//!   to a live viewer) and the cache (W08-AC08: a 1 GiB entry saved, then restored from the store,
+//!   and over HTTP from its blob URL as `@actions/cache` restores it). The runs' and logs' network
+//!   part (the runner's link, the browser) is the live cluster's to confirm, as §1.5 says.
+//! - The cache's restore over a 10 GbE link (W08-AC08): this binary again, in a user and network
+//!   namespace of its own (`unshare -rn`) whose loopback it shapes to 10 Gbit/s, 50 µs each way
+//!   (`tc … netem`), where the machine lets it.
 //! - Against a store on disk of its own: the runs list's first page with a million runs in it
 //!   (W21-AC04's server time).
 //! - Each measure is the median of `--runs` runs, against its target. They're written to
@@ -55,7 +58,8 @@ pub struct BenchArgs {
     #[arg(long)]
     scheduler: bool,
     /// Only these: `scheduler`, `expressions`, `parsing`, `runs`, `logs`, `cache`, `list`, `restart` (comma-separated); `firecracker`
-    /// too, which runs only when named (a microVM's cold and warm start, W13-AC05).
+    /// too, which runs only when named (a microVM's cold and warm start, W13-AC05); `cache-http`, the
+    /// cache's restore over HTTP alone.
     #[arg(long, value_delimiter = ',')]
     only: Vec<String>,
     /// Pushes for run creation.
@@ -81,6 +85,11 @@ pub struct BenchArgs {
     /// Where the hub's measures keep their data while they run (on disk: a few GiB), removed after.
     #[arg(long, default_value = "target/ci-bench-data")]
     data: PathBuf,
+    /// Shape this network namespace's loopback to this rate first (`10gbit`), 50 µs each way, as
+    /// the bench does in a namespace of its own for W08-AC08's 10 GbE link (`shaped`). Needs
+    /// CAP_NET_ADMIN where it runs.
+    #[arg(long, hide = true)]
+    link: Option<String>,
 }
 
 /// One measure against its target.
@@ -487,9 +496,10 @@ async fn logs(dir: &Path, mib: u64) -> Result<Vec<Measure>> {
     Ok(vec![Measure::new("logs.ingest", "MiB/s", Better::Higher, 200.0, vec![wrote / secs]), Measure::new("logs.live_line_p99", "ms", Better::Lower, 250.0, vec![p99])])
 }
 
-/// W08-AC08's store half: a `mib` MiB entry put into the cache's content store, then restored
-/// from it, streamed as a restore streams it (≥ 500 MiB/s).
-async fn cache(hub: &Arc<Hub>, dir: &Path, mib: u64) -> Result<Vec<Measure>> {
+/// W08-AC08: a `mib` MiB entry put into the cache's content store, then restored from it,
+/// streamed as a restore streams it (its store half), and over HTTP from its blob URL (its
+/// network half, `restore_http`), each ≥ 500 MiB/s. `http_only`: that one alone.
+async fn cache(hub: &Arc<Hub>, dir: &Path, mib: u64, runs: usize, http_only: bool) -> Result<Vec<Measure>> {
     let file = dir.join("bench-cache.bin");
     // Not one repeated byte: chunking and hashing see data like a real entry's.
     let f = file.clone();
@@ -522,7 +532,147 @@ async fn cache(hub: &Arc<Hub>, dir: &Path, mib: u64) -> Result<Vec<Measure>> {
     let restored = got as f64 / f64::from(1u32 << 20) / t.elapsed().as_secs_f64();
     anyhow::ensure!(got == obj.size, "restored {got} of {} bytes", obj.size);
     let _ = std::fs::remove_file(&file);
-    Ok(vec![Measure::new("cache.restore", "MiB/s", Better::Higher, 500.0, vec![restored]), Measure::new("cache.save", "MiB/s", Better::Higher, 0.0, vec![saved])])
+    let over_http = Measure::new("cache.restore_http", "MiB/s", Better::Higher, 500.0, restore_http(hub, &obj, runs).await?);
+    if http_only {
+        return Ok(vec![over_http]);
+    }
+    Ok(vec![Measure::new("cache.restore", "MiB/s", Better::Higher, 500.0, vec![restored]), over_http, Measure::new("cache.save", "MiB/s", Better::Higher, 0.0, vec![saved])])
+}
+
+/// W08-AC08's network half: `obj` restored from its blob URL over HTTP, from kiln's listener, as
+/// `@actions/cache` restores an entry that isn't on Azure: its length from a `HEAD`, then 4 MiB
+/// ranges, 8 at once. Over this namespace's loopback, which `--link` shapes. The client counts
+/// what it gets, as a runner writing to a disk faster than the link would. MiB/s, once a run.
+async fn restore_http(hub: &Arc<Hub>, obj: &crate::ci::services::cas::Object, runs: usize) -> Result<Vec<f64>> {
+    use crate::ci::services::blob;
+    use crate::http::server::{self as srv, Handler, Request, Response};
+    const SEGMENT: u64 = 4 << 20;
+    // The entry, as a saved cache's row has it.
+    let (digest, size, now) = (obj.digest.clone(), obj.size, crate::util::now_unix());
+    let stored = i64::try_from(size)?;
+    let id = hub
+        .store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO ci_caches (repo_id, scope, key, version, object, size, created_at) VALUES ('bench', 'refs/heads/main', 'bench', ?1, ?2, ?3, ?4)",
+                rusqlite::params![crate::util::new_id(), digest, stored, now],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .await?;
+    /// kiln's blob URLs alone.
+    struct Blobs(Arc<Hub>);
+    impl Handler for Blobs {
+        async fn handle(self: Arc<Self>, req: Request) -> Response {
+            let id = req.uri().path().strip_prefix("/_kiln/blob/").unwrap_or_default().to_owned();
+            match blob::serve(&self.0, &id, req).await {
+                Ok(r) => r,
+                Err((status, why)) => srv::text(status, &why),
+            }
+        }
+    }
+    let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 64).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let blobs = Arc::new(Blobs(Arc::clone(hub)));
+    let accept = crate::rt::spawn(async move {
+        while let Ok(stream) = tcp.accept().await {
+            let (remote, blobs) = (stream.peer_addr().ok(), Arc::clone(&blobs));
+            crate::rt::spawn(async move { srv::serve_accepted(stream, blobs, remote, None).await });
+        }
+    });
+    let url = blob::url(hub, &format!("http://{addr}"), blob::Target::Cache(id), "r", 3600);
+    let client = Arc::new(crate::http::client::Client::public()?);
+    let mut samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t = Instant::now();
+        let head = client.request(crate::http::client::Method::Head, &url).send().await?;
+        let len: u64 = head.header("content-length").and_then(|v| v.parse().ok()).ok_or_else(|| anyhow::anyhow!("the HEAD said no length ({})", head.status()))?;
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (client, url, next) = (Arc::clone(&client), url.clone(), Arc::clone(&next));
+                crate::rt::spawn(async move {
+                    let mut got = 0u64;
+                    loop {
+                        let start = next.fetch_add(SEGMENT, std::sync::atomic::Ordering::Relaxed);
+                        if start >= len {
+                            break;
+                        }
+                        let end = (start + SEGMENT).min(len);
+                        let mut r = client.get(&url).header("range", &format!("bytes={start}-{}", end - 1)).send().await?;
+                        anyhow::ensure!(r.status() == 206, "bytes {start}-{end}: {}", r.status());
+                        while let Some(b) = r.chunk().await? {
+                            got += b.len() as u64;
+                        }
+                    }
+                    anyhow::Ok(got)
+                })
+            })
+            .collect();
+        let mut got = 0u64;
+        for task in tasks {
+            got += task.await.map_err(|_| anyhow::anyhow!("a range's download ended early"))??;
+        }
+        anyhow::ensure!(got == size && len == size, "restored {got} of {size} bytes over HTTP");
+        samples.push(got as f64 / f64::from(1u32 << 20) / t.elapsed().as_secs_f64());
+    }
+    accept.abort();
+    Ok(samples)
+}
+
+/// `--link`: this namespace's loopback up and shaped to `rate` (netem), 50 µs each way, so a
+/// round trip takes a LAN's 0.1 ms.
+async fn shape(rate: &str) -> Result<()> {
+    let rate = rate.to_owned();
+    crate::rt::blocking(move || -> Result<()> {
+        for (cmd, args) in [("ip", vec!["link", "set", "lo", "up"]), ("tc", vec!["qdisc", "replace", "dev", "lo", "root", "netem", "rate", rate.as_str(), "delay", "50us"])] {
+            let out = std::process::Command::new(cmd).args(&args).output()?;
+            anyhow::ensure!(out.status.success(), "{cmd} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    })
+    .await?
+}
+
+/// W08-AC08's 10 GbE link: [`restore_http`] again, by this binary in a user and network namespace
+/// of its own (`unshare -rn`) whose loopback it shapes to 10 Gbit/s (`--link`). An error where the
+/// machine can't: no `unshare` or `tc`, or user namespaces off.
+async fn shaped(a: &BenchArgs, runs: usize) -> Result<Measure> {
+    let exe = std::env::current_exe()?;
+    std::fs::create_dir_all(&a.data)?;
+    let report = a.data.join(format!("shaped-{}.json", crate::util::new_id()));
+    let (mib, data, at) = (a.cache_mib, a.data.clone(), report.clone());
+    let out = crate::rt::blocking(move || {
+        std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--net"])
+            .arg(&exe)
+            .args(["ci", "bench", "--only", "cache-http", "--link", "10gbit", "--cache-mib", &mib.to_string(), "--runs", &runs.to_string()])
+            .arg("--out")
+            .arg(&at)
+            .arg("--data")
+            .arg(&data)
+            // Its measures are this run's: one `$KILN_METRICS` line each, from here.
+            .env_remove("KILN_METRICS")
+            .output()
+    })
+    .await??;
+    // A miss exits 1 after writing its report.
+    let read = std::fs::read(&report);
+    let _ = std::fs::remove_file(&report);
+    let Ok(bytes) = read else {
+        let said = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("{}: {}", out.status, said.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no report"));
+    };
+    let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let samples: Vec<f64> = v
+        .get("measures")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|ms| ms.iter().find(|m| m.get("name").and_then(serde_json::Value::as_str) == Some("ci.bench.cache.restore_http")))
+        .and_then(|m| m.get("samples").and_then(serde_json::Value::as_array))
+        .map(|xs| xs.iter().filter_map(serde_json::Value::as_f64).collect())
+        .unwrap_or_default();
+    anyhow::ensure!(!samples.is_empty(), "its report has no restore over HTTP");
+    Ok(Measure::new("cache.restore_10gbe", "MiB/s", Better::Higher, 500.0, samples))
 }
 
 /// What a run of the bench found.
@@ -549,8 +699,8 @@ async fn bench(a: BenchArgs) -> Result<u8> {
     }
     for o in &only {
         anyhow::ensure!(
-            matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache" | "list" | "restart" | "firecracker"),
-            "`{o}`: scheduler, expressions, parsing, runs, logs, cache, list, restart or firecracker"
+            matches!(o.as_str(), "scheduler" | "expressions" | "parsing" | "runs" | "logs" | "cache" | "cache-http" | "list" | "restart" | "firecracker"),
+            "`{o}`: scheduler, expressions, parsing, runs, logs, cache, cache-http, list, restart or firecracker"
         );
     }
     let want = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
@@ -565,7 +715,10 @@ async fn bench(a: BenchArgs) -> Result<u8> {
     if want("parsing") {
         measures.push(parsing(runs));
     }
-    if want("runs") || want("logs") || want("cache") {
+    if let Some(rate) = &a.link {
+        shape(rate).await?;
+    }
+    if want("runs") || want("logs") || want("cache") || want("cache-http") {
         let dir = a.data.join(crate::util::new_id());
         std::fs::create_dir_all(&dir)?;
         let hub = bench_hub(&dir)?;
@@ -577,8 +730,8 @@ async fn bench(a: BenchArgs) -> Result<u8> {
             if want("logs") {
                 m.extend(logs(&dir, a.log_mib).await?);
             }
-            if want("cache") {
-                m.extend(cache(&hub, &dir, a.cache_mib).await?);
+            if want("cache") || want("cache-http") {
+                m.extend(cache(&hub, &dir, a.cache_mib, runs, !want("cache")).await?);
             }
             anyhow::Ok(m)
         }
@@ -586,6 +739,13 @@ async fn bench(a: BenchArgs) -> Result<u8> {
         hub.shutdown.cancel();
         let _ = std::fs::remove_dir_all(&dir);
         measures.extend(measured?);
+    }
+    // W08-AC08's 10 GbE link, where the machine lets the bench make one of its own.
+    if want("cache") && a.link.is_none() {
+        match shaped(&a, runs).await {
+            Ok(m) => measures.push(m),
+            Err(e) => eprintln!("cache.restore_10gbe not measured: a network namespace with a shaped link couldn't be made ({e:#})"),
+        }
     }
     if want("list") {
         let dir = a.data.join(crate::util::new_id());
@@ -649,5 +809,21 @@ mod tests {
         assert!(!Measure::new("z", "ms", Better::Lower, 1.0, Vec::new()).ok, "nothing measured misses");
         let p = parsing(1);
         assert!(p.value > 0.0 && p.samples.len() == 1, "{p:?}");
+    }
+
+    /// W08-AC08's network half, small: a 9 MiB entry restored from its blob URL over HTTP, in two
+    /// whole 4 MiB ranges and a part of one.
+    #[test]
+    fn w08_ac08_restore_over_http() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().to_path_buf();
+        crate::rt::block_on(async move {
+            let hub = bench_hub(&dir)?;
+            let m = cache(&hub, &dir, 9, 2, true).await;
+            hub.shutdown.cancel();
+            let m = m?;
+            assert!(m.len() == 1 && m.iter().all(|x| x.name == "ci.bench.cache.restore_http" && x.samples.len() == 2 && x.value > 0.0), "{m:?}");
+            anyhow::Ok(())
+        })
     }
 }
