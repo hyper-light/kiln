@@ -158,6 +158,24 @@ const family = new Map<string, Member>(
 {
   const m = family.get("fam-orch");
   m?.events.push({ id: "fam-orch-plan", seq: 3, at: t0 + 50_000, kind: "tool", tool_id: "tp1", name: "ExitPlanMode", tool: "plan", title: "Plan ready for review", input: { plan: PROPOSED }, status: "done", started: t0 + 50_000 } as unknown as HEvent);
+  // It records what it found in its research (pages.ts `rs_quic`), as kiln's MCP tool.
+  m?.events.push({
+    id: "fam-orch-research",
+    seq: 4,
+    at: t0 + 55_000,
+    kind: "tool",
+    tool_id: "tr1",
+    name: "mcp__kiln__research_add",
+    tool: "mcp",
+    server: "kiln",
+    tool_short: "research_add",
+    title: "research_add",
+    input: { id: "rs_quic", findings: [{ claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is." }] },
+    output: '{"id": "rs_quic", "question": "Add full hyperaraft dual UDP/QUIC stack replication"}',
+    status: "done",
+    started: t0 + 55_000,
+    ended: t0 + 56_000,
+  } as unknown as HEvent);
 }
 const ORCH_TODOS: Todo[] = [
   { text: "Reproduce it with the CLI test", status: "completed" },

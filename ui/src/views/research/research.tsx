@@ -3,13 +3,18 @@
  * (A to F, out of 100) and what makes it (its sources' kinds, how far its citations held up when
  * kiln looked for each quote where it says it is, how many independent sources agree, what's
  * against it), each quote under it with the source it's from, and the sources, numbered: inside
- * (the machines and systems the agent works in) or outside. On a plan's page while it's planned, and
- * on a page of its own; kept live while quotes are being looked for.
+ * (the machines and systems the agent works in) or outside. Kept live while quotes are being looked
+ * for.
+ *
+ * Where it shows: its plan's page; its agent's Plan tab (the newest in full); its agent's
+ * conversation, where the agent records or reads it (in brief, in full on asking); a planned goal
+ * on its stack (in a line); the Plans page (all of it, listed); and a page of its own.
  */
+import * as React from "react";
 import { useParams, Link } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { planHref } from "@/api/plans";
-import { INSIDE, SOURCE_WORDS, researchApi, type Cite, type CheckState, type Finding, type Research, type ResearchSource } from "@/api/research";
+import { INSIDE, SOURCE_WORDS, researchApi, researchHref, type Cite, type CheckState, type Finding, type Research, type ResearchSource } from "@/api/research";
 import { Loadable } from "@/components/ui/loading";
 import { RowsHold } from "@/components/ui/hold";
 import { Crumbs, EmptyState } from "@/components/ui/misc";
@@ -139,18 +144,32 @@ function FindingCard({ f, sources }: { f: Finding; sources: ResearchSource[] }) 
   );
 }
 
+/** Its findings' grades, as many of each: "A 2 · B 3 · C 1". */
+const gradeWords = (r: Research) =>
+  (["A", "B", "C", "D", "F"] as const)
+    .filter((g) => r.summary.grades[g])
+    .map((g) => `${g} ${r.summary.grades[g]}`)
+    .join(" · ");
+
+/** What it comes to: its findings and sources (inside, outside), and their grades. */
+function ResearchHead({ r, live }: { r: Research; live?: boolean }) {
+  const s = r.summary;
+  return (
+    <div className="rs-head">
+      <Shimmer on={!!live} className="sg-label">
+        {live ? "Researching" : "Research"} · {s.findings} finding{s.findings === 1 ? "" : "s"} · {s.sources} source{s.sources === 1 ? "" : "s"} ({s.internal} inside, {s.external} outside)
+      </Shimmer>
+      {gradeWords(r) && <span className="rs-grades">{gradeWords(r)}</span>}
+    </div>
+  );
+}
+
 /** Research, graded, its sources numbered. `live`: it's still being done. */
 export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
   const s = r.summary;
-  const grades = (["A", "B", "C", "D", "F"] as const).filter((g) => s.grades[g]).map((g) => `${g} ${s.grades[g]}`);
   return (
     <div className="rs">
-      <div className="rs-head">
-        <Shimmer on={!!live} className="sg-label">
-          {live ? "Researching" : "Research"} · {s.findings} finding{s.findings === 1 ? "" : "s"} · {s.sources} source{s.sources === 1 ? "" : "s"} ({s.internal} inside, {s.external} outside)
-        </Shimmer>
-        {grades.length > 0 && <span className="rs-grades">{grades.join(" · ")}</span>}
-      </div>
+      <ResearchHead r={r} live={live} />
       <p className="rs-question">{r.question}</p>
       {s.checking > 0 && (
         <p className="rs-dim">
@@ -197,6 +216,46 @@ export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
   );
 }
 
+/** Research in brief: what it comes to, what was asked, its first findings with their grades. */
+export function ResearchBrief({ r, live }: { r: Research; live?: boolean }) {
+  return (
+    <div className="rs">
+      <ResearchHead r={r} live={live} />
+      <p className="rs-question">{r.question}</p>
+      {r.findings.length > 0 && (
+        <ol className="rs-claims">
+          {r.findings.slice(0, 3).map((f) => (
+            <li key={f.id}>
+              <span className="rs-grade rs-grade-sm" title={f.confidence.why}>
+                <b data-g={f.confidence.grade}>{f.confidence.grade}</b>
+              </span>
+              <span>{f.claim}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+      {r.findings.length > 3 && <p className="rs-dim rs-more">and {r.findings.length - 3} more</p>}
+    </div>
+  );
+}
+
+/** Where to open research: its page, and its plan's. */
+function ResearchLinks({ r, children }: { r: Research; children?: React.ReactNode }) {
+  return (
+    <p className="rs-acts">
+      {children}
+      <Link to={researchHref(r.id)} className="rs-link">
+        Open it
+      </Link>
+      {r.plan && (
+        <Link to={planHref(r.plan)} className="rs-link">
+          Its plan
+        </Link>
+      )}
+    </p>
+  );
+}
+
 const unlessGone = (e: unknown): "gone" => {
   if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return "gone";
   throw e;
@@ -215,6 +274,99 @@ function ResearchLoaded({ id, live }: { id: string; live?: boolean }) {
   const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
   if (res.data === "gone") return <p className="rs-dim">Its research is gone.</p>;
   return <ResearchView r={res.data} live={live} />;
+}
+
+/** Research `id` where its agent records or reads it (its conversation): in brief, in full on asking. */
+export function ResearchCard({ id }: { id: string }) {
+  return (
+    <Loadable label="its research" fallback={<RowsHold rows={1} rowHeight={56} />}>
+      <ResearchCardLoaded id={id} />
+    </Loadable>
+  );
+}
+
+function ResearchCardLoaded({ id }: { id: string }) {
+  const [open, setOpen] = React.useState(false);
+  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  if (res.data === "gone") return <p className="rs-dim">Its research is gone.</p>;
+  const r = res.data;
+  return (
+    <div className="rs-card">
+      {open ? <ResearchView r={r} live={r.summary.checking > 0} /> : <ResearchBrief r={r} live={r.summary.checking > 0} />}
+      <ResearchLinks r={r}>
+        <button type="button" className="rs-link" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? "Less" : "Each finding, its grade and sources"}
+        </button>
+      </ResearchLinks>
+    </div>
+  );
+}
+
+/** The research agent `agent` did, newest first: the newest in full, the rest in brief. None, nothing. */
+export function AgentResearch({ agent }: { agent: string }) {
+  const all = useSuspenseResource(`research/of/${agent}`, (s) => researchApi.list({ agent }, s), { pollMs: 5000 }).data.research;
+  const newest = all[0];
+  if (!newest) return null;
+  return (
+    <section>
+      <h3 className="in-sec-head">Its research{all.length > 1 && <span>{all.length}</span>}</h3>
+      <div className="rs-list">
+        <div className="rs-card">
+          <ResearchView r={newest} live={newest.summary.checking > 0} />
+          <ResearchLinks r={newest} />
+        </div>
+        {all.slice(1).map((r) => (
+          <div key={r.id} className="rs-card">
+            <ResearchBrief r={r} live={r.summary.checking > 0} />
+            <ResearchLinks r={r} />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** A plan's research in a line: to open, with what it comes to. */
+export function ResearchLine({ id }: { id: string }) {
+  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  if (res.data === "gone") return null;
+  const r = res.data;
+  return (
+    <>
+      <Link to={researchHref(id)}>its research</Link>: {r.summary.findings} finding{r.summary.findings === 1 ? "" : "s"}
+      {gradeWords(r) && ` (${gradeWords(r)})`}
+    </>
+  );
+}
+
+/** All research, newest change first, each to open: what was asked and what it comes to. None, nothing. */
+export function ResearchList() {
+  const all = useSuspenseResource("research/all", (s) => researchApi.list({}, s), { pollMs: 15000 }).data.research;
+  if (all.length === 0) return null;
+  return (
+    <section className="plans-research" aria-label="Research">
+      <h2 className="plan-h">Research</h2>
+      <ul className="plans-list">
+        {all.map((r) => (
+          <li key={r.id} className="plans-row">
+            <Link to={researchHref(r.id)} className="plans-row-title">
+              {r.question}
+            </Link>
+            <div className="plans-row-meta">
+              {r.summary.findings} finding{r.summary.findings === 1 ? "" : "s"}
+              {gradeWords(r) && ` (${gradeWords(r)})`} · {r.summary.sources} source{r.summary.sources === 1 ? "" : "s"} · changed {relativeTime(r.updated_at / 1000)}
+              {r.plan && (
+                <>
+                  {" · "}
+                  <Link to={planHref(r.plan)}>its plan</Link>
+                </>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 /** Research on a page of its own. */

@@ -22,6 +22,7 @@ import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
 import { planHref, plansApi, runHref, type Plan } from "@/api/plans";
 import { PlanGraph } from "@/views/plans/graph";
+import { ResearchLine } from "@/views/research/research";
 import { effectiveNeeds } from "@/views/plans/graph-layout";
 import { StandTitle, StepGlyph, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
@@ -101,6 +102,12 @@ function PlannedView({ p, stand, run }: { p: Plan; stand: (n: number) => Stand |
           <>
             {" · "}
             <Link to={runHref(run)}>its run</Link>
+          </>
+        )}
+        {p.research && (
+          <>
+            {" · "}
+            <ResearchLine id={p.research} />
           </>
         )}
       </p>
