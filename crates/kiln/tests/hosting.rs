@@ -1527,9 +1527,9 @@ fn w14_r01_first_branch_and_refusals_said() -> anyhow::Result<()> {
 }
 
 /// W14-R01: a public native repository is anyone's to read over git, as a public GitHub
-/// repository is (a step's `git fetch` after `actions/checkout`'s `persist-credentials: false`);
-/// pushing still needs a token, a token that isn't kiln's is refused, and a private repository
-/// stays private.
+/// repository is (a step's `git fetch` after `actions/checkout`'s `persist-credentials: false`,
+/// or with a token that may not read it); pushing still needs a token that may, a token that
+/// isn't kiln's is refused, and a private repository stays private.
 #[test]
 fn w14_r01_public_repositories_read_without_a_token() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1573,6 +1573,20 @@ fn w14_r01_public_repositories_read_without_a_token() -> anyhow::Result<()> {
     // A private repository stays private.
     let (read, out) = git(&home, dir.path(), &["-c", "credential.helper=", "ls-remote", &anonymous("acme/closed")])?;
     assert!(!read, "a private repository needs a token: {out}");
+    // A token of kiln's that may not read them (as a job's whose `permissions` leave `contents`
+    // out) reads the public one as anyone does, and pushes nothing; the private one it can't read.
+    let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": "outsider", "grants": [] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&json!({ "kind": "pat", "user": "outsider", "grants": ["owner"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let token = serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let theirs = format!("http.extraHeader=Authorization: Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("x:{token}")));
+    let (read, out) = git(&home, dir.path(), &["-c", &theirs, "ls-remote", &anonymous("acme/open")])?;
+    assert!(read, "a token that may not read a public repository reads it as anyone does: {out}");
+    let (read, out) = git(&home, dir.path(), &["-c", &theirs, "ls-remote", &anonymous("acme/closed")])?;
+    assert!(!read, "nor the private one: {out}");
+    let (pushed, out) = git(&home, &clone, &["-c", &theirs, "-c", "credential.helper=", "push", "-q", &anonymous("acme/open"), "main"])?;
+    assert!(!pushed, "and pushes nothing: {out}");
     Ok(())
 }
 
