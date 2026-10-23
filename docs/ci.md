@@ -1440,7 +1440,8 @@ for GHA semantics; kiln's matrix and data-flow additions on top. Pure code in
 - **W04-R24** `jobs.<id>.uses` names `./.github/workflows/<file>` or `$/.github/workflows/<file>`
   (both the same commit; `$/` reads it without a checkout, GitHub-exact) or
   `owner/repo/.github/workflows/<file>@ref` (fetched through W07's mirror, pinned to the SHA the
-  ref resolved to when the run started). Inputs are typed (`boolean`, `number`, `string`) with
+  ref resolved to when the run started). A called workflow's own `./` calls are its repository's,
+  at that commit, not the caller's. Inputs are typed (`boolean`, `number`, `string`) with
   defaults and `required`; `secrets` are mapped explicitly or `inherit`ed; outputs map
   `jobs.<id>.outputs` of the called workflow. Called jobs appear as `<caller> / <called>`. The
   `github` context is the caller's; the OIDC `job_workflow_ref` is the called workflow's.
@@ -2398,6 +2399,13 @@ Gives step execution for `uses:`.
     to that repository's legs only. No checkout is needed.
   - R02 through reusable workflows: their calls are followed when the run starts, and the
     actions of the workflows they call are pinned with the rest.
+  - An owner's `.github` repository, where `crazy-max/.github` and `docker/.github` keep the
+    actions and workflows their repositories share, is a repository like any other. A name may
+    start with a dot, but is never dots alone. A workflow there that calls another by `./` calls
+    its own repository's, at that commit (W04-R24), not the caller's
+    (`w07_r02_an_owners_shared_repository`). The corpus's docker/buildx found both. Its
+    annotations step failed with "was not resolved when the run started", and its `binaries`
+    call (`docker/github-builder`'s `bake.yml`) with "no such workflow".
   - R02 through the repository's own composite actions (`./path`): each is read from the
     repository at the running commit, where a checkout of it puts it, and its remote actions are
     pinned with the rest (`w07_ac04_kinds`'s local action uses one nothing else does). The
