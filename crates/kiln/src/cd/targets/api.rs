@@ -122,6 +122,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
         ("digitalocean", Some(n)) => super::digitalocean::adopt(&tcx, n).await,
         ("heroku", None) => super::heroku::discover(&tcx).await,
         ("heroku", Some(n)) => super::heroku::adopt(&tcx, n).await,
+        ("netlify", None) => super::netlify::discover(&tcx).await,
+        ("netlify", Some(n)) => super::netlify::adopt(&tcx, n).await,
         ("render", None) => super::render::discover(&tcx).await,
         ("render", Some(n)) => super::render::adopt(&tcx, n).await,
         ("vercel", None) => super::vercel::discover(&tcx).await,

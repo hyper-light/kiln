@@ -395,7 +395,7 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true, signing: None },
     KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false, signing: None },
     KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false, signing: None },
-    KindInfo { kind: "netlify", title: "Netlify", category: "hosting", mode: Mode::Token, fields: &[f("account", false, "the team slug")], secret: Some("personal access token"), built: false, signing: None },
+    KindInfo { kind: "netlify", title: "Netlify", category: "hosting", mode: Mode::Token, fields: &[f("account", false, "the team slug")], secret: Some("personal access token"), built: true, signing: None },
     KindInfo { kind: "render", title: "Render", category: "hosting", mode: Mode::Token, fields: &[f("owner_id", false, "the workspace")], secret: Some("API key"), built: true, signing: None },
     KindInfo { kind: "heroku", title: "Heroku", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("API key"), built: true, signing: None },
     KindInfo { kind: "digitalocean", title: "DigitalOcean", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("personal access token"), built: true, signing: None },

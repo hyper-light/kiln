@@ -154,7 +154,7 @@ pub fn site_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
 }
 
 /// The built site CI made, read whole.
-async fn read_site(cx: &Cx<'_>, site: &str) -> Result<BTreeMap<String, Vec<u8>>> {
+pub async fn read_site(cx: &Cx<'_>, site: &str) -> Result<BTreeMap<String, Vec<u8>>> {
     let (rx, len) = cx.files.open(site.trim_start_matches("sha256:")).await?;
     if usize::try_from(len).unwrap_or(usize::MAX) > SITE_MAX {
         bail!("the site is {len} bytes, past the {} MiB kiln reads", SITE_MAX >> 20);

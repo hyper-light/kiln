@@ -1,5 +1,5 @@
-//! A fake of the hosting platforms' APIs for tests (Render, DigitalOcean App Platform, Heroku), in
-//! memory, behaving as each
+//! A fake of the hosting platforms' APIs for tests (Render, DigitalOcean App Platform, Heroku,
+//! Netlify), in memory, behaving as each
 //! documents it where kiln depends on it: a deploy builds and goes live, the one before serving
 //! until it does, and one that fails leaves it serving; a rollback re-deploys an earlier deploy.
 //! Every request carries the platform's token.
@@ -50,9 +50,20 @@ pub struct HerokuApp {
     pub crashing: Vec<String>,
 }
 
+/// A Netlify site as the fake keeps it: its deploys, newest first, and the one published.
+#[derive(Clone, Debug, Default)]
+pub struct NetlifySite {
+    pub id: String,
+    pub deploys: Vec<Value>,
+    pub published: Option<String>,
+}
+
 #[derive(Default)]
 pub struct HostingState {
     pub base: String,
+    pub netlify: BTreeMap<String, NetlifySite>,
+    /// Files Netlify holds, by SHA-1.
+    pub netlify_files: BTreeMap<String, Vec<u8>>,
     pub heroku: BTreeMap<String, HerokuApp>,
     /// Places sources were sent to, by id.
     pub blobs: BTreeMap<String, Vec<u8>>,
@@ -124,6 +135,7 @@ impl srv::Handler for FakeHosting {
                 ok(json!({ "source_blob": { "get_url": format!("{base}/blobs/s{n}?sig=get"), "put_url": format!("{base}/blobs/s{n}?sig=put") } }))
             }
             ["apps", rest @ ..] => heroku(&mut st, &method, rest, &body),
+            ["api", "v1", rest @ ..] => netlify(&mut st, &method, rest, &query, &body, &raw),
             _ => err(404, "not_found", &format!("the fake has no {method} {path}")),
         }
     }
@@ -472,6 +484,112 @@ fn heroku(st: &mut HostingState, method: &http::Method, rest: &[&str], body: &Va
             srv::json(http::StatusCode::CREATED, &r)
         }
         _ => err(404, "not_found", "the fake has no such Heroku call"),
+    }
+}
+
+// ------------------------------------------------------------------ Netlify
+
+fn netlify_site(name: &str, s: &NetlifySite) -> Value {
+    let published = s.published.as_ref().and_then(|p| s.deploys.iter().find(|d| d.get("id").and_then(Value::as_str) == Some(p.as_str()))).map(|d| json!({ "id": d.get("id"), "state": d.get("state") }));
+    json!({ "id": s.id, "name": name, "url": format!("http://{name}.netlify.app"), "ssl_url": format!("https://{name}.netlify.app"), "published_deploy": published, "updated_at": "2026-10-23T00:00:00Z" })
+}
+
+fn netlify(st: &mut HostingState, method: &http::Method, rest: &[&str], query: &BTreeMap<String, String>, body: &Value, raw: &[u8]) -> Response {
+    let n = next(st);
+    let by_id = |st: &HostingState, id: &str| st.netlify.iter().find(|(_, s)| s.id == id).map(|(n, _)| n.clone());
+    match (method.as_str(), rest) {
+        ("GET", ["sites"]) => {
+            let want = query.get("name");
+            ok(Value::Array(st.netlify.iter().filter(|(n, _)| want.is_none_or(|w| w == *n)).map(|(n, s)| netlify_site(n, s)).collect()))
+        }
+        ("POST", ["sites"]) => {
+            let name = body.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let site = NetlifySite { id: format!("site-{n}"), ..NetlifySite::default() };
+            let answer = netlify_site(&name, &site);
+            st.netlify.insert(name.clone(), site);
+            st.calls.push(format!("CreateSite {name}"));
+            srv::json(http::StatusCode::CREATED, &answer)
+        }
+        (_, ["sites", id, rest @ ..]) => {
+            let Some(name) = by_id(st, id) else { return err(404, "not_found", "Not Found") };
+            match (method.as_str(), rest) {
+                ("DELETE", []) => {
+                    st.netlify.remove(&name);
+                    st.calls.push(format!("DeleteSite {name}"));
+                    srv::status(http::StatusCode::NO_CONTENT)
+                }
+                ("GET", ["deploys"]) => ok(Value::Array(st.netlify.get(&name).map(|s| s.deploys.iter().take(1).cloned().collect()).unwrap_or_default())),
+                ("POST", ["deploys"]) => {
+                    let files = body.get("files").and_then(Value::as_object).cloned().unwrap_or_default();
+                    let mut required: Vec<String> = files.values().filter_map(Value::as_str).filter(|sha| !st.netlify_files.contains_key(*sha)).map(str::to_owned).collect();
+                    required.sort();
+                    required.dedup();
+                    let state = if required.is_empty() { "processing" } else { "uploading" };
+                    let d = json!({ "id": format!("deploy-{n}"), "site_id": id, "state": state, "required": required, "files": files });
+                    if let Some(s) = st.netlify.get_mut(&name) {
+                        s.deploys.insert(0, d.clone());
+                    }
+                    st.calls.push(format!("Deploy {name} {} files, {} to upload", files.len(), required.len()));
+                    ok(d)
+                }
+                ("POST", ["deploys", did, "restore"]) => {
+                    let Some(s) = st.netlify.get_mut(&name) else { return err(404, "not_found", "Not Found") };
+                    if !s.deploys.iter().any(|d| d.get("id").and_then(Value::as_str) == Some(*did) && d.get("state").and_then(Value::as_str) == Some("ready")) {
+                        return err(422, "unprocessable", "only a ready deploy is restored");
+                    }
+                    s.published = Some((*did).to_owned());
+                    st.calls.push(format!("Restore {name} {did}"));
+                    ok(json!({ "id": did, "state": "ready" }))
+                }
+                _ => err(404, "not_found", "the fake has no such Netlify call"),
+            }
+        }
+        (_, ["deploys", did, rest @ ..]) => {
+            let Some((name, i)) = st.netlify.iter().find_map(|(n, s)| s.deploys.iter().position(|d| d.get("id").and_then(Value::as_str) == Some(*did)).map(|i| (n.clone(), i))) else { return err(404, "not_found", "Not Found") };
+            match (method.as_str(), rest) {
+                ("PUT", path) if path.first() == Some(&"files") => {
+                    let file = format!("/{}", path.get(1..).unwrap_or_default().iter().map(|p| srv::decode(p)).collect::<Vec<_>>().join("/"));
+                    let sha = crate::ci::integrations::vercel::sha1_hex(raw);
+                    let Some(d) = st.netlify.get(&name).and_then(|s| s.deploys.get(i)).cloned() else { return err(404, "not_found", "Not Found") };
+                    if d.pointer("/files").and_then(|f| f.get(&file)).and_then(Value::as_str) != Some(sha.as_str()) {
+                        return err(422, "unprocessable", &format!("{file} doesn't match its digest"));
+                    }
+                    st.netlify_files.insert(sha, raw.to_vec());
+                    st.calls.push(format!("UploadFile {file}"));
+                    let known = st.netlify_files.clone();
+                    if let Some(d) = st.netlify.get_mut(&name).and_then(|s| s.deploys.get_mut(i)) {
+                        let all = d.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).all(|r| known.contains_key(r));
+                        if all {
+                            set(d, "state", json!("processing"));
+                        }
+                    }
+                    ok(json!({ "path": file }))
+                }
+                ("GET", []) => {
+                    let known = st.netlify_files.clone();
+                    let Some(s) = st.netlify.get_mut(&name) else { return err(404, "not_found", "Not Found") };
+                    let mut publish = None;
+                    if let Some(d) = s.deploys.get_mut(i)
+                        && d.get("state").and_then(Value::as_str) == Some("processing")
+                    {
+                        let broken = d.get("files").and_then(Value::as_object).into_iter().flatten().filter_map(|(_, sha)| sha.as_str().and_then(|x| known.get(x))).any(|b| String::from_utf8_lossy(b).contains("broken"));
+                        if broken {
+                            set(d, "state", json!("error"));
+                            set(d, "error_message", json!("a post-processing step failed"));
+                        } else {
+                            set(d, "state", json!("ready"));
+                            publish = Some((*did).to_owned());
+                        }
+                    }
+                    if publish.is_some() {
+                        s.published = publish;
+                    }
+                    ok(s.deploys.get(i).cloned().unwrap_or_default())
+                }
+                _ => err(404, "not_found", "the fake has no such Netlify call"),
+            }
+        }
+        _ => err(404, "not_found", "the fake has no such Netlify call"),
     }
 }
 

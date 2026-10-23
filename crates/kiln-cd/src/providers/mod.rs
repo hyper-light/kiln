@@ -31,6 +31,7 @@ pub mod gcp_compute;
 pub mod gcp_functions;
 pub mod gcp_run;
 pub mod heroku;
+pub mod netlify;
 pub mod render;
 pub mod vercel;
 
@@ -511,11 +512,11 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "netlify",
         place: &[],
         scope: None,
-        settings: &[s("site", true, "the site"), s("dir", true, "the built site (${{ artifacts.* }})")],
+        settings: &[s("site", true, "the site (made if it isn't there)"), s("dir", true, "the built site: a zip or .tar.gz CI made (${{ release.artifacts.<name>.digest }})")],
         kinds: &[kind("netlify.kiln.dev", "Site", "Site"), child(kind("netlify.kiln.dev", "Deploy", "Deploy"))],
-        capabilities: &[Versions, Previews, Drift, Adopt],
-        reads: &["netlify.toml"],
-        built: false,
+        capabilities: &[Versions, Drift, Adopt],
+        reads: &[],
+        built: true,
     },
     ProviderDef {
         name: "render",
@@ -781,6 +782,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "gcp-functions" => gcp_functions::render(input),
         "gcp-run" => gcp_run::render(input),
         "heroku" => heroku::render(input),
+        "netlify" => netlify::render(input),
         "render" => render::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
@@ -811,6 +813,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "gcp-functions" => gcp_functions::files(spec),
         "gcp-run" => gcp_run::files(spec),
         "heroku" => heroku::files(spec),
+        "netlify" => netlify::files(spec),
         "render" => render::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
@@ -843,6 +846,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "gcp-functions" => gcp_functions::health(obj),
         "gcp-run" => gcp_run::health(obj),
         "heroku" => heroku::health(obj),
+        "netlify" => netlify::health(obj),
         "render" => render::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,
