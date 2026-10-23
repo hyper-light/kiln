@@ -209,9 +209,15 @@ struct Tree {
 impl Tree {
     /// `acme/restart`, made on `s` with a first commit, once the server has polled it.
     fn new(dir: &Path, s: &Server) -> anyhow::Result<Tree> {
-        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/restart", "mode": "native" })))?;
+        Tree::named(dir, s, "acme/restart")
+    }
+
+    /// `name`, made on `s` with a first commit, once the server has polled it.
+    fn named(dir: &Path, s: &Server, name: &str) -> anyhow::Result<Tree> {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
         anyhow::ensure!(st == 200, "{st} {body}");
-        let t = Tree { home: dir.join("githome"), work: dir.join("tree"), push: format!("http://x:{}@127.0.0.1:{}/git/acme/restart.git", s.admin, s.port) };
+        let key = name.replace('/', "_");
+        let t = Tree { home: dir.join("githome"), work: dir.join(format!("tree-{key}")), push: format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port) };
         std::fs::create_dir_all(&t.home)?;
         std::fs::create_dir_all(t.work.join(".kiln"))?;
         git(&t.home, &t.work, &["init", "-q", "-b", "main"])?;
@@ -235,9 +241,14 @@ impl Tree {
 
 /// The newest run of `workflow`'s id, once there is one.
 fn run_of(s: &Server, workflow: &str) -> anyhow::Result<String> {
+    run_in(s, "acme/restart", workflow)
+}
+
+/// The newest run of `repo`'s `workflow`, once there is one.
+fn run_in(s: &Server, repo: &str, workflow: &str) -> anyhow::Result<String> {
     let mut run = String::new();
     until(s, 120, "the run", || {
-        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo=acme/restart&workflow={workflow}&limit=1"), &s.admin, None)?;
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo={repo}&workflow={workflow}&limit=1"), &s.admin, None)?;
         run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
         Ok(run.is_empty().then_some(body))
     })?;
@@ -331,6 +342,39 @@ fn w05_r25_a_cancel_holds_over_a_restart() -> anyhow::Result<()> {
     tree.commit(".kiln/next.yaml", "on: push\njobs:\n  next:\n    runs-on: local\n    steps:\n      - run: echo next\n")?;
     let next = run_of(&s, ".kiln/next.yaml")?;
     until(&s, 120, "the next leg on the runner", || {
+        let all = legs(&s, &next)?;
+        Ok((!all.iter().any(|(_, _, st, _)| st == "succeeded")).then(|| format!("{all:?}")))
+    })?;
+    Ok(())
+}
+
+/// A repository deleted while its legs run takes them with it, as a deleted GitHub repository
+/// does: its runner stops them, and a slot they held goes to the next repository's leg.
+#[test]
+fn a_deleted_repository_takes_its_legs_with_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let held = Tree::new(dir.path(), &s)?;
+    held.commit(".kiln/hold.yaml", "on: push\njobs:\n  hold:\n    runs-on: local\n    matrix: { n: [1, 2, 3] }\n    steps:\n      - run: sleep 300\n")?;
+    let run = run_of(&s, ".kiln/hold.yaml")?;
+    until(&s, 300, "both of the runner's slots held", || {
+        let all = legs(&s, &run)?;
+        Ok((all.iter().filter(|(_, _, st, _)| st == "running").count() < 2).then(|| format!("{all:?}")))
+    })?;
+    // Another repository's leg waits for a slot.
+    let other = Tree::named(dir.path(), &s, "acme/other")?;
+    other.commit(".kiln/next.yaml", "on: push\njobs:\n  next:\n    runs-on: local\n    steps:\n      - run: echo next\n")?;
+    let next = run_in(&s, "acme/other", ".kiln/next.yaml")?;
+    let (_, repos) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+    let id = serde_json::from_str::<Value>(&repos)?
+        .as_array()
+        .and_then(|r| r.iter().find(|x| x.get("name").and_then(Value::as_str) == Some("acme/restart")))
+        .and_then(|x| x.get("id").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned();
+    let (st, body) = http(s.port, "DELETE", &format!("/api/repos/{id}"), &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "delete: {st} {body}");
+    until(&s, 120, "the next repository's leg, on a slot the deleted one's legs held", || {
         let all = legs(&s, &next)?;
         Ok((!all.iter().any(|(_, _, st, _)| st == "succeeded")).then(|| format!("{all:?}")))
     })?;

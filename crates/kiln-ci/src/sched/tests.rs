@@ -269,6 +269,34 @@ fn a_cancelled_leg_is_never_retried() {
     assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Cancelled, .. } if leg == "l")), "{c:?}");
 }
 
+/// A leg gone with its repository leaves no trace: its runner is told to stop it, its slot goes
+/// to the next leg at once, and nothing is settled or retried (its records went with it).
+#[test]
+fn a_leg_gone_with_its_repository_frees_its_runner() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("gone", "acme/gone", 60))), 0);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "gone")), "{c:?}");
+    let c = s.handle(Input::LegQueued(Box::new(leg("next", "acme/kept", 60))), 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "the runner is full: {c:?}");
+    let c = s.handle(Input::LegQueued(Box::new(leg("queued", "acme/gone", 60))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    // The queued one first: out of the queue, nothing said.
+    let c = s.handle(Input::LegGone { leg: "queued".into() }, 3);
+    assert!(c.iter().all(|x| !matches!(x, Command::Settled { .. } | Command::Assign { .. })), "{c:?}");
+    // The running one: its runner stops it, and the slot waits for the runner to say so.
+    let c = s.handle(Input::LegGone { leg: "gone".into() }, 4);
+    assert!(c.iter().any(|x| matches!(x, Command::Cancel { leg, .. } if leg == "gone")), "its runner stops it: {c:?}");
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Settled { .. })), "{c:?}");
+    // Its attempt's end, killed or lost with its runner, frees the slot for the next leg, and
+    // nothing is settled or retried (its records went with it).
+    let c = s.handle(Input::AttemptFinished { leg: "gone".into(), attempt: 1, outcome: Outcome::Cancelled }, 5);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "next" && runner == "a")), "the slot is the next leg's: {c:?}");
+    assert!(!c.iter().any(|x| matches!(x, Command::Settled { .. } | Command::Retry { .. })), "{c:?}");
+    let c = s.handle(Input::AttemptFinished { leg: "gone".into(), attempt: 1, outcome: Outcome::Cancelled }, 6);
+    assert!(c.is_empty(), "once: {c:?}");
+}
+
 #[test]
 fn resources_mode_and_cancellation() {
     let cfg = Config { resources: true, ..Config::default() };

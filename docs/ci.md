@@ -3873,7 +3873,12 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     - an empty repository takes its first trunk from anyone who may push;
     - other branches need `diffs.submit`, tags `diffs.land`; a leg needs `contents: write`;
     - `refs/kiln/*` and `refs/pull/*` are kiln's;
-  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once.
+  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once;
+  - a repository deleted takes its runs with it, as a deleted GitHub repository does: the CI
+    engine drops their legs, a running one stopped on its runner and its slot free once the
+    runner says it ended, and nothing of them settles or retries
+    (`a_deleted_repository_takes_its_legs_with_it`). They used to stay in the engine, a queued
+    leg still assigned and run with its records gone.
   - Checked end to end with real git (`crates/kiln/tests/hosting.rs`): clone and push by
     developer, viewer, owner and powerless tokens, trunk refusals, whole-push refusal, and the
     push's run.

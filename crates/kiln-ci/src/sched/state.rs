@@ -132,7 +132,16 @@ pub enum Input {
     LegRunning { leg: Box<LegIn>, runner: String, attempt: u32 },
     /// The plan cancelled a leg (fail-fast, the run cancelled).
     LegCancelled { leg: String, reason: String },
-    AttemptFinished { leg: String, attempt: u32, outcome: Outcome },
+    /// A leg gone with its repository: dropped without settling (its records are gone with it),
+    /// its runner told to stop it.
+    LegGone {
+        leg: String,
+    },
+    AttemptFinished {
+        leg: String,
+        attempt: u32,
+        outcome: Outcome,
+    },
     /// The runner refused the assignment (no free slot, draining): the leg goes back to its queue,
     /// the same attempt, and not to that runner.
     Rejected { leg: String },
@@ -226,6 +235,8 @@ struct Leg {
     last_runner: Option<String>,
     /// Cancelled while it ran, and why: however its attempt ends, it ends cancelled, never retried.
     cancelling: Option<String>,
+    /// Gone with its repository while it ran: its attempt's end frees its runner, nothing else.
+    gone: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +314,7 @@ impl Scheduler {
             Input::LegQueued(leg) => self.leg_queued(*leg, now, &mut out),
             Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt),
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
+            Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
             Input::Rejected { leg } => {
                 if let Some(runner) = self.release(&leg) {
@@ -458,7 +470,10 @@ impl Scheduler {
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
         let group = input.group.clone();
-        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None });
+        self.legs.insert(
+            id.clone(),
+            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false },
+        );
         match group {
             Some((key, name, cfg)) => {
                 let actions = self.groups.arrive(&key, &name, &format!("leg:{id}"), &cfg);
@@ -485,7 +500,24 @@ impl Scheduler {
         }
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
-        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Assigned { runner: runner.clone() }, attempt, queued_at: 0, key: None, reason: None, avoid: None, pin: None, last_runner: Some(runner.clone()), cancelling: None });
+        self.legs.insert(
+            id.clone(),
+            Leg {
+                input,
+                req,
+                sig,
+                state: State::Assigned { runner: runner.clone() },
+                attempt,
+                queued_at: 0,
+                key: None,
+                reason: None,
+                avoid: None,
+                pin: None,
+                last_runner: Some(runner.clone()),
+                cancelling: None,
+                gone: false,
+            },
+        );
         // The runner may not have reconnected yet: keep what it runs until it does.
         let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, exclusive: false });
         r.running.push(id);
@@ -712,6 +744,10 @@ impl Scheduler {
         if l.attempt != attempt || l.state == State::Done {
             return;
         }
+        if l.gone {
+            self.drop_gone(id, now, out);
+            return;
+        }
         let runner = self.release(id);
         self.discard_used(id, out);
         // Cancelled while it ran: a failure now (killed, its runner gone) is the cancel's doing.
@@ -771,6 +807,33 @@ impl Scheduler {
             for a in self.groups.leave(&key, &format!("leg:{id}")) {
                 self.group_action(a, now, out);
             }
+        }
+    }
+
+    fn gone(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(l) = self.legs.get_mut(id) else { return };
+        // Running: its runner stops it, and its slot is free once the runner says it ended.
+        if matches!(l.state, State::Assigned { .. }) {
+            l.gone = true;
+            out.push(Command::Cancel { leg: id.to_owned(), attempt: l.attempt, reason: "its repository was deleted".into() });
+            return;
+        }
+        self.unqueue(id);
+        self.drop_gone(id, now, out);
+    }
+
+    /// A leg gone with its repository, off its runner and out of the scheduler: nothing settled.
+    fn drop_gone(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let runner = self.release(id);
+        self.discard_used(id, out);
+        let group = self.legs.remove(id).and_then(|l| l.input.group);
+        if let Some((key, _, _)) = group {
+            for a in self.groups.leave(&key, &format!("leg:{id}")) {
+                self.group_action(a, now, out);
+            }
+        }
+        if let Some(r) = runner {
+            self.try_runner(&r, now, out);
         }
     }
 
