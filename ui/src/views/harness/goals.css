@@ -61,6 +61,28 @@
   font-size: 12px;
   line-height: 1.55;
 }
+/* Big goals planned first: the stack's one setting, under what it does. */
+.gs-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+.gs-option input {
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  accent-color: var(--color-accent);
+}
+.gs-option-hint {
+  display: block;
+  color: #8d9099;
+  font-size: 12px;
+}
 .gs-reason {
   margin: 0;
   padding: 8px 10px;
@@ -102,79 +124,93 @@
 .gs-link[data-status="met"]:not(:last-child)::before {
   background: #5d7a74;
 }
-/* Each goal's node: its number, inside where it stands drawn as the console draws work
-   (plans/status.tsx), on the panel's own colour so the line runs behind it. The goal at work has
-   the prism's light turning around its number (only a transform moves) and its words in the
-   shimmer; waiting goals are only sketched, still. */
+/* Each goal's badge: its number, ringed by where it stands, on the panel's own colour so the line
+   runs behind it. While it's worked on, the console's running light (a sector of the prism,
+   signals.css) turns around the ring; only a transform moves. */
 .gs-node {
+  position: relative;
   display: grid;
   width: 22px;
   height: 22px;
   place-items: center;
+  border: 1px solid #343a45;
   border-radius: 50%;
   background: #0a0c0f;
   color: #8d9099;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
-  line-height: 1;
+  isolation: isolate;
 }
-.gs-node > * {
-  grid-area: 1 / 1;
+/* Two figures sit closer, to fit. */
+.gs-node[data-wide] {
+  font-size: 9px;
+  letter-spacing: -0.04em;
 }
-.gs-node .sg-beam {
-  width: 22px;
-  height: 22px;
-}
-/* The mark's loop sits a little left of its box; two figures sit closer to fit inside it. */
-.gs-n {
-  translate: -0.5px 0;
-}
-.gs-n[data-wide] {
-  font-size: 8.5px;
-  letter-spacing: -0.06em;
+.gs-node::before {
+  position: absolute;
+  z-index: -1;
+  inset: -1px;
+  padding: 1.5px;
+  border-radius: 50%;
+  background: conic-gradient(transparent 0turn 0.5turn, #b8d9d2 0.6turn, #a6c4ed 0.7turn, #b8a6d5 0.8turn, #d6a2aa 0.9turn, #d8cbb0 0.97turn, transparent 1turn);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  content: "";
 }
 .gs-node[data-stand="working"] {
+  border-color: #2f3540;
   color: #e3e7ee;
   box-shadow: 0 0 0 3px rgb(166 196 237 / 10%);
 }
-/* Under way while the agent is between turns: its number in the light's blue. */
+.gs-node[data-stand="working"]::before {
+  opacity: 1;
+  animation: gs-turn 1.8s linear infinite;
+}
+@keyframes gs-turn {
+  to {
+    transform: rotate(1turn);
+  }
+}
+/* Under way while the agent is between turns: the ring held in the light's blue. */
 .gs-link[data-status="active"] .gs-node[data-stand="waiting"] {
+  border-color: #a6c4ed;
   color: #a6c4ed;
 }
 .gs-node[data-stand="met"] {
+  border-color: #5d7a74;
   color: #b8d9d2;
 }
 .gs-node[data-stand="unmet"] {
+  border-color: #8a6d4f;
   color: #d8bb95;
 }
 .gs-node[data-stand="skipped"] {
+  border-color: #6e5560;
+  border-style: dashed;
   color: #d5a4ad;
 }
 /* The goal under way while you've paused the stack: held, in the paused chip's amber. */
 .gs-node[data-stand="paused"] {
+  border-color: #e3c9a0;
+  border-style: dashed;
   color: #e3c9a0;
 }
-.gs-node[data-stand="paused"] .sg-trace {
-  --sg-tone: #e3c9a0;
+:root[data-motion="paused"] .gs-node::before {
+  animation-play-state: paused;
+}
+@media (prefers-reduced-motion: reduce) {
+  .gs-node[data-stand="working"]::before {
+    background: conic-gradient(#b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0, #b8d9d2);
+    animation: none;
+  }
 }
 .gs-chain .sg-beam[data-status="pending"] {
   animation: none;
-}
-/* A goal's parts: smaller links on the same chain, before the goal they're parts of; a step's own
-   parts (its criteria and tests) smaller still. */
-.gs-link[data-part] .gs-node .sg-beam,
-.gs-link[data-part] .gs-node .sg-optic {
-  width: 11px;
-  height: 11px;
-}
-.gs-link[data-depth="2"] .gs-node .sg-beam,
-.gs-link[data-depth="2"] .gs-node .sg-optic {
-  width: 9px;
-  height: 9px;
-}
-.gs-link[data-depth="2"] .gs-text {
-  font-size: 12px;
 }
 .gs-link[data-status="paused"] .gs-word {
   color: #e3c9a0;
@@ -301,19 +337,182 @@
   gap: 6px;
   margin-top: 6px;
 }
-/* A goal that became a plan: its steps' graph under its words, each step as it stands. */
-.gs-plan {
+/* A goal's steps under it, on its line (goal-plan.tsx): each step's glyph on the goal's line, or on
+   the branch beside it where steps run at once (never more than two lines), with the curves
+   between; where each stands, a word at the right. Masked by the panel's colour, the lines run
+   behind the glyphs. */
+.gp {
+  position: relative;
+  grid-column: 1 / -1;
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+/* The last goal's line runs on through its steps. */
+.gs-link:last-child > .gp::before {
+  position: absolute;
+  top: -10px;
+  bottom: 18px;
+  left: 10.5px;
+  width: 1px;
+  background: #2a3039;
+  content: "";
+}
+.gp-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px 22px minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 10px;
+  padding-bottom: 10px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.gp-glyph {
+  display: grid;
+  height: 18px;
+  place-items: center;
+}
+.gp-glyph > * {
+  border-radius: 50%;
+  background: #0a0c0f;
+  box-shadow: 0 0 0 3px #0a0c0f;
+}
+.gp-row[data-lane="main"] .gp-glyph {
+  grid-column: 1;
+}
+.gp-row[data-lane="main"] .gp-text {
+  grid-column: 2 / 4;
+}
+.gp-row[data-lane="branch"] .gp-glyph {
   grid-column: 2;
+}
+.gp-row[data-lane="branch"] .gp-text {
+  grid-column: 3;
+}
+/* The branch's line, through its steps. */
+.gp-row[data-lane="branch"]::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 42.5px;
+  width: 1px;
+  background: #343a45;
+  content: "";
+}
+.gp-text {
+  display: grid;
   min-width: 0;
-  margin-top: 6px;
 }
-.gs-plan-line {
-  margin: 4px 0 0;
-  color: #7d818b;
-  font-size: 11px;
+.gp-title {
+  color: #c9cbd1;
+  overflow-wrap: anywhere;
 }
-.gs-plan-line a {
+.gp-title code {
   color: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+.gp-row[data-stand="met"] .gp-title,
+.gp-row[data-stand="skipped"] .gp-title {
+  color: #9a9ca3;
+}
+.gp-row[data-stand="waiting"] .gp-title,
+.gp-row[data-stand="stopped"] .gp-title {
+  color: #7d818b;
+}
+.gp-row[data-stand="needs_you"] .gp-title,
+.gp-row[data-stand="yours"] .gp-title {
+  color: #e3e7ee;
+}
+/* Who's at it, what it waits for: under its words, small. */
+.gp-sub {
+  margin-top: 1px;
+  color: #7d818b;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.gp-word {
+  grid-column: 4;
+  padding-top: 2px;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.gp-row[data-stand="met"] .gp-word {
+  color: #a8c9bc;
+}
+.gp-row[data-stand="working"] .gp-word {
+  color: #a6c4ed;
+}
+.gp-row[data-stand="needs_you"] .gp-word,
+.gp-row[data-stand="yours"] .gp-word,
+.gp-row[data-stand="unmet"] .gp-word,
+.gp-row[data-stand="paused"] .gp-word {
+  color: #d8bb95;
+}
+.gp-row[data-stand="skipped"] .gp-word {
+  color: #d5a4ad;
+}
+.gp-row[data-stand="stopped"] .gp-word {
+  color: #5c5f66;
+}
+/* A finished stretch, folded: shown on asking. */
+.gp-show {
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #8d9099;
+  font: inherit;
   text-decoration: underline;
   text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.gp-show:hover {
+  color: #e3e7ee;
+}
+/* Where a branch leaves the goal's line (how many run at once on it), and where it comes back. */
+.gp-fork,
+.gp-join {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px 22px minmax(0, 1fr);
+  column-gap: 10px;
+}
+.gp-fork {
+  height: 22px;
+}
+.gp-join {
+  height: 12px;
+}
+.gp-curve {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 54px;
+  height: 100%;
+  overflow: visible;
+}
+.gp-curve path {
+  fill: none;
+  stroke: #343a45;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.gp-count {
+  grid-column: 3;
+  align-self: center;
+  color: #7d818b;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }

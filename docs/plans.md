@@ -137,9 +137,11 @@ what it waits for instead (**after 2, 3**).
 
 ## Planning a goal
 
-An agent turns a goal of its stack into a plan kiln keeps with `goals_plan` (docs/goals.md): a plan
-in its **planning phase**, the goal's words its brief, with research of its own (docs/research.md).
-The goal gets one part first, planning it; the plan isn't run until it's ready.
+An agent turns a goal of its stack into a plan kiln keeps with `goals_plan` (docs/goals.md), as a
+person does with **Make a plan**, and kiln does by itself for a big goal about to start (docs/goals.md,
+"Big goals, planned first"): a plan in its **planning phase**, the goal's words its brief, with
+research of its own (docs/research.md). The goal gets one part first, planning it; the plan isn't
+run until it's ready.
 
 1. **Research.** The agent looks inside (its machine's files and others': code, documents, data,
    pictures, frames of video; kiln's records: `conversations_search`, plans, CI runs, deployments)

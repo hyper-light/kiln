@@ -147,33 +147,40 @@ pub struct Found {
     pub peers: Vec<Peer>,
 }
 
-/// A repository this machine holds that others hold too: where its work goes next (`PUT
-/// /api/sync/bundles/:batch`), and whether the server has none of it yet (it goes whatever it is).
+/// A repository this machine holds that others hold too: where its branches' bundle and its work
+/// in progress's go next (`PUT /api/sync/bundles/:batch`), and whether the server has none of its
+/// work yet (it goes whatever it is).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShareSlot {
     pub key: String,
     pub batch: String,
+    pub wip_batch: String,
     pub fresh: bool,
 }
 
-/// A machine's work in a repository: its branches, the work in progress of each folder of it (a
-/// commit of its files as they are, on the branch checked out), and the bundle of the commits
-/// those name that its remote lacks.
+/// A machine's work in a repository: its branches, the work in progress of its folders of it (a
+/// commit of its files as they are, on the branch checked out), and two bundles: the commits its
+/// branches name that its remote lacks, and the work in progress beyond them. Each goes again only
+/// when it changes: a batch left empty is the one before.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Work {
     pub key: String,
     /// The machine it's from (the server fills it in).
     pub from: String,
-    pub batch: String,
     /// Branch → commit.
     pub branches: BTreeMap<String, String>,
     /// Branch checked out → its work in progress.
     pub wip: BTreeMap<String, String>,
-    /// The bundle, when there's one: its SHA-256 and size.
+    /// The branches' bundle: its batch, and its SHA-256 and size when there's one.
+    pub batch: String,
     pub hash: Option<String>,
     pub size: u64,
+    /// The work in progress's bundle, the same way.
+    pub wip_batch: String,
+    pub wip_hash: Option<String>,
+    pub wip_size: u64,
 }
 
 /// How a folder's branch stands against the same branch on another machine (its work, taken in).

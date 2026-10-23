@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use common::{Options, Server, http, start};
+use common::{Options, Server, http, start_env};
 use serde_json::{Value, json};
 
 fn git(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -136,6 +136,37 @@ fn stand_in(seen: Arc<Mutex<Vec<Seen>>>, answer: impl Fn(&Seen) -> (u16, &'stati
     });
     Ok(port)
 }
+
+/// Where no Docker is (a CI pod), a stand-in for the `docker login` the ECR action runs: what a login
+/// asks of the registry (its `/v2/`, with the credentials ECR gave), first on the `PATH` the
+/// server's jobs run with. Where Docker is, it's Docker's own.
+fn docker_path(dir: &Path) -> anyhow::Result<Option<String>> {
+    if Command::new("sh").args(["-c", "command -v docker"]).output().is_ok_and(|o| o.status.success()) {
+        return Ok(None);
+    }
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let docker = bin.join("docker");
+    std::fs::write(&docker, STAND_IN_DOCKER)?;
+    std::fs::set_permissions(&docker, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755))?;
+    Ok(Some(format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())))
+}
+
+/// `docker login` as a registry sees it: `GET /v2/` with the credentials given.
+const STAND_IN_DOCKER: &str = r#"#!/bin/sh
+[ "$1" = login ] || exit 0
+shift
+user= pass= server=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u|--username) user=$2; shift 2 ;;
+    -p|--password) pass=$2; shift 2 ;;
+    --password-stdin) pass=$(cat); shift ;;
+    *) server=$1; shift ;;
+  esac
+done
+curl -fsS -u "$user:$pass" "http://${server#*://}/v2/" >/dev/null && echo "Login Succeeded"
+"#;
 
 /// STS, ECR and a registry as AWS answers them: credentials for a web identity, the caller's
 /// identity, an ECR authorization token naming this stand-in (the host it was asked at) as the
@@ -331,7 +362,9 @@ fn w22_ac02_account_actions_in_dry_configurations() -> anyhow::Result<()> {
         (200, "application/json", json!({ "raw_upload_location": "http://127.0.0.1:1/storage", "url": "http://127.0.0.1:1/report" }).to_string())
     })?;
     let google = if localhost_names() { Some(google_sts(dir.path())?) } else { None };
-    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let path = docker_path(dir.path())?;
+    let env: Vec<(&str, &str)> = path.as_deref().map(|p| ("PATH", p)).into_iter().collect();
+    let s = start_env(dir.path(), &Options { agent: true, ..Options::default() }, false, &env)?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");
     let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));

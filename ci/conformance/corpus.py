@@ -16,7 +16,10 @@ written from all of them, with the reason for each run that didn't pass.
         [--pass NAME]
 
 The server's runners must route `ubuntu-latest` (`[ci] github_labels = true`) and give legs
-Docker, as for the starter workflows (ci/conformance/starters.py).
+Docker, as for the starter workflows (ci/conformance/starters.py). The labels some of the
+repositories use for other hosted runners (Depot's, Namespace's, their own names for GitHub's
+larger runners) this script routes as GitHub's equivalents, with the server's routing rules
+(`PUT /api/ci/routing/rules`, which it replaces), as a user moving to kiln would.
 """
 
 import argparse
@@ -47,12 +50,38 @@ ORDER = [
 ]
 FINISHED = {"succeeded", "failed", "cancelled", "timed_out", "skipped"}
 
+# Other hosted runners' labels in the corpus, by the platform and image of GitHub's equivalent
+# (kiln's own rules for GitHub's labels, `github_label_rules`).
+HOSTED = {
+    ("linux", "x86_64", "kiln/runner-ubuntu-24.04"): [
+        "depot-ubuntu-24.04", "depot-ubuntu-24.04-4", "depot-ubuntu-24.04-8", "depot-ubuntu-24.04-16", "depot-ubuntu-latest-4",
+        "github-ubuntu-24.04-x86_64-2", "github-ubuntu-24.04-x86_64-4", "github-ubuntu-24.04-x86_64-8", "github-ubuntu-24.04-x86_64-32",
+        "ubuntu-24.04-xl", "ubuntu-latest-4-core-oss", "ubuntu-latest-16-core-oss",
+    ],
+    ("linux", "x86_64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-8", "depot-ubuntu-22.04-16"],
+    ("linux", "aarch64", "kiln/runner-ubuntu-24.04"): ["depot-ubuntu-24.04-arm-8", "depot-ubuntu-24.04-arm-16", "github-ubuntu-24.04-aarch64-4", "ubuntu-24.04-arm64-xl"],
+    ("linux", "aarch64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-arm-4"],
+    ("macos", "aarch64", None): ["namespace-profile-macos-15"],
+    ("windows", "x86_64", None): ["namespace-profile-windows-2022-x86-64-4", "namespace-profile-windows-2022-x86-64-16x32", "windows-2022-xl", "windows-latest-8-core-oss"],
+    ("windows", "aarch64", None): ["github-windows-11-aarch64-8"],
+}
+
 # Failures that aren't kiln's, by what their notes say: the reason the table gives.
 KNOWN = [
     (r"deploy-pages|Failed to create deployment \(status: 501\)", "GitHub Pages is outside kiln (docs/ci.md §1.3)"),
-    # `persist-credentials: false`, then a fetch of the repository: GitHub's public repositories
-    # answer anyone, kiln's only those signed in.
-    (r"could not read Username for", "the job drops its credentials and fetches again: kiln's repositories aren't read anonymously, as a public one on GitHub is"),
+    # The corpus submits the whole tree against an empty trunk: a check that compares a pull
+    # request with its base finds nothing there to compare.
+    (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
+    # bat's: the pull request's own changelog line, by its number and its author on GitHub.
+    (r"Search for added line in changelog", "it looks for the pull request's own changelog line (its number, its author from GitHub's API); the corpus's pull request is the whole tree"),
+    # `actions/upload-artifact@master` is that repository's old branch: 2.0.1 (2020), on the artifact
+    # protocol GitHub retired on 2025-01-30.
+    (r"Unable to create a container for the artifact", "its `upload-artifact@master` is 2.0.1, on the artifact protocol GitHub retired in January 2025: it fails there too"),
+    # A test that waits a few seconds for a message, or a minute for a release to boot, run while
+    # the lab's pacer froze its work (the machine's disks busy): to be run again quietly.
+    (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
+    # The lab's runner has two slots and one Docker daemon; a hosted runner, a machine a job.
+    (r'The container name "/cargo_test_\d+" is already in use|previous docker build failed, unable to run test', "two of its legs ran at once on the lab's one Docker daemon, and its tests name their containers (`cargo_test_0`): a hosted runner gives each job a daemon of its own (docs/ci.md W13-R04)"),
 ]
 
 
@@ -115,6 +144,19 @@ class Api:
                 print(f"  {method} {path}: no answer ({e}); again in 30 s", flush=True)
                 time.sleep(30)
         return None
+
+
+def route_hosted(api):
+    """The server's routing rules: [`HOSTED`]'s labels each routed as its GitHub equivalent."""
+    rules = []
+    for (os_, arch, image), labels in HOSTED.items():
+        for label in labels:
+            rule = {"match": {"labels": [label]}, "require": [f"os == {os_}", f"arch == {arch}"]}
+            if image:
+                rule.update(executor=["docker", "host"], image=image)
+            rules.append(rule)
+    api.call("PUT", "/api/ci/routing/rules?scope=server", {"rules": rules})
+    print(f"routed {len(rules)} other hosted runners' labels as GitHub's", flush=True)
 
 
 def git(cwd, *args, check=True, env=None):
@@ -207,9 +249,16 @@ def wait_reason(w):
 ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|exception)\b")
 
 
+# A test runner's own words for a failed test, before the generic last line (make's, an exit code):
+# ExUnit's numbered failures (and the line after, what failed), libtest's, pytest's, Go's.
+FAILED_TEST = re.compile(r"^\d+\) test .+ \(.+\)$|^test \S+ \.\.\. FAILED$|^FAILED \S+::\S+|^--- FAIL: \S+")
+GENERIC = re.compile(r"^make(\[\d+\])?: \*\*\*|exit(ed with)? code|exit status \d+|^error: test failed, to rerun pass")
+
+
 def leg_detail(api, leg):
     """The failing step's name and its last useful line: the last that reads as an error, else
-    the last."""
+    the last. A generic one (make's, an exit code) is preceded by the first test the log says
+    failed, and what failed in it."""
     try:
         f = api.call("GET", f"/api/ci/legs/{leg['id']}/logs/failure")
     except RuntimeError:
@@ -217,6 +266,18 @@ def leg_detail(api, leg):
     lines = [re.sub(r"\x1b\[[0-9;]*m", "", x.get("text", "")).strip() for x in (f or {}).get("lines") or []]
     lines = [x for x in lines if x and not x.startswith("[command]")]
     said = next((x for x in reversed(lines) if ERRORISH.search(x) and not x.startswith("+ ")), lines[-1] if lines else "")
+    if GENERIC.search(said):
+        at = next((i for i, x in enumerate(lines) if FAILED_TEST.search(x)), None)
+        if at is not None:
+            test = lines[at]
+            # ExUnit says what failed on the next line.
+            if re.match(r"^\d+\) test ", test) and at + 2 < len(lines):
+                test = f"{test}: {lines[at + 2]}" if lines[at + 1].startswith(("test/", "lib/", "/")) else f"{test}: {lines[at + 1]}"
+            said = f"{test} ({said})"
+    # A line the known failures name, wherever it is in the step's log, goes with it.
+    known = next((x for x in lines if any(re.search(pat, x) for pat, _ in KNOWN) and x not in said), None)
+    if known and not any(re.search(pat, said) for pat, _ in KNOWN):
+        said = f"{said[:180]} — {known[:110]}"
     return (f or {}).get("step_name") or "", said[:300]
 
 
@@ -405,6 +466,7 @@ def main():
     os.makedirs(args.work, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
     srcs = sources()
+    route_hosted(api)
     for repo in ORDER:
         if args.only and repo not in args.only:
             continue

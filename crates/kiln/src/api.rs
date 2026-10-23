@@ -864,6 +864,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 "done" => ("goals.done", None),
                 "split" => ("goals.split", None),
                 "plan" => ("goals.plan", None),
+                "settings" => ("goals.settings", None),
                 action => ("goals.control", Some(("action", (*action).to_owned()))),
             };
             let mut body = boxed(|| body_value(req)).await?;
@@ -2355,7 +2356,9 @@ async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, ApiError> {
 
 async fn delete_repo(hub: &Hub, id: &str) -> R {
     let repo = find_repo(hub, id).await?;
-    hub.store.delete_repo(repo.id).await?;
+    hub.store.delete_repo(repo.id.clone()).await?;
+    // Its runs go with it: the CI engine stops their legs where they run, as GitHub does.
+    hub.ci.send(crate::ci::dispatch::Msg::RepoDeleted { repo: repo.id });
     hub.store.audit("admin".into(), "repo.delete".into(), repo.name).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }

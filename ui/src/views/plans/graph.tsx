@@ -77,10 +77,10 @@ function lines(el: HTMLElement, steps: GraphStep[]): Drawn {
 const MARK_X = 18;
 
 /** A step's title: code as code, a long name broken where its parts meet. */
-function TitleText({ parts }: { parts: TitlePart[] }) {
+export function TitleText({ parts }: { parts: TitlePart[] }) {
   return parts.map((p, i) =>
     p.code ? (
-      <code key={i} className="pg-code">
+      <code key={i} className="ptree-code">
         {p.text.split(/(?<=[/_.:])/).flatMap((x, j) => (j ? [<wbr key={j} />, x] : [x]))}
       </code>
     ) : (
@@ -107,7 +107,7 @@ export function PlanGraph({ steps, label, picked, onPick }: { steps: GraphStep[]
       };
       const watch = new ResizeObserver(draw);
       watch.observe(el);
-      el.querySelectorAll(".pg-node").forEach((n) => watch.observe(n));
+      el.querySelectorAll(".ptree-node").forEach((n) => watch.observe(n));
       draw();
       return () => watch.disconnect();
     },
@@ -117,10 +117,10 @@ export function PlanGraph({ steps, label, picked, onPick }: { steps: GraphStep[]
   );
   const stand = new Map(steps.map((s) => [s.n, s.stand]));
   const lineState = (l: Line) => (stand.get(l.from) === "met" ? (stand.get(l.to) === "working" ? "live" : "met") : "waits");
-  const gradient = `pg-prism-${React.useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const gradient = `ptree-prism-${React.useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   return (
-    <div className="pg" ref={ref} role="group" aria-label={label}>
-      <svg className="pg-lines" aria-hidden="true">
+    <div className="ptree" ref={ref} role="group" aria-label={label}>
+      <svg className="ptree-lines" aria-hidden="true">
         <defs>
           {/* Across the whole graph: a line flat across has no height for a gradient of its own. */}
           <linearGradient id={gradient} gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="100%" y2="100%">
@@ -135,37 +135,37 @@ export function PlanGraph({ steps, label, picked, onPick }: { steps: GraphStep[]
           <path key={`${l.from}-${l.to}`} d={l.d} data-s={lineState(l)} style={lineState(l) === "live" ? { stroke: `url(#${gradient})` } : undefined} />
         ))}
       </svg>
-      <div className="pg-rounds">
+      <div className="ptree-rounds">
         {rounds(steps).map((r, i) => (
-          <div key={i} className="pg-round">
+          <div key={i} className="ptree-round">
             {r.map((s) => {
               const st: Stand = s.stand ?? "waiting";
               const body = (
                 <>
                   <StepGlyph stand={st} />
-                  <span className="pg-text">
-                    <span className="pg-title">
-                      <span className="pg-n">{s.n}</span>
+                  <span className="ptree-text">
+                    <span className="ptree-title">
+                      <span className="ptree-n">{s.n}</span>
                       <StandTitle stand={st} flow={`${s.n}:${s.title}`}>
                         {s.title ? <TitleText parts={headline(s.title)} /> : "Untitled step"}
                       </StandTitle>
                     </span>
-                    {s.stand && <span className="pg-word">{STAND_WORDS[st]}</span>}
-                    {drawn.after[s.n]?.length ? <span className="pg-after">after {drawn.after[s.n]?.join(", ")}</span> : null}
-                    {s.who && <span className="pg-who">{s.who}</span>}
+                    {s.stand && <span className="ptree-word">{STAND_WORDS[st]}</span>}
+                    {drawn.after[s.n]?.length ? <span className="ptree-after">after {drawn.after[s.n]?.join(", ")}</span> : null}
+                    {s.who && <span className="ptree-who">{s.who}</span>}
                   </span>
                 </>
               );
               return s.href ? (
-                <Link key={s.n} to={s.href} className="pg-node" data-n={s.n} data-stand={s.stand}>
+                <Link key={s.n} to={s.href} className="ptree-node" data-n={s.n} data-stand={s.stand}>
                   {body}
                 </Link>
               ) : onPick ? (
-                <button key={s.n} type="button" className="pg-node" data-n={s.n} data-stand={s.stand} aria-pressed={picked?.includes(s.n) ?? false} onClick={() => onPick(s.n)}>
+                <button key={s.n} type="button" className="ptree-node" data-n={s.n} data-stand={s.stand} aria-pressed={picked?.includes(s.n) ?? false} onClick={() => onPick(s.n)}>
                   {body}
                 </button>
               ) : (
-                <div key={s.n} className="pg-node" data-n={s.n} data-stand={s.stand}>
+                <div key={s.n} className="ptree-node" data-n={s.n} data-stand={s.stand}>
                   {body}
                 </div>
               );
@@ -180,7 +180,7 @@ export function PlanGraph({ steps, label, picked, onPick }: { steps: GraphStep[]
 /** How far a run has come: a segment a step, in where it stands. */
 export function StepBar({ stands }: { stands: Stand[] }) {
   return (
-    <div className="pg-bar" aria-hidden="true">
+    <div className="ptree-bar" aria-hidden="true">
       {stands.map((s, i) => (
         <i key={i} data-s={s} />
       ))}

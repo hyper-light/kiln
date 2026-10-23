@@ -7,10 +7,11 @@
  * it, so it goes on with the console closed and across restarts.
  *
  * Drawn as a chain: each goal a numbered link (met, under way, next, not met), joined to the next,
- * a goal's parts (it was split into them: they come first) as smaller links before it; one field
- * to add a goal; the stack's few actions; editing the goals not yet met (the one under way first) is
- * one text box, a goal a line. Cleared goals can be brought back. A stack paused for a while says
- * when it resumes by itself.
+ * the one under way ringed in the turning light and its words in the holographic shimmer; under a
+ * goal, its steps (its plan's, or the parts it was split into) on its line, as goal-plan.tsx draws
+ * them; one field to add a goal; the stack's few actions; editing the goals not yet met (the one
+ * under way first) is one text box, a goal a line. Cleared goals can be brought back. A stack
+ * paused for a while says when it resumes by itself.
  */
 import * as React from "react";
 import { ListTree } from "lucide-react";
@@ -20,14 +21,16 @@ import { Loadable } from "@/components/ui/loading";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
-import { planHref, plansApi, runHref, type Plan } from "@/api/plans";
-import { PlanGraph } from "@/views/plans/graph";
+import { planHref, plansApi, runHref } from "@/api/plans";
+import { ResearchLine } from "@/views/research/research";
 import { effectiveNeeds } from "@/views/plans/graph-layout";
-import { StandTitle, StepGlyph, type Stand } from "@/views/plans/status";
+import { StandTitle, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
 import { canPlan, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "./goal-stack";
+import { GoalPlan } from "./goal-plan";
+import { machineWord, type GoalStep } from "./goal-plan-layout";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
@@ -53,59 +56,133 @@ function GoalWords({ text, stand }: { text: string; stand: Stand }) {
   );
 }
 
+/** A goal's parts at any depth: its own, and theirs (a plan step's criteria and tests). */
+function partsOf(g: GoalItem, items: GoalItem[]): GoalItem[] {
+  const ids = new Set([g.id]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const i of items)
+      if (i.part_of && ids.has(i.part_of) && !ids.has(i.id)) {
+        ids.add(i.id);
+        grew = true;
+      }
+  }
+  return items.filter((i) => i.id !== g.id && ids.has(i.id));
+}
+
 /** "gone" for a plan or run that isn't there any more. */
 const unlessGone = (e: unknown): "gone" => {
   if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return "gone";
   throw e;
 };
 
-/** A goal that became a plan: its steps as they run (each as the goal's parts, or its run, say), and the plan to open. */
-function PlannedGoal({ goal, items, paused }: { goal: GoalItem; items: GoalItem[]; paused: boolean }) {
-  const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
-  return (
-    <Loadable label="its plan" fallback={null}>
-      {run ? <PlannedRun plan={goal.planned_as ?? ""} run={run} /> : <PlannedParts plan={goal.planned_as ?? ""} goal={goal} items={items} paused={paused} />}
-    </Loadable>
-  );
-}
-
 const usePlan = (plan: string) => useSuspenseResource(`plans/${plan}`, (s) => plansApi.get(plan, s).catch(unlessGone)).data;
 
-/** Its steps are the goal's parts: each stands as its part does. */
-function PlannedParts({ plan, goal, items, paused }: { plan: string; goal: GoalItem; items: GoalItem[]; paused: boolean }) {
-  const p = usePlan(plan);
-  if (!p || p === "gone") return null;
-  return <PlannedView p={p} stand={(n) => stepStand(goal, items, n, paused)} />;
+/** A plan run as it goes, read again every few seconds (none without a run). */
+const useRunView = (run: string | undefined) =>
+  useSuspenseResource(
+    run ? `plans/runs/${run}` : "plans/runs/none",
+    (s) => (run ? plansApi.runView(run, s).catch(unlessGone) : Promise.resolve(null)),
+    run ? { on: ["harness", "harness_closed", "plan_stack"], pollMs: 4000 } : {},
+  ).data;
+
+const PART_STANDS: Record<GoalItem["status"], Stand> = { pending: "waiting", active: "working", met: "met", unmet: "unmet", skipped: "skipped" };
+
+/** Where a part stands: under way while you've paused the stack, paused. */
+const partStand = (p: GoalItem | undefined, paused: boolean): Stand => (p?.status === "active" && paused ? "paused" : PART_STANDS[p?.status ?? "pending"]);
+
+/** How many of a part's own parts (a plan step's acceptance criteria and tests) are met. */
+function checksOf(part: GoalItem | undefined, items: GoalItem[]): GoalStep["checks"] {
+  const own = part ? items.filter((i) => i.part_of === part.id) : [];
+  return own.length ? { met: own.filter((i) => i.status === "met").length, of: own.length } : undefined;
 }
 
-/** Its steps run with an agent each: each stands as its run says. */
-function PlannedRun({ plan, run }: { plan: string; run: string }) {
-  const p = usePlan(plan);
-  const v = useSuspenseResource(`plans/runs/${run}`, (s) => plansApi.runView(run, s).catch(unlessGone), { on: ["harness", "harness_closed", "plan_stack"], pollMs: 4000 }).data;
-  if (!p || p === "gone") return null;
-  const steps = v && v !== "gone" ? v.steps : [];
-  return <PlannedView p={p} stand={(n) => steps.find((s) => s.n === n)?.stand} run={run} />;
-}
+/** Who an agent is, at a step: its harness and its machine ("Devin · fedora"). */
+const whoOf = (a: { kind_name: string; target: string } | undefined) => (a ? `${a.kind_name} · ${machineWord(a.target)}` : undefined);
 
-function PlannedView({ p, stand, run }: { p: Plan; stand: (n: number) => Stand | undefined; run?: string }) {
+/**
+ * A planned goal's plan and its steps as they stand: its parts on this stack (each step a part),
+ * or its run, an agent a step, saying who's at each. Being planned (none of its steps on the stack
+ * yet, nor its run), its one step is the planning.
+ */
+function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: string) {
+  const p = usePlan(goal.planned_as ?? "");
+  const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
+  const view = useRunView(run);
+  const sessions = useRes(harnessSessionsRes).data;
+  const own = whoOf(sessions.find((x) => x.id === agent));
+  if (!p || p === "gone") return null;
+  const planning = p.phase === "planning" && !run && !items.some((i) => i.part_of === goal.id && i.part_kind === "plan");
+  if (planning) {
+    const part = items.find((i) => i.part_of === goal.id && i.part_kind === "planning");
+    const steps: GoalStep[] = [{ n: 1, title: "Research it inside and out, and write its steps", needs: [], stand: partStand(part, paused), who: own }];
+    return { plan: p, run, steps, planning };
+  }
   const titles = p.items?.length ? p.items.map((it) => it.title || "Untitled step") : p.steps;
   const waits = effectiveNeeds(titles.map((_, i) => p.items?.[i]?.needs));
-  const steps = titles.map((title, i) => ({ n: i + 1, title, needs: waits[i] ?? [], stand: stand(i + 1) }));
+  const ran = view && view !== "gone" ? view.steps : null;
+  const steps: GoalStep[] = titles.map((title, i) => {
+    const n = i + 1;
+    const r = ran?.find((x) => x.n === n);
+    if (r) {
+      const who = whoOf(sessions.find((x) => x.id === r.agent_id)) ?? (r.agent ? `${r.agent.kind} · ${machineWord(r.agent.machine)}` : undefined);
+      return { n, title, needs: waits[i] ?? [], stand: r.stand, who };
+    }
+    const part = items.find((x) => x.part_of === goal.id && x.part_kind === "plan" && x.step?.n === n);
+    return { n, title, needs: waits[i] ?? [], stand: stepStand(goal, items, n, paused) ?? "waiting", who: own, checks: checksOf(part, items) };
+  });
+  return { plan: p, run, steps, planning };
+}
+
+/** A planned goal, in its line: how many of its plan's steps are met (its plan to open), its run, its research. */
+function PlannedWords({ goal, items, paused, agent }: { goal: GoalItem; items: GoalItem[]; paused: boolean; agent: string }) {
+  const planned = usePlanned(goal, items, paused, agent);
+  if (!planned) return null;
+  const { plan, run, steps, planning } = planned;
   const met = steps.filter((s) => s.stand === "met").length;
   return (
-    <div className="gs-plan">
-      {steps.length > 0 && <PlanGraph label={`Its plan, “${p.title}”`} steps={steps} />}
-      <p className="gs-plan-line">
-        <Link to={planHref(p.id)}>{p.phase === "planning" ? "Being planned: researching it and writing its steps" : `${met} of ${steps.length} step${steps.length === 1 ? "" : "s"} met`}</Link>
-        {run && (
-          <>
-            {" · "}
-            <Link to={runHref(run)}>its run</Link>
-          </>
-        )}
-      </p>
-    </div>
+    <>
+      {" · "}
+      <Link to={planHref(plan.id)}>{planning ? "being planned" : `${met} of ${steps.length} step${steps.length === 1 ? "" : "s"} met`}</Link>
+      {run && (
+        <>
+          {" · "}
+          <Link to={runHref(run)}>its run</Link>
+        </>
+      )}
+      {plan.research && (
+        <>
+          {" · "}
+          <ResearchLine id={plan.research} />
+        </>
+      )}
+    </>
   );
+}
+
+/** A planned goal's steps, under it on its line. */
+function PlannedSteps({ goal, items, paused, agent }: { goal: GoalItem; items: GoalItem[]; paused: boolean; agent: string }) {
+  const planned = usePlanned(goal, items, paused, agent);
+  if (!planned?.steps.length) return null;
+  return <GoalPlan steps={planned.steps} label={`Its plan, “${planned.plan.title}”`} />;
+}
+
+/** What a plan step's goal says before its criterion or test: its step and plan, said by the goal already. */
+const STEP_SAID = /^"[^"]*" \(step \d+ of the plan "[^"]*"\), /;
+
+/** The parts a goal was split into (or a plan step's criteria and tests), under it on its line, each in turn. */
+function PartSteps({ parts, items, paused, agent }: { parts: GoalItem[]; items: GoalItem[]; paused: boolean; agent: string }) {
+  const own = whoOf(useRes(harnessSessionsRes).data.find((x) => x.id === agent));
+  const steps: GoalStep[] = parts.map((p, i) => ({
+    n: i + 1,
+    title: p.text.replace(STEP_SAID, ""),
+    needs: i ? [i] : [],
+    stand: partStand(p, paused),
+    who: own,
+    checks: checksOf(p, items),
+  }));
+  return <GoalPlan steps={steps} label="Its parts" />;
 }
 
 /** An agent's name, from the agents kiln knows (its id's start until they're in). */
@@ -182,18 +259,6 @@ function standOf(g: GoalItem, paused: boolean, working: boolean): Stand {
   return "waiting";
 }
 
-/** How deep a goal is among parts: 0 a goal, 1 a part, 2 a part's part. */
-function depthOf(g: GoalItem, items: GoalItem[]): number {
-  let d = 0;
-  let at: GoalItem | undefined = g;
-  while (at?.part_of && d < 3) {
-    const up: string = at.part_of;
-    at = items.find((i) => i.id === up);
-    d += 1;
-  }
-  return d;
-}
-
 function GoalPanel({
   agent,
   harness,
@@ -220,16 +285,19 @@ function GoalPanel({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const items = stack?.items ?? [];
-  // Each goal's number in the stack, as it's spoken of (a goal's parts have none: they're its own).
-  const numbers = new Map(items.filter((i) => !i.part_of).map((g, i) => [g.id, i + 1]));
+  // The stack's own goals: their parts are drawn under them, as their steps.
+  const goals = items.filter((i) => !i.part_of);
+  // Each goal's number in the stack, as it's spoken of.
+  const numbers = new Map(goals.map((g, i) => [g.id, i + 1]));
   const pending = items.filter((i) => i.status === "pending");
   const active = items.find((i) => i.status === "active");
-  const met = items.filter((i) => i.status === "met").length;
+  const met = goals.filter((i) => i.status === "met").length;
   const cleared = stack?.cleared ?? 0;
+  const paused = stack?.state === "paused";
   // Finished ones beyond the last few fold away.
-  const done = items.filter((i) => i.status !== "pending" && i.status !== "active");
+  const done = goals.filter((i) => i.status !== "pending" && i.status !== "active");
   const folded = earlier ? 0 : Math.max(0, done.length - 3);
-  const shown = items.filter((i) => !done.slice(0, folded).includes(i));
+  const shown = goals.filter((i) => !done.slice(0, folded).includes(i));
   // The goal that stopped the stack, to try again first (none while a goal is under way: that one resumes).
   const unmet = stoppedBy(stack);
   const startWord = startWords(stack);
@@ -272,11 +340,11 @@ function GoalPanel({
   const state = !stack ? (readError ? "unread" : "reading") : items.length === 0 ? "empty" : stack.state;
   const chip =
     state === "running"
-      ? `Running · ${met} of ${items.length} met`
+      ? `Running · ${met} of ${goals.length} met`
       : state === "done"
-        ? `Done · ${met} of ${items.length} met`
+        ? `Done · ${met} of ${goals.length} met`
         : state === "paused"
-          ? `Paused · ${met} of ${items.length} met`
+          ? `Paused · ${met} of ${goals.length} met`
           : state === "reading"
             ? "Reading…"
             : state === "unread"
@@ -297,6 +365,14 @@ function GoalPanel({
           : `Goals run one after another on this agent: each goes to ${who} as its own /goal, and the next starts once it's met.`}{" "}
         Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
       </p>
+      {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
+      <label className="gs-option">
+        <input type="checkbox" className="check" checked={stack?.plan_big ?? true} disabled={busy} onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))} />
+        <span>
+          Plan big goals first
+          <span className="gs-option-hint">A goal longer than a couple of sentences is researched and planned before it&rsquo;s worked on, its steps run under it.</span>
+        </span>
+      </label>
       {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
       {stack?.state === "paused" && stack.reason && (
         <p className="gs-reason">
@@ -332,7 +408,7 @@ function GoalPanel({
         </div>
       ) : (
         <>
-          {items.length > 0 && (
+          {goals.length > 0 && (
             <ol className="gs-chain">
               {folded > 0 || (earlier && done.length > 3) ? (
                 <li className="gs-more">
@@ -342,21 +418,19 @@ function GoalPanel({
                 </li>
               ) : null}
               {shown.map((g) => {
+                // A goal whose parts come first is under way while they are (its steps, or its run's agents, at work).
+                const doing = g.status === "pending" ? partsOf(g, items).find((i) => i.status === "active") : undefined;
+                const status = doing ? "active" : g.status;
                 // The goal under way while you've paused the stack: paused, not under way.
-                const held = g.status === "active" && stack?.state === "paused";
+                const held = status === "active" && stack?.state === "paused";
                 // One handed to another agent (a program's track's worker): under way there.
-                const away = g.status === "pending" ? g.on : undefined;
-                const stand = standOf(g, held, working && !g.waits_on);
+                const away = g.status === "pending" && !doing ? g.on : undefined;
+                const stand = standOf({ ...g, status }, held, doing?.waits_on ? true : working && !g.waits_on);
                 return (
-                  <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : g.status} data-part={g.part_of ? "" : undefined} data-depth={g.part_of ? depthOf(g, items) : undefined}>
-                    {/* Its number in the stack, inside where it stands, drawn as the console draws work (plans/status.tsx). */}
-                    <span className="gs-node" data-stand={stand} title={WORD[g.status]}>
-                      <StepGlyph stand={stand} />
-                      {!g.part_of && (
-                        <span className="gs-n" data-wide={(numbers.get(g.id) ?? 0) > 9 ? "" : undefined}>
-                          {numbers.get(g.id)}
-                        </span>
-                      )}
+                  <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : status}>
+                    {/* Its number in the stack, ringed by where it stands: the one at work in the turning light. */}
+                    <span className="gs-node" data-stand={stand} data-wide={(numbers.get(g.id) ?? 0) > 9 ? "" : undefined} title={WORD[status]}>
+                      {numbers.get(g.id)}
                     </span>
                     <span className="gs-text">
                       {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
@@ -371,16 +445,18 @@ function GoalPanel({
                             </Link>
                           </>
                         ) : (
-                          WORD[g.status]
+                          WORD[status]
                         )}
-                        {g.status === "active" && !held && !g.waits_on ? sentWords(g) : ""}
+                        {g.planned_as ? (
+                          <Loadable label="its plan" fallback={null}>
+                            <PlannedWords goal={g} items={items} paused={paused} agent={agent} />
+                          </Loadable>
+                        ) : g.status === "active" && !held && !g.waits_on ? (
+                          sentWords(g)
+                        ) : (
+                          ""
+                        )}
                         {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
-                        {g.planned_as && (
-                          <>
-                            {" · "}
-                            <Link to={planHref(g.planned_as)}>planned</Link>: met once every step of its plan is
-                          </>
-                        )}
                         {g.waits_on && (
                           <>
                             {" · waits for "}
@@ -407,7 +483,16 @@ function GoalPanel({
                         </Button>
                       </div>
                     )}
-                    {g.planned_as && <PlannedGoal goal={g} items={items} paused={stack?.state === "paused"} />}
+                    {/* Its steps under it, on its line: its plan's, or the parts it was split into. */}
+                    {g.planned_as ? (
+                      <Loadable label="its plan" fallback={null}>
+                        <PlannedSteps goal={g} items={items} paused={paused} agent={agent} />
+                      </Loadable>
+                    ) : items.some((i) => i.part_of === g.id) ? (
+                      <Loadable label="its parts" fallback={null}>
+                        <PartSteps parts={items.filter((i) => i.part_of === g.id)} items={items} paused={paused} agent={agent} />
+                      </Loadable>
+                    ) : null}
                   </li>
                 );
               })}

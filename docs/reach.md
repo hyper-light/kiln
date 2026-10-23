@@ -37,11 +37,14 @@ separated by commas or spaces. Aliases are understood (`amd64`, `x64` → `x86_6
 `aarch64`; `darwin`, `mac` → `macos`).
 
 Of the connected runners that take reach links and suit, the asking machine itself comes first
-while it has 4 GiB of memory free (nothing crosses the network — it then runs locally — and
-another machine's resources stay its own): work goes elsewhere only when it asks for what this
-machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others, the one
-with the most idle cores wins, then free memory; CI work on it and a tunnelled path (HTTP instead
-of UDP) count against it, and the asking machine wins a tie when it's short of memory. The
+while it has 4 GiB of memory free and isn't overloaded (nothing crosses the network — it then runs
+locally — and another machine's resources stay its own): work goes elsewhere only when it asks for
+what this machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others,
+the one with the most idle cores wins (by its busy share or its load average, whichever leaves
+fewer: work waiting on disk or memory shows in its load), then free memory; CI work on it and a
+tunnelled path (HTTP instead of UDP) count against it, and the asking machine wins a tie when it's
+short of memory. A machine that's overloaded (under 2 GiB or a twentieth of its memory free, or a
+load past twice its cores) gets work only when no other suits, and says so (`· overloaded`). The
 directory comes from the server (cached 30 s, refreshed after every reconnect); the choice is the
 asking runner's. `GET /api/reach/runners?want=…` shows the same ranking.
 

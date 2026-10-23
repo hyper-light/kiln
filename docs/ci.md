@@ -2040,7 +2040,8 @@ It replaces `exec.rs` for `AssignV2`.
 - **W06-R08 Masking.** Secrets the leg receives, values from `::add-mask::`, and every line of a
   multi-line secret are replaced by `***` in logs, annotations, summaries, step names and outputs
   before anything leaves the runner. Masking works across chunk boundaries (a streaming matcher
-  keeps the longest mask's length minus one byte of look-behind). kiln also masks each secret's
+  holds back what could be the start of a mask still arriving, and lets the rest go at once, so a
+  step's live log keeps up with whole lines). kiln also masks each secret's
   base64, percent-encoded and JSON-escaped forms (secrets of 8 or more characters). Values shorter
   than 4 characters are not masked (that would destroy logs); the secret's settings page warns.
 - **W06-R09 Logs.** Raw bytes per step as today (ANSI kept), plus `JobEvent`s for groups and
@@ -3839,7 +3840,9 @@ enforcement points to W18, agent isolation to W20.
     `job.services` context;
   - teardown;
   - Docker actions (W07-R06);
-  - `CAP_DOCKER` announced when a CLI answers.
+  - `CAP_DOCKER` announced when a CLI answers. One probe runs at a time, waited for 10 s from
+    its start. A daemon too busy to answer by then (a loaded machine) is asked again at the
+    runner's next connection, rather than taken for absent until a restart.
 - *Done.* R04's `docker` executor:
   - a leg runs in a fresh container of its routing rule's image, without the host's Docker
     socket;
@@ -3878,7 +3881,10 @@ enforcement points to W18, agent isolation to W20.
     `snap install NAME` installs Ubuntu's package of each name, as `taiki-e/install-action`'s
     Valgrind asks for (tokio's stress tests), and anything else says why it can't.
 
-  On Ubuntu 24.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's image's
+  It comes for Ubuntu 26.04 too (`kiln/runner-ubuntu-26.04`, `ImageOS=ubuntu26`, from
+  `ubuntu-26.04` and `ubuntu-26.04-arm`; four of the corpus's repositories ask for it), and
+  `ubuntu-slim`, GitHub's lightweight runner, gets `kiln/runner-ubuntu-24.04-slim`. On Ubuntu
+  24.04 and 26.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's images'
   does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.
 
   apt assumes yes, as GitHub's images set it. Cargo's and npm's global directories are the
@@ -3906,6 +3912,13 @@ enforcement points to W18, agent isolation to W20.
   these legs' containers have no seccomp filter, as a hosted runner's machine has none: with the
   host's Docker they could start any container they like, and the filter kept debuggers from
   turning ASLR off (`personality`, which lldb needs to launch a program: cargo's `lldb` tests).
+
+  The daemon is still the host's, one for every leg on that runner: the names a step gives its
+  containers, networks and volumes are the daemon's. Two legs at once that use the same ones
+  collide, as cargo's test suite does on a runner of two slots (it names its containers
+  `cargo_test_0`, …). A hosted runner gives each job a machine and a daemon of its own. Until
+  the leg's socket gives each leg names of its own, such a job runs `exclusive: true`, or on a
+  runner of one slot.
 - *Done.* In kiln's runner image, a `docker` leg has GitHub's hosted runners' paths:
   `/home/runner/work/<repo>/<repo>` for the workspace, `/home/runner/work/_temp` and
   `/home/runner/work/_actions` beside it, the event file and the file commands under `_temp`, and
@@ -4045,10 +4058,14 @@ enforcement points to W18, agent isolation to W20.
       comes).
   - A terminal into a pod's leg (W17-R01) is the pod's own shell: the leg is recorded as `k8s`,
     so it needs `runs.debug`, not `runners.terminal`.
+  - An executor's pod is the pool's to reap alone: the reaper of v1 jobs' pods leaves a pod that
+    carries no job. (It took one for a finished job's, so a leg that ran past the reaper's next
+    turn, within 15 s, lost its pod mid-leg, was tried again in another and lost again.)
   - Checked against a stand-in for Kubernetes's API that runs each pod's job container on the
     machine, as a kubelet would, with no container engine but a Docker sidecar's
     (`w13_r07_k8s_pool_runs_each_leg_in_a_pod`: three legs on a pool of at most two pods, each
     leg on a pod's runner of its own, the pods gone after;
+    `w13_r07_a_long_leg_in_a_pod_runs_to_its_end`: a 15-second leg runs once, in its one pod;
     `w13_r07_a_leg_with_containers_runs_in_a_pod_made_for_it`: the pod's job container from the
     leg's matrix, its service a sidecar, its steps run in place with the service's ports;
     `w13_r07_docker_actions_in_pods_need_the_pools_sidecar`: KCI4032 on a pool without one, and
@@ -4349,9 +4366,15 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     public repository (`POST /api/repos` with `public: true`, shown as `public` in its listing),
     which anyone reads without a token, as anyone reads a public GitHub repository. A step's
     `git fetch` after `actions/checkout`'s `persist-credentials: false` relies on it (the
-    corpus's elixir; its repositories are public, as on GitHub). A token that isn't kiln's is
-    refused, public or not, and a push always needs one
-    (`w14_r01_public_repositories_read_without_a_token`);
+    corpus's elixir; its repositories are public, as on GitHub), and so does a token of kiln's
+    that may not read it (a job's whose `permissions` leave `contents` out, as elixir's CodeQL
+    jobs' do). A token that isn't kiln's is refused, public or not, and a push always needs one
+    that may (`w14_r01_public_repositories_read_without_a_token`);
+  - a leg's fetch of a repository kiln doesn't have (`actions/checkout`'s `repository:`, ORT's
+    configuration) goes on to where kiln takes that owner's actions (`[[ci.actions.sources]]`,
+    else GitHub), without the leg's token, so a public repository there is fetched as anyone
+    fetches it, and one that needs credentials isn't found. It's passed through, nothing kept,
+    so a shallow fetch stays shallow (`w14_r11_a_leg_fetches_another_public_repository`);
   - a push's ref updates are read before git sees the pack, and the push is refused whole, in
     git's own report and as `remote: kiln: …` lines, when one of them breaks policy:
     - only the owner, or a principal `.kiln/review.yaml` `direct-push` names (read from trunk),
@@ -4360,7 +4383,12 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     - an empty repository takes its first trunk from anyone who may push;
     - other branches need `diffs.submit`, tags `diffs.land`; a leg needs `contents: write`;
     - `refs/kiln/*` and `refs/pull/*` are kiln's;
-  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once.
+  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once;
+  - a repository deleted takes its runs with it, as a deleted GitHub repository does: the CI
+    engine drops their legs, a running one stopped on its runner and its slot free once the
+    runner says it ended, and nothing of them settles or retries
+    (`a_deleted_repository_takes_its_legs_with_it`). They used to stay in the engine, a queued
+    leg still assigned and run with its records gone.
   - Checked end to end with real git (`crates/kiln/tests/hosting.rs`): clone and push by
     developer, viewer, owner and powerless tokens, trunk refusals, whole-push refusal, and the
     push's run.
@@ -5173,6 +5201,9 @@ Firecracker microVMs, R01 in `k8s` pods, and R06. R03 is W06-R13's debug reruns.
   - Output is masked with the leg's secrets. What could start a secret is held back until output
     pauses for 25 ms.
   - Sessions are audited, and a terminal closes when its leg ends or is let go.
+  - A leg is running once it's assigned, and has its shell once its workspace and environment are
+    set up: a terminal asked for in between waits for it, 60 s at most, and opens with what was
+    typed meanwhile (`w17_r01_kiln_debug_terminal` asks as soon as the leg runs).
   - Runners announce it with `CAP_JOB_TTY` and offer it when `[terminal]` is enabled.
 - *R02, keep on failure*:
   - `debug: { keep-on-failure: 30m }`, or "Keep failed legs" when rerunning

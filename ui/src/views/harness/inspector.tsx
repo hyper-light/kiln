@@ -16,6 +16,7 @@ import { Background, isBackground } from "./background";
 import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
 import { ProposedPlan, TodoSteps } from "@/views/plans/its-plan";
+import { AgentResearch } from "@/views/research/research";
 import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
@@ -365,7 +366,6 @@ export function Inspector({
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
               <section>
-                <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
                 {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
                 {todos.length > 0 && (
                   <div className="hx-stack">
@@ -376,7 +376,7 @@ export function Inspector({
                 {/* The plan it proposed (plan mode), in its words, kept by kiln. */}
                 {agentId ? (
                   <Loadable label="its plan" fallback={null}>
-                    <ProposedPlan session={agentId} words={proposed} />
+                    <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
                   </Loadable>
                 ) : (
                   proposed && (
@@ -388,6 +388,12 @@ export function Inspector({
                 )}
                 {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
               </section>
+              {/* What it found out, graded by kiln (research.tsx): the newest in full. */}
+              {agentId && (
+                <Loadable label="its research" fallback={null}>
+                  <AgentResearch agent={agentId} />
+                </Loadable>
+              )}
               {agentId && (
                 <section>
                   <h3 className="in-sec-head">Your plans</h3>

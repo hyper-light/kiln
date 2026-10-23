@@ -56,30 +56,29 @@ pub async fn repository_of(folder: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(dir.trim()))
 }
 
-/// What a machine's work in a repository is now, cheaply: it changes when a branch, a folder's
-/// `HEAD` or its files do.
-pub async fn fingerprint(folders: &[PathBuf]) -> String {
-    let mut h = Sha256::new();
-    if let Some(first) = folders.first()
-        && let Ok(o) = run(Some(first), &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"], STATUS_TIME).await
-    {
-        h.update(o.as_bytes());
+/// What a machine's work in a repository is now, cheaply, in two parts: its branches (they change
+/// when one moves), and its folders (when a `HEAD` or a file does).
+pub async fn fingerprints(repo: &Path, folders: &[PathBuf]) -> (String, String) {
+    let mut branches = Sha256::new();
+    if let Ok(o) = run(Some(repo), &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"], STATUS_TIME).await {
+        branches.update(o.as_bytes());
     }
+    let mut files = Sha256::new();
     for f in folders {
-        h.update(f.to_string_lossy().as_bytes());
+        files.update(f.to_string_lossy().as_bytes());
         if let Ok(o) = run(Some(f), &["rev-parse", "-q", "--verify", "HEAD"], STATUS_TIME).await {
-            h.update(o.as_bytes());
+            files.update(o.as_bytes());
         }
-        if let Ok((listed, files)) = changes(f).await {
-            h.update(listed.as_bytes());
-            for (path, size, mtime) in files {
-                h.update(path.as_bytes());
-                h.update(size.to_le_bytes());
-                h.update(mtime.to_le_bytes());
+        if let Ok((listed, changed)) = changes(f).await {
+            files.update(listed.as_bytes());
+            for (path, size, mtime) in changed {
+                files.update(path.as_bytes());
+                files.update(size.to_le_bytes());
+                files.update(mtime.to_le_bytes());
             }
         }
     }
-    hex::encode(h.finalize())
+    (hex::encode(branches.finalize()), hex::encode(files.finalize()))
 }
 
 /// What git says changed in a folder (`status --porcelain -z`, untracked files too), and each
@@ -87,7 +86,7 @@ pub async fn fingerprint(folders: &[PathBuf]) -> String {
 async fn changes(folder: &Path) -> anyhow::Result<(String, Vec<(String, u64, i128)>)> {
     let listed = run(Some(folder), &["--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all"], STATUS_TIME).await?;
     let root = folder.to_path_buf();
-    let names: Vec<String> = listed.split('\0').filter(|e| e.len() > 3).map(|e| e[3..].to_owned()).collect();
+    let names: Vec<String> = listed.split('\0').filter_map(|e| e.get(3..)).filter(|n| !n.is_empty()).map(str::to_owned).collect();
     let files = crate::rt::blocking(move || {
         names
             .into_iter()
@@ -141,48 +140,58 @@ async fn wip_of(folder: &Path, me: &str) -> anyhow::Result<Option<(String, Strin
     Ok(Some((branch, commit.trim().to_owned())))
 }
 
-/// A machine's work in a repository (`folders`, all of one repository): its branches, each
-/// folder's work in progress, and in `out` a bundle of the commits they name that its remote
-/// lacks (true when one was made).
-pub async fn work(folders: &[PathBuf], me: &str, out: &Path) -> anyhow::Result<(Work, bool)> {
-    let first = folders.first().context("no folder")?;
-    let mut w = Work::default();
-    for line in run(Some(first), &["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"], STATUS_TIME).await?.lines() {
+/// A repository's branches: name → commit.
+pub async fn branches(repo: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for line in run(Some(repo), &["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"], STATUS_TIME).await?.lines() {
         if let Some((branch, commit)) = line.split_once(' ') {
-            w.branches.insert(branch.to_owned(), commit.trim().to_owned());
+            out.insert(branch.to_owned(), commit.trim().to_owned());
         }
     }
+    Ok(out)
+}
+
+/// The work in progress of `folders`: branch checked out → its commit.
+pub async fn wips(folders: &[PathBuf], me: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
     for f in folders {
         match wip_of(f, me).await {
             Ok(Some((branch, commit))) => {
-                w.wip.insert(branch, commit);
+                out.insert(branch, commit);
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(target: "kiln.sync", folder = %f.display(), error = %format!("{e:#}"), "a folder's work in progress couldn't be made"),
         }
     }
-    let tips: Vec<String> = w.branches.values().chain(w.wip.values()).cloned().collect();
-    let mut made = bundle(first, &tips, out).await?;
-    if made && size_of(out) > BUNDLE_MAX && !w.wip.is_empty() {
-        // Too big with the work in progress: the branches alone.
-        w.wip.clear();
-        let tips: Vec<String> = w.branches.values().cloned().collect();
-        made = bundle(first, &tips, out).await?;
-    }
-    if made && size_of(out) > BUNDLE_MAX {
+    out
+}
+
+/// A bundle in `out` of the commits `branches` name that the repository's remote lacks: false, and
+/// none, when it lacks none, or they'd be more than [`BUNDLE_MAX`] (the others take the branches
+/// whose commits they hold).
+pub async fn bundle_branches(repo: &Path, branches: &BTreeMap<String, String>, out: &Path) -> anyhow::Result<bool> {
+    let tips: Vec<String> = branches.values().cloned().collect();
+    capped(bundle(repo, &tips, &[], out).await?, out)
+}
+
+/// A bundle in `out` of the work in progress `wip` beyond `branches` and the remote.
+pub async fn bundle_wip(repo: &Path, wip: &BTreeMap<String, String>, branches: &BTreeMap<String, String>, out: &Path) -> anyhow::Result<bool> {
+    let tips: Vec<String> = wip.values().cloned().collect();
+    let not: Vec<String> = branches.values().cloned().collect();
+    capped(bundle(repo, &tips, &not, out).await?, out)
+}
+
+fn capped(made: bool, out: &Path) -> anyhow::Result<bool> {
+    if made && std::fs::metadata(out).map_or(0, |m| m.len()) > BUNDLE_MAX {
         let _ = std::fs::remove_file(out);
-        made = false;
+        return Ok(false);
     }
-    Ok((w, made))
+    Ok(made)
 }
 
-fn size_of(p: &Path) -> u64 {
-    std::fs::metadata(p).map_or(0, |m| m.len())
-}
-
-/// A bundle in `out` of what the commits `tips` reach that the repository's remote doesn't: false,
-/// and none, when it reaches them all.
-async fn bundle(repo: &Path, tips: &[String], out: &Path) -> anyhow::Result<bool> {
+/// A bundle in `out` of what the commits `tips` reach that neither `not` nor the repository's
+/// remote does: false, and none, when that's nothing.
+async fn bundle(repo: &Path, tips: &[String], not: &[String], out: &Path) -> anyhow::Result<bool> {
     if tips.is_empty() {
         return Ok(false);
     }
@@ -194,6 +203,7 @@ async fn bundle(repo: &Path, tips: &[String], out: &Path) -> anyhow::Result<bool
         }
         let mut args: Vec<String> = vec!["bundle".into(), "create".into(), "--quiet".into(), out.to_string_lossy().into_owned()];
         args.extend(names.iter().cloned());
+        args.extend(not.iter().map(|c| format!("^{c}")));
         if run(Some(repo), &["config", "--get", "remote.origin.url"], STATUS_TIME).await.is_ok() {
             args.extend(["--not".into(), "--remotes=origin".into()]);
         }
@@ -235,20 +245,21 @@ async fn held(repo: &Path, ids: &BTreeSet<&str>) -> HashSet<String> {
     out.lines().filter_map(|l| l.split_once(' ')).filter(|(_, kind)| *kind == "commit").map(|(id, _)| id.to_owned()).collect()
 }
 
-/// Takes another machine's work (`w`, its bundle in `bundle` when there's one) into the
+/// Takes another machine's work (`w`, its bundles in `bundles`, the branches' first) into the
 /// repository `repo`: its branches as `kiln/<machine>/<branch>`, its work in progress as
 /// `refs/kiln/wip/<machine>/<branch>`, and what it no longer has goes. Nothing else moves.
-pub async fn take(repo: &Path, w: &Work, bundle: Option<&Path>) -> anyhow::Result<()> {
+pub async fn take(repo: &Path, w: &Work, bundles: &[&Path]) -> anyhow::Result<()> {
     let ids: BTreeSet<&str> = w.branches.values().chain(w.wip.values()).map(String::as_str).collect();
     let mut have = held(repo, &ids).await;
-    if have.len() < ids.len()
-        && let Some(file) = bundle
-    {
-        let file = file.to_string_lossy().into_owned();
-        if run(Some(repo), &["bundle", "unbundle", &file], LONG).await.is_err() {
-            // Built on commits its remote has and this repository hasn't fetched yet.
-            let _ = run(Some(repo), &["fetch", "--quiet", "origin"], LONG).await;
-            let _ = run(Some(repo), &["bundle", "unbundle", &file], LONG).await;
+    if have.len() < ids.len() && !bundles.is_empty() {
+        // The branches' bundle first: the work in progress builds on it.
+        for file in bundles {
+            let file = file.to_string_lossy().into_owned();
+            if run(Some(repo), &["bundle", "unbundle", &file], LONG).await.is_err() {
+                // Built on commits its remote has and this repository hasn't fetched yet.
+                let _ = run(Some(repo), &["fetch", "--quiet", "origin"], LONG).await;
+                let _ = run(Some(repo), &["bundle", "unbundle", &file], LONG).await;
+            }
         }
         have = held(repo, &ids).await;
     }
@@ -298,7 +309,7 @@ pub async fn peers(folder: &Path, branch: &str) -> Vec<Peer> {
 
 // ------------------------------------------------------------------------------ the server's side
 
-/// Who shares what: each machine's latest work in each repository, and the batch it sends its
+/// Who shares what: each machine's latest work in each repository, and the batches it sends its
 /// next to.
 #[derive(Default)]
 pub struct Shares {
@@ -309,15 +320,15 @@ pub struct Shares {
 struct Inner {
     /// (repository, machine) → its latest work.
     latest: HashMap<(String, String), Work>,
-    /// (repository, machine) → the batch its next work goes to.
-    slots: HashMap<(String, String), String>,
-    /// (machine, repository, from) → the batch of `from`'s work it was given last.
-    given: HashMap<(String, String, String), String>,
+    /// (repository, machine) → the batches its next branches' and work in progress's bundles go to.
+    slots: HashMap<(String, String), (String, String)>,
+    /// (machine, repository, from) → the batches of `from`'s work it was given last.
+    given: HashMap<(String, String, String), (String, String)>,
 }
 
 impl Shares {
     /// What machines hold changed (or one connected): each is told the repositories it holds that
-    /// others hold too, with a batch for its work in each, and given the others' work it lacks.
+    /// others hold too, with batches for its work in each, and given the others' work it lacks.
     pub fn arrange(&self, hub: &Hub) {
         let held = hub.places.keys();
         let holders = |key: &str| -> BTreeSet<String> { held.iter().filter(|(_, keys)| keys.contains(key)).map(|(m, _)| m.clone()).collect() };
@@ -332,16 +343,19 @@ impl Shares {
                         continue;
                     }
                     let id = (key.clone(), machine.clone());
-                    let batch = inner.slots.entry(id.clone()).or_insert_with(crate::util::new_id).clone();
+                    let (batch, wip_batch) = inner.slots.entry(id.clone()).or_insert_with(|| (crate::util::new_id(), crate::util::new_id())).clone();
                     hub.tasks.open_bundle(&batch, machine, others.clone());
-                    slots.push(ShareSlot { key: key.clone(), batch, fresh: !inner.latest.contains_key(&id) });
+                    hub.tasks.open_bundle(&wip_batch, machine, others.clone());
+                    slots.push(ShareSlot { key: key.clone(), batch, wip_batch, fresh: !inner.latest.contains_key(&id) });
                     // The others' latest work it hasn't been given.
                     for from in &others {
                         let Some(w) = inner.latest.get(&(key.clone(), from.clone())).cloned() else { continue };
                         hub.tasks.allow(&w.batch, machine);
+                        hub.tasks.allow(&w.wip_batch, machine);
                         let given = (machine.clone(), key.clone(), from.clone());
-                        if inner.given.get(&given) != Some(&w.batch) {
-                            inner.given.insert(given, w.batch.clone());
+                        let now = (w.batch.clone(), w.wip_batch.clone());
+                        if inner.given.get(&given) != Some(&now) {
+                            inner.given.insert(given, now);
                             out.push((machine.clone(), Msg::Take(Box::new(w))));
                         }
                     }
@@ -354,31 +368,42 @@ impl Shares {
         }
     }
 
-    /// `machine` shared its work: kept as its latest (its last bundle goes), given to the others
-    /// that hold the repository, and the machine told where its next goes.
+    /// `machine` shared its work: kept as its latest (a bundle it sent again replaces the one
+    /// before, one it left out stays), given to the others that hold the repository, and the
+    /// machine told where its next goes.
     pub fn shared(&self, hub: &Hub, machine: &str, mut w: Work) {
         let id = (w.key.clone(), machine.to_owned());
-        let wanted = self.inner.lock().slots.get(&id).is_some_and(|b| *b == w.batch);
-        if !wanted {
+        let Some((batch, wip_batch)) = self.inner.lock().slots.get(&id).cloned() else { return };
+        // Each bundle it names is its slot's, as the server took it; one it doesn't name is the one before.
+        if (!w.batch.is_empty() && w.batch != batch) || (!w.wip_batch.is_empty() && w.wip_batch != wip_batch) {
             return;
         }
-        // The bundle is the one the server took for the batch, or none.
-        match hub.tasks.bundled(&w.batch) {
-            Some((hash, size)) => (w.hash, w.size) = (Some(hash), size),
-            None => (w.hash, w.size) = (None, 0),
-        }
         w.from = machine.to_owned();
-        let old = {
-            let mut inner = self.inner.lock();
-            inner.slots.remove(&id);
-            inner.latest.insert(id, w.clone())
-        };
-        if let Some(old) = old
-            && old.batch != w.batch
+        let mut gone = Vec::new();
         {
-            hub.tasks.drop_bundle(&old.batch);
+            let mut inner = self.inner.lock();
+            let before = inner.latest.get(&id).cloned().unwrap_or_default();
+            let slot = inner.slots.entry(id.clone()).or_default();
+            if w.batch.is_empty() {
+                (w.batch, w.hash, w.size) = (before.batch.clone(), before.hash.clone(), before.size);
+            } else {
+                (w.hash, w.size) = hub.tasks.bundled(&w.batch).map_or((None, 0), |(h, n)| (Some(h), n));
+                gone.push(before.batch.clone());
+                slot.0 = crate::util::new_id();
+            }
+            if w.wip_batch.is_empty() {
+                (w.wip_batch, w.wip_hash, w.wip_size) = (before.wip_batch.clone(), before.wip_hash.clone(), before.wip_size);
+            } else {
+                (w.wip_hash, w.wip_size) = hub.tasks.bundled(&w.wip_batch).map_or((None, 0), |(h, n)| (Some(h), n));
+                gone.push(before.wip_batch.clone());
+                slot.1 = crate::util::new_id();
+            }
+            inner.latest.insert(id, w.clone());
         }
-        tracing::info!(target: "kiln.sync", event = "sync.shared", repo = %w.key, machine = %machine, branches = w.branches.len(), wip = w.wip.len(), bytes = w.size, "a machine shared its work");
+        for b in gone.iter().filter(|b| !b.is_empty() && **b != w.batch && **b != w.wip_batch) {
+            hub.tasks.drop_bundle(b);
+        }
+        tracing::info!(target: "kiln.sync", event = "sync.shared", repo = %w.key, machine = %machine, branches = w.branches.len(), wip = w.wip.len(), bytes = w.size, wip_bytes = w.wip_size, "a machine shared its work");
         self.arrange(hub);
     }
 }
@@ -422,16 +447,28 @@ mod tests {
         std::fs::write(a.join("README"), "hello again\n")?;
         std::fs::write(a.join("notes.txt"), "half done\n")?;
         let quiet = git(&a, &["status", "--porcelain"])?;
-        let bundle = dir.path().join("work.bundle");
-        let (aa, bb, file) = (a.clone(), b.clone(), bundle.clone());
-        let (w, made, print) = crate::rt::block_on(async move {
-            let print = fingerprint(std::slice::from_ref(&aa)).await;
-            let (mut w, made) = work(std::slice::from_ref(&aa), "a", &file).await?;
-            w.from = "a".into();
-            take(&bb, &w, made.then_some(file.as_path())).await?;
-            anyhow::Ok((w, made, print))
-        })?;
-        assert!(made, "a's commit isn't on the remote: it goes in the bundle");
+        let (bundle, wip_bundle) = (dir.path().join("work.bundle"), dir.path().join("wip.bundle"));
+        // a's work, as a share makes it, taken in by b.
+        let share = |a: PathBuf, b: PathBuf, file: PathBuf, wip_file: PathBuf| {
+            crate::rt::block_on(async move {
+                let repo = repository_of(&a).await.context("a's repository")?;
+                let prints = fingerprints(&repo, std::slice::from_ref(&a)).await;
+                let mut w = Work { from: "a".into(), branches: branches(&repo).await?, wip: wips(std::slice::from_ref(&a), "a").await, ..Work::default() };
+                let mut files = Vec::new();
+                if bundle_branches(&repo, &w.branches, &file).await? {
+                    files.push(file.clone());
+                }
+                if bundle_wip(&repo, &w.wip, &w.branches, &wip_file).await? {
+                    files.push(wip_file.clone());
+                }
+                let bundles: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+                take(&b, &w, &bundles).await?;
+                w.hash = Some(files.len().to_string());
+                anyhow::Ok((w, prints))
+            })
+        };
+        let (w, prints) = share(a.clone(), b.clone(), bundle.clone(), wip_bundle.clone())?;
+        assert_eq!(w.hash.as_deref(), Some("2"), "a's commit and its work in progress, each in a bundle");
         assert_eq!(w.branches.get("main"), Some(&committed));
         assert!(w.wip.contains_key("main"));
         assert_eq!(git(&a, &["status", "--porcelain"])?, quiet, "making the work in progress changed nothing in a's folder");
@@ -444,19 +481,11 @@ mod tests {
         let bb = b.clone();
         let stands = crate::rt::block_on(async move { anyhow::Ok(peers(&bb, "main").await) })?;
         assert_eq!(stands, vec![Peer { machine: "a".into(), ahead: 0, behind: 1, wip: true }]);
-        // a's work in progress goes (committed): b's goes too; a's look says nothing changed twice.
+        // a's work in progress goes (committed): b's goes too; each fingerprint follows its own part.
         git(&a, &["add", "--all"])?;
         git(&a, &["commit", "-q", "-m", "done"])?;
-        let (aa, bb, file) = (a.clone(), b.clone(), bundle.clone());
-        let (again, same) = crate::rt::block_on(async move {
-            let again = fingerprint(std::slice::from_ref(&aa)).await;
-            let same = fingerprint(std::slice::from_ref(&aa)).await;
-            let (mut w, made) = work(std::slice::from_ref(&aa), "a", &file).await?;
-            w.from = "a".into();
-            take(&bb, &w, made.then_some(file.as_path())).await?;
-            anyhow::Ok((again, same))
-        })?;
-        assert!(again != print && again == same, "the fingerprint follows the work, and only it");
+        let (_, again) = share(a.clone(), b.clone(), bundle.clone(), wip_bundle.clone())?;
+        assert!(again.0 != prints.0 && again.1 != prints.1, "a commit moves the branch and empties the folder's changes");
         assert_eq!(git(&b, &["rev-parse", "refs/remotes/kiln/a/main"])?, git(&a, &["rev-parse", "main"])?);
         assert_eq!(git(&b, &["for-each-ref", "refs/kiln/wip/"])?, "", "a's work in progress is gone from b");
         Ok(())

@@ -1021,6 +1021,12 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         slots: a.slots,
         upgrade: false,
         service: "kiln-agent".to_owned(),
+        on: None,
+        context: None,
+        namespace: "kiln".to_owned(),
+        image: None,
+        registry: None,
+        port: 7070,
     })
     .await?;
     // When it starts (at boot, or at sign-in) is the install's to say: it's the `boot` line above.
