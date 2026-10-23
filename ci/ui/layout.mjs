@@ -36,3 +36,22 @@ export async function checkLayout(check, who, page) {
   check(who, "nothing scrolls sideways", p.sideways.length === 0, p.sideways.join(", "));
   check(who, "nothing fixed but the shell's own", p.fixed.length === 0, p.fixed.join(", "));
 }
+
+/**
+ * A page's errors as the checks count them, kept as they come (`base`: the server the check
+ * drives). A fetch the page was still making when it went to another page, WebKit reports as "Fetch
+ * API cannot load <url> due to access control checks", and Playwright takes that for a page error,
+ * though the page caught it (Chromium only says the request was cut off). Nothing else makes a
+ * request to the page's own server fail those checks, so that report isn't counted; one for any
+ * other server is.
+ */
+export function pageErrors(page, base) {
+  const errors = [];
+  const own = new URL(base).host;
+  page.on("pageerror", (e) => {
+    const said = String(e);
+    const cut = /^Fetch API cannot load https?:\s?\/{1,2}([^/\s]+)\S* due to access control checks\.$/.exec(said);
+    if (cut?.[1] !== own) errors.push(said);
+  });
+  return errors;
+}

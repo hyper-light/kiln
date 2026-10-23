@@ -18,7 +18,7 @@
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/pages-shots:/shots \
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/pages_check.mjs
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
-import { checkLayout } from "./layout.mjs";
+import { checkLayout, pageErrors } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.INSIGHTS);
 const shots = "/shots";
@@ -68,8 +68,7 @@ for (const [name, type, phone] of [
       await signIn.goto((await r.json()).url);
       await signIn.close();
       const page = await ctx.newPage();
-      const errors = [];
-      page.on("pageerror", (e) => errors.push(String(e)));
+      const errors = pageErrors(page, cfg.base);
       const shot = (what) => page.screenshot({ path: `${shots}/${what}-${name}-${tag}.png`, fullPage: true });
 
       await flow(`${who}: a leg's page`, async () => {
