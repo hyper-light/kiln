@@ -90,7 +90,8 @@ knows the app, release it this way; the tools are `deploy_*` (code mode: `kiln.d
      soak, a window, a freeze). Its `gates` say which, each with `passed` and `detail`, and
      `message` says why. It goes by itself once the gate lets it.
    - `waiting_approval`: people must approve it. Tell the person who asked, with its link; don't
-     approve your own request.
+     approve your own request. Its message in the app's chat channels carries Approve and Reject
+     for whoever may.
    - `committing` with "waits for its pull request #N to be merged" ("merge request !N" on
      GitLab): the environment releases as pull requests (`via: pull-request`). A person merges it
      on GitHub, GitLab or Bitbucket, and that's the approval: tell the person who asked, with its
@@ -140,7 +141,8 @@ request per repository, and on kiln's own git server a branch and its diff. Foll
   release is also theirs to make: they deploy in that environment, or they're in one of the app's
   owner teams and the environment lets owners release. A 403 means a person must (one who may,
   as its message says): say so, with what you would have released, and stop. Don't work around
-  it (committing to a release repository by hand, or asking another agent).
+  it (committing to a release repository by hand, asking another agent, or saying it to kiln in a
+  chat: a bot's command there acts as an agent for the person who linked it, held the same way).
 - One release at a time per app and environment: while one is in flight a second is refused
   (409), or queued where the environment says so. Wait for it, or cancel it if that's what the
   person asked.

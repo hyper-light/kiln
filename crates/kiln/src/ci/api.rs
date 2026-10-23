@@ -63,7 +63,16 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W03-R02: an inbound webhook's call, checked by its signature.
         ["api", "ci", "hooks", id] if req.method() == Method::POST => Some(super::inbound::call(hub, id, req).await),
         // W14-R05: Slack's Events API, at a Slack integration's own address.
-        ["api", "ci", "replies", "slack", id, key] if req.method() == Method::POST => Some(super::replies::slack_events(hub, id, key, req).await),
+        ["api", "ci", "replies", "slack", id, key] if req.method() == Method::POST => {
+            let (hub, id, key) = (Arc::clone(hub), (*id).to_owned(), (*key).to_owned());
+            Some(apart(async move { super::replies::slack_events(&hub, &id, &key, req).await }).await)
+        }
+        // docs/deploy-api.md §12.3: what a chat sends kiln (commands, buttons, events), at an
+        // integration's own address, checked as that chat signs it.
+        ["api", "ci", "chat", kind, id, key] if req.method() == Method::POST => {
+            let (hub, kind, id, key) = (Arc::clone(hub), (*kind).to_owned(), (*id).to_owned(), (*key).to_owned());
+            Some(apart(async move { super::chat::inbound(&hub, &kind, &id, &key, req).await }).await)
+        }
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -92,6 +101,7 @@ pub fn is_open(seg: &[&str]) -> bool {
                 | ["api", "uploads", ..]
                 | ["api", "ci", "hooks", _]
                 | ["api", "ci", "replies", "slack", _, _]
+                | ["api", "ci", "chat", _, _, _]
         )
 }
 

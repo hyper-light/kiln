@@ -52,9 +52,35 @@ fn dns_label(what: &str, s: &str) -> Result<(), Fail> {
     if ok { Ok(()) } else { Err(bad(format!("{what} {s:?}: lowercase letters, digits and '-', at most 63, starting and ending with a letter or digit"))) }
 }
 
+/// Who may approve a release, as its approvals gate found them.
+fn approvers(r: &Release) -> Value {
+    r.gates.iter().find(|g| g.gate == "approvals").and_then(|g| g.evidence.get("reviewers")).cloned().unwrap_or(Value::Null)
+}
+
+/// A release as clients and chats are told of it: with who may approve it (`approvers`) while it
+/// waits for them.
+pub fn release_value(r: &Release) -> Value {
+    let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
+    if r.state == State::WaitingApproval
+        && let Some(m) = v.as_object_mut()
+    {
+        m.insert("approvers".into(), approvers(r));
+    }
+    v
+}
+
 /// Tells every client, and whoever waits on it, that a release moved; one waiting for approval
 /// says so, and who may give it (`needs`, `approvers`).
 pub(super) fn emit_release(d: &Deploy, r: &Release) {
+    tell(d, r, false);
+}
+
+/// [`emit_release`], for a release just recorded: `release.started` is said of it too.
+pub(super) fn emit_new_release(d: &Deploy, r: &Release) {
+    tell(d, r, true);
+}
+
+fn tell(d: &Deploy, r: &Release, new: bool) {
     let mut e = json!({
         "type": "deploy",
         "id": r.id,
@@ -68,33 +94,30 @@ pub(super) fn emit_release(d: &Deploy, r: &Release) {
     if r.state == State::WaitingApproval
         && let Some(m) = e.as_object_mut()
     {
-        let reviewers = r.gates.iter().find(|g| g.gate == "approvals").and_then(|g| g.evidence.get("reviewers")).cloned().unwrap_or(Value::Null);
         m.insert("needs".into(), json!("approval"));
-        m.insert("approvers".into(), reviewers);
+        m.insert("approvers".into(), approvers(r));
     }
     d.hub.emit(&e);
     d.changes.send(r.id);
     // The host's deployment of its commit, where the release repository is on another host (§7).
     remote::report(d, r);
-    // Chat, paging and webhooks: the server's rules, and the app's own channels.
-    let event = match r.state {
+    // Chat, paging and webhooks: the server's rules and the app's own channels, each message a
+    // release has in a chat brought up to date (`crate::ci::chat`).
+    let mut events = Vec::new();
+    if new {
+        events.push("release.started");
+    }
+    events.extend(match r.state {
         State::WaitingApproval => Some("release.waiting_approval"),
         State::Succeeded => Some("release.succeeded"),
         State::Failed => Some("release.failed"),
         State::Cancelled => Some("release.cancelled"),
         _ => None,
-    };
-    if let Some(event) = event {
-        let (hub, app) = (Arc::clone(&d.hub), r.app.clone());
-        let mut release = serde_json::to_value(r).unwrap_or(Value::Null);
-        if let (Some(m), Some(approvers)) = (release.as_object_mut(), e.get("approvers")) {
-            m.insert("approvers".into(), approvers.clone());
-        }
-        crate::rt::spawn(async move {
-            let channels = store::app(&hub.store, &app).await.ok().flatten().map(|a| a.contacts.channels).unwrap_or_default();
-            crate::ci::notify::release_event(hub, event, release, channels).await;
-        });
-    }
+    });
+    let (hub, id) = (Arc::clone(&d.hub), r.id);
+    crate::rt::spawn(async move {
+        crate::ci::notify::release_moved(hub, id, events).await;
+    });
 }
 
 /// Who asks for a change: the name the audit, the release and its commit say, and whether it is
@@ -1313,7 +1336,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     store::schedule(&d.hub.store, r.id, now).await.map_err(internal)?;
     d.wake.notify();
     audit(d, actor, "deploy.release", format!("{} {} in {}: release {}", r.kind.as_str(), r.version.as_deref().unwrap_or(""), r.environment, r.id)).await;
-    emit_release(d, &r);
+    emit_new_release(d, &r);
     Ok(r)
 }
 
@@ -2355,7 +2378,7 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
         }
         store::schedule(st, back.id, now + 2).await?;
         audit(d, "kiln", "deploy.release", format!("revert of release {} in {}: release {}", failed.id, back.environment, back.id)).await;
-        emit_release(d, &back);
+        emit_new_release(d, &back);
     }
     Ok(back)
 }
@@ -2547,7 +2570,7 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
                     tracing::warn!(release = r.id, error = %e, "deploy: delivering a commit kiln didn't make");
                 }
                 store::schedule(st, r.id, now + 2).await?;
-                emit_release(d, &r);
+                emit_new_release(d, &r);
             }
         }
         st.kv_set(key, head).await?;

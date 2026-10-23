@@ -3325,7 +3325,11 @@ catalog; this section is the machinery.
   so on. **Verify** runs a real exchange from a short verification leg and shows the result.
 - **W11-R06 Chat and paging** (for W19): Slack (bot token or incoming webhook), Discord (bot or
   webhook), Microsoft Teams (workflow webhook), Telegram (bot), email (SMTP), generic webhooks
-  (HMAC-signed), PagerDuty and Opsgenie (events APIs).
+  (HMAC-signed), PagerDuty and Opsgenie (events APIs). The chats take commands too
+  (docs/deploy-api.md §12.3): a kind's second secret (`signing`, set as `signing_secret` beside
+  `secret`) is what its requests are checked with, a Slack app's signing secret or a Teams
+  outgoing webhook's security token; Discord's `public_key` and Telegram's `commands` are config,
+  and each of Discord and Telegram takes an `api` (a test's, a Bot API server of one's own).
 - **W11-R07 Issue trackers** (opt-in rules): Linear and Jira (Atlassian) link runs and diffs to
   issues from trailers (`Fixes: LIN-123`, `Refs: ABC-42`), comment when a diff lands or a trunk run
   fails, and open an issue when a test is quarantined (W16).
@@ -5661,10 +5665,12 @@ with W11-AC03's tenants).
   - Events so far: `run.failed`, `run.fixed`, `run.succeeded`, `run.cancelled` and
     `approval.waiting`, announced once per leg; an agent's `agent.needs_you`,
     `agent.finished`, `agent.stopped` and `agent.paused` (docs/notifications.md), which only the
-    server's rules take, `where` reading `agent`; and a release's `release.waiting_approval`,
-    `release.succeeded`, `release.failed` and `release.cancelled` (docs/deploy-api.md §12.3),
-    which only the server's rules take, `where` reading `release`, and which go to the app's own
-    channels too, once per release, event and channel.
+    server's rules take, `where` reading `agent`; and a release's `release.started`,
+    `release.waiting_approval`, `release.succeeded`, `release.failed` and `release.cancelled`
+    (docs/deploy-api.md §12.3), which only the server's rules take, `where` reading `release`,
+    and which go to the app's own channels too: where a channel can change a message afterwards
+    (a Slack bot, a Discord webhook, a Telegram bot), as the one message the release has there,
+    edited as it moves; elsewhere once per release, event and channel.
   - Channels are W11-R06's integration kinds (`slack`, `discord`, `teams`, `telegram`,
     `pagerduty`, `opsgenie`, `webhook`), named `kind:target`: the integration called `target`,
     or the first the repository may use, with `target` as its channel or chat.

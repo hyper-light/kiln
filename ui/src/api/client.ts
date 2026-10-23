@@ -101,6 +101,8 @@ export interface IntegrationKind {
   fields: { name: string; required: boolean; help: string }[];
   secret: string | null;
   built: boolean;
+  /** What a second secret it keeps is (a Slack app's signing secret), when it keeps one. */
+  signing?: string;
 }
 
 export interface Integration {
@@ -109,6 +111,8 @@ export interface Integration {
   name: string;
   config: Record<string, unknown>;
   has_secret: boolean;
+  /** Whether it keeps its kind's signing secret too. */
+  has_signing_secret?: boolean;
   scope: string;
   created_at: number;
   verified_at: number | null;
@@ -119,6 +123,36 @@ export interface Integration {
 export interface Integrations {
   kinds: IntegrationKind[];
   integrations: Integration[];
+}
+
+/** Where a chat sends kiln its commands and buttons, and what to set there (docs/deploy-api.md §12.3). */
+export interface ChatSetup {
+  address: string;
+  how: string;
+  /** Slack and Teams: whether kiln has the signing secret it checks them with. */
+  signing_secret?: boolean;
+  /** Discord: whether kiln has the application's public key. */
+  public_key?: boolean;
+  /** Telegram: whether the bot's webhook is kiln's. */
+  commands?: boolean;
+  scopes?: string[];
+  events?: string[];
+}
+
+/** A chat account linked to the signed-in person's kiln account. */
+export interface ChatLink {
+  integration: string | null;
+  kind: string | null;
+  id: string;
+  account: string;
+  name: string;
+  created_at: number;
+}
+
+export interface ChatLinks {
+  links: ChatLink[];
+  /** The chats kiln has, by integration. */
+  chats: { name: string; kind: string }[];
 }
 
 export interface OidcIssuer {
@@ -161,7 +195,18 @@ export const api = {
   setCdImage: (name: string, home: ImageHome) => request<CdImages>("PUT", `/api/cd/images/${encodeURIComponent(name)}`, home),
   /** Integrations (docs/ci.md W11): the catalog of kinds and the ones set up. */
   integrations: (signal?: AbortSignal) => get<Integrations>("/api/ci/integrations", signal),
-  createIntegration: (body: { kind: string; name: string; config: Record<string, string>; secret?: string }) => post<Integration>("/api/ci/integrations", body),
+  createIntegration: (body: { kind: string; name: string; config: Record<string, string>; secret?: string; signing_secret?: string }) => post<Integration>("/api/ci/integrations", body),
+  /** An integration's configuration, secret or signing secret changed (each given replaces it; "" removes a secret). */
+  updateIntegration: (name: string, body: { config?: Record<string, unknown>; secret?: string; signing_secret?: string }) =>
+    request<Integration>("PATCH", `/api/ci/integrations/${encodeURIComponent(name)}`, body),
+  /** Where a chat integration's commands and buttons come to kiln (docs/deploy-api.md §12.3). */
+  integrationChat: (name: string, signal?: AbortSignal) => get<ChatSetup>(`/api/ci/integrations/${encodeURIComponent(name)}/chat`, signal),
+  /** A Telegram bot's webhook pointed at kiln, so its chats' commands and buttons come here. */
+  connectIntegrationChat: (name: string) => post<ChatSetup>(`/api/ci/integrations/${encodeURIComponent(name)}/chat`, {}),
+  /** The chat accounts linked to yours, and a code to link another with (`link <code>`, said there). */
+  myChat: (signal?: AbortSignal) => get<ChatLinks>("/api/me/chat", signal),
+  chatCode: () => post<{ code: string; expires_at: number; say: string }>("/api/me/chat/codes", {}),
+  unlinkChat: (integration: string, account: string) => del<void>(`/api/me/chat/${encodeURIComponent(integration)}/${encodeURIComponent(account)}`),
   /** A real exchange with the integration; a federated one as `repository`'s `environment` (docs/cd-targets.md §6). */
   verifyIntegration: (name: string, as?: { repository?: string; environment?: string }) =>
     post<{ ok: boolean; message?: string; error?: string }>(`/api/ci/integrations/${encodeURIComponent(name)}/verify`, as ?? {}),

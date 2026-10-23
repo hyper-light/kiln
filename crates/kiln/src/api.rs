@@ -463,6 +463,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 20)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             boxed(|| crate::ci::notify::mine(&hub, &caller, Some(body))).await.map_err(|(s, m)| ApiError(s, m))
         }
+        // docs/deploy-api.md §12.3: one's own chat accounts.
+        (_, ["api", "me", "chat", rest @ ..]) => {
+            let rest: Vec<&str> = rest.to_vec();
+            boxed(|| crate::ci::chat::mine(&hub, &caller, &method, &rest)).await.map_err(|(s, m)| ApiError(s, m))
+        }
         // W10: one's own passkeys and password.
         (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
         (&Method::POST, ["api", "me", "passkeys", "options"]) => {

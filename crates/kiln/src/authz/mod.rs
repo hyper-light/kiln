@@ -335,6 +335,10 @@ pub static ROUTES: &[Rule] = &[
     r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/password", SIGNED_IN, At::Server),
     r("PUT", "/api/me/password", SIGNED_IN, At::Server),
+    // One's own chat accounts (docs/deploy-api.md §12.3): those linked, a code to link one with.
+    r("GET", "/api/me/chat", SIGNED_IN, At::Server),
+    r("POST", "/api/me/chat/codes", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/chat/*/*", SIGNED_IN, At::Server),
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),

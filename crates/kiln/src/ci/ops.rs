@@ -743,12 +743,12 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["integrations", "kinds"]), HashMap::new())),
                 run: |_cx: Cx, _v: Value| async move { Ok(json!({ "kinds": super::integrations::KINDS })) }),
-            op!("ci.integrations.create", "Make an integration: its kind (ci.integrations.kinds), a name, its config, its secret (write-only) and the scope it's for.", ro: false, destructive: false,
-                input: || schema(json!({"kind": {"type": "string"}, "name": {"type": "string"}, "config": {"type": "object"}, "secret": {"type": "string", "description": "Stored encrypted, never shown again."}, "scope": {"type": "string", "description": SCOPE}}), &["kind", "name"]),
+            op!("ci.integrations.create", "Make an integration: its kind (ci.integrations.kinds), a name, its config, its secret (write-only), its signing secret where its kind keeps one, and the scope it's for.", ro: false, destructive: false,
+                input: || schema(json!({"kind": {"type": "string"}, "name": {"type": "string"}, "config": {"type": "object"}, "secret": {"type": "string", "description": "Stored encrypted, never shown again."}, "signing_secret": {"type": "string", "description": "A kind's second secret (its `signing`: a Slack app's signing secret), stored as the first."}, "scope": {"type": "string", "description": SCOPE}}), &["kind", "name"]),
                 route: |_| Ok((Method::POST, path(&["integrations"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let config = v.get("config").cloned().filter(|c| !c.is_null()).unwrap_or_else(|| json!({}));
-                    let made = super::integrations::create(&cx.hub, &text(&v, "kind")?, &text(&v, "name")?, config, v.get("secret").and_then(Value::as_str), v.get("scope").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    let made = super::integrations::create(&cx.hub, &text(&v, "kind")?, &text(&v, "name")?, config, v.get("secret").and_then(Value::as_str), v.get("signing_secret").and_then(Value::as_str), v.get("scope").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
                     Ok(serde_json::to_value(made).unwrap_or_default())
                 }),
             op!("ci.integrations.get", "One integration: its kind, config, scope and what it's for (never its secret).", ro: true, destructive: false,
@@ -758,11 +758,11 @@ pub fn ops() -> &'static [Op] {
                     let name = text(&v, "integration")?;
                     super::integrations::get(&cx.hub, &name).await.map_err(internal)?.map(|i| serde_json::to_value(i).unwrap_or_default()).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no integration `{name}`")))
                 }),
-            op!("ci.integrations.update", "Change an integration's config or replace its secret.", ro: false, destructive: false,
-                input: || schema(json!({"integration": {"type": "string", "description": "Its name."}, "config": {"type": "object"}, "secret": {"type": "string"}}), &["integration"]),
+            op!("ci.integrations.update", "Change an integration's config or replace its secret or signing secret.", ro: false, destructive: false,
+                input: || schema(json!({"integration": {"type": "string", "description": "Its name."}, "config": {"type": "object"}, "secret": {"type": "string"}, "signing_secret": {"type": "string"}}), &["integration"]),
                 route: |v| Ok((Method::PATCH, path(&["integrations", &text(v, "integration")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
-                    let i = super::integrations::update(&cx.hub, &text(&v, "integration")?, v.get("config").cloned().filter(|c| !c.is_null()), v.get("secret").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    let i = super::integrations::update(&cx.hub, &text(&v, "integration")?, v.get("config").cloned().filter(|c| !c.is_null()), v.get("secret").and_then(Value::as_str), v.get("signing_secret").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
                     Ok(serde_json::to_value(i).unwrap_or_default())
                 }),
             op!("ci.integrations.delete", "Delete an integration (jobs and deployments using it fail until another takes its name).", ro: false, destructive: true,

@@ -904,15 +904,48 @@ until the two become one.
 - **UI**: Apps (the list, an app's page with environments side by side), the environments board
   (what runs where, what waits to move), a release's page (its gates, commit and live progress),
   the deploy dialog, the rollback picker, an approvals inbox that works on a phone.
-- **Chat**: Slack first. Commands for the calls above, and a message per release that updates in
-  place as it moves (txst's deployment messages), in the registration's channels. Built so far: a
-  message when a release waits for approval (naming who may approve), lands, fails or is
-  cancelled (`release.waiting_approval`, `release.succeeded`, `release.failed`,
-  `release.cancelled`), to the app's own channels (`contacts.channels`: `kind:target` as
-  ci.md W19-R06 names channels, a bare `#channel` being Slack's) and through the server's
-  notification rules (`[[ci.notify]]`, `where` reading `release`: its `app`, `environment`,
-  `kind`, `version`, `requested_by`, `approvers`), on any channel kiln has: Slack, Discord, Teams,
-  Telegram, PagerDuty, Opsgenie, signed webhooks. Each goes once per release, event and channel.
+- **Chat**: Slack first, then Discord, Telegram and Teams (`crates/kiln/src/ci/chat`): a message
+  per release that changes as it moves (txst's deployment messages), and commands for the calls
+  above.
+  - *A release's message* goes to the app's own channels (`contacts.channels`: `kind:target` as
+    ci.md W19-R06 names channels, a bare `#channel` being Slack's) and through the server's
+    notification rules that take its events (`[[ci.notify]]`, `where` reading `release`: its
+    `app`, `environment`, `kind`, `version`, `state`, `requested_by`, `approvers`): `release.started`
+    as it's asked for, `release.waiting_approval` (naming who may approve), `release.succeeded`,
+    `release.failed`, `release.cancelled`. Where a channel can change a message afterwards, the
+    release has one message there, posted the first time and edited as it moves on (what holds
+    it, committing, delivering, landed, failed, cancelled, rolled back, replaced), saying who
+    approved or rejected it: a Slack bot's (`chat.update`), a Discord webhook's (its message
+    patched), a Telegram bot's (`editMessageText`). While it waits for approval it carries Approve
+    and Reject where kiln takes that chat's buttons: a Slack app whose signing secret kiln has, a
+    Telegram bot whose webhook is kiln's. A channel that can't change a message (a Slack incoming
+    webhook, Teams' Workflows, PagerDuty, Opsgenie, a webhook) gets one per event, once per
+    release, event and channel, and an app's own such channels aren't told each release starts.
+  - *Commands*: `deploy <app> <version> to <environment>`, `approve <release> [why]`, `reject
+    <release> [why]`, `rollback <app> in <environment> [to <release>]`, `status <app> [in
+    <environment>]` or `status <release>`, `link <code>`, `help`: a Slack slash command
+    (`/kiln …`), button or @-mention, Discord's `/kiln`, a Telegram bot's commands (`/approve 42`)
+    and buttons, an @-mention of a Teams outgoing webhook. Each reaches its integration's own
+    address (`/api/ci/chat/<kind>/<integration>/<key>`, the key from the server's master key;
+    `GET /api/ci/integrations/<name>/chat` shows it and what that chat needs set; a Slack app's
+    events, interactivity and slash command share it), checked as its chat signs it: a Slack
+    app's signing secret (`X-Slack-Signature`, at most five minutes old; the integration's
+    `signing_secret`), a Discord application's Ed25519 key (`public_key`), a Telegram bot's secret
+    token (`POST /api/ci/integrations/<name>/chat` points the bot's webhook at kiln with it), a
+    Teams outgoing webhook's HMAC (its security token as `signing_secret`). Each runs as its
+    person's kiln user, through the operation it is (`deploy.releases.create`, `.approve`,
+    `.reject`, `.rollback`, `deploy.apps.get`, `deploy.registrations.get`,
+    `deploy.releases.get`): judged by the route table, held by the environment's gates and agents
+    policy, and audited, as that route is. Its answer is its person's alone where the chat allows
+    (Slack, Discord, Telegram's buttons): at once when it's quick, else as soon as it's done.
+  - *Whose account*: the kiln user who linked it, with a code from Settings → You → Chat accounts
+    (`POST /api/me/chat/codes`: a signed-in person's, never a token's, since the account then acts
+    with all their grants) said to kiln there within ten minutes (`link <code>`), once; or, in
+    Slack, the one person here with the email Slack has for it (`users.info`; none, or more than
+    one, is nobody). `GET /api/me/chat` lists one's own, `DELETE /api/me/chat/<integration>/
+    <account>` unlinks one. A bot's account (another app's, an agent's; in Slack, an @-mention by
+    a bot) acts as an agent for the person who linked it (`slack:<bot> for user:<them>`), so the
+    environment's agents policy holds it (cd-targets.md D6).
 - **MCP**: one operation per call, in kiln's registry of operations (ci.md W20): MCP tools
   (`deploy_releases_create`) and code mode's `kiln.deploy.*`. Each is one of `/api/deploy`'s routes,
   judged by the route table as that route is, and audited as it is:
