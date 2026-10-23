@@ -854,6 +854,11 @@ a.pg-node:hover {
 .pg-node[data-stand="unmet"] .pg-word {
   color: #d8bb95;
 }
+/* A step whose line to a step it waits for would run behind another: what it waits for, said. */
+.pg-after {
+  color: #8d9099;
+  font-size: 11px;
+}
 .pg-who {
   overflow: hidden;
   color: #7d818b;

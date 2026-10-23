@@ -652,6 +652,31 @@ The successor's handle store starts fresh, so a page re-fetched after the takeov
 
 const PLANS = [
   {
+    id: "pl_search",
+    title: "Search across agents' conversations",
+    body: "Agents can search every conversation they may read.",
+    items: [
+      { title: "Store: search by agent and time", description: "", examples: "", acceptance: [], testing: [], needs: [] },
+      { title: "Op: conversations.search", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "Agents use it in code mode", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "UI: search in Mission Control", description: "", examples: "", acceptance: [], testing: [], needs: [2, 3] },
+      { title: "Docs and the kiln-agents skill", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "Bench: a million events under 50 ms", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "WebKit and phone check", description: "", examples: "", acceptance: [], testing: [], needs: [4] },
+      { title: "Ship it", description: "", examples: "", acceptance: [], testing: [], needs: [4, 5, 6, 7] },
+    ],
+    tags: [],
+    source: null,
+    share: null,
+    version: 1,
+    created_at: T0 - 7_200,
+    updated_at: T0 - 3_600,
+    steps: ["Store: search by agent and time", "Op: conversations.search", "Agents use it in code mode", "UI: search in Mission Control", "Docs and the kiln-agents skill", "Bench: a million events under 50 ms", "WebKit and phone check", "Ship it"],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
+  {
     id: "pl_proposed",
     title: "Fix: a mount taken over by a restarted daemon dropped a store",
     body: PROPOSED,

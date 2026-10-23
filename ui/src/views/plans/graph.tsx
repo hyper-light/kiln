@@ -10,7 +10,7 @@
  */
 import * as React from "react";
 import { Link } from "@/lib/router";
-import { rounds, type GraphStep } from "./graph-layout";
+import { blocked, curve, rounds, type Box, type GraphStep } from "./graph-layout";
 import { STAND_WORDS, StandTitle, StepGlyph, type Stand } from "./status";
 
 export { effectiveNeeds, type GraphStep } from "./graph-layout";
@@ -21,19 +21,37 @@ interface Line {
   d: string;
 }
 
+/** What the graph draws between its steps: the lines, and for each step the steps it waits for whose line would run behind another step ("after 2, 3" on it instead). */
+interface Drawn {
+  lines: Line[];
+  after: Record<number, number[]>;
+}
+
 /** The lines between steps, from where `el` lays them out. */
-function lines(el: HTMLElement, steps: GraphStep[]): Line[] {
+function lines(el: HTMLElement, steps: GraphStep[]): Drawn {
   const box = el.getBoundingClientRect();
   const out: Line[] = [];
+  const after: Record<number, number[]> = {};
+  // Each step's box, from the graph's top left.
+  const boxes = new Map<number, Box>();
+  for (const s of steps) {
+    const r = el.querySelector<HTMLElement>(`[data-n="${s.n}"]`)?.getBoundingClientRect();
+    if (r) boxes.set(s.n, { left: r.left - box.left, top: r.top - box.top, right: r.right - box.left, bottom: r.bottom - box.top });
+  }
   for (const s of steps)
     for (const d of s.needs) {
-      const a = el.querySelector<HTMLElement>(`[data-n="${d}"]`)?.getBoundingClientRect();
-      const b = el.querySelector<HTMLElement>(`[data-n="${s.n}"]`)?.getBoundingClientRect();
+      const a = boxes.get(d);
+      const b = boxes.get(s.n);
       if (!a || !b) continue;
       const across = b.left > a.right - 4;
-      const [x1, y1, x2, y2] = across
-        ? [a.right - box.left, a.top + a.height / 2 - box.top, b.left - box.left, b.top + b.height / 2 - box.top]
-        : [a.left + a.width / 2 - box.left, a.bottom - box.top, b.left + b.width / 2 - box.left, b.top - box.top];
+      const [x1, y1, x2, y2] = across ? [a.right, (a.top + a.bottom) / 2, b.left, (b.top + b.bottom) / 2] : [(a.left + a.right) / 2, a.bottom, (b.left + b.right) / 2, b.top];
+      // A line that would run behind another step (a phone's rows of two, a round between) isn't
+      // drawn: the step says what it waits for instead.
+      const others = [...boxes].filter(([n]) => n !== d && n !== s.n).map(([, x]) => x);
+      if (blocked(curve(x1, y1, x2, y2, across), others)) {
+        (after[s.n] ??= []).push(d);
+        continue;
+      }
       const r = (v: number) => Math.round(v * 10) / 10;
       out.push({
         from: d,
@@ -41,12 +59,12 @@ function lines(el: HTMLElement, steps: GraphStep[]): Line[] {
         d: across ? `M${r(x1)} ${r(y1)} C${r(x1 + 18)} ${r(y1)}, ${r(x2 - 18)} ${r(y2)}, ${r(x2)} ${r(y2)}` : `M${r(x1)} ${r(y1)} C${r(x1)} ${r(y1 + 12)}, ${r(x2)} ${r(y2 - 12)}, ${r(x2)} ${r(y2)}`,
       });
     }
-  return out;
+  return { lines: out, after };
 }
 
 export function PlanGraph({ steps, label }: { steps: GraphStep[]; label: string }) {
   const shape = steps.map((s) => `${s.n}:${s.needs.join(",")}`).join(";");
-  const [drawn, setDrawn] = React.useState<Line[]>([]);
+  const [drawn, setDrawn] = React.useState<Drawn>({ lines: [], after: {} });
   // The lines follow the layout: drawn when it's there, and whenever its size changes.
   const ref = React.useCallback(
     (el: HTMLDivElement | null) => {
@@ -54,7 +72,7 @@ export function PlanGraph({ steps, label }: { steps: GraphStep[]; label: string 
       let last = "";
       const draw = () => {
         const next = lines(el, steps);
-        const key = next.map((l) => l.d).join("|");
+        const key = `${next.lines.map((l) => l.d).join("|")}/${JSON.stringify(next.after)}`;
         if (key !== last) {
           last = key;
           setDrawn(next);
@@ -86,7 +104,7 @@ export function PlanGraph({ steps, label }: { steps: GraphStep[]; label: string 
             <stop offset="1" stopColor="#d8cbb0" />
           </linearGradient>
         </defs>
-        {drawn.map((l) => (
+        {drawn.lines.map((l) => (
           <path key={`${l.from}-${l.to}`} d={l.d} data-s={lineState(l)} style={lineState(l) === "live" ? { stroke: `url(#${gradient})` } : undefined} />
         ))}
       </svg>
@@ -106,6 +124,7 @@ export function PlanGraph({ steps, label }: { steps: GraphStep[]; label: string 
                       </StandTitle>
                     </span>
                     {s.stand && <span className="pg-word">{STAND_WORDS[st]}</span>}
+                    {drawn.after[s.n]?.length ? <span className="pg-after">after {drawn.after[s.n]?.join(", ")}</span> : null}
                     {s.who && <span className="pg-who">{s.who}</span>}
                   </span>
                 </>

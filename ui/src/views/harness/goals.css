@@ -102,100 +102,33 @@
 .gs-link[data-status="met"]:not(:last-child)::before {
   background: #5d7a74;
 }
-/* Each goal's badge: its number (or how it ended), ringed by where it stands, on the panel's own
-   colour so the line runs behind it. While it's worked on, the console's running light (a sector
-   of the prism, signals.css) turns around the ring; only a transform moves. Nothing else moves. */
+/* Each goal's node: where it stands, drawn as the console draws work (plans/status.tsx), on the
+   panel's own colour so the line runs behind it. Waiting goals are only sketched, still. */
 .gs-node {
-  position: relative;
   display: grid;
   width: 22px;
   height: 22px;
   place-items: center;
-  border: 1px solid #343a45;
-  border-radius: 50%;
   background: #0a0c0f;
-  color: #8d9099;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-variant-numeric: tabular-nums;
-  isolation: isolate;
 }
-.gs-node::before {
-  position: absolute;
-  z-index: -1;
-  inset: -1px;
-  padding: 1.5px;
-  border-radius: 50%;
-  background: conic-gradient(transparent 0turn 0.5turn, #b8d9d2 0.6turn, #a6c4ed 0.7turn, #b8a6d5 0.8turn, #d6a2aa 0.9turn, #d8cbb0 0.97turn, transparent 1turn);
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  opacity: 0;
-  content: "";
+.gs-node .sg-beam {
+  width: 15px;
+  height: 15px;
 }
-.gs-node[data-stand="working"] {
-  border-color: #2f3540;
-  color: #e3e7ee;
-  box-shadow: 0 0 0 3px rgb(166 196 237 / 10%);
+.gs-chain .sg-beam[data-status="pending"] {
+  animation: none;
 }
-.gs-node[data-stand="working"]::before {
-  opacity: 1;
-  animation: gs-turn 1.8s linear infinite;
+/* A goal's parts: smaller links on the same chain, before the goal they're parts of; a step's own
+   parts (its criteria and tests) smaller still. */
+.gs-link[data-part] .gs-node .sg-beam,
+.gs-link[data-part] .gs-node .sg-optic {
+  width: 11px;
+  height: 11px;
 }
-@keyframes gs-turn {
-  to {
-    transform: rotate(1turn);
-  }
-}
-/* Its turn not under way (the agent between turns): under way, the ring held in its blue. */
-.gs-node[data-stand="waiting"] {
-  border-color: #343a45;
-}
-.gs-link[data-status="active"] .gs-node[data-stand="waiting"] {
-  border-color: #a6c4ed;
-  color: #a6c4ed;
-}
-.gs-node[data-stand="met"] {
-  border-color: #5d7a74;
-  color: #b8d9d2;
-}
-.gs-node[data-stand="unmet"] {
-  border-color: #8a5a55;
-  color: #e3a7a0;
-}
-.gs-node[data-stand="skipped"] {
-  border-style: dashed;
-  color: #6d7078;
-}
-/* The goal under way while you've paused the stack: held, in the paused chip's amber. */
-.gs-node[data-stand="paused"] {
-  border-color: #e3c9a0;
-  border-style: dashed;
-  color: #e3c9a0;
-}
-:root[data-motion="paused"] .gs-node::before {
-  animation-play-state: paused;
-}
-@media (prefers-reduced-motion: reduce) {
-  .gs-node[data-stand="working"]::before {
-    background: conic-gradient(#b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa, #d8cbb0, #b8d9d2);
-    animation: none;
-  }
-}
-/* A goal's parts: smaller links on the same chain, before the goal they're parts of (no number:
-   they're the goal's); a step's own parts (its criteria and tests) smaller still. */
-.gs-link[data-part] .gs-node {
-  width: 14px;
-  height: 14px;
-  margin: 4px;
-  font-size: 0;
-}
-.gs-link[data-depth="2"] .gs-node {
-  width: 10px;
-  height: 10px;
-  margin: 6px;
+.gs-link[data-depth="2"] .gs-node .sg-beam,
+.gs-link[data-depth="2"] .gs-node .sg-optic {
+  width: 9px;
+  height: 9px;
 }
 .gs-link[data-depth="2"] .gs-text {
   font-size: 12px;

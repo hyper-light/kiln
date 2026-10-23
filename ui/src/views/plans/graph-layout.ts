@@ -36,3 +36,38 @@ export function effectiveNeeds(needs: (number[] | undefined)[]): number[][] {
   const any = needs.some((d) => d && d.length);
   return needs.map((d, i) => (any ? (d ?? []) : i === 0 ? [] : [i]));
 }
+
+/** A step's box in the graph, from the graph's own top left. */
+export interface Box {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+/**
+ * The points a line from one step to the next passes through, as it's drawn: a curve out of the
+ * one's right side into the other's left when the second is across from it, else out of its
+ * bottom into the other's top.
+ */
+export function curve(x1: number, y1: number, x2: number, y2: number, across: boolean, n = 24): [number, number][] {
+  const [c1, c2]: [[number, number], [number, number]] = across
+    ? [
+        [x1 + 18, y1],
+        [x2 - 18, y2],
+      ]
+    : [
+        [x1, y1 + 12],
+        [x2, y2 - 12],
+      ];
+  return Array.from({ length: n + 1 }, (_, i) => {
+    const t = i / n;
+    const u = 1 - t;
+    return [u * u * u * x1 + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t * t * t * x2, u * u * u * y1 + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t * t * t * y2];
+  });
+}
+
+/** Whether a line passes through any of `others` (steps it would run behind): their step says "after …" instead. */
+export function blocked(points: readonly [number, number][], others: readonly Box[], margin = 3): boolean {
+  return points.some(([x, y]) => others.some((b) => x > b.left + margin && x < b.right - margin && y > b.top + margin && y < b.bottom - margin));
+}

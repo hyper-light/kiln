@@ -101,7 +101,9 @@ conversation draws its work: a step at work with hyperlight's mark turning and i
 holographic shimmer; one needing a person with the optic held in amber; met, its loop closed; not
 met, broken; skipped, dashed; stopped, faint; waiting, sketched and still. Only steps at work move.
 A plan's page draws its steps the same way, without where they stand, so **Runs after** reads as a
-graph while it's written.
+graph while it's written. Wide, its rounds run across; narrow (a phone, a side panel), down, two
+steps a row. A line that would run behind another step isn't drawn: the step it leads to says
+what it waits for instead (**after 2, 3**).
 
 - **Which steps run when.** A step starts once each step it waits for is met (**Runs after**;
   `needs` in the API). Steps that don't wait for each other run side by side: the run's page says
