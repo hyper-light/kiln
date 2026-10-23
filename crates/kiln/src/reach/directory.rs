@@ -322,14 +322,14 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
         // Idle cores count most, free memory next; CI work on it and a tunnelled path count against
         // it, and being overloaded (nearly out of memory, or loaded past twice its cores) most of
         // all: such a machine gets work only when no other suits. This machine itself comes first
-        // while it has room (nothing crosses the network, and another machine's resources stay its
-        // own), and wins a tie when it hasn't; overloaded, it gets no such turn.
+        // while it has room and isn't overloaded (nothing crosses the network, and another
+        // machine's resources stay its own), and wins a tie when it hasn't.
         let mut score = room(s, r.busy, r.slots);
         if r.via == "tunnel" {
             score -= 2.0;
         }
-        if r.name == me && !s.overloaded {
-            score += if r.mem_total == 0 || r.mem_free() >= ROOM { HOME } else { 0.5 };
+        if r.name == me {
+            score += if !s.overloaded && (r.mem_total == 0 || r.mem_free() >= ROOM) { HOME } else { 0.5 };
         }
         let why = format!(
             "{} · {:.0} of {} cores idle · {} free{}{}{}",
