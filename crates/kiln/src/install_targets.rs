@@ -13,8 +13,8 @@
 //!   (its own Deployment, its pods), the admin token as a secret, a NodePort service, the config, a
 //!   volume and one Deployment (three nodes come with docs/p2p.md's P3). It's opened at a node's
 //!   address and the service's port, or through a port forward when no node can be reached.
-//! - **Docker.** A container (`kiln`), started again by Docker, its data in a volume, on `--port`
-//!   and the next port for QUIC.
+//! - **Docker.** A container (`kiln`, or `--name`), started again by Docker, its data in a volume
+//!   (`kiln-data`), on `--port` and the next port for QUIC.
 //! - **Done means it works.** An install ends once the kiln answers, its UI's page and script load
 //!   and its runner is connected, and says where to open it; else it says what failed and takes
 //!   back what it made.
@@ -85,11 +85,13 @@ async fn check(via: &Via<'_>) -> anyhow::Result<u64> {
     let (status, page) = via.get("/").await.context("its UI doesn't answer")?;
     anyhow::ensure!(status == 200, "its UI's page answers with {status}");
     let page = String::from_utf8_lossy(&page);
+    // The path from `/assets/` on: an API server's proxy rewrites a page's links to go through it.
     let script = page
         .split("src=\"")
         .skip(1)
         .filter_map(|s| s.split('"').next())
-        .find(|s| s.starts_with("/assets/") && s.ends_with(".js"))
+        .filter(|s| s.ends_with(".js"))
+        .find_map(|s| s.find("/assets/").and_then(|at| s.get(at..)))
         .context("its UI's page names no script: this kiln was built without its UI")?;
     let (status, _) = via.get(script).await.context("its UI's script doesn't load")?;
     anyhow::ensure!(status == 200, "its UI's script {script} answers with {status}");
@@ -271,8 +273,14 @@ fn docker(args: &[&str]) -> anyhow::Result<String> {
 /// A whole kiln in a container on this machine's Docker.
 pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
     docker(&["version", "--format", "{{.Server.Version}}"]).context("Docker isn't running here, or this user can't use it")?;
-    if !docker(&["ps", "-aq", "--filter", &format!("name=^{APP}$")])?.is_empty() {
-        bail!("a container named {APP} is here already: remove it (docker rm -f {APP}) to install again");
+    let name = a.name.as_deref().unwrap_or(APP);
+    let volume = format!("{name}-data");
+    if !docker(&["ps", "-aq", "--filter", &format!("name=^{name}$")])?.is_empty() {
+        // Another tool's container may have the name (minikube names its node after its profile).
+        if docker(&["inspect", "--format", "{{index .Config.Labels \"kiln.installed\"}}", name]).is_ok_and(|l| l == "1") {
+            bail!("kiln is installed in Docker here already (container {name}): `docker rm -f {name}` and `docker volume rm {volume}` remove it, or name another one with --name");
+        }
+        bail!("a container named {name} is here already, and kiln didn't install it: name kiln's another with --name");
     }
     let (image, built) = match &a.image {
         Some(image) => (image.clone(), false),
@@ -282,31 +290,30 @@ pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
             (tag, built)
         }
     };
-    let volume = "kiln-data";
     let made_volume = docker(&["volume", "ls", "-q", "--filter", &format!("name=^{volume}$")])?.is_empty();
     let (http, quic) = (a.port, a.port.checked_add(1).context("--port can't be the last port: QUIC takes the next one")?);
     let url = format!("http://localhost:{http}");
     let undo = || {
-        let _ = docker(&["rm", "-f", APP]);
+        let _ = docker(&["rm", "-f", name]);
         if made_volume {
-            let _ = docker(&["volume", "rm", volume]);
+            let _ = docker(&["volume", "rm", &volume]);
         }
         if built {
             let _ = docker(&["image", "rm", &image]);
         }
     };
     let (ports, quic_ports, data, public) = (format!("{http}:7070"), format!("{quic}:7071/udp"), format!("{volume}:/var/lib/kiln"), format!("KILN_PUBLIC_URL={url}"));
-    let run = ["run", "-d", "--name", APP, "--hostname", APP, "--restart", "unless-stopped", "-p", &ports, "-p", &quic_ports, "-v", &data, "-e", &public];
+    let run = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped", "-p", &ports, "-p", &quic_ports, "-v", &data, "-e", &public];
     if let Err(e) = docker(&[&run[..], &["--label", "kiln.installed=1", &image]].concat()) {
         undo();
         return Err(e.context("starting its container (nothing was left)"));
     }
-    say(format!("container   {APP} ({image}), its data in volume {volume}{}", if made_volume { "" } else { " (kept from before)" }));
+    say(format!("container   {name} ({image}), its data in volume {volume}{}", if made_volume { "" } else { " (kept from before)" }));
     // Its admin token, as its server made it in its data.
     let mut token = String::new();
     let start = Instant::now();
     while token.is_empty() && start.elapsed() < Duration::from_secs(60) {
-        token = docker(&["exec", APP, "cat", "/var/lib/kiln/admin.token"]).unwrap_or_default();
+        token = docker(&["exec", name, "cat", "/var/lib/kiln/admin.token"]).unwrap_or_default();
         if token.is_empty() {
             crate::rt::sleep(Duration::from_secs(1)).await;
         }
@@ -317,12 +324,12 @@ pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
     };
     match ready {
         Ok(runners) => {
-            opened(&url, &token, runners, &later(&url, &token, &format!("docker exec {APP} cat /var/lib/kiln/admin.token")));
-            say(format!("container   docker logs {APP}"));
+            opened(&url, &token, runners, &later(&url, &token, &format!("docker exec {name} cat /var/lib/kiln/admin.token")));
+            say(format!("container   docker logs {name}"));
             Ok(())
         }
         Err(e) => {
-            let logs = docker(&["logs", "--tail", "30", APP]).unwrap_or_default();
+            let logs = docker(&["logs", "--tail", "30", name]).unwrap_or_default();
             undo();
             let what = match (made_volume, built) {
                 (true, true) => "container, volume and image were",
@@ -766,7 +773,8 @@ mod tests {
 
     /// A kiln stand-in on a port of its own: `/healthz`, its page (naming its script, when `ui`),
     /// the script, and `/healthz/server` with `runners` connected; at those paths, and through an
-    /// API server's proxy to kiln's service in namespace `kiln`.
+    /// API server's proxy to kiln's service in namespace `kiln`, which rewrites the page's links to
+    /// go through it, as Kubernetes' does.
     fn stand_in(ui: bool, runners: u64) -> anyhow::Result<String> {
         use std::io::Write as _;
         let l = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -782,9 +790,14 @@ mod tests {
                     "<!doctype html><html><p>The UI was not built into this binary.</p></html>"
                 };
                 let path = req.split_whitespace().nth(1).unwrap_or("/");
-                let (status, body) = match path.strip_prefix(proxy_base("kiln").as_str()).unwrap_or(path) {
+                let proxied = path.strip_prefix(proxy_base("kiln").as_str());
+                let page = match proxied {
+                    Some(_) => page.replace("src=\"/", &format!("src=\"https://10.0.0.1:6443{}/", proxy_base("kiln"))),
+                    None => page.to_owned(),
+                };
+                let (status, body) = match proxied.unwrap_or(path) {
                     "/healthz" => ("200 OK", "ok".to_owned()),
-                    "/" => ("200 OK", page.to_owned()),
+                    "/" => ("200 OK", page),
                     "/assets/index-x1.js" => ("200 OK", "export {}".to_owned()),
                     "/healthz/server" => ("200 OK", format!(r#"{{"runners":{{"connected":{runners},"before":0,"back":1.0}}}}"#)),
                     _ => ("404 Not Found", String::new()),
