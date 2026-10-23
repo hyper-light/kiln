@@ -75,7 +75,7 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "3f9b396a902de2e4cb48a1b0b9f8bb7d09a415ea"
+commit = "ea4c372901f862430df97f44815a9ab8628b7b2a"
 path = "vendor/quiver"
 exclude = ["vendor"]
 
@@ -84,7 +84,7 @@ exclude = ["vendor"]
 [projects.focal-bus]
 kind = "git"
 repository = "https://github.com/hyper-light/focal"
-commit = "52d17cbd5a12832daa88cf4ad3db63076b9daec3"
+commit = "f8052a5eaf21f81709129583e535331c2e9722f3"
 path = "vendor/focal-bus"
 take = [
   "Cargo.toml",

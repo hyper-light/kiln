@@ -9,10 +9,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design (`docs/design/`), the
   gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the vendoring tool
   (`scripts/vendor.py`, kiln's).
-- **Focal's bus, vendored** (CP-T2.1): `bus-replicated` at `52d17cb` in `vendor/focal-bus`, and
-  hyper-raft at its `main`, `25cf889` (since its two lines met; the bus takes `d4e8447`, the same
-  code but for tests), in `vendor/hyper-raft` (each one's `UPSTREAM.md` lists Quiver's recorded
-  changes; `python3 scripts/vendor.py check` proves both).
+- **Focal's bus, vendored** (CP-T2.1): `bus-replicated` at `f8052a5` in `vendor/focal-bus`, and
+  hyper-raft at the revision it takes, `25cf889`, hyper-raft's `main` since its two lines met, in
+  `vendor/hyper-raft` (each one's `UPSTREAM.md` lists Quiver's recorded changes;
+  `python3 scripts/vendor.py check` proves both).
 - **`quiver-api`** (CP-T2.1): the `Topics` trait other code reaches Quiver through, its simulator,
   and its conformance suite of 19 clauses (`docs/design/topics.md`, held to the code by a doc-truth
   test).

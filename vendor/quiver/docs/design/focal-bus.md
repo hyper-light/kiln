@@ -6,18 +6,17 @@ sources, its evidence and what would falsify it.
 
 ## What is taken
 
-- **Focal's bus,** branch `bus-replicated` at `52d17cb` (2026-10-22), into `vendor/focal-bus`: the
+- **Focal's bus,** branch `bus-replicated` at `f8052a5` (2026-10-22), into `vendor/focal-bus`: the
   crates `focal-bus` (Focal's docs 32 to 34: the batch, a part's log and streams, the node over
   QUIC, the replicated part over hyper-durable), `focal-memory` (the budget every byte is charged
   to), `focal-seal` and `focal-platform` (the node log's keys, the files a part's image is installed
   through) and `focal-timing` (the bus's tests' waits), with Focal's LICENSE and root manifest.
   `vendor/focal-bus/UPSTREAM.md` lists Quiver's one change: the shared crates named by version, so
   whoever builds the bus points them at one copy.
-- **hyper-raft** at `25cf889`, its `main`, into `vendor/hyper-raft`, unchanged: the runtime, the
-  transport over QUIC and TLS, the consensus core, the durable shell over the log and the block
-  layer, the liveness stream, sealing at rest, and their measurement and simulation crates. This
-  commit of the bus takes them at `d4e8447` (Focal's `vendor/README.md` names all fifteen there), and
-  `25cf889` is `d4e8447` and four commits that change tests alone, so the bus builds on the same code.
+- **hyper-raft** at `25cf889`, its `main` and the revision this commit of the bus takes (Focal's
+  `vendor/README.md` names all fifteen shared crates there), into `vendor/hyper-raft`, unchanged: the
+  runtime, the transport over QUIC and TLS, the consensus core, the durable shell over the log and the
+  block layer, the liveness stream, sealing at rest, and their measurement and simulation crates.
 - **One revision in kiln.** Kiln holds one copy of each hyper-light product (kiln's
   docs/vendoring.md): it vendors Focal's bus and hyper-raft at these same commits, beside Quiver,
   and moves its own hyper-raft from `767627f` to `25cf889`.
@@ -126,9 +125,10 @@ checked against Focal's tree:
      merged hyper-raft's `main` into `fate-commit` (`7d5e536`), and Focal's `bus-replicated` at
      `52d17cb` vendors hyper-raft `d4e8447`, on top of the merge. Once CI passed every job on the
      merged line's tip (run 39848761865, Linux, macOS and Windows), Focal's agent fast-forwarded
-     hyper-raft's `main` to it, `25cf889`: `d4e8447` and four commits that change tests alone. Quiver
-     takes `main` at `25cf889` with the bus at `52d17cb`, so Mantle and Quiver's bus hold one
-     revision.
+     hyper-raft's `main` to it, `25cf889`: `d4e8447` and four commits that change tests alone. Focal's
+     `bus-replicated` at `f8052a5` takes its shared crates there; between `52d17cb` and `f8052a5`
+     Focal changed none of what Quiver takes (its other crates, its tools, the recorded revisions).
+     Quiver takes that pair, which Mantle meets: one revision of hyper-raft in kiln.
 2. **The API.** `focal_bus::part::Part`, `focal_bus::log::{SegmentPool, Position}`,
    `focal_bus::batch::{Batch, BatchBuilder, Producing}` and `focal_memory::MemoryBudget` exist, are
    public and reasonable to build on, but Focal publishes no stable API: they are internal surfaces
