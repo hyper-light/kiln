@@ -47,6 +47,24 @@ pub struct Config {
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
+    /// kiln's records through the cluster group (docs/p2p.md).
+    pub cluster: Cluster,
+}
+
+/// `[cluster]` (docs/p2p.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cluster {
+    /// The store's writes go through the cluster group (P1): one hyper-raft group with kiln.db as
+    /// its state machine, its log in `<data>/cluster`. Off (or `KILN_CLUSTER_GROUP=0`), writes go
+    /// straight to kiln.db, as before it; the database is whole either way.
+    pub group: bool,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Self { group: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +516,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_PUBLIC_URL") {
             cfg.server.public_url = v;
+        }
+        if let Ok(v) = std::env::var("KILN_CLUSTER_GROUP") {
+            cfg.cluster.group = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         if let Ok(v) = std::env::var("KILN_QUIC_ADVERTISE") {
             cfg.server.quic_advertise = v;

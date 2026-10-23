@@ -274,7 +274,7 @@ pub async fn callback(hub: &Hub, provider: &str, code: &str, state: &str) -> Res
     let found: Result<(String, String, i64), String> = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             // The linked account, else the verified email, else a new user (when allowed).
             let mut user: Option<String> = tx.query_row("SELECT user_id FROM user_identities WHERE provider = ?1 AND subject = ?2", params![p, w.subject], |r| r.get(0)).optional()?;

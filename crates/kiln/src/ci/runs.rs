@@ -39,7 +39,7 @@ pub async fn create(hub: &Hub, repo: &Repo, n: NewRun) -> anyhow::Result<(i64, i
     let repo_id = repo.id.clone();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let number: i64 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE repo_id = ?1", [&repo_id], |r| r.get(0))?;
             tx.execute(
@@ -123,7 +123,7 @@ pub async fn insert_leg(hub: &Hub, run: &str, id: &str, spec: &LegSpec, status: 
     let needed: Vec<String> = spec.needs.as_object().map(|o| o.keys().map(|k| format!("{prefix}{k}")).collect()).unwrap_or_default();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let terminal = status.is_terminal();
             // The legs of those jobs, by key, which is what the run's graph links (W21).
@@ -180,7 +180,7 @@ pub async fn claim(hub: &Hub, leg: &str, agent: &str, executor: &str, attempt: u
     let (leg, agent, executor) = (leg.to_owned(), agent.to_owned(), executor.to_owned());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             close_wait(&tx, &leg, now)?;
             // The attempt (W19-R01); one before it that never reported ended with its runner.
@@ -275,7 +275,7 @@ pub async fn wait_reason(hub: &Hub, leg: &str, reason: &serde_json::Value) -> an
     let (leg, r) = (leg.to_owned(), (!reason.is_null()).then(|| reason.to_string()));
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let was: Option<Option<String>> = tx.query_row("SELECT wait_reason FROM jobs WHERE id = ?1", [&leg], |x| x.get(0)).optional()?;
             if was.as_ref().is_some_and(|w| wait_kind(w.as_deref()) != wait_kind(r.as_deref())) {
                 close_wait(&tx, &leg, crate::util::now_unix())?;
@@ -402,7 +402,7 @@ pub async fn start_attempt(hub: &Hub, run: &str, by: &str) -> anyhow::Result<u32
     let (run, by) = (run.to_owned(), by.to_owned());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute("UPDATE runs SET attempt = attempt + 1, status = 'queued', conclusion = NULL, error = NULL, started_at = NULL, finished_at = NULL WHERE id = ?1", [&run])?;
             tx.execute("UPDATE ci_plans SET done = 0 WHERE run_id = ?1", [&run])?;
             let n: u32 = tx.query_row("SELECT attempt FROM runs WHERE id = ?1", [&run], |r| r.get(0))?;
@@ -419,7 +419,7 @@ pub async fn keep_leg(hub: &Hub, run: &str, old: &str, id: &str) -> anyhow::Resu
     let (run, old, id) = (run.to_owned(), old.to_owned(), id.to_owned());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, executor, attempt, queued_at, started_at, finished_at, exit_code, error,
                                    job_id, matrix, leg_index, outputs, conclusion, requirements, routing, concurrency_group, priority, input_hash, reused_from, environment, leg, run_attempt)

@@ -387,7 +387,7 @@ async fn list(dir: &Path, n: usize, runs: usize) -> Result<Vec<Measure>> {
     let ids = repos.clone();
     store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             {
                 let mut run = tx.prepare(
                     "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, started_at, finished_at)

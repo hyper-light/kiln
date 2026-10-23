@@ -326,7 +326,7 @@ pub async fn evict(hub: &Hub, repo: Option<&str>) -> anyhow::Result<usize> {
         crate::ci::notify::cache_use(hub, r.clone(), used, quota).await;
         hub.store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 for id in &ids {
                     tx.execute("DELETE FROM ci_caches WHERE id = ?1", [id])?;
                 }

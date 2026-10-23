@@ -208,9 +208,10 @@ async fn pass(hub: &Hub) -> anyhow::Result<usize> {
             }
         }
         let leg2 = leg.clone();
+        // The index is this node's own, built from its own logs: past the cluster group.
         hub.store
-            .call(move |c| {
-                let tx = c.transaction()?;
+            .call_local(move |c| {
+                let tx = crate::store::tx(c)?;
                 let (mut first, mut last, mut bytes) = (None::<i64>, None::<i64>, 0usize);
                 for (s, raw) in &texts {
                     bytes += raw.len();
@@ -236,8 +237,8 @@ async fn pass(hub: &Hub) -> anyhow::Result<usize> {
 pub async fn forget(hub: &Hub, legs: Vec<String>) {
     let _ = hub
         .store
-        .call(move |c| {
-            let tx = c.transaction()?;
+        .call_local(move |c| {
+            let tx = crate::store::tx(c)?;
             for leg in &legs {
                 let rows: Option<(Option<i64>, Option<i64>)> = tx.query_row("SELECT first_row, last_row FROM ci_log_indexed WHERE leg = ?1", [leg], |x| Ok((x.get(0)?, x.get(1)?))).optional()?;
                 if let Some((Some(a), Some(b))) = rows {

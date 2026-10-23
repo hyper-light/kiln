@@ -175,7 +175,7 @@ pub async fn upload(s: &Site<'_>, claims: &Job, body: &Value) -> Result<Response
         .hub
         .store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut fresh = Vec::new();
             for run in &runs {

@@ -398,7 +398,7 @@ pub async fn record_uses(hub: &Hub, leg: &str, ids: Vec<String>) -> anyhow::Resu
     let names: Vec<String> = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut names = Vec::new();
             for id in &ids {
@@ -422,7 +422,7 @@ pub async fn rotate(hub: &Hub) -> anyhow::Result<usize> {
     let m = master(hub)?;
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let keys = all_keys(&tx, &m)?;
             let (new_id, fresh) = new_key(&tx, &m)?;
             let rows: Vec<(String, String, String, String, Vec<u8>, Vec<u8>, String)> = {

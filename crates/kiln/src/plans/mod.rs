@@ -653,7 +653,7 @@ pub async fn create_in(hub: &Hub, n: New, by: &str, phase: &'static str) -> R<Pl
     let plan = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "INSERT INTO plans (id, title, body, items, tags, source, version, created_at, updated_at, phase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8)",
                 params![id, title, body, items, tags, source, now, phase],
@@ -731,7 +731,7 @@ pub async fn update(hub: &Hub, id: &str, patch: Patch, by: &str) -> R<Plan> {
     let plan = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let version = if new_version { old.version.saturating_add(1) } else { old.version };
             tx.execute("UPDATE plans SET title = ?2, body = ?3, items = ?4, tags = ?5, version = ?6, updated_at = ?7 WHERE id = ?1", params![id, title, body, items, tags, version, now])?;
             if new_version {
@@ -756,7 +756,7 @@ pub async fn delete(hub: &Hub, id: &str) -> R<()> {
     let gone = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let n = tx.execute("DELETE FROM plans WHERE id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_versions WHERE plan_id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_runs WHERE plan_id = ?1", params![id])?;
