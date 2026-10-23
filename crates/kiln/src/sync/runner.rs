@@ -670,11 +670,11 @@ impl Owner {
                 self.resent = Instant::now().checked_sub(RESEND).unwrap_or_else(Instant::now);
             }
             // The machine's repositories' (`super::repos`), in the order the server sent them.
-            Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } => {
+            Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } | Msg::Shares { .. } | Msg::Take(_) => {
                 let _ = self.repos.try_send(super::repos::Job::Order(msg));
             }
             // Only a runner says these.
-            Msg::Steps { .. } | Msg::Status(_) | Msg::Repos(_) | Msg::Task(_) | Msg::Move(_) => {}
+            Msg::Steps { .. } | Msg::Status(_) | Msg::Repos(_) | Msg::Task(_) | Msg::Move(_) | Msg::Shared(_) => {}
         }
     }
 

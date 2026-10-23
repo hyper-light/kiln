@@ -227,6 +227,36 @@ it adopts the group's files through) and its status `looked` and `adopting`.
 commits made after a sync joined move between copies with `git` (fetch, pull) until git refs
 (phase 3) carry them. Line endings a Windows checkout converts are a difference like any other.
 
+## Work between machines
+
+What an agent or a person does in a repository on one machine reaches every other machine that
+holds the same repository (the same key, [above](#repositories-on-machines)), with no one starting
+it, and nothing of theirs moves (`crate::sync::share`):
+
+- **Who shares:** each machine says what it holds (`Msg::Repos`, when it connects and when that
+  changes); the server tells each one the repositories others hold too (`Msg::Shares`, a batch
+  for its work in each).
+- **What goes:** when its work in one changes (a branch moved, a folder's `HEAD`, its files), a
+  machine sends its branches, and each folder's **work in progress**: a commit of its files as they
+  are (what git ignores left out), on the commit checked out, made from an index of its own so
+  nothing in the folder changes. The commits they name that the remote lacks go in a bundle (`git
+  bundle … --not --remotes=origin`), at most 256 MiB: too big, the work in progress stays; too big
+  still, the branches go alone. A folder's work in progress stays when its changed files are more
+  than 5,000 or 64 MiB. A machine with several clones of a repository shares the one git last
+  worked in (with its worktrees).
+- **Where it lands:** the others take it in beside their own, `kiln/<machine>/<branch>`
+  (`refs/remotes/kiln/…`, as `git branch -r` shows), and its work in progress as
+  `refs/kiln/wip/<machine>/<branch>` (`git stash apply refs/kiln/wip/fedora/main`, `git checkout
+  refs/kiln/wip/fedora/main -- <file>`); what that machine no longer has goes. No branch of their
+  own, no `HEAD`, no file moves: a person or an agent merges what they want, when they want.
+- **Conflict-aware:** each folder says how its branch stands against the same branch of the others
+  (`peers` in what it holds: ahead, behind, both: diverged, and whether there's work in progress),
+  and the Repositories page shows it on each place: "fedora 2 ahead", "diverged from fedora",
+  "work in progress on fedora".
+- A machine that connects later is given the others' latest work at once. The server keeps the
+  latest of each machine in each repository (not across its own restart: the machines share again
+  then).
+
 ## Watching it
 
 Sync is replication between peers, so each part of it can be watched: what each copy holds and
