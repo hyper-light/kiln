@@ -4,9 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
+chaos = []
+
 [dependencies]
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }
+# kiln's own HTTP/1.1 and HTTP/2 on hyper-rt (no tokio, no hyper).
+kiln-http = { path = "../kiln-http" }
 # The seams kiln reaches every product through, with their simulators (docs/seams.md).
 kiln-seams = { path = "../kiln-seams" }
 hyper-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
@@ -25,6 +31,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 glob = "0.3.4"
 hex = "0.4.3"
+httparse = "1.10.1"
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 portable-pty = "0.9.0"
@@ -54,7 +61,6 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2
 hmac = "0.13.0"
 # Secrets at rest: AES-256-GCM (docs/ci.md W09-R03); already in the tree through hyper-raft.
 aws-lc-rs = "1.18.2"
-hyper = { version = "1.12.0", features = ["http1", "http2", "server", "client"] }
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
@@ -83,7 +89,7 @@ str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"]
 
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time"] }
 rustix = { version = "1.1", features = ["process", "termios", "net"] }
 filedescriptor = "0.8"
 

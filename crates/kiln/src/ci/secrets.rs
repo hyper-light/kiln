@@ -112,6 +112,12 @@ fn master(hub: &Hub) -> anyhow::Result<[u8; 32]> {
     }
 }
 
+/// A key of its own for `label`, from the master key: one kiln checks with and never stores (an
+/// inbound webhook's secret, W03-R02).
+pub(crate) fn derived(hub: &Hub, label: &str) -> anyhow::Result<String> {
+    Ok(crate::util::hmac_hex(&master(hub)?, label.as_bytes()))
+}
+
 fn key(bytes: &[u8; 32]) -> anyhow::Result<LessSafeKey> {
     Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, bytes).map_err(|_| anyhow::anyhow!("bad key"))?))
 }
@@ -535,7 +541,7 @@ async fn scope_of(hub: &Hub, q: &std::collections::HashMap<String, String>) -> R
 
 /// `/api/ci/secrets…` and `/api/ci/variables…`, behind the console's auth. Reads never carry a
 /// secret's value.
-pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: hyper::body::Incoming) -> Result<crate::http::server::Response, super::Fail> {
+pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: kiln_http::Incoming) -> Result<crate::http::server::Response, super::Fail> {
     use crate::http::server as srv;
     use http::{Method, StatusCode};
     let internal = |e: anyhow::Error| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));

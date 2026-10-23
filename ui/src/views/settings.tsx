@@ -21,6 +21,14 @@ import { useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
+import { DeliveriesGroup, DeliveriesHold, MyNotificationsGroup, MyNotificationsHold, myNotificationsRes } from "@/views/settings-ci-notifications";
+import { MyPasswordGroup, MyPasswordHold, PasskeysGroup, PasskeysHold, myPasswordRes, passkeysRes } from "@/views/settings-signin";
+import { PeopleGroup, PeopleHold, RolesGroup, RolesHold, peopleRes, rolesRes } from "@/views/settings-people";
+import { TokensGroup, TokensHold, tokensRes } from "@/views/settings-tokens";
+import { CiSecretsGroups, CiSecretsHold } from "@/views/settings-ci";
+import { RoutingGroups, RoutingHold } from "@/views/settings-routing";
+import { OidcGroups, OidcHold } from "@/views/settings-oidc";
+import { ActionsGroup, ActionsHold } from "@/views/settings-actions";
 import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
 
 /** What finds the line saying Updates are on the System page, in a search of Settings. */
@@ -32,7 +40,27 @@ const methodsRes: Res<{ password: boolean; token: boolean }> = {
 };
 
 export default function Settings() {
-  warm(methodsRes, pushStateRes, pushDevicesRes, thisDeviceRes);
+  // Each section for those who can use it (W10-R02): the owner sees every one, a person what their rights reach.
+  const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
+  // A person (not the owner): their own password beside their passkeys.
+  const person = useAuth((s) => s.kind === "authed" && s.me?.kind === "user");
+  const may = (c: string, server = true) => !can || can[c] === "server" || (!server && can[c] === "some");
+  const [pushes, deployments, server, manages] = [may("agents.run"), may("integrations.manage"), may("settings.manage"), may("users.manage")];
+  // The owner and people keep tokens; others reach Settings through one.
+  const signedIn = useAuth((s) => s.kind === "authed" && (s.me?.kind === "owner" || s.me?.kind === "user" || !s.me?.kind));
+  warm(
+    methodsRes,
+    thisDeviceRes,
+    myNotificationsRes,
+    passkeysRes,
+    ...(signedIn ? [tokensRes, rolesRes] : []),
+    ...(manages ? [peopleRes] : []),
+    ...(person ? [myPasswordRes] : []),
+    ...(pushes ? [pushStateRes, pushDevicesRes] : []),
+  );
+  // The sections shown, numbered in order.
+  let shown = 0;
+  const next = () => ++shown;
   const [query, setQuery] = React.useState("");
   // At /settings#<section or group>, arriving or following a link here: that one opens.
   const { hash } = useLocation();
@@ -48,10 +76,12 @@ export default function Settings() {
       <PageIntro index={10} label="Settings" title="Settings" />
       <SettingsSearch value={query} onChange={setQuery} />
       <SettingsSections query={query} onQueryChange={setQuery}>
-        <SettingsSection id="device" index={1} title="This device" about="How kiln behaves in this browser" words="browser phone">
-          <Loadable label="notifications" fallback={<NotificationsHold />}>
-            <NotificationsGroup />
-          </Loadable>
+        <SettingsSection id="device" index={next()} title="This device" about="How kiln behaves in this browser" words="browser phone">
+          {pushes && (
+            <Loadable label="notifications" fallback={<NotificationsHold />}>
+              <NotificationsGroup />
+            </Loadable>
+          )}
           <MotionGroup />
         </SettingsSection>
         {(!query.trim() || matches(wordsOf(query), ELSEWHERE_WORDS)) && (
@@ -59,18 +89,92 @@ export default function Settings() {
             Updates and builds are on the System page. <Link to="/system#system.updates">System → Updates</Link>
           </p>
         )}
-        <SettingsSection id="deployments" index={2} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">
-          <DeploySettings />
-        </SettingsSection>
-        <SettingsSection id="integrations" index={3} title="Integrations" about="Peered kiln clusters, and a Grafana link" words="peering">
-          <ClustersGroup />
+        {deployments && (
+          <SettingsSection id="deployments" index={next()} title="Deployments" about="Where images live, the registries kiln pulls from, the accounts it deploys through" words="cd deploy">
+            <DeploySettings />
+          </SettingsSection>
+        )}
+        <SettingsSection id="integrations" index={next()} title="Integrations" about={server ? "Peered kiln clusters, and a Grafana link" : "A Grafana link"} words="peering">
+          {server && <ClustersGroup />}
           <GrafanaGroup />
         </SettingsSection>
-        <SettingsSection id="signin" index={4} title="Sign-in" about="The password other devices sign in with, and this session" words="login account" status={<PasswordStatus />}>
-          <Loadable label="sign-in" fallback={<PasswordHold />}>
-            <PasswordGroup />
+        <SettingsSection
+          id="signin"
+          index={next()}
+          title="Sign-in"
+          about={server ? "The password other devices sign in with, your passkeys, and this session" : "Your password and passkeys, and this session"}
+          words="login account"
+          status={server ? <PasswordStatus /> : undefined}
+        >
+          {server && (
+            <Loadable label="sign-in" fallback={<PasswordHold />}>
+              <PasswordGroup />
+            </Loadable>
+          )}
+          {person && (
+            <Loadable label="your password" fallback={<MyPasswordHold />}>
+              <MyPasswordGroup />
+            </Loadable>
+          )}
+          <Loadable label="your passkeys" fallback={<PasskeysHold />}>
+            <PasskeysGroup />
           </Loadable>
           <SessionGroup />
+        </SettingsSection>
+        {manages && (
+          <SettingsSection id="people" index={next()} title="People" about="Who signs in here, what each may do where, and the roles grants name" words="people users grants roles">
+            <Loadable label="the people" fallback={<PeopleHold />}>
+              <PeopleGroup />
+            </Loadable>
+            <Loadable label="the roles" fallback={<RolesHold />}>
+              <RolesGroup />
+            </Loadable>
+          </SettingsSection>
+        )}
+        {signedIn && (
+          <SettingsSection id="tokens" index={next()} title="Tokens" about="Personal access tokens, for the CLI, scripts and tools" words="tokens pat api cli">
+            <Loadable label="your tokens" fallback={<TokensHold />}>
+              <TokensGroup />
+            </Loadable>
+          </SettingsSection>
+        )}
+        {(may("secrets.manage", false) || may("variables.manage", false) || may("routing.manage") || may("settings.manage")) && (
+          <SettingsSection
+            id="ci"
+            index={next()}
+            title="CI"
+            about="The secrets and variables runs read, where legs run, the actions they may use, and the identity jobs prove"
+            words="ci secrets variables routing actions oidc"
+          >
+            {(may("secrets.manage", false) || may("variables.manage", false)) && (
+              <Loadable label="the scopes" fallback={<CiSecretsHold />}>
+                <CiSecretsGroups />
+              </Loadable>
+            )}
+            {may("routing.manage") && (
+              <Loadable label="the routing rules" fallback={<RoutingHold />}>
+                <RoutingGroups />
+              </Loadable>
+            )}
+            {may("settings.manage") && (
+              <>
+                <Loadable label="the actions policy" fallback={<ActionsHold />}>
+                  <ActionsGroup />
+                </Loadable>
+                <Loadable label="the issuer" fallback={<OidcHold />}>
+                  <OidcGroups />
+                </Loadable>
+                <Loadable label="the deliveries" fallback={<DeliveriesHold />}>
+                  <DeliveriesGroup />
+                </Loadable>
+              </>
+            )}
+          </SettingsSection>
+        )}
+        <SettingsSection id="you" index={next()} title="You" about="What kiln tells you of your repositories, wherever you sign in" words="person account">
+          <Loadable label="your notifications" fallback={<MyNotificationsHold />}>
+            <MyNotificationsGroup />
+          </Loadable>
         </SettingsSection>
       </SettingsSections>
     </div>

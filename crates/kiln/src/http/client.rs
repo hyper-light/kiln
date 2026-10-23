@@ -1,4 +1,4 @@
-//! HTTP/1.1 client over hyper-rt TCP, with HTTPS from hyper-tls (hyper-raft's rustls fork):
+//! HTTP/1.1 client (kiln-http's) over hyper-rt TCP, with HTTPS from hyper-tls (hyper-raft's rustls fork):
 //! GitHub's API, the Kubernetes API, and agent⇄server HTTP (enrollment, source archives,
 //! artifacts). One connection per request: the volumes are small and it keeps failure handling
 //! trivial (no pool to poison).
@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, header};
 use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 
 use super::server::{Body, channel_body, empty, full};
 
@@ -111,7 +111,12 @@ impl Client {
     /// Open a WebSocket (`ws(s)://`, or `http(s)://` for the same) trusting this client's roots;
     /// see [`super::ws::connect`].
     pub async fn websocket(&self, url: &str, max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
-        match crate::rt::timeout(DEFAULT_TIMEOUT, super::ws::connect(&self.tls, url, max_message)).await {
+        self.websocket_with(url, &[], max_message).await
+    }
+
+    /// [`Self::websocket`], with `headers` on the handshake.
+    pub async fn websocket_with(&self, url: &str, headers: &[(&str, &str)], max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
+        match crate::rt::timeout(DEFAULT_TIMEOUT, super::ws::connect_with(&self.tls, url, headers, max_message)).await {
             Ok(r) => r,
             Err(_) => anyhow::bail!("WebSocket to {url} timed out after {DEFAULT_TIMEOUT:?}"),
         }

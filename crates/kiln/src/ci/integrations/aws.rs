@@ -218,6 +218,11 @@ impl From<Vec<u8>> for Body {
 impl Aws {
     /// Signs and sends `call`.
     pub async fn send(&self, call: Call<'_>) -> Result<Response> {
+        self.send_with(client()?, call).await
+    }
+
+    /// Signs and sends `call` with `http` (one that trusts a private store's CA, say).
+    pub async fn send_with(&self, http: &Client, call: Call<'_>) -> Result<Response> {
         let host = call.base.split_once("://").map_or(call.base, |(_, h)| h).trim_end_matches('/').to_owned();
         let amz_date = amz_date_now();
         let payload = match &call.body {
@@ -242,7 +247,7 @@ impl Aws {
         let url = if query.is_empty() { format!("{}{}", call.base.trim_end_matches('/'), call.path) } else { format!("{}{}?{}", call.base.trim_end_matches('/'), call.path, query.join("&")) };
         // An upload's answer comes once it's all sent.
         let wait = if matches!(call.body, Body::Stream { .. }) { 1800 } else { 60 };
-        let mut req = client()?.request(call.method, &url).timeout(std::time::Duration::from_secs(wait)).header("authorization", &auth);
+        let mut req = http.request(call.method, &url).timeout(std::time::Duration::from_secs(wait)).header("authorization", &auth);
         for (k, v) in headers.iter().filter(|(k, _)| k != "host") {
             req = req.header(k, v);
         }

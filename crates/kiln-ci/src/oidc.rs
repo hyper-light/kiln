@@ -172,13 +172,7 @@ pub fn claims(f: &Facts<'_>, issuer: &str, audience: &str, jti: &str, now: i64, 
     put("kiln_job", f.job.to_owned());
     let sub = subject(&c, subject_keys);
     c.insert("sub".into(), Value::String(sub));
-    c.insert("iss".into(), Value::String(issuer.to_owned()));
-    c.insert("aud".into(), Value::String(audience.to_owned()));
-    c.insert("jti".into(), Value::String(jti.to_owned()));
-    let ttl = ttl.clamp(60, MAX_TTL_SECS);
-    c.insert("iat".into(), json!(now));
-    c.insert("nbf".into(), json!(now - 5));
-    c.insert("exp".into(), json!(now + ttl));
+    stamp(&mut c, issuer, audience, jti, now, ttl);
     c
 }
 
@@ -233,6 +227,12 @@ pub fn workload_claims(w: &Workload<'_>, issuer: &str, audience: &str, jti: &str
     }
     let sub = subject(&c, subject_keys);
     c.insert("sub".into(), Value::String(sub));
+    stamp(&mut c, issuer, audience, jti, now, ttl);
+    c
+}
+
+/// A token's issuer, audience, id and times (`ttl` held to a minute to an hour).
+fn stamp(c: &mut Map<String, Value>, issuer: &str, audience: &str, jti: &str, now: i64, ttl: i64) {
     c.insert("iss".into(), Value::String(issuer.to_owned()));
     c.insert("aud".into(), Value::String(audience.to_owned()));
     c.insert("jti".into(), Value::String(jti.to_owned()));
@@ -240,6 +240,33 @@ pub fn workload_claims(w: &Workload<'_>, issuer: &str, audience: &str, jti: &str
     c.insert("iat".into(), json!(now));
     c.insert("nbf".into(), json!(now - 5));
     c.insert("exp".into(), json!(now + ttl));
+}
+
+/// The server's own token (W10-R11): `sub` is `kiln:<server-id>:service:<name>`, for what it
+/// federates into as itself (a secret store, a model provider).
+pub fn service_claims(server_id: &str, name: &str, issuer: &str, audience: &str, jti: &str, now: i64, ttl: i64) -> Map<String, Value> {
+    let mut c = Map::new();
+    c.insert("sub".into(), Value::String(format!("kiln:{server_id}:service:{name}")));
+    c.insert("kiln_source".into(), json!("service"));
+    c.insert("kiln_service".into(), Value::String(name.to_owned()));
+    stamp(&mut c, issuer, audience, jti, now, ttl);
+    c
+}
+
+/// An agent kiln started (W10-R11), acting for a person: `sub` is `kiln:agent:<session>`, with
+/// whom it acts for (`kiln_on_behalf_of`, also `actor`) and its harness.
+#[allow(clippy::too_many_arguments)]
+pub fn agent_claims(session: &str, on_behalf_of: &str, harness: Option<&str>, issuer: &str, audience: &str, jti: &str, now: i64, ttl: i64) -> Map<String, Value> {
+    let mut c = Map::new();
+    c.insert("sub".into(), Value::String(format!("kiln:agent:{session}")));
+    c.insert("kiln_source".into(), json!("agent"));
+    c.insert("kiln_agent".into(), Value::String(session.to_owned()));
+    c.insert("actor".into(), Value::String(on_behalf_of.to_owned()));
+    c.insert("kiln_on_behalf_of".into(), Value::String(on_behalf_of.to_owned()));
+    if let Some(h) = harness.filter(|h| !h.is_empty()) {
+        c.insert("kiln_harness".into(), Value::String(h.to_owned()));
+    }
+    stamp(&mut c, issuer, audience, jti, now, ttl);
     c
 }
 
@@ -255,7 +282,7 @@ pub fn discovery(issuer: &str, jwks_uri: &str) -> Value {
             "repository_owner_id", "repository_visibility", "run_id", "run_number", "run_attempt", "runner_environment", "actor",
             "actor_id", "workflow", "workflow_ref", "workflow_sha", "head_ref", "base_ref", "event_name", "ref_type", "ref_protected",
             "environment", "job_workflow_ref", "job_workflow_sha", "kiln_trust", "kiln_executor", "kiln_runner", "kiln_pool", "kiln_job",
-            "kiln_source", "kiln_app", "kiln_deployment", "kiln_trigger"
+            "kiln_source", "kiln_app", "kiln_deployment", "kiln_trigger", "kiln_service", "kiln_agent", "kiln_on_behalf_of", "kiln_harness"
         ],
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid"]
@@ -265,6 +292,20 @@ pub fn discovery(issuer: &str, jwks_uri: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W10-R11: the server's own subject and an agent's, each with what tells it apart.
+    #[test]
+    fn w10_r11_service_and_agent_subjects() {
+        let c = service_claims("8f3a", "broker", "https://kiln.example/oidc", "sts.amazonaws.com", "j1", 1_000, 300);
+        assert_eq!(c.get("sub"), Some(&json!("kiln:8f3a:service:broker")));
+        assert_eq!((c.get("kiln_source"), c.get("aud"), c.get("exp")), (Some(&json!("service")), Some(&json!("sts.amazonaws.com")), Some(&json!(1_300))));
+        let a = agent_claims("s1", "user:ada", Some("claude"), "https://kiln.example/oidc", "api.anthropic.com", "j2", 1_000, 99_999);
+        assert_eq!(a.get("sub"), Some(&json!("kiln:agent:s1")));
+        assert_eq!((a.get("kiln_on_behalf_of"), a.get("actor"), a.get("kiln_harness")), (Some(&json!("user:ada")), Some(&json!("user:ada")), Some(&json!("claude"))));
+        assert_eq!(a.get("exp"), Some(&json!(1_000 + MAX_TTL_SECS)), "an hour at most");
+        let d = discovery("https://kiln.example/oidc", "https://kiln.example/oidc/jwks");
+        assert!(d.get("claims_supported").and_then(Value::as_array).is_some_and(|c| c.contains(&json!("kiln_agent")) && c.contains(&json!("kiln_service"))));
+    }
 
     const DAY: i64 = 86_400;
 

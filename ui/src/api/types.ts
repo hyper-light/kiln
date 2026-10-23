@@ -29,6 +29,10 @@ export interface Me {
   authenticated: boolean;
   version: string;
   hostname: string;
+  /** Who is signed in: the owner, a person, or a token's or agent's principal. */
+  kind?: "owner" | "user" | "pat" | "agent" | "job" | "peer" | null;
+  /** Each capability held: on the whole server, or only somewhere (a repository, …). */
+  can?: Record<string, "server" | "some">;
   /** Where the server says it is reachable from other devices. */
   public_url?: string;
   /** Its runners' front doors (`https://kiln.home`, …). */
@@ -50,6 +54,8 @@ export interface Repo {
   created_at: number;
   last_polled_at: number | null;
   last_error: string | null;
+  /** `native`: kiln hosts it (W14); `upstream`: kiln follows another host's. */
+  mode?: string;
 }
 
 export interface Run {
@@ -69,6 +75,9 @@ export interface Run {
   finished_at: number | null;
   error: string | null;
   concurrency_group: string | null;
+  /** The runners and executors its legs ran on (the runs list's facets). */
+  runners?: string[];
+  executors?: string[];
 }
 
 export interface Step {
@@ -136,6 +145,8 @@ export interface Job {
   cpu_seconds: number | null;
   steps: Step[];
   spec?: PlannedJob;
+  /** A CI matrix leg's values, by axis. */
+  matrix?: Record<string, unknown>;
 }
 
 export interface HostSample {
@@ -261,15 +272,19 @@ export interface OverviewStats {
 export interface Overview {
   stats: OverviewStats;
   queue: { queued: number; running: number };
-  agents: { connected: number; total: number; slots: number; busy: number };
+  /** `null` for a person of some repositories (W10): runners are the server's. */
+  agents: { connected: number; total: number; slots: number; busy: number } | null;
   system: {
     version: string;
     uptime_s: number;
-    hostname: string;
+    /** `null` for a person of some repositories. */
+    hostname: string | null;
     generation: number;
     children: Child[];
     sample: HostSample | null;
   };
+  /** The repositories it covers, for a person of some of them (W10); absent, it is the whole server's. */
+  narrowed?: string[];
 }
 
 export interface RunDetail {

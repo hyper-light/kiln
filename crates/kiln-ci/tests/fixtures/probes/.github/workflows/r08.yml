@@ -1,0 +1,6 @@
+# F-22: level 8 of the nesting probe (make_reusable.py).
+name: r08
+on: workflow_call
+jobs:
+  next:
+    uses: ./.github/workflows/r09.yml

@@ -209,6 +209,15 @@ impl App {
         Ok((status, v))
     }
 
+    /// GitHub's GraphQL endpoint: `/graphql` beside github.com's REST API, an Enterprise Server's
+    /// `/api/graphql` beside its `/api/v3`.
+    pub fn graphql_url(&self) -> String {
+        match self.api.trim_end_matches('/').strip_suffix("/api/v3") {
+            Some(host) => format!("{host}/api/graphql"),
+            None => format!("{}/graphql", self.api.trim_end_matches('/')),
+        }
+    }
+
     /// The App's installation for `owner/name`, or for an owner (`name` without a `/`).
     pub async fn installation(&self, name: &str) -> anyhow::Result<u64> {
         static C: OnceLock<parking_lot::Mutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
@@ -296,8 +305,20 @@ impl App {
     /// Commits through the Git Data API: blobs, a tree on `expected`'s, a commit, and the branch
     /// moved only as a fast-forward (so never past someone else's commit).
     pub async fn commit(&self, repo: &Repo, branch: &str, expected: Option<&str>, files: &[super::Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
-        let (name, t) = self.token_for(repo, &[("contents", "write"), ("metadata", "read")]).await?;
-        let base_tree = match expected {
+        self.commit_on(repo, branch, expected, expected, files, message, author).await
+    }
+
+    /// [`App::commit`], the commit made on `base` (none: an empty tree) and the branch at
+    /// `expected` (none: made by it), as a new branch off another's head is. A workflow file is
+    /// written only with the `workflows` permission, as GitHub refuses it otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_on(&self, repo: &Repo, branch: &str, base: Option<&str>, expected: Option<&str>, files: &[super::Change], message: &str, author: &Author) -> Result<Committed, CommitError> {
+        let mut perms = vec![("contents", "write"), ("metadata", "read")];
+        if files.iter().any(|f| f.path.starts_with(".github/workflows/")) {
+            perms.push(("workflows", "write"));
+        }
+        let (name, t) = self.token_for(repo, &perms).await?;
+        let base_tree = match base {
             Some(e) => {
                 let (st, v) = self.call(Method::Get, &format!("/repos/{name}/git/commits/{e}"), Auth::Token(&t), None).await?;
                 if st != 200 {
@@ -330,12 +351,12 @@ impl App {
             return Err(CommitError::Other(anyhow!("the tree: {}", said(&v))));
         }
         let tree = v.get("sha").and_then(Value::as_str).unwrap_or_default().to_owned();
-        if let (Some(e), Some(b)) = (expected, &base_tree)
+        if let (Some(e), Some(b)) = (base, &base_tree)
             && *b == tree
         {
             return Ok(Committed::Unchanged(e.to_owned()));
         }
-        let parents: Vec<&str> = expected.into_iter().collect();
+        let parents: Vec<&str> = base.into_iter().collect();
         let who = json!({ "name": author.name, "email": author.email });
         let (st, v) = self.call(Method::Post, &format!("/repos/{name}/git/commits"), Auth::Token(&t), Some(&json!({ "message": message, "tree": tree, "parents": parents, "author": who, "committer": who }))).await?;
         if st != 201 {

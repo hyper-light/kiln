@@ -1,0 +1,6 @@
+# The Conda starter's environment (`conda env update --file environment.yml --name base`).
+name: base
+channels:
+  - conda-forge
+dependencies:
+  - pip

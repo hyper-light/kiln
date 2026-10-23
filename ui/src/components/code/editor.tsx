@@ -1,13 +1,14 @@
 /**
  * The code editor (docs/ci.md W21-R01): CodeMirror 6 with YAML, `${{ }}` marked inside it,
- * diagnostics from the server 300 ms after typing stops, and completion the page supplies. Lines
- * wrap, so nothing scrolls sideways on a phone. Loaded on demand: import it with React.lazy.
+ * diagnostics from the server 300 ms after typing stops, and completion and hover the page
+ * supplies. Lines wrap, so nothing scrolls sideways on a phone. Loaded on demand: import it with
+ * React.lazy.
  */
 import * as React from "react";
 import { autocompletion, closeBrackets, completionKeymap, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { yaml } from "@codemirror/lang-yaml";
-import { bracketMatching, HighlightStyle, indentOnInput, syntaxHighlighting } from "@codemirror/language";
+import { bracketMatching, HighlightStyle, indentOnInput, StreamLanguage, syntaxHighlighting } from "@codemirror/language";
 import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { EditorState } from "@codemirror/state";
@@ -17,6 +18,7 @@ import {
   EditorView,
   highlightActiveLine,
   highlightActiveLineGutter,
+  hoverTooltip,
   keymap,
   lineNumbers,
   MatchDecorator,
@@ -25,6 +27,7 @@ import {
   type ViewUpdate,
 } from "@codemirror/view";
 import { tags as t } from "@lezer/highlight";
+import { agentFile, dockerFile } from "./image-modes";
 
 export type { Diagnostic } from "@codemirror/lint";
 export type { CompletionContext, CompletionResult } from "@codemirror/autocomplete";
@@ -36,8 +39,14 @@ export interface CodeEditorProps {
   /** The document's problems, asked for 300 ms after typing stops. */
   lint?: (text: string) => Promise<Diagnostic[]>;
   complete?: (ctx: CompletionContext) => CompletionResult | null | Promise<CompletionResult | null>;
+  /** What to say of what's under the pointer at `pos`: where it is, and the words. */
+  hover?: (text: string, pos: number) => { from: number; to: number; text: string } | null;
   label: string;
+  /** What it reads the text as: YAML (by default), a Dockerfile or an Agentfile (W13-R11). */
+  language?: "yaml" | "dockerfile" | "agentfile";
 }
+
+const languages = { yaml, dockerfile: () => StreamLanguage.define(dockerFile), agentfile: () => StreamLanguage.define(agentFile) };
 
 const highlight = HighlightStyle.define([
   { tag: [t.propertyName, t.definition(t.propertyName)], color: "#a6c4ed" },
@@ -70,6 +79,7 @@ const theme = EditorView.theme(
     ".cm-lintRange-warning": { backgroundImage: "none", textDecoration: "underline wavy #cbb69a", textUnderlineOffset: "3px" },
     ".cm-panels": { backgroundColor: "#0e1014", color: "#d4dde8" },
     ".cm-searchMatch": { backgroundColor: "rgb(216 203 176 / 18%)" },
+    ".cm-hover-words": { maxWidth: "min(360px, 80vw)", padding: "6px 9px", fontSize: "12px", lineHeight: "1.5", color: "#c9d0da" },
   },
   { dark: true },
 );
@@ -111,13 +121,28 @@ export default function CodeEditor(props: CodeEditorProps) {
           highlightSelectionMatches(),
           EditorView.lineWrapping,
           EditorView.contentAttributes.of({ "aria-label": latest.current.label }),
-          yaml(),
+          languages[latest.current.language ?? "yaml"](),
           syntaxHighlighting(highlight),
           expressions,
           theme,
           lintGutter(),
           linter((v) => latest.current.lint?.(v.state.doc.toString()) ?? [], { delay: 300 }),
           autocompletion({ override: [(ctx) => latest.current.complete?.(ctx) ?? null], icons: false }),
+          hoverTooltip((view, pos) => {
+            const h = latest.current.hover?.(view.state.doc.toString(), pos);
+            if (!h) return null;
+            return {
+              pos: h.from,
+              end: h.to,
+              above: true,
+              create: () => {
+                const dom = document.createElement("div");
+                dom.className = "cm-hover-words";
+                dom.textContent = h.text;
+                return { dom };
+              },
+            };
+          }),
           keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap, ...searchKeymap, ...completionKeymap]),
           EditorView.updateListener.of((u) => {
             if (u.docChanged) latest.current.onChange?.(u.state.doc.toString());

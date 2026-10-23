@@ -19,7 +19,7 @@
 //! mirror, polling and events of upstream repositories serve it too; a push wakes the poller at
 //! once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -424,8 +424,21 @@ async fn trunks(hub: &Hub, path: &str) -> (Vec<String>, Review) {
     (list, review)
 }
 
+/// Reads what's left of a refused push and drops it: at most 4 GiB, for ten minutes, and nothing
+/// once the client pauses for a minute.
+async fn drain(body: &mut kiln_http::Incoming) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut read = 0u64;
+    while read < 4 << 30 && std::time::Instant::now() < deadline {
+        match crate::rt::timeout(std::time::Duration::from_secs(60), srv::next_chunk(body)).await {
+            Ok(Ok(Some(chunk))) => read += chunk.len() as u64,
+            _ => break,
+        }
+    }
+}
+
 /// More of a push's start: its next chunk, into `head`.
-async fn more(head: &mut Vec<u8>, body: &mut hyper::body::Incoming) -> Result<(), Fail> {
+async fn more(head: &mut Vec<u8>, body: &mut kiln_http::Incoming) -> Result<(), Fail> {
     if head.len() >= 1 << 20 {
         return Err((StatusCode::PAYLOAD_TOO_LARGE, "too many ref updates in one push".into()));
     }
@@ -519,9 +532,11 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         }
         let message = no.iter().map(|(u, why)| format!("{}: {why}", u.name)).collect::<Vec<_>>().join("\n");
         hub.store.audit(user.clone(), "repo.push".into(), format!("{} refused: {}", repo.name, message.replace('\n', "; "))).await;
+        // The rest of the push (its pack) is read and dropped first: answered while it still
+        // sends, git sees the connection close, not why.
+        drain(&mut body).await;
         return Ok(srv::response(StatusCode::OK, "application/x-git-receive-pack-result", srv::full(bytes::Bytes::from(refusal(&all, &caps, &message)))));
     }
-    let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
     let target = submitted.first().map(|u| (*u).clone());
     // The push's options follow its commands.
     let mut given: Vec<String> = Vec::new();
@@ -547,6 +562,14 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         }
         None => None,
     };
+    // Who pushes to each branch and tag (W10-R02's `secrets.use`), kept before git takes it: the
+    // poller makes the push's events, and their runs are given only the secrets the pusher may
+    // use. A push kiln can't keep this for is refused.
+    let started_by = match &who {
+        Pusher::Caller(c) => c.started_by(),
+        Pusher::Job(_) => None,
+    };
+    keep_pushers(hub, repo, &updates, started_by.as_ref()).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("who pushed couldn't be kept, so the push isn't taken: {e:#}")))?;
     // git takes the push; its answer (a report, and its progress) is read before it's passed on,
     // so kiln can say what the push made.
     let mut configs: Vec<&str> = cgi.configs.to_vec();
@@ -576,7 +599,20 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         }
     }
     // What git took (`ok <ref>`), before kiln says more.
-    let took: std::collections::HashSet<String> = report.lines.iter().filter_map(|l| l.strip_prefix("ok ")).map(|r| r.split_whitespace().next().unwrap_or(r).to_owned()).collect();
+    let took: HashSet<String> = report.lines.iter().filter_map(|l| l.strip_prefix("ok ")).map(|r| r.split_whitespace().next().unwrap_or(r).to_owned()).collect();
+    // The first branch pushed to an empty repository is its default, as on GitHub, when the one
+    // it was made on (its HEAD) isn't among those pushed.
+    if empty
+        && let Some(first) = updates.iter().filter(|u| u.creates() && took.contains(&u.name)).find_map(|u| u.name.strip_prefix("refs/heads/"))
+        && trunk_list.last().is_some_and(|head| !updates.iter().any(|u| u.name == format!("refs/heads/{head}")))
+        && crate::gitops::run_git(hub, &["-C", &p, "symbolic-ref", "HEAD", &format!("refs/heads/{first}")], crate::gitops::LS_REMOTE_TIMEOUT).await.is_ok()
+    {
+        let (id, branch) = (repo.id.clone(), first.to_owned());
+        if let Err(e) = hub.store.call(move |c| Ok(c.execute("UPDATE repos SET default_branch = ?2 WHERE id = ?1", rusqlite::params![id, branch])?)).await {
+            tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the default branch could not be recorded");
+        }
+        said.push(format!("{first} is the repository's default branch: the first pushed"));
+    }
     if let Some(target) = &target {
         let at = report.lines.iter().position(|l| *l == format!("ok {}", target.name));
         if let (Some(at), Some((spec, suffix))) = (at, for_ref(&target.name)) {
@@ -587,12 +623,12 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
                 // A change request (W14-R04): the branch is the commit pushed, then reviewed whole.
                 Some((trunk, branch)) => match crate::gitops::run_git(hub, &["-C", &p, "update-ref", &format!("refs/heads/{branch}"), &target.new], crate::gitops::LS_REMOTE_TIMEOUT).await {
                     Ok(_) => {
-                        let by = super::cr::By { pushed_by: user.clone(), author: author.clone() };
+                        let by = super::cr::By { pushed_by: user.clone(), author: author.clone(), started_by: started_by.clone() };
                         super::cr::submit(hub, repo, &p, trunk, branch, &target.new, &by, &options).await.map(|o| vec![o])
                     }
                     Err(e) => Err(format!("the branch {branch}: {e:#}")),
                 },
-                None => super::diffs::submit(hub, super::diffs::Submission { repo, path: &p, trunk: spec, sha: &target.new, pushed_by: &user, author: author.clone(), options }).await,
+                None => super::diffs::submit(hub, super::diffs::Submission { repo, path: &p, trunk: spec, sha: &target.new, pushed_by: &user, started_by: started_by.clone(), author: author.clone(), options }).await,
             };
             match result {
                 Ok(outcomes) => {
@@ -619,6 +655,42 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         // The ref was only the push's way in.
         let _ = crate::gitops::run_git(hub, &["-C", &p, "update-ref", "-d", &target.name], crate::gitops::LS_REMOTE_TIMEOUT).await;
     }
+    let by = super::cr::By { pushed_by: user, author, started_by };
+    said.extend(after_push(hub, repo, &p, &by, &trunk_list, &updates, &took).await);
+    Ok(srv::response(StatusCode::OK, &ctype, srv::full(bytes::Bytes::from(write_report(&report, &said, band)))))
+}
+
+/// Who moves each branch and tag (W10-R02's `secrets.use`), kept before the refs move: the poller
+/// makes the push's events, and their runs are given only the secrets the pusher may use.
+async fn keep_pushers(hub: &Hub, repo: &Repo, updates: &[Update], started_by: Option<&serde_json::Value>) -> anyhow::Result<()> {
+    let moved: Vec<(String, String)> = updates.iter().filter(|u| u.name.starts_with("refs/heads/") || u.name.starts_with("refs/tags/")).map(|u| (u.name.clone(), u.new.clone())).collect();
+    if moved.is_empty() {
+        return Ok(());
+    }
+    let (id, by) = (repo.id.clone(), started_by.map(serde_json::Value::to_string));
+    hub.store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            let tx = c.transaction()?;
+            for (r, sha) in moved {
+                tx.execute("DELETE FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2", rusqlite::params![id, r])?;
+                // Whoever may use every secret leaves nothing to hold its runs to.
+                if let Some(b) = &by
+                    && sha != ZERO
+                {
+                    tx.execute("INSERT OR REPLACE INTO ci_pushes (repo_id, ref, sha, started_by, ts) VALUES (?1, ?2, ?3, ?4, ?5)", rusqlite::params![id, r, sha, b, now])?;
+                }
+            }
+            tx.execute("DELETE FROM ci_pushes WHERE ts < ?1", [now - 30 * 86_400])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// What follows the ref updates git took (`took`, of `updates`): what it says of them.
+async fn after_push(hub: &Arc<Hub>, repo: &Repo, p: &str, by: &super::cr::By, trunk_list: &[String], updates: &[Update], took: &HashSet<String>) -> Vec<String> {
+    let mut said = Vec::new();
     // Branches pushed (not trunks): their open change requests get the new heads as versions.
     let branches: Vec<(String, String)> = updates
         .iter()
@@ -627,19 +699,80 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         .filter(|(b, _)| !trunk_list.iter().any(|t| t == b))
         .collect();
     if !branches.is_empty() {
-        let by = super::cr::By { pushed_by: user.clone(), author: author.clone() };
-        said.extend(super::cr::pushed(hub, repo, &p, &branches, &by).await);
+        said.extend(super::cr::pushed(hub, repo, p, &branches, by).await);
     }
     // A trunk written directly goes to the mirror too.
     for t in trunk_list.iter().filter(|t| took.contains(&format!("refs/heads/{t}"))) {
-        mirror_trunk(hub, repo, &p, t);
+        mirror_trunk(hub, repo, p, t);
     }
-    hub.store.audit(user, "repo.push".into(), format!("{}: {summary}", repo.name)).await;
+    // What a job pushes with its token starts no run, as GitHub starts none for what a
+    // `GITHUB_TOKEN` does (but `workflow_dispatch` and `repository_dispatch`): a job doesn't start
+    // itself again. Its moves are recorded first, so the poller finds them taken.
+    if super::diffs::by_job(&by.pushed_by) {
+        for u in updates.iter().filter(|u| !u.deletes() && took.contains(&u.name) && !u.name.starts_with("refs/for/")) {
+            let _ = hub.store.advance_ref(repo.id.clone(), u.name.clone(), u.new.clone()).await;
+        }
+    }
+    let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
+    hub.store.audit(by.pushed_by.clone(), "repo.push".into(), format!("{}: {summary}", repo.name)).await;
     // The poller takes the new refs now: events, runs.
     if updates.iter().any(|u| !u.name.starts_with("refs/for/")) {
         hub.gitops_kick.notify();
     }
-    Ok(srv::response(StatusCode::OK, &ctype, srv::full(bytes::Bytes::from(write_report(&report, &said, band)))))
+    said
+}
+
+/// A commit of `file` to `branch` of a repository kiln hosts, made through the API (a workflow
+/// saved from its editor, W21-R06) as a push of it would be: on the branch's head (a new branch on
+/// the default branch's), refused for what a push is refused for, its pusher kept for its runs'
+/// secrets, and what follows a push. The commit, and what kiln says of it.
+pub(crate) async fn commit_branch(hub: &Arc<Hub>, repo: &Repo, caller: &Caller, branch: &str, file: &str, content: Vec<u8>, message: &str) -> Result<(String, Vec<String>), Fail> {
+    let path = native_path(hub, repo).ok_or((StatusCode::CONFLICT, format!("{} isn't hosted here", repo.name)))?;
+    let p = path.to_string_lossy().into_owned();
+    let git = |args: Vec<String>| {
+        let p = p.clone();
+        async move {
+            let mut a: Vec<&str> = vec!["-C", &p];
+            a.extend(args.iter().map(String::as_str));
+            crate::gitops::run_git(hub, &a, crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned())
+        }
+    };
+    if branch.starts_with('-') || git(vec!["check-ref-format".into(), format!("refs/heads/{branch}")]).await.is_err() {
+        return Err((StatusCode::BAD_REQUEST, format!("`{branch}` isn't a branch name")));
+    }
+    let (trunk_list, review) = trunks(hub, &p).await;
+    let head = git(vec!["rev-parse".into(), "--verify".into(), "--quiet".into(), format!("refs/heads/{branch}^{{commit}}")]).await.ok().filter(|s| s.len() == 40);
+    let default = git(vec!["symbolic-ref".into(), "--short".into(), "HEAD".into()]).await.unwrap_or_else(|_| "main".into());
+    let base = match &head {
+        Some(h) => h.clone(),
+        None => git(vec!["rev-parse".into(), "--verify".into(), format!("refs/heads/{default}^{{commit}}")]).await.map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, format!("{default} has no commits yet")))?,
+    };
+    let mode = git(vec!["ls-tree".into(), base.clone(), "--".into(), file.to_owned()]).await.ok().and_then(|l| l.split_whitespace().next().map(str::to_owned)).unwrap_or_else(|| "100644".into());
+    let tree = super::diffs::tree_with(hub, &p, &base, super::diffs::Edit::Put { file, mode: &mode, content }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    if git(vec!["rev-parse".into(), format!("{base}^{{tree}}")]).await.is_ok_and(|t| t == tree) {
+        return Err((StatusCode::CONFLICT, format!("{file} is already so on {branch}: nothing to commit")));
+    }
+    let author = super::diffs::author_of(&caller.name, Some(caller.kind));
+    let me = author.0.strip_prefix("user:").unwrap_or(&author.0).to_owned();
+    let sha = super::diffs::make_commit(hub, &p, &tree, &base, (&me, None), &me, &format!("{}\n", message.trim_end())).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let u = Update { old: head.clone().unwrap_or_else(|| ZERO.to_owned()), new: sha.clone(), name: format!("refs/heads/{branch}") };
+    let who = Pusher::Caller(caller.clone());
+    // Not an empty repository: the commit is on one of its own.
+    if let Some(why) = refused(&who, &repo.name, &review, &trunk_list, &u, false) {
+        hub.store.audit(who.name(), "repo.push".into(), format!("{} refused: {}: {why}", repo.name, u.name)).await;
+        return Err((StatusCode::FORBIDDEN, format!("{branch}: {why}")));
+    }
+    let started_by = caller.started_by();
+    keep_pushers(hub, repo, std::slice::from_ref(&u), started_by.as_ref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("who committed couldn't be kept, so the commit isn't taken: {e:#}")))?;
+    if git(vec!["update-ref".into(), u.name.clone(), sha.clone(), u.old.clone()]).await.is_err() {
+        return Err((StatusCode::CONFLICT, format!("{branch} moved while this was saved: reload it and save again")));
+    }
+    let took: HashSet<String> = [u.name.clone()].into();
+    let by = super::cr::By { pushed_by: who.name(), author, started_by };
+    let said = after_push(hub, repo, &p, &by, &trunk_list, std::slice::from_ref(&u), &took).await;
+    Ok((sha, said))
 }
 
 fn short(oid: &str) -> &str {

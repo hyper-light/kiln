@@ -306,7 +306,9 @@ impl Pki {
 
     /// The server's leaf, (re)issued when missing, expiring, or when its names changed.
     pub fn server_leaf(&self, extra_names: &[String]) -> anyhow::Result<Leaf> {
-        let mut names = vec![SERVER_NAME.to_owned(), "localhost".to_owned(), "127.0.0.1".to_owned()];
+        // And the name containers on this machine reach it by (a leg's job container, Docker
+        // actions: `host.docker.internal`).
+        let mut names = vec![SERVER_NAME.to_owned(), "localhost".to_owned(), "127.0.0.1".to_owned(), crate::runner::docker::HOST_ALIAS.to_owned()];
         let host = crate::config::Config::hostname();
         names.push(host);
         for n in extra_names {

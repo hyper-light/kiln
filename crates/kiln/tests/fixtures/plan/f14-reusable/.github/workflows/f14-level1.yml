@@ -1,0 +1,23 @@
+# F-14's first level: typed inputs, one left to its default.
+name: level1
+on:
+  workflow_call:
+    inputs:
+      count:
+        type: number
+        required: true
+      flag:
+        type: boolean
+        default: false
+      label:
+        type: string
+        default: plain
+    outputs:
+      answer:
+        value: ${{ jobs.down.outputs.answer }}
+jobs:
+  down:
+    uses: ./.github/workflows/f14-level2.yml
+    with:
+      prefix: ${{ inputs.count }}-${{ inputs.flag }}-${{ inputs.label }}
+    secrets: inherit

@@ -135,7 +135,7 @@ export const api = {
     setAuthed(true);
   },
   /** Which sign-in methods this server offers (public). */
-  authMethods: (signal?: AbortSignal) => get<{ password: boolean; token: boolean }>("/api/auth/methods", signal),
+  authMethods: (signal?: AbortSignal) => get<{ password: boolean; token: boolean; passkey?: boolean; people?: boolean }>("/api/auth/methods", signal),
   loginPassword: async (password: string) => {
     await post<void>("/api/auth/password", { password });
     setAuthed(true);
@@ -191,8 +191,9 @@ export const api = {
   pollRepo: (id: string) => post<void>(`/api/repos/${enc(id)}/poll`),
   triggerRepo: (id: string, body: { branch?: string; pipeline?: string }) => post<Run[]>(`/api/repos/${enc(id)}/trigger`, body),
 
-  runs: (params: { repo?: string; limit?: number; before?: string | number }, signal?: AbortSignal) =>
-    get<Run[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before })}`, signal),
+  /** Newest first, older pages `before` a time; or by `sort` (`oldest`, `longest`, `shortest`), later pages from `offset`. */
+  runs: (params: { repo?: string; limit?: number; before?: string | number; sort?: string; offset?: number }, signal?: AbortSignal) =>
+    get<Run[]>(`/api/runs${qs({ repo: params.repo, limit: params.limit ?? 50, before: params.before, sort: params.sort, offset: params.offset })}`, signal),
   run: (id: string, signal?: AbortSignal, attempt?: number) => get<RunDetail>(`/api/runs/${enc(id)}${attempt ? `?attempt=${attempt}` : ""}`, signal),
   cancelRun: (id: string) => post<void>(`/api/runs/${enc(id)}/cancel`),
   retryRun: (id: string, onlyFailed: boolean) => post<void>(`/api/runs/${enc(id)}/retry`, { only_failed: onlyFailed }),

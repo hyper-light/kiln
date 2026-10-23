@@ -7,7 +7,7 @@
 import * as React from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { Link, useParams } from "@/lib/router";
-import { diffRes, filesRes, inboxRes, readinessRes, reviewApi, STATE_WORD, threadsRes, whoSaid, type DiffDetail, type ReviewAction, type Thread } from "@/api/review";
+import { dependenciesRes, diffRes, filesRes, inboxRes, readinessRes, reviewApi, STATE_WORD, threadsRes, whoSaid, type DiffDetail, type ReviewAction, type Thread } from "@/api/review";
 import { Button } from "@/components/ui/button";
 import { Loadable, Loading } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
@@ -19,6 +19,7 @@ import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { useListener } from "@/views/harness/dom";
 import { anchorOf, FileDiff, ThreadView, type Pick } from "./diff";
+import { Gates } from "./gates";
 import { findMoves, parsePatch } from "./patch";
 import "./review.css";
 
@@ -103,8 +104,39 @@ function Review({ diffKey }: { diffKey: string }) {
           <Files diffKey={diffKey} version={version} split={split} whitespace={whitespace} threads={threads} />
         )}
       </Loadable>
+      <Loadable label="Loading its dependency changes" fallback={<></>}>
+        <Dependencies diffKey={diffKey} to={compare == null ? version : Math.max(compare, version)} from={compare == null ? null : Math.min(compare, version)} />
+      </Loadable>
       <ReviewForm d={d} drafts={drafts} />
     </>
+  );
+}
+
+/** What the version changes in the dependencies its lockfiles pin (docs/ci.md W18-R03): each
+ * lockfile's packages added, removed and changed. Nothing when none did. */
+function Dependencies({ diffKey, to, from }: { diffKey: string; to: number; from: number | null }) {
+  const deps = useRes(dependenciesRes(diffKey, to, from)).data;
+  if (!deps.lockfiles.length) return null;
+  return (
+    <section className="flex flex-col gap-2 py-3" aria-label="Dependency changes">
+      <h3 className="font-mono text-[11px] tracking-[0.08em] text-[#93a1b4] uppercase">Dependencies, from {deps.from}</h3>
+      {deps.lockfiles.map((f) => (
+        <details key={f.path} open={deps.lockfiles.length === 1} className="min-w-0">
+          <summary className="cursor-pointer text-[12.5px] text-[#c5cdd8]">
+            <code className="font-mono text-[#e4e5e7]">{f.path}</code>{" "}
+            <span className="text-[#8c8f98]">{[f.added && `${f.added} added`, f.removed && `${f.removed} removed`, f.changed && `${f.changed} changed`].filter(Boolean).join(" · ")}</span>
+          </summary>
+          <ul className="mt-1.5 flex flex-col gap-0.5 pl-4">
+            {f.changes.map((c) => (
+              <li key={`${c.ecosystem}/${c.name}`} className="flex min-w-0 flex-wrap gap-x-2 font-mono text-[11.5px] text-[#a6b2c6]">
+                <span className="[overflow-wrap:anywhere] text-[#d4dde8]">{c.name}</span>
+                <span>{c.from.length === 0 ? `added ${c.to.join(", ")}` : c.to.length === 0 ? `removed ${c.from.join(", ")}` : `${c.from.join(", ")} → ${c.to.join(", ")}`}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ))}
+    </section>
   );
 }
 
@@ -183,16 +215,20 @@ function Head({ d }: { d: DiffDetail }) {
 
 function Checks({ d }: { d: DiffDetail }) {
   if (d.runs.length === 0) return <p className="rv-sub rv-checks">No checks have run on its latest version.</p>;
+  const gates = d.runs.flatMap((r) => r.gates ?? []);
   return (
-    <ul className="rv-checks" aria-label="Checks on its latest version">
-      {d.runs.map((r) => (
-        <li key={r.id}>
-          <StatusDot status={r.conclusion ?? r.status} title={r.conclusion ?? r.status} />
-          <Link to={`/runs/${r.id}`}>{r.workflow ?? r.name ?? `run ${r.number ?? ""}`}</Link>
-          <span className="rv-sub">{r.conclusion ?? r.status}</span>
-        </li>
-      ))}
-    </ul>
+    <>
+      <ul className="rv-checks" aria-label="Checks on its latest version">
+        {d.runs.map((r) => (
+          <li key={r.id}>
+            <StatusDot status={r.conclusion ?? r.status} title={r.conclusion ?? r.status} />
+            <Link to={`/runs/${r.id}`}>{r.workflow ?? r.name ?? `run ${r.number ?? ""}`}</Link>
+            <span className="rv-sub">{r.conclusion ?? r.status}</span>
+          </li>
+        ))}
+      </ul>
+      {gates.length > 0 && <Gates gates={gates} />}
+    </>
   );
 }
 

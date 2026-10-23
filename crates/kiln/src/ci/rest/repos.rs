@@ -3,10 +3,12 @@
 //! - `GET /repos/{o}/{r}`;
 //! - `/commits/{ref}`;
 //! - `/branches/{b}`;
-//! - `/git/ref/{ref}` and `/git/matching-refs/{ref}`;
+//! - `/git/ref/{ref}`, `/git/matching-refs/{ref}` and the older `/git/refs[/{ref}]`;
 //! - `/contents/{path}?ref=`;
 //! - `/tarball/{ref}` and `/zipball/{ref}`;
 //! - `/compare/{base}...{head}`.
+
+use std::sync::Arc;
 
 use base64::Engine as _;
 use http::StatusCode;
@@ -20,7 +22,7 @@ use crate::store::Repo;
 
 /// The run's repository, as the facade describes it.
 pub struct Site<'a> {
-    pub hub: &'a Hub,
+    pub hub: &'a Arc<Hub>,
     pub repo: Repo,
     /// `<origin>/api/v3/repos/<owner>/<repo>`.
     pub api: String,
@@ -32,7 +34,7 @@ pub struct Site<'a> {
 }
 
 impl Site<'_> {
-    pub async fn new<'a>(hub: &'a Hub, repo: Repo, origin: &str) -> Site<'a> {
+    pub async fn new<'a>(hub: &'a Arc<Hub>, repo: Repo, origin: &str) -> Site<'a> {
         let f = crate::ci::events::facts(hub, &repo).await;
         Site { api: format!("{origin}/api/v3/repos/{}", repo.name), html: format!("{origin}/{}", repo.name), origin: origin.to_owned(), mirror: f.mirror, default_branch: f.default_branch, hub, repo }
     }
@@ -58,6 +60,11 @@ impl Site<'_> {
             }
         }
         None
+    }
+
+    /// The last commit `a` and `b` share, if they share one.
+    pub async fn merge_base(&self, a: &str, b: &str) -> Option<String> {
+        self.text(&["merge-base", a, b]).await.filter(|s| s.len() == 40)
     }
 
     pub fn owner(&self) -> &str {
@@ -219,6 +226,14 @@ pub async fn git_refs(s: &Site<'_>, r: &str, one: bool) -> Response {
     } else {
         srv::json(StatusCode::OK, &Value::Array(found))
     }
+}
+
+/// `GET /git/refs[/{ref}]`, GitHub's older form: the ref when one is named exactly, else the
+/// refs it begins (every ref, with none).
+pub async fn git_refs_older(s: &Site<'_>, r: &str) -> Response {
+    let full = format!("refs/{}", r.trim_start_matches("refs/"));
+    let exact = !r.is_empty() && s.text(&["for-each-ref", "--format=%(refname)", &full]).await.is_some_and(|out| out.lines().any(|l| l == full));
+    git_refs(s, r, exact).await
 }
 
 /// `GET /repos/{o}/{r}/contents/{path}?ref=`: a file (base64, or raw when asked) or a

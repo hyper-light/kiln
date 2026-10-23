@@ -2,7 +2,7 @@
 
 > **Superseded by [ci.md](ci.md), W20-R11** (2026-10-17), which adapts this draft. Kept for history.
 
-> **Draft spec.** None of this is built yet.
+> **Built** as [ci.md](ci.md) W20-R11 describes, which also says what's left.
 
 When an agent asks you to choose between options, you don't have to guess. **Run an experiment**:
 kiln has the agent build every option in its own isolated workspace, measures every variant

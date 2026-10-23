@@ -15,6 +15,7 @@ import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
+import { Gates } from "./gates";
 import "./review.css";
 
 const TONE: Record<string, string> = { queued: "queued", testing: "running", landed: "succeeded", ejected: "failed", cancelled: "cancelled" };
@@ -77,34 +78,39 @@ function Entries({ repo }: { repo: string }) {
   };
   return (
     <ul className="rv-inbox-list">
-      {entries.map((e) => (
-        <li key={e.id} className="rv-queue-row">
-          <StatusDot status={TONE[e.state] ?? e.state} title={e.state} />
-          <div className="min-w-0 flex-1">
-            <p className="rv-inbox-what">
-              {e.diffs.map((d, i) => (
-                <React.Fragment key={d}>
-                  {i > 0 && ", "}
-                  <Link to={`/review/${d}`}>{d}</Link>
-                </React.Fragment>
-              ))}{" "}
-              <span className="rv-sub">
-                onto {e.trunk} · {e.strategy.replace(/-/g, " ")} · {e.state}
-                {e.batch ? " · in the batch under test" : ""}
-              </span>
-            </p>
-            <p className="rv-sub">
-              {whoSaid(e.enqueued_by)} · {relativeTime(e.created_at)}
-              {e.reason ? ` · ${e.reason}` : ""}
-            </p>
-          </div>
-          {(e.state === "queued" || e.state === "testing") && (
-            <Button size="xs" variant="ghost" disabled={busy !== null} onClick={() => void out(e.id)}>
-              Take it out
-            </Button>
-          )}
-        </li>
-      ))}
+      {entries.map((e) => {
+        // The candidate's benchmark gates, but for what the reason already says.
+        const gates = (e.gates ?? []).filter((g) => !e.reason?.includes(g.message));
+        return (
+          <li key={e.id} className="rv-queue-row">
+            <StatusDot status={TONE[e.state] ?? e.state} title={e.state} />
+            <div className="min-w-0 flex-1">
+              <p className="rv-inbox-what">
+                {e.diffs.map((d, i) => (
+                  <React.Fragment key={d}>
+                    {i > 0 && ", "}
+                    <Link to={`/review/${d}`}>{d}</Link>
+                  </React.Fragment>
+                ))}{" "}
+                <span className="rv-sub">
+                  onto {e.trunk} · {e.strategy.replace(/-/g, " ")} · {e.state}
+                  {e.batch ? " · in the batch under test" : ""}
+                </span>
+              </p>
+              <p className="rv-sub">
+                {whoSaid(e.enqueued_by)} · {relativeTime(e.created_at)}
+                {e.reason ? ` · ${e.reason}` : ""}
+              </p>
+              {gates.length > 0 && <Gates gates={gates} />}
+            </div>
+            {(e.state === "queued" || e.state === "testing") && (
+              <Button size="xs" variant="ghost" disabled={busy !== null} onClick={() => void out(e.id)}>
+                Take it out
+              </Button>
+            )}
+          </li>
+        );
+      })}
     </ul>
   );
 }

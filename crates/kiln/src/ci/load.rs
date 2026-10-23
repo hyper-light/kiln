@@ -39,6 +39,8 @@ pub struct Commit {
     pub workflows: Vec<Loaded>,
     pub github_run: bool,
     pub github_note: String,
+    /// Its actions' files (`.github/actions/**/action.yml`, `.kiln/actions/…`), for their editor.
+    pub actions: Vec<String>,
 }
 
 /// Is `r` a ref this module passes to git: a branch, tag, `pull/<n>/head`, `HEAD` or SHA, never
@@ -113,11 +115,15 @@ pub async fn load_from(src: &impl Source, sha: &str, setting: GithubWorkflows) -
     let (run_github, note) = wf::github_workflows_run(setting, has_kiln);
     let overlays: HashMap<String, (String, String)> =
         files.iter().filter_map(|(p, oid, k)| if let FileKind::Overlay { stem } = k { Some((stem.clone(), (p.clone(), oid.clone()))) } else { None }).collect();
-    let mut out = Commit { workflows: Vec::new(), github_run: run_github, github_note: note.to_owned() };
+    let mut out = Commit { workflows: Vec::new(), github_run: run_github, github_note: note.to_owned(), actions: Vec::new() };
     for (path, oid, kind) in &files {
         let (dialect, runs) = match kind {
             FileKind::KilnWorkflow => (Dialect::Kiln, true),
             FileKind::GhaWorkflow => (Dialect::Gha, run_github),
+            FileKind::Action => {
+                out.actions.push(path.clone());
+                continue;
+            }
             _ => continue,
         };
         let stem = path.rsplit('/').next().and_then(|n| n.strip_suffix(".yml").or_else(|| n.strip_suffix(".yaml"))).unwrap_or_default().to_owned();
@@ -160,7 +166,7 @@ struct Mirror<'a> {
 
 impl Source for Mirror<'_> {
     async fn tree(&self, sha: &str) -> anyhow::Result<String> {
-        let out = gitops::run_git(self.hub, &["-C", &self.dir, "ls-tree", "-r", sha, "--", ".github/workflows", ".kiln"], LS_REMOTE_TIMEOUT).await?;
+        let out = gitops::run_git(self.hub, &["-C", &self.dir, "ls-tree", "-r", sha, "--", ".github/workflows", ".github/actions", ".kiln"], LS_REMOTE_TIMEOUT).await?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 

@@ -1,0 +1,29 @@
+# F-22 (docs/ci.md W22-AC03, A.8): the last-writer rule for a matrix job's outputs. The legs set
+# the same output and finish in a known order (the first leg last); the job after reads it. One
+# output is set by the second leg, then set empty by the first: whether an empty value overwrites.
+name: probe matrix outputs
+on: [push, workflow_dispatch]
+jobs:
+  m:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        v: [first, second, third]
+    outputs:
+      x: ${{ steps.s.outputs.x }}
+      only-second: ${{ steps.s.outputs.only-second }}
+    steps:
+      - id: s
+        run: |
+          case "${{ matrix.v }}" in first) sleep 40;; second) sleep 20;; third) sleep 1;; esac
+          echo "x=${{ matrix.v }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.v }}" = second ]; then echo "only-second=yes" >> "$GITHUB_OUTPUT"; fi
+          if [ "${{ matrix.v }}" = first ]; then echo "only-second=" >> "$GITHUB_OUTPUT"; fi
+  after:
+    needs: m
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "PROBE matrix.output=${{ needs.m.outputs.x }}"
+          echo "PROBE matrix.empty-after-set=${{ needs.m.outputs.only-second }}"
+          echo "PROBE matrix.result=${{ needs.m.result }}"

@@ -321,6 +321,9 @@ pub async fn evict(hub: &Hub, repo: Option<&str>) -> anyhow::Result<usize> {
         let all = entries(hub, &r).await?;
         let ids = cache::evict(&all, crate::util::now_unix(), idle, quota);
         gone += ids.len();
+        // W19-R06: what's left, against the quota (`quota.near`).
+        let used: u64 = all.iter().filter(|e| !ids.contains(&e.id)).map(|e| e.size).sum();
+        crate::ci::notify::cache_use(hub, r.clone(), used, quota).await;
         hub.store
             .call(move |c| {
                 let tx = c.transaction()?;

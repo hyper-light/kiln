@@ -726,7 +726,7 @@ pub fn binaries(hub: &Hub) -> Vec<Binary> {
 }
 
 /// GET with redirects followed (GitHub release assets redirect to their storage).
-async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
+pub(crate) async fn get_following(client: &crate::http::client::Client, url: &str, timeout: Duration) -> anyhow::Result<crate::http::client::Response> {
     let mut url = url.to_owned();
     for _ in 0..6 {
         let resp = client.get(&url).timeout(timeout).send().await?;
@@ -2358,15 +2358,20 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
     "kiln-agent".to_owned()
 }
 
-/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do, and
-/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
+/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do,
+/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once), and
+/// `CAP_FIRECRACKER` when it can boot microVMs (W13-R05).
 pub fn runner_build() -> AgentMsg {
     let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
+    #[cfg(target_os = "linux")]
+    let microvms = if crate::runner::firecracker::Machine::find().is_some() { crate::proto::CAP_FIRECRACKER } else { 0 };
+    #[cfg(not(target_os = "linux"))]
+    let microvms = 0;
     // Under a supervisor that can start a new build beside it (`kiln supervise` on Unix).
     let blue_green = if crate::bluegreen::Supervisor::from_env().is_some() { crate::proto::CAP_BLUE_GREEN } else { 0 };
     // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
     let rootless = if docker != 0 && crate::runner::docker::rootless_engine() { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | blue_green | rootless }
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | microvms | blue_green | rootless }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
@@ -2424,7 +2429,10 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_PREVIEW
     | crate::proto::CAP_PORTS
     | crate::proto::CAP_ENGINES
-    | crate::proto::CAP_WORKSPACE;
+    | crate::proto::CAP_WORKSPACE
+    | crate::proto::CAP_POOLS
+    | crate::proto::CAP_RECEIVED
+    | crate::proto::CAP_UNDEPLOY;
 
 /// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions
 /// and agents (taking a session over, listing folders), none of its jobs, upgrades, front door,

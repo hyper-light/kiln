@@ -19,6 +19,7 @@ use bytes::Bytes;
 use kiln_seams::blobs::Refusal;
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
+use sha2::Digest as _;
 
 use crate::hub::Hub;
 
@@ -167,6 +168,114 @@ pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Rec
         return rx;
     }
     crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), Some(obj.digest.clone()), start, end.saturating_sub(1))
+}
+
+// ---------------------------------------------------------------------------------------- chunks
+
+/// The local store, when it's the one: kiln's chunked cache protocol (`super::chunks`, W08-R09)
+/// moves an object chunk by chunk, which only a store that keeps chunks can serve.
+pub fn chunked(hub: &Hub) -> Option<&Arc<crate::blobs::local::LocalBlobs>> {
+    hub.blobs.local.as_ref()
+}
+
+fn is_digest(d: &str) -> bool {
+    d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// An object's chunks (each one's digest and size, in order), as the local store keeps it.
+pub async fn chunks_of(hub: &Hub, digest: &str) -> anyhow::Result<Option<crate::blobs::chunks::Chunks>> {
+    let d = digest.to_owned();
+    hub.store
+        .call(move |c| {
+            let row: Option<String> = c.query_row("SELECT chunks FROM cas_objects WHERE digest = ?1", [&d], |r| r.get(0)).optional()?;
+            Ok(match row {
+                Some(list) => Some(serde_json::from_str(&list)?),
+                None => None,
+            })
+        })
+        .await
+}
+
+/// Where the local store keeps chunk `digest`, when it does.
+pub fn chunk_file(hub: &Hub, digest: &str) -> Option<PathBuf> {
+    let local = chunked(hub)?;
+    is_digest(digest).then(|| crate::blobs::chunks::path(local.root(), digest)).filter(|p| p.is_file())
+}
+
+/// Keeps a chunk in the local store, its digest checked first: the bytes newly written.
+pub fn put_chunk(hub: &Hub, digest: &str, data: &[u8]) -> anyhow::Result<u64> {
+    let local = chunked(hub).ok_or_else(|| anyhow::anyhow!("kiln's store of bytes keeps no chunks here ([blobs] store isn't local)"))?;
+    anyhow::ensure!(is_digest(digest) && hex::encode(sha2::Sha256::digest(data)) == digest, "the chunk doesn't hash to {digest}");
+    Ok(crate::blobs::chunks::keep(local.root(), digest, data)?)
+}
+
+/// An object made of chunks the local store keeps already (each there, the whole hashing to
+/// `digest`: the caller checked), kept at its key and recorded.
+pub async fn put_chunked(hub: &Hub, digest: &str, chunks: crate::blobs::chunks::Chunks) -> anyhow::Result<Object> {
+    let local = Arc::clone(chunked(hub).ok_or_else(|| anyhow::anyhow!("kiln's store of bytes keeps no chunks here ([blobs] store isn't local)"))?);
+    let size = chunks.iter().map(|(_, n)| *n).sum::<u64>();
+    let _held = stripe(digest).lock().await;
+    local.put_chunks(&key(digest), digest, chunks).await.map_err(refused)?;
+    record(hub, digest, size).await?;
+    tracing::debug!(target: "kiln.blobs", event = "put", object = %digest, size, "kept from chunks");
+    Ok(Object { digest: digest.to_owned(), size })
+}
+
+/// What a verification found (`kiln store verify`, W08-R01).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Verified {
+    pub chunks: usize,
+    pub bytes: u64,
+    /// Chunks whose contents aren't their digest: each moved to `<store>/corrupt/`, so the next
+    /// write of it stores it again and a read of it fails rather than returning wrong bytes.
+    pub corrupt: Vec<String>,
+}
+
+/// Re-hashes every chunk the local store keeps on this machine's disk against its name (W08-R01).
+/// An S3 store's objects are checked by the store itself (each put's SHA-256).
+pub async fn verify(hub: &Hub) -> anyhow::Result<Verified> {
+    let Some(local) = chunked(hub) else { anyhow::bail!("kiln's store of bytes is S3 ([blobs] store), which checks each object's SHA-256 as it's put: no chunks to re-hash here") };
+    let root = local.root().to_path_buf();
+    crate::rt::blocking(move || verify_blocking(&root)).await?
+}
+
+fn verify_blocking(root: &Path) -> anyhow::Result<Verified> {
+    use std::io::Read as _;
+    let mut out = Verified::default();
+    let mut buf = vec![0u8; 1 << 20];
+    let Ok(level1) = std::fs::read_dir(root.join("chunks")) else { return Ok(out) };
+    for a in level1.flatten() {
+        let Ok(level2) = std::fs::read_dir(a.path()) else { continue };
+        for b in level2.flatten() {
+            let Ok(files) = std::fs::read_dir(b.path()) else { continue };
+            for f in files.flatten() {
+                let digest = f.file_name().to_string_lossy().to_string();
+                if !is_digest(&digest) {
+                    continue;
+                }
+                let Ok(mut file) = std::fs::File::open(f.path()) else { continue };
+                let mut h = sha2::Sha256::new();
+                let mut size = 0u64;
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    size += n as u64;
+                    h.update(buf.get(..n).unwrap_or_default());
+                }
+                out.chunks += 1;
+                out.bytes += size;
+                if hex::encode(h.finalize()) != digest {
+                    let aside = root.join("corrupt");
+                    std::fs::create_dir_all(&aside)?;
+                    std::fs::rename(f.path(), aside.join(&digest))?;
+                    out.corrupt.push(digest);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// What a collection let go.

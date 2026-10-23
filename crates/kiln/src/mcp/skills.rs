@@ -26,8 +26,22 @@ macro_rules! skill {
     };
 }
 
-static SKILLS: &[Skill] =
-    &[skill!("kiln-agents"), skill!("kiln-plans"), skill!("kiln-deploy"), skill!("kiln-diagnose"), skill!("kiln-apps"), skill!("kiln-argocd-migration"), skill!("kiln-ci-diagnose")];
+static SKILLS: &[Skill] = &[
+    skill!("kiln-agents"),
+    skill!("kiln-plans"),
+    skill!("kiln-deploy"),
+    skill!("kiln-diagnose"),
+    skill!("kiln-apps"),
+    skill!("kiln-argocd-migration"),
+    // CI's (docs/ci.md W20-R05).
+    skill!("kiln-ci-author"),
+    skill!("kiln-ci-diagnose"),
+    skill!("kiln-ci-runners"),
+    skill!("kiln-ci-review"),
+    skill!("kiln-ci-migrate"),
+    skill!("kiln-ci-secrets"),
+    skill!("kiln-ci-performance"),
+];
 
 /// A frontmatter field of a `SKILL.md`.
 fn field(text: &str, key: &str) -> String {

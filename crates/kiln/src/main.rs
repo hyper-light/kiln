@@ -112,8 +112,12 @@ enum Cmd {
     /// Run a command on another runner (`--on linux/amd64`, `--on <name>`): this repo is synced over
     /// first, output streams back, and the exit code is the command's.
     Run(kiln::reach::cli::RunArgs),
-    /// The runners commands can run on, best first for what you need (`kiln runners linux`).
+    /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
+    /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).
     Runners(kiln::reach::cli::RunnersArgs),
+    /// This machine as a CI runner: `kiln runner setup docker|firecracker|shards` takes an
+    /// executor's one-time privileged steps, each said first, `sudo` asked for itself.
+    Runner(kiln::runner::setup::RunnerArgs),
     /// Reach between runners: this runner's identity and pinned keys.
     Reach(kiln::reach::cli::ReachArgs),
     /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
@@ -126,6 +130,16 @@ enum Cmd {
     Secrets(kiln::ci::cli::SecretsArgs),
     /// CI variables (the `vars` context): set, list, delete.
     Vars(kiln::ci::cli::VarsArgs),
+    /// CI integrations, what jobs and deployments reach other systems through: list, verify.
+    Integrations(kiln::ci::cli::IntegrationsArgs),
+    /// CI executor pools: list, set, scale.
+    Pools(kiln::ci::cli::PoolsArgs),
+    /// CI runner images: list, validate, build (and push).
+    Images(kiln::ci::cli::ImagesArgs),
+    /// The CI store of caches, artifacts and the rest: verify (re-hash every chunk), gc.
+    Store(kiln::ci::cli::StoreArgs),
+    /// Experiments: options measured against each other and together (start, list, get, decide, cancel).
+    Experiment(kiln::ci::cli::ExperimentArgs),
     /// The CI OIDC issuer: status, keys to paste or publish, rotation.
     Oidc(kiln::ci::cli::OidcArgs),
     /// CI actions: the mirrored catalog, prefetching, the action policy.
@@ -133,6 +147,8 @@ enum Cmd {
     /// A benchmark tool's output as CI metrics, added to the step's `$KILN_METRICS`
     /// (criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest, k6).
     Metrics(kiln::ci::cli::MetricsArgs),
+    /// The CI engine's own checks: `kiln ci bench` measures §1.5's performance targets.
+    Ci(kiln::ci::bench::CiArgs),
     /// Workflows of this working tree: `kiln workflow run [WORKFLOW]` runs them here, or on a
     /// server's runners (`--server`), before you push.
     Workflow(kiln::ci::local::WorkflowArgs),
@@ -146,6 +162,8 @@ enum Cmd {
     EgressRelay,
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
+    /// Any of kiln's operations, as agents have them: `kiln op` lists them, `kiln op <name> …` runs one.
+    Op(kiln::ci::cli::OpArgs),
     /// A CI run's or leg's logs.
     Logs(kiln::ci::cli::LogsArgs),
     /// Start a workflow_dispatch run.
@@ -168,6 +186,9 @@ enum Cmd {
     Submit(kiln::ci::review_cli::SubmitArgs),
     /// Fetch the trunk and rebase the stack onto it; landed diffs drop out.
     Sync(kiln::ci::review_cli::SyncArgs),
+    /// Amend each edit of the working copy into the commit of the stack that last touched its lines
+    /// (`-n` says where each would go); what can't be placed stays.
+    Absorb(kiln::ci::review_cli::AbsorbArgs),
     /// A repository's diffs.
     Diffs(kiln::ci::review_cli::DiffsArgs),
     /// Check out a diff's version: `kiln checkout D12` (its latest) or `D12@v2`.
@@ -302,6 +323,10 @@ struct AgentArgs {
     no_reach: bool,
     #[arg(long, env = "KILN_SHELL")]
     shell: Option<String>,
+    /// Fault injection, a test build's (docs/ci.md W22-AC04): `drop=2s,delay=300ms,oom=1s,disk=8,corrupt`.
+    #[cfg(feature = "chaos")]
+    #[arg(long, env = "KILN_CHAOS")]
+    chaos: Option<String>,
 }
 
 fn init_tracing(filter: &str, json: bool) {
@@ -407,6 +432,16 @@ fn thread_stacks() {
 
 fn main() -> ExitCode {
     thread_stacks();
+    // A microVM's init (docs/ci.md W13-R05): before anything else starts, as PID 1 forks.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("guest") {
+        return kiln::runner::guest::main(&std::env::args().nth(2).unwrap_or_default());
+    }
+    // A microVM's VMM, jailed (W13-R05): namespaces need this process's one thread.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("vmm-jail") {
+        return kiln::runner::jail::main();
+    }
     // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
     if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
         let action = std::env::args().nth(1).unwrap_or_default();
@@ -455,6 +490,17 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
     // Make the resolved config path visible to children (supervise → server).
     let shutdown = Shutdown::new();
     let _ = kiln::SHUTDOWN.set(shutdown.clone());
+    // A test build's faults, for this process's runner (a server's own runner reads KILN_CHAOS).
+    #[cfg(feature = "chaos")]
+    {
+        let spec = match &cli.cmd {
+            Cmd::Agent(a) => a.chaos.clone(),
+            _ => std::env::var("KILN_CHAOS").ok(),
+        };
+        if let Some(spec) = spec.filter(|s| !s.trim().is_empty()) {
+            kiln::runner::chaos::set(kiln::runner::chaos::parse(&spec)?);
+        }
+    }
     match cli.cmd {
         Cmd::Server => {
             let cfg = config::Config::load(&config_path)?;
@@ -746,7 +792,13 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             shutdown_on_signals(shutdown.clone());
             boxed(|| kiln::reach::cli::run(a, shutdown)).await
         }
-        Cmd::Runners(a) => kiln::reach::cli::runners(a),
+        Cmd::Runners(mut a) => match a.facts.take() {
+            Some(c) => {
+                let cfg = config::Config::load(&config_path).unwrap_or_default();
+                boxed(|| kiln::ci::cli::runner_facts(c, &cfg)).await
+            }
+            None => kiln::reach::cli::runners(a),
+        },
         Cmd::Reach(a) => kiln::reach::cli::reach(a),
         Cmd::Cd(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
@@ -768,6 +820,26 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::ci::cli::vars(a, &cfg)).await
         }
+        Cmd::Integrations(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::integrations(a, &cfg)).await
+        }
+        Cmd::Pools(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::pools(a, &cfg)).await
+        }
+        Cmd::Images(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::images(a, &cfg)).await
+        }
+        Cmd::Store(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::store(a, &cfg)).await
+        }
+        Cmd::Experiment(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::experiment(a, &cfg)).await
+        }
         Cmd::Oidc(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::ci::cli::oidc(a, &cfg)).await
@@ -780,9 +852,22 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::ci::cli::runs(a, &cfg)).await
         }
+        Cmd::Op(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::op(a, &cfg)).await
+        }
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
+        Cmd::Ci(a) => {
+            // On a task of its own, as `kiln workflow run`: not beneath this frame.
+            let code = kiln::rt::spawn(kiln::ci::bench::run(a)).await.map_err(|_| anyhow::anyhow!("the bench ended without an answer"))??;
+            if code != 0 {
+                return Err(anyhow::Error::new(kiln::reach::cli::ExitWith(code)));
+            }
+            Ok(())
+        }
         Cmd::Auth(a) => boxed(|| kiln::runner::auth::cli(a)).await,
         Cmd::Sbom(a) => boxed(|| kiln::ci::sbom::cli(a)).await,
+        Cmd::Runner(a) => boxed(|| kiln::runner::setup::cli(a)).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
@@ -825,6 +910,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Submit(a) => kiln::ci::review_cli::submit(a),
         Cmd::Sync(a) => kiln::ci::review_cli::sync(a),
+        Cmd::Absorb(a) => kiln::ci::review_cli::absorb(a),
         Cmd::Diffs(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::ci::review_cli::diffs(a, &cfg)).await

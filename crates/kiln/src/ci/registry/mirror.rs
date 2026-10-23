@@ -200,6 +200,31 @@ pub fn client_config(hub: &Hub, origin: &str) -> serde_json::Value {
     serde_json::json!({ "docker": { "registry-mirrors": docker }, "containerd": containerd })
 }
 
+/// `GET /api/ci/registry/mirrors` (`ci.registry.mirrors`): the registries kiln pulls through, and
+/// what a machine that pulls through kiln is given: Docker's `registry-mirrors`, and each
+/// mirror's containerd `hosts.toml`, as a cluster's nodes read them under `config_path`
+/// (`kiln images mirrors --containerd /etc/containerd/certs.d` writes them). A mirror that isn't
+/// `anonymous` asks a node to sign in, which containerd's files can't: it's said so.
+pub async fn mirrors(hub: &Hub) -> Result<crate::http::server::Response, crate::ci::Fail> {
+    let list: Vec<serde_json::Value> =
+        hub.cfg.ci.registry.mirrors.iter().map(|m| serde_json::json!({ "upstream": m.upstream, "prefix": m.prefix(), "listen": m.listen, "anonymous": m.anonymous })).collect();
+    let notes: Vec<String> = hub
+        .cfg
+        .ci
+        .registry
+        .mirrors
+        .iter()
+        .filter(|m| !m.anonymous)
+        .map(|m| format!("{} isn't `anonymous`: kiln asks whoever pulls through it to sign in, which a node pulling with containerd's hosts.toml doesn't", m.upstream))
+        .collect();
+    let mut out = client_config(hub, &hub.cfg.server.public_url);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("mirrors".into(), serde_json::Value::Array(list));
+        o.insert("notes".into(), serde_json::json!(notes));
+    }
+    Ok(crate::http::server::json(StatusCode::OK, &out))
+}
+
 /// Whether `reference` names an image kiln mirrors: the reference to pull it through kiln
 /// (`kiln.example:443/docker.io/library/alpine:3.20`), for runners' image pulls.
 pub fn through(hub: &Hub, reference: &str, registry_host: &str) -> Option<String> {
@@ -220,4 +245,34 @@ pub fn through(hub: &Hub, reference: &str, registry_host: &str) -> Option<String
 /// A response's header, to say kiln served its own copy (W12-R06).
 pub fn warn_stale(r: crate::http::server::Response, upstream: &str) -> crate::http::server::Response {
     crate::http::server::with_header(r, header::WARNING, &format!("110 kiln \"served from kiln's copy: {upstream} is out of reach\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W12-R02: what a machine pulling through kiln is given: Docker's `registry-mirrors` for
+    /// Docker Hub's own `listen`, and each mirror's containerd `hosts.toml` (its upstream's address,
+    /// then kiln's under its prefix, `override_path`, as a cluster's nodes read them).
+    #[test]
+    fn w12_r02_what_a_node_pulls_through() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| {
+                c.ci.registry.mirrors = vec![
+                    Mirror { upstream: "docker.io".into(), listen: Some("0.0.0.0:5001".into()), anonymous: true, ..Mirror::default() },
+                    Mirror { upstream: "ghcr.io".into(), prefix: Some("gh".into()), ..Mirror::default() },
+                ];
+            })
+            .await?;
+            let c = client_config(&hub, "https://kiln.example/");
+            assert_eq!(c.pointer("/docker/registry-mirrors"), Some(&serde_json::json!(["https://kiln.example:5001"])), "{c}");
+            let file = |k: &str| c.get("containerd").and_then(|m| m.get(k)).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            assert_eq!(
+                file("/etc/containerd/certs.d/docker.io/hosts.toml"),
+                "server = \"https://registry-1.docker.io\"\n\n[host.\"https://kiln.example/v2/docker.io\"]\n  capabilities = [\"pull\", \"resolve\"]\n  override_path = true\n"
+            );
+            assert!(file("/etc/containerd/certs.d/ghcr.io/hosts.toml").contains("server = \"https://ghcr.io\"\n\n[host.\"https://kiln.example/v2/gh\"]"), "{c}");
+            Ok(())
+        })
+    }
 }

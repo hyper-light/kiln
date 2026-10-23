@@ -70,18 +70,26 @@ fn parse_env(text: &str) -> Vec<(String, String)> {
 /// Variables a login shell sets that make no sense to hand on (they describe that shell).
 const SKIP_ENV: &[&str] = &["_", "SHLVL", "PWD", "OLDPWD", "PS1", "PS2", "TERM_SESSION_ID", "KILN_TERM_SESSION"];
 
-/// Ask the user's login shell for its environment (blocking).
-fn ask_login_shell() -> Option<Vec<(String, String)>> {
+/// The ssh agent a login shell's environment names (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`), while its
+/// socket is there.
+fn agent_of(env: &[(String, String)]) -> Vec<(String, String)> {
+    let alive = env.iter().any(|(k, v)| k == "SSH_AUTH_SOCK" && Path::new(v).exists());
+    env.iter().filter(|(k, _)| alive && (k == "SSH_AUTH_SOCK" || k == "SSH_AGENT_PID")).cloned().collect()
+}
+
+/// Ask the user's login shell for its environment (blocking), handing it `agent`, the ssh agent an
+/// earlier answer named: a startup file that starts an agent unless one is set (fish's and bash's
+/// often do) starts none again, where each answer would otherwise leave one more running.
+fn ask_login_shell(shell: &str, agent: Vec<(String, String)>) -> Option<Vec<(String, String)>> {
     if cfg!(windows) {
         return None;
     }
-    let shell = login_shell();
     const BEGIN: &str = "__KILN_REACH_ENV_BEGIN__";
     const END: &str = "__KILN_REACH_ENV_END__";
     let script = format!("printf '\\n{BEGIN}\\n'; env; printf '\\n{END}\\n'");
-    let mut cmd = std::process::Command::new(&shell);
+    let mut cmd = std::process::Command::new(shell);
     cmd.args(["-l", "-i", "-c", &script]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
-    cmd.current_dir(crate::os::home_dir());
+    cmd.current_dir(crate::os::home_dir()).envs(agent);
     // A second early: process start times are whole seconds.
     let since = unix_s().saturating_sub(1);
     let mut child = cmd.spawn().ok()?;
@@ -150,7 +158,8 @@ pub async fn login_env() -> Vec<(String, String)> {
     if let Some(env) = kept() {
         return env;
     }
-    let env = crate::rt::blocking(ask_login_shell).await.ok().flatten().unwrap_or_else(|| std::env::vars().collect());
+    let agent = cell.lock().as_ref().map(|(_, env)| agent_of(env)).unwrap_or_default();
+    let env = crate::rt::blocking(move || ask_login_shell(&login_shell(), agent)).await.ok().flatten().unwrap_or_else(|| std::env::vars().collect());
     *cell.lock() = Some((Instant::now(), env.clone()));
     env
 }
@@ -546,6 +555,43 @@ mod tests {
         let shown: Vec<String> = places.iter().map(|p| p.to_string_lossy().replace('/', "\\")).collect();
         assert!(shown.iter().any(|p| p == r"Program Files\Git\bin\bash.exe"), "beside git's cmd folder: {shown:?}");
         assert!(shown.iter().any(|p| p == r"Apps\Git\bin\bash.exe"), "where it installs: {shown:?}");
+    }
+
+    /// The ssh agent a login shell's startup file starts goes on to the next ask, so the file
+    /// starts none again: one an answer, every ten minutes, had piled up to 56 on one machine.
+    #[cfg(unix)]
+    #[test]
+    fn a_login_shells_agent_is_handed_on() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+            eprintln!("a_login_shells_agent_is_handed_on: skipped, this process has an agent already");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let (marks, sock) = (dir.path().join("started"), dir.path().join("agent.sock"));
+        std::fs::write(&sock, "")?;
+        // As fish's or bash's startup file often does: an agent, unless one is set.
+        let shell = dir.path().join("shell");
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n[ -n \"$SSH_AUTH_SOCK\" ] || {{ echo started >> '{}'; SSH_AUTH_SOCK='{}'; SSH_AGENT_PID=4242; export SSH_AUTH_SOCK SSH_AGENT_PID; }}\nexec /bin/sh -c \"$4\"\n",
+                marks.display(),
+                sock.display()
+            ),
+        )?;
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))?;
+        let shell = shell.to_string_lossy().into_owned();
+        let first = ask_login_shell(&shell, Vec::new()).ok_or_else(|| anyhow::anyhow!("no answer"))?;
+        let agent = agent_of(&first);
+        assert_eq!(agent.len(), 2, "its socket and pid: {first:?}");
+        let second = ask_login_shell(&shell, agent).ok_or_else(|| anyhow::anyhow!("no second answer"))?;
+        assert_eq!(std::fs::read_to_string(&marks)?.lines().count(), 1, "one agent, not one an answer");
+        assert!(second.iter().any(|(k, v)| k == "SSH_AUTH_SOCK" && Path::new(v) == sock), "{second:?}");
+        // Its socket gone, it's not handed on.
+        std::fs::remove_file(&sock)?;
+        assert!(agent_of(&second).is_empty());
+        Ok(())
     }
 
     #[test]

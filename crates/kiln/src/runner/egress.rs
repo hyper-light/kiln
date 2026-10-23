@@ -70,6 +70,13 @@ impl Policy {
         Policy { allow, kiln }
     }
 
+    /// A leg's: `allow`, and kiln's server as the leg's runtime services reach it.
+    pub fn for_leg(rt: &kiln_ci::wire::Runtime, allow: Vec<String>) -> Policy {
+        let urls: Vec<&str> =
+            [rt.results_url.as_str(), rt.cache_url.as_str(), rt.facade_url.as_str(), rt.api_url.as_str(), rt.graphql_url.as_str()].into_iter().chain(rt.id_token_url.as_deref()).collect();
+        Policy::new(allow, &urls)
+    }
+
     fn is_kiln(&self, host: &str, port: u16) -> bool {
         self.kiln.iter().any(|(h, p)| h.eq_ignore_ascii_case(host) && *p == port)
     }
@@ -402,6 +409,12 @@ impl Pool {
             }
         });
         Ok((Pool { stop, blocked }, port))
+    }
+
+    /// A proxy that runs elsewhere (a microVM's leg's, on its host: docs/ci.md W13-R05), whose
+    /// refusals come on `blocked`.
+    pub fn remote(blocked: async_channel::Receiver<String>) -> Pool {
+        Pool { stop: Shutdown::new(), blocked }
     }
 
     /// What was refused since last asked.

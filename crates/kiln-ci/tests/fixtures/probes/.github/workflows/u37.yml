@@ -1,0 +1,8 @@
+# F-22: one of the count probe's workflows (make_reusable.py).
+name: u37
+on: workflow_call
+jobs:
+  leaf:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PROBE count.u37=ran"
