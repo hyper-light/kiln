@@ -297,9 +297,8 @@
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
 }
-/* More/Less, and Make a plan: words to press, as the goal's links are, with room for a finger. */
-.gs-fold,
-.gs-act {
+/* More/Less: words to press, as the goal's links are, with room for a finger. */
+.gs-fold {
   margin: -6px 0;
   padding: 6px 0;
   border: 0;
@@ -315,13 +314,16 @@
   display: block;
   font-size: 11px;
 }
-.gs-fold:hover,
-.gs-act:hover {
+.gs-fold:hover {
   color: #eceef2;
 }
-.gs-act:disabled {
-  opacity: 0.5;
-  cursor: default;
+/* What can be done with a goal (Make a plan): buttons under its words. */
+.gs-acts {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
 }
 /* A goal that became a plan: its steps' graph under its words, each step as it stands. */
 .gs-plan {

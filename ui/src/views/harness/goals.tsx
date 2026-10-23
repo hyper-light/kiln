@@ -13,6 +13,7 @@
  * when it resumes by itself.
  */
 import * as React from "react";
+import { ListTree } from "lucide-react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -372,24 +373,6 @@ function GoalPanel({
                             <Link to={planHref(g.planned_as)}>planned</Link>: met once every step of its plan is
                           </>
                         )}
-                        {canPlan(g) && (
-                          <>
-                            {" · "}
-                            <button
-                              type="button"
-                              className="gs-act"
-                              disabled={busy}
-                              onClick={() =>
-                                void act(async () => {
-                                  await harnessApi.planGoal(agent, g.id);
-                                  return harnessApi.goals(agent);
-                                })
-                              }
-                            >
-                              Make a plan
-                            </button>
-                          </>
-                        )}
                         {g.waits_on && (
                           <>
                             {" · waits for "}
@@ -398,6 +381,24 @@ function GoalPanel({
                         )}
                       </span>
                     </span>
+                    {/* What can be done with it: a goal of its own still to go becomes a plan. */}
+                    {canPlan(g) && (
+                      <div className="gs-acts">
+                        <Button
+                          size="xs"
+                          variant="secondary"
+                          disabled={busy}
+                          onClick={() =>
+                            void act(async () => {
+                              await harnessApi.planGoal(agent, g.id);
+                              return harnessApi.goals(agent);
+                            })
+                          }
+                        >
+                          <ListTree aria-hidden="true" /> Make a plan
+                        </Button>
+                      </div>
+                    )}
                     {g.planned_as && <PlannedGoal goal={g} items={items} paused={stack?.state === "paused"} />}
                   </li>
                 );
