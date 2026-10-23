@@ -57,6 +57,9 @@ HOSTED = {
         "depot-ubuntu-24.04", "depot-ubuntu-24.04-4", "depot-ubuntu-24.04-8", "depot-ubuntu-24.04-16", "depot-ubuntu-latest-4",
         "github-ubuntu-24.04-x86_64-2", "github-ubuntu-24.04-x86_64-4", "github-ubuntu-24.04-x86_64-8", "github-ubuntu-24.04-x86_64-32",
         "ubuntu-24.04-xl", "ubuntu-latest-4-core-oss", "ubuntu-latest-16-core-oss",
+        # The repositories' own Linux pools, as a team moving to kiln routes its pools' labels to
+        # its runners: TypeScript's 1ES pool, CodSpeed's benchmark machines (Ubuntu 24.04).
+        "TypeScript-1ES-GitHub-TypeScript-1", "codspeed-macro", "codspeed-macro-x64-ryzen-9950x-ubuntu-24-04",
     ],
     ("linux", "x86_64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-8", "depot-ubuntu-22.04-16"],
     ("linux", "aarch64", "kiln/runner-ubuntu-24.04"): ["depot-ubuntu-24.04-arm-8", "depot-ubuntu-24.04-arm-16", "github-ubuntu-24.04-aarch64-4", "ubuntu-24.04-arm64-xl"],
