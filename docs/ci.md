@@ -2605,6 +2605,18 @@ reusing the results of jobs whose inputs have not changed.
       links to kiln.
   - **Unzipped files.** A file uploaded with `archive: false` downloads raw, under its own name
     (`Content-Disposition`).
+  - **v1 to v3.** GitHub still takes their protocol, file containers, from an action its version
+    check doesn't refuse. bat's `upload-artifact@master` (2.0.1, July 2020) uploads there and its
+    run passes, its artifacts kept as v4's are. kiln serves it at `ACTIONS_RUNTIME_URL`
+    (`_apis/pipelines/workflows/<run>/artifacts`, `_apis/resources/Containers/<id>`,
+    `services/pipelines.rs`):
+    - a file at a time, in `Content-Range` chunks, gzipped when that's smaller;
+    - another upload by the artifact's name adds to it, as v3 had it (a matrix's legs, one
+      artifact); one still uploading waits for the next finish;
+    - its size, set, zips what came.
+
+    Such an artifact is one of the run's like any other, read by v4's actions and the REST API,
+    and the run's v4 artifacts are read this way too (`w08_r08_artifacts_as_v3_keeps_them`).
 
 **Requirements: kiln's improvements** (G-10, G-19)
 
