@@ -3424,6 +3424,13 @@ enforcement points to W18, agent isolation to W20.
   these legs' containers have no seccomp filter, as a hosted runner's machine has none: with the
   host's Docker they could start any container they like, and the filter kept debuggers from
   turning ASLR off (`personality`, which lldb needs to launch a program: cargo's `lldb` tests).
+
+  The daemon is still the host's, one for every leg on that runner: the names a step gives its
+  containers, networks and volumes are the daemon's. Two legs at once that use the same ones
+  collide, as cargo's test suite does on a runner of two slots (it names its containers
+  `cargo_test_0`, …). A hosted runner gives each job a machine and a daemon of its own. Until
+  the leg's socket gives each leg names of its own, such a job runs `exclusive: true`, or on a
+  runner of one slot.
 - *Done.* In kiln's runner image, a `docker` leg has GitHub's hosted runners' paths:
   `/home/runner/work/<repo>/<repo>` for the workspace, `/home/runner/work/_temp` and
   `/home/runner/work/_actions` beside it, the event file and the file commands under `_temp`, and

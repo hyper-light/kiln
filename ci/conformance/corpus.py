@@ -72,6 +72,11 @@ KNOWN = [
     # The corpus submits the whole tree against an empty trunk: a check that compares a pull
     # request with its base finds nothing there to compare.
     (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
+    # `actions/upload-artifact@master` is that repository's old branch: 2.0.1 (2020), on the artifact
+    # protocol GitHub retired on 2025-01-30.
+    (r"Unable to create a container for the artifact", "its `upload-artifact@master` is 2.0.1, on the artifact protocol GitHub retired in January 2025: it fails there too"),
+    # The lab's runner has two slots and one Docker daemon; a hosted runner, a machine a job.
+    (r'The container name "/cargo_test_\d+" is already in use|previous docker build failed, unable to run test', "two of its legs ran at once on the lab's one Docker daemon, and its tests name their containers (`cargo_test_0`): a hosted runner gives each job a daemon of its own (docs/ci.md W13-R04)"),
 ]
 
 
