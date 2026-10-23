@@ -433,7 +433,19 @@ def results(api, repo, event, corpus, runs, blocked):
         passed = sum(1 for leg in legs if leg.get("conclusion") == "success")
         if r.get("status") not in FINISHED:
             api.call("POST", f"/api/ci/runs/{r['id']}/cancel", {})
-            out[n] = {"result": "blocked" if n in blocked else "unfinished", "legs": f"{passed} of {len(legs)} legs passed", "notes": notes}
+            # What never ran for it: the jobs that need a leg that waited (tokio's whole CI needs
+            # its `docs` job, one of whose legs is Windows's), skipped once the run is cancelled.
+            after, deadline = legs, time.time() + 60
+            while time.time() < deadline:
+                time.sleep(5)
+                got = api.call("GET", "/api/ci/runs/" + r["id"])
+                after = got.get("legs") or after
+                if (got.get("run") or {}).get("finished_at") is not None:
+                    break
+            never = sum(1 for leg in after if leg.get("status") == "skipped") - sum(1 for leg in legs if leg.get("status") == "skipped")
+            if never > 0:
+                notes.append(f"{never} more legs never ran: they need one that waits" if n in blocked else f"{never} more legs never ran: the run was stopped unfinished")
+            out[n] = {"result": "blocked" if n in blocked else "unfinished", "legs": f"{passed} of {len(after)} legs passed", "notes": notes}
             continue
         if not notes and r.get("error"):
             notes.append(r["error"])
@@ -483,6 +495,8 @@ def not_kilns(note):
     """Why a leg's miss (its note) isn't kiln's to fix, or None when it is."""
     if ELSEWHERE.search(note):
         return "it waits for macOS, Windows or Linux on arm64, which the lab hasn't (its runner is Linux's, x86-64)"
+    if re.match(r"^\d+ more legs never ran: they need one that waits$", note):
+        return "they need a leg that waits for a machine the lab hasn't"
     return next((r for pat, r in KNOWN if re.search(pat, note)), None)
 
 
