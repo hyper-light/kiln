@@ -1863,8 +1863,13 @@ impl Leg {
             Some(v) => st.value(v, Site::StepWith, "test-results.format").map(|x| x.coerce_string()).unwrap_or_default(),
             None => String::new(),
         };
-        // Patterns are the working directory's; the workspace is what they may reach.
+        // Patterns are the working directory's; the workspace is what they may reach. One in the
+        // job container's terms (`${{ github.workspace }}/…` there) is the host's first.
         let root = st.layout.workspace.clone();
+        let patterns = match st.containers.as_ref().and_then(|c| c.job.as_ref()) {
+            Some(j) => on_host(&j.map, &patterns),
+            None => patterns,
+        };
         let patterns = from_wd(&root, wd, &patterns);
         let files = match super::hashfiles::Workspace::new(&root).and_then(|w| w.matching(&patterns)) {
             Ok(f) => f,
@@ -2881,6 +2886,21 @@ fn stays_inside(root: &Path, dir: &Path) -> bool {
 }
 
 /// Patterns of the working directory `wd` as the workspace's (`!` negations kept).
+/// `patterns`' absolute ones in a container's terms, as the host has them (a `!` kept); the rest
+/// as they are.
+fn on_host(map: &super::docker::PathMap, patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|p| {
+            let (neg, body) = p.strip_prefix('!').map_or(("", p.as_str()), |b| ("!", b));
+            match Path::new(body).is_absolute().then(|| map.to_host(body)).flatten() {
+                Some(host) => format!("{neg}{}", host.to_string_lossy()),
+                None => p.clone(),
+            }
+        })
+        .collect()
+}
+
 fn from_wd(root: &Path, wd: &Path, patterns: &[String]) -> Vec<String> {
     let rel = wd.strip_prefix(root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
     patterns
@@ -5015,6 +5035,14 @@ jobs:
         let l = other.layout();
         assert_eq!(other.container_map(&l).translate(&l.workspace.to_string_lossy()), l.workspace.to_string_lossy());
         Ok(())
+    }
+
+    /// A test report's absolute pattern in the container's terms is the host's, a `!` kept.
+    #[test]
+    fn w16_r01_report_patterns_in_a_containers_terms() {
+        let map = super::super::docker::PathMap::new(vec![(PathBuf::from("/work/w/1234/app"), "/home/runner/work/app/app".into())]);
+        let got = on_host(&map, &["/home/runner/work/app/app/target/*.xml".into(), "!/home/runner/work/app/app/target/skip.xml".into(), "junit.xml".into(), "/elsewhere/x.xml".into()]);
+        assert_eq!(got, ["/work/w/1234/app/target/*.xml", "!/work/w/1234/app/target/skip.xml", "junit.xml", "/elsewhere/x.xml"]);
     }
 
     /// A cancelled leg's post steps run to their end, as GitHub's do: the cancel stops the step
