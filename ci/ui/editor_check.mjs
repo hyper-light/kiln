@@ -9,7 +9,7 @@
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/editor-shots:/shots \
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/editor_check.mjs
 import { chromium, webkit } from "/pw/node_modules/playwright-core/index.mjs";
-import { checkLayout } from "./layout.mjs";
+import { checkLayout, pageErrors } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
 const shots = "/shots";
@@ -61,8 +61,7 @@ for (const [name, type] of [
     await signIn.goto((await r.json()).url);
     await signIn.close();
     const page = await ctx.newPage();
-    const errors = [];
-    page.on("pageerror", (e) => errors.push(String(e)));
+    const errors = pageErrors(page, cfg.base);
     await page.goto(`${cfg.base}/workflows?repo=acme%2Fpeople&path=.kiln%2Fci.yaml`);
     const content = page.locator(".cm-content").first();
     await content.waitFor({ timeout: 30000 });

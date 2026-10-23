@@ -20,7 +20,7 @@
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/people_check.mjs
 import { readFileSync } from "node:fs";
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
-import { checkLayout } from "./layout.mjs";
+import { checkLayout, pageErrors } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
 const shots = "/shots";
@@ -70,8 +70,7 @@ for (const [name, type, phone] of [
       ]) {
         const ctx = await browser.newContext(options);
         const page = await ctx.newPage();
-        const errors = [];
-        page.on("pageerror", (e) => errors.push(String(e)));
+        const errors = pageErrors(page, cfg.base);
         await linkIn(ctx, "lead");
         const sam = `sam-${name}-${tag}`;
 

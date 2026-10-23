@@ -55,9 +55,11 @@ jobs:
     name: ui checks (Chromium and WebKit, desktop and phone)
     needs: [rust, ui]
     # Every page's check (docs/ci.md W21-AC01) against servers of this build, the browsers in
-    # Playwright's image: on any machine that runs Docker and builds kiln (the engine routes by
-    # these; v1, by the label alone).
-    runs-on: [baremetal]
+    # Playwright's image: on a Linux machine that runs Docker and builds kiln. The engine routes by
+    # `requires`; v1 by the labels alone, and the Windows and macOS runners are bare metal too
+    # (c76ef82's checks went to jupiter, whose PowerShell couldn't read them): `linux` keeps it on
+    # Linux.
+    runs-on: [baremetal, linux]
     requires: ["os == linux", "executors has docker", "tools has cargo", "tools has node", "tools has python3", "tools has git"]
     if: "branch == 'main'"
     timeout-minutes: 120
