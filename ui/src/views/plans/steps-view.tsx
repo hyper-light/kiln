@@ -28,21 +28,21 @@ export function PlanSteps({ plan, picked, onPick, onRun }: { plan: Plan; picked:
   const pick = (n: number, on: boolean) => onPick(on ? [...picked.filter((x) => x !== n), n].sort((a, b) => a - b) : picked.filter((x) => x !== n));
   return (
     <section className="plan-section" aria-label="Steps">
-      <div className="ps-top">
+      <div className="sv-top">
         <h2 className="plan-h">Steps</h2>
         {picked.length > 0 ? (
-          <span className="ps-picked">
+          <span className="sv-picked">
             {stepsWords(picked)} picked to run ·{" "}
-            <button type="button" className="ps-link" onClick={() => onPick([])}>
+            <button type="button" className="sv-link" onClick={() => onPick([])}>
               clear
             </button>
           </span>
         ) : (
-          <span className="plan-dim ps-hint">Pick steps to run just those</span>
+          <span className="plan-dim sv-hint">Pick steps to run just those</span>
         )}
       </div>
       {steps.length > 1 && said && <PlanGraph label="Its steps, as they'll run" steps={steps} />}
-      <ol className="ps-list">
+      <ol className="sv-list">
         {steps.map((s, i) => (
           <StepCard
             key={s.n}
@@ -79,22 +79,22 @@ function StepCard({
 }) {
   const [open, setOpen] = React.useState(false);
   return (
-    <li className="ps-step" data-picked={picked || undefined}>
-      <input type="checkbox" className="check ps-check" checked={picked} onChange={(e) => onPick(e.target.checked)} aria-label={`Pick step ${n}`} />
-      <div className="ps-body">
-        <p className="ps-title">
-          <span className="ps-n">{n}</span>
+    <li className="sv-step" data-picked={picked || undefined}>
+      <input type="checkbox" className="check sv-check" checked={picked} onChange={(e) => onPick(e.target.checked)} aria-label={`Pick step ${n}`} />
+      <div className="sv-body">
+        <p className="sv-title">
+          <span className="sv-n">{n}</span>
           {title}
         </p>
-        {after.length > 0 && <p className="ps-after">After {stepsWords(after)}</p>}
+        {after.length > 0 && <p className="sv-after">After {stepsWords(after)}</p>}
         {detail && (
           <>
             {open && (
-              <div className="ps-detail">
+              <div className="sv-detail">
                 <Prose text={detail} />
               </div>
             )}
-            <button type="button" className="ps-link" aria-expanded={open} onClick={() => setOpen(!open)}>
+            <button type="button" className="sv-link" aria-expanded={open} onClick={() => setOpen(!open)}>
               {open ? "Less" : "What it is"}
             </button>
           </>

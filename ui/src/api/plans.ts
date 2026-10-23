@@ -10,6 +10,8 @@ export interface PlanSource {
   agent?: string | null;
   /** The goal it was made from: once every step is met, so is the goal. */
   goal?: { agent: string; id: string; text: string } | null;
+  /** The plan its agent proposed (plan mode), kept by kiln: one an agent, a version each time it proposes another. */
+  proposed?: boolean;
 }
 
 /** How a measure compares with its threshold (crates/kiln/src/plans/criteria.rs `Op`). */
@@ -242,6 +244,8 @@ const enc = encodeURIComponent;
 export const plansApi = {
   list: (signal?: AbortSignal) => request<Plan[]>("GET", "/api/plans", undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<Plan>("GET", `/api/plans/${enc(id)}`, undefined, { signal }),
+  /** The plan agent `session` proposed (plan mode), as kiln keeps it: one at most. */
+  proposedBy: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}&proposed=1`, undefined, { signal }),
   create: (p: { title?: string; body: string; items?: PlanItem[]; tags?: string[]; source?: PlanSource }) => request<Plan>("POST", "/api/plans", p),
   update: (id: string, patch: { title?: string; body?: string; items?: PlanItem[]; tags?: string[] }) => request<Plan>("PATCH", `/api/plans/${enc(id)}`, patch),
   remove: (id: string) => request<void>("DELETE", `/api/plans/${enc(id)}`),
@@ -250,7 +254,8 @@ export const plansApi = {
   restore: (id: string, version: number) => request<Plan>("POST", `/api/plans/${enc(id)}/restore`, { version }),
   run: (id: string, target: PlanRunTarget, mode: Exclude<PlanMode, "agents">, pick: PlanPick = {}) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode, ...pick }),
   /** One agent per step, on the machine and harness given, one after another. */
-  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }, pick: Pick<PlanPick, "only"> = {}) => request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents", ...pick }),
+  runAgents: (id: string, to: { target: string; kind: string; cwd?: string }, pick: Pick<PlanPick, "only"> = {}) =>
+    request<PlanStarted>("POST", `/api/plans/${enc(id)}/run`, { new: to, mode: "agents", ...pick }),
   /** Runs of one agent per step (`active`: those under way). */
   agentRuns: (active: boolean, signal?: AbortSignal) => request<{ runs: PlanRunBrief[] }>("GET", `/api/plans/runs${active ? "?active=1" : ""}`, undefined, { signal }),
   runView: (run: string, signal?: AbortSignal) => request<PlanRunView>("GET", `/api/plans/runs/${enc(run)}`, undefined, { signal }),

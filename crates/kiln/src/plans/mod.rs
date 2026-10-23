@@ -220,6 +220,10 @@ pub struct Source {
     /// The goal it was made from (`goals_plan`): once every step is met, so is the goal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal: Option<GoalOf>,
+    /// The plan its agent proposed (plan mode), kept by kiln: one an agent, a version each time it
+    /// proposes another ([`keep_proposed`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub proposed: bool,
 }
 
 /// A goal a plan was made from: its agent's, by id, in the words it had.
@@ -661,6 +665,32 @@ fn fill_source(hub: &Hub, s: Source) -> Source {
         agent: s.agent.or(Some(i.name)),
         session: s.session,
         goal: s.goal,
+        proposed: s.proposed,
+    }
+}
+
+/// Of `plans`, an agent's (`session`: made in its conversation) and the ones agents proposed
+/// (`proposed`), when asked.
+pub fn of_source(plans: Vec<Plan>, session: Option<&str>, proposed: bool) -> Vec<Plan> {
+    plans
+        .into_iter()
+        .filter(|p| session.is_none_or(|x| p.source.as_ref().and_then(|s| s.session.as_deref()) == Some(x)))
+        .filter(|p| !proposed || p.source.as_ref().is_some_and(|s| s.proposed))
+        .collect()
+}
+
+/// The plan agent `agent` proposed (plan mode), kept: one plan an agent, a new version each time it
+/// proposes another (its title from its words again); the same words again change nothing.
+pub async fn keep_proposed(hub: &Hub, agent: &str, words: &str) -> R<Plan> {
+    let words = words.trim();
+    let mine = list(hub, None, None).await?.into_iter().find(|p| p.source.as_ref().is_some_and(|s| s.proposed && s.session.as_deref() == Some(agent)));
+    match mine {
+        Some(p) if p.body.trim() == words => Ok(p),
+        Some(p) => update(hub, &p.id, Patch { title: Some(String::new()), body: Some(words.to_owned()), ..Patch::default() }, "kiln").await,
+        None => {
+            let source = Source { session: Some(agent.to_owned()), proposed: true, ..Source::default() };
+            create(hub, New { body: words.to_owned(), source: Some(source), ..New::default() }, "kiln").await
+        }
     }
 }
 

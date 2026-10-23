@@ -502,7 +502,18 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "repos"]) => {
             let mut repos = boxed(|| hub.store.repos()).await?;
             repos.retain(|r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }));
-            Ok(srv::json(StatusCode::OK, &repos))
+            let public = hub.store.public_repos().await.unwrap_or_default();
+            let listed: Vec<serde_json::Value> = repos
+                .iter()
+                .map(|r| {
+                    let mut v = serde_json::to_value(r).unwrap_or_default();
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("public".into(), json!(public.contains(&r.id)));
+                    }
+                    v
+                })
+                .collect();
+            Ok(srv::json(StatusCode::OK, &listed))
         }
         (&Method::POST, ["api", "repos"]) => boxed(|| add_repo(&hub, req)).await,
         (&Method::DELETE, ["api", "repos", id]) => boxed(|| delete_repo(&hub, id)).await,
@@ -1849,6 +1860,9 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
 
 async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
     let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
+    let plans = crate::plans::of_source(plans, q.get("session").map(String::as_str).filter(|s| !s.is_empty()), proposed);
     Ok(srv::json(StatusCode::OK, &plans))
 }
 
@@ -2253,6 +2267,9 @@ struct NewRepo {
     default_branch: Option<String>,
     /// A native repository's upstream, its trunk pushed there after each land (W14-R01).
     mirror: Option<String>,
+    /// A native repository anyone may read over git, as a public GitHub repository.
+    #[serde(default)]
+    public: bool,
 }
 
 async fn add_repo(hub: &Hub, req: Request) -> R {
@@ -2300,9 +2317,16 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
             mirror: r.mirror.clone(),
         })
         .await?;
+    if native {
+        hub.store.set_repo_public(repo.id.clone(), r.public).await?;
+    }
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
     hub.gitops_kick.notify();
-    Ok(srv::json(StatusCode::OK, &repo))
+    let mut body = serde_json::to_value(&repo).unwrap_or_default();
+    if let Some(o) = body.as_object_mut() {
+        o.insert("public".into(), json!(native && r.public));
+    }
+    Ok(srv::json(StatusCode::OK, &body))
 }
 
 async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, ApiError> {

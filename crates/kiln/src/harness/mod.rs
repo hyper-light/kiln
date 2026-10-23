@@ -33,6 +33,7 @@ pub mod elsewhere;
 pub mod files;
 pub mod gitstate;
 pub mod handoff;
+pub mod homes;
 pub mod host;
 pub mod kept;
 pub mod kinds;

@@ -435,6 +435,9 @@ struct State {
     /// The server's certificate authority and a bundle of it and this machine's roots, when the
     /// leg reaches the server over HTTPS (§2.6): its tools trust them.
     trust: Option<(PathBuf, PathBuf)>,
+    /// The authority is in the leg's machine's own store (kiln's runner image), so its tools
+    /// trust it without being told of a bundle.
+    trust_in_store: bool,
     /// The kind of failure that failed the leg (W05-R15): `infra`, `image-pull`, `oom` or
     /// `disk-full`, said to the server with its result; else it's a `failure`.
     class: Option<&'static str>,
@@ -1061,10 +1064,16 @@ impl Leg {
         }
         // The server's own certificate authority beside the machine's roots (§2.6): Node adds
         // it to its own; git, curl, Python and OpenSSL take the bundle. A job's own say wins.
+        // In the machine's own store, only Node and Python's requests (which read bundles of
+        // their own) are told: the rest work, and say what they say, as on a hosted runner.
         if let Some((ca, bundle)) = &st.trust {
             set("NODE_EXTRA_CA_CERTS", ca.to_string_lossy().into_owned());
-            for k in ["SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"] {
-                set(k, bundle.to_string_lossy().into_owned());
+            if st.trust_in_store {
+                set("REQUESTS_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt".to_owned());
+            } else {
+                for k in ["SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"] {
+                    set(k, bundle.to_string_lossy().into_owned());
+                }
             }
         }
         v
@@ -1217,6 +1226,7 @@ impl Leg {
             pre_state: BTreeMap::new(),
             action_state: Vec::new(),
             trust,
+            trust_in_store: false,
             class: None,
             step_class: None,
             oom_seen: None,
@@ -2206,6 +2216,17 @@ impl Leg {
             }
             st.docker_sock = Some(std::sync::Arc::new(p));
         }
+        // kiln's runner image is the leg's machine: the server's authority goes in its own store,
+        // as a hosted runner's machine trusts what it reaches, and its tools needn't be told.
+        st.trust_in_store = match (st.trust.as_ref(), started.job.as_ref()) {
+            (Some((ca, _)), Some(j)) if self.github_paths(&st.layout) => {
+                let inside = j.map.translate(&ca.to_string_lossy());
+                let script = "cp \"$1\" /usr/local/share/ca-certificates/kiln-ca.crt && update-ca-certificates >/dev/null";
+                let args: Vec<String> = ["exec", "-u", "0", j.id.as_str(), "sh", "-c", script, "sh", inside.as_str()].map(str::to_owned).into();
+                started.cli.run(&args, &BTreeMap::new(), Duration::from_secs(120)).await.is_ok()
+            }
+            _ => false,
+        };
         if let (Some((e, n)), Some((_, port))) = (egress, started.relay.as_ref()) {
             st.egress = Some(std::sync::Arc::new(super::egress::Pool::start(*port, e.token, self.egress_policy(&n))));
             st.env.extend(super::docker::proxy_env(keys.iter().map(String::as_str)));

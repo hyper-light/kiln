@@ -11,10 +11,11 @@ import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
-import { TaskElapsed, TodoList } from "./timeline";
+import { TaskElapsed } from "./timeline";
 import { Background, isBackground } from "./background";
 import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
+import { ProposedPlan, TodoSteps } from "@/views/plans/its-plan";
 import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
@@ -365,30 +366,31 @@ export function Inspector({
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
               <section>
                 <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
-                {todos.length > 0 ? (
+                {/* The plan it proposed (plan mode), kept by kiln: its steps to pick or run. */}
+                {agentId ? (
+                  <Loadable label="its plan" fallback={null}>
+                    <ProposedPlan session={agentId} words={proposed} />
+                  </Loadable>
+                ) : (
+                  proposed && (
+                    <div className="hx-stack">
+                      <Prose text={proposed} className="hx-plan-text" />
+                      <SavePlan body={proposed} />
+                    </div>
+                  )
+                )}
+                {/* Its to-do list, each item as a step stands. */}
+                {todos.length > 0 && (
                   <div className="hx-stack">
                     <div className="hx-progress">
                       <span style={{ width: `${(done / todos.length) * 100}%` }} />
                     </div>
-                    <TodoList todos={todos} />
+                    <TodoSteps todos={todos} />
                     <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
                   </div>
-                ) : proposed ? (
-                  <div className="hx-stack">
-                    <Prose text={proposed} className="hx-plan-text" />
-                    <SavePlan body={proposed} />
-                  </div>
-                ) : (
-                  <p className="in-none">None yet: the plan it writes (or its to-do list) shows here, to keep as one of your plans.</p>
                 )}
+                {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
               </section>
-              {todos.length > 0 && proposed && (
-                <section>
-                  <h3 className="in-sec-head">Proposed plan</h3>
-                  <Prose text={proposed} className="hx-plan-text" />
-                  <SavePlan body={proposed} />
-                </section>
-              )}
               {agentId && (
                 <section>
                   <h3 className="in-sec-head">Your plans</h3>
