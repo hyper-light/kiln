@@ -271,6 +271,17 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              && curl -fsSL -o \"/tmp/$f\" \"$u/$f\" && echo \"$(curl -fsSL \"$u/gh_2.102.0_checksums.txt\" | grep \"  $f$\" | cut -d' ' -f1)  /tmp/$f\" | sha256sum -c - \\\n    \
              && tar -xzf \"/tmp/$f\" -C /tmp && install -m 0755 \"/tmp/gh_2.102.0_linux_$g/bin/gh\" /usr/local/bin/gh && rm -rf \"/tmp/$f\" \"/tmp/gh_2.102.0_linux_$g\"\n"
         ));
+        // Go, as GitHub's images have it on `PATH` (prometheus's `promci-setup` asks `go env` for its
+        // caches' paths without setting Go up): the newest release, checked against the sums
+        // go.dev lists. Its own `PATH` here, so the layers before stay as they were.
+        d.push_str(
+            "RUN case \"$(dpkg --print-architecture)\" in amd64) a=amd64 ;; arm64) a=arm64 ;; esac \\\n    \
+             && curl -fsSL -o /tmp/go.json 'https://go.dev/dl/?mode=json' && v=$(jq -r '.[0].version' /tmp/go.json) && f=\"$v.linux-$a.tar.gz\" \\\n    \
+             && s=$(jq -r --arg f \"$f\" '.[0].files[] | select(.filename == $f) | .sha256' /tmp/go.json) \\\n    \
+             && curl -fsSL -o \"/tmp/$f\" \"https://go.dev/dl/$f\" && echo \"$s  /tmp/$f\" | sha256sum -c - \\\n    \
+             && tar -xzf \"/tmp/$f\" -C /usr/local && rm -f \"/tmp/$f\" /tmp/go.json\n\
+             ENV PATH=/usr/local/go/bin:$PATH\n",
+        );
         if os != "ubuntu22" {
             // pip installs as it does on GitHub's Ubuntu 24.04 and 26.04 machines, whose
             // `/etc/pip.conf` says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
@@ -1239,6 +1250,8 @@ mod tests {
             "/usr/bin/pwsh",
             "libicu74",
             "cli/cli/releases",
+            "https://go.dev/dl/$f",
+            "PATH=/usr/local/go/bin:",
             "break-system-packages",
         ] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
