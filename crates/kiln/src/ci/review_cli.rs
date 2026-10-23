@@ -316,6 +316,422 @@ pub fn sync(args: SyncArgs) -> Result<()> {
 }
 
 #[derive(clap::Args)]
+pub struct AbsorbArgs {
+    /// Where the stack starts (default: where HEAD left the remote's trunk, as last fetched).
+    #[arg(long)]
+    base: Option<String>,
+    #[arg(long)]
+    trunk: Option<String>,
+    #[arg(long)]
+    remote: Option<String>,
+    /// Say where each edit would go, and change nothing.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+}
+
+/// `kiln absorb`: each edit of the working copy (to a file HEAD has, staged or not) amended into
+/// the commit of the stack that last touched its lines; an insertion goes where the lines on both
+/// sides of it come from one commit. The commits from the lowest one up are rewritten (authors,
+/// dates and messages kept) and HEAD moves to the new top; the rest stays in the working copy.
+pub fn absorb(args: AbsorbArgs) -> Result<()> {
+    let top = out(&["rev-parse", "--show-toplevel"])?;
+    let base = match &args.base {
+        Some(b) => out(&["rev-parse", "--verify", &format!("{b}^{{commit}}")])?,
+        None => {
+            let remote = remote_of(args.remote.as_deref())?;
+            let trunk = trunk_of(&remote, args.trunk.as_deref());
+            out(&["merge-base", &format!("refs/remotes/{remote}/{trunk}"), "HEAD"]).with_context(|| format!("where does the stack start? `git fetch {remote}`, or pass --base"))?
+        }
+    };
+    let r = absorb_in(std::path::Path::new(&top), &base, args.dry_run)?;
+    if r.edits.is_empty() {
+        println!("nothing to absorb: no edits to files HEAD has");
+        return Ok(());
+    }
+    let mut subjects: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (e, into) in &r.edits {
+        match into {
+            Ok(sha) => {
+                let s = subjects.entry(sha.clone()).or_insert_with(|| out(&["log", "-1", "--format=%s", sha]).unwrap_or_default());
+                println!("{}:{}  into {} {s}", e.path, e.line, sha.get(..12).unwrap_or(sha));
+            }
+            Err(why) => println!("{}:{}  stays: {why}", e.path, e.line),
+        }
+    }
+    let n = r.edits.iter().filter(|(_, into)| into.is_ok()).count();
+    let edits = if r.edits.len() == 1 { "edit" } else { "edits" };
+    match &r.now {
+        _ if args.dry_run => eprintln!("[kiln] {n} of {} {edits} would be absorbed (--dry-run: nothing changed)", r.edits.len()),
+        Some(_) => eprintln!("[kiln] absorbed {n} of {} {edits}; the stack was {} (`kiln submit` sends the new versions)", r.edits.len(), r.was),
+        None => eprintln!("[kiln] nothing absorbed"),
+    }
+    Ok(())
+}
+
+/// One edit of the working copy: HEAD's lines `start..start + old.len()` (from 1; after line
+/// `start` when `old` is empty) become `new`, at `line` in the working copy.
+struct Edit {
+    path: String,
+    start: usize,
+    line: usize,
+    old: Vec<Vec<u8>>,
+    new: Vec<Vec<u8>>,
+}
+
+/// What `kiln absorb` did: each edit with the commit it went into (or why it stayed), the stack's
+/// top before, and its new top (none when nothing moved).
+struct Absorbed {
+    edits: Vec<(Edit, Result<String, String>)>,
+    was: String,
+    now: Option<String>,
+}
+
+/// `git -C dir args` (pathspecs literal): its output, or an error saying what git said.
+fn git_in(dir: &std::path::Path, args: &[&str], env: &[(&str, &std::path::Path)], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    let mut c = git();
+    c.arg("-C").arg(dir).arg("--literal-pathspecs").args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    if input.is_some() {
+        c.stdin(Stdio::piped());
+    }
+    let mut child = c.spawn().with_context(|| format!("git {}", args.first().unwrap_or(&"")))?;
+    if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin.write_all(data)?;
+    }
+    let o = child.wait_with_output()?;
+    if !o.status.success() {
+        bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
+    }
+    Ok(o.stdout)
+}
+
+fn text_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_in(dir, args, &[], None)?).trim().to_owned())
+}
+
+/// `path`'s mode and blob in `rev`.
+fn entry(dir: &std::path::Path, rev: &str, path: &str) -> Result<Option<(String, String)>> {
+    let listed = git_in(dir, &["ls-tree", "-z", rev, "--", path], &[], None)?;
+    let first = listed.split(|b| *b == 0).next().unwrap_or_default();
+    let meta = String::from_utf8_lossy(first.split(|b| *b == b'\t').next().unwrap_or_default()).into_owned();
+    let mut f = meta.split(' ');
+    Ok(match (f.next(), f.next(), f.next()) {
+        (Some(mode), Some("blob"), Some(sha)) => Some((mode.to_owned(), sha.to_owned())),
+        _ => None,
+    })
+}
+
+/// The edits in one file's `git diff -U0`.
+fn edits_of(path: &str, patch: &[u8]) -> Vec<Edit> {
+    let mut list: Vec<Edit> = Vec::new();
+    let mut into_new = false;
+    for line in patch.split_inclusive(|b| *b == b'\n') {
+        if let Some(rest) = line.strip_prefix(b"@@ -") {
+            let head = String::from_utf8_lossy(rest);
+            let mut f = head.split_whitespace();
+            let mut num = || f.next().and_then(|r| r.trim_start_matches('+').split(',').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+            let (start, line) = (num(), num());
+            list.push(Edit { path: path.to_owned(), start, line, old: Vec::new(), new: Vec::new() });
+            continue;
+        }
+        let Some(e) = list.last_mut() else { continue };
+        match line.split_first() {
+            Some((b'-', rest)) => {
+                e.old.push(rest.to_vec());
+                into_new = false;
+            }
+            Some((b'+', rest)) => {
+                e.new.push(rest.to_vec());
+                into_new = true;
+            }
+            // "\ No newline at end of file": the line before it ends without one.
+            Some((b'\\', _)) => {
+                if let Some(l) = if into_new { e.new.last_mut() } else { e.old.last_mut() }
+                    && l.last() == Some(&b'\n')
+                {
+                    l.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    list
+}
+
+/// `path` at `rev`, blamed within the stack (`base..rev`): each line's `(commit, its line
+/// there)`; lines from before the stack are the boundary's.
+fn blame(dir: &std::path::Path, base: &str, rev: &str, path: &str) -> Result<Vec<(String, usize)>> {
+    let text = git_in(dir, &["blame", "--porcelain", "--ignore-revs-file", "", &format!("{base}..{rev}"), "--", path], &[], None)?;
+    let mut lines: Vec<Option<(String, usize)>> = Vec::new();
+    for l in text.split(|b| *b == b'\n').filter(|l| l.first() != Some(&b'\t')) {
+        let s = String::from_utf8_lossy(l);
+        let mut f = s.split(' ');
+        let (Some(sha), Some(Ok(orig)), Some(Ok(at))) = (f.next(), f.next().map(str::parse::<usize>), f.next().map(str::parse::<usize>)) else { continue };
+        if sha.len() < 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) || at == 0 {
+            continue;
+        }
+        if lines.len() < at {
+            lines.resize(at, None);
+        }
+        if let Some(slot) = lines.get_mut(at - 1) {
+            *slot = Some((sha.to_owned(), orig));
+        }
+    }
+    lines.into_iter().collect::<Option<Vec<_>>>().context("git blame left a line out")
+}
+
+/// The commit of the stack (its index) an edit belongs in, or why it has none: the one every line
+/// it changes comes from, or for an insertion, the lines on both sides of it.
+fn target(e: &Edit, head: &[(String, usize)], at: &std::collections::HashMap<&str, usize>) -> Result<usize, String> {
+    let insert = e.old.is_empty();
+    let lines: Vec<&(String, usize)> = if insert {
+        [e.start.checked_sub(1), Some(e.start)].into_iter().flatten().filter_map(|i| head.get(i)).collect()
+    } else {
+        head.get(e.start.saturating_sub(1)..e.start.saturating_sub(1) + e.old.len()).map(|s| s.iter().collect()).unwrap_or_default()
+    };
+    let mut into = None;
+    for (sha, _) in lines {
+        let Some(&i) = at.get(sha.as_str()) else {
+            return Err(if insert { "next to lines from before the stack" } else { "changes lines from before the stack" }.to_owned());
+        };
+        if into.is_some_and(|j| j != i) {
+            return Err(if insert { "between lines of two commits" } else { "changes lines of more than one commit" }.to_owned());
+        }
+        into = Some(i);
+    }
+    into.ok_or_else(|| "no lines around it".to_owned())
+}
+
+/// Where `e` goes in a commit whose file is `lines` and whose blame `pos` finds each `(commit,
+/// line there)` at: the index of its first line (or where it inserts), when its lines are there,
+/// in one piece and unchanged.
+fn place(e: &Edit, head: &[(String, usize)], pos: &std::collections::HashMap<(&str, usize), usize>, lines: &[&[u8]]) -> Option<usize> {
+    let find = |i: usize| head.get(i).and_then(|(sha, o)| pos.get(&(sha.as_str(), *o)).copied());
+    let p = if e.old.is_empty() {
+        let above = match e.start {
+            0 => None,
+            s => Some(find(s - 1)?),
+        };
+        let below = if e.start < head.len() { Some(find(e.start)?) } else { None };
+        let p = match (above, below) {
+            (Some(a), Some(b)) if b == a + 1 => b,
+            (Some(a), None) => a + 1,
+            (None, Some(b)) => b,
+            _ => return None,
+        };
+        // Not after a last line without a newline.
+        if p > 0 && lines.get(p - 1).is_some_and(|l| l.last() != Some(&b'\n')) {
+            return None;
+        }
+        p
+    } else {
+        let first = find(e.start.checked_sub(1)?)?;
+        for i in 1..e.old.len() {
+            if find(e.start - 1 + i)? != first + i {
+                return None;
+            }
+        }
+        first
+    };
+    let here = lines.get(p..p + e.old.len())?;
+    if here.iter().zip(&e.old).any(|(a, b)| *a != b.as_slice()) {
+        return None;
+    }
+    // A new last line without a newline stays the file's last.
+    if e.new.last().is_some_and(|l| l.last() != Some(&b'\n')) && p + e.old.len() != lines.len() {
+        return None;
+    }
+    Some(p)
+}
+
+/// Removes a file when dropped.
+struct Gone(std::path::PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `sha` again with `tree` and `parent`: its author, committer, dates and message kept (a
+/// signature dropped: it no longer matches).
+fn recommit(dir: &std::path::Path, sha: &str, tree: &str, parent: &str) -> Result<String> {
+    let raw = git_in(dir, &["cat-file", "commit", sha], &[], None)?;
+    let end = raw.windows(2).position(|w| w == b"\n\n").map_or(raw.len(), |i| i + 1);
+    let (head, body) = raw.split_at(end);
+    let mut commit = Vec::with_capacity(raw.len());
+    let mut signature = false;
+    for line in head.split_inclusive(|b| *b == b'\n') {
+        if line.starts_with(b" ") {
+            if !signature {
+                commit.extend_from_slice(line);
+            }
+            continue;
+        }
+        signature = line.starts_with(b"gpgsig");
+        if line.starts_with(b"tree ") {
+            commit.extend_from_slice(format!("tree {tree}\n").as_bytes());
+        } else if line.starts_with(b"parent ") {
+            commit.extend_from_slice(format!("parent {parent}\n").as_bytes());
+        } else if !signature {
+            commit.extend_from_slice(line);
+        }
+    }
+    commit.extend_from_slice(body);
+    Ok(String::from_utf8_lossy(&git_in(dir, &["hash-object", "-t", "commit", "-w", "--stdin"], &[], Some(&commit))?).trim().to_owned())
+}
+
+/// `kiln absorb` in the working copy at `dir` (its top), for the stack above `base`.
+fn absorb_in(dir: &std::path::Path, base: &str, dry_run: bool) -> Result<Absorbed> {
+    use std::collections::{BTreeSet, HashMap};
+    for busy in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] {
+        if dir.join(text_in(dir, &["rev-parse", "--git-path", busy])?).exists() {
+            bail!("a merge, rebase, cherry-pick or revert is in progress: finish it first");
+        }
+    }
+    let was = text_in(dir, &["rev-parse", "--verify", "HEAD"])?;
+    // The stack, bottom first, with its parents.
+    let mut stack: Vec<(String, String)> = Vec::new();
+    for l in text_in(dir, &["rev-list", "--reverse", "--topo-order", "--parents", &format!("{base}..HEAD")])?.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        match f.as_slice() {
+            [sha, parent] => stack.push(((*sha).to_owned(), (*parent).to_owned())),
+            [sha, ..] => bail!("{} is a merge: a stack is single commits", sha.get(..12).unwrap_or(sha)),
+            [] => {}
+        }
+    }
+    if stack.is_empty() {
+        bail!("nothing to absorb into: HEAD is the stack's base");
+    }
+    let at: HashMap<&str, usize> = stack.iter().enumerate().map(|(i, (sha, _))| (sha.as_str(), i)).collect();
+    let status = git_in(dir, &["diff", "--no-renames", "--name-status", "-z", "HEAD"], &[], None)?;
+    let mut fields = status.split(|b| *b == 0).filter(|f| !f.is_empty());
+    let mut files = Vec::new();
+    while let (Some(st), Some(path)) = (fields.next(), fields.next()) {
+        if let (b"M", Ok(p)) = (st, std::str::from_utf8(path)) {
+            files.push(p.to_owned());
+        }
+    }
+    // Each edit and the commit it belongs in.
+    let mut edits: Vec<(Edit, Result<usize, String>)> = Vec::new();
+    let mut heads: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    for path in &files {
+        let patch = git_in(dir, &["diff", "--no-ext-diff", "--no-color", "--no-textconv", "--no-renames", "-U0", "HEAD", "--", path], &[], None)?;
+        let list = edits_of(path, &patch);
+        let mode = entry(dir, "HEAD", path)?.map(|(m, _)| m).unwrap_or_default();
+        let whole = |why: &str| (Edit { path: path.clone(), start: 0, line: 0, old: Vec::new(), new: Vec::new() }, Err(why.to_owned()));
+        if list.is_empty() {
+            edits.push(whole(if patch.windows(12).any(|w| w == b"Binary files") { "a binary file" } else { "no lines changed" }));
+            continue;
+        }
+        if mode != "100644" && mode != "100755" {
+            edits.push(whole("not a regular file"));
+            continue;
+        }
+        let head = blame(dir, base, "HEAD", path)?;
+        for e in list {
+            let t = target(&e, &head, &at);
+            edits.push((e, t));
+        }
+        heads.insert(path.clone(), head);
+    }
+    // Where each edit goes in every commit from its own up: those it can't be placed in stay.
+    let mut places: HashMap<(usize, usize), usize> = HashMap::new();
+    for path in &files {
+        let Some(head) = heads.get(path) else { continue };
+        let mine: Vec<usize> = edits.iter().enumerate().filter(|(_, (e, t))| e.path == *path && t.is_ok()).map(|(i, _)| i).collect();
+        let Some(lowest) = mine.iter().filter_map(|&i| edits.get(i).and_then(|(_, t)| t.as_ref().ok().copied())).min() else { continue };
+        for (k, (sha, _)) in stack.iter().enumerate().skip(lowest) {
+            let here = match (blame(dir, base, sha, path), entry(dir, sha, path)?) {
+                (Ok(b), Some((_, blob))) => Some((b, git_in(dir, &["cat-file", "blob", &blob], &[], None)?)),
+                _ => None,
+            };
+            let found: Option<(HashMap<(&str, usize), usize>, Vec<&[u8]>)> = here.as_ref().map(|(b, data)| (b.iter().enumerate().map(|(n, (s, o))| ((s.as_str(), *o), n)).collect(), data.split_inclusive(|c| *c == b'\n').collect()));
+            for &i in &mine {
+                let Some((e, t)) = edits.get_mut(i) else { continue };
+                if !t.as_ref().is_ok_and(|&c| c <= k) {
+                    continue;
+                }
+                match found.as_ref().and_then(|(pos, lines)| place(e, head, pos, lines)) {
+                    Some(p) => {
+                        places.insert((i, k), p);
+                    }
+                    None => *t = Err(format!("the commits above {} move or change its lines", sha.get(..12).unwrap_or(sha))),
+                }
+            }
+        }
+    }
+    let lowest = edits.iter().filter_map(|(_, t)| t.as_ref().ok().copied()).min();
+    let named = |edits: Vec<(Edit, Result<usize, String>)>, shas: &[String]| edits.into_iter().map(|(e, t)| (e, t.map(|i| shas.get(i).cloned().unwrap_or_default()))).collect();
+    let old: Vec<String> = stack.iter().map(|(sha, _)| sha.clone()).collect();
+    let Some(lowest) = lowest.filter(|_| !dry_run) else { return Ok(Absorbed { edits: named(edits, &old), was, now: None }) };
+    // The commits from the lowest up, each with the edits at or below it.
+    let git_dir = std::path::PathBuf::from(text_in(dir, &["rev-parse", "--absolute-git-dir"])?);
+    let mut shas = old.clone();
+    let mut parent = stack.get(lowest).map(|(_, p)| p.clone()).unwrap_or_default();
+    let mut changed: BTreeSet<&str> = BTreeSet::new();
+    for (k, (sha, _)) in stack.iter().enumerate().skip(lowest) {
+        let mut by_file: HashMap<&str, Vec<(usize, &Edit)>> = HashMap::new();
+        for (i, (e, t)) in edits.iter().enumerate() {
+            if let (Ok(c), Some(&p)) = (t, places.get(&(i, k)))
+                && *c <= k
+            {
+                by_file.entry(e.path.as_str()).or_default().push((p, e));
+            }
+        }
+        let tree = if by_file.is_empty() {
+            text_in(dir, &["rev-parse", &format!("{sha}^{{tree}}")])?
+        } else {
+            let index = Gone(git_dir.join(format!("kiln-absorb-{}.index", crate::util::random_token())));
+            let env = [("GIT_INDEX_FILE", index.0.as_path())];
+            git_in(dir, &["read-tree", sha], &env, None)?;
+            for (path, mut list) in by_file {
+                let (mode, blob) = entry(dir, sha, path)?.with_context(|| format!("{path} isn't in {sha}"))?;
+                let data = git_in(dir, &["cat-file", "blob", &blob], &[], None)?;
+                let mut lines: Vec<&[u8]> = data.split_inclusive(|c| *c == b'\n').collect();
+                list.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+                for (p, e) in list {
+                    if lines.get(p..p + e.old.len()).is_none() {
+                        bail!("{path}: an edit's lines aren't in {sha}; nothing changed");
+                    }
+                    let rest = lines.split_off(p + e.old.len());
+                    lines.truncate(p);
+                    lines.extend(e.new.iter().map(Vec::as_slice));
+                    lines.extend(rest);
+                }
+                let new_blob = String::from_utf8_lossy(&git_in(dir, &["hash-object", "-w", "--stdin"], &[], Some(&lines.concat()))?).trim().to_owned();
+                git_in(dir, &["update-index", "--cacheinfo", &mode, &new_blob, path], &env, None)?;
+                changed.insert(path);
+            }
+            String::from_utf8_lossy(&git_in(dir, &["write-tree"], &env, None)?).trim().to_owned()
+        };
+        parent = recommit(dir, sha, &tree, &parent)?;
+        if let Some(s) = shas.get_mut(k) {
+            s.clone_from(&parent);
+        }
+    }
+    // A file all of whose edits were absorbed is now the working copy's, exactly.
+    for path in &changed {
+        let all = edits.iter().filter(|(e, _)| e.path == *path).all(|(_, t)| t.is_ok());
+        let now = entry(dir, &parent, path)?.map(|(_, b)| b);
+        if all && now.as_deref() != Some(text_in(dir, &["hash-object", "--", path])?.as_str()) {
+            bail!("the new {path} isn't the working copy's: nothing changed (HEAD is still {was})");
+        }
+    }
+    match text_in(dir, &["symbolic-ref", "-q", "HEAD"]) {
+        Ok(branch) if !branch.is_empty() => git_in(dir, &["update-ref", "-m", "kiln absorb", &branch, &parent, &was], &[], None)?,
+        _ => git_in(dir, &["update-ref", "--no-deref", "-m", "kiln absorb", "HEAD", &parent, &was], &[], None)?,
+    };
+    // The files it changed are staged as the new top has them; what stays in them is unstaged.
+    let mut reset = vec!["reset", "-q", "--"];
+    reset.extend(changed.iter().copied());
+    git_in(dir, &reset, &[], None)?;
+    Ok(Absorbed { edits: named(edits, &shas), was, now: Some(parent) })
+}
+
+#[derive(clap::Args)]
 pub struct DiffsArgs {
     #[command(flatten)]
     conn: Conn,
@@ -573,6 +989,60 @@ mod tests {
         assert!(id.is_some(), "{m}");
         g(&["commit", "-q", "--amend", "--no-edit"])?;
         assert_eq!(kiln_ci::review::change_id(&g(&["log", "-1", "--format=%B"])?), id, "an amend keeps it");
+        Ok(())
+    }
+
+    /// Each edit goes into the commit that last touched its lines (an insertion, into the one both
+    /// its neighbours come from); edits of the trunk's lines stay in the working copy.
+    #[cfg(unix)]
+    #[test]
+    fn w14_r03_absorb() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let d = dir.path().to_string_lossy().into_owned();
+        let g = |args: &[&str]| -> Result<String> {
+            let o = Command::new("git").args(["-C", &d, "-c", "commit.gpgsign=false"]).args(args).env("GIT_CONFIG_NOSYSTEM", "1").env("HOME", &d).output()?;
+            anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let write = |name: &str, body: &str| std::fs::write(dir.path().join(name), body);
+        g(&["init", "-q"])?;
+        g(&["config", "user.name", "T"])?;
+        g(&["config", "user.email", "t@x"])?;
+        write("a", "1\n2\n3\n")?;
+        g(&["add", "a"])?;
+        g(&["commit", "-qm", "trunk"])?;
+        let base = g(&["rev-parse", "HEAD"])?.trim().to_owned();
+        write("a", "1\n2\n3\nfour\nfive\n")?;
+        g(&["commit", "-qam", "one: four and five"])?;
+        write("a", "1\n2\n3\nfour\nfive\nsix\n")?;
+        write("b", "x\ny\n")?;
+        g(&["add", "b"])?;
+        g(&["commit", "-qam", "two: six and b"])?;
+        // `2` is the trunk's, `four` one's, `six` and the line between x and y two's.
+        write("a", "1\nTWO\n3\nFOUR\nfive\nSIX\n")?;
+        write("b", "x\nbetween\ny\n")?;
+        let was = g(&["rev-parse", "HEAD"])?.trim().to_owned();
+
+        let plan = absorb_in(dir.path(), &base, true)?;
+        assert!(plan.now.is_none());
+        assert_eq!(g(&["rev-parse", "HEAD"])?.trim(), was, "a dry run changes nothing");
+        let r = absorb_in(dir.path(), &base, false)?;
+        let went: Vec<(String, usize, Option<String>)> = r.edits.iter().map(|(e, into)| (e.path.clone(), e.line, into.as_ref().ok().map(|sha| g(&["log", "-1", "--format=%s", sha]).unwrap_or_default().trim().to_owned()))).collect();
+        assert_eq!(
+            went,
+            vec![("a".into(), 2, None), ("a".into(), 4, Some("one: four and five".into())), ("a".into(), 6, Some("two: six and b".into())), ("b".into(), 2, Some("two: six and b".into()))],
+            "{:?}",
+            r.edits.iter().map(|(_, into)| into.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(r.edits.first().and_then(|(_, into)| into.clone().err()).as_deref(), Some("changes lines from before the stack"));
+        assert_eq!(g(&["log", "--format=%s", &format!("{base}..HEAD")])?, "two: six and b\none: four and five\n", "the messages and the stack's shape are kept");
+        assert_eq!(g(&["show", "HEAD~1:a"])?, "1\n2\n3\nFOUR\nfive\n");
+        assert_eq!(g(&["show", "HEAD:a"])?, "1\n2\n3\nFOUR\nfive\nSIX\n");
+        assert_eq!(g(&["show", "HEAD:b"])?, "x\nbetween\ny\n");
+        assert_eq!(g(&["show", "HEAD~1:b"]).ok(), None, "b is two's");
+        assert_eq!(g(&["diff", "HEAD", "-U0", "--no-color"])?.lines().filter(|l| l.starts_with(['-', '+']) && !l.starts_with("---") && !l.starts_with("+++")).collect::<Vec<_>>(), vec!["-2", "+TWO"], "only the trunk's edit stays");
+        assert_eq!(g(&["diff", "--cached", "--name-only"])?, "", "nothing is left staged");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a"))?, "1\nTWO\n3\nFOUR\nfive\nSIX\n", "the working copy is untouched");
         Ok(())
     }
 }

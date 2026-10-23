@@ -234,6 +234,21 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
             };
         }
+        // Every operation over HTTP (docs/ci.md W20-R01): the list, and one run as its caller.
+        // Each is checked as its own route is, and a change audited as that route's would be.
+        (&Method::GET, ["api", "ops"]) => {
+            return match boxed(|| caller_of(&hub, req.headers())).await {
+                Some(_) => Ok(srv::json(StatusCode::OK, &crate::ops::catalog(&hub))),
+                None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
+            };
+        }
+        (&Method::POST, ["api", "ops", name]) => {
+            let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else { return Err(err(StatusCode::UNAUTHORIZED, "authentication required")) };
+            let name = (*name).to_owned();
+            let input: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null);
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller };
+            return boxed(|| crate::ops::call(cx, &name, input)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m));
+        }
         (&Method::POST, ["api", "auth", "login"]) => return boxed(|| login(&hub, req)).await,
         // SSO with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
         (&Method::GET, ["api", "auth", "sso"]) => return Ok(srv::json(StatusCode::OK, &boxed(|| crate::authz::sso::providers(&hub)).await)),
@@ -258,6 +273,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(boxed(|| otp(&hub, &req)).await),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(boxed(|| auth_methods(&hub)).await),
         (&Method::POST, ["api", "auth", "password"]) => return boxed(|| login_password(&hub, req)).await,
+        // Passkeys (docs/ci.md W10): a challenge, then the signature that answers it.
+        (&Method::POST, ["api", "auth", "passkey", "options"]) => {
+            let origin = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            return crate::authz::passkeys::sign_in_options(&hub, origin.as_deref()).map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m));
+        }
+        (&Method::POST, ["api", "auth", "passkey"]) => return boxed(|| login_passkey(&hub, req)).await,
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
         (&Method::GET, ["api", "me"]) => return Ok(boxed(|| me(&hub, req.headers())).await),
         (&Method::POST, ["api", "agents", "enroll"]) => return boxed(|| enroll(&hub, req)).await,
@@ -397,7 +418,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         };
     }
     match (&method, s.as_slice()) {
-        (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION")))),
+        (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION"), &crate::ops::all(&hub)))),
         (&Method::GET, ["api", "peers"]) => boxed(|| crate::peers::list(&hub)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "peers", "open"]) => crate::peers::openable(&hub).map_err(|(c, m)| err(c, m)),
         (&Method::POST, ["api", "peers"]) => boxed(|| crate::peers::register(&hub, &caller.name, req)).await.map_err(|(c, m)| err(c, m)),
@@ -424,13 +445,40 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (_, ["api", "ci", rest @ ..]) => boxed(|| crate::ci::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "push", rest @ ..]) => boxed(|| crate::push::api::route(&hub, &caller, &method, rest, req)).await.map_err(|(c, m)| err(c, m)),
+        // W20-R11: experiments.
+        (_, ["api", "experiments", rest @ ..]) => {
+            let rest: Vec<&str> = rest.to_vec();
+            let body: serde_json::Value = if method == Method::POST { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
+            boxed(|| crate::ci::experiments::route(&hub, &caller, &method, &rest, &q, body)).await.map_err(|(c, m)| err(c, m))
+        }
         // W14: diffs and stacks.
         (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body)).await.map_err(|(c, m)| err(c, m))
         }
-        (&Method::GET, ["api", "overview"]) => boxed(|| overview(&hub)).await,
+        (&Method::GET, ["api", "overview"]) => boxed(|| overview(&hub, &caller)).await,
+        (&Method::GET, ["api", "me", "notifications"]) => boxed(|| crate::ci::notify::mine(&hub, &caller, None)).await.map_err(|(s, m)| ApiError(s, m)),
+        (&Method::PUT, ["api", "me", "notifications"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 20)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| crate::ci::notify::mine(&hub, &caller, Some(body))).await.map_err(|(s, m)| ApiError(s, m))
+        }
+        // W10: one's own passkeys and password.
+        (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
+        (&Method::POST, ["api", "me", "passkeys", "options"]) => {
+            let origin = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            boxed(|| crate::authz::passkeys::register_options(&hub, &caller, origin.as_deref())).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m))
+        }
+        (&Method::POST, ["api", "me", "passkeys"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 16)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| crate::authz::passkeys::register(&hub, &caller, &body)).await.map(|v| srv::json(StatusCode::CREATED, &v)).map_err(|(s, m)| ApiError(s, m))
+        }
+        (&Method::DELETE, ["api", "me", "passkeys", id]) => boxed(|| crate::authz::passkeys::remove(&hub, &caller, id)).await.map(|()| srv::status(StatusCode::NO_CONTENT)).map_err(|(s, m)| ApiError(s, m)),
+        (&Method::GET, ["api", "me", "password"]) => boxed(|| crate::authz::passwords::get(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
+        (&Method::PUT, ["api", "me", "password"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 16)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            boxed(|| crate::authz::passwords::set(&hub, &caller, &body)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m))
+        }
         (&Method::GET, ["api", "system"]) => Ok(boxed(|| system(&hub)).await),
         (&Method::GET, ["api", "audit"]) => boxed(|| audit(&hub, &q)).await,
         (&Method::GET, ["api", "updates"]) => Ok(boxed(|| updates_overview(&hub, false)).await),
@@ -463,7 +511,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let id = (*id).to_owned();
             boxed(|| trigger(&hub, &id, req)).await
         }
-        (&Method::GET, ["api", "runs"]) => boxed(|| runs(&hub, &q)).await,
+        (&Method::GET, ["api", "runs"]) => boxed(|| runs(&hub, &q, &caller)).await,
         (&Method::GET, ["api", "runs", id]) => boxed(|| run(&hub, id, &q)).await,
         (&Method::POST, ["api", "runs", id, "cancel"]) => boxed(|| cancel(&hub, id)).await,
         (&Method::POST, ["api", "runs", id, "retry"]) => {
@@ -507,6 +555,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let name = (*name).to_owned();
             boxed(|| drain_agent(&hub, &name, req)).await
         }
+        (&Method::POST, ["api", "agents", name, "probe"]) => boxed(|| probe_agent(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "front-doors"]) => front_door(boxed(|| crate::frontdoor::control::list(&hub)).await),
         (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(boxed(|| crate::frontdoor::control::get(&hub, name)).await),
         (&Method::PUT, ["api", "runners", name, "front-door"]) => {
@@ -524,7 +573,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::DELETE, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::delete(&hub)).await),
         (&Method::PUT, ["api", "settings", "password"]) => boxed(|| set_password(&hub, req)).await,
         (&Method::DELETE, ["api", "settings", "password"]) => boxed(|| clear_password(&hub)).await,
-        (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
+        (&Method::GET, ["api", "events"]) => {
+            // A person of some repositories hears theirs (W10); the server's scope hears it all.
+            let narrow = boxed(|| crate::authz::gate::readable(&hub, &caller, "runs.read"))
+                .await
+                .map(|repos| Narrow { repos: repos.into_iter().collect(), person: crate::ci::inbox::person(&crate::ci::review::who(&caller).0), runs: HashMap::new() });
+            events_ws(hub.clone(), req, narrow)
+        }
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => boxed(|| ai_transcript(&hub, machine, pid)).await,
@@ -1961,18 +2016,27 @@ static PASSWORD_GATE: async_lock::Mutex<()> = async_lock::Mutex::new(());
 async fn auth_methods(hub: &Hub) -> Response {
     let path = crate::password::path(&hub.cfg);
     let password = crate::rt::blocking(move || crate::password::load(&path).is_some()).await.unwrap_or(false);
-    srv::json(StatusCode::OK, &json!({ "password": password, "token": true }))
+    // Passkeys kept here, and people's own passwords (who then sign in with their name).
+    let (passkey, people) = (crate::authz::passkeys::any(hub).await, crate::authz::passwords::any(hub).await);
+    srv::json(StatusCode::OK, &json!({ "password": password, "token": true, "passkey": passkey, "people": people }))
 }
 
 #[derive(Deserialize)]
 struct PasswordLogin {
     password: String,
+    /// A person's name: their own password (W10). Without, the owner's.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 async fn login_password(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: PasswordLogin =
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if let Some(name) = l.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        let (id, _, epoch) = crate::authz::passwords::sign_in(hub, name, &l.password).await.map_err(|(c, m)| err(c, m))?;
+        return Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &cookie_for(&crate::authz::gate::session_value(hub, &id, epoch), secure)));
+    }
     let gate = PASSWORD_GATE.lock().await;
     if let Err(wait) = PASSWORD_THROTTLE.check() {
         let secs = wait.as_secs().max(1);
@@ -2003,6 +2067,23 @@ async fn login_password(hub: &Hub, req: Request) -> R {
             StatusCode::CONFLICT,
             "Password sign-in is not set up yet. Sign in with the admin token once, then choose a password in Settings.",
         )),
+    }
+}
+
+/// `POST /api/auth/passkey`: a passkey's answer to its challenge; the session of whoever it's
+/// theirs (docs/ci.md W10).
+async fn login_passkey(hub: &Hub, req: Request) -> R {
+    let secure = is_secure(hub, &req);
+    let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    match crate::authz::passkeys::sign_in(hub, &body).await {
+        Ok(crate::authz::passkeys::Who::Owner) => Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub, secure))),
+        Ok(crate::authz::passkeys::Who::User { id, epoch, .. }) => {
+            Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &cookie_for(&crate::authz::gate::session_value(hub, &id, epoch), secure)))
+        }
+        Err((c, m)) => {
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            Err(err(c, m))
+        }
     }
 }
 
@@ -2053,6 +2134,20 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "principal": caller.as_ref().map(|c| c.name.clone()),
             "kind": caller.as_ref().map(|c| c.kind),
             "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
+            // What it may do (W10-R02), for pages that show only what one can use: each
+            // capability held on the whole server, or only somewhere (a repository, …).
+            "can": caller.as_ref().map(|c| {
+                crate::authz::CAPABILITIES
+                    .iter()
+                    .filter_map(|cap| {
+                        if c.can(cap, &crate::authz::Scope::Server) {
+                            Some(((*cap).to_owned(), json!("server")))
+                        } else {
+                            c.has_somewhere(cap).then(|| ((*cap).to_owned(), json!("some")))
+                        }
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+            }),
             "public_url": hub.cfg.server.public_url,
             // Where pages agents show are served, when not here (docs/previews.md).
             "pages_url": hub.cfg.server.pages_url,
@@ -2067,8 +2162,16 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
 
 // ------------------------------------------------------------------ overview / system
 
-async fn overview(hub: &Hub) -> R {
-    let stats = hub.store.stats().await?;
+async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
+    // A person of some repositories sees theirs (W10): their runs, jobs and queue, none of the
+    // server's (its runners, processes and samples, its host's name).
+    if let Some(repos) = crate::authz::gate::readable(hub, caller, "runs.read").await {
+        let stats = hub.store.stats(Some(repos.clone())).await?;
+        let queue = hub.store.queue_among(repos.clone()).await?;
+        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "uptime_s": hub.started.elapsed().as_secs(), "hostname": null, "generation": hub.generation, "children": [], "sample": null });
+        return Ok(srv::json(StatusCode::OK, &json!({ "stats": stats, "queue": queue, "agents": null, "system": system, "sample": null, "narrowed": repos })));
+    }
+    let stats = hub.store.stats(None).await?;
     let agents = hub.agent_list().await;
     let m = crate::metrics::global();
     let sample = hub.history.lock().get("server").and_then(|q| q.back().cloned());
@@ -2247,10 +2350,37 @@ async fn trigger(hub: &Hub, id: &str, req: Request) -> R {
 
 // ------------------------------------------------------------------ runs & jobs
 
-async fn runs(hub: &Hub, q: &HashMap<String, String>) -> R {
+/// `GET /api/runs`: runs newest first, of the repositories the caller may read (W10).
+async fn runs(hub: &Hub, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> R {
     let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let before = q.get("before").and_then(|v| v.parse().ok());
-    Ok(srv::json(StatusCode::OK, &hub.store.runs(q.get("repo").cloned(), limit, before).await?))
+    // Another order than newest first pages by `offset` (W21-R03's sort).
+    if let Some(sort) = q.get("sort").filter(|s| matches!(s.as_str(), "oldest" | "longest" | "shortest")) {
+        let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
+        let list = hub.store.runs_sorted(among, q.get("repo").cloned(), sort, limit, offset).await?;
+        return Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?));
+    }
+    let list = match crate::authz::gate::readable(hub, caller, "runs.read").await {
+        None => hub.store.runs(q.get("repo").cloned(), limit, before).await?,
+        Some(names) => hub.store.runs_among(names, q.get("repo").cloned(), limit, before).await?,
+    };
+    Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?))
+}
+
+/// Runs, each with the runners and executors its legs ran on (W21-R03's facets).
+async fn with_hosts(hub: &Hub, runs: &[crate::store::Run]) -> anyhow::Result<Vec<serde_json::Value>> {
+    let hosts = hub.store.run_hosts(runs.iter().map(|r| r.id.clone()).collect()).await?;
+    let mut out = Vec::with_capacity(runs.len());
+    for r in runs {
+        let mut v = serde_json::to_value(r)?;
+        if let (Some(o), Some((runners, executors))) = (v.as_object_mut(), hosts.get(&r.id)) {
+            o.insert("runners".into(), json!(runners));
+            o.insert("executors".into(), json!(executors));
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
@@ -2548,6 +2678,29 @@ async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
     }
 }
 
+/// `POST /api/agents/:name/probe` (docs/ci.md W13-R01, on request): the runner probes its facts
+/// again now. The answer is its new report once it comes (within 30 s), or, when it hasn't yet,
+/// 202 without one.
+pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::Fail> {
+    let Some(before) = hub.agents.lock().get(name).map(|a| a.facts.as_ref().map_or(0, |f| f.probed_at)) else {
+        return Err((StatusCode::NOT_FOUND, format!("no runner `{name}`")));
+    };
+    if !hub.send_to_agent(name, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::ProbeFacts).await {
+        return Err((StatusCode::CONFLICT, format!("{name} isn't connected")));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let fresh = hub.agents.lock().get(name).and_then(|a| a.facts.as_ref().filter(|f| f.probed_at > before).map(|f| serde_json::to_value(f.as_ref()).unwrap_or_default()));
+        if let Some(facts) = fresh {
+            return Ok(srv::json(StatusCode::OK, &json!({ "runner": name, "facts": facts })));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(srv::json(StatusCode::ACCEPTED, &json!({ "runner": name, "facts": null, "note": "asked: its report hasn't come yet" })));
+        }
+        crate::rt::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 fn join_info(hub: &Hub) -> Response {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let token = hub.join_token.clone();
@@ -2608,13 +2761,22 @@ fn outpost_invite(hub: &Hub) -> Response {
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
-    let ephemeral = !persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some();
+    // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
+    // executor's, whatever it asks to be.
+    let pod = if persistent { None } else { hub.executor_tokens.lock().remove(&r.token).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
+    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some());
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
         return Err(err(StatusCode::UNAUTHORIZED, "invalid join token"));
     }
-    let name = crate::pki::sanitize_name(&r.name);
+    let name = match &pod {
+        Some((executor, pod_name, _)) => {
+            hub.pod_executors.lock().insert(pod_name.clone(), executor.clone());
+            pod_name.clone()
+        }
+        None => crate::pki::sanitize_name(&r.name),
+    };
     // An outpost never takes another machine's name: the same machine enrolling again keeps its
     // own, another one gets `<name>-2`.
     let name = if outpost { free_agent_name(hub, &name, &r.hostname).await } else { name };
@@ -3410,13 +3572,51 @@ fn agent_tunnel(hub: &Arc<Hub>, req: Request) -> R {
 
 // ------------------------------------------------------------------ events ws
 
-fn events_ws(hub: Arc<Hub>, req: Request) -> R {
+/// What a caller of some repositories hears of the event stream (W10): events about those
+/// repositories (a run's, a job's run's, any that names one) and their own inbox's; the rest are
+/// the server's.
+struct Narrow {
+    repos: std::collections::HashSet<String>,
+    person: String,
+    /// The repository of each run a job event was about, as looked up.
+    runs: HashMap<String, Option<String>>,
+}
+
+impl Narrow {
+    async fn lets(&mut self, hub: &Hub, text: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+        let kind = v.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        match kind {
+            "resync" => return true,
+            "inbox" => return v.get("person").and_then(serde_json::Value::as_str) == Some(self.person.as_str()),
+            _ => {}
+        }
+        let named = v
+            .get("repo")
+            .and_then(|r| r.as_str().map(str::to_owned).or_else(|| r.get("name").and_then(serde_json::Value::as_str).map(str::to_owned)))
+            .or_else(|| v.pointer("/run/repo_name").and_then(serde_json::Value::as_str).map(str::to_owned));
+        if let Some(r) = named {
+            return self.repos.contains(&r);
+        }
+        let Some(run) = v.pointer("/job/run_id").and_then(serde_json::Value::as_str).map(str::to_owned) else { return false };
+        if !self.runs.contains_key(&run) {
+            if self.runs.len() > 10_000 {
+                self.runs.clear();
+            }
+            let repo = hub.store.run(run.clone()).await.ok().flatten().map(|r| r.repo_name);
+            self.runs.insert(run.clone(), repo);
+        }
+        self.runs.get(&run).cloned().flatten().is_some_and(|r| self.repos.contains(&r))
+    }
+}
+
+fn events_ws(hub: Arc<Hub>, req: Request, narrow: Option<Narrow>) -> R {
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
         m.ws_clients.add(1);
-        if let Err(e) = pump_events(&hub, socket).await {
+        if let Err(e) = pump_events(&hub, socket, narrow).await {
             tracing::debug!(error = %e, "events stream ended");
         }
         m.ws_clients.add(-1);
@@ -3424,7 +3624,7 @@ fn events_ws(hub: Arc<Hub>, req: Request) -> R {
     Ok(resp)
 }
 
-async fn pump_events(hub: &Hub, socket: ws::WebSocket) -> anyhow::Result<()> {
+async fn pump_events(hub: &Hub, socket: ws::WebSocket, mut narrow: Option<Narrow>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let mut rx = hub.events.subscribe();
@@ -3432,7 +3632,15 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket) -> anyhow::Result<()> {
     loop {
         futures::select_biased! {
             ev = rx.recv().fuse() => match ev {
-                Ok(text) => tx.send(ws::text(text.as_ref())).await?,
+                Ok(text) => {
+                    let keep = match narrow.as_mut() {
+                        Some(n) => n.lets(hub, text.as_ref()).await,
+                        None => true,
+                    };
+                    if keep {
+                        tx.send(ws::text(text.as_ref())).await?;
+                    }
+                }
                 Err(async_broadcast::RecvError::Overflowed(_)) => {
                     tx.send(ws::text(json!({"type": "resync"}).to_string())).await?;
                 }

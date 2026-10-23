@@ -7,7 +7,14 @@
 //!   `GET`/`PATCH`/`DELETE /pulls/comments/{id}`;
 //! - `GET`/`POST /pulls/{n}/reviews` (`APPROVE`, `REQUEST_CHANGES`, `COMMENT`, or pending);
 //! - `GET /issues/{n}`, `GET`/`POST /issues/{n}/comments`, `GET`/`PATCH`/`DELETE
-//!   /issues/comments/{id}` (comments on the diff as a whole).
+//!   /issues/comments/{id}` (comments on the diff as a whole);
+//! - `POST /pulls` (a change request for a branch a job pushed), `PATCH /pulls/{n}` (title,
+//!   description, closed or open again);
+//! - labels: `GET`/`POST`/`PUT`/`DELETE /issues/{n}/labels`, `DELETE /issues/{n}/labels/{name}`
+//!   (what `actions/labeler` and `create-pull-request` set);
+//! - landing, as on a GitHub branch that requires a merge queue (every kiln trunk lands through
+//!   its land queue): `GET /pulls/{n}/merge`, a `PUT` there refused; GraphQL's auto-merge and
+//!   enqueueing over [`auto_merge`] and [`queue`]; a job that writes contents and pull requests may.
 //!
 //! A job writes as `github-actions[bot]`; its reviews are an agent's (they count only where
 //! `agents-can-approve`). Comments' ids are numbers, as GitHub's are.
@@ -42,6 +49,16 @@ fn invalid(m: &str) -> Response {
 
 fn forbidden(scope: &str) -> Response {
     srv::json(StatusCode::FORBIDDEN, &json!({ "message": format!("Resource not accessible by integration: the job's token lacks `{scope}: write`") }))
+}
+
+/// A land strategy as GitHub names a merge method: kiln's that make one commit are its squash,
+/// those that keep each commit its rebase.
+fn merge_method(strategy: &str) -> &'static str {
+    match strategy {
+        "squash" | "stack-squash" => "squash",
+        "merge" => "merge",
+        _ => "rebase",
+    }
 }
 
 /// A principal as GitHub shows a user.
@@ -141,21 +158,28 @@ async fn pr_json(s: &Site<'_>, d: &Diff, vs: &[Version]) -> Value {
         (Some(_), Some(v)) => s.hub_text(&["rev-list", "--count", &format!("{}..{}", v.base, v.commit)]).await.and_then(|c| c.trim().parse::<i64>().ok()).unwrap_or(1),
         _ => 1,
     };
+    // Waiting to land when ready (GitHub's auto-merge), or in the land queue (its merge queue).
+    let auto = crate::ci::land::when_ready_of(s.hub, d)
+        .await
+        .map(|w| json!({ "enabled_by": user(&w.by), "merge_method": merge_method(&w.strategy), "commit_title": w.title, "commit_message": w.message, "enabled_at": rfc3339(w.at) }));
+    let queued = crate::ci::land::queued_of(s.hub, d)
+        .await
+        .map(|(entry, state, position, at, by)| json!({ "entry": entry, "state": state, "position": position, "enqueued_at": rfc3339(at), "enqueued_by": user(&by) }));
     let url = format!("{}/pulls/{n}", s.api);
     let mut v = json!({
         "url": url, "id": n, "node_id": format!("kiln-pr-{}", d.id), "number": n,
         "html_url": format!("{}/diffs/{}", s.origin, d.name), "diff_url": format!("{}/diffs/{}.diff", s.origin, d.name), "patch_url": format!("{}/diffs/{}.patch", s.origin, d.name),
         "issue_url": format!("{}/issues/{n}", s.api), "commits_url": format!("{url}/commits"), "review_comments_url": format!("{url}/comments"), "comments_url": format!("{}/issues/{n}/comments", s.api), "statuses_url": format!("{}/statuses/{head}", s.api),
         "state": if closed { "closed" } else { "open" }, "locked": false, "title": d.title, "body": d.summary, "user": user(&d.author),
-        "labels": [], "milestone": null, "assignee": null, "assignees": [], "requested_reviewers": reviewers, "requested_teams": [],
+        "labels": labels_of(s, d).await, "milestone": null, "assignee": null, "assignees": [], "requested_reviewers": reviewers, "requested_teams": [],
     });
     let more = json!({
         "draft": d.state == "draft", "created_at": rfc3339(d.created_at), "updated_at": rfc3339(d.updated_at),
         "closed_at": if closed { Value::String(rfc3339(merged_at.unwrap_or(d.updated_at))) } else { Value::Null }, "merged_at": merged_at.map(rfc3339),
         "merged": d.state == "landed", "merge_commit_sha": merge_commit, "mergeable": if closed { Value::Null } else { Value::Bool(true) }, "mergeable_state": if d.state == "accepted" { "clean" } else { "blocked" },
         "head": side(&head_ref, &head), "base": side(&d.trunk, &base),
-        "author_association": "MEMBER", "auto_merge": null, "comments": comments, "review_comments": review_comments, "commits": commits, "additions": adds, "deletions": dels, "changed_files": files,
-        "kiln": { "id": d.name, "kind": d.kind, "state": d.state, "version": latest.map(|v| v.n) },
+        "author_association": "MEMBER", "auto_merge": auto, "comments": comments, "review_comments": review_comments, "commits": commits, "additions": adds, "deletions": dels, "changed_files": files,
+        "kiln": { "id": d.name, "kind": d.kind, "state": d.state, "version": latest.map(|v| v.n), "queue": queued },
     });
     if let (Some(o), Value::Object(m)) = (v.as_object_mut(), more) {
         o.extend(m);
@@ -202,6 +226,28 @@ pub async fn list(s: &Site<'_>, q: &std::collections::HashMap<String, String>) -
         out.push(pr_json(s, &d, &vs).await);
     }
     Ok(srv::json(StatusCode::OK, &out))
+}
+
+/// Every pull request of the repository, newest first, as the facade shows one (for search).
+pub(crate) async fn all(s: &Site<'_>) -> Result<Vec<Value>, Fail> {
+    let repo = s.repo.id.clone();
+    let keys: Vec<String> = s
+        .hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT id FROM diffs WHERE repo_id = ?1 ORDER BY number DESC")?;
+            let rows = st.query_map(params![repo], |r| r.get::<_, String>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+        .map_err(internal)?;
+    let mut out = Vec::new();
+    for k in keys {
+        let Some(d) = diffs::find(s.hub, &k).await.map_err(internal)? else { continue };
+        let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+        out.push(pr_json(s, &d, &vs).await);
+    }
+    Ok(out)
 }
 
 /// `GET /pulls/{n}`.
@@ -412,13 +458,14 @@ pub async fn comment(s: &Site<'_>, id: &str, job: &Job, method: &Method, body: O
 pub async fn issue(s: &Site<'_>, n: &str) -> Result<Response, Fail> {
     let Some(d) = find(s, n).await? else { return Ok(not_found()) };
     let (comments, _) = counts(s, &d).await;
+    let labels = labels_of(s, &d).await;
     let closed = matches!(d.state.as_str(), "landed" | "abandoned");
     let num = d.number;
     Ok(srv::json(
         StatusCode::OK,
         &json!({
             "id": num, "node_id": format!("kiln-issue-{}", d.id), "number": num, "url": format!("{}/issues/{num}", s.api), "html_url": format!("{}/diffs/{}", s.origin, d.name),
-            "state": if closed { "closed" } else { "open" }, "title": d.title, "body": d.summary, "user": user(&d.author), "labels": [], "assignees": [], "comments": comments,
+            "state": if closed { "closed" } else { "open" }, "title": d.title, "body": d.summary, "user": user(&d.author), "labels": labels, "assignees": [], "comments": comments,
             "created_at": rfc3339(d.created_at), "updated_at": rfc3339(d.updated_at), "closed_at": if closed { Value::String(rfc3339(d.updated_at)) } else { Value::Null },
             "pull_request": { "url": format!("{}/pulls/{num}", s.api), "html_url": format!("{}/diffs/{}", s.origin, d.name) }, "author_association": "MEMBER",
         }),
@@ -495,4 +542,267 @@ pub async fn reviews(s: &Site<'_>, n: &str, job: &Job, body: Option<&Value>) -> 
         })
         .collect();
     Ok(srv::json(StatusCode::OK, &out))
+}
+
+/// A label as GitHub shows one. Labels have no rows of their own here, so the id comes from the
+/// name.
+pub(crate) fn label_json(s: &Site<'_>, name: &str) -> Value {
+    let id = name.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))) & 0x1f_ffff_ffff_ffff;
+    let path: String = name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
+    json!({ "id": id, "node_id": format!("kiln-label-{id}"), "url": format!("{}/labels/{path}", s.api), "name": name, "color": "ededed", "default": false, "description": null })
+}
+
+/// A pull request's labels, by name.
+async fn labels_of(s: &Site<'_>, d: &Diff) -> Vec<Value> {
+    let id = d.id.clone();
+    let names: Vec<String> = s
+        .hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT name FROM diff_labels WHERE diff_id = ?1 ORDER BY name")?;
+            let rows = st.query_map([&id], |r| r.get::<_, String>(0))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+        .unwrap_or_default();
+    names.iter().map(|n| label_json(s, n)).collect()
+}
+
+/// `GET`/`POST`/`PUT`/`DELETE /issues/{n}/labels`: a pull request's labels. `POST` adds them,
+/// `PUT` sets them, `DELETE` clears them; GitHub takes `{"labels": [...]}` or the bare list, of
+/// names or `{"name": ...}`.
+pub async fn labels(s: &Site<'_>, n: &str, job: &Job, method: &Method, body: Option<&Value>) -> Result<Response, Fail> {
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    if *method != Method::GET {
+        if !job.may("issues", Level::Write) && !job.may("pull-requests", Level::Write) {
+            return Ok(forbidden("issues"));
+        }
+        let list = body.and_then(|b| b.get("labels").or(Some(b))).and_then(Value::as_array).cloned().unwrap_or_default();
+        let names: Vec<String> = list.iter().filter_map(|l| l.as_str().or_else(|| l.get("name").and_then(Value::as_str))).map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
+        if names.iter().any(|n| n.chars().count() > 50) {
+            return Ok(invalid("a label's name is at most 50 characters"));
+        }
+        let (id, by, set, clear) = (d.id.clone(), format!("job:{}", job.leg), *method == Method::PUT, *method == Method::DELETE);
+        s.hub
+            .store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                if set || clear {
+                    tx.execute("DELETE FROM diff_labels WHERE diff_id = ?1", [&id])?;
+                }
+                if !clear {
+                    let now = crate::util::now_unix();
+                    for n in &names {
+                        tx.execute("INSERT OR IGNORE INTO diff_labels (diff_id, name, added_by, added_at) VALUES (?1, ?2, ?3, ?4)", params![id, n, by, now])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(internal)?;
+        if clear {
+            return Ok(srv::status(StatusCode::NO_CONTENT));
+        }
+    }
+    Ok(srv::json(StatusCode::OK, &labels_of(s, &d).await))
+}
+
+/// `DELETE /issues/{n}/labels/{name}`: the labels left; 404 when it hadn't that one, as GitHub
+/// answers.
+pub async fn unlabel(s: &Site<'_>, n: &str, name: &str, job: &Job) -> Result<Response, Fail> {
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    if !job.may("issues", Level::Write) && !job.may("pull-requests", Level::Write) {
+        return Ok(forbidden("issues"));
+    }
+    let (id, name) = (d.id.clone(), srv::decode(name));
+    let removed = s.hub.store.call(move |c| Ok(c.execute("DELETE FROM diff_labels WHERE diff_id = ?1 AND name = ?2", params![id, name])?)).await.map_err(internal)?;
+    if removed == 0 {
+        return Ok(srv::json(StatusCode::NOT_FOUND, &json!({ "message": "Label does not exist" })));
+    }
+    Ok(srv::json(StatusCode::OK, &labels_of(s, &d).await))
+}
+
+/// `POST /pulls` `{title, head, base, body, draft}`: a change request for the branch `head` (one a
+/// job pushed) into the trunk `base`, as opening a pull request on GitHub. One branch has one open
+/// pull request into a trunk: another is refused, as GitHub refuses it.
+pub async fn create(hub: &std::sync::Arc<crate::hub::Hub>, s: &Site<'_>, job: &Job, body: &Value) -> Result<Response, Fail> {
+    if !job.may("pull-requests", Level::Write) {
+        return Ok(forbidden("pull-requests"));
+    }
+    let (Some(head), Some(base)) = (body.get("head").and_then(Value::as_str), body.get("base").and_then(Value::as_str)) else {
+        return Ok(invalid("a pull request has a `head` and a `base`"));
+    };
+    // `owner:branch`, as GitHub names a fork's branch: here, this repository's.
+    let branch = head.rsplit(':').next().unwrap_or(head).trim_start_matches("refs/heads/").to_owned();
+    let base = base.trim_start_matches("refs/heads/").to_owned();
+    let Some(path) = crate::ci::hosting::native_path(s.hub, &s.repo) else { return Ok(invalid("pull requests are opened on repositories kiln hosts")) };
+    let p = path.to_string_lossy().into_owned();
+    if let Err(e) = crate::ci::cr::branch_ok(&branch, std::slice::from_ref(&base)) {
+        return Ok(invalid(&e));
+    }
+    let (repo, b, t) = (s.repo.id.clone(), branch.clone(), base.clone());
+    let open: Option<u32> = s
+        .hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT number FROM diffs WHERE repo_id = ?1 AND trunk = ?2 AND branch = ?3 AND kind = 'change_request' AND state NOT IN ('landed', 'abandoned')", params![repo, t, b], |r| r.get(0)).optional()?))
+        .await
+        .map_err(internal)?;
+    if open.is_some() {
+        return Ok(invalid(&format!("A pull request already exists for {}:{branch}.", s.owner())));
+    }
+    let rev = |spec: String| {
+        let p = p.clone();
+        async move { crate::gitops::run_git(s.hub, &["-C", &p, "rev-parse", "--verify", "--quiet", &spec], crate::gitops::LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).trim().to_owned()).filter(|x| !x.is_empty()) }
+    };
+    if rev(format!("refs/heads/{base}^{{commit}}")).await.is_none() {
+        return Ok(invalid(&format!("base: no branch {base}")));
+    }
+    let Some(head_sha) = rev(format!("refs/heads/{branch}^{{commit}}")).await else { return Ok(invalid(&format!("head: no branch {branch}: push it first"))) };
+    // A job's run shares its trust: nothing more to hold the change request's runs to.
+    let by = crate::ci::cr::By { pushed_by: format!("job:{}", job.leg), author: (format!("job:{}", job.leg), "agent"), started_by: None };
+    let options = kiln_ci::review::Options { draft: body.get("draft").and_then(Value::as_bool).unwrap_or(false), title: body.get("title").and_then(Value::as_str).map(str::to_owned), ..kiln_ci::review::Options::default() };
+    let made = match crate::ci::cr::submit(hub, &s.repo, &p, &base, &branch, &head_sha, &by, &options).await {
+        Ok(o) => o,
+        Err(e) => return Ok(invalid(&e)),
+    };
+    // Its description is the body given, as a pull request's is.
+    if let Some(text) = body.get("body").and_then(Value::as_str).map(str::to_owned) {
+        let (repo, number) = (s.repo.id.clone(), made.number);
+        s.hub.store.call(move |c| Ok(c.execute("UPDATE diffs SET summary = ?3 WHERE repo_id = ?1 AND number = ?2", params![repo, number, text]).map(|_| ())?)).await.map_err(internal)?;
+    }
+    let Some(d) = find(s, &made.number.to_string()).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::CREATED, &pr_json(s, &d, &vs).await))
+}
+
+/// `PATCH /pulls/{n}` `{title, body, state}`: its title and description; `state: closed` abandons
+/// it, `open` takes an abandoned one back. Any job that may write pull requests may, as on GitHub.
+pub async fn update(s: &Site<'_>, n: &str, job: &Job, body: &Value) -> Result<Response, Fail> {
+    if !job.may("pull-requests", Level::Write) {
+        return Ok(forbidden("pull-requests"));
+    }
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let to = match body.get("state").and_then(Value::as_str) {
+        None => None,
+        Some("closed") if d.state == "landing" => return Ok(invalid("it's landing")),
+        Some("closed") if !matches!(d.state.as_str(), "landed" | "abandoned") => Some("abandoned"),
+        Some("open") if d.state == "abandoned" => Some("needs-review"),
+        Some("closed" | "open") => None,
+        Some(other) => return Ok(invalid(&format!("state `{other}`: `open` or `closed`"))),
+    };
+    let title = body.get("title").and_then(Value::as_str).map(str::to_owned);
+    let text = body.get("body").and_then(Value::as_str).map(str::to_owned);
+    let id = d.id.clone();
+    s.hub
+        .store
+        .call(move |c| {
+            c.execute(
+                "UPDATE diffs SET title = COALESCE(?2, title), summary = COALESCE(?3, summary), state = COALESCE(?4, state), updated_at = ?5 WHERE id = ?1",
+                params![id, title, text, to, crate::util::now_unix()],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    s.hub.store.audit(format!("job:{}", job.leg), "diffs.update".into(), format!("{} {}{}", d.repo, d.name, to.map(|t| format!(" {t}")).unwrap_or_default())).await;
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &pr_json(s, &d, &vs).await))
+}
+
+/// `GET /pulls/{n}/merge`: 204 once it landed, else 404. `PUT`: refused, as GitHub refuses it
+/// where a branch requires a merge queue: a kiln trunk lands only through its land queue (GraphQL's
+/// `enablePullRequestAutoMerge` and `enqueuePullRequest` put a pull request in it).
+pub async fn merge(s: &Site<'_>, n: &str, put: bool) -> Result<Response, Fail> {
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    if !put {
+        return Ok(if d.state == "landed" { srv::status(StatusCode::NO_CONTENT) } else { not_found() });
+    }
+    let message = if matches!(d.state.as_str(), "landed" | "abandoned") { "Pull Request is not mergeable" } else { "Changes must be made through the merge queue" };
+    Ok(srv::json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "message": message, "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request" })))
+}
+
+/// What GitHub says of a land queue refusal: 409 as kiln's (what keeps it from landing), the rest
+/// as they are.
+fn refused(code: StatusCode, why: &str) -> Response {
+    srv::json(if code == StatusCode::CONFLICT { StatusCode::UNPROCESSABLE_ENTITY } else { code }, &json!({ "message": why }))
+}
+
+/// May a job land pull requests: its token writes contents and pull requests, as on GitHub, and
+/// whoever started its run may land here (`diffs.land`): a job never does more than its starter
+/// (a run nobody started, a schedule's, is the repository's own). Who its land entry is held to
+/// then (its candidate's runs, W10-R02), or why not.
+async fn may_land(s: &Site<'_>, job: &Job) -> Result<Option<Value>, Box<Response>> {
+    if !job.may("contents", Level::Write) {
+        return Err(Box::new(forbidden("contents")));
+    }
+    if !job.may("pull-requests", Level::Write) {
+        return Err(Box::new(forbidden("pull-requests")));
+    }
+    let run = job.run.clone();
+    let input: Option<String> = s.hub.store.call(move |c| Ok(c.query_row("SELECT input FROM ci_plans WHERE run_id = ?1", [&run], |r| r.get(0)).optional()?)).await.ok().flatten();
+    let starter = input.and_then(|i| serde_json::from_str::<Value>(&i).ok()).and_then(|v| v.pointer("/event/started_by").cloned()).filter(|v| !v.is_null());
+    if let Some(by) = &starter
+        && !crate::authz::gate::starter_may(s.hub, by, "diffs.land", &Scope::Repo { repo: s.repo.name.clone() }).await
+    {
+        let who = by.get("name").and_then(Value::as_str).unwrap_or("whoever started the run");
+        return Err(Box::new(srv::json(StatusCode::FORBIDDEN, &json!({ "message": format!("Resource not accessible by integration: {who}, who started the run, may not land here (`diffs.land`)") }))));
+    }
+    Ok(starter)
+}
+
+/// GitHub's auto-merge for a job (GraphQL's `enablePullRequestAutoMerge` with `Some(method, title,
+/// message)`, `disablePullRequestAutoMerge` with `None`): the pull request lands through the queue
+/// as soon as its trunk's policy lets it, by `method` if given (`SQUASH`, `REBASE`, `MERGE`; a
+/// stack of diffs' `REBASE` is its `stack`, and its `MERGE` the trunk's default). The pull request
+/// after.
+pub async fn auto_merge(s: &Site<'_>, n: &str, job: &Job, on: Option<(Option<&str>, Option<String>, Option<String>)>) -> Result<Response, Fail> {
+    let starter = match may_land(s, job).await {
+        Ok(by) => by,
+        Err(no) => return Ok(*no),
+    };
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let by = format!("job:{}", job.leg);
+    let done = match on {
+        Some((method, title, message)) => {
+            // A stack of diffs lands squashed or a commit each (no merge commit); a change request
+            // as GitHub's do.
+            let stack = d.kind == "diff";
+            let strategy = match method {
+                None => None,
+                Some("SQUASH") => Some("squash"),
+                Some("REBASE") => Some(if stack { "stack" } else { "rebase" }),
+                Some("MERGE") => (!stack).then_some("merge"),
+                Some(other) => return Ok(invalid(&format!("merge method `{other}`: MERGE, SQUASH or REBASE"))),
+            };
+            crate::ci::land::land_when_ready(s.hub, &d, &by, starter, strategy, title, message).await.map(|_| ())
+        }
+        None => crate::ci::land::not_when_ready(s.hub, &d, &by).await.map(|_| ()),
+    };
+    if let Err((code, why)) = done {
+        return Ok(refused(code, &why));
+    }
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &pr_json(s, &d, &vs).await))
+}
+
+/// GitHub's merge queue for a job (GraphQL's `enqueuePullRequest`, `dequeuePullRequest`): the pull
+/// request into kiln's land queue now, if its trunk's policy lets it, or out of it. The pull request
+/// after.
+pub async fn queue(s: &Site<'_>, n: &str, job: &Job, on: bool) -> Result<Response, Fail> {
+    let starter = match may_land(s, job).await {
+        Ok(by) => by,
+        Err(no) => return Ok(*no),
+    };
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let done =
+        if on { crate::ci::land::enqueue_as(s.hub, &d, &format!("job:{}", job.leg), starter, &json!({})).await } else { crate::ci::land::dequeue(s.hub, &d, &job_caller(job, &s.repo.name)).await };
+    if let Err((code, why)) = done {
+        return Ok(refused(code, &why));
+    }
+    let Some(d) = find(s, n).await? else { return Ok(not_found()) };
+    let vs = diffs::versions(s.hub, &d).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &pr_json(s, &d, &vs).await))
 }

@@ -1,19 +1,31 @@
 /**
  * The workflow editor (docs/ci.md W21-R01, W21-R06): a repository's workflow in the code editor,
- * checked as you type, with the plan it would make for an event beside it (W04-R29). The YAML is
- * the source; Copy and Download take it away until saving to the repository arrives (W14).
+ * checked as you type, or in its flow view (its jobs by stage, edited in place), with the plan it
+ * would make for an event beside it (W04-R29). The YAML is the source. An edit is saved as its repository takes it (`ci.workflows.edit`): a diff on the
+ * trunk of a repository kiln hosts, a pull or merge request on GitHub, GitLab or Bitbucket, or a
+ * commit to a branch; for any repository the patch, Copy and Download take it away. Below, the
+ * workflow's own secrets and variables (W09-R11).
  */
 import * as React from "react";
 import { Download } from "lucide-react";
 import { api } from "@/api/client";
-import { ci, type CiOutline, type CiPreview } from "@/api/ci";
+import { attachHref } from "@/api/attach";
+import { ci, type CiCatalogEntry, type CiMatrix, type CiOutline, type CiPreview, type CiSave } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
+import { Segmented } from "@/components/ui/tabs";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@/components/ui/misc";
-import { useSearchParams } from "@/lib/router";
+import { Link, useSearchParams } from "@/lib/router";
+import { unifiedPatch } from "@/lib/patch";
+import { describe, keysAt, siblingValue, yamlSpot, type Schema } from "@/lib/yaml-spot";
+import { placed } from "@/lib/diagnostics";
+import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
+import { ScopeSecrets } from "@/views/settings-ci";
+import { FlowView } from "@/views/ci/flow-view";
+import { ActionView, TryPane } from "@/views/ci/action-view";
 
 const CodeEditor = React.lazy(() => import("@/components/code/editor"));
 
@@ -38,9 +50,19 @@ export default function Workflows() {
         <Picker repo={repo} path={path} gitRef={ref} onChange={set} />
       </Loadable>
       {repo && path ? (
-        <Loadable label="the workflow" fallback={<Hold height={420} className="mt-6" />}>
-          <WorkflowFile key={`${repo}\u0000${path}\u0000${ref}`} repo={repo} path={path} gitRef={ref} />
-        </Loadable>
+        <>
+          <Loadable label="the workflow" fallback={<Hold height={420} className="mt-6" />}>
+            <WorkflowFile key={`${repo}\u0000${path}\u0000${ref}`} repo={repo} path={path} gitRef={ref} />
+          </Loadable>
+          {/* A workflow's own secrets and variables; an action has none of its own. */}
+          {!/(^|\/)action\.ya?ml$/.test(path) && (
+            <Loadable label="its secrets and variables" fallback={<Hold height={160} className="mt-8" />}>
+              <section className="mt-8 max-w-3xl" aria-label="This workflow's secrets and variables">
+                <ScopeSecrets key={`${repo}\u0000${path}`} scope={`workflow:${repo}:${path}`} of="This workflow's" />
+              </section>
+            </Loadable>
+          )}
+        </>
       ) : (
         <div className="mt-8">
           <EmptyState title="Choose a workflow.">Pick a repository and one of its workflows to edit it.</EmptyState>
@@ -87,15 +109,18 @@ function Picker({ repo, path, gitRef, onChange }: { repo: string; path: string; 
 }
 
 function WorkflowSelect({ repo, gitRef, path, onChange }: { repo: string; gitRef: string; path: string; onChange: (p: string) => void }) {
-  const list = useSuspenseResource(`ci-workflows/${repo}/${gitRef}`, (s) => ci.workflows(repo, gitRef, s)).data.workflows;
+  const at = useSuspenseResource(`ci-workflows/${repo}/${gitRef}`, (s) => ci.workflows(repo, gitRef, s)).data;
+  const [list, actions] = [at.workflows, at.actions ?? []];
   return (
     <SelectField
       label="Workflow"
       value={path}
       onChange={onChange}
       options={[
-        { value: "", label: list.length ? "Choose a workflow" : "No workflows here" },
+        { value: "", label: list.length || actions.length ? "Choose a workflow" : "No workflows here" },
         ...list.map((w) => ({ value: w.path, label: `${w.path}${w.errors ? ` · ${w.errors} error${w.errors === 1 ? "" : "s"}` : ""}` })),
+        // Its own actions too, in the same editor (W21-R07).
+        ...actions.map((a) => ({ value: a, label: `${a} · action` })),
       ]}
       className="w-80"
     />
@@ -121,14 +146,60 @@ function jobAt(text: string): string | null {
 
 function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitRef: string }) {
   const file = useSuspenseResource(`ci-workflow/${repo}/${path}/${gitRef}`, (s) => ci.workflow(repo, path, gitRef, s)).data;
+  // Saving (W21-R06): what the repository takes, from where it is kept; the patch for any.
+  const saves = file.saves ?? ["patch"];
+  const change = file.host === "gitlab" ? { one: "a merge request", title: "Merge request" } : { one: "a pull request", title: "Pull request" };
   const [text, setText] = React.useState(file.source);
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState<{ tone?: "error"; text: string; diff?: string; url?: string } | null>(null);
+  // The branch a commit goes to, while it's being named.
+  const [branch, setBranch] = React.useState<string | null>(null);
+  // Two views of the text (a workflow's flow, an action's inputs and outputs); the code editor
+  // opens again on what the other made of it.
+  const isAction = file.kind === "action";
+  const [view, setView] = React.useState<"yaml" | "flow">("yaml");
+  const [opened, setOpened] = React.useState(0);
+  const fromView = (t: string) => {
+    setText(t);
+    setOpened((n) => n + 1);
+    void lint(t);
+  };
   const [counts, setCounts] = React.useState<{ errors: number; warnings: number } | null>(null);
   const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
   const [preview, setPreview] = React.useState<CiPreview | null>(null);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
-  const known = React.useRef<{ outline: CiOutline | null; names?: { secrets: string[]; variables: string[] }; catalog?: { label: string; detail: string }[]; timer?: number; asked?: number }>({
+  const known = React.useRef<{
+    outline: CiOutline | null;
+    names?: { secrets: string[]; variables: string[] };
+    catalog?: { label: string; detail: string }[];
+    actions?: CiCatalogEntry[];
+    labels?: { label: string; detail: string }[];
+    schema?: Schema;
+    schemaAsked?: boolean;
+    timer?: number;
+    asked?: number;
+  }>({
     outline: file.outline,
   });
+  // The file's schema (W02-R09): the keys a mapping may have, and what each is (W21-R01).
+  const kind = path.startsWith(".github/workflows/") ? "gha" : /(^|\/)action\.ya?ml$/.test(path) ? "action" : "kiln";
+  const schema = (): Schema | undefined => {
+    if (!known.current.schemaAsked) {
+      known.current.schemaAsked = true;
+      ci.schema(kind).then(
+        (s) => (known.current.schema = s),
+        () => (known.current.schemaAsked = false),
+      );
+    }
+    return known.current.schema;
+  };
+  const hover = (content: string, pos: number) => {
+    const s = schema();
+    const spot = s ? yamlSpot(content, pos) : null;
+    if (!s || !spot?.key) return null;
+    const text = describe(s, [...spot.path, spot.key.name]);
+    return text ? { from: spot.key.from, to: spot.key.to, text } : null;
+  };
 
   const ask = (content: string, ev: string) => {
     window.clearTimeout(known.current.timer);
@@ -148,29 +219,13 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   };
 
   const lint = async (content: string): Promise<Diagnostic[]> => {
-    const r = await ci.validate(path, content);
+    schema();
+    const r = await ci.validate(path, content, repo);
     known.current.outline = r.outline ?? known.current.outline;
     const errors = r.diagnostics.filter((d) => d.severity === "error").length;
     setCounts({ errors, warnings: r.diagnostics.length - errors });
-    if (errors === 0) ask(content, event);
-    const end = content.length;
-    const starts = [0];
-    for (let i = 0; i < content.length; i++) if (content[i] === "\n") starts.push(i + 1);
-    // Positions by line and column, which every diagnostic has.
-    const at = (p: { line: number; col: number }) => {
-      const line = starts[Math.max(0, p.line - 1)] ?? end;
-      const next = starts[p.line] ?? end + 1;
-      return Math.min(line + Math.max(0, p.col - 1), next - 1, end);
-    };
-    return r.diagnostics.map((d) => {
-      const from = at(d.range.start);
-      return {
-        from,
-        to: Math.min(Math.max(at(d.range.end), from + 1), end),
-        severity: d.severity === "error" ? "error" : d.severity === "warning" ? "warning" : "info",
-        message: `${d.code}: ${d.message}`,
-      };
-    });
+    if (errors === 0 && !isAction) ask(content, event);
+    return placed(content, r.diagnostics);
   };
 
   const complete = async (ctx: CompletionContext): Promise<CompletionResult | null> => {
@@ -205,17 +260,90 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
       };
       return { from: ns.from + space.length + 1, options: (names[space] ?? []).map((label) => ({ label, detail: space })) };
     }
+    // The catalog (W07-R12): what `uses:` offers, and the inputs `with:` offers.
+    const actions = async () => (known.current.actions ??= (await ci.catalog("").catch(() => ({ actions: [] }))).actions);
     const uses = ctx.matchBefore(/\buses:\s*[\w./@-]*$/);
     if (uses) {
       if (!known.current.catalog) {
-        const list = await ci.catalog("").catch(() => ({ actions: [] }));
-        known.current.catalog = list.actions.flatMap((a) => a.versions.slice(0, 3).map((v) => ({ label: `${a.uses}@${v.ref}`, detail: a.action?.description?.split("\n")[0] ?? v.sha.slice(0, 12) })));
+        // A mirrored action's latest versions; kiln's own, as they're used.
+        known.current.catalog = (await actions()).flatMap((a) =>
+          a.versions?.length
+            ? a.versions.slice(0, 3).map((v) => ({ label: `${a.uses}@${v.ref}`, detail: a.action?.description?.split("\n")[0] ?? v.sha.slice(0, 12) }))
+            : [{ label: a.uses, detail: (a.description ?? a.action?.description ?? "").split("\n")[0] ?? "" }],
+        );
       }
       return { from: uses.from + (/^uses:\s*/.exec(uses.text)?.[0].length ?? 0), options: known.current.catalog };
     }
     const runsOn = ctx.matchBefore(/\bruns-on:\s*[\w.-]*$/);
-    if (runsOn) return { from: runsOn.from + (/^runs-on:\s*/.exec(runsOn.text)?.[0].length ?? 0), options: HOSTED.map((label) => ({ label, detail: "label" })) };
+    if (runsOn) {
+      // This server's runners', pools' and rules' labels, then GitHub's hosted ones.
+      if (!known.current.labels) {
+        const here = (await ci.labels(repo).catch(() => ({ labels: [] }))).labels;
+        known.current.labels = [
+          ...here.map((l) => ({ label: l.label, detail: l.from.join(", ") })),
+          ...HOSTED.filter((h) => !here.some((l) => l.label.toLowerCase() === h)).map((label) => ({ label, detail: "GitHub" })),
+        ];
+      }
+      return { from: runsOn.from + (/^runs-on:\s*/.exec(runsOn.text)?.[0].length ?? 0), options: known.current.labels };
+    }
+    // A key being typed at a line's start (or asked for there): the keys its mapping may have.
+    const typing = ctx.matchBefore(/^\s*(?:-\s+)*[\w.-]*$/);
+    const word = /[\w.-]*$/.exec(typing?.text ?? "")?.[0] ?? "";
+    if (typing && (word || ctx.explicit)) {
+      const doc = ctx.state.doc.toString();
+      // A step's `with:`: the inputs of the action it uses, from the catalog.
+      if (yamlSpot(doc, ctx.pos)?.path.at(-1) === "with") {
+        const bare = (u: string) => u.split("@")[0]?.toLowerCase() ?? "";
+        const used = bare(siblingValue(doc, ctx.pos, "uses") ?? "");
+        const entry = used ? (await actions()).find((a) => bare(a.uses) === used) : undefined;
+        // A mirrored action's from its action.yml; a built-in's as its own action.yml would say them.
+        const inputs = entry?.action?.inputs ?? Object.entries(entry?.inputs ?? {}).map(([name, i]) => ({ name, description: i.description, required: i.required, default: i.default }));
+        if (inputs.length) {
+          return {
+            from: ctx.pos - word.length,
+            options: inputs.map((i) => ({
+              label: i.name,
+              detail: i.required ? "required" : i.default !== null ? `default ${i.default}` : "input",
+              info: i.description ?? undefined,
+              apply: `${i.name}: `,
+            })),
+          };
+        }
+      }
+      const s = schema() ?? (known.current.schema = await ci.schema(kind).catch(() => undefined));
+      const spot = s ? yamlSpot(doc, ctx.pos) : null;
+      if (s && spot) return { from: ctx.pos - word.length, options: keysAt(s, spot.path).map((k) => ({ label: k.key, info: k.description, apply: `${k.key}: ` })) };
+    }
     return null;
+  };
+
+  const changed = text !== file.source;
+  const blocked = saving || (counts?.errors ?? 0) > 0;
+  const save = async (to: CiSave, onto?: string) => {
+    setSaving(true);
+    setSaved(null);
+    try {
+      const r = await ci.saveWorkflow(repo, path, { content: text, to, branch: onto });
+      const d = r.diffs?.[0];
+      if (d) setSaved({ text: `${d.name} opened: it lands through review.`, diff: d.name });
+      else if (r.change) setSaved({ text: ` #${r.change.number} opened on ${r.branch ?? "a new branch"}.`, url: r.change.url });
+      else if (r.branch) {
+        setSaved({ text: `Committed to ${r.branch} (${(r.sha ?? "").slice(0, 7)}).` });
+        setBranch(null);
+      } else setSaved({ text: "Saved." });
+    } catch (e) {
+      setSaved({ tone: "error", text: errorMessage(e) });
+    } finally {
+      setSaving(false);
+    }
+  };
+  const patch = () => {
+    const url = URL.createObjectURL(new Blob([unifiedPatch(path, file.source, text)], { type: "text/x-diff" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${path.split("/").pop() ?? "workflow"}.patch`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const download = () => {
@@ -234,6 +362,11 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
         title={path}
         actions={
           <>
+            {!isAction && (
+              <Button asChild size="xs" variant="ghost">
+                <Link to={attachHref(`workflow:${repo}:${path}`)}>Attach agent</Link>
+              </Button>
+            )}
             <CopyButton text={text} label="Copy" />
             <Button size="xs" variant="ghost" onClick={download}>
               <Download /> Download
@@ -245,20 +378,135 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
           counts && (counts.errors || counts.warnings ? `${counts.errors} error${counts.errors === 1 ? "" : "s"}, ${counts.warnings} warning${counts.warnings === 1 ? "" : "s"}` : "No problems.")
         }
       >
+        <Segmented
+          label="View"
+          value={view}
+          onChange={setView}
+          options={[
+            { value: "yaml", label: "YAML" },
+            { value: "flow", label: isAction ? "Inputs and outputs" : "Flow" },
+          ]}
+          className="mx-5 mt-1 mb-2"
+        />
         <React.Suspense fallback={<Hold height={420} />}>
-          <CodeEditor value={file.source} onChange={setText} lint={lint} complete={complete} label={`Editing ${path}`} />
+          {view === "yaml" ? (
+            <CodeEditor key={opened} value={text} onChange={setText} lint={lint} complete={complete} hover={hover} label={`Editing ${path}`} />
+          ) : isAction ? (
+            <ActionView text={text} onChange={fromView} />
+          ) : (
+            <FlowView repo={repo} text={text} onChange={fromView} />
+          )}
         </React.Suspense>
+        {/* Under the edit, so a phone's header keeps to Copy and Download. */}
+        {(changed || saved) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-5 pt-3">
+            <p className={`min-w-0 flex-1 basis-64 text-[12.5px] leading-[1.55] [overflow-wrap:anywhere] ${saved?.tone === "error" ? "text-[var(--color-fail)]" : "text-[#a1a4ad]"}`} role="status">
+              {saved?.diff ? (
+                <>
+                  <Link to={`/review/${encodeURIComponent(saved.diff)}`} className="text-link">
+                    {saved.diff}
+                  </Link>{" "}
+                  opened: it lands through review.
+                </>
+              ) : saved?.url ? (
+                <>
+                  <a href={saved.url} target="_blank" rel="noreferrer" className="text-link">
+                    {change.title}
+                  </a>
+                  {saved.text}
+                </>
+              ) : (
+                saved?.text
+              )}
+            </p>
+            {changed && (
+              <div className="flex flex-wrap gap-2">
+                <Button size="xs" variant="ghost" onClick={patch}>
+                  The patch
+                </Button>
+                {saves.includes("branch") && branch === null && (
+                  <Button size="xs" variant="ghost" disabled={blocked} onClick={() => setBranch("")}>
+                    To a branch
+                  </Button>
+                )}
+                {saves.includes("change") && (
+                  <Button size="xs" variant="secondary" disabled={blocked} onClick={() => void save("change")}>
+                    Open {change.one}
+                  </Button>
+                )}
+                {saves.includes("diff") && (
+                  <Button size="xs" variant="secondary" disabled={blocked} onClick={() => void save("diff")}>
+                    Open a diff
+                  </Button>
+                )}
+              </div>
+            )}
+            {changed && branch !== null && (
+              <form
+                className="flex w-full flex-wrap items-end gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (branch.trim()) void save("branch", branch.trim());
+                }}
+              >
+                <TextField id="wf-save-branch" label="Branch" className="min-w-0 flex-1" value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="ci/faster-tests" autoFocus />
+                <Button size="xs" type="submit" variant="secondary" disabled={blocked || !branch.trim()}>
+                  Commit
+                </Button>
+                <Button size="xs" type="button" variant="ghost" onClick={() => setBranch(null)}>
+                  Cancel
+                </Button>
+              </form>
+            )}
+          </div>
+        )}
       </Panel>
-      <PreviewPane
-        preview={preview}
-        error={previewError}
-        event={event}
-        onEvent={(ev) => {
-          setEvent(ev);
-          ask(text, ev);
-        }}
-      />
+      {isAction ? (
+        <TryPane repo={repo} path={path} gitRef={gitRef} text={text} blocked={(counts?.errors ?? 0) > 0} />
+      ) : (
+        <PreviewPane
+          preview={preview}
+          error={previewError}
+          event={event}
+          onEvent={(ev) => {
+            setEvent(ev);
+            ask(text, ev);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+/** A job's matrix as written (W21-R06): its axes as a table, then `include`, `exclude` and `where` as rows. */
+function MatrixView({ m }: { m: CiMatrix }) {
+  const value = (v: unknown) => (typeof v === "string" ? v : JSON.stringify(v));
+  const each = (v: unknown): unknown[] => (Array.isArray(v) ? v : v == null ? [] : [v]);
+  const pairs = (o: unknown) =>
+    o && typeof o === "object" && !Array.isArray(o)
+      ? Object.entries(o)
+          .map(([k, v]) => `${k}: ${value(v)}`)
+          .join(", ")
+      : value(o);
+  const row = (key: string, label: string, text: string) => (
+    <tr key={key}>
+      <th scope="row" className="w-0 pr-3 text-left align-top font-normal whitespace-nowrap text-[#93a1b4]">
+        {label}
+      </th>
+      <td className="[overflow-wrap:anywhere] text-[#d4dde8]">{text}</td>
+    </tr>
+  );
+  if (m.expr) return <p className="mb-2 font-mono text-[11.5px] leading-[1.6] [overflow-wrap:anywhere] text-[#a6b2c6]">matrix: {m.expr}</p>;
+  return (
+    <table className="mb-2 w-full font-mono text-[11.5px] leading-[1.6]" aria-label="Its matrix">
+      <tbody>
+        {m.axes?.map((a) => row(`a-${a.name}`, a.name, Array.isArray(a.values) ? a.values.map(value).join(" · ") : a.values))}
+        {m.platforms != null && row("platforms", "platforms", Array.isArray(m.platforms) ? m.platforms.map(value).join(" · ") : value(m.platforms))}
+        {each(m.include).map((r, i) => row(`i${i}`, "include", pairs(r)))}
+        {each(m.exclude).map((r, i) => row(`e${i}`, "exclude", pairs(r)))}
+        {m.where && row("where", "where", m.where)}
+      </tbody>
+    </table>
   );
 }
 
@@ -293,8 +541,10 @@ function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | 
                 <div className="label mb-1.5">
                   {job}
                   {legs.length > 1 ? ` · ${legs.length} legs` : ""}
+                  {plan.removed[job]?.length ? ` · ${plan.removed[job]?.length} removed` : ""}
                 </div>
               )}
+              {preview?.matrices?.[job] && <MatrixView m={preview.matrices[job]} />}
               <ul className="flex flex-col gap-1">
                 {legs.map((l) => {
                   const fits = l.routing?.runners.filter((r) => r.eligible) ?? [];

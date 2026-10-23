@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};

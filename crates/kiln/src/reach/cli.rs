@@ -75,6 +75,9 @@ pub struct RunnersArgs {
     pub want: Option<String>,
     #[arg(long)]
     pub json: bool,
+    /// A runner's facts instead (docs/ci.md W13-R01).
+    #[command(subcommand)]
+    pub facts: Option<crate::ci::cli::RunnerFacts>,
 }
 
 #[derive(clap::Args, Clone, Debug)]

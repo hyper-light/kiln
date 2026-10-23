@@ -611,6 +611,8 @@ pub struct Requirement {
     pub rules: Vec<usize>,
     /// Docker only when its engine runs rootless (an untrusted leg's, W18-R07).
     pub rootless_docker: bool,
+    /// The pool whose executors run it (W13-R09).
+    pub pool: Option<String>,
 }
 
 impl Requirement {
@@ -621,7 +623,16 @@ impl Requirement {
         labels.dedup();
         let mut cs: Vec<&str> = self.constraints.iter().map(|(s, _)| s.as_str()).collect();
         cs.sort_unstable();
-        format!("labels={};group={};req={};caps={:x};exec={}{}", labels.join(","), self.group.as_deref().unwrap_or(""), cs.join(" && "), self.caps, self.executors.join(","), if self.rootless_docker { ";rootless" } else { "" })
+        format!(
+            "labels={};group={};req={};caps={:x};exec={}{}{}",
+            labels.join(","),
+            self.group.as_deref().unwrap_or(""),
+            cs.join(" && "),
+            self.caps,
+            self.executors.join(","),
+            if self.rootless_docker { ";rootless" } else { "" },
+            self.pool.as_deref().map(|p| format!(";pool={p}")).unwrap_or_default()
+        )
     }
 }
 
@@ -633,19 +644,25 @@ fn rule_applies(r: &Rule, leg: &LegRoute) -> bool {
     if !m.repos.is_empty() && !m.repos.iter().any(|g| Pattern::new(g).is_ok_and(|p| p.matches(&leg.repo))) {
         return false;
     }
-    if let Some(j) = &m.job {
-        let Ok(c) = Condition::parse(j, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
-        let cx = MapContexts::default()
-            .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
-            .with("workflow", Value::str(&leg.workflow))
-            .with("repo", Value::str(&leg.repo))
-            .with("event", Value::str(&leg.event));
-        if !expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false) {
-            return false;
-        }
+    if let Some(j) = &m.job
+        && !job_condition(j, leg)
+    {
+        return false;
     }
     // A rule with nothing to match applies to every leg (a fleet-wide default).
     true
+}
+
+/// Whether a condition over a leg holds (a rule's `match.job`, a reservation's `for`): over `job`
+/// (`id`, `name`), `workflow`, `repo` and `event`. One that doesn't parse holds for none.
+pub fn job_condition(src: &str, leg: &LegRoute) -> bool {
+    let Ok(c) = Condition::parse(src, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
+    let cx = MapContexts::default()
+        .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
+        .with("workflow", Value::str(&leg.workflow))
+        .with("repo", Value::str(&leg.repo))
+        .with("event", Value::str(&leg.event));
+    expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false)
 }
 
 /// A leg's requirement (W05-R19): rules that match it, in order, add their constraints and

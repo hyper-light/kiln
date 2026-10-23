@@ -409,6 +409,23 @@ impl LocalBlobs {
         }
     }
 
+    /// An object of chunks this store keeps already ([`chunks::keep`]), put at `key`: what kiln's
+    /// chunked cache protocol (`crate::ci::services::chunks`, docs/ci.md W08-R09) commits once a
+    /// runner has sent the chunks the store lacked. The caller checked that each chunk is here and
+    /// that together they hash to `digest`.
+    pub async fn put_chunks(&self, key: &str, digest: &str, chunks: Chunks) -> Result<Meta, Refusal> {
+        seam::check_key(key)?;
+        seam::check_sha256(digest)?;
+        let size = chunks.iter().map(|(_, n)| *n).sum::<u64>();
+        if size > self.limits.object {
+            return Err(Refusal::TooLarge { what: "an object", size, limit: self.limits.object });
+        }
+        let w = Write { key: key.to_owned(), digest: digest.to_owned(), size, chunks, cond: Cond::Always, now_ms: self.clock.unix_ms(), upload: None };
+        let (meta, released) = self.sql(move |c| commit(c, &w)).await?;
+        Self::release(released).await;
+        Ok(meta)
+    }
+
     /// Removes a file a replaced or deleted key named, where it lay.
     async fn release(file: Option<String>) {
         if let Some(f) = file

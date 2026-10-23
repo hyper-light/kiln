@@ -56,6 +56,17 @@ export interface DiffRun {
   event: string;
   status: string;
   conclusion: string | null;
+  /** What its jobs' `bench-gate`s said (W16-R09). */
+  gates?: BenchGate[];
+}
+
+/** A job's `bench-gate` result on a commit (W16-R09): failing (`error`) or a warning, and why. */
+export interface BenchGate {
+  run: string;
+  leg: string;
+  job: string;
+  level: string;
+  message: string;
 }
 
 export interface Reviewer {
@@ -157,8 +168,23 @@ export interface InboxThread {
   last: string;
 }
 
+/** What a notification rule put in your inbox (W19-R06). */
+export interface InboxNote {
+  id: string;
+  event: string;
+  title: string;
+  line: string;
+  url: string;
+  repo: string | null;
+  at: number;
+  read: boolean;
+}
+
 export interface Inbox {
   you: string;
+  /** What notification rules put here, newest first. */
+  notifications: InboxNote[];
+  unread: number;
   /** Threads whose last word isn't yours. */
   waiting_for_you: InboxThread[];
   /** Threads whose last word is yours. */
@@ -189,6 +215,8 @@ export interface QueueEntry {
   enqueued_by: string;
   created_at: number;
   updated_at: number;
+  /** What the candidate's `bench-gate`s said (W16-R09). */
+  gates?: BenchGate[];
 }
 
 export type ReviewAction = "accept" | "request_changes" | "comment" | "resign";
@@ -197,9 +225,12 @@ const enc = encodeURIComponent;
 
 export const reviewApi = {
   inbox: (signal?: AbortSignal) => request<Inbox>("GET", "/api/review/inbox", undefined, { signal }),
+  readAll: () => request<{ read: number }>("POST", "/api/review/inbox/read", { all: true }),
   diff: (key: string, signal?: AbortSignal) => request<DiffDetail>("GET", `/api/diffs/${enc(key)}`, undefined, { signal }),
   files: (key: string, version: number, signal?: AbortSignal) => request<VersionFiles>("GET", `/api/diffs/${enc(key)}/versions/${version}/files`, undefined, { signal }),
   interdiff: (key: string, from: number, to: number, signal?: AbortSignal) => request<Interdiff>("GET", `/api/diffs/${enc(key)}/interdiff?from=${from}&to=${to}`, undefined, { signal }),
+  dependencies: (key: string, to: number, from: number | null, signal?: AbortSignal) =>
+    request<Dependencies>("GET", `/api/diffs/${enc(key)}/dependencies?to=${to}${from != null ? `&from=${from}` : ""}`, undefined, { signal }),
   threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[] }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
   comment: (
     key: string,
@@ -222,12 +253,25 @@ export const reviewApi = {
 };
 
 /** Events that change what review pages show. */
-const REVIEW_EVENTS = ["diff", "diff_version", "review", "comment", "queue", "landed", "diff_run", "run"];
+const REVIEW_EVENTS = ["diff", "diff_version", "review", "comment", "queue", "landed", "diff_run", "run", "inbox"];
 
 export const inboxRes: Res<Inbox> = { key: "review/inbox", fetch: (s) => reviewApi.inbox(s), opts: { on: REVIEW_EVENTS } };
 export const diffRes = (key: string): Res<DiffDetail> => ({ key: `review/diff/${key}`, fetch: (s) => reviewApi.diff(key, s), opts: { on: REVIEW_EVENTS } });
 export const threadsRes = (key: string): Res<Thread[]> => ({ key: `review/threads/${key}`, fetch: (s) => reviewApi.threads(key, s), opts: { on: ["comment", "review", "diff_version"] } });
 export const filesRes = (key: string, version: number): Res<VersionFiles> => ({ key: `review/files/${key}/${version}`, fetch: (s) => reviewApi.files(key, version, s) });
+
+/** What a version changes in the dependencies its lockfiles pin (docs/ci.md W18-R03). */
+export interface Dependencies {
+  diff: string;
+  from: string;
+  to: string;
+  lockfiles: { path: string; added: number; removed: number; changed: number; changes: { ecosystem: string; name: string; from: string[]; to: string[] }[] }[];
+}
+
+export const dependenciesRes = (key: string, to: number, from: number | null): Res<Dependencies> => ({
+  key: `review/dependencies/${key}/${from ?? "base"}/${to}`,
+  fetch: (s) => reviewApi.dependencies(key, to, from, s),
+});
 export const readinessRes = (key: string): Res<Readiness> => ({ key: `review/land/${key}`, fetch: (s) => reviewApi.readiness(key, s), opts: { on: REVIEW_EVENTS } });
 
 /** Who someone is, in words: `agent:a1b2` → "agent a1b2", `user:ada` → "ada". */

@@ -397,15 +397,16 @@ pub async fn log(hub: &Hub, run: &str, seq: i64, kind: &str, leg: Option<String>
         .await
 }
 
-/// A new attempt of a finished run (W05-R17): its number, the run queued again.
-pub async fn start_attempt(hub: &Hub, run: &str) -> anyhow::Result<u32> {
-    let run = run.to_owned();
+/// A new attempt of a finished run (W05-R17), started by `by`: its number, the run queued again.
+pub async fn start_attempt(hub: &Hub, run: &str, by: &str) -> anyhow::Result<u32> {
+    let (run, by) = (run.to_owned(), by.to_owned());
     hub.store
         .call(move |c| {
             let tx = c.transaction()?;
             tx.execute("UPDATE runs SET attempt = attempt + 1, status = 'queued', conclusion = NULL, error = NULL, started_at = NULL, finished_at = NULL WHERE id = ?1", [&run])?;
             tx.execute("UPDATE ci_plans SET done = 0 WHERE run_id = ?1", [&run])?;
             let n: u32 = tx.query_row("SELECT attempt FROM runs WHERE id = ?1", [&run], |r| r.get(0))?;
+            tx.execute("INSERT OR REPLACE INTO ci_run_attempts (run_id, attempt, actor, created_at) VALUES (?1, ?2, ?3, ?4)", params![run, n, by, crate::util::now_unix()])?;
             tx.commit()?;
             Ok(n)
         })

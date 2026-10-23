@@ -83,6 +83,19 @@ fn w02_s05_untrusted_input_in_run() {
     assert_eq!(step.first().map(|(k, v)| (k.as_str(), v.src.as_str())), Some(("PULL_REQUEST_TITLE", "${{ github.event.pull_request.title }}")));
 }
 
+/// W21-R01's quick fixes: an unknown key close to a known one comes with its rename.
+#[test]
+fn w21_r01_an_unknown_keys_fix() {
+    let src = "on: push\njobs:\n  a:\n    runs_on: x\n    steps: [{run: echo}]\n";
+    let (_, d) = gha(src);
+    let e = d.iter().find(|x| x.code == "KCI1010");
+    assert_eq!(e.and_then(|x| x.fix.as_ref()).map(|f| f.title.as_str()), Some("Rename it `runs-on`"), "{d:?}");
+    let fixed = e.map(|x| apply_fix(src, x)).unwrap_or_default();
+    assert_eq!(fixed, src.replace("runs_on", "runs-on"));
+    let (_, again) = gha(&fixed);
+    assert!(errors(&again).is_empty(), "{:?}", errors(&again));
+}
+
 #[test]
 fn w02_s05_fix_quotes_for_the_shell() {
     // A block scalar, single and no quotes, an existing env, the same value twice.
@@ -214,6 +227,21 @@ fn actions() {
     assert!(codes(&d).contains(&"KCI1014"));
 }
 
+/// W09-AC06: an action reading a secret it doesn't declare is told so (`KCI4041`, a warning:
+/// inside it the secret is nothing), where it reads it; what it declares, and `GITHUB_TOKEN`,
+/// are fine.
+#[test]
+fn actions_read_only_the_secrets_they_declare() {
+    let (_, d) = parse_action(
+        "name: deploy\nsecrets:\n  DEPLOY_KEY: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo ${{ secrets.deploy_key }} ${{ secrets.GITHUB_TOKEN }}\n    - shell: bash\n      env:\n        O: ${{ secrets.OTHER }}\n      run: echo $O\n",
+    );
+    let found: Vec<&Diag> = d.iter().filter(|x| x.code == "KCI4041").collect();
+    assert_eq!(found.len(), 1, "{d:?}");
+    assert!(found.iter().all(|x| x.severity == Severity::Warning && x.message.contains("`OTHER`") && x.path == "runs.steps[1].env.O" && x.range.start.line == 11), "{found:?}");
+    let (_, d) = parse_action("name: plain\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo ${{ secrets.TOKEN }}\n");
+    assert!(d.iter().any(|x| x.code == "KCI4041" && x.message.contains("`TOKEN`")), "declaring none, it reads none: {d:?}");
+}
+
 #[test]
 fn schemas_are_generated() {
     for k in [SchemaKind::Gha, SchemaKind::Kiln, SchemaKind::Overlay, SchemaKind::Action] {
@@ -281,4 +309,19 @@ fn needs_of_itself_and_twice_end() {
     assert!(errors(&d).is_empty(), "{d:?}");
     let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    needs: [a, b]\n    steps: [{run: b}]\n");
     assert!(errors(&d).iter().any(|e| e.contains("form a cycle")), "{d:?}");
+}
+
+/// `kiln: { chain-depth }` (W03-R13): how deep a `workflow_run` chain a workflow takes part in,
+/// from 1 to 10; GitHub's three when unset.
+#[test]
+fn w03_r13_chain_depth() {
+    let (w, d) = kiln("on:\n  pipeline: { name: build }\nkiln:\n  chain-depth: 6\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(w.and_then(|w| w.chain_depth), Some(6));
+    let (w, _) = kiln("on: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert_eq!(w.and_then(|w| w.chain_depth), None);
+    for bad in ["11", "0", "deep"] {
+        let (_, d) = kiln(&format!("on: push\nkiln:\n  chain-depth: {bad}\njobs:\n  a:\n    runs-on: x\n    steps: [{{run: echo}}]\n"));
+        assert!(d.iter().any(|x| x.code == "KCI1015" && x.message.contains("1 to 10")), "{bad}: {d:?}");
+    }
 }

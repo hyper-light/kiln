@@ -16,6 +16,8 @@ pub mod event;
 pub mod github;
 pub mod matcher;
 pub mod pattern;
+#[cfg(test)]
+mod payload_schemas;
 pub mod skip;
 
 pub use event::{Event, Source, ZERO_SHA};

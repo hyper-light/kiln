@@ -538,6 +538,9 @@ pub async fn discover_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let sem = Arc::new(async_lock::Semaphore::new(hub.cfg.gitops.git_concurrency.max(1)));
     let inflight = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
+    // Kicked while their poll ran (a push meanwhile): polled again as that poll ends, not a whole
+    // interval later.
+    let again = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
     let mut force = true;
     loop {
         let now = crate::util::now_unix();
@@ -546,11 +549,17 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 continue;
             }
             let due = force || repo.last_polled_at.is_none_or(|t| now - t >= i64::from(repo.poll_seconds.max(10)));
-            if !due || inflight.lock().contains(&repo.id) {
+            if !due {
+                continue;
+            }
+            if inflight.lock().contains(&repo.id) {
+                if force {
+                    again.lock().insert(repo.id.clone());
+                }
                 continue;
             }
             inflight.lock().insert(repo.id.clone());
-            let (hub, sem, inflight) = (hub.clone(), sem.clone(), inflight.clone());
+            let (hub, sem, inflight, again) = (hub.clone(), sem.clone(), inflight.clone(), again.clone());
             crate::sup::spawn_guarded("poll-repo", async move {
                 let _permit = sem.acquire().await;
                 let r = poll_repo(&hub, &repo).await;
@@ -566,6 +575,9 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 }
                 hub.store.repo_polled(repo.id.clone(), err).await?;
                 inflight.lock().remove(&repo.id);
+                if again.lock().remove(&repo.id) {
+                    hub.gitops_kick.notify();
+                }
                 Ok(())
             });
         }

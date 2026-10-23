@@ -7,7 +7,7 @@
  */
 import * as React from "react";
 import { Plus } from "lucide-react";
-import { Link } from "@/lib/router";
+import { Link, useSearchParams } from "@/lib/router";
 import { attachApi, attachmentsRes, CAN, incidentsRes, onWords, WAKES_CODE, WAKES_RUNNERS, type AttachmentInput, type AttachmentRow, type IncidentBrief } from "@/api/attach";
 import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
@@ -24,6 +24,9 @@ const WAKE_WORDS: Record<string, string> = {
   flaky: "a test is flaky",
   ejected: "the land queue takes a change out",
   stuck: "a job waits for a runner",
+  slow: "a run is slower than usual",
+  unroutable: "a job can't run anywhere",
+  degraded: "an app it deploys degrades",
   mention: "someone mentions it",
   schedule: "on a schedule",
   offline: "a runner goes offline",
@@ -48,7 +51,10 @@ const CAN_WORDS: Record<string, string> = {
 const STATE_WORDS: Record<IncidentBrief["state"], string> = { open: "its agent is on it", reported: "reported", resolved: "resolved", waiting: "waiting for you", dismissed: "dismissed" };
 
 export default function AttachedPage() {
-  const [adding, setAdding] = React.useState(false);
+  // A page's "Attach agent" opens the form on what it is (`?on=`).
+  const [search] = useSearchParams();
+  const asked = fromOn(search.get("on"));
+  const [adding, setAdding] = React.useState(asked !== null);
   return (
     <div className="container-console page attach-page">
       <title>Attached agents · kiln</title>
@@ -65,7 +71,7 @@ export default function AttachedPage() {
           )
         }
       />
-      {adding && <AttachForm onDone={() => setAdding(false)} />}
+      {adding && <AttachForm initial={asked} onDone={() => setAdding(false)} />}
       <Loadable label="the attachments" fallback={<RowsHold rows={3} rowHeight={84} label="Loading the attachments" />}>
         <Attached onAttach={() => setAdding(true)} adding={adding} />
       </Loadable>
@@ -221,6 +227,34 @@ function onOf(kind: Kind, repo: string, extra: string): string {
   }
 }
 
+/** What a page's "Attach agent" names (`?on=`), as the form asks it; null for nothing it knows. */
+function fromOn(on: string | null): { kind: Kind; repo: string; extra: string } | null {
+  if (!on) return null;
+  if (on === "runners") return { kind: "runners", repo: "", extra: "" };
+  const [kind, rest = ""] = on.split(/:(.*)/s);
+  switch (kind) {
+    case "repo":
+      return rest ? { kind: "repo", repo: rest, extra: "" } : null;
+    case "workflow":
+    case "environment": {
+      const i = rest.indexOf(":");
+      return i > 0 ? { kind, repo: rest.slice(0, i), extra: rest.slice(i + 1) } : null;
+    }
+    case "pool":
+    case "runner":
+      return rest ? { kind, repo: "", extra: rest } : null;
+    default:
+      return null;
+  }
+}
+
+/** What can wake one that looks after `kind`: an environment's are its deployments' and its apps', a workflow's its runs'. */
+function wakesOf(kind: Kind): readonly string[] {
+  if (kind === "runners" || kind === "runner" || kind === "pool") return WAKES_RUNNERS;
+  if (kind === "environment") return ["failure", "degraded", "mention", "schedule"];
+  return kind === "workflow" ? WAKES_CODE.filter((w) => w !== "degraded") : WAKES_CODE;
+}
+
 const KINDS = [
   { value: "repo", label: "A repository" },
   { value: "workflow", label: "A workflow" },
@@ -240,21 +274,24 @@ const HARNESSES = [
   { value: "antigravity", label: "Antigravity CLI" },
 ];
 
-function AttachForm({ onDone }: { onDone: () => void }) {
+function AttachForm({ initial, onDone }: { initial: { kind: Kind; repo: string; extra: string } | null; onDone: () => void }) {
   const [name, setName] = React.useState("");
-  const [kind, setKind] = React.useState<Kind>("repo");
-  const [repo, setRepo] = React.useState("");
-  const [extra, setExtra] = React.useState("");
+  const [kind, setKind] = React.useState<Kind>(initial?.kind ?? "repo");
+  const [repo, setRepo] = React.useState(initial?.repo ?? "");
+  const [extra, setExtra] = React.useState(initial?.extra ?? "");
   const [branches, setBranches] = React.useState("");
   const [harness, setHarness] = React.useState("claude");
   const [machine, setMachine] = React.useState("");
   const [folder, setFolder] = React.useState("");
   const runners = kind === "runners" || kind === "runner" || kind === "pool";
-  const wakes: readonly string[] = runners ? WAKES_RUNNERS : WAKES_CODE;
-  const [wake, setWake] = React.useState<string[]>(["failure"]);
+  const wakes = wakesOf(kind);
+  const [wake, setWake] = React.useState<string[]>(() => (runners ? ["offline", "upgrade"] : ["failure"]));
   const [schedule, setSchedule] = React.useState("");
   const [can, setCan] = React.useState<string[]>([]);
   const [perDay, setPerDay] = React.useState("10");
+  const [tokens, setTokens] = React.useState("5000000");
+  const [minutes, setMinutes] = React.useState("300");
+  const [slowBy, setSlowBy] = React.useState("25");
   const [playbook, setPlaybook] = React.useState("");
   const [reviewers, setReviewers] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -283,7 +320,14 @@ function AttachForm({ onDone }: { onDone: () => void }) {
       wake: wake.filter((w) => wakes.includes(w)),
       ...(wake.includes("schedule") && { schedule: schedule.trim() }),
       can: ["read", ...can],
-      limits: { sessions_per_day: Number(perDay) || 10, reruns_per_failure: 2, stuck_minutes: 15 },
+      limits: {
+        sessions_per_day: Number(perDay) || 10,
+        reruns_per_failure: 2,
+        stuck_minutes: 15,
+        slow_percent: Number(slowBy) || 25,
+        tokens_per_day: Number(tokens) || 5_000_000,
+        runner_minutes_per_day: Number(minutes) || 300,
+      },
       playbook,
       reviewers: reviewers
         .split(",")
@@ -315,6 +359,8 @@ function AttachForm({ onDone }: { onDone: () => void }) {
         <TextField label="Runs on" placeholder="the server; or a machine, linux/amd64, +gpu" value={machine} onChange={(e) => setMachine(e.target.value)} />
         <TextField label="In folder" placeholder="a checkout of the repository" value={folder} onChange={(e) => setFolder(e.target.value)} />
         <TextField label="Incidents a day" type="number" min={1} max={500} value={perDay} onChange={(e) => setPerDay(e.target.value)} />
+        <TextField label="Tokens a day" type="number" min={1} value={tokens} onChange={(e) => setTokens(e.target.value)} hint="Its agents' sessions together." />
+        <TextField label="Runner minutes a day" type="number" min={1} value={minutes} onChange={(e) => setMinutes(e.target.value)} hint="The runs its agents ask for and rerun." />
       </div>
       <fieldset className="attach-checks">
         <legend className="field-label">Wakes when</legend>
@@ -326,6 +372,17 @@ function AttachForm({ onDone }: { onDone: () => void }) {
         ))}
       </fieldset>
       {wake.includes("schedule") && <TextField label="Schedule" placeholder="0 6 * * 1 (cron, UTC)" value={schedule} onChange={(e) => setSchedule(e.target.value)} required />}
+      {wake.includes("slow") && (
+        <TextField
+          label="Slower than usual by"
+          type="number"
+          min={1}
+          max={1000}
+          value={slowBy}
+          onChange={(e) => setSlowBy(e.target.value)}
+          hint="Percent over the median of its last green runs' critical paths."
+        />
+      )}
       <fieldset className="attach-checks">
         <legend className="field-label">May, beyond reading what it looks after</legend>
         {CAN.filter((c) => (runners ? ["diagnose", "manage-runners", "comment"] : CAN.filter((x) => x !== "manage-runners")).includes(c)).map((c) => (

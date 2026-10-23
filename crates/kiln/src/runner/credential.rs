@@ -11,6 +11,13 @@
 //! - **Quay** (`"quay"`): a robot's federated token; **JFrog** (`"jfrog"`): an Artifactory access
 //!   token for its OIDC provider; **Cloudsmith** (`"cloudsmith"`): a service's token;
 //!   **Chainguard** (`"chainguard"`): an assumable identity's token;
+//! - **Alibaba's Container Registry** (`"alibaba"`): a RAM role's credentials for the leg's ID
+//!   token, then the registry's temporary password (an Enterprise Edition instance's, with
+//!   `instance_id`, or the Personal Edition's);
+//! - **Oracle's Container Registry** (`"oracle"`): an OCI identity domain's session token for the
+//!   leg's ID token, bound to a key made for it, then the registry's token for a request that key
+//!   signs (an auth token, with no federation, is the stored token, its `username`
+//!   `<namespace>/<user>`);
 //! - **the rest** (Docker Hub, GHCR, GitLab, Harbor robots, …): the integration's stored token;
 //! - **kiln's own registry**: the job's token, which ends with the leg.
 //!
@@ -149,7 +156,29 @@ pub async fn credentials_for(host: &str, list: &[Integration]) -> anyhow::Result
             let token = v.get("token").and_then(Value::as_str).ok_or_else(|| anyhow!("Chainguard's answer has no token"))?;
             Ok(Some(("_token".to_owned(), token.to_owned())))
         }
-        Some(other) => Err(anyhow!("`{}`: federation `{other}`: aws, gcp, azure, quay, jfrog, cloudsmith or chainguard (or none, for its token)", i.name)),
+        Some("alibaba") => {
+            use crate::ci::integrations::alibaba;
+            let (role, provider) = (
+                cfg(i, "role_arn").ok_or_else(|| anyhow!("`{}` has no role_arn (`acs:ram::<account>:role/<name>`)", i.name))?,
+                cfg(i, "oidc_provider_arn").ok_or_else(|| anyhow!("`{}` has no oidc_provider_arn", i.name))?,
+            );
+            let region = cfg(i, "region").map(str::to_owned).or_else(|| alibaba::acr_region(host)).ok_or_else(|| anyhow!("`{}`: which region is {host} in? (`region`)", i.name))?;
+            let jwt = token_for(cfg(i, "audience").unwrap_or("sts.aliyuncs.com").to_owned()).await?;
+            let session = aws::session_name(&format!("kiln-{}", std::env::var("GITHUB_REPOSITORY").unwrap_or_default()));
+            let creds = alibaba::assume_role_with_oidc(&http, Some(&region), provider, role, &session, &jwt, 3600).await?;
+            Ok(Some(alibaba::acr_login(&http, &region, cfg(i, "instance_id"), &creds).await?))
+        }
+        Some("oracle") => {
+            use crate::ci::integrations::oracle;
+            let (domain, client) =
+                (cfg(i, "domain").ok_or_else(|| anyhow!("`{}` has no domain (its OCI identity domain's URL)", i.name))?, cfg(i, "client_id").ok_or_else(|| anyhow!("`{}` has no client_id", i.name))?);
+            let secret = i.token.clone().ok_or_else(|| anyhow!("`{}` has no client secret (its token)", i.name))?;
+            let jwt = token_for(cfg(i, "audience").unwrap_or(domain).to_owned()).await?;
+            let key = oracle::SessionKey::new()?;
+            let session = oracle::exchange(&http, domain, client, &secret, &jwt, &key.public()?).await?;
+            Ok(Some((oracle::BEARER_USER.to_owned(), oracle::registry_token(&http, host, &session, &key).await?)))
+        }
+        Some(other) => Err(anyhow!("`{}`: federation `{other}`: aws, gcp, azure, quay, jfrog, cloudsmith, chainguard, alibaba or oracle (or none, for its token)", i.name)),
         None => {
             let t = i.token.clone().ok_or_else(|| anyhow!("`{}` has no token, and no federation", i.name))?;
             Ok(Some((cfg(i, "username").unwrap_or("kiln").to_owned(), t)))

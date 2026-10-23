@@ -203,6 +203,9 @@ pub struct Workflow {
     pub run_env: bool,
     /// kiln: `kiln: { honour-skip-ci }` (W03-R06).
     pub honour_skip_ci: bool,
+    /// kiln: `kiln: { chain-depth }`, how deep a chain of `workflow_run` (and `pipeline`) runs
+    /// this workflow takes part in: 3 when unset (GitHub's), at most 10 (W03-R13).
+    pub chain_depth: Option<u32>,
     /// kiln: the implicit checkout (W06-R14); GHA workflows never have one.
     pub checkout: bool,
 }
@@ -364,6 +367,8 @@ pub struct JobKiln {
     pub quarantine_enforce: bool,
     pub bench_gate: Option<YVal>,
     pub deploy: Option<YVal>,
+    /// `discover`: the usual reports, after the job's steps (W16-R01).
+    pub test_results: Option<YVal>,
     pub agents: Option<YVal>,
     /// v1's `artifacts: [globs]`.
     pub artifacts: Vec<String>,

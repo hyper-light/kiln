@@ -279,7 +279,7 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     });
     if let Some(door) = peer {
         if h2 {
-            srv::serve_h2(client, door, remote, true).await;
+            srv::serve_h2(client, bytes::Bytes::new(), door, remote, true).await;
         } else {
             srv::serve_connection_with(client, door, remote, true).await;
         }
@@ -754,14 +754,14 @@ mod tests {
                 // A browser asks for HTTP/2 first.
                 let tcp = hyper_rt::tcp::TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await.map_err(|e| anyhow::anyhow!("{e}"))?;
                 let tls = TlsStream::connect(RtFuturesIo::new(tcp), roots.config_alpn(&[H2, HTTP11])?, crate::http::tls::server_name("kiln.test")?).await?;
-                let body = |r: http::Response<hyper::body::Incoming>| async move {
+                let body = |r: http::Response<kiln_http::Incoming>| async move {
                     use http_body_util::BodyExt as _;
                     Ok::<_, anyhow::Error>(String::from_utf8_lossy(&r.into_body().collect().await?.to_bytes()).into_owned())
                 };
                 let req = || http::Request::builder().uri("https://kiln.test/").header(header::HOST, "kiln.test").body(http_body_util::Empty::<bytes::Bytes>::new());
                 if h2_upstream {
                     assert_eq!(tls.alpn_protocol(), Some(H2));
-                    let (mut send, conn) = hyper::client::conn::http2::handshake(crate::http::io::RtExec, tls).await?;
+                    let (mut send, conn) = kiln_http::client::http2::handshake::<_, http_body_util::Empty<bytes::Bytes>>(tls).await?;
                     crate::rt::spawn(conn);
                     assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/2.0 kiln.test");
                     // Many at once, over the one connection.
@@ -769,7 +769,7 @@ mod tests {
                     assert!(many.iter().all(|r| r.as_ref().is_ok_and(|r| r.status() == StatusCode::OK)));
                 } else {
                     assert_eq!(tls.alpn_protocol(), Some(HTTP11));
-                    let (mut send, conn) = hyper::client::conn::http1::handshake(tls).await?;
+                    let (mut send, conn) = kiln_http::client::http1::handshake::<_, http_body_util::Empty<bytes::Bytes>>(tls).await?;
                     crate::rt::spawn(conn);
                     assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/1.1 kiln.test");
                 }

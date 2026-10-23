@@ -1,0 +1,111 @@
+# F-12 (docs/ci.md Appendix F; W04-AC01, AC07): the matrix examples of GitHub's "Running
+# variations of jobs in a workflow", as written there but for `runs-on` (any runner here). The
+# test that uses it lists the legs GitHub documents for each.
+name: matrices
+on: push
+jobs:
+  single:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        version: [10, 12, 14]
+    steps:
+      - run: echo "node ${{ matrix.version }}"
+  multi:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-20.04]
+        version: [10, 12, 14]
+    steps:
+      - run: echo "${{ matrix.os }} ${{ matrix.version }}"
+  expand:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        fruit: [apple, pear]
+        animal: [cat, dog]
+        include:
+          - color: green
+          - color: pink
+            animal: cat
+          - fruit: apple
+            shape: circle
+          - fruit: banana
+          - fruit: banana
+            animal: cat
+    steps:
+      - run: echo "${{ matrix.fruit }} ${{ matrix.animal }} ${{ matrix.color }} ${{ matrix.shape }}"
+  extend:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: [14, 16]
+        include:
+          - os: windows-latest
+            node: 16
+            npm: 6
+    steps:
+      - run: echo "${{ matrix.os }} ${{ matrix.node }} ${{ matrix.npm }}"
+  add:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        version: [12, 14, 16]
+        include:
+          - os: windows-latest
+            version: 17
+    steps:
+      - run: echo "${{ matrix.os }} ${{ matrix.version }}"
+  only-include:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        include:
+          - site: "production"
+            datacenter: "site-a"
+          - site: "staging"
+            datacenter: "site-b"
+    steps:
+      - run: echo "${{ matrix.site }} ${{ matrix.datacenter }}"
+  exclude:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+        version: [12, 14, 16]
+        environment: [staging, production]
+        exclude:
+          - os: macos-latest
+            version: 12
+            environment: production
+          - os: windows-latest
+            version: 16
+    steps:
+      - run: echo "${{ matrix.os }} ${{ matrix.version }} ${{ matrix.environment }}"
+  objects:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node:
+          - version: 14
+          - version: 20
+            env: NODE_OPTIONS=--openssl-legacy-provider
+    steps:
+      - run: echo "${{ matrix.os }} ${{ matrix.node.version }} ${{ matrix.node.env }}"
+  experimental:
+    runs-on: self-hosted
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: true
+      matrix:
+        version: [6, 7, 8]
+        experimental: [false]
+        include:
+          - version: 9
+            experimental: true
+    steps:
+      - run: echo "${{ matrix.version }} ${{ matrix.experimental }}"
