@@ -30,6 +30,7 @@ pub mod gcp_appengine;
 pub mod gcp_compute;
 pub mod gcp_functions;
 pub mod gcp_run;
+pub mod heroku;
 pub mod render;
 pub mod vercel;
 
@@ -538,11 +539,17 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "heroku",
         place: &[],
         scope: None,
-        settings: &[s("app", true, "the app"), s("image", false, "an image (${{ artifacts.* }}); otherwise a build of the source")],
+        settings: &[
+            s("app", true, "the app (made if it isn't there)"),
+            s("source", true, "a .tar.gz of the source CI made (${{ release.artifacts.<name>.digest }}), which Heroku builds"),
+            s("config", false, "config vars kiln sets ({MODE: prod}); the app's others are left as they are"),
+            s("stack", false, "for an app kiln makes: its stack (heroku-24)"),
+            s("region", false, "for an app kiln makes: its region (us, eu)"),
+        ],
         kinds: &[kind("heroku.kiln.dev", "App", "App"), child(kind("heroku.kiln.dev", "Release", "Release")), child(kind("heroku.kiln.dev", "Build", "Build"))],
-        capabilities: &[Versions, Logs, Drift, Adopt],
-        reads: &["app.json", "heroku.yml"],
-        built: false,
+        capabilities: &[Versions, Drift, Adopt],
+        reads: &[],
+        built: true,
     },
     ProviderDef {
         name: "digitalocean",
@@ -773,6 +780,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "gcp-compute" => gcp_compute::render(input),
         "gcp-functions" => gcp_functions::render(input),
         "gcp-run" => gcp_run::render(input),
+        "heroku" => heroku::render(input),
         "render" => render::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
@@ -802,6 +810,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "gcp-compute" => gcp_compute::files(spec),
         "gcp-functions" => gcp_functions::files(spec),
         "gcp-run" => gcp_run::files(spec),
+        "heroku" => heroku::files(spec),
         "render" => render::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
@@ -833,6 +842,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "gcp-compute" => gcp_compute::health(obj),
         "gcp-functions" => gcp_functions::health(obj),
         "gcp-run" => gcp_run::health(obj),
+        "heroku" => heroku::health(obj),
         "render" => render::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,

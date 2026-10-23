@@ -1,4 +1,5 @@
-//! A fake of the hosting platforms' APIs for tests (Render, DigitalOcean App Platform), in memory, behaving as each
+//! A fake of the hosting platforms' APIs for tests (Render, DigitalOcean App Platform, Heroku), in
+//! memory, behaving as each
 //! documents it where kiln depends on it: a deploy builds and goes live, the one before serving
 //! until it does, and one that fails leaves it serving; a rollback re-deploys an earlier deploy.
 //! Every request carries the platform's token.
@@ -35,9 +36,26 @@ pub struct DoApp {
     pub busy: u32,
 }
 
+/// A Heroku app as the fake keeps it: its releases and builds, newest first, its config vars, and
+/// whether its dynos start on its current release (by slug).
+#[derive(Clone, Debug, Default)]
+pub struct HerokuApp {
+    pub releases: Vec<Value>,
+    pub builds: Vec<Value>,
+    pub config: serde_json::Map<String, Value>,
+    /// Reads left before the newest build is done; and before the dynos have started.
+    pub building: u32,
+    pub starting: u32,
+    /// Slugs whose dynos crash.
+    pub crashing: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct HostingState {
     pub base: String,
+    pub heroku: BTreeMap<String, HerokuApp>,
+    /// Places sources were sent to, by id.
+    pub blobs: BTreeMap<String, Vec<u8>>,
     pub render: BTreeMap<String, RenderService>,
     /// App Platform's apps, by id.
     pub apps: BTreeMap<String, DoApp>,
@@ -79,8 +97,18 @@ impl srv::Handler for FakeHosting {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
         let (method, path, query) = (req.method().clone(), req.uri().path().to_owned(), query_of(req.uri().query()));
         let auth = srv::header_str(&req, &http::header::AUTHORIZATION).unwrap_or("").to_owned();
+        let accept = srv::header_str(&req, &http::header::ACCEPT).unwrap_or("").to_owned();
         let raw = srv::body_bytes(req.into_body(), 64 << 20).await.unwrap_or_default();
         let mut st = self.state.lock();
+        // A place Heroku's sources signed: no token.
+        if let Some(id) = path.strip_prefix("/blobs/") {
+            if query.get("sig").map(String::as_str) != Some("put") || method != http::Method::PUT {
+                return err(403, "forbidden", "a source's place takes a signed PUT");
+            }
+            st.calls.push("UploadSource".to_owned());
+            st.blobs.insert(id.to_owned(), raw.to_vec());
+            return ok(Value::Null);
+        }
         if auth != format!("Bearer {TOKEN}") {
             return err(401, "unauthorized", "a valid token is required");
         }
@@ -89,6 +117,13 @@ impl srv::Handler for FakeHosting {
         match parts.as_slice() {
             ["v1", "services", rest @ ..] => render(&mut st, &method, rest, &query, &body),
             ["v2", "apps", rest @ ..] => digitalocean(&mut st, &method, rest, &body),
+            ["apps", ..] | ["sources"] if !accept.contains("application/vnd.heroku+json; version=3") => err(406, "variant_not_available", "Heroku's API wants its Accept header"),
+            ["sources"] if method == http::Method::POST => {
+                let n = next(&mut st);
+                let base = st.base.clone();
+                ok(json!({ "source_blob": { "get_url": format!("{base}/blobs/s{n}?sig=get"), "put_url": format!("{base}/blobs/s{n}?sig=put") } }))
+            }
+            ["apps", rest @ ..] => heroku(&mut st, &method, rest, &body),
             _ => err(404, "not_found", &format!("the fake has no {method} {path}")),
         }
     }
@@ -300,6 +335,143 @@ fn digitalocean(st: &mut HostingState, method: &http::Method, rest: &[&str], bod
             }
         }
         _ => err(404, "not_found", "the fake has no such App Platform call"),
+    }
+}
+
+// ------------------------------------------------------------------ Heroku
+
+/// A read: the newest build goes on, and once it's done its release is current; the dynos start
+/// on the current release, or crash on a slug that does.
+fn heroku_step(st: &mut HostingState, name: &str) {
+    let n = next(st);
+    let blobs = st.blobs.clone();
+    let Some(a) = st.heroku.get_mut(name) else { return };
+    if a.building > 0 {
+        a.building -= 1;
+        if a.building == 0 {
+            let url = a.builds.first().and_then(|b| b.pointer("/source_blob/url")).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let id = url.rsplit('/').next().unwrap_or_default().split('?').next().unwrap_or_default().to_owned();
+            let source = blobs.get(&id).map(|b| String::from_utf8_lossy(b).into_owned());
+            match source {
+                Some(src) if !src.contains("unbuildable") => {
+                    let slug = format!("slug-{n}");
+                    if src.contains("broken") {
+                        a.crashing.push(slug.clone());
+                    }
+                    let release = heroku_release(a, n, &slug, "Deploy");
+                    if let Some(b) = a.builds.first_mut() {
+                        set(b, "status", json!("succeeded"));
+                        set(b, "release", json!({ "id": release }));
+                        set(b, "slug", json!({ "id": slug }));
+                    }
+                }
+                _ => {
+                    if let Some(b) = a.builds.first_mut() {
+                        set(b, "status", json!("failed"));
+                    }
+                }
+            }
+        }
+    } else if a.starting > 0 {
+        a.starting -= 1;
+    }
+}
+
+/// A new release of `slug`, current: its id.
+fn heroku_release(a: &mut HerokuApp, n: u64, slug: &str, what: &str) -> String {
+    for r in &mut a.releases {
+        set(r, "current", json!(false));
+    }
+    let version = a.releases.len() + 1;
+    let id = format!("rel-{n}");
+    a.releases.insert(0, json!({ "id": id, "version": version, "status": "succeeded", "current": true, "slug": { "id": slug }, "description": format!("{what} v{version}"), "created_at": format!("2026-10-23T00:{:02}:00Z", n % 60) }));
+    a.starting = 1;
+    id
+}
+
+fn heroku_dynos(a: &HerokuApp) -> Value {
+    let Some(r) = a.releases.iter().find(|r| r.get("current").and_then(Value::as_bool) == Some(true)) else { return json!([]) };
+    let slug = r.pointer("/slug/id").and_then(Value::as_str).unwrap_or_default();
+    let state = if a.starting > 0 { "starting" } else if a.crashing.iter().any(|c| c == slug) { "crashed" } else { "up" };
+    json!([{ "type": "web", "name": "web.1", "state": state, "release": { "id": r.get("id"), "version": r.get("version") } }, { "type": "web", "name": "web.2", "state": state, "release": { "id": r.get("id"), "version": r.get("version") } }])
+}
+
+fn heroku(st: &mut HostingState, method: &http::Method, rest: &[&str], body: &Value) -> Response {
+    if let ([], "GET") = (rest, method.as_str()) {
+        return ok(Value::Array(st.heroku.keys().map(|n| json!({ "name": n, "web_url": format!("https://{n}-abc.herokuapp.com/") })).collect()));
+    }
+    if let ([], "POST") = (rest, method.as_str()) {
+        let name = body.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if st.heroku.contains_key(&name) {
+            return err(422, "invalid_params", "Name is already taken");
+        }
+        st.heroku.insert(name.clone(), HerokuApp::default());
+        st.calls.push(format!("CreateApp {name}"));
+        return srv::json(http::StatusCode::CREATED, &json!({ "name": name }));
+    }
+    let Some(name) = rest.first().map(|n| (*n).to_owned()) else { return err(404, "not_found", "no such call") };
+    if !st.heroku.contains_key(&name) {
+        return err(404, "not_found", "Couldn't find that app.");
+    }
+    let n = next(st);
+    match (method.as_str(), rest.get(1..).unwrap_or_default()) {
+        ("GET", []) => ok(json!({ "name": name, "web_url": format!("https://{name}-abc.herokuapp.com/"), "stack": { "name": "heroku-24" } })),
+        ("DELETE", []) => {
+            st.heroku.remove(&name);
+            st.calls.push(format!("DeleteApp {name}"));
+            ok(json!({ "name": name }))
+        }
+        ("GET", ["config-vars"]) => ok(Value::Object(st.heroku.get(&name).map(|a| a.config.clone()).unwrap_or_default())),
+        ("PATCH", ["config-vars"]) => {
+            let Some(a) = st.heroku.get_mut(&name) else { return err(404, "not_found", "no app") };
+            for (k, v) in body.as_object().into_iter().flatten() {
+                a.config.insert(k.clone(), v.clone());
+            }
+            // A config change is a release of the current slug.
+            let slug = a.releases.first().and_then(|r| r.pointer("/slug/id")).and_then(Value::as_str).map(str::to_owned);
+            if let Some(slug) = slug {
+                heroku_release(a, n, &slug, "Set config vars");
+            }
+            st.calls.push(format!("SetConfig {name}"));
+            ok(Value::Object(st.heroku.get(&name).map(|a| a.config.clone()).unwrap_or_default()))
+        }
+        ("GET", ["dynos"]) => {
+            heroku_step(st, &name);
+            ok(st.heroku.get(&name).map(heroku_dynos).unwrap_or_default())
+        }
+        ("GET", ["builds"]) => ok(Value::Array(st.heroku.get(&name).map(|a| a.builds.iter().take(1).cloned().collect()).unwrap_or_default())),
+        ("POST", ["builds"]) => {
+            let Some(a) = st.heroku.get_mut(&name) else { return err(404, "not_found", "no app") };
+            let b = json!({ "id": format!("build-{n}"), "status": "pending", "source_blob": body.get("source_blob"), "created_at": format!("2026-10-23T00:{:02}:00Z", n % 60) });
+            a.builds.insert(0, b.clone());
+            a.building = 2;
+            st.calls.push(format!("Build {name}"));
+            srv::json(http::StatusCode::CREATED, &b)
+        }
+        ("GET", ["builds", id]) => {
+            heroku_step(st, &name);
+            match st.heroku.get(&name).and_then(|a| a.builds.iter().find(|b| b.get("id").and_then(Value::as_str) == Some(*id)).cloned()) {
+                Some(b) => ok(b),
+                None => err(404, "not_found", "no such build"),
+            }
+        }
+        ("GET", ["releases"]) => ok(Value::Array(st.heroku.get(&name).map(|a| a.releases.clone()).unwrap_or_default())),
+        ("GET", ["releases", id]) => match st.heroku.get(&name).and_then(|a| a.releases.iter().find(|r| r.get("id").and_then(Value::as_str) == Some(*id)).cloned()) {
+            Some(r) => ok(r),
+            None => err(404, "not_found", "no such release"),
+        },
+        ("POST", ["releases"]) => {
+            let target = body.get("release").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let Some(a) = st.heroku.get_mut(&name) else { return err(404, "not_found", "no app") };
+            let Some(before) = a.releases.iter().find(|r| r.get("id").and_then(Value::as_str) == Some(target.as_str())).cloned() else { return err(404, "not_found", "no such release") };
+            let slug = before.pointer("/slug/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let id = heroku_release(a, n, &slug, &format!("Rollback to v{}", before.get("version").and_then(Value::as_u64).unwrap_or(0)));
+            let r = a.releases.first().cloned().unwrap_or_default();
+            st.calls.push(format!("Rollback {name} {target}"));
+            let _ = id;
+            srv::json(http::StatusCode::CREATED, &r)
+        }
+        _ => err(404, "not_found", "the fake has no such Heroku call"),
     }
 }
 

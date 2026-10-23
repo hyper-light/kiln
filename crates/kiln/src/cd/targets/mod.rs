@@ -39,6 +39,7 @@ pub mod gcp_appengine;
 pub mod gcp_compute;
 pub mod gcp_functions;
 pub mod gcp_run;
+pub mod heroku;
 pub mod render;
 pub mod vercel;
 #[cfg(test)]
@@ -604,6 +605,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "gcp-functions" => gcp_functions::list(cx, kind, names).await?,
         "gcp-run" => gcp_run::list(cx, kind, names).await?,
         "digitalocean" => digitalocean::list(cx, kind, names).await?,
+        "heroku" => heroku::list(cx, kind, names).await?,
         "render" => render::list(cx, kind, names).await?,
         "vercel" => vercel::list(cx, kind, names).await?,
         other => bail!("no reading {other} yet"),
@@ -635,6 +637,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "gcp-functions" => gcp_functions::apply(cx, desired).await,
         "gcp-run" => gcp_run::apply(cx, desired).await,
         "digitalocean" => digitalocean::apply(cx, desired).await,
+        "heroku" => heroku::apply(cx, desired).await,
         "render" => render::apply(cx, desired).await,
         "vercel" => vercel::apply(cx, desired).await,
         other => bail!("no applying to {other} yet"),
@@ -661,6 +664,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "gcp-functions" => gcp_functions::delete(cx, key).await,
         "gcp-run" => gcp_run::delete(cx, key).await,
         "digitalocean" => digitalocean::delete(cx, key).await,
+        "heroku" => heroku::delete(cx, key).await,
         "render" => render::delete(cx, key).await,
         "vercel" => vercel::delete(cx, key).await,
         other => bail!("no deleting from {other} yet"),
