@@ -3871,9 +3871,15 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     public repository (`POST /api/repos` with `public: true`, shown as `public` in its listing),
     which anyone reads without a token, as anyone reads a public GitHub repository. A step's
     `git fetch` after `actions/checkout`'s `persist-credentials: false` relies on it (the
-    corpus's elixir; its repositories are public, as on GitHub). A token that isn't kiln's is
-    refused, public or not, and a push always needs one
-    (`w14_r01_public_repositories_read_without_a_token`);
+    corpus's elixir; its repositories are public, as on GitHub), and so does a token of kiln's
+    that may not read it (a job's whose `permissions` leave `contents` out, as elixir's CodeQL
+    jobs' do). A token that isn't kiln's is refused, public or not, and a push always needs one
+    that may (`w14_r01_public_repositories_read_without_a_token`);
+  - a leg's fetch of a repository kiln doesn't have (`actions/checkout`'s `repository:`, ORT's
+    configuration) goes on to where kiln takes that owner's actions (`[[ci.actions.sources]]`,
+    else GitHub), without the leg's token, so a public repository there is fetched as anyone
+    fetches it, and one that needs credentials isn't found. It's passed through, nothing kept,
+    so a shallow fetch stays shallow (`w14_r11_a_leg_fetches_another_public_repository`);
   - a push's ref updates are read before git sees the pack, and the push is refused whole, in
     git's own report and as `remote: kiln: …` lines, when one of them breaks policy:
     - only the owner, or a principal `.kiln/review.yaml` `direct-push` names (read from trunk),

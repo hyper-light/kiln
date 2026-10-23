@@ -1590,6 +1590,73 @@ fn w14_r01_public_repositories_read_without_a_token() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W14-R11: a leg fetches a repository kiln doesn't have (`actions/checkout`'s `repository:`) from
+/// kiln's code host as it would from GitHub's: passed on to where kiln takes that owner's actions
+/// (`[[ci.actions.sources]]`, else GitHub), with no token, a public repository there. Here that
+/// is another kiln's public repository; one it hasn't got isn't found.
+#[test]
+fn w14_r11_a_leg_fetches_another_public_repository() -> anyhow::Result<()> {
+    let (dir_a, dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    // Elsewhere: a public repository on another kiln.
+    let a = start(dir_a.path(), &Options::default())?;
+    let (st, body) = http(a.port, "POST", "/api/repos", &a.admin, Some(&json!({ "name": "up/tools", "mode": "native", "public": true })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let tools = dir.path().join("tools");
+    std::fs::create_dir_all(&tools)?;
+    must(git(&home, &tools, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(tools.join("TOOLS.md"), "the tools of another\n")?;
+    must(git(&home, &tools, &["add", "."]), "add")?;
+    must(git(&home, &tools, &["commit", "-qm", "tools"]), "commit")?;
+    must(git(&home, &tools, &["push", "-q", &format!("http://x:{}@127.0.0.1:{}/git/up/tools.git", a.admin, a.port), "main"]), "push")?;
+    // Here: `ext`'s repositories are that kiln's.
+    let sources = format!("[[ci.actions.sources]]\nowners = [\"ext\"]\nurl = \"http://127.0.0.1:{}/git/up/{{repo}}.git\"\n", a.port);
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &sources })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    until(60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    // As `actions/checkout` sends the job's token (`github.token`, no variable of a step's own).
+    let fetch = "auth=$(printf 'x-access-token:%s' \"$TOKEN\" | base64 -w0)\n\
+        git -c http.extraheader=\"AUTHORIZATION: basic $auth\" clone -q --depth 1 \"$GITHUB_SERVER_URL/ext/tools\" tools\n\
+        cat tools/TOOLS.md\n\
+        if git -c http.extraheader=\"AUTHORIZATION: basic $auth\" clone -q \"$GITHUB_SERVER_URL/ext/missing\" missing; then exit 1; fi\n";
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let workflow = String::from("on: push\njobs:\n  other:\n    runs-on: local\n    checkout: false\n    steps:\n      - env:\n          TOKEN: ${{ github.token }}\n        run: |\n");
+    std::fs::write(work.join(".kiln/other.yaml"), workflow + &fetch.lines().map(|l| format!("          {}\n", l.trim_start())).collect::<String>())?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "other"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url, "main"]), "push")?;
+    let mut run = Value::Null;
+    until(180, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0").cloned().unwrap_or_default();
+        Ok(run.get("finished_at").is_none_or(Value::is_null).then(|| body.clone()))
+    })?;
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut log = String::new();
+    for step in 0..3 {
+        let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&text);
+    }
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{detail}\n{log}\n{}", s.log());
+    assert!(log.contains("the tools of another"), "{log}");
+    Ok(())
+}
+
 /// kiln's other native events (W03-R02, R09): a change request's `pull_request` activity (ready
 /// for review, edited, labeled and unlabeled, closed by abandoning, reopened by reclaiming), and
 /// kiln's `agent` (an agent asks for a run), `webhook` (a signed call to a hook of the repository)
