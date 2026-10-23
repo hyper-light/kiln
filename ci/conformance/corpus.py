@@ -297,7 +297,7 @@ ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|can
 
 # A test runner's own words for a failed test, before the generic last line (make's, an exit code):
 # ExUnit's numbered failures (and the line after, what failed), libtest's, pytest's, Go's.
-FAILED_TEST = re.compile(r"^\d+\) test .+ \(.+\)$|^test \S+ \.\.\. FAILED$|^FAILED \S+::\S+|^--- FAIL: \S+")
+FAILED_TEST = re.compile(r"^\d+\) test .+ \(.+\)$|^test \S+ \.\.\. FAILED$|^FAILED \S+::\S+|^--- FAIL: \S+|^---- \S+ stdout ----$")
 GENERIC = re.compile(r"^make(\[\d+\])?: \*\*\*|exit(ed with)? code|exit status \d+|^error: test failed, to rerun pass")
 
 
@@ -319,6 +319,10 @@ def leg_detail(api, leg):
             # ExUnit says what failed on the next line.
             if re.match(r"^\d+\) test ", test) and at + 2 < len(lines):
                 test = f"{test}: {lines[at + 2]}" if lines[at + 1].startswith(("test/", "lib/", "/")) else f"{test}: {lines[at + 1]}"
+            # libtest, after where the test panicked.
+            if m := re.match(r"^---- (\S+) stdout ----$", test):
+                panicked = next((i for i in range(at + 1, min(at + 8, len(lines))) if "panicked at" in lines[i]), None)
+                test = f"{m.group(1)}: {lines[panicked + 1]}" if panicked is not None and panicked + 1 < len(lines) else m.group(1)
             said = f"{test} ({said})"
     # A line the known failures name, wherever it is in the step's log, goes with it.
     known = next((x for x in lines if any(re.search(pat, x) for pat, _ in KNOWN) and x not in said), None)
