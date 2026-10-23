@@ -61,6 +61,28 @@
   font-size: 12px;
   line-height: 1.55;
 }
+/* Big goals planned first: the stack's one setting, under what it does. */
+.gs-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+.gs-option input {
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  accent-color: var(--color-accent);
+}
+.gs-option-hint {
+  display: block;
+  color: #8d9099;
+  font-size: 12px;
+}
 .gs-reason {
   margin: 0;
   padding: 8px 10px;
