@@ -1,9 +1,10 @@
 # kiln without a server
 
 > **Approved** (2026-10-22), with three decisions taken: three nodes by default on Kubernetes, the
-> CA and secrets sealed in shares two of three voters open, and the phases without a server first.
-> How voters are chosen and elections held is [Voters and elections](#voters-and-elections),
-> researched as asked. It is built in the phases at the end, each tested and live before the next.
+> CA and secrets sealed in shares two of three voters open, and the phases without a server first,
+> Amphora and Mantle under them after. How voters are chosen and elections held is
+> [Voters and elections](#voters-and-elections), researched as asked. It is built in the phases at
+> the end, each tested and live before the next.
 
 Today one process is special: the **server**. It serves the API and the UI, keeps the store
 (runs, jobs, repositories, people, settings, deployments), takes the conversation feed from the
@@ -13,8 +14,9 @@ server is down, kiln is down, and installing kiln means installing a server and 
 
 The end state has no server role. **Every runner is a node, and every node is a whole kiln**: the
 API, the UI, the stores, the scheduler, the runner. A person opens any node's address and sees
-and does everything. kiln's records live in **Amphora**, replicated in groups whose voters are
-the steadiest machines; its bytes in **Mantle**. Work that must happen once (polling a
+and does everything. kiln's records are replicated in groups whose voters are the steadiest
+machines: first the **cluster group**, kiln's own, then **Amphora**'s groups under it; its bytes go
+to **Mantle**. Work that must happen once (polling a
 repository, a deployment's sync) is held by a lease that another node takes over when its holder
 goes away. kiln works while a quorum of voters is up, and a node cut off from the rest (a laptop on
 a plane) keeps working on its own sessions, folders and jobs, and catches up when it's back.
@@ -33,28 +35,30 @@ One binary, one process per machine (`kiln node`, which `kiln agent` and `kiln s
 | Part | Today | A node |
 | --- | --- | --- |
 | API and UI | the server's | every node's, from its own replicas |
-| The fleet's records | the server's SQLite | Amphora's **root group**, a replica on every node |
-| Conversations | runner feeds, the server's copy | Amphora: a group per session |
-| Runs, jobs | the server's store | Amphora: a group per CI repository |
-| Deployments | the server's store | Amphora: a group per deploy environment |
+| The fleet's records, runs, jobs, deployments | the server's SQLite | the **cluster group**, a replica on every node; Amphora's groups at P7 |
+| Conversations | runner feeds, the server's copy | today's feed and mirror; Amphora's session groups at P7 |
 | Logs, artifacts, bundles, images | the server's disk and content store | Mantle: chunks on nodes, metadata replicated |
 | Polling, scheduling, deployments, rollouts | the server's loops | **leases**: one holder each, any node |
 | Terminals, agents' harnesses | the runner's | the node's (unchanged) |
 | Synced repos | the server votes | voters on nodes |
 | Links | through the server | direct between nodes; relayed by any node both reach |
-| The CA, join codes | the server's key | the root group's, sealed |
+| The CA, join codes | the server's key | the cluster group's, sealed |
 
 ## State, by kind
 
-- **Amphora's root group.** People, accounts, tokens, roles, settings, registered repositories,
-  secrets (sealed, below), goals and plans, and the fleet itself: its nodes, their certificates,
-  addresses and roles, and the leases. Small and read everywhere, so every node holds a replica:
-  voters as [chosen below](#voters-and-elections), the rest learners. A node reads its own replica;
-  a write goes to the group's leader over the node links and returns once committed.
-- **Amphora's other groups.** One per session (conversations), one per CI repository (runs, jobs,
-  steps), one per deploy environment, and directory partitions for search, as Amphora's design
-  has them. Each places its own voters by the same rules, its leader where its work is: a session's
-  on the node its agent runs on, so a write commits on that machine and one more.
+- **The cluster group.** Everything the server's store keeps (people, accounts, tokens, roles,
+  settings, registered repositories, runs and jobs, deployments, secrets sealed as below, goals and
+  plans) and the fleet itself: its nodes, their certificates, addresses and roles, and the leases.
+  One hyper-raft group, as each synced repo's is (`crate::sync::group`), with the store kiln has as
+  its state machine (SQLite, a file on each node), so kiln's records move whole, not table by
+  table. Every node holds a replica: voters as [chosen below](#voters-and-elections), the rest
+  learners. A node reads its own replica; a write goes to the group's leader over the node links and
+  returns once committed.
+- **Amphora's groups (P7).** Amphora takes the cluster group's records over as its root group, and
+  splits off a group per session (conversations), per CI repository (runs, jobs, steps) and per
+  deploy environment, with directory partitions for search, as its design has them (kiln plan T1).
+  Each places its voters by the same rules, its leader where its work is: a session's on the node
+  its agent runs on, so a write commits on that machine and one more.
 - **Bytes.** Mantle: logs, artifacts, images, bundles and backups, chunked over nodes' disks, with
   its metadata replicated on three nodes. A job's log is written where the job runs and goes to
   Mantle as it's written.
@@ -89,12 +93,12 @@ ranks below a laptop that hasn't slept yet: the measure is too short.
 
 ### What kiln does
 
-1. **Every node is a member; voters are few.** Every node holds a learner replica of the root
+1. **Every node is a member; voters are few.** Every node holds a learner replica of the cluster
    group: it reads locally and votes on nothing. Three of them vote (five past ten eligible nodes,
    at most seven). A fleet of one runs every group with one voter, as Amphora's one code path has
    it.
 2. **Who may vote (candidacy).** A node is eligible when it is all of:
-   - **steady:** up at least 99% of the last seven days, measured by the root group from the
+   - **steady:** up at least 99% of the last seven days, measured by the cluster group from the
      nodes' own liveness, not by a connection's age, with a planned restart (an upgrade, a move)
      not counted against it;
    - **not portable:** a machine on battery power or that has slept in the last week is never a
@@ -127,13 +131,13 @@ ranks below a laptop that hasn't slept yet: the measure is too short.
    a pod rescheduled with a new address keeps its seat.
 
 hyper-raft has what this needs but the witness role and detectors shared between groups; both are
-added to it (with its own suites and simulations). Amphora's placement (CP-T1.9) carries the
-rules, for the root group and every other group; kiln shows them on the System page: each node's
-role, eligibility and why, and the groups' voters and leaders.
+added to it (with its own suites and simulations). kiln's cluster group keeps the rules first;
+Amphora's placement (CP-T1.9) carries them for its groups after. kiln shows them on the System page:
+each node's role, eligibility and why, and the groups' voters and leaders.
 
 ## Work that happens once: leases
 
-A lease is a row in the root group: what it's for, the node holding it, until when, and its
+A lease is a row in the cluster group: what it's for, the node holding it, until when, and its
 epoch. The holder renews it; when it lapses (the holder gone for twice the renewal), any node may
 take it, with the next epoch. Every write a lease's work makes carries its epoch, and the group
 refuses a write with an older one, so two holders never both act.
@@ -141,20 +145,20 @@ refuses a write with an older one, so two holders never both act.
 | Lease | One per | Was |
 | --- | --- | --- |
 | `poll` | repository | the server's GitOps poller |
-| `schedule` | CI repository group | the server's scheduler |
+| `schedule` | CI repository | the server's scheduler |
 | `deploy` | deployment app | the CD controller |
 | `rollout` | the fleet | update rollouts |
 | `notify` | the fleet | notifications and webhooks out |
 | `mirror` | external store | backups, Tailscale and DNS upkeep |
 
-A webhook can arrive at any node: it is written to the root group, and the `poll` lease holder
+A webhook can arrive at any node: it is written to the cluster group, and the `poll` lease holder
 acts on it. Leases prefer steady nodes with what the work needs (a Kubernetes context for
 `deploy`, the network GitHub is on for `poll`).
 
 ## Jobs
 
-A run's jobs wait in its repository group's queue by their `runs-on` labels. A node with free
-slots that matches claims a job (a compare-and-set through the group's leader), runs it, and
+A run's jobs wait in the cluster group's queue by their `runs-on` labels. A node with free slots
+that matches claims a job (a compare-and-set through the group's leader), runs it, and
 heartbeats its claim; a claim that lapses goes back on the queue, as a lost agent's jobs do today.
 Kubernetes jobs are claimed by a node that holds a context for the cluster, which starts the job's
 pod.
@@ -164,29 +168,29 @@ pod.
 - **Reads** come from the node's own replicas: a list may be a moment behind (a follower read), a
   page that must be current waits for the leader's index (ReadIndex) first.
 - **Writes** go to the leader of the group they touch, over the node links.
-- **Live updates** come from the node's replicas as they apply entries, on Amphora's change feeds.
+- **Live updates** come from the node's replicas as they apply entries.
 - **Node-local things** (a terminal, an agent's harness, a job's live log) are reached through the
   node that has them, over the links, as reach does now.
-- **Signing in** works on every node: sessions and tokens are in the root group, and cookies are
+- **Signing in** works on every node: sessions and tokens are in the cluster group, and cookies are
   signed with a key it keeps.
 - **One address:** the front door answers on any node. With a domain (Tailscale's, a custom one),
   its name resolves to every node that serves it; a node that goes away drops out.
 
 ## Trust
 
-- **The CA** is the root group's: its key sealed in shares, one with each voter, any two of three
+- **The CA** is the cluster group's: its key sealed in shares, one with each voter, any two of three
   (three of five) opening it. A new node's certificate is a request committed to the group and
   signed by the leader once the shares open the key. When voters change, the shares are dealt
   again before the old ones are dropped.
 - **Joining** is `kiln join` as today (a code, or a cluster found on the network): the new node
-  gets its certificate, joins the root group as a learner, and fills its replica.
+  gets its certificate, joins the cluster group as a learner, and fills its replica.
 - **Secrets** (tokens to GitHub, registries, clusters) are sealed the same way and opened only on a
   node that needs them for a lease's work.
 
 ## Links
 
 Nodes talk directly over QUIC (hyper-transport, mutual TLS on their certificates), found through
-the root group's address book, the local network (mDNS) and Tailscale. Two nodes that can't reach
+the cluster group's address book, the local network (mDNS) and Tailscale. Two nodes that can't reach
 each other relay through any node both can (the steadiest first), not a fixed server.
 
 ## Installing
@@ -217,16 +221,16 @@ kiln install --join <code>                   # join a kiln, rather than start on
 ## Getting there from today
 
 Production keeps working at every step; each phase ships, is checked live, then the next starts.
-Amphora's own goals (CP-T1.8 replication, CP-T1.9 placement) are its track's; the phases below take
-each as it lands.
+The phases without a server come first (P1–P6); Amphora and Mantle go under them after (P7), as
+their own tracks land.
 
 | Phase | What | Done when |
 | --- | --- | --- |
-| P1 | kiln's records on Amphora, one voter, on the server: the store's tables through kiln-seams' `Records` | the API reads and writes through Amphora; a restart replays it; nothing else changes |
-| P2 | Runners as learners: each holds the root group's replica, serves the UI and API from it, and forwards writes | the UI works through any runner's front door, its reads served by that runner |
-| P3 | Voters on runners, chosen and replaced as [above](#voters-and-elections) (Amphora's replication, CP-T1.8; the witness and shared detectors in hyper-raft) | the server stopped, kiln still serves and writes; a voter lost for good is replaced in minutes |
+| P1 | The cluster group on the server alone: the store as its state machine, seeded from today's | the API reads and writes through the group; nothing else changes; a restart replays it |
+| P2 | Runners as learners: each holds the group's replica, serves the UI and API from it, and forwards writes | the UI works through any runner's front door, its reads served by that runner |
+| P3 | Voters on runners, chosen and replaced as [above](#voters-and-elections), with the witness and the shared detectors in hyper-raft | the server stopped, kiln still serves and writes; a voter lost for good is replaced in minutes |
 | P4 | Leases: polling, scheduling, deployments, rollouts, notifications | with the server stopped, a push still builds and deploys |
-| P5 | Links without the server; relays on any node; trust (sealed CA, joining) in the root group | two runners link directly; a new node joins with the server gone |
+| P5 | Links without the server; relays on any node; trust (sealed CA, joining) in the cluster group | two runners link directly; a new node joins with the server gone |
 | P6 | `kiln install` on Kubernetes (default), Docker and a machine, as whole nodes | each target installs a working node from nothing, in one command, checked on each |
-| P7 | Amphora's other groups (sessions, repositories, environments) and Mantle under the nodes | conversations, runs and bytes no longer go through one machine |
+| P7 | Amphora under the nodes (its root group takes the cluster group's records; session, repository and environment groups; kiln plan T1) and Mantle for bytes (T10) | conversations, runs and bytes no longer go through one machine |
 | P8 | The server role retired: production runs as nodes | no code path names a server; production's minikube runs three nodes |
