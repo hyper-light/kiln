@@ -351,7 +351,7 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
         let url = local_url(&cfg);
         if running {
             let runners = crate::install_targets::verify_url(&url, crate::install_targets::READY_TIME).await?;
-            crate::install_targets::opened(&url, &token, runners);
+            crate::install_targets::opened(&url, &token, runners, "kiln login");
         } else {
             say("");
             say(format!("UI          {url}"));

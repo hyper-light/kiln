@@ -124,13 +124,35 @@ fn client() -> anyhow::Result<crate::http::client::Client> {
     crate::http::client::Client::new(crate::http::client::Roots::WebPki, None)
 }
 
-/// Says an installed kiln is ready, where to open it, and its login link.
-pub fn opened(url: &str, token: &str, runners: u64) {
+/// Says an installed kiln is ready, where to open it, its login link, and `later`: the command
+/// that makes a new link.
+pub fn opened(url: &str, token: &str, runners: u64, later: &str) {
     let more = if runners > 1 { format!(" ({runners} runners)") } else { String::new() };
     say(format!("ready       it answers, its UI loads and its runner is connected{more}"));
     say("");
     say(format!("UI          {url}"));
-    say(format!("login link  {} (valid 5 min; `kiln login` makes a new one)", crate::api::otp_url(token, url)));
+    say(format!("login link  {} (valid 5 min)", crate::api::otp_url(token, url)));
+    say(format!("            a new one: {later}"));
+}
+
+/// Keeps a kiln installed elsewhere (a container, a cluster) where `kiln login` and `kiln token`
+/// look for one (`access::cluster_credentials_path`), unless that names another kiln already:
+/// whether it's kept there.
+fn remember(url: &str, token: &str) -> bool {
+    let path = crate::access::cluster_credentials_path();
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && !text.lines().any(|l| l.trim().strip_prefix("KILN_URL=").is_some_and(|u| u.trim_matches('"') == url))
+    {
+        return false;
+    }
+    let body = format!("# The kiln `kiln install` set up last; `kiln login` and `kiln token` reach it with these.\nKILN_URL={url}\nKILN_ADMIN_TOKEN={token}\n");
+    crate::util::write_secret(&path, body.as_bytes(), 0o600).is_ok()
+}
+
+/// The command that makes a new login link for the kiln at `url`: `kiln login` once it's
+/// remembered, else one given `token_from`, a shell command printing its admin token.
+fn later(url: &str, token: &str, token_from: &str) -> String {
+    if remember(url, token) { "kiln login".to_owned() } else { format!("kiln login --url {url} --token \"$({token_from})\"") }
 }
 
 // ------------------------------------------------------------------------------ the image
@@ -293,7 +315,7 @@ pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
     };
     match ready {
         Ok(runners) => {
-            opened(&url, &token, runners);
+            opened(&url, &token, runners, &later(&url, &token, &format!("docker exec {APP} cat /var/lib/kiln/admin.token")));
             say(format!("container   docker logs {APP}"));
             Ok(())
         }
@@ -442,16 +464,18 @@ async fn install_in(cluster: &Cluster, ctx: &str, ns: &str, image: (&str, &str),
             break;
         }
     }
+    let token_from = format!("kubectl --context {ctx} -n {ns} get secret kiln-admin -o jsonpath='{{.data.token}}' | base64 -d");
     match reached {
         Some(url) => {
             let runners = verify(&Via::Url(&http, url.clone()), READY_TIME).await?;
-            opened(&url, token, runners);
+            opened(&url, token, runners, &later(&url, token, &token_from));
         }
         None => {
             let runners = verify(&Via::Proxy(cluster, proxy_base(ns)), READY_TIME).await?;
             say("address     no node of the cluster can be reached from here: it was checked through the cluster's API server");
             say(format!("            open it from here with: kubectl --context {ctx} -n {ns} port-forward svc/{APP} 7070:7070"));
-            opened("http://localhost:7070", token, runners);
+            let url = "http://localhost:7070";
+            opened(url, token, runners, &later(url, token, &token_from));
         }
     }
     say(format!("in cluster  kubectl --context {ctx} -n {ns} get pods"));
@@ -491,7 +515,7 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": APP },
         "subjects": [{ "kind": "ServiceAccount", "name": APP, "namespace": ns }] });
     make(cluster, made, binding).await?;
-    make(cluster, made, json!({ "apiVersion": "v1", "kind": "Secret", "metadata": meta("kiln-admin"), "type": "Opaque", "stringData": { "admin.token": token } })).await?;
+    make(cluster, made, json!({ "apiVersion": "v1", "kind": "Secret", "metadata": meta("kiln-admin"), "type": "Opaque", "stringData": { "token": token } })).await?;
     let ports = json!([
         { "name": "http", "port": 7070, "targetPort": 7070, "protocol": "TCP" },
         { "name": "quic", "port": 7071, "targetPort": 7071, "protocol": "UDP" },
@@ -502,7 +526,7 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
     let node_port = |name: &str| service.pointer("/spec/ports")?.as_array()?.iter().find(|p| p.get("name").and_then(Value::as_str) == Some(name))?.get("nodePort")?.as_u64();
     let (http, quic) = (node_port("http").context("its service has no node port for HTTP")?, node_port("quic").context("its service has no node port for QUIC")?);
     let quic_host = if host.contains(':') { format!("[{host}]") } else { host.to_owned() };
-    let server = format!("public_url = \"{}\"\nquic_advertise = \"{quic_host}:{quic}\"\nadmin_token_file = \"/etc/kiln-admin/admin.token\"\n", url_of(host, http));
+    let server = format!("public_url = \"{}\"\nquic_advertise = \"{quic_host}:{quic}\"\nadmin_token_file = \"/etc/kiln-admin/token\"\n", url_of(host, http));
     make(cluster, made, json!({ "apiVersion": "v1", "kind": "ConfigMap", "metadata": meta("kiln-config"), "data": { "kiln.toml": config(&server) } })).await?;
     let claim = json!({ "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "10Gi" } } });
     make(cluster, made, json!({ "apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": meta("kiln-data"), "spec": claim })).await?;
@@ -689,10 +713,10 @@ mod tests {
 
     #[test]
     fn an_installed_kiln_has_its_own_runner_and_the_address_it_was_given() -> anyhow::Result<()> {
-        let c: crate::config::Config = toml::from_str(&config("public_url = \"http://10.0.0.2:30070\"\nadmin_token_file = \"/etc/kiln-admin/admin.token\"\n"))?;
+        let c: crate::config::Config = toml::from_str(&config("public_url = \"http://10.0.0.2:30070\"\nadmin_token_file = \"/etc/kiln-admin/token\"\n"))?;
         assert_eq!((c.server.http_addr.as_str(), c.server.public_url.as_str()), ("0.0.0.0:7070", "http://10.0.0.2:30070"));
         assert_eq!((c.local_agent.enabled, c.local_agent.name.as_deref(), c.kubernetes.enabled), (true, Some("kiln"), false));
-        assert_eq!(c.server.admin_token_file.as_deref(), Some(Path::new("/etc/kiln-admin/admin.token")));
+        assert_eq!(c.server.admin_token_file.as_deref(), Some(Path::new("/etc/kiln-admin/token")));
         Ok(())
     }
 
