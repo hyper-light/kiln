@@ -406,7 +406,7 @@ pub const KINDS: &[KindInfo] = &[
         mode: Mode::Token,
         fields: &[f("address", true, "https://nomad.example.com:4646"), f("namespace", false, "default"), f("region", false, "the region")],
         secret: Some("ACL token"),
-        built: false,
+        built: true,
         signing: None,
     },
     KindInfo { kind: "terraform", title: "HCP Terraform", category: "infrastructure", mode: Mode::Token, fields: &[f("organization", true, "the organization"), f("hostname", false, "app.terraform.io, or a Terraform Enterprise host")], secret: Some("team token"), built: false, signing: None },

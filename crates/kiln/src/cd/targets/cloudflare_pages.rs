@@ -94,8 +94,8 @@ mod blake3 {
         let mut w = [0u32; 16];
         let mut padded = block.to_vec();
         padded.resize(BLOCK, 0);
-        for (x, c) in w.iter_mut().zip(padded.chunks_exact(4)) {
-            *x = u32::from_le_bytes(c.try_into().unwrap_or([0; 4]));
+        for (x, c) in w.iter_mut().zip(padded.as_chunks::<4>().0) {
+            *x = u32::from_le_bytes(*c);
         }
         w
     }
@@ -117,8 +117,8 @@ mod blake3 {
         fn root(&self) -> [u8; 32] {
             let w = first8(compress(self.cv, self.block, 0, self.len, self.flags | ROOT));
             let mut out = [0u8; 32];
-            for (o, x) in out.chunks_exact_mut(4).zip(w) {
-                o.copy_from_slice(&x.to_le_bytes());
+            for (o, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(w) {
+                *o = x.to_le_bytes();
             }
             out
         }

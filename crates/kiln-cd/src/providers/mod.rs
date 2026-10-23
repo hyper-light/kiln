@@ -34,6 +34,7 @@ pub mod gcp_functions;
 pub mod gcp_run;
 pub mod heroku;
 pub mod netlify;
+pub mod nomad;
 pub mod render;
 pub mod vercel;
 
@@ -585,11 +586,15 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "nomad",
         place: &[],
         scope: None,
-        settings: &[s("job", true, "the job: HCL or JSON in the source")],
+        settings: &[
+            s("job", true, "the job: HCL or JSON in the source (Nomad parses HCL), or an object"),
+            s("namespace", false, "for HCL: the job's namespace (default)"),
+            s("set", false, "values to set in the job's JSON by path: {\"TaskGroups[Name=api].Tasks[Name=api].Config.image\": \"…\"}"),
+        ],
         kinds: &[scoped(kind("nomad.kiln.dev", "Job", "Job")), child(scoped(kind("nomad.kiln.dev", "Deployment", "Deployment"))), child(scoped(kind("nomad.kiln.dev", "Allocation", "Allocation")))],
-        capabilities: &[Traffic, Logs, Events, Drift, Adopt, Validate],
+        capabilities: &[Versions, Drift, Adopt],
         reads: &["job HCL or JSON"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "host",
@@ -794,6 +799,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "gcp-run" => gcp_run::render(input),
         "heroku" => heroku::render(input),
         "netlify" => netlify::render(input),
+        "nomad" => nomad::render(input),
         "render" => render::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
@@ -827,6 +833,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "gcp-run" => gcp_run::files(spec),
         "heroku" => heroku::files(spec),
         "netlify" => netlify::files(spec),
+        "nomad" => nomad::files(spec),
         "render" => render::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
@@ -862,6 +869,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "gcp-run" => gcp_run::health(obj),
         "heroku" => heroku::health(obj),
         "netlify" => netlify::health(obj),
+        "nomad" => nomad::health(obj),
         "render" => render::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,

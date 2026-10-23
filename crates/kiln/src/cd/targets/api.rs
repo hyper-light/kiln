@@ -127,6 +127,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
         ("heroku", None) => super::heroku::discover(&tcx).await,
         ("heroku", Some(n)) => super::heroku::adopt(&tcx, n).await,
         ("netlify", None) => super::netlify::discover(&tcx).await,
+        ("nomad", None) => super::nomad::discover(&tcx).await,
+        ("nomad", Some(n)) => super::nomad::adopt(&tcx, scope.as_deref().unwrap_or_default(), n).await,
         ("netlify", Some(n)) => super::netlify::adopt(&tcx, n).await,
         ("render", None) => super::render::discover(&tcx).await,
         ("render", Some(n)) => super::render::adopt(&tcx, n).await,
