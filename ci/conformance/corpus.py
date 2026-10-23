@@ -93,6 +93,9 @@ KNOWN = [
     # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
     # answers. Prometheus's Triton test expects nothing at 127.0.0.1:443.
     (r"an error occurred unmarshaling the discovery response json: invalid character '<'", "the lab's legs share the host's network, where a server listens on 443; a hosted runner's own machine has nothing there"),
+    # gh matches a checkout's remotes to GH_HOST by host name alone, without its port: the lab's
+    # facade is on port 42511 (a GitHub Enterprise Server is always on 443).
+    (r"none of the git remotes configured for this repository correspond to the GH_HOST", "gh matches the checkout's remote to GH_HOST by host name alone, and the lab's facade is on port 42511, not 443 as a GitHub Enterprise Server is; a facade on 443 matches"),
     # Two legs at once on that network share one EPMD (Erlang's port mapper), and name their
     # nodes alike: elixir's `primary@<host>`.
     (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),

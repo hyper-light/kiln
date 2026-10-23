@@ -3840,6 +3840,11 @@ adapts [review.md](review.md), which it replaces.
   for the queries the top actions make. Anything else answers 501 with
   `{"message": "not implemented by kiln: <method> <path>", "documentation_url": …}`, and the
   step gets a warning annotation naming the route, so gaps are visible and get filled.
+- *Note.* `gh` without `--repo` takes the repository from the checkout's remotes, and matches them
+  to `GH_HOST` by host name alone: with a facade on a port other than 443 (`GH_HOST` names the
+  port) it matches none ("none of the git remotes … correspond to the GH_HOST environment
+  variable", the corpus lab's, on 42511). A GitHub Enterprise Server is always on 443; so is a
+  facade that `gh`'s inference is to work with. `--repo` or `GH_REPO` works on any port.
 - **W14-R12 Per repository** (`ci.github_api`): `facade` (default; everything through kiln, fast
   and independent of GitHub) or `github` (upstream repositories with the App: `GITHUB_SERVER_URL`
   is github.com and `GITHUB_TOKEN` an installation token, for workflows that must act on GitHub
