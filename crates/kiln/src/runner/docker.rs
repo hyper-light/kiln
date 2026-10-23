@@ -340,7 +340,7 @@ pub async fn sweep(work: &Path) {
     let Some(owner) = cli.owner.clone() else { return };
     // And what its legs made through their own sockets.
     let mut labels = vec![owner.clone()];
-    labels.extend(owner.split_once('=').map(|(_, v)| format!("{}={v}", super::docker_sock::SOCKET_RUNNER)));
+    labels.extend(super::docker_sock::runner_label(&owner));
     let [containers, networks, volumes] = remove_labelled(&cli, &labels, SWEEP).await;
     if containers + networks + volumes > 0 {
         tracing::info!(containers, networks, volumes, "removed what this runner left running when it last stopped");
@@ -1070,7 +1070,7 @@ impl Containers {
     /// and what the leg made through its own socket ([`super::docker_sock`]), as the end of a
     /// machine of its own would.
     pub async fn stop(&self) {
-        let made = format!("{}={}", super::docker_sock::SOCKET_LEG, self.label.strip_prefix("kiln.leg=").unwrap_or(&self.label));
+        let made = super::docker_sock::leg_label(self.label.strip_prefix("kiln.leg=").unwrap_or(&self.label));
         remove_labelled(&self.cli, &[self.label.clone(), made], CALL).await;
     }
 }

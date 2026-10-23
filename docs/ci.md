@@ -3948,7 +3948,8 @@ enforcement points to W18, agent isolation to W20.
 
   So two legs at once can both make cargo's `cargo_test_0`, or the same compose project, as two
   hosted jobs can (`w13_r04_two_legs_make_the_same_names`). Before, they collided. What a leg
-  made carries the labels `kiln.socket.leg` and `kiln.socket.runner`. It goes when the leg ends,
+  made carries the labels `kiln.socket.leg.<tag>` and `kiln.socket.runner.<hash>`, keys of their
+  own (a leg's socket within another's, kiln's tests in a kiln leg, keeps both). It goes when the leg ends,
   as the end of its machine would take it, and in the sweep when a runner that stopped short
   starts again. The leg's containers' anonymous volumes go with them (kiln's own services' left
   theirs before). Images and the build cache stay the daemon's, every leg's cache.

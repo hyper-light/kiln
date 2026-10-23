@@ -72,6 +72,12 @@ KNOWN = [
     # The corpus submits the whole tree against an empty trunk: a check that compares a pull
     # request with its base finds nothing there to compare.
     (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
+    # What publishes with the repository's own secrets, which the corpus's copy hasn't.
+    (r"you are not authenticated for buf\.build", "it publishes to the Buf registry with the repository's secret (BUF_TOKEN), which the corpus's copy hasn't"),
+    (r"Docker config file not found|could not find api key for server quay\.io", "it pushes to Docker Hub and quay.io with the repository's secrets, which the corpus's copy hasn't"),
+    # prometheus's: the pull request's description, which the corpus's pull request (the whole
+    # tree) hasn't.
+    (r"release-notes block empty or not found", "it reads the pull request's description, which the corpus's pull request (the whole tree) hasn't"),
     # bat's: the pull request's own changelog line, by its number and its author on GitHub.
     (r"Search for added line in changelog", "it looks for the pull request's own changelog line (its number, its author from GitHub's API); the corpus's pull request is the whole tree"),
     # A test that waits a few seconds for a message, or a minute for a release to boot, run while
@@ -79,6 +85,7 @@ KNOWN = [
     (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
     # buildx's debug adapter tests wait 5 s for a build to end (`require.Fail(t, "timeout reached")`).
     (r"Error:\s+timeout reached", "a test's timed wait (buildx's debug adapter waits 5 s for a build to end), in the lab, which runs at nice 19 and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    (r"Condition never satisfied", "a test's timed wait (testify's `Eventually`: prometheus's waits seconds for its server), in the slow lab: timing, to be run again when quiet"),
     (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
     # The lab's firewall keeps containers on networks of their own from its server, so its legs
     # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
@@ -466,6 +473,24 @@ def run_repo(api, args, repo, commit):
     return out
 
 
+# A leg that waits for a machine the lab hasn't: macOS's or Windows's.
+ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == (macos|windows)|runs-on \[[^\]]*(macos|windows))")
+
+
+def not_kilns(note):
+    """Why a leg's miss (its note) isn't kiln's to fix, or None when it is."""
+    if ELSEWHERE.search(note):
+        return "it waits for macOS or Windows, which the lab hasn't (its runner is Linux's)"
+    return next((r for pat, r in KNOWN if re.search(pat, note)), None)
+
+
+def miss(w):
+    """A workflow's result for an event, a miss: the reasons it's not kiln's, every leg's that
+    missed, or None when one of them is kiln's (or none says why)."""
+    reasons = [not_kilns(x) for x in w.get("notes", [])]
+    return sorted(set(reasons)) if reasons and all(reasons) else None
+
+
 def write(out_dir):
     done = []
     for repo in ORDER:
@@ -479,6 +504,8 @@ def write(out_dir):
     rows = [(d, n) for d in done for n in sorted({n for e in d["events"].values() for n in e})]
     ran = [(d, n) for d, n in rows if any(e.get(n, {}).get("result") != "no run" for e in d["events"].values())]
     passed = [(d, n) for d, n in ran if all(e.get(n, {}).get("result") in ("pass", "no run", None) for e in d["events"].values())]
+    missed = [(d, n) for d, n in ran if (d, n) not in passed]
+    explained = [(d, n) for d, n in missed if all(e.get(n, {}).get("result") in ("pass", "no run", None) or miss(e[n]) for e in d["events"].values())]
     lines = [
         "# CI conformance: F-03's popular repositories",
         "",
@@ -488,7 +515,10 @@ def write(out_dir):
         "(`pull_request`, every file changed), then pushed to the trunk (`push`). The starter workflows",
         "are in `docs/ci-conformance.md`.",
         "",
-        f"**{len(passed)} of {len(ran)} workflows that ran passed** ({len(rows)} in all) in {len(done)} of {len(ORDER)} repositories run so far.",
+        f"**{len(passed)} of {len(ran)} workflows that ran passed.** {len(explained)} more missed only for reasons not kiln's, each leg's named below,"
+        f" and {len(missed) - len(explained)} for one that is kiln's to fix ({len(rows)} in all) in {len(done)} of {len(ORDER)} repositories run so far.",
+        "",
+        "A cell says why each of its legs that missed did, when none is kiln's; `kiln's` when one is, or says nothing.",
         "",
     ]
     for d in done:
@@ -502,9 +532,9 @@ def write(out_dir):
                 if w["result"] == "no run":
                     said = [no_run(d["repo"], n, e)]
                 result = w["result"]
-                why = next((r for pat, r in KNOWN if any(re.search(pat, x) for x in said)), None)
-                if why and result != "pass":
-                    result += f": {why}"
+                if result not in ("pass", "no run"):
+                    why = miss(w)
+                    result += f": {'; '.join(why)}" if why else ": kiln's"
                 cells.append(result)
                 said = ([w["legs"]] if w.get("legs") else []) + said
                 if said:

@@ -88,12 +88,32 @@ fn joined(base: &Path, rest: &Path) -> String {
     if rest.as_os_str().is_empty() { base.to_string_lossy().into_owned() } else { base.join(rest).to_string_lossy().into_owned() }
 }
 
-/// What the leg's socket makes carries the leg's id as this label: kiln removes what has it when
-/// the leg ends ([`super::docker::Containers::stop`]), and the leg's lists leave out other legs'.
+/// What a leg's socket makes carries `kiln.socket.leg.<tag>` (the leg's tag: its names' suffix),
+/// the leg's id its value: kiln removes what has it when the leg ends
+/// ([`super::docker::Containers::stop`]), and the leg's lists leave out what another leg's socket
+/// made. A key of each leg's own: a leg's socket within another's (kiln's own tests, in a kiln
+/// leg) puts its own beside the other's, and both find what it made.
 pub const SOCKET_LEG: &str = "kiln.socket.leg";
-/// And the runner's (its [`super::docker::owner_label`]'s value): what a runner that stopped short
-/// left is swept when it starts ([`super::docker::sweep`]).
+/// And `kiln.socket.runner.<hash>`, the runner's ([`super::docker::owner_label`]'s value): what a
+/// runner that stopped short left is swept when it starts ([`super::docker::sweep`]).
 pub const SOCKET_RUNNER: &str = "kiln.socket.runner";
+
+/// A leg's tag: `k` and 8 hex digits of its id.
+fn tag_of(leg: &str) -> String {
+    let digest = crate::util::sha256_hex(leg.as_bytes());
+    format!("k{}", digest.get(..8).unwrap_or(&digest))
+}
+
+/// The label leg `leg`'s socket puts on what it makes, by its key (`label=<key>` finds them).
+pub fn leg_label(leg: &str) -> String {
+    format!("{SOCKET_LEG}.{}", tag_of(leg))
+}
+
+/// The label the sockets of the legs of runner `owner` (its [`super::docker::owner_label`]) put
+/// on what they make, by its key.
+pub fn runner_label(owner: &str) -> Option<String> {
+    owner.split_once('=').map(|(_, v)| format!("{SOCKET_RUNNER}.{v}"))
+}
 /// Docker's and Podman's own network modes, which take no aliases.
 const OWN_NETWORKS: &[&str] = &["bridge", "host", "none", "default", "podman", "nat", "slirp4netns", "pasta", "private"];
 
@@ -106,8 +126,8 @@ const OWN_NETWORKS: &[&str] = &["bridge", "host", "none", "default", "podman", "
 /// came, and so does an id.
 #[derive(Debug, Default)]
 pub struct Names {
-    /// The leg's id; empty for a socket whose names are the daemon's.
-    leg: String,
+    /// Its label's key ([`leg_label`]); empty for a socket whose names are the daemon's.
+    key: String,
     suffix: String,
     labels: Vec<(String, String)>,
     containers: HashSet<String>,
@@ -125,10 +145,10 @@ enum Kind {
 impl Names {
     /// Leg `leg`'s names, on the runner whose label is `owner`.
     pub fn for_leg(leg: &str, owner: Option<&str>) -> Names {
-        let digest = crate::util::sha256_hex(leg.as_bytes());
-        let mut labels = vec![(SOCKET_LEG.to_owned(), leg.to_owned())];
-        labels.extend(owner.and_then(|o| o.split_once('=')).map(|(_, v)| (SOCKET_RUNNER.to_owned(), v.to_owned())));
-        Names { leg: leg.to_owned(), suffix: format!("-k{}", digest.get(..8).unwrap_or(&digest)), labels, ..Names::default() }
+        let key = leg_label(leg);
+        let mut labels = vec![(key.clone(), leg.to_owned())];
+        labels.extend(owner.and_then(runner_label).map(|r| (r, "1".to_owned())));
+        Names { key, suffix: format!("-{}", tag_of(leg)), labels, ..Names::default() }
     }
 
     fn kind(&mut self, k: Kind) -> &mut HashSet<String> {
@@ -160,9 +180,12 @@ impl Names {
         if made.contains(bare) { format!("{slash}{bare}{}", self.suffix) } else { name.to_owned() }
     }
 
-    /// Whether `labels` (an object's, an event's attributes) say another leg made it.
+    /// Whether `labels` (an object's, an event's attributes) say another leg's socket made it, and
+    /// not through this one.
     fn theirs(&self, labels: Option<&Value>) -> bool {
-        !self.leg.is_empty() && labels.and_then(|l| l.get(SOCKET_LEG)).and_then(Value::as_str).is_some_and(|l| l != self.leg)
+        let Some(l) = labels.and_then(Value::as_object).filter(|_| !self.key.is_empty()) else { return false };
+        let leg = format!("{SOCKET_LEG}.");
+        l.keys().any(|k| k.starts_with(&leg)) && !l.contains_key(&self.key)
     }
 
     /// `v`'s labels with the leg's. Whether it changed.
@@ -422,7 +445,7 @@ fn route(method: &str, target: &str, names: &mut Names) -> Route {
         ["", "volumes", "create"] if post => Route { target: None, gather: Some(Gather::VolumeCreate), answer: if leg { Answer::One } else { plain } },
         // A leg prunes what it made, as on a machine of its own.
         ["", "containers" | "networks" | "volumes", "prune"] if post && leg => {
-            let label = format!("{SOCKET_LEG}={}", names.leg);
+            let label = names.key.clone();
             let q = requery(query, "filters", |v| Some(with_label(v, &label)));
             Route { target: q.map(|q| to(&parts, Some(&q))), gather: None, answer: Answer::One }
         }
@@ -1510,9 +1533,10 @@ mod tests {
         // A prune takes what the leg made, and only that.
         let prune = route("POST", "/v1.51/containers/prune?filters=%7B%22until%22%3A%5B%2224h%22%5D%7D", &mut names).target.unwrap_or_default();
         let filters = percent_decode(prune.split_once("filters=").map(|(_, f)| f).unwrap_or_default());
-        assert_eq!(serde_json::from_str::<Value>(&filters)?, serde_json::json!({"until": ["24h"], "label": ["kiln.socket.leg=leg-a"]}));
+        let key = names.key.clone();
+        assert_eq!(serde_json::from_str::<Value>(&filters)?, serde_json::json!({"until": ["24h"], "label": [key]}));
         let bare = route("POST", "/volumes/prune", &mut names).target.unwrap_or_default();
-        assert_eq!(percent_decode(&bare), r#"/volumes/prune?filters={"label":["kiln.socket.leg=leg-a"]}"#);
+        assert_eq!(percent_decode(&bare), format!(r#"/volumes/prune?filters={{"label":["{key}"]}}"#));
         assert_eq!(with_label(Some(r#"{"label":{"a=b":true}}"#), "c=d"), r#"{"label":{"a=b":true,"c=d":true}}"#);
         assert_eq!(route("POST", "/networks/net/connect", &mut names).gather, Some(Gather::NetworkMember(true)));
         // A socket whose names are the daemon's changes none.
@@ -1539,10 +1563,15 @@ mod tests {
         use serde_json::json;
         let mut names = Names::for_leg("leg-a", Some("kiln.runner-work=abc"));
         let k = names.suffix.clone();
+        let ours = json!({ names.key.clone(): "leg-a", "kiln.socket.runner.abc": "1" });
         let net = rewritten(&Gather::NetworkCreate, &json!({"Name": "net", "Driver": "bridge"}), &mut names)?;
-        assert_eq!(net, json!({"Name": format!("net{k}"), "Driver": "bridge", "Labels": {"kiln.socket.leg": "leg-a", "kiln.socket.runner": "abc"}}));
+        assert_eq!(net, json!({"Name": format!("net{k}"), "Driver": "bridge", "Labels": ours}));
         let volume = rewritten(&Gather::VolumeCreate, &json!({"Name": "data", "Labels": {"x": "y"}}), &mut names)?;
-        assert_eq!(volume, json!({"Name": format!("data{k}"), "Labels": {"x": "y", "kiln.socket.leg": "leg-a", "kiln.socket.runner": "abc"}}));
+        let mut labelled = ours.clone();
+        if let Some(o) = labelled.as_object_mut() {
+            o.insert("x".into(), json!("y"));
+        }
+        assert_eq!(volume, json!({"Name": format!("data{k}"), "Labels": labelled}));
         created("db", &json!({"Image": "postgres"}), &mut names)?;
         let web = created(
             "web",
@@ -1573,7 +1602,14 @@ mod tests {
         assert_eq!(config.get("IpcMode"), Some(&json!("shareable")));
         // Found on its network by the name it was given, as it would be without the suffix.
         assert_eq!(web.pointer(&format!("/NetworkingConfig/EndpointsConfig/net{k}")), Some(&json!({"Aliases": ["web"]})));
-        assert_eq!(web.get("Labels"), Some(&json!({"app": "x", "kiln.socket.leg": "leg-a", "kiln.socket.runner": "abc"})));
+        let mut labelled = ours.clone();
+        if let Some(o) = labelled.as_object_mut() {
+            o.insert("app".into(), json!("x"));
+        }
+        assert_eq!(web.get("Labels"), Some(&labelled));
+        // A leg's socket within another leg's: what it made keeps the inner leg's label too.
+        let inner = rewritten(&Gather::VolumeCreate, &json!({"Name": "deep", "Labels": {"kiln.socket.leg.k0123abcd": "leg-inner"}}), &mut names)?;
+        assert_eq!(inner.pointer("/Labels/kiln.socket.leg.k0123abcd"), Some(&json!("leg-inner")));
         // On every network it joins that takes aliases: its own, kiln's.
         let joined = created("web2", &json!({"HostConfig": {"NetworkMode": "net"}, "NetworkingConfig": {"EndpointsConfig": {"net": {"Aliases": ["w"]}, "kiln_leg_net": null}}}), &mut names)?;
         assert_eq!(joined.pointer("/NetworkingConfig/EndpointsConfig"), Some(&json!({format!("net{k}"): {"Aliases": ["w", "web2"]}, "kiln_leg_net": {"Aliases": ["web2"]}})));
@@ -1608,7 +1644,7 @@ mod tests {
     #[test]
     fn w13_r04_answers_say_the_legs_names() {
         let mut names = Names::for_leg("leg-a", None);
-        let k = names.suffix.clone();
+        let (k, mine) = (names.suffix.clone(), names.key.clone());
         names.made(Kind::Container, "db");
         let names = Mutex::new(names);
         let theirs = "-k0123abcd";
@@ -1622,14 +1658,17 @@ mod tests {
         input.push_str(&json_answer("200 OK", &format!(r#"{{"Name":"/db{k}","HostConfig":{{"NetworkMode":"net{k}"}},"NetworkSettings":{{"Networks":{{"net{k}":{{}}}}}},"Id":"4f6c{k}x"}}"#)));
         expected.push_str(&json_answer("200 OK", &format!(r#"{{"Name":"/db","HostConfig":{{"NetworkMode":"net"}},"NetworkSettings":{{"Networks":{{"net":{{}}}}}},"Id":"4f6c{k}x"}}"#)));
         // A list, chunked: without what another leg made.
-        let list =
-            format!(r#"[{{"Names":["/db{k}"],"Labels":{{"kiln.socket.leg":"leg-a"}}}},{{"Names":["/db{theirs}"],"Labels":{{"kiln.socket.leg":"leg-b"}}}},{{"Names":["/kiln_leg_db"],"Labels":{{}}}}]"#);
+        let list = format!(
+            r#"[{{"Names":["/db{k}"],"Labels":{{"{mine}":"leg-a"}}}},{{"Names":["/db{theirs}"],"Labels":{{"kiln.socket.leg.k0123abcd":"leg-b"}}}},{{"Names":["/nested{k}"],"Labels":{{"kiln.socket.leg.kfedcba98":"x","{mine}":"leg-a"}}}},{{"Names":["/kiln_leg_db"],"Labels":{{}}}}]"#
+        );
         input.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n");
         for piece in list.as_bytes().chunks(11) {
             input.push_str(&format!("{:x}\r\n{}\r\n", piece.len(), String::from_utf8_lossy(piece)));
         }
         input.push_str("0\r\n\r\n");
-        let listed = r#"[{"Names":["/db"],"Labels":{"kiln.socket.leg":"leg-a"}},{"Names":["/kiln_leg_db"],"Labels":{}}]"#;
+        let listed = format!(
+            r#"[{{"Names":["/db"],"Labels":{{"{mine}":"leg-a"}}}},{{"Names":["/nested"],"Labels":{{"kiln.socket.leg.kfedcba98":"x","{mine}":"leg-a"}}}},{{"Names":["/kiln_leg_db"],"Labels":{{}}}}]"#
+        );
         expected.push_str(&format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{listed}", listed.len()));
         // A start's: nothing to say. A refusal's message: the leg's names.
         let started = "HTTP/1.1 204 No Content\r\nApi-Version: 1.51\r\n\r\n";
@@ -1643,8 +1682,8 @@ mod tests {
         expected.push_str(interim);
         // Events, an event to a line however they're chunked: another leg's left out.
         let [mine, other, network] = [
-            format!(r#"{{"Type":"container","Action":"start","Actor":{{"ID":"1","Attributes":{{"kiln.socket.leg":"leg-a","name":"db{k}"}}}}}}"#),
-            format!(r#"{{"Type":"container","Action":"start","Actor":{{"ID":"2","Attributes":{{"kiln.socket.leg":"leg-b","name":"db{theirs}"}}}}}}"#),
+            format!(r#"{{"Type":"container","Action":"start","Actor":{{"ID":"1","Attributes":{{"{mine}":"leg-a","name":"db{k}"}}}}}}"#),
+            format!(r#"{{"Type":"container","Action":"start","Actor":{{"ID":"2","Attributes":{{"kiln.socket.leg.k0123abcd":"leg-b","name":"db{theirs}"}}}}}}"#),
             format!(r#"{{"Type":"network","Action":"connect","Actor":{{"ID":"3","Attributes":{{"name":"net{k}","container":"1"}}}}}}"#),
         ];
         let stream: String = [&mine, &other, &network].iter().map(|e| format!("{e}\n")).collect();
@@ -1795,7 +1834,7 @@ mod tests {
             for leg in &legs {
                 for kind in kinds {
                     let mut args: Vec<String> = kind.iter().map(|a| (*a).to_owned()).collect();
-                    args.extend(["--filter".to_owned(), format!("label={SOCKET_LEG}={leg}")]);
+                    args.extend(["--filter".to_owned(), format!("label={}", leg_label(leg))]);
                     left.push_str(&cli.run(&args, &none, std::time::Duration::from_secs(60)).await?);
                 }
             }
