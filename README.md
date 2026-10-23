@@ -40,8 +40,10 @@ answers, its UI loads and its runner is connected, saying where to open it; a fa
 failed and takes back what the install made. In Kubernetes it goes in namespace `kiln`
 (`--namespace`, `--context`), reached at a node's address and a NodePort (or, when no node can be
 reached, through `kubectl port-forward`); Docker's is on port 7070 (`--port`), QUIC on the next.
-Both run an image built from the binary that installs them (`--image` to run another; a cluster
-other than minikube, kind, k3d or Docker Desktop's needs `--registry` to pull it from).
+Both run an image built from the binary that installs them, which must be a Linux kiln
+(`--image` to run another). minikube, kind and k3d clusters are loaded with it, and Docker Desktop's
+single node shares it; any other cluster, Docker Desktop's multi-node one too, pulls it from
+`--registry`.
 
 `kiln install --unattended` never prompts. `kiln install --system` installs system-wide on this
 machine (asks for sudo; add `--unattended` to use `sudo -n` only). The server runs a local agent by

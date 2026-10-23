@@ -5,8 +5,10 @@
 //! - **The image.** `--image` names one; else one is built from this binary with this machine's
 //!   Docker, as kiln's own image is (`Dockerfile`): on Alpine for a static kiln (the released ones
 //!   are), else on this machine's own system, whose C library the binary was linked against.
-//! - **Into a cluster.** minikube, kind and k3d take the image from this machine's Docker; Docker
-//!   Desktop's cluster shares it; any other cluster pulls it from `--registry`, pushed there first.
+//! - **Into a cluster.** minikube, kind and k3d take the image from this machine's Docker (an image
+//!   `--image` names too, when that Docker has it); Docker Desktop's single node and OrbStack's
+//!   share it; any other cluster (Docker Desktop's multi-node one too) pulls it from `--registry`,
+//!   pushed there first.
 //! - **Kubernetes.** In `--namespace` (`kiln`): a service account with the role kiln's updates use
 //!   (its own Deployment, its pods), the admin token as a secret, a NodePort service, the config, a
 //!   volume and one Deployment (three nodes come with docs/p2p.md's P3). It's opened at a node's
@@ -347,20 +349,38 @@ fn context_name(context: Option<&str>) -> anyhow::Result<String> {
     doc.get("current-context").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_owned).context("the kubeconfig has no current context: give one with --context")
 }
 
-/// How the cluster of context `ctx` takes an image built on this machine (an empty command: it
-/// shares this machine's Docker), if it can: a minikube profile's, kind's or k3d's loader.
-fn loader(ctx: &str, minikube_profile: Option<&str>) -> Option<Vec<String>> {
-    let words = |w: &[&str]| Some(w.iter().map(|w| (*w).to_owned()).collect());
-    if let Some(p) = minikube_profile {
+/// How the cluster of context `ctx` (`nodes`, its nodes) takes an image from this machine's
+/// Docker: a minikube profile's, kind's or k3d's loader, or nothing (an empty command) for Docker
+/// Desktop's and OrbStack's single node, which runs on that Docker; else why it can't. Docker
+/// Desktop's multi-node cluster runs kind out of Docker's sight, so its images are pulled.
+fn loader(ctx: &str, nodes: &[Value]) -> Result<Vec<String>, String> {
+    let words = |w: &[&str]| Ok(w.iter().map(|w| (*w).to_owned()).collect());
+    if let Some(p) = nodes.iter().find_map(|n| n.pointer("/metadata/labels/minikube.k8s.io~1name")?.as_str()) {
         return words(&["minikube", "-p", p, "image", "load"]);
     }
-    if let Some(name) = ctx.strip_prefix("kind-") {
-        return words(&["kind", "load", "docker-image", "--name", name]);
+    // kind's nodes say their cluster: `kind://docker/<cluster>/<node>`.
+    if let Some(cluster) = nodes.iter().find_map(|n| n.pointer("/spec/providerID")?.as_str()?.strip_prefix("kind://")?.split('/').nth(1)) {
+        if ctx == "docker-desktop" {
+            return Err("Docker Desktop's multi-node cluster pulls its images from a registry".to_owned());
+        }
+        return words(&["kind", "load", "docker-image", "--name", cluster]);
     }
     if let Some(name) = ctx.strip_prefix("k3d-") {
         return words(&["k3d", "image", "import", "-c", name]);
     }
-    (ctx == "docker-desktop").then(Vec::new)
+    if ["docker-desktop", "orbstack"].contains(&ctx) {
+        return Ok(Vec::new());
+    }
+    Err(format!("the cluster of context {ctx} takes no image from this machine"))
+}
+
+/// Runs `load` (a [`loader`]'s command) for `image`.
+fn load_image(load: &[String], image: &str) -> anyhow::Result<()> {
+    let Some((bin, args)) = load.split_first() else { return Ok(()) };
+    let out = Command::new(bin).args(args).arg(image).stdin(Stdio::null()).output().with_context(|| format!("running {bin} (is it installed?)"))?;
+    anyhow::ensure!(out.status.success(), "{bin} couldn't load {image} into the cluster: {}", String::from_utf8_lossy(&out.stderr).trim());
+    say(format!("image       {image}, loaded into the cluster ({bin})"));
+    Ok(())
 }
 
 /// The hosts a NodePort service may be reached at from here, best first: this machine for a
@@ -400,15 +420,22 @@ fn url_of(host: &str, port: u64) -> String {
     if host.contains(':') { format!("http://[{host}]:{port}") } else { format!("http://{host}:{port}") }
 }
 
-/// The image the cluster runs, and its pull policy: `--image`; else one built from this binary,
-/// pushed to `--registry`, or loaded into a cluster that takes images from this machine.
-fn cluster_image(a: &InstallArgs, ctx: &str, minikube_profile: Option<&str>) -> anyhow::Result<(String, &'static str)> {
+/// The image the cluster runs, and its pull policy: `--image` (loaded into a cluster that takes
+/// images from this machine, when this machine's Docker has it); else one built from this binary,
+/// pushed to `--registry`, or loaded into the cluster.
+fn cluster_image(a: &InstallArgs, ctx: &str, nodes: &[Value]) -> anyhow::Result<(String, &'static str)> {
+    let load = loader(ctx, nodes);
     if let Some(image) = &a.image {
+        if let Ok(load) = &load
+            && !load.is_empty()
+            && docker(&["image", "inspect", "--format", "{{.Id}}", image]).is_ok()
+        {
+            load_image(load, image)?;
+        }
         return Ok((image.clone(), "IfNotPresent"));
     }
-    let load = loader(ctx, minikube_profile);
-    if load.is_none() && a.registry.is_none() {
-        bail!("the cluster of context {ctx} can't take an image built here: give --registry to push one to, or --image");
+    if let (Err(why), None) = (&load, &a.registry) {
+        bail!("{why}: give --registry to push the image built from this binary to, or --image of one it can pull");
     }
     let tag = own_tag().context("this binary's build can't be read to tag an image of it: give one with --image")?;
     build_image(&tag)?;
@@ -419,11 +446,7 @@ fn cluster_image(a: &InstallArgs, ctx: &str, minikube_profile: Option<&str>) -> 
         say(format!("image       pushed to {pushed}"));
         return Ok((pushed, "IfNotPresent"));
     }
-    if let Some((bin, args)) = load.as_deref().and_then(<[String]>::split_first) {
-        let out = Command::new(bin).args(args).arg(&tag).stdin(Stdio::null()).output().with_context(|| format!("running {bin} (is it installed?)"))?;
-        anyhow::ensure!(out.status.success(), "{bin} couldn't load the image into the cluster: {}", String::from_utf8_lossy(&out.stderr).trim());
-        say(format!("image       loaded into the cluster ({bin})"));
-    }
+    load_image(&load.unwrap_or_default(), &tag)?;
     Ok((tag, "Never"))
 }
 
@@ -440,10 +463,9 @@ pub async fn kubernetes_install(a: &InstallArgs) -> anyhow::Result<()> {
         }
     }
     let nodes = cluster.list_in(&GroupKind::new("", "Node"), None, None, false).await.context("listing the cluster's nodes")?;
-    let profile = nodes.iter().find_map(|n| n.pointer("/metadata/labels/minikube.k8s.io~1name")?.as_str()).map(str::to_owned);
     let hosts = addresses(&ctx, &nodes);
     anyhow::ensure!(!hosts.is_empty(), "the cluster's nodes have no address");
-    let (image, pull) = cluster_image(a, &ctx, profile.as_deref())?;
+    let (image, pull) = cluster_image(a, &ctx, &nodes)?;
     let token = crate::util::random_token();
     let mut made = Vec::new();
     let Err(e) = install_in(&cluster, &ctx, ns, (&image, pull), &token, &hosts, &mut made).await else { return Ok(()) };
@@ -681,13 +703,15 @@ mod tests {
 
     #[test]
     fn a_cluster_takes_an_image_built_here_the_way_its_kind_does() {
-        let cmd = |ctx: &str, p: Option<&str>| loader(ctx, p).map(|c| c.join(" "));
-        assert_eq!(cmd("minikube", Some("minikube")).as_deref(), Some("minikube -p minikube image load"));
-        assert_eq!(cmd("lab", Some("kiln-install-check")).as_deref(), Some("minikube -p kiln-install-check image load"));
-        assert_eq!(cmd("kind-dev", None).as_deref(), Some("kind load docker-image --name dev"));
-        assert_eq!(cmd("k3d-ci", None).as_deref(), Some("k3d image import -c ci"));
-        assert_eq!(cmd("docker-desktop", None).as_deref(), Some(""), "Docker Desktop's cluster shares its Docker");
-        assert_eq!(cmd("gke_prod_us-east1_main", None), None, "a cluster elsewhere needs a registry");
+        let node = |labels: Value, provider: &str| json!({ "metadata": { "labels": labels }, "spec": { "providerID": provider } });
+        let cmd = |ctx: &str, nodes: &[Value]| loader(ctx, nodes).map(|c| c.join(" "));
+        assert_eq!(cmd("lab", &[node(json!({ "minikube.k8s.io/name": "kiln-install-check" }), "")]).as_deref(), Ok("minikube -p kiln-install-check image load"));
+        assert_eq!(cmd("anything", &[node(json!({}), "kind://docker/dev/dev-control-plane")]).as_deref(), Ok("kind load docker-image --name dev"));
+        assert_eq!(cmd("k3d-ci", &[node(json!({}), "k3s://k3d-ci-server-0")]).as_deref(), Ok("k3d image import -c ci"));
+        assert_eq!(cmd("docker-desktop", &[node(json!({}), "")]).as_deref(), Ok(""), "Docker Desktop's single node runs on its Docker");
+        let desktop_kind = cmd("docker-desktop", &[node(json!({}), "kind://docker/desktop/desktop-control-plane")]);
+        assert!(desktop_kind.is_err_and(|why| why.contains("registry")), "Docker Desktop's multi-node cluster pulls");
+        assert!(cmd("gke_prod_us-east1_main", &[node(json!({}), "gce://prod/us-east1-b/n1")]).is_err(), "a cluster elsewhere needs a registry");
     }
 
     #[test]
