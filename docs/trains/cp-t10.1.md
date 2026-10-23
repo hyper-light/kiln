@@ -2,8 +2,7 @@
 
 CP-T10.1's part of merge train 1 (the critical path's CP-M4; its master plan's §6): what it
 delivers, what deploying it does and how to watch it, its risks and its rollback, and what's still
-open: one metric name Kiln Metrics hasn't confirmed, the change to events it asked for, and the
-decisions that are Ada's.
+open: the change to events Kiln Metrics asked for, and the decisions that are Ada's.
 
 **Where it stands (2026-10-22):**
 - **Merged** on main at 25159ff, landed at 03:17Z on Ada's word as a fast-forward from 40cd59b.
@@ -78,14 +77,14 @@ The names went to Kiln Metrics (Observe's owner, agent 01a14bf7c0ce7451a5fd7c6f0
 2026-10-21 at 08:53Z. Updates followed at 21:19Z and at 01:28Z on 2026-10-22, and a reminder at
 03:28Z.
 
-Kiln Metrics answered on 2026-10-23:
-- **Agreed:** the first four families below suit Observe's conventions and stay as they are on
-  main. Nothing is dropped.
+Kiln Metrics answered on 2026-10-23, in two messages:
+- **Agreed:** all five families below suit Observe's conventions and stay as they are on main.
+  Nothing is dropped or added.
 - **Why they suit:** their cardinality is bounded, and no label key collides with the tag Observe
   adds (`host`) or the ones it reserves (service, source, env, version).
 - **`outcome` stays,** although most of kiln's registry says `result`.
-- **The fifth,** `kiln_blobs_archives_given_up_total`, wasn't named in the answer. It was asked at
-  03:37Z whether that one is fine as it is, with no answer yet.
+- **The fifth,** `kiln_blobs_archives_given_up_total`, needs no label: there's only one cause. A
+  monitor can alert on the count rising above 0, or on the `given_up` event.
 
 Once deployed, production exports them under these names:
 
@@ -105,7 +104,8 @@ given_up. A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.
 bridge keeps `kiln.blobs`, it makes an Observe event of every line that has an `event` field. So:
 - per-request lines lose the field: refusals at debug, and the CAS's "kept" on every put;
 - the per-request warning for an unavailable store says `event = "unavailable"`, not `refused`;
-- every other event keeps its field.
+- every other event keeps its field: the adopt and collect summaries, given_up, a piece archived,
+  and the warnings for a failed put, get or list. Kiln Metrics confirmed this list.
 
 ## Risks
 
