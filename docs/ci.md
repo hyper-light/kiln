@@ -3380,7 +3380,10 @@ enforcement points to W18, agent isolation to W20.
     telnet, ftp, the ACL tools, SWIG, Texinfo, rpm, UPX, MediaInfo, Mercurial and Xvfb;
   - git from the git-core PPA, current as GitHub's is (2.55 when added; Ubuntu 24.04's own is
     2.43). Tools go by its version: cargo retries a failed `git fetch` itself only below 2.54,
-    and its ssh and https tests count the retries.
+    and its ssh and https tests count the retries;
+  - a `snap` that does what a container can: snapd needs a machine of its own, so
+    `snap install NAME` installs Ubuntu's package of each name, as `taiki-e/install-action`'s
+    Valgrind asks for (tokio's stress tests), and anything else says why it can't.
 
   On Ubuntu 24.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's image's
   does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.
