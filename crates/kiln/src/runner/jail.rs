@@ -171,7 +171,8 @@ fn read_only(at: &Path) -> anyhow::Result<()> {
         (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
         (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
         (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
-        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+        // Linux's ST_RELATIME, which nix names on glibc but not on musl (kiln's static builds).
+        (FsFlags::from_bits_retain(4096), MsFlags::MS_RELATIME),
     ] {
         if has.contains(f) {
             flags |= m;
