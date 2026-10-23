@@ -786,6 +786,13 @@ pub struct CfState {
     pub domains: Vec<Value>,
     /// Each upload: its metadata and its modules' names.
     pub uploads: Vec<Value>,
+    /// Pages: projects (their production branch, deployments newest first, the one in
+    /// production), the assets uploaded by hash, and the upload token given.
+    pub pages: BTreeMap<String, (String, Vec<Value>, Option<String>)>,
+    pub assets: BTreeMap<String, Vec<u8>>,
+    pub pages_jwt: Option<String>,
+    /// Each Pages call that changes something: `Upload 2 assets`.
+    pub pages_calls: Vec<String>,
     next: u32,
 }
 
@@ -842,7 +849,11 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 impl srv::Handler for FakeCf {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
-        if srv::header_str(&req, &http::header::AUTHORIZATION) != Some("Bearer cf-token") {
+        let auth = srv::header_str(&req, &http::header::AUTHORIZATION).unwrap_or("").to_owned();
+        // Pages' asset store takes the project's upload token; the rest, the account's.
+        let assets = req.uri().path().starts_with("/pages/assets/");
+        let allowed = if assets { self.state.lock().pages_jwt.as_ref().is_some_and(|j| auth == format!("Bearer {j}")) } else { auth == "Bearer cf-token" };
+        if !allowed {
             return cf_err(403, 10000, "Authentication error");
         }
         let method = req.method().clone();
@@ -978,9 +989,119 @@ impl srv::Handler for FakeCf {
                 st.domains.retain(|d| d.get("id").and_then(Value::as_str) != Some(*id));
                 cf_ok(Value::Null)
             }
-            _ => cf_err(400, 7000, &format!("the fake has no {method} {path}")),
+            _ => pages(&mut st, &method, &segs, &ct, &raw, &body).unwrap_or_else(|| cf_err(400, 7000, &format!("the fake has no {method} {path}"))),
         }
     }
+}
+
+fn pages_project(name: &str, (branch, deployments, canonical): &(String, Vec<Value>, Option<String>)) -> Value {
+    let find = |id: &Option<String>| id.as_ref().and_then(|i| deployments.iter().find(|d| d.get("id").and_then(Value::as_str) == Some(i.as_str()))).cloned();
+    json!({ "name": name, "production_branch": branch, "subdomain": format!("{name}.pages.dev"), "canonical_deployment": find(canonical), "latest_deployment": deployments.first() })
+}
+
+/// Pages' calls: none for a call that isn't one.
+fn pages(st: &mut CfState, method: &http::Method, segs: &[&str], ct: &str, raw: &[u8], body: &Value) -> Option<Response> {
+    st.next += 1;
+    let n = st.next;
+    Some(match (method.as_str(), segs) {
+        ("GET", ["accounts", "acct1", "pages", "projects"]) => cf_ok(Value::Array(st.pages.iter().map(|(n, p)| pages_project(n, p)).collect())),
+        ("POST", ["accounts", "acct1", "pages", "projects"]) => {
+            let name = body.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let branch = body.get("production_branch").and_then(Value::as_str).unwrap_or("main").to_owned();
+            st.pages.insert(name.clone(), (branch, Vec::new(), None));
+            st.pages_calls.push(format!("CreateProject {name}"));
+            cf_ok(st.pages.get(&name).map(|p| pages_project(&name, p)).unwrap_or_default())
+        }
+        (_, ["accounts", "acct1", "pages", "projects", name, rest @ ..]) => {
+            let name = (*name).to_owned();
+            if !st.pages.contains_key(&name) {
+                return Some(cf_err(404, 8_000_007, "Project not found"));
+            }
+            match (method.as_str(), rest) {
+                ("GET", []) => cf_ok(st.pages.get(&name).map(|p| pages_project(&name, p)).unwrap_or_default()),
+                ("DELETE", []) => {
+                    st.pages.remove(&name);
+                    st.pages_calls.push(format!("DeleteProject {name}"));
+                    cf_ok(Value::Null)
+                }
+                ("GET", ["upload-token"]) => {
+                    let jwt = format!("pages-jwt-{n}");
+                    st.pages_jwt = Some(jwt.clone());
+                    cf_ok(json!({ "jwt": jwt }))
+                }
+                ("POST", ["deployments"]) => {
+                    let ps = parts(ct, raw);
+                    let Some(manifest) = ps.iter().find(|p| p.0 == "manifest").and_then(|p| serde_json::from_slice::<Value>(&p.2).ok()) else { return Some(cf_err(400, 8_000_096, "a manifest is required")) };
+                    let branch = ps.iter().find(|p| p.0 == "branch").map(|p| String::from_utf8_lossy(&p.2).into_owned()).unwrap_or_default();
+                    if let Some(h) = manifest.as_object().into_iter().flatten().filter_map(|(_, h)| h.as_str()).find(|h| !st.assets.contains_key(*h)) {
+                        return Some(cf_err(400, 8_000_097, &format!("asset {h} wasn't uploaded")));
+                    }
+                    let Some(p) = st.pages.get_mut(&name) else { return Some(cf_err(404, 8_000_007, "Project not found")) };
+                    let env = if branch == p.0 { "production" } else { "preview" };
+                    let d = json!({ "id": format!("dpl-{n}"), "url": format!("https://{n:x}.{name}.pages.dev"), "environment": env, "latest_stage": { "name": "queued", "status": "active" }, "manifest": manifest });
+                    p.1.insert(0, d.clone());
+                    st.pages_calls.push(format!("Deploy {name} {} files", manifest.as_object().map_or(0, Map::len)));
+                    cf_ok(d)
+                }
+                ("GET", ["deployments", id]) => {
+                    let assets = st.assets.clone();
+                    let Some(p) = st.pages.get_mut(&name) else { return Some(cf_err(404, 8_000_007, "Project not found")) };
+                    let Some(d) = p.1.iter_mut().find(|d| d.get("id").and_then(Value::as_str) == Some(*id)) else { return Some(cf_err(404, 8_000_009, "Deployment not found")) };
+                    let stage = d.pointer("/latest_stage/name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let mut canonical = None;
+                    match stage.as_str() {
+                        "queued" => {
+                            if let Some(m) = d.as_object_mut() {
+                                m.insert("latest_stage".into(), json!({ "name": "deploy", "status": "active" }));
+                            }
+                        }
+                        "deploy" if d.pointer("/latest_stage/status").and_then(Value::as_str) == Some("active") => {
+                            let broken = d.get("manifest").and_then(Value::as_object).into_iter().flatten().filter_map(|(_, h)| h.as_str().and_then(|h| assets.get(h))).any(|b| String::from_utf8_lossy(b).contains("broken"));
+                            if let Some(m) = d.as_object_mut() {
+                                m.insert("latest_stage".into(), json!({ "name": "deploy", "status": if broken { "failure" } else { "success" } }));
+                            }
+                            if !broken && d.get("environment").and_then(Value::as_str) == Some("production") {
+                                canonical = Some((*id).to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                    let answer = d.clone();
+                    if canonical.is_some() {
+                        p.2 = canonical;
+                    }
+                    cf_ok(answer)
+                }
+                ("POST", ["deployments", id, "rollback"]) => {
+                    let Some(p) = st.pages.get_mut(&name) else { return Some(cf_err(404, 8_000_007, "Project not found")) };
+                    let ok_to = p.1.iter().find(|d| d.get("id").and_then(Value::as_str) == Some(*id)).filter(|d| d.pointer("/latest_stage/status").and_then(Value::as_str) == Some("success")).cloned();
+                    let Some(d) = ok_to else { return Some(cf_err(400, 8_000_010, "only a deployment that succeeded is rolled back to")) };
+                    p.2 = Some((*id).to_owned());
+                    st.pages_calls.push(format!("Rollback {name} {id}"));
+                    cf_ok(d)
+                }
+                _ => return None,
+            }
+        }
+        ("POST", ["pages", "assets", "check-missing"]) => {
+            let missing: Vec<Value> = body.get("hashes").and_then(Value::as_array).into_iter().flatten().filter(|h| h.as_str().is_some_and(|h| !st.assets.contains_key(h))).cloned().collect();
+            cf_ok(Value::Array(missing))
+        }
+        ("POST", ["pages", "assets", "upload"]) => {
+            use base64::Engine as _;
+            let mut count = 0;
+            for a in body.as_array().into_iter().flatten() {
+                let (Some(key), Some(value)) = (a.get("key").and_then(Value::as_str), a.get("value").and_then(Value::as_str)) else { return Some(cf_err(400, 8_000_098, "an asset needs its key and value")) };
+                let Ok(data) = base64::engine::general_purpose::STANDARD.decode(value) else { return Some(cf_err(400, 8_000_098, "an asset's value is base64")) };
+                st.assets.insert(key.to_owned(), data);
+                count += 1;
+            }
+            st.pages_calls.push(format!("Upload {count} assets"));
+            cf_ok(json!({ "successful_key_count": count }))
+        }
+        ("POST", ["pages", "assets", "upsert-hashes"]) => cf_ok(Value::Null),
+        _ => return None,
+    })
 }
 
 /// Starts the fake Cloudflare on a free port: its base URL.

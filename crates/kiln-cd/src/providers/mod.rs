@@ -23,6 +23,7 @@ pub mod azure_containerapps;
 pub mod azure_static;
 pub mod azure_vmss;
 pub mod azure_web;
+pub mod cloudflare_pages;
 pub mod cloudflare_workers;
 pub mod cloudformation;
 pub mod digitalocean;
@@ -455,11 +456,15 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "cloudflare",
         place: &[],
         scope: None,
-        settings: &[s("project", true, "the Pages project"), s("site", true, "the built site (${{ artifacts.* }})")],
+        settings: &[
+            s("project", true, "the Pages project (made if it isn't there)"),
+            s("site", true, "the built site: a zip or .tar.gz CI made (${{ release.artifacts.<name>.digest }})"),
+            s("branch", false, "the production branch (main)"),
+        ],
         kinds: &[kind("pages.cloudflare.kiln.dev", "Project", "Project"), child(kind("pages.cloudflare.kiln.dev", "Deployment", "Deployment"))],
-        capabilities: &[Versions, Previews, Drift, Adopt],
-        reads: &["wrangler.toml"],
-        built: false,
+        capabilities: &[Versions, Drift, Adopt],
+        reads: &[],
+        built: true,
     },
     ProviderDef {
         name: "vercel",
@@ -778,6 +783,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "azure-containerapps" => azure_containerapps::render(input),
         "azure-static" => azure_static::render(input),
         "azure-vmss" => azure_vmss::render(input),
+        "cloudflare-pages" => cloudflare_pages::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
         "cloudformation" => cloudformation::render(input),
         "digitalocean" => digitalocean::render(input),
@@ -810,6 +816,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "azure-containerapps" => azure_containerapps::files(spec),
         "azure-static" => azure_static::files(spec),
         "azure-vmss" => azure_vmss::files(spec),
+        "cloudflare-pages" => cloudflare_pages::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
         "cloudformation" => cloudformation::files(spec),
         "digitalocean" => digitalocean::files(spec),
@@ -844,6 +851,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "azure-containerapps" => azure_containerapps::health(obj),
         "azure-static" => azure_static::health(obj),
         "azure-vmss" => azure_vmss::health(obj),
+        "cloudflare-pages" => cloudflare_pages::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
         "cloudformation" => cloudformation::health(obj),
         "digitalocean" => digitalocean::health(obj),

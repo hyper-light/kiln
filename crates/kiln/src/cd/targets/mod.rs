@@ -31,6 +31,7 @@ pub mod azure_containerapps;
 pub mod azure_static;
 pub mod azure_vmss;
 pub mod azure_web;
+pub mod cloudflare_pages;
 pub mod cloudflare_workers;
 pub mod cloudformation;
 pub mod digitalocean;
@@ -600,6 +601,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "azure-static" => azure_static::list(cx, kind, names).await?,
         "azure-vmss" => azure_vmss::list(cx, kind, names).await?,
         "aws-ecs" => aws_ecs::list(cx, kind, names).await?,
+        "cloudflare-pages" => cloudflare_pages::list(cx, kind, names).await?,
         "cloudflare-workers" => cloudflare_workers::list(cx, kind, names).await?,
         "cloudformation" => cloudformation::list(cx, kind, names).await?,
         "gcp-appengine" => gcp_appengine::list(cx, kind, names).await?,
@@ -634,6 +636,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "azure-static" => azure_static::apply(cx, desired).await,
         "azure-vmss" => azure_vmss::apply(cx, desired).await,
         "aws-ecs" => aws_ecs::apply(cx, desired).await,
+        "cloudflare-pages" => cloudflare_pages::apply(cx, desired).await,
         "cloudflare-workers" => cloudflare_workers::apply(cx, desired).await,
         "cloudformation" => cloudformation::apply(cx, desired).await,
         "gcp-appengine" => gcp_appengine::apply(cx, desired).await,
@@ -663,6 +666,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "azure-static" => azure_static::delete(cx, key).await,
         "azure-vmss" => azure_vmss::delete(cx, key).await,
         "aws-ecs" => aws_ecs::delete(cx, key).await,
+        "cloudflare-pages" => cloudflare_pages::delete(cx, key).await,
         "cloudflare-workers" => cloudflare_workers::delete(cx, key).await,
         "cloudformation" => cloudformation::delete(cx, key).await,
         "gcp-appengine" => gcp_appengine::delete(cx, key).await,
