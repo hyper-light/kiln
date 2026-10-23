@@ -515,10 +515,98 @@ def not_kilns(note):
     return next((r for pat, r in KNOWN if re.search(pat, note)), None)
 
 
-def miss(w):
+def jobs_of(repo, name):
+    """The jobs of `repo`'s corpus workflow `name`: each job's id → (the jobs it needs, whether it
+    runs whatever they did, whether it reads how they did). Read by indentation, as `triggers`
+    reads `on`: enough for a workflow's own `jobs:` block."""
+    try:
+        with open(os.path.join(CORPUS, repo.replace("/", "_"), name)) as f:
+            lines = [x for x in f.read().splitlines() if x.strip() and not x.lstrip().startswith("#")]
+    except OSError:
+        return {}
+    at = next((i for i, x in enumerate(lines) if re.match(r"^jobs:\s*(#.*)?$", x)), None)
+    if at is None:
+        return {}
+    blocks, indent = {}, None
+    for x in lines[at + 1 :]:
+        if not x[0].isspace():
+            break
+        width = len(x) - len(x.lstrip())
+        m = re.match(r"^\s+([A-Za-z_][\w-]*|\"[^\"]+\"|'[^']+')\s*:\s*(#.*)?$", x)
+        if m and width <= (indent if indent is not None else width):
+            indent = width
+            blocks[m.group(1).strip("'\"")] = []
+        elif blocks:
+            blocks[next(reversed(blocks))].append(x)
+    out = {}
+    for job, block in blocks.items():
+        own = min((len(x) - len(x.lstrip()) for x in block), default=0)
+        needs, runs_anyway = set(), False
+        for i, x in enumerate(block):
+            if len(x) - len(x.lstrip()) != own:
+                continue
+            if m := re.match(r"^\s*needs:\s*(.*?)\s*(#.*)?$", x):
+                if m.group(1):
+                    needs = {e.strip().strip("'\"") for e in m.group(1).strip("[]").split(",") if e.strip()}
+                else:
+                    for y in block[i + 1 :]:
+                        # A list's items may sit at the key's own indent.
+                        if len(y) - len(y.lstrip()) < own or (len(y) - len(y.lstrip()) == own and not y.lstrip().startswith("-")):
+                            break
+                        if k := re.match(r"^\s*-\s*['\"]?([\w-]+)", y):
+                            needs.add(k.group(1))
+            if re.match(r"^\s*if:.*(\b(always|failure)\(\)|!\s*cancelled\(\))", x):
+                runs_anyway = True
+        # It reads how they did (an expression's names are any case: cargo's `toJson(needs)`), and
+        # does nothing else: no secret, no action but alls-green's (a notice of a failure, an
+        # issue opened for one, a run cancelled for one miss for their own reasons).
+        text = "\n".join(block)
+        reads = bool(re.search(r"(?i)\bneeds\.(\*|[\w-]+)\.result|\btojson\(\s*needs\s*\)", text))
+        alone = not re.search(r"(?i)\bsecrets\.", text) and all(re.match(r"re-actors/alls-green@", u) for u in re.findall(r"^\s*(?:-\s*)?uses:\s*['\"]?(\S+?)['\"]?\s*(?:#.*)?$", text, re.M))
+        out[job] = (needs, runs_anyway, reads and alone)
+    return out
+
+
+def job_of(note):
+    """The job of a leg's note (`` `key`: … `` or `` `key` waits: … ``): its key's id, without a
+    matrix's values or a called workflow's job."""
+    m = re.match(r"^`([^`]+)`", note)
+    return m.group(1).split(" / ")[0].split(" (")[0] if m else None
+
+
+GATE = "a gate (one stable name for branch protection): it fails when a job it needs missed, as it should, so it misses for theirs, said here"
+
+
+def gates(repo, name, notes):
+    """The notes, of one run of `repo`'s workflow `name`, of gate jobs: a job that runs whatever
+    the jobs it needs did, reads how they did and fails when one missed (prometheus's
+    `test_go_oldest_status`, a matrix's one name for branch protection), when another note is of
+    a job it needs, directly or through others. Its miss is theirs: the run's result says why
+    they missed."""
+    jobs = jobs_of(repo, name) if repo and name else {}
+    out = set()
+    for note in notes:
+        job = job_of(note)
+        if job not in jobs or not (jobs[job][1] and jobs[job][2]):
+            continue
+        under, todo = set(), list(jobs[job][0])
+        while todo:
+            j = todo.pop()
+            if j not in under:
+                under.add(j)
+                todo += list(jobs.get(j, (set(),))[0])
+        if any(job_of(other) in under for other in notes if other != note):
+            out.add(note)
+    return out
+
+
+def miss(w, repo=None, name=None):
     """A workflow's result for an event, a miss: the reasons it's not kiln's, every leg's that
-    missed, or None when one of them is kiln's (or none says why)."""
-    reasons = [not_kilns(x) for x in w.get("notes", [])]
+    missed, or None when one of them is kiln's (or none says why). A gate's (`gates`) is the
+    jobs' it needs."""
+    notes = w.get("notes", [])
+    gated = gates(repo, name, notes)
+    reasons = [GATE if x in gated else not_kilns(x) for x in notes]
     return sorted(set(reasons)) if reasons and all(reasons) else None
 
 
@@ -536,7 +624,7 @@ def write(out_dir):
     ran = [(d, n) for d, n in rows if any(e.get(n, {}).get("result") != "no run" for e in d["events"].values())]
     passed = [(d, n) for d, n in ran if all(e.get(n, {}).get("result") in ("pass", "no run", None) for e in d["events"].values())]
     missed = [(d, n) for d, n in ran if (d, n) not in passed]
-    explained = [(d, n) for d, n in missed if all(e.get(n, {}).get("result") in ("pass", "no run", None) or miss(e[n]) for e in d["events"].values())]
+    explained = [(d, n) for d, n in missed if all(e.get(n, {}).get("result") in ("pass", "no run", None) or miss(e[n], d["repo"], n) for e in d["events"].values())]
     lines = [
         "# CI conformance: F-03's popular repositories",
         "",
@@ -564,8 +652,9 @@ def write(out_dir):
                     said = [no_run(d["repo"], n, e)]
                 result = w["result"]
                 if result not in ("pass", "no run"):
-                    why = miss(w)
-                    known = sorted({x for x in (left(n) for n in w.get("notes", []) if not not_kilns(n)) if x})
+                    why = miss(w, d["repo"], n)
+                    gated = gates(d["repo"], n, w.get("notes", []))
+                    known = sorted({x for x in (left(y) for y in w.get("notes", []) if y not in gated and not not_kilns(y)) if x})
                     result += f": {'; '.join(why)}" if why else (f": kiln's, left: {'; '.join(known)}" if known else ": kiln's")
                 cells.append(result)
                 said = ([w["legs"]] if w.get("legs") else []) + said

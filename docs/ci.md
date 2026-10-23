@@ -6259,6 +6259,9 @@ and AC02.
     - it waits for macOS or Windows, which the lab hasn't;
     - a reason not kiln's: the repository's secrets, GitHub Pages, a check of the pull
       request's description or base, the lab's host network, a timed wait in the slow lab;
+    - a gate's (one job that says how the ones it needs did, a stable name for branch
+      protection, as prometheus's `test_go_oldest_status`), which follows their misses: it is
+      explained only as they are;
     - or kiln's to fix.
   - Found and fixed on the way, each with its test:
     - `cross`'s mounts, and GitHub's paths, in a `docker` leg (W13-R04);
@@ -6268,10 +6271,14 @@ and AC02.
     - a leg's fetch of another public repository (W14-R11), and `GH_HOST` in a container;
     - an owner's `.github` repository, and a remote reusable workflow's `./` calls (W07-R02);
     - v1 to v3 artifacts (W08-R08);
-    - live logs the masker held back (W06-R08).
+    - live logs the masker held back (W06-R08);
+    - `USER` and `LOGNAME`, the runner's, in a hosted leg's steps (W13-R04);
+    - Go on the runner image's `PATH`, as on GitHub's (prometheus's setup asks `go env` without
+      setting Go up).
   - Pass 1022g (six repositories, on builds before most of these): 10 of 25 workflows that ran
     passed, 7 more missed only for reasons not kiln's, and 8 for kiln's, each fixed since.
-    Pass 1023b runs every repository again on a build with all of it.
+    Pass 1023b ran ripgrep, bat, cargo and tokio again on a build with all of it; pass 1023c,
+    from 2026-10-23, runs the other twenty, each on the newest build when it starts.
 - *AC02, fourth batch* (2026-10-19), in the lab, the facade over HTTPS:
   - `github/codeql-action/upload-sarif`: the code-scanning starters above.
   - `peter-evans/create-pull-request@v7`: a branch pushed, a pull request opened, then updated
@@ -6465,7 +6472,7 @@ and AC02.
     `12345678901234567000`, `1000`, `0.1` and `16`.
   - Found on the way, and fixed: a cancelled step in a job container was never signalled (W05's
     AC07 note), and the probes' own matrix one didn't test an empty value written last.
-- *Left.* AC01: the rest of pass 1023b; the corpus's macOS and Windows legs, which need such
+- *Left.* AC01: the rest of pass 1023c; the corpus's macOS and Windows legs, which need such
   runners in the lab (user-assisted: joining a Mac and a Windows machine runs third-party CI code
   on them); the host executor's run of the repositories' workflows (W06-AC07), which needs a
   machine of its own to run them on; and test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
