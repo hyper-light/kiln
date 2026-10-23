@@ -204,6 +204,7 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away:
         branch: None,
         to: vec![Target { machine: to.to_owned(), path: target.clone() }],
         delete: false,
+        mode: crate::sync::Mode::Files,
     };
     let tasks = crate::sync::tasks::start(hub, ask).await?;
     let task = tasks.into_iter().next().ok_or_else(|| "the copy was not started".to_owned())?;

@@ -102,18 +102,61 @@
 .gs-link[data-status="met"]:not(:last-child)::before {
   background: #5d7a74;
 }
-/* Each goal's node: where it stands, drawn as the console draws work (plans/status.tsx), on the
-   panel's own colour so the line runs behind it. Waiting goals are only sketched, still. */
+/* Each goal's node: its number, inside where it stands drawn as the console draws work
+   (plans/status.tsx), on the panel's own colour so the line runs behind it. The goal at work has
+   the prism's light turning around its number (only a transform moves) and its words in the
+   shimmer; waiting goals are only sketched, still. */
 .gs-node {
   display: grid;
   width: 22px;
   height: 22px;
   place-items: center;
+  border-radius: 50%;
   background: #0a0c0f;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.gs-node > * {
+  grid-area: 1 / 1;
 }
 .gs-node .sg-beam {
-  width: 15px;
-  height: 15px;
+  width: 22px;
+  height: 22px;
+}
+/* The mark's loop sits a little left of its box; two figures sit closer to fit inside it. */
+.gs-n {
+  translate: -0.5px 0;
+}
+.gs-n[data-wide] {
+  font-size: 8.5px;
+  letter-spacing: -0.06em;
+}
+.gs-node[data-stand="working"] {
+  color: #e3e7ee;
+  box-shadow: 0 0 0 3px rgb(166 196 237 / 10%);
+}
+/* Under way while the agent is between turns: its number in the light's blue. */
+.gs-link[data-status="active"] .gs-node[data-stand="waiting"] {
+  color: #a6c4ed;
+}
+.gs-node[data-stand="met"] {
+  color: #b8d9d2;
+}
+.gs-node[data-stand="unmet"] {
+  color: #d8bb95;
+}
+.gs-node[data-stand="skipped"] {
+  color: #d5a4ad;
+}
+/* The goal under way while you've paused the stack: held, in the paused chip's amber. */
+.gs-node[data-stand="paused"] {
+  color: #e3c9a0;
+}
+.gs-node[data-stand="paused"] .sg-trace {
+  --sg-tone: #e3c9a0;
 }
 .gs-chain .sg-beam[data-status="pending"] {
   animation: none;

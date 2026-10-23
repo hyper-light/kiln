@@ -1420,7 +1420,12 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   }
 
   // Research
-  if (p === "/api/research" && m === "GET") return (void json(res, 200, { research: Object.values(RESEARCH) }), true);
+  if (p === "/api/research" && m === "GET") {
+    // One agent's, one plan's, or all, as the server answers.
+    const agent = url.searchParams.get("agent");
+    const plan = url.searchParams.get("plan");
+    return (void json(res, 200, { research: Object.values(RESEARCH).filter((r) => (!agent || r.agent === agent) && (!plan || r.plan === plan)) }), true);
+  }
   if ((mm = p.match(/^\/api\/research\/([^/]+)$/)) && m === "GET") {
     const r = RESEARCH[decodeURIComponent(mm[1]!)];
     return (r ? json(res, 200, r) : err(res, 404, "no such research"), true);

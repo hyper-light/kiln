@@ -22,6 +22,7 @@ import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
 import { planHref, plansApi, runHref, type Plan } from "@/api/plans";
 import { PlanGraph } from "@/views/plans/graph";
+import { ResearchLine } from "@/views/research/research";
 import { effectiveNeeds } from "@/views/plans/graph-layout";
 import { StandTitle, StepGlyph, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
@@ -101,6 +102,12 @@ function PlannedView({ p, stand, run }: { p: Plan; stand: (n: number) => Stand |
           <>
             {" · "}
             <Link to={runHref(run)}>its run</Link>
+          </>
+        )}
+        {p.research && (
+          <>
+            {" · "}
+            <ResearchLine id={p.research} />
           </>
         )}
       </p>
@@ -220,6 +227,8 @@ function GoalPanel({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const items = stack?.items ?? [];
+  // Each goal's number in the stack, as it's spoken of (a goal's parts have none: they're its own).
+  const numbers = new Map(items.filter((i) => !i.part_of).map((g, i) => [g.id, i + 1]));
   const pending = items.filter((i) => i.status === "pending");
   const active = items.find((i) => i.status === "active");
   const met = items.filter((i) => i.status === "met").length;
@@ -344,15 +353,21 @@ function GoalPanel({
                 const held = g.status === "active" && stack?.state === "paused";
                 // One handed to another agent (a program's track's worker): under way there.
                 const away = g.status === "pending" ? g.on : undefined;
+                const stand = standOf(g, held, working && !g.waits_on);
                 return (
                   <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : g.status} data-part={g.part_of ? "" : undefined} data-depth={g.part_of ? depthOf(g, items) : undefined}>
-                    {/* Where it stands, drawn as the console draws work (plans/status.tsx). */}
-                    <span className="gs-node" title={WORD[g.status]}>
-                      <StepGlyph stand={standOf(g, held, working && !g.waits_on)} />
+                    {/* Its number in the stack, inside where it stands, drawn as the console draws work (plans/status.tsx). */}
+                    <span className="gs-node" data-stand={stand} title={WORD[g.status]}>
+                      <StepGlyph stand={stand} />
+                      {!g.part_of && (
+                        <span className="gs-n" data-wide={(numbers.get(g.id) ?? 0) > 9 ? "" : undefined}>
+                          {numbers.get(g.id)}
+                        </span>
+                      )}
                     </span>
                     <span className="gs-text">
                       {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                      <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={standOf(g, held, working && !g.waits_on)} />
+                      <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={stand} />
                       {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
                       <span className="gs-word">
                         {held ? "paused" : away ? (

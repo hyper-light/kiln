@@ -37,6 +37,11 @@ function gitWords(p: Place): string[] {
     g.ahead > 0 && `${g.ahead} ahead`,
     g.behind > 0 && `${g.behind} behind`,
     !g.upstream && g.head && "no upstream",
+    // The same branch on the other machines (`kiln/<machine>/<branch>` here).
+    ...(g.peers ?? []).flatMap((o) => [
+      o.ahead > 0 && o.behind > 0 ? `diverged from ${o.machine}` : o.behind > 0 ? `${o.machine} ${o.behind} ahead` : o.ahead > 0 ? `${o.machine} ${o.ahead} behind` : null,
+      o.wip ? `work in progress on ${o.machine}` : null,
+    ]),
   ].filter((x): x is string => Boolean(x));
 }
 

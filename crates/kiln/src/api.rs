@@ -1710,6 +1710,9 @@ struct SyncCreateAsk {
     copies: Vec<SyncCopyAsk>,
     #[serde(default)]
     exclude: Vec<String>,
+    /// Its files (the default), its git refs (`git`), or both (`files_and_git`).
+    #[serde(default)]
+    mode: crate::sync::Mode,
 }
 
 /// Machines kiln knows.
@@ -1727,7 +1730,7 @@ async fn sync_create(hub: &Hub, req: Request) -> R {
         known_machine(hub, &c.machine).await?;
     }
     let what = format!("{} ({} copies)", a.name, a.copies.len());
-    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude, transient: None };
+    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude, mode: a.mode, transient: None };
     let id = hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), "sync.create".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "id": id })))
