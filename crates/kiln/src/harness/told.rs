@@ -431,7 +431,7 @@ mod tests {
         let text = line(&asking);
         assert!(text.contains("waits on a person (Run cargo publish)") && text.contains("tell the person"), "{text}");
         let mut crashed = child("c8", Status::Exited, 5, "");
-        crashed.exit = Some(crate::harness::model::ExitInfo { code: Some(1), error: Some("claude exited with 1".into()) });
+        crashed.exit = Some(crate::harness::model::ExitInfo { code: Some(1), error: Some("claude exited with 1".into()), ..Default::default() });
         assert!(line(&crashed).contains("stopped: claude exited with 1"), "{}", line(&crashed));
         Ok(())
     }

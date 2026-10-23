@@ -50,7 +50,26 @@ kiln follows every agent's state and sends a note only when it changes, once it 
 
 So a state that comes and goes says nothing, a burst of approvals is one note, and nothing is said
 twice: what was said is kept with the server's data, so a restart, or a machine coming back
-online, doesn't say it again.
+online, doesn't say it again. A request is known by its id: asked again after a restart (its
+runner's, its harness's) at another time, it's the one said already.
+
+## Put away, acted on, seen
+
+What you do with a notice is kept for you on the server, so a refresh, a restart, another device
+or browser, or kiln reached through another runner's address never shows it again:
+
+- **Put away:** a card's × (or a swipe) puts it away. A request is known by its id; a goal stack
+  paused for you, a stop or a usage limit, by its kind, its agent and since when (a stop by when it
+  ended), so the next one shows.
+- **Acted on:** a request answered, a stopped agent restarted, a paused stack resumed.
+- **Seen:** while an agent's page is open, it's seen (the server hears it at most every 30 s, and
+  as you leave): Mission control tells finished work you haven't looked at from that, on every
+  device.
+
+A device isn't pushed what you dealt with already: each request it's about put away or acted on,
+the stop or pause put away, or (a finished turn) the agent seen since it ended. Rules and webhooks
+still get the event. Putting a notice away closes its agent's notification on every device with
+kiln open. Marks are kept 30 days.
 
 ## Turning it on
 
@@ -123,6 +142,8 @@ nobody sees or removes another person's.
 | `POST /api/push/test` | `{id?}`: a test to your devices (or one), each tried once: `{sent, results: [{id, device, ok, error?}]}` |
 | `PUT /api/push/mutes/:agent` | mutes an agent for you |
 | `DELETE /api/push/mutes/:agent` | unmutes it |
+| `GET /api/push/notices` | `{you, marks}`: who you are to them (`owner`, `user:<id>`) and your marks, each `{key, how, at}`, newest first |
+| `POST /api/push/notices` | `{keys, how, tags?}`: marks up to 200 notices (`how`: `away`, `done`, or `seen` for `seen:<agent>`), at the server's time; `tags`: the agents whose shown notifications close on your devices with kiln open. Your pages hear it as a `notices` event |
 
 The kinds are `agent.needs_you`, `agent.finished`, `agent.stopped`, `agent.paused` and
 `machine.battery_low`. A push's data, which the service worker reads, is

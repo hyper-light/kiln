@@ -5,7 +5,8 @@
  * agent that stopped by itself restarted. One at a usage limit is only said. Where kiln's other
  * notifications are, on every screen: at the bottom, above any passing ones. Not on Mission
  * control, nor on the agent's own page (where the message box is): those show it themselves.
- * × (or a swipe, on a touch screen) puts one away until there's something new.
+ * × (or a swipe, on a touch screen) puts one away until there's something new: kept for you by the
+ * server (notices.ts), so no refresh, restart, device or kiln address brings it back.
  */
 import * as React from "react";
 import "./approval-toasts.css";
@@ -22,40 +23,18 @@ import { machineName } from "./parts";
 import { pauseLine } from "./pause";
 import { getNoneWaiting, getWaiting, subscribeWaiting } from "./waiting";
 import { answer, useAnswered } from "./answered";
+import { isMarked, markNotices, useMarks } from "./notices";
 
 /** Cards at once (one on a phone); past these, one line says how many more agents wait. */
 const MAX = 2;
 const PHONE = "(max-width: 640px)";
-/** Requests put away, for as long as the tab is open (by request: a new one shows again). */
-const AWAY_KEY = "kiln.requests.away";
 /** How far a finger drags a card sideways to put it away. */
 const SWIPE = 64;
 
-let away: ReadonlySet<string> = new Set(readAway());
-const awayListeners = new Set<() => void>();
-function readAway(): string[] {
-  try {
-    const v: unknown = JSON.parse(sessionStorage.getItem(AWAY_KEY) ?? "[]");
-    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-  } catch {
-    return [];
-  }
+/** Card `keys` of agent `agent` put away (`away`) or dealt with (`done`), wherever you are. */
+function putAway(keys: string[], agent: string, how: "away" | "done" = "away") {
+  markNotices(keys, how, [agent]);
 }
-function putAway(ids: string[]) {
-  away = new Set([...away, ...ids]);
-  try {
-    // The latest few hundred are plenty: a request's id is never asked again.
-    sessionStorage.setItem(AWAY_KEY, JSON.stringify([...away].slice(-300)));
-  } catch {
-    /* private mode: kept for this page only */
-  }
-  awayListeners.forEach((l) => l());
-}
-const subscribeAway = (l: () => void) => {
-  awayListeners.add(l);
-  return () => awayListeners.delete(l);
-};
-const getAway = () => away;
 
 /** What a tool call would do, as an agent's page says it. */
 const VERB: Record<string, string> = {
@@ -110,7 +89,7 @@ function Shell({ card, lead, line, busy, children }: { card: Card; lead: string;
   const { a } = card;
   const label = agentLabel(a);
   // A request puts away all its agent asks now; the rest, this one.
-  const away = () => putAway(card.kind === "request" ? a.approvals.map((p) => p.id) : [card.key]);
+  const away = () => putAway(card.kind === "request" ? a.approvals.map((p) => p.id) : [card.key], a.id);
   return (
     <li className="toast rq" data-kind={card.kind} aria-busy={busy || undefined} {...swipe(away)}>
       <span className="rq-dot" aria-hidden="true" />
@@ -206,7 +185,7 @@ function HeldCard({ card }: { card: Card }) {
   const resume = () => {
     setBusy(true);
     void harnessApi.goalAction(a.id, "start").then(
-      () => putAway([card.key]),
+      () => putAway([card.key], a.id, "done"),
       (e: unknown) => {
         toast.error(`Couldn't resume ${agentLabel(a)}'s goals`, errorMessage(e));
         setBusy(false);
@@ -244,7 +223,7 @@ function StoppedCard({ card }: { card: Card }) {
   const restart = () => {
     setBusy(true);
     void harnessApi.command(a.id, { type: "restart" }).then(
-      () => putAway([card.key]),
+      () => putAway([card.key], a.id, "done"),
       (e: unknown) => {
         toast.error(`Couldn't restart ${agentLabel(a)}`, errorMessage(e));
         setBusy(false);
@@ -286,7 +265,8 @@ function CardOf({ card }: { card: Card }) {
 
 export default function RequestToasts() {
   const waiting = React.useSyncExternalStore(subscribeWaiting, getWaiting, getNoneWaiting);
-  const gone = React.useSyncExternalStore(subscribeAway, getAway, getAway);
+  const marks = useMarks();
+  const gone = React.useMemo(() => ({ has: (key: string) => isMarked(marks, key) }), [marks]);
   const done = useAnswered();
   const path = useLocation().pathname;
   const max = useMediaQuery(PHONE) ? 1 : MAX;

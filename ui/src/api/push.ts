@@ -40,6 +40,17 @@ export interface PushTest {
 
 const enc = encodeURIComponent;
 
+/** What a person did with a notice: put it away, acted on it, or (`seen:<agent>`) saw its agent. */
+export type MarkHow = "away" | "done" | "seen";
+
+/** One of your marks, kept by the server (`notice_marks`): a request's id, `<kind>:<agent>:<since>`, `seen:<agent>`. */
+export interface NoticeMark {
+  key: string;
+  how: MarkHow;
+  /** Unix ms (the server's). */
+  at: number;
+}
+
 export const pushApi = {
   state: (signal?: AbortSignal) => request<PushState>("GET", "/api/push", undefined, { signal }),
   devices: (signal?: AbortSignal) => request<{ devices: PushDevice[] }>("GET", "/api/push/subscriptions", undefined, { signal }).then((r) => r.devices),
@@ -47,6 +58,10 @@ export const pushApi = {
   remove: (id: string) => request<void>("DELETE", `/api/push/subscriptions/${enc(id)}`),
   test: (id?: string) => request<PushTest>("POST", "/api/push/test", id ? { id } : {}),
   mute: (agent: string, on: boolean) => request<void>(on ? "PUT" : "DELETE", `/api/push/mutes/${enc(agent)}`),
+  /** Your marks, and who you are to them (`owner`, `user:<id>`). */
+  notices: (signal?: AbortSignal) => request<{ you: string; marks: NoticeMark[] }>("GET", "/api/push/notices", undefined, { signal }),
+  /** `tags`: the agents whose shown notifications go too, on every device with kiln open. */
+  mark: (keys: string[], how: MarkHow, tags: string[] = []) => request<{ marked: number; at: number }>("POST", "/api/push/notices", { keys, how, tags }),
 };
 
 /** A server that can't say (an older one, or you may not run agents): push isn't for here. */

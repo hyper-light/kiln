@@ -134,21 +134,27 @@ pub struct Watch {
     seq: u64,
 }
 
-/// The approvals waiting, as a key: each one's id and when it was asked.
+/// The approvals waiting, as a key: each one's id (a request is known by its id alone: asked again
+/// after a restart, with another time, it's still the one said).
 fn needs_key(i: &Info) -> String {
     if i.approvals.is_empty() {
         return format!("waiting@{}", i.turn_started.unwrap_or(0));
     }
-    let mut keys: Vec<String> = i.approvals.iter().map(|a| format!("{}@{}", a.id, a.at)).collect();
+    let mut keys: Vec<String> = i.approvals.iter().map(|a| a.id.clone()).collect();
     keys.sort();
     keys.join("\n")
+}
+
+/// An approval's part of a needs key, as said before too (`id@at`, before ids alone).
+fn request_of(k: &str) -> &str {
+    if k.starts_with("waiting@") { k } else { k.split('@').next().unwrap_or(k) }
 }
 
 /// Whether `key` holds an approval `said` didn't.
 fn new_needs(key: &str, said: Option<&String>) -> bool {
     let Some(said) = said else { return true };
-    let old: HashSet<&str> = said.split('\n').collect();
-    key.split('\n').any(|k| !old.contains(k))
+    let old: HashSet<&str> = said.split('\n').map(request_of).collect();
+    key.split('\n').any(|k| !old.contains(request_of(k)))
 }
 
 impl Watch {
@@ -416,7 +422,7 @@ mod tests {
     fn stands_as_mission_control_says_them() {
         assert_eq!(stand_of(&agent(Status::Running)), Stand::Working);
         assert_eq!(stand_of(&Info { approvals: vec![ask("a", 1, ToolKind::Question, "which database?")], ..agent(Status::Running) }), Stand::Needs);
-        assert_eq!(stand_of(&Info { exit: Some(ExitInfo { code: Some(1), error: Some("no such file".into()) }), ..agent(Status::Exited) }), Stand::Stopped);
+        assert_eq!(stand_of(&Info { exit: Some(ExitInfo { code: Some(1), error: Some("no such file".into()), ..Default::default() }), ..agent(Status::Exited) }), Stand::Stopped);
         assert_eq!(stand_of(&agent(Status::Exited)), Stand::Ended);
         let pause = Pause { reason: "limit".into(), window: None, label: Some("Session".into()), said: String::new(), until: None, since: 5, auto: true, by: "harness".into(), cut: None, checkpoint: None, tries: 0, checking: None, next_check: None };
         assert_eq!(stand_of(&Info { pause: Some(pause.clone()), ..agent(Status::Idle) }), Stand::Paused);
@@ -493,7 +499,7 @@ mod tests {
     fn stopped_and_paused_once_each() {
         let mut w = Watch::default();
         w.heard(agent(Status::Running));
-        let crash = Info { exit: Some(ExitInfo { code: Some(101), error: Some("claude: command not found".into()) }), ..agent(Status::Exited) };
+        let crash = Info { exit: Some(ExitInfo { code: Some(101), error: Some("claude: command not found".into()), ..Default::default() }), ..agent(Status::Exited) };
         assert_eq!(say(&mut w, crash.clone()), vec![(Kind::Stopped, "Stopped: claude: command not found".to_owned())]);
         assert!(say(&mut w, crash.clone()).is_empty());
         assert!(say(&mut w, agent(Status::Disconnected)).is_empty());
@@ -527,12 +533,32 @@ mod tests {
         let down = Info { approvals: vec![ask("q2", 20, ToolKind::Question, "ship it?")], ..agent(Status::Waiting) };
         assert_eq!(say(&mut fresh, down).len(), 1);
         // A crash said before the restart isn't said again; one that happened meanwhile is.
-        let crash = Info { exit: Some(ExitInfo { code: Some(1), error: Some("out of memory".into()) }), ..agent(Status::Exited) };
+        let crash = Info { exit: Some(ExitInfo { code: Some(1), error: Some("out of memory".into()), ..Default::default() }), ..agent(Status::Exited) };
         let mut after = Watch::default();
         after.remember("ag1", "agent.stopped", "out of memory");
         assert!(say(&mut after, crash.clone()).is_empty());
         assert_eq!(say(&mut Watch::default(), crash).len(), 1);
         Ok(())
+    }
+
+    /// A request is known by its id: asked again after a restart (a runner's, its harness's) with
+    /// another time, it's said already; a key said before ids alone (`id@at`) is taken as its id.
+    #[test]
+    fn a_request_asked_again_after_a_restart_is_said_already() {
+        let mut w = Watch::default();
+        w.heard(agent(Status::Running));
+        let first = Info { approvals: vec![ask("q1", 10, ToolKind::Question, "which database?")], ..agent(Status::Waiting) };
+        assert_eq!(say(&mut w, first).len(), 1);
+        let again = Info { approvals: vec![ask("q1", 99, ToolKind::Question, "which database?")], ..agent(Status::Waiting) };
+        let mut after = Watch::default();
+        after.remember("ag1", "agent.needs_you", "q1");
+        assert!(say(&mut after, again.clone()).is_empty(), "asked again at another time: the same request");
+        let mut upgraded = Watch::default();
+        upgraded.remember("ag1", "agent.needs_you", "q1@10");
+        assert!(say(&mut upgraded, again).is_empty(), "said before as id@at");
+        // Waiting without a request still goes by its turn.
+        assert!(new_needs("waiting@5", Some(&"waiting@4".to_owned())));
+        assert!(!new_needs("waiting@5", Some(&"waiting@5".to_owned())));
     }
 
     #[test]

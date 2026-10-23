@@ -246,6 +246,53 @@ pub fn forget(c: &Connection, agent: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a person did with a notice (`notice_marks`): put it away, acted on it, or (an agent's
+/// `seen:<agent>`) saw its agent, and when (unix ms; a `seen` mark keeps the latest).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mark {
+    pub key: String,
+    pub how: String,
+    pub at: i64,
+}
+
+/// What a mark says: put away (`away`), acted on (`done`), its agent seen (`seen`).
+pub const HOWS: &[&str] = &["away", "done", "seen"];
+/// How long a mark is kept: past it, nothing would show its notice again (a request's id is never
+/// asked again; a card's key holds when it began).
+pub const MARK_DAYS: i64 = 30;
+/// The most keys one mark takes, and the longest key.
+pub const MARK_KEYS: usize = 200;
+pub const MARK_KEY_MAX: usize = 300;
+
+/// Marks `keys` as `how`, for `principal`, at `at`; a person's marks past [`MARK_DAYS`] go.
+pub fn mark(c: &Connection, principal: &str, keys: &[String], how: &str, at: i64) -> anyhow::Result<()> {
+    let mut st = c.prepare("INSERT INTO notice_marks (principal, key, how, at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (principal, key) DO UPDATE SET how = ?3, at = MAX(at, ?4)")?;
+    for k in keys {
+        st.execute(params![principal, k, how, at])?;
+    }
+    c.execute("DELETE FROM notice_marks WHERE principal = ?1 AND at < ?2", params![principal, at - MARK_DAYS * 86_400_000])?;
+    Ok(())
+}
+
+/// A person's marks, newest first.
+pub fn marks(c: &Connection, principal: &str) -> anyhow::Result<Vec<Mark>> {
+    let mut st = c.prepare("SELECT key, how, at FROM notice_marks WHERE principal = ?1 ORDER BY at DESC LIMIT 5000")?;
+    let rows = st.query_map([principal], |r| Ok(Mark { key: r.get(0)?, how: r.get(1)?, at: r.get(2)? }))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Which of `keys` a person marked, and when.
+pub fn marked(c: &Connection, principal: &str, keys: &[String]) -> anyhow::Result<Vec<Mark>> {
+    let mut st = c.prepare("SELECT key, how, at FROM notice_marks WHERE principal = ?1 AND key = ?2")?;
+    let mut out = Vec::new();
+    for k in keys {
+        if let Some(m) = st.query_row(params![principal, k], |r| Ok(Mark { key: r.get(0)?, how: r.get(1)?, at: r.get(2)? })).optional()? {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
 /// What GET /api/push lists as kinds.
 pub fn kinds_json() -> Value {
     Value::Array(KINDS.iter().map(|(id, label, means)| serde_json::json!({ "id": id, "label": label, "means": means })).collect())
@@ -254,6 +301,25 @@ pub fn kinds_json() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_person_s_marks_are_theirs_kept_a_while_and_a_seen_one_keeps_the_latest() -> anyhow::Result<()> {
+        let c = Connection::open_in_memory()?;
+        c.execute_batch(include_str!("../store/migrations/20261023-1600_notice_marks.sql"))?;
+        let day = 86_400_000;
+        mark(&c, "owner", &["q1".to_owned(), "stopped:ag1:5".to_owned()], "away", 10 * day)?;
+        mark(&c, "user:u1", &["q1".to_owned()], "done", 10 * day)?;
+        mark(&c, "owner", &["seen:ag1".to_owned()], "seen", 12 * day)?;
+        mark(&c, "owner", &["seen:ag1".to_owned()], "seen", 11 * day)?;
+        let got = marked(&c, "owner", &["q1".to_owned(), "seen:ag1".to_owned(), "q9".to_owned()])?;
+        assert_eq!(got, vec![Mark { key: "q1".into(), how: "away".into(), at: 10 * day }, Mark { key: "seen:ag1".into(), how: "seen".into(), at: 12 * day }]);
+        assert_eq!(marks(&c, "user:u1")?.len(), 1, "each person's own");
+        // Past MARK_DAYS a person's marks go.
+        mark(&c, "owner", &["q2".to_owned()], "away", (12 + MARK_DAYS) * day)?;
+        let left: Vec<String> = marks(&c, "owner")?.into_iter().map(|m| m.key).collect();
+        assert_eq!(left, vec!["q2".to_owned(), "seen:ag1".to_owned()]);
+        Ok(())
+    }
 
     fn browser(endpoint: &str) -> anyhow::Result<NewDevice> {
         let device = aws_lc_rs::agreement::PrivateKey::generate(&aws_lc_rs::agreement::ECDH_P256).map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -1250,6 +1250,21 @@ pub struct ExitInfo {
     pub code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Unix ms it ended: what a stop is known by (its card, a person's mark of it), so a refresh
+    /// or a restart is never another stop.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub at: i64,
+}
+
+impl ExitInfo {
+    /// It ended now, with `code` and `error`.
+    pub fn now(code: Option<i32>, error: Option<String>) -> Self {
+        Self { code, error, at: crate::util::now_ms() }
+    }
+}
+
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
 }
 
 /// What rarely changes: what the harness supports and offers.

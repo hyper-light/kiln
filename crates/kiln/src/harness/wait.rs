@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(stand(&info("w5", Status::Waiting)), "needs_you");
         let asking = Info { approvals: vec![ApprovalBrief { id: "p".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "rm".into(), at: 1 }], ..info("w6", Status::Running) };
         assert_eq!(stand(&asking), "needs_you");
-        assert_eq!(stand(&Info { exit: Some(ExitInfo { code: Some(1), error: Some("boom".into()) }), ..info("w7", Status::Exited) }), "stopped");
+        assert_eq!(stand(&Info { exit: Some(ExitInfo { code: Some(1), error: Some("boom".into()), ..Default::default() }), ..info("w7", Status::Exited) }), "stopped");
         assert_eq!(stand(&info("w8", Status::Exited)), "ended");
         assert_eq!(stand(&info("w9", Status::Disconnected)), "offline");
         let paused = Info { pause: Some(crate::harness::model::Pause { reason: "limit".into(), since: 1, auto: true, by: "harness".into(), ..Default::default() }), ..info("w10", Status::Idle) };

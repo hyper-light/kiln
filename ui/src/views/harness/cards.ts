@@ -35,8 +35,8 @@ export const atLimit = (a: AgentInfo) => !!a.pause && a.status !== "running" && 
 /** Whether an agent has anything to show as a card. */
 export const notable = (a: AgentInfo) => a.approvals.length > 0 || !!a.held || stoppedItself(a) || atLimit(a);
 
-/** The cards for page `path`: requests answered here (`answered`) or put away (`away`) aren't. */
-export function cardsOf(agents: readonly AgentInfo[], path: string, away: ReadonlySet<string>, answered: { has(id: string): boolean }): Card[] {
+/** The cards for page `path`: requests answered here (`answered`) or put away or dealt with (`away`, your marks) aren't. */
+export function cardsOf(agents: readonly AgentInfo[], path: string, away: { has(key: string): boolean }, answered: { has(id: string): boolean }): Card[] {
   const cards = agents.flatMap((a): Card[] => {
     if (showsItsOwn(path, a.id)) return [];
     const open = a.approvals.filter((p) => !away.has(p.id) && !answered.has(p.id));
@@ -46,7 +46,7 @@ export function cardsOf(agents: readonly AgentInfo[], path: string, away: Readon
       return away.has(key) ? [] : [{ kind, a, key, since, more: 0 }];
     };
     if (a.held) return card("held", a.held.since);
-    if (stoppedItself(a)) return card("stopped", a.last_activity);
+    if (stoppedItself(a)) return card("stopped", a.exit?.at || a.last_activity);
     if (a.pause && atLimit(a)) return card("limit", a.pause.since);
     return [];
   });
