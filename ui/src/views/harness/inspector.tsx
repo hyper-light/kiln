@@ -366,7 +366,14 @@ export function Inspector({
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
               <section>
                 <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
-                {/* The plan it proposed (plan mode), kept by kiln: its steps to pick or run. */}
+                {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
+                {todos.length > 0 && (
+                  <div className="hx-stack">
+                    <TodoSteps todos={todos} />
+                    <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
+                  </div>
+                )}
+                {/* The plan it proposed (plan mode), in its words, kept by kiln. */}
                 {agentId ? (
                   <Loadable label="its plan" fallback={null}>
                     <ProposedPlan session={agentId} words={proposed} />
@@ -378,16 +385,6 @@ export function Inspector({
                       <SavePlan body={proposed} />
                     </div>
                   )
-                )}
-                {/* Its to-do list, each item as a step stands. */}
-                {todos.length > 0 && (
-                  <div className="hx-stack">
-                    <div className="hx-progress">
-                      <span style={{ width: `${(done / todos.length) * 100}%` }} />
-                    </div>
-                    <TodoSteps todos={todos} />
-                    <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
-                  </div>
                 )}
                 {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
               </section>

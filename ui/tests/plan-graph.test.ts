@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { blocked, curve, effectiveNeeds, rounds } from "../src/views/plans/graph-layout.ts";
+import { blocked, curve, effectiveNeeds, headline, inlineParts, rounds, type TitlePart } from "../src/views/plans/graph-layout.ts";
+import { planSteps, stepMarkdown } from "../src/views/plans/steps.ts";
 
 const step = (n: number, needs: number[]) => ({ n, title: `s${n}`, needs });
 
@@ -41,4 +42,69 @@ test("a line that would run behind another step isn't drawn: that step says what
   // The ends of a line touch its own steps' edges, never another's inside.
   assert.deepEqual(curve(0, 0, 10, 20, false, 2)[0], [0, 0]);
   assert.deepEqual(curve(0, 0, 10, 20, false, 2)[2], [10, 20]);
+});
+
+const said = (parts: TitlePart[]) => parts.map((p) => (p.code ? `<${p.text}>` : p.text)).join("");
+
+test("a step's markdown reads as its words, its code as code", () => {
+  assert.deepEqual(inlineParts("Run **all** of `cargo test` per [the docs](https://x.y)"), [
+    { code: false, text: "Run all of " },
+    { code: true, text: "cargo test" },
+    { code: false, text: " per the docs" },
+  ]);
+});
+
+test("a step that's a paragraph is titled by its bold lead, its first sentence, or what's before its colon", () => {
+  // A bold lead names it.
+  assert.equal(said(headline("**An interest word** (`crates/mem/src/handle.rs`, beside `Encoded`'s layout): - Layout: the real shard id")), "An interest word");
+  // A short first sentence is its title, without its full stop.
+  assert.equal(said(headline("Reproduce it: the CLI test fails 3 of 3. Then fix the daemon.")), "Reproduce it: the CLI test fails 3 of 3");
+  // A long one, cut at its colon (never one inside code).
+  const long =
+    "`crates/rt/tests/readiness.rs`: `a_task_racing_two_descriptors_learns_which_one_became_readable` (`left: Quiet`, `right: Signalled`), and `a_deadline_on_a_readiness_wait_that_never_comes_is_reported_as_the_deadline`.";
+  assert.equal(said(headline(long)), "<crates/rt/tests/readiness.rs>");
+  // A short title is itself; code beside code keeps the space between them.
+  assert.equal(said(headline("Op: conversations.search")), "Op: conversations.search");
+  assert.equal(said(headline("`a.rs` `b.rs` together")), "<a.rs> <b.rs> together");
+});
+
+test("a long title without a place to cut stops between words", () => {
+  const words = Array.from({ length: 40 }, (_, i) => `word${i}`).join(" ");
+  const t = said(headline(words, 60));
+  assert.ok(t.endsWith("…"), t);
+  assert.ok(t.length <= 60, t);
+  assert.ok(/word\d+…$/.test(t), t);
+});
+
+test("a plain plan's step reads as its markdown, what's indented under it and all", () => {
+  const body = [
+    "# Fix it",
+    "",
+    "## Tests first",
+    "",
+    "1. `readiness.rs`: two descriptors race.",
+    "",
+    "```",
+    "- not a step: code",
+    "```",
+    "",
+    "## The change",
+    "",
+    "2. **An interest word** (`handle.rs`):",
+    "   - Layout: the real shard id.",
+    "   - Decoding it never yields a handle.",
+    "",
+    "   ```rust",
+    "   const MARK: u16 = 0x7fff;",
+    "   ```",
+    "3. Run the tests.",
+    "",
+    "Then ship it.",
+  ].join("\n");
+  // Numbered as the server numbers them: list items at the top, none inside code.
+  assert.equal(planSteps(body).length, 3);
+  assert.equal(stepMarkdown(body, 1), "`readiness.rs`: two descriptors race.");
+  assert.equal(stepMarkdown(body, 2), "**An interest word** (`handle.rs`):\n- Layout: the real shard id.\n- Decoding it never yields a handle.\n\n```rust\nconst MARK: u16 = 0x7fff;\n```");
+  assert.equal(stepMarkdown(body, 3), "Run the tests.");
+  assert.equal(stepMarkdown(body, 4), "");
 });

@@ -6,6 +6,7 @@
  * faint; waiting, only sketched, still. Only work in progress moves, and only by what the GPU
  * moves.
  */
+import type { ReactNode } from "react";
 import { Beam, Optic, Shimmer, type BeamStatus } from "@/views/harness/signals";
 
 /** Where a step (or a goal) stands, as its glyph shows it. */
@@ -40,7 +41,7 @@ export function StepGlyph({ stand, className }: { stand: Stand; className?: stri
 }
 
 /** A step's title: in the holographic shimmer while it's worked on, its own way (`flow`: the step's id), painted into its own letters as a working agent's are. */
-export function StandTitle({ stand, children, flow }: { stand: Stand; children: string; flow?: string }) {
+export function StandTitle({ stand, children, flow }: { stand: Stand; children: ReactNode; flow?: string }) {
   return (
     <Shimmer on={stand === "working"} flow={flow}>
       {children}
