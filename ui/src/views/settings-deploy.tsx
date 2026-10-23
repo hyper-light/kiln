@@ -615,23 +615,26 @@ function chatMissing(kind: string, setup: ChatSetup): string | null {
 /** Where a chat's commands and buttons come to kiln, what that chat needs set, and for a Telegram
  * bot, its webhook pointed here (docs/deploy-api.md §12.3). */
 function ChatCommands({ a, id }: { a: Integration; id: string }) {
+  return (
+    <Loadable label={`${a.name}'s commands`} fallback={<Hold height={60} />}>
+      <ChatCommandsLoaded a={a} id={id} />
+    </Loadable>
+  );
+}
+
+function ChatCommandsLoaded({ a, id }: { a: Integration; id: string }) {
   const { setData } = useRes(integrationsRes);
-  const [setup, setSetup] = React.useState<ChatSetup | null>(null);
+  const chat = useRes<ChatSetup>({ key: `ci/integrations/${a.name}/chat`, fetch: (sig) => api.integrationChat(a.name, sig) });
+  const setup = chat.data;
   const [problem, setProblem] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [draft, setDraft] = React.useState("");
-  React.useEffect(() => {
-    const ctl = new AbortController();
-    api.integrationChat(a.name, ctl.signal).then(setSetup, (e) => {
-      if (!ctl.signal.aborted) setProblem(errorText(e));
-    });
-    return () => ctl.abort();
-  }, [a.name]);
   const connect = async () => {
     setBusy(true);
     setProblem(null);
     try {
-      setSetup(await api.connectIntegrationChat(a.name));
+      const next = await api.connectIntegrationChat(a.name);
+      chat.setData(() => next);
       invalidate("ci/integrations");
       toast({ title: `${a.name}'s bot reports to kiln`, description: "Commands and buttons in its chats come here now.", tone: "succeeded" });
     } catch (e) {
@@ -648,7 +651,8 @@ function ChatCommands({ a, id }: { a: Integration; id: string }) {
       const changed = await api.updateIntegration(a.name, a.kind === "discord" ? { config: { ...a.config, public_key: value } } : { signing_secret: value });
       setData((data) => ({ ...data, integrations: upsert(data.integrations, changed, (item) => item.id, false) }));
       invalidate("ci/integrations");
-      setSetup(await api.integrationChat(a.name));
+      const next = await api.integrationChat(a.name);
+      chat.setData(() => next);
       setDraft("");
     } catch (e) {
       setProblem(errorText(e));
@@ -656,7 +660,6 @@ function ChatCommands({ a, id }: { a: Integration; id: string }) {
       setBusy(false);
     }
   };
-  if (!setup) return problem ? <p className="dep-status" data-tone="error" role="alert">{problem}</p> : <Hold height={60} />;
   const missing = chatMissing(a.kind, setup);
   const asks = a.kind === "discord" ? (setup.public_key ? null : "The application's public key") : a.kind === "telegram" ? null : setup.signing_secret ? null : a.kind === "teams" ? "The outgoing webhook's security token" : "The Slack app's signing secret";
   return (
