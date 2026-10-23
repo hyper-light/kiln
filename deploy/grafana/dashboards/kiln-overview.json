@@ -3221,7 +3221,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(kiln_bus_deliver_seconds_bucket{job=\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(kiln_bus_delivery_seconds_bucket{job=\"$job\"}[5m])))",
           "legendFormat": "p50",
           "range": true,
           "instant": false
@@ -3232,7 +3232,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kiln_bus_deliver_seconds_bucket{job=\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kiln_bus_delivery_seconds_bucket{job=\"$job\"}[5m])))",
           "legendFormat": "p99",
           "range": true,
           "instant": false

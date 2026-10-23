@@ -57,9 +57,9 @@ another class.
 | Metric | What it counts |
 |---|---|
 | `kiln_bus_published_total` | Frames sessions' live feeds published. |
-| `kiln_bus_refused_total{op}` | What the bus refused a live feed, by operation (`create`, `publish`, `delete`): each sends the feed's viewers back to a snapshot. |
+| `kiln_bus_refused_total{op}` | What the bus refused a live feed, by operation (`create`, `publish`, `delete`): a refused create or publish sends the feed's viewers back to a snapshot (a warning on target `kiln.bus`); a refused delete leaves an ended session's topic behind (info). |
 | `kiln_bus_lag_notices_total` | Viewers told they fell behind what a feed keeps, and sent back to a snapshot. |
-| `kiln_bus_deliver_seconds` | How long a frame took from its publish to a viewer's read. |
+| `kiln_bus_delivery_seconds` | How long a frame took from its publish to a viewer's read. |
 | `kiln_bus_topics` | Topics the bus holds. |
 | `kiln_bus_viewers` | Viewers reading sessions' live feeds. |
 | `kiln_bus_memory_bytes`, `kiln_bus_memory_limit_bytes` | Bytes the bus's messages take, and may take. |

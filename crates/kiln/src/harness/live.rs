@@ -12,8 +12,9 @@
 //! viewer back to a snapshot. A mirror let go (the session ended) drops its feed, and the feed's
 //! topic goes with it.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use futures::FutureExt as _;
 use kiln_seams::Bus;
@@ -38,20 +39,36 @@ pub fn topic(id: &str, n: u64) -> String {
     if plain { format!("sessions/{id}/{n}") } else { format!("sessions/sha256-{}/{n}", kiln_seams::sha256_hex(id.as_bytes())) }
 }
 
-/// A frame as the bus carries it: its whole text's length (4 bytes, little-endian), the text,
-/// then what changed in a state when there's a patch (the rest).
+/// Microseconds on this process's monotonic clock: a frame's publish and its read are both here
+/// (the feed's topic is this process's), so their difference is its delivery, finer than the
+/// bus's millisecond stamps.
+pub fn now_us() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(BASE.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// A frame as the bus carries it: when it was published ([`now_us`], 8 bytes, little-endian),
+/// its whole text's length (4 bytes, little-endian), the text, then what changed in a state when
+/// there's a patch (the rest). The topic is this process's alone, so the form is free to change.
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let patch = frame.patch.as_deref().unwrap_or_default();
-    let mut out = Vec::with_capacity(frame.text.len().saturating_add(patch.len()).saturating_add(4));
+    let mut out = Vec::with_capacity(frame.text.len().saturating_add(patch.len()).saturating_add(12));
+    out.extend_from_slice(&now_us().to_le_bytes());
     out.extend_from_slice(&u32::try_from(frame.text.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(frame.text.as_bytes());
     out.extend_from_slice(patch.as_bytes());
     out
 }
 
+/// When the frame in `bytes` was published ([`now_us`]); `None` for bytes [`encode`] didn't make.
+pub fn published_us(bytes: &[u8]) -> Option<u64> {
+    bytes.first_chunk::<8>().map(|at| u64::from_le_bytes(*at))
+}
+
 /// A frame from what [`encode`] made; `None` for bytes it didn't make.
 pub fn decode(bytes: &[u8]) -> Option<Frame> {
-    let (len, rest) = bytes.split_first_chunk::<4>()?;
+    let (_, rest) = bytes.split_first_chunk::<8>()?;
+    let (len, rest) = rest.split_first_chunk::<4>()?;
     let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
     let text = std::str::from_utf8(rest.get(..len)?).ok()?;
     let patch = std::str::from_utf8(rest.get(len..)?).ok()?;
@@ -198,7 +215,9 @@ impl Drop for Feed {
             && let Err(e) = at_once(self.bus.delete(&self.topic))
         {
             crate::metrics::bus().refused.inc(&["delete"]);
-            tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %self.topic, error = %e, "a session's live feed couldn't be let go");
+            // No viewer loses anything (the session ended): info, where a viewer sent back to a
+            // snapshot warns.
+            tracing::info!(target: "kiln.bus", event = "feed.refused", topic = %self.topic, error = %e, "a session's live feed couldn't be let go");
         }
     }
 }
@@ -221,7 +240,19 @@ mod tests {
             assert_eq!(back, Some((f.text.to_string(), f.patch.as_deref().map(str::to_owned))));
         }
         assert!(decode(b"\x09\x00").is_none());
-        assert!(decode(b"\x05\x00\x00\x00abc").is_none());
+        assert!(decode(b"\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00abc").is_none());
+    }
+
+    /// A frame carries when it was published, on this process's microsecond clock: what the
+    /// feed's delivery is timed from.
+    #[test]
+    fn a_frame_carries_the_microsecond_it_was_published() {
+        let before = now_us();
+        let bytes = encode(&Frame::of(r#"{"t":"events","events":[]}"#.to_owned()));
+        let after = now_us();
+        let at = published_us(&bytes);
+        assert!(at.is_some_and(|at| (before..=after).contains(&at)), "{at:?} not in {before}..={after}");
+        assert_eq!(published_us(b"\x01\x02"), None);
     }
 
     /// Topic names: a session's id where it fits a name, its SHA-256 where it doesn't; the bus

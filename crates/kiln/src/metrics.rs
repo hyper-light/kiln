@@ -54,6 +54,10 @@ pub const DURATION_BUCKETS: &[f64] =
 pub const QUEUE_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0];
 /// A millisecond to ten minutes, about 2.5 times apart: sync's commits, transfers and how long a
 /// change takes to reach another machine, and a move's waits.
+/// 50 µs to 5 s: an in-process delivery (the live feed's publish to a viewer's read) sits well
+/// under a millisecond, so the buckets start there (Kiln Metrics, 2026-10-23).
+pub const DELIVERY_BUCKETS: &[f64] =
+    &[0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 pub const LATENCY_BUCKETS: &[f64] =
     &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 150.0, 300.0, 600.0];
 
@@ -486,12 +490,12 @@ pub struct BusMetrics {
     /// Viewers told they fell behind what a feed keeps, and sent back to a snapshot.
     pub lag_notices: Counter,
     /// How long a frame took from its publish to a viewer's read.
-    pub deliver_seconds: Histogram,
+    pub delivery_seconds: Histogram,
 }
 
 pub fn bus() -> &'static BusMetrics {
     static M: OnceLock<BusMetrics> = OnceLock::new();
-    M.get_or_init(|| BusMetrics { published: Counter::default(), refused: CounterVec::new(&["op"]), lag_notices: Counter::default(), deliver_seconds: Histogram::new(LATENCY_BUCKETS) })
+    M.get_or_init(|| BusMetrics { published: Counter::default(), refused: CounterVec::new(&["op"]), lag_notices: Counter::default(), delivery_seconds: Histogram::new(DELIVERY_BUCKETS) })
 }
 
 /// The bus's figures as the server's node states them when scraped: set by whoever holds the bus.
@@ -520,8 +524,8 @@ fn render_bus(o: &mut String) {
     m.refused.render(o, "kiln_bus_refused_total");
     help(o, "kiln_bus_lag_notices_total", "counter", "Viewers told they fell behind what a live feed keeps, and sent back to a snapshot.");
     let _ = writeln!(o, "kiln_bus_lag_notices_total {}", m.lag_notices.get());
-    help(o, "kiln_bus_deliver_seconds", "histogram", "How long a live feed's frame took from its publish to a viewer's read.");
-    m.deliver_seconds.render(o, "kiln_bus_deliver_seconds", "");
+    help(o, "kiln_bus_delivery_seconds", "histogram", "How long a live feed's frame took from its publish to a viewer's read.");
+    m.delivery_seconds.render(o, "kiln_bus_delivery_seconds", "");
     help(o, "kiln_bus_topics", "gauge", "Topics the bus holds.");
     let _ = writeln!(o, "kiln_bus_topics {}", g.topics.get());
     help(o, "kiln_bus_viewers", "gauge", "Viewers reading sessions' live feeds.");

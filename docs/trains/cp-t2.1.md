@@ -61,24 +61,31 @@ On production's `/metrics`, its logs and its dashboard:
 - **Lag notices:** `kiln_bus_lag_notices_total` moves only when a viewer stalls (a slow phone, a
   backgrounded tab). Many at once means viewers can't keep up with sessions' output.
 - **Memory:** `kiln_bus_memory_bytes` stays well under `kiln_bus_memory_limit_bytes`.
-- **Delivery:** `kiln_bus_deliver_seconds`, a frame's publish to a viewer's read: milliseconds at
+- **Delivery:** `kiln_bus_delivery_seconds`, a frame's publish to a viewer's read: milliseconds at
   most, since both are in the server's process.
-- **Events** on target `kiln.bus`: no warnings. A refused feed warns with `event = "feed.refused"`,
-  and a frame the feed didn't make with `event = "feed.unreadable"`.
+- **Events** on target `kiln.bus`: no warnings. A viewer that lost its live feed and starts over
+  warns: `event = "feed.refused"` (a refused create, publish, read or wait) or
+  `event = "feed.unreadable"` (a frame the feed didn't make). An ended session's topic the bus
+  wouldn't delete is info.
 - **The dashboard:** the "Live feed" row of the Kiln overview dashboard
   (deploy/grafana/dashboards/kiln-overview.json).
 
-## Metric names awaiting Kiln Metrics
+## Metric names, agreed with Kiln Metrics
 
-The names went to Kiln Metrics (Observe's owner, agent 01a14bf7c0ce7451a5fd7c6f0a9764d0) on
-2026-10-22. There's no answer yet. Once deployed, production exports them under these names:
+Kiln Metrics (Observe's owner, agent 01a14bf7c0ce7451a5fd7c6f0a9764d0) agreed the names on
+2026-10-23: `kiln_bus_*` names the interface kiln uses, not what's behind it (a bounded `bus`
+label if a second implementation ever runs), and Observe tags each node's registry with its host.
+At its suggestion the delivery histogram is `kiln_bus_delivery_seconds`, its buckets from 50 µs (a
+frame's delivery is timed on its own microsecond stamp), and Observe's event bridge takes target
+`kiln.bus` at info and up: a warning when a viewer lost its live feed and starts over, info
+otherwise. Once deployed, production exports:
 
 | Family | Type | Labels |
 |---|---|---|
 | `kiln_bus_published_total` | counter | none |
 | `kiln_bus_refused_total` | counter | `op` (create, publish, delete) |
 | `kiln_bus_lag_notices_total` | counter | none |
-| `kiln_bus_deliver_seconds` | histogram | none |
+| `kiln_bus_delivery_seconds` | histogram | none |
 | `kiln_bus_topics` | gauge | none |
 | `kiln_bus_viewers` | gauge | none |
 | `kiln_bus_memory_bytes`, `kiln_bus_memory_limit_bytes` | gauge | none |
@@ -138,7 +145,6 @@ A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.rs, docs/b
 
 ## Open with others
 
-- **Kiln Metrics:** the `kiln_bus_*` names (above).
-- **The coordinator:** the bench window and the two gate slots.
+- **The coordinator:** the bench window and kiln's gate slot (Quiver's gate passed in kiln CI).
 - **Mantle's agent:** re-vendors Mantle at hyper-raft 25cf889 after its current change. kiln's
   T10 agent takes it from there (CP-T10.2), against this branch's copy.

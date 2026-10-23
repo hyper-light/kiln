@@ -4695,7 +4695,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             w = live.fuse() => match w {
                 Live::Ready => match hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ).await {
                     Ok(batch) => {
-                        let now = crate::util::now_ms();
+                        // Read now: each frame's delivery, from its publish on this process's
+                        // microsecond clock (the bus's own stamps are milliseconds).
+                        let now = crate::harness::live::now_us();
                         for m in &batch.messages {
                             match crate::harness::live::decode(&m.payload) {
                                 Some(frame) if frame.text.as_ref() == crate::harness::live::RESYNC => {
@@ -4703,8 +4705,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                                     break;
                                 }
                                 Some(frame) => {
-                                    let ms = now.saturating_sub(m.at_ms).max(0);
-                                    crate::metrics::bus().deliver_seconds.observe(ms as f64 / 1000.0);
+                                    if let Some(at) = crate::harness::live::published_us(&m.payload) {
+                                        crate::metrics::bus().delivery_seconds.observe(now.saturating_sub(at) as f64 / 1e6);
+                                    }
                                     tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
                                 }
                                 None => {
