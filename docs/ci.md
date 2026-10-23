@@ -3852,7 +3852,13 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     from network URLs only); `repos` gains `mode` and `default_branch` (R13's first part);
   - clone and push over HTTPS at `/git/<owner>/<repo>.git` (and at the root, for legs), with a
     PAT or an agent token as git's password, or a leg's `GITHUB_TOKEN`;
-  - fetches need `diffs.read` (a leg: `contents: read`, its own repository only);
+  - fetches need `diffs.read` (a leg: `contents: read`, its own repository only), except of a
+    public repository (`POST /api/repos` with `public: true`, shown as `public` in its listing),
+    which anyone reads without a token, as anyone reads a public GitHub repository. A step's
+    `git fetch` after `actions/checkout`'s `persist-credentials: false` relies on it (the
+    corpus's elixir; its repositories are public, as on GitHub). A token that isn't kiln's is
+    refused, public or not, and a push always needs one
+    (`w14_r01_public_repositories_read_without_a_token`);
   - a push's ref updates are read before git sees the pack, and the push is refused whole, in
     git's own report and as `remote: kiln: …` lines, when one of them breaks policy:
     - only the owner, or a principal `.kiln/review.yaml` `direct-push` names (read from trunk),
