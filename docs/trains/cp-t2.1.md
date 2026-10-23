@@ -5,18 +5,16 @@ delivers, what deploying it does and how to watch it, its risks and its rollback
 open: the metric names Kiln Metrics hasn't answered and the decisions that are Ada's.
 
 **Where it stands (2026-10-23):**
-- **Not merged.** Branch `cp/t2-quiver` at 543d566, local. It merged main at 131601d (main's
-  6adf2ba), so it merges main again before it lands.
+- **Not merged.** Branch `cp/t2-quiver`, local, has merged main at 719c954 (76b6baf). Main's new
+  kiln-http took hyper-rt from git at 767627f; it now takes the vendored copy, so kiln holds one
+  hyper-raft.
 - **Not gated.** Its two gates, Quiver's and kiln's, wait for slots from the coordinator. What
-  has run on fedora so far, as development checks:
-  - clippy on every target;
-  - kiln's 1,092 unit tests;
-  - the vendored test (8);
-  - the live-feed labs (2);
-  - the blob labs;
-  - kiln-cd's tests (153).
-  The later moves (hyper-raft 25cf889, Focal's bus f8052a5) changed no code; the vendored test
-  and `vendor.py check` ran again on them.
+  has run on fedora on the merged tree, as development checks:
+  - clippy on kiln, kiln-cd, kiln-seams and kiln-http, every target;
+  - kiln's unit tests: 1,323 passed, none failed;
+  - the live-feed labs (2) and the vendored test (8);
+  - kiln-http's tests (39) and kiln-cd's (153).
+  The blob labs passed before the merge.
 - **Not measured.** AC-T2.1.2 to AC-T2.1.4 (Quiver's fan-out bench and its hour's soak) and the
   comparison with NATS, Redis and Kafka wait for a quiet window on fedora.
 - **Quiver** is at ea4c372, local; it's pushed to hyper-light/quiver once its gate passes.
