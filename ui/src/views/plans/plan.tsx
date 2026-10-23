@@ -8,7 +8,7 @@
  * says so.
  */
 import * as React from "react";
-import { Link, useNavigate, useParams } from "@/lib/router";
+import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { harnessApi, type KindInfo } from "@/api/harness";
 import { planHref, plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
@@ -133,8 +133,15 @@ function PlanEditor({ id }: { id: string }) {
   const [preview, setPreview] = React.useState(true);
   // A plan is read first; its words and steps are changed on asking (a new one is written at once).
   const [editing, setEditing] = React.useState(isNew);
-  // Steps picked to run just those.
-  const [picked, setPicked] = React.useState<number[]>([]);
+  // Steps picked to run just those (`?pick=2,3`: picked elsewhere, an agent's Plan tab, to run here).
+  const [search] = useSearchParams();
+  const [picked, setPicked] = React.useState<number[]>(() =>
+    (search.get("pick") ?? "")
+      .split(",")
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n > 0),
+  );
+  const [cameToRun] = React.useState(() => search.has("pick"));
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -220,15 +227,7 @@ function PlanEditor({ id }: { id: string }) {
               <Prose text={withoutTitle(plan.body, plan.title)} />
             </div>
           )}
-          <PlanSteps
-            plan={plan}
-            picked={picked}
-            onPick={setPicked}
-            onRun={(n) => {
-              setPicked([n]);
-              document.getElementById("plan-run")?.scrollIntoView({ behavior: "smooth", block: "start" });
-            }}
-          />
+          <PlanSteps plan={plan} picked={picked} onPick={setPicked} onRun={() => document.getElementById("plan-run")?.scrollIntoView({ behavior: "smooth", block: "start" })} />
         </>
       ) : (
         <>
@@ -318,7 +317,7 @@ function PlanEditor({ id }: { id: string }) {
             </section>
           ) : (
             <Loadable label="where it can run" fallback={<RunHold />}>
-              <RunPlan plan={plan} dirty={dirty} picked={picked} onPicked={setPicked} onRan={() => invalidate(`plans/${plan.id}`)} />
+              <RunPlan plan={plan} dirty={dirty} picked={picked} onPicked={setPicked} onRan={() => invalidate(`plans/${plan.id}`)} focus={cameToRun} />
             </Loadable>
           )}
           <SharePlan plan={plan} onChange={(p) => res.setData(() => p)} />
@@ -364,11 +363,15 @@ function RunHold() {
 }
 
 /** Run the plan on an agent. */
-function RunPlan({ plan, dirty, picked, onPicked, onRan }: { plan: Plan; dirty: boolean; picked: number[]; onPicked: (n: number[]) => void; onRan: () => void }) {
+function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; dirty: boolean; picked: number[]; onPicked: (n: number[]) => void; onRan: () => void; focus?: boolean }) {
   warm(harnessSessionsRes, kindsRes);
   const agents = useRes(harnessSessionsRes).data;
   const kinds = useRes(kindsRes).data;
-  const [where, setWhere] = React.useState("new");
+  // On the agent it came from, while that agent runs; else a new one.
+  const [where, setWhere] = React.useState(() => {
+    const from = plan.source?.session;
+    return from && agents.some((a) => a.id === from && a.status !== "exited") ? from : "new";
+  });
   const [target, setTarget] = React.useState("local");
   const [kindChoice, setKind] = React.useState("");
   const [cwd, setCwd] = React.useState("");
@@ -415,13 +418,13 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan }: { plan: Plan; dirty: 
   };
 
   return (
-    <section className="plan-section" id="plan-run" aria-label="Run the plan">
+    <section className="plan-section" id="plan-run" aria-label="Run the plan" ref={focus ? (el) => el?.scrollIntoView({ block: "start" }) : undefined}>
       <h2 className="plan-h">{some ? `Run ${stepsWords(picked)}` : "Run it"}</h2>
       {some && (
         <p className="plan-dim plan-meta-line">
           Just {picked.length === 1 ? "that step" : "those steps"}, each keeping its number; the steps {picked.length === 1 ? "it waits" : "they wait"} for outside{" "}
           {picked.length === 1 ? "it" : "them"} are taken as done.{" "}
-          <button type="button" className="ps-link" onClick={() => onPicked([])}>
+          <button type="button" className="sv-link" onClick={() => onPicked([])}>
             Run the whole plan instead
           </button>
         </p>

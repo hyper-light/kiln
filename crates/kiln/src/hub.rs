@@ -73,6 +73,33 @@ impl OutpostInvites {
     }
 }
 
+/// Whether a runner carries a label a job asks for (`runs-on`), in any case: one of its own, its
+/// name, or what its platform says (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
+/// `aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled so.
+fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
+    want == name || labels.iter().any(|l| l.eq_ignore_ascii_case(want)) || platform_labels(os, arch).iter().any(|l| l.eq_ignore_ascii_case(want))
+}
+
+/// The labels a runner's platform gives it.
+fn platform_labels<'a>(os: &'a str, arch: &'a str) -> Vec<&'a str> {
+    let mut v = vec!["self-hosted", os, arch];
+    if os == "macos" {
+        v.push("darwin");
+    }
+    match arch {
+        "x86_64" => v.extend(["amd64", "x64"]),
+        "aarch64" => v.push("arm64"),
+        _ => {}
+    }
+    v.retain(|l| !l.is_empty());
+    v
+}
+
+/// How hard a runner is pressed, by its last sample (none yet: unknown, not overloaded).
+fn strain_of(a: &AgentLive) -> crate::reach::directory::Strain {
+    a.sample.as_ref().map(|s| crate::reach::directory::strain(s.cpus, s.cpu_pct, s.load1, s.mem_total, s.mem_used)).unwrap_or_default()
+}
+
 /// An outpost (`kiln outpost`) says so with its label and no slots; a runner given the label by
 /// hand still takes jobs.
 fn is_outpost(labels: &[String], slots: u32) -> bool {
@@ -213,6 +240,8 @@ pub struct Hub {
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
     pub tasks: crate::sync::tasks::Tasks,
+    /// Work kept in step between the machines that hold a repository (`crate::sync::share`).
+    pub shares: crate::sync::share::Shares,
     /// Notifications to people's devices (`crate::push`).
     pub push: crate::push::Service,
     /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
@@ -307,6 +336,7 @@ impl Hub {
             reach: Mutex::new(crate::reach::relay::Relay::default()),
             places,
             tasks,
+            shares: crate::sync::share::Shares::default(),
             push: crate::push::Service::default(),
             blobs,
         }))
@@ -385,7 +415,10 @@ impl Hub {
                 if self.places.heard(machine, r) {
                     self.emit(&serde_json::json!({ "type": "places" }));
                 }
+                // Said when it connects, and when what it holds changes: what it shares.
+                self.shares.arrange(self);
             }
+            Some(crate::sync::wire::Msg::Shared(w)) => self.shares.shared(self, machine, *w),
             Some(crate::sync::wire::Msg::Task(news)) => self.tasks.heard(machine, news),
             Some(msg) => self.sync.from_runner(machine, msg, raft),
             None => {}
@@ -2027,13 +2060,16 @@ impl Hub {
                 Some(d) => d == &job.id,
                 None => true,
             })
-            .filter(|a| job.labels.iter().all(|l| a.labels.contains(l) || l == &a.name))
+            .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
             .filter(|a| if exclusive { a.running.is_empty() } else { a.busy < a.slots })
-            // Least loaded first, then most free slots.
-            .min_by(|a, b| {
-                let la = f64::from(a.busy) / f64::from(a.slots.max(1));
-                let lb = f64::from(b.busy) / f64::from(b.slots.max(1));
-                la.total_cmp(&lb).then(b.slots.cmp(&a.slots))
+            // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
+            // job goes to another, or waits for one (a pod made for it is its own).
+            .filter(|a| a.ephemeral || !strain_of(a).overloaded)
+            // The one with the most room: by its idle cores, free memory and CI slots taken, as
+            // reach measures it; then the most slots.
+            .max_by(|a, b| {
+                let (ra, rb) = (crate::reach::directory::room(strain_of(a), a.busy, a.slots), crate::reach::directory::room(strain_of(b), b.busy, b.slots));
+                ra.total_cmp(&rb).then(a.slots.cmp(&b.slots)).then(b.name.cmp(&a.name))
             })
             .map(|a| a.name.clone())
     }
@@ -2189,6 +2225,21 @@ impl Hub {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A job's labels fit a runner by its own labels, its name, or its platform (`linux`, `amd64`,
+    /// `arm64`, `self-hosted`), in any case: `[linux]` isn't only for runners labelled so.
+    #[test]
+    fn a_job_for_linux_fits_every_linux_runner() {
+        let own = vec!["baremetal".to_owned(), "bench".to_owned(), "local".to_owned()];
+        let fits = |want: &str| carries(&own, "linux", "x86_64", "adacachy", want);
+        for w in ["linux", "Linux", "x86_64", "amd64", "X64", "self-hosted", "baremetal", "BENCH", "adacachy"] {
+            assert!(fits(w), "{w}");
+        }
+        for w in ["macos", "arm64", "gpu", "windows"] {
+            assert!(!fits(w), "{w}");
+        }
+        assert!(carries(&[], "macos", "aarch64", "mac", "arm64") && carries(&[], "macos", "aarch64", "mac", "darwin"));
+    }
 
     /// A hub of its own for a test: its data in a folder that lives as long as the process (tests
     /// end with it), a QUIC endpoint on a free loopback port, no runners, its agents off unless a

@@ -362,6 +362,10 @@ pub struct Codex {
     seed: Option<Vec<Value>>,
     seeded: bool,
     injecting: bool,
+    /// The goal the thread it went on from pursued (a move), set on the new thread once its
+    /// conversation is in (`thread/goal/set`'s params, but the thread).
+    #[serde(default)]
+    goal: Option<Value>,
 }
 
 impl Codex {
@@ -434,13 +438,33 @@ impl Codex {
             seed: None,
             seeded: false,
             injecting: false,
+            goal: None,
         }
     }
 
-    /// Start the new thread with this conversation (one carried over from another harness).
+    /// Start the new thread with this conversation (one carried over from another harness), and
+    /// the goal it pursued, if one came with it (`moving::GOAL`).
     pub fn seed(&mut self, items: Vec<Value>) {
+        let (goals, items): (Vec<Value>, Vec<Value>) = items.into_iter().partition(|i| i.get("type").and_then(Value::as_str) == Some(super::moving::GOAL));
+        self.goal = goals.into_iter().last().map(|mut g| {
+            if let Some(o) = g.as_object_mut() {
+                o.remove("type");
+                o.retain(|_, v| !v.is_null());
+            }
+            g
+        });
         self.seeded = items.is_empty();
         self.seed = (!items.is_empty()).then_some(items);
+    }
+
+    /// The goal that came with the conversation, set on the thread it goes on in.
+    fn set_carried_goal(&mut self, core: &mut Core) {
+        let (Some(mut params), Some(thread)) = (self.goal.take(), self.thread.clone()) else { return };
+        if let Some(o) = params.as_object_mut() {
+            o.insert("threadId".into(), json!(thread));
+            o.insert("origin".into(), json!("user"));
+        }
+        self.request(core, Pending::Plain("Setting the goal it pursued again".into()), "thread/goal/set", params);
     }
 
     /// The conversation it was given is in its thread (or it was given none).
@@ -1330,9 +1354,11 @@ impl Codex {
         if core.state.mcp.iter().any(|m| m.status == McpStatus::Pending) && now - self.mcp_at > 4_000 {
             self.ask_mcp(core);
         }
-        if self.account_kind.as_deref() == Some("chatgpt") && now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits)) {
+        // Every few minutes its account, read again (one signed in outside kiln, `codex login` in a
+        // terminal, shows), and with a ChatGPT account its rate limits.
+        if now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits | Pending::Account)) {
             self.usage_at = now;
-            self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
+            self.request(core, Pending::Account, "account/read", json!({}));
         }
     }
 
@@ -1932,6 +1958,8 @@ impl Codex {
                 Pending::Inject => {
                     self.injecting = false;
                     self.notice(core, Level::Error, format!("Codex did not take the conversation carried over: {msg}"));
+                    // Without the conversation, its goal would be pursued from nothing.
+                    self.goal = None;
                     self.ready(core);
                 }
                 Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
@@ -2025,6 +2053,8 @@ impl Codex {
                     self.settle(core);
                     return;
                 }
+                // A goal that came without a conversation to go in first.
+                self.set_carried_goal(core);
                 // A resumed thread's history: inline from a Codex that still sends it so, else
                 // its latest turns, listed (the session is ready once they are in).
                 let turns = thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -2236,6 +2266,8 @@ impl Codex {
                 // old account's limits go, and a pause for one ends.
                 if was.is_some() && core.state.account != was {
                     core.state.limits.clear();
+                    // What was read of the old account's limits is never shown as the new one's.
+                    self.rate_limits.clear();
                     if core.state.pause.is_some()
                         && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
                     {
@@ -2357,6 +2389,8 @@ impl Codex {
             Pending::Inject => {
                 self.injecting = false;
                 self.seeded = true;
+                // The conversation is in: the goal it pursued goes on too.
+                self.set_carried_goal(core);
                 self.ready(core);
             }
             Pending::Revert(ev) => {
@@ -4790,6 +4824,44 @@ mod tests {
         Ok(())
     }
 
+    /// A move's goal goes on in the new thread, once the conversation is in; without a
+    /// conversation, as soon as the thread is open; not when Codex didn't take the conversation.
+    #[test]
+    fn a_goal_carried_over_is_set_on_the_new_thread_once_the_conversation_is_in() {
+        let goal = json!({"type": super::super::moving::GOAL, "objective": "port the parser", "status": "active", "tokenBudget": 200_000});
+        let said = json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "port the parser"}]});
+        let open = |items: Vec<Value>| {
+            let mut core = Core::new();
+            core.state.cwd = "/work".into();
+            let mut c = Codex::new(None, None, None, false);
+            c.seed(items);
+            c.start(&mut core);
+            feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
+            feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th2", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
+            let w = written(&mut core);
+            (c, core, w)
+        };
+        let set = |w: &[Value]| w.iter().find(|v| v.get("method") == Some(&json!("thread/goal/set"))).and_then(|v| v.get("params")).cloned();
+        let (mut c, mut core, w) = open(vec![said.clone(), goal.clone()]);
+        let inject = w.iter().find(|v| v.get("method") == Some(&json!("thread/inject_items"))).cloned().unwrap_or_default();
+        // The conversation alone goes in; the goal waits for it.
+        assert_eq!(inject.pointer("/params/items"), Some(&json!([said.clone()])));
+        assert_eq!(set(&w), None);
+        respond(&mut c, &mut core, &w, "thread/inject_items", json!({}));
+        assert!(c.seeded());
+        assert_eq!(set(&written(&mut core)), Some(json!({"threadId": "th2", "objective": "port the parser", "status": "active", "tokenBudget": 200_000, "origin": "user"})));
+        // A goal alone: set once the thread is open.
+        let (c, _, w) = open(vec![goal.clone()]);
+        assert!(c.seeded());
+        assert!(w.iter().all(|v| v.get("method") != Some(&json!("thread/inject_items"))));
+        assert_eq!(set(&w).and_then(|p| p.get("threadId").cloned()), Some(json!("th2")));
+        // Codex didn't take the conversation: no goal to pursue from nothing.
+        let (mut c, mut core, w) = open(vec![said, goal]);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/inject_items"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no"}})]);
+        assert_eq!(set(&written(&mut core)), None);
+    }
+
     #[test]
     fn the_threads_goal_is_followed_to_complete() {
         let mut c = Codex::new(None, None, None, false);
@@ -5179,6 +5251,27 @@ mod tests {
         let w = written(&mut core);
         assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
         respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_ne!(core.state.account, old);
+        assert!(core.state.limits.is_empty(), "the old account's limits go");
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
+    }
+
+    /// Signed in as someone else outside kiln (`codex login` in a terminal): the account read every
+    /// few minutes names the new one, the old one's limits go and the new one's are read.
+    #[test]
+    fn a_sign_in_made_outside_kiln_shows_at_the_next_look_at_the_account() {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"}}));
+        let old = core.state.account.clone();
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "account/rateLimits/read", json!({"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 95.0, "windowDurationMins": 10080}}}));
+        assert!(!core.state.limits.is_empty());
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_eq!(core.state.account, Some(account_id("codex", "Pro", Some("b@example.com"))));
         assert_ne!(core.state.account, old);
         assert!(core.state.limits.is_empty(), "the old account's limits go");
         assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");

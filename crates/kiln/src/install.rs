@@ -41,6 +41,17 @@ pub enum Boot {
     None,
 }
 
+/// Where `kiln install` puts a server (docs/p2p.md, "Installing").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum On {
+    /// The cluster of the kubeconfig's current context (or `--context`'s).
+    Kubernetes,
+    /// A container on this machine's Docker.
+    Docker,
+    /// This machine itself, as a service.
+    Machine,
+}
+
 #[derive(Debug, Clone, clap::Args)]
 pub struct InstallArgs {
     /// Never prompt (no passwords, no questions). Fails clearly instead.
@@ -82,6 +93,42 @@ pub struct InstallArgs {
     /// Agent: the installed agent's service (unit, launchd label or task name) for --upgrade.
     #[arg(long, default_value = "kiln-agent")]
     pub service: String,
+    /// Where a server goes: Kubernetes (the default; the kubeconfig's current context), Docker on
+    /// this machine, or this machine itself (the default with --system). An agent goes on this
+    /// machine.
+    #[arg(long, value_enum)]
+    pub on: Option<On>,
+    /// Kubernetes: the kubeconfig context to install into, rather than the current one.
+    #[arg(long)]
+    pub context: Option<String>,
+    /// Kubernetes: the namespace to install into.
+    #[arg(long, default_value = "kiln")]
+    pub namespace: String,
+    /// Kubernetes, Docker: the image to run, rather than one built from this binary.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Kubernetes: a registry to push the image built from this binary to, for a cluster that
+    /// can't take it from this machine's Docker (minikube's, kind's, k3d's and Docker Desktop's can).
+    #[arg(long)]
+    pub registry: Option<String>,
+    /// Docker: the port on this machine for kiln's UI and API (QUIC takes the next one).
+    #[arg(long, default_value_t = 7070)]
+    pub port: u16,
+}
+
+impl InstallArgs {
+    /// Where this install goes: an agent on this machine; a server where `--on` says, else on
+    /// this machine for a system-wide install (`--system`), else in Kubernetes.
+    pub fn target(&self) -> anyhow::Result<On> {
+        match (self.agent, self.on) {
+            (true, None | Some(On::Machine)) => Ok(On::Machine),
+            (true, Some(_)) => anyhow::bail!("an agent is installed on this machine: leave out --on"),
+            (false, Some(on)) if on != On::Machine && self.system => anyhow::bail!("--system installs on this machine: give --on machine, or leave out --system"),
+            (false, Some(on)) => Ok(on),
+            (false, None) if self.system => Ok(On::Machine),
+            (false, None) => Ok(On::Kubernetes),
+        }
+    }
 }
 
 fn is_root() -> bool {
@@ -120,7 +167,7 @@ fn run(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn say(msg: impl AsRef<str>) {
+pub(crate) fn say(msg: impl AsRef<str>) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stderr(), "  {}", msg.as_ref());
 }
@@ -177,6 +224,17 @@ fn put_on_path(bin: &Path) {
 }
 
 pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
+    match a.target()? {
+        On::Kubernetes => {
+            eprintln_header("Installing kiln on Kubernetes");
+            return crate::install_targets::kubernetes_install(&a).await;
+        }
+        On::Docker => {
+            eprintln_header("Installing kiln in Docker");
+            return crate::install_targets::docker_install(&a).await;
+        }
+        On::Machine => {}
+    }
     if a.system && cfg!(windows) {
         anyhow::bail!("--system is not supported on Windows: kiln installs per user and needs no administrator rights");
     }
@@ -207,15 +265,43 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     }
     let system = a.system || is_root();
     let bin = bin_path(system);
-    eprintln_header(if a.agent { "Installing kiln agent" } else { "Installing kiln server" });
-    place_binary(&bin)?;
-    say(format!("binary      {}", bin.display()));
-    put_on_path(&bin);
-
     let config_path = crate::config::default_config_path();
+    // A server installed where none was: a failure takes back what it made, and nothing else may
+    // answer on its port (the check would ask that instead).
+    let fresh = !a.agent && !config_path.exists();
+    let (had_bin, data_dir) = (bin.exists(), crate::config::default_data_dir());
+    let had_data = data_dir.exists();
+    let ours = ["server".to_owned()];
+    let running_before = if fresh { supervisors_of(&ours) } else { Vec::new() };
+    if fresh {
+        let addr = crate::config::Config::load(&config_path)?.server.http_addr;
+        if let Err(e) = std::net::TcpListener::bind(&addr) {
+            anyhow::bail!("kiln's address {addr} is taken here ({e}): stop what listens on it, or set KILN_HTTP_ADDR");
+        }
+    }
+    eprintln_header(if a.agent { "Installing kiln agent" } else { "Installing kiln server" });
+    match install_here(&a, system, &bin, &config_path).await {
+        Err(e) if fresh => {
+            say("");
+            say("taking back the install, which didn't come up");
+            let started: Vec<u32> = supervisors_of(&ours).into_iter().filter(|p| !running_before.contains(p)).collect();
+            take_back(&started, &config_path, (!had_bin).then_some(bin.as_path()), (!had_data).then_some(data_dir.as_path()));
+            Err(e.context("kiln didn't come up on this machine; nothing was left: what the install made was removed"))
+        }
+        done => done,
+    }
+}
+
+/// Installs kiln on this machine: its binary at `bin`, its config at `config_path`, started at
+/// boot and now. A server's install ends once it answers, its UI loads and its runner is connected.
+async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &Path) -> anyhow::Result<()> {
+    place_binary(bin)?;
+    say(format!("binary      {}", bin.display()));
+    put_on_path(bin);
+
     let mut state_dir = crate::config::default_data_dir().join("agent");
     let (unit, args): (&str, Vec<String>) = if a.agent {
-        ("kiln-agent", agent_setup(&a).await?)
+        ("kiln-agent", agent_setup(a).await?)
     } else {
         if !config_path.exists() {
             let cfg = crate::config::Config::default();
@@ -223,12 +309,12 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
                 "# kiln configuration. Every key is optional; see docs/configuration.md.\n\n{}",
                 toml::to_string_pretty(&cfg).unwrap_or_default()
             );
-            crate::util::write_secret(&config_path, text.as_bytes(), 0o640)?;
+            crate::util::write_secret(config_path, text.as_bytes(), 0o640)?;
             say(format!("config      {} (new)", config_path.display()));
         } else {
             say(format!("config      {} (kept)", config_path.display()));
         }
-        let cfg = crate::config::Config::load(&config_path)?;
+        let cfg = crate::config::Config::load(config_path)?;
         let token = crate::server::admin_token(&cfg)?;
         say(format!("admin token {}", crate::server::token_path(&cfg).display()));
         let _ = token;
@@ -239,17 +325,18 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     let mut sup_args = vec!["supervise".to_owned(), "--".to_owned()];
     sup_args.extend(args);
     let ask = !a.unattended && crate::join::interactive();
-    let boot = Install { system, unit, bin: &bin, args: &sup_args, config: &config_path, state_dir: &state_dir, env: None, ask };
+    let boot = Install { system, unit, bin, args: &sup_args, config: config_path, state_dir: &state_dir, env: None, ask };
     let started_by_boot = setup_boot(a.boot, &boot)?;
 
+    let mut running = started_by_boot;
     if !a.no_start && !started_by_boot {
         if cfg!(windows) && crate::os::elevated() {
             // Started from here, kiln (and everything it runs) would have this shell's
             // administrator rights; its Scheduled Task never gives it those.
             say("started     no: not from an elevated shell; it starts at the next sign-in or boot");
         } else {
-            start_replacing(&boot, || {
-                let mut cmd = Command::new(&bin);
+            running = start_replacing(&boot, || {
+                let mut cmd = Command::new(bin);
                 cmd.arg("supervise").arg("--detach").args(sup_args.iter().skip(1));
                 run(&mut cmd)?;
                 say("started     kiln supervise (detached)");
@@ -259,14 +346,36 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     }
 
     if !a.agent {
-        let cfg = crate::config::Config::load(&config_path)?;
+        let cfg = crate::config::Config::load(config_path)?;
         let token = crate::server::admin_token(&cfg)?;
         let url = local_url(&cfg);
-        say("");
-        say(format!("UI          {url}"));
-        say(format!("login link  {} (valid 5 min; `kiln login` makes a new one)", crate::api::otp_url(&token, &url)));
+        if running {
+            let runners = crate::install_targets::verify_url(&url, crate::install_targets::READY_TIME).await?;
+            crate::install_targets::opened(&url, &token, runners, "kiln login");
+        } else {
+            say("");
+            say(format!("UI          {url}"));
+            say(format!("login link  {} (valid 5 min; `kiln login` makes a new one)", crate::api::otp_url(&token, &url)));
+        }
     }
     Ok(())
+}
+
+/// Takes back a server's install on this machine that didn't come up: its service at boot, the
+/// supervisors it `started`, its config, and its binary and data when they were new (`bin`, `data`).
+fn take_back(started: &[u32], config_path: &Path, bin: Option<&Path>, data: Option<&Path>) {
+    remove_service(false);
+    if !started.is_empty() {
+        crate::os::supervise::stop(started);
+        say(format!("stopped     kiln supervise (pid {})", started.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
+    }
+    for (path, dir) in [(Some(config_path), false), (data, true), (bin, false)] {
+        let Some(path) = path.filter(|p| p.exists()) else { continue };
+        match if dir { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) } {
+            Ok(()) => say(format!("removed     {}", path.display())),
+            Err(e) => say(format!("not removed {} ({e})", path.display())),
+        }
+    }
 }
 
 fn local_url(cfg: &crate::config::Config) -> String {
@@ -516,17 +625,9 @@ fn start_replacing(i: &Install<'_>, start: impl FnOnce() -> anyhow::Result<bool>
 /// This user's supervisors of the service `ours` (what follows `supervise --`) that run other
 /// arguments ([`stale_in`]), and whether this process runs under one of them.
 fn stale_supervisors(ours: &[String]) -> (Vec<u32>, bool) {
-    use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).with_user(UpdateKind::Always));
+    use sysinfo::Process;
+    let (sys, procs) = user_procs();
     let me = sysinfo::get_current_pid().ok();
-    let user = me.and_then(|p| sys.process(p)).and_then(Process::user_id).cloned();
-    let procs: Vec<(u32, Vec<String>)> = sys
-        .processes()
-        .iter()
-        .filter(|(pid, p)| Some(**pid) != me && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
-        .map(|(pid, p)| (pid.as_u32(), p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()))
-        .collect();
     let stale = stale_in(&procs, ours, &crate::config::default_data_dir().join("agent"));
     let mut up = me.and_then(|p| sys.process(p)).and_then(Process::parent);
     let mut inside = false;
@@ -539,6 +640,38 @@ fn stale_supervisors(ours: &[String]) -> (Vec<u32>, bool) {
         up = sys.process(p).and_then(Process::parent);
     }
     (stale, inside)
+}
+
+/// This user's processes, but this one: the system's view, and each one's pid and command line.
+fn user_procs() -> (sysinfo::System, Vec<(u32, Vec<String>)>) {
+    use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).with_user(UpdateKind::Always));
+    let me = sysinfo::get_current_pid().ok();
+    let user = me.and_then(|p| sys.process(p)).and_then(Process::user_id).cloned();
+    let procs = sys
+        .processes()
+        .iter()
+        .filter(|(pid, p)| Some(**pid) != me && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
+        .map(|(pid, p)| (pid.as_u32(), p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()))
+        .collect();
+    (sys, procs)
+}
+
+/// This user's supervisors running the service `ours` (what follows `supervise --`) as it is.
+fn supervisors_of(ours: &[String]) -> Vec<u32> {
+    running_in(&user_procs().1, ours)
+}
+
+/// Of `procs` (`(pid, command line)`), the supervisors running exactly `ours` after `supervise --`.
+fn running_in(procs: &[(u32, Vec<String>)], ours: &[String]) -> Vec<u32> {
+    procs
+        .iter()
+        .filter_map(|(pid, argv)| {
+            let sep = argv.iter().position(|w| w == "--")?;
+            (argv.get(1..sep)?.iter().any(|w| w == "supervise") && argv.get(sep + 1..)? == ours).then_some(*pid)
+        })
+        .collect()
 }
 
 /// Of `procs` (`(pid, command line)`), the supervisors of the service `ours` (what follows
@@ -1221,6 +1354,8 @@ fn install_command(i: &Install<'_>) -> String {
     let mut words = vec!["kiln".to_owned(), "install".to_owned()];
     if rest.next().is_some_and(|sub| sub == "agent") {
         words.push("--agent".to_owned());
+    } else {
+        words.extend(["--on".to_owned(), "machine".to_owned()]);
     }
     words.extend(rest.map(|a| ps_quote(a)));
     words.join(" ")
@@ -1238,6 +1373,13 @@ fn ps_quote(s: &str) -> String {
 // ---------------------------------------------------------------------------------- uninstall
 
 pub fn uninstall(agent: bool) -> anyhow::Result<()> {
+    remove_service(agent);
+    say("data and config were kept; delete them yourself if you want a clean slate");
+    Ok(())
+}
+
+/// Stops kiln's service (`kiln-agent` for an agent) and removes how it starts at boot.
+fn remove_service(agent: bool) {
     let unit = if agent { "kiln-agent" } else { "kiln" };
     if have("systemctl") {
         for user in [true, false] {
@@ -1276,8 +1418,6 @@ pub fn uninstall(agent: bool) -> anyhow::Result<()> {
             }
         }
     }
-    say("data and config were kept; delete them yourself if you want a clean slate");
-    Ok(())
 }
 
 /// Delete Scheduled Task `unit`. One registered with administrator rights (kiln's at boot) takes
@@ -1315,6 +1455,40 @@ mod tests {
         assert_eq!(win_quote(""), "\"\"");
         assert_eq!(win_quote(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(win_quote(r"C:\Program Files\kiln\"), r#""C:\Program Files\kiln\\""#);
+    }
+
+    #[test]
+    fn a_server_install_that_fails_stops_the_supervisor_it_started_and_no_other() {
+        let p = |pid: u32, cmd: &str| (pid, cmd.split_whitespace().map(str::to_owned).collect::<Vec<_>>());
+        let procs = [
+            p(101, "/home/me/.local/bin/kiln supervise -- server"),
+            p(102, "/home/me/.local/bin/kiln server"),
+            p(103, "/home/me/.local/bin/kiln supervise -- agent --server http://h:7070"),
+            p(104, "/usr/bin/env -- server"),
+            p(105, "/home/me/.local/bin/kiln supervise -- server --other"),
+        ];
+        assert_eq!(running_in(&procs, &["server".to_owned()]), [101]);
+    }
+
+    #[test]
+    fn a_server_goes_to_kubernetes_unless_told_otherwise_and_an_agent_stays_here() -> anyhow::Result<()> {
+        #[derive(clap::Parser)]
+        struct Install {
+            #[command(flatten)]
+            a: InstallArgs,
+        }
+        let on = |words: &[&str]| -> anyhow::Result<On> {
+            use clap::Parser as _;
+            Install::try_parse_from(std::iter::once("install").chain(words.iter().copied()))?.a.target()
+        };
+        assert_eq!(on(&[])?, On::Kubernetes);
+        assert_eq!(on(&["--on", "docker"])?, On::Docker);
+        assert_eq!(on(&["--on", "machine"])?, On::Machine);
+        assert_eq!(on(&["--system"])?, On::Machine, "a system-wide install is one on this machine");
+        assert_eq!(on(&["--agent", "--server", "http://h:7070"])?, On::Machine);
+        assert!(on(&["--agent", "--on", "docker"]).is_err(), "an agent is installed here");
+        assert!(on(&["--system", "--on", "kubernetes"]).is_err(), "--system is for this machine");
+        Ok(())
     }
 
     #[test]
@@ -1583,6 +1757,6 @@ mod tests {
             "kiln install --agent --server http://10.0.0.2:7070 --name 'O''Brien box' --labels 'baremetal,windows,x86_64'"
         );
         let server = ["supervise", "--", "server"].map(str::to_owned);
-        assert_eq!(install_command(&Install { unit: "kiln", args: &server, ..i }), "kiln install");
+        assert_eq!(install_command(&Install { unit: "kiln", args: &server, ..i }), "kiln install --on machine");
     }
 }

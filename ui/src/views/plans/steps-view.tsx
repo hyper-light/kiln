@@ -1,15 +1,14 @@
 /**
- * A plan's steps as you read and run them: its graph (what waits for what), then each step as a
- * card: its number and title, what it waits for, and what it is (what to do, examples, acceptance
- * criteria, tests), folded until asked. Pick steps to run just those (Run it, below, takes them);
- * a step's own Run picks it alone.
+ * A plan's steps as you read and run them: their graph, as they'll run (what waits for what), each
+ * step its number and title. Pick steps by tapping them: what each picked step is shows under the
+ * graph (what to do, examples, acceptance criteria, tests; a plain step's own words), and Run takes
+ * just those.
  */
-import * as React from "react";
 import type { Plan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Prose } from "@/views/harness/parts";
 import { effectiveNeeds, PlanGraph } from "./graph";
-import { itemDetail } from "./steps";
+import { itemDetail, stepMarkdown } from "./steps";
 
 /** Steps as words: "step 2", "steps 2 and 3", "steps 1, 2 and 4". */
 export function stepsWords(n: readonly number[]): string {
@@ -17,92 +16,58 @@ export function stepsWords(n: readonly number[]): string {
   return `steps ${n.slice(0, -1).join(", ")} and ${n[n.length - 1]}`;
 }
 
-export function PlanSteps({ plan, picked, onPick, onRun }: { plan: Plan; picked: readonly number[]; onPick: (n: number[]) => void; onRun: (n: number) => void }) {
+export function PlanSteps({ plan, picked, onPick, onRun }: { plan: Plan; picked: readonly number[]; onPick: (n: number[]) => void; onRun: () => void }) {
   const items = plan.items ?? [];
   const titles = items.length ? items.map((it) => it.title || "Untitled step") : plan.steps;
   if (titles.length === 0) return null;
   // Steps that say what they wait for run as that says; else each after the one before.
-  const said = items.some((it) => it.needs?.length);
   const waits = effectiveNeeds(titles.map((_, i) => items[i]?.needs));
   const steps = titles.map((title, i) => ({ n: i + 1, title, needs: waits[i] ?? [] }));
-  const pick = (n: number, on: boolean) => onPick(on ? [...picked.filter((x) => x !== n), n].sort((a, b) => a - b) : picked.filter((x) => x !== n));
+  const pick = (n: number) => onPick(picked.includes(n) ? picked.filter((x) => x !== n) : [...picked, n].sort((a, b) => a - b));
   return (
     <section className="plan-section" aria-label="Steps">
-      <div className="ps-top">
+      <div className="sv-top">
         <h2 className="plan-h">Steps</h2>
         {picked.length > 0 ? (
-          <span className="ps-picked">
-            {stepsWords(picked)} picked to run ·{" "}
-            <button type="button" className="ps-link" onClick={() => onPick([])}>
+          <span className="sv-picked">
+            {stepsWords(picked)} picked ·{" "}
+            <button type="button" className="sv-link" onClick={() => onPick([])}>
               clear
             </button>
           </span>
         ) : (
-          <span className="plan-dim ps-hint">Pick steps to run just those</span>
+          <span className="plan-dim sv-hint">Pick steps to see what they are and run just those</span>
         )}
       </div>
-      {steps.length > 1 && said && <PlanGraph label="Its steps, as they'll run" steps={steps} />}
-      <ol className="ps-list">
-        {steps.map((s, i) => (
-          <StepCard
-            key={s.n}
-            n={s.n}
-            title={s.title}
-            after={said ? s.needs : []}
-            detail={items[i] ? itemDetail(items[i]) : ""}
-            picked={picked.includes(s.n)}
-            onPick={(on) => pick(s.n, on)}
-            onRun={() => onRun(s.n)}
-          />
-        ))}
-      </ol>
+      <PlanGraph label="Its steps, as they'll run" steps={steps} picked={picked} onPick={pick} />
+      {picked.length > 0 && (
+        <div className="sv-picked-steps">
+          <ol className="sv-details">
+            {picked.map((n) => {
+              const it = items[n - 1];
+              const detail = it ? itemDetail(it) : "";
+              return (
+                <li key={n} className="sv-detail">
+                  <span className="sv-n">{n}</span>
+                  <div className="sv-body">
+                    {it ? (
+                      <>
+                        <p className="sv-title">{it.title || "Untitled step"}</p>
+                        {detail && <Prose text={detail} />}
+                      </>
+                    ) : (
+                      <Prose text={stepMarkdown(plan.body, n) || (plan.steps[n - 1] ?? "")} />
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+          <Button size="sm" className="sv-run" onClick={onRun}>
+            Run {stepsWords(picked)}
+          </Button>
+        </div>
+      )}
     </section>
-  );
-}
-
-function StepCard({
-  n,
-  title,
-  after,
-  detail,
-  picked,
-  onPick,
-  onRun,
-}: {
-  n: number;
-  title: string;
-  after: number[];
-  detail: string;
-  picked: boolean;
-  onPick: (on: boolean) => void;
-  onRun: () => void;
-}) {
-  const [open, setOpen] = React.useState(false);
-  return (
-    <li className="ps-step" data-picked={picked || undefined}>
-      <input type="checkbox" className="check ps-check" checked={picked} onChange={(e) => onPick(e.target.checked)} aria-label={`Pick step ${n}`} />
-      <div className="ps-body">
-        <p className="ps-title">
-          <span className="ps-n">{n}</span>
-          {title}
-        </p>
-        {after.length > 0 && <p className="ps-after">After {stepsWords(after)}</p>}
-        {detail && (
-          <>
-            {open && (
-              <div className="ps-detail">
-                <Prose text={detail} />
-              </div>
-            )}
-            <button type="button" className="ps-link" aria-expanded={open} onClick={() => setOpen(!open)}>
-              {open ? "Less" : "What it is"}
-            </button>
-          </>
-        )}
-      </div>
-      <Button size="xs" variant="secondary" onClick={onRun}>
-        Run
-      </Button>
-    </li>
   );
 }

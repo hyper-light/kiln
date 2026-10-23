@@ -37,11 +37,14 @@ separated by commas or spaces. Aliases are understood (`amd64`, `x64` → `x86_6
 `aarch64`; `darwin`, `mac` → `macos`).
 
 Of the connected runners that take reach links and suit, the asking machine itself comes first
-while it has 4 GiB of memory free (nothing crosses the network — it then runs locally — and
-another machine's resources stay its own): work goes elsewhere only when it asks for what this
-machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others, the one
-with the most idle cores wins, then free memory; CI work on it and a tunnelled path (HTTP instead
-of UDP) count against it, and the asking machine wins a tie when it's short of memory. The
+while it has 4 GiB of memory free and isn't overloaded (nothing crosses the network — it then runs
+locally — and another machine's resources stay its own): work goes elsewhere only when it asks for
+what this machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others,
+the one with the most idle cores wins (by its busy share or its load average, whichever leaves
+fewer: work waiting on disk or memory shows in its load), then free memory; CI work on it and a
+tunnelled path (HTTP instead of UDP) count against it, and the asking machine wins a tie when it's
+short of memory. A machine that's overloaded (under 2 GiB or a twentieth of its memory free, or a
+load past twice its cores) gets work only when no other suits, and says so (`· overloaded`). The
 directory comes from the server (cached 30 s, refreshed after every reconnect); the choice is the
 asking runner's. `GET /api/reach/runners?want=…` shows the same ranking.
 
@@ -266,12 +269,15 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    (Claude Code's transcript as it is; Codex's conversation as a new thread's history, as a switch of
    harness carries it; for ACP agents and Antigravity, whose own records kiln doesn't keep, the
    conversation in words from kiln's timeline, given with the first message the harness gets there),
-   kiln's timeline and state with its queue, its settings with the folder it goes on in — and hands
-   it over a reach link: end to end encrypted, in pieces within a window, started over if the link
-   drops (`Ask::Adopt`, `Say::AdoptGot`, `Say::Adopted`). A package in words is version 2 of the
-   format; the others stay version 1, which older runners take.
-5. **The take-over** (the other runner). It puts the record where its harness looks for it, starts the
-   session under the same id with its timeline as it was, and says so; the server follows the session
+   kiln's timeline and state with its queue, its settings with the folder it goes on in, and what its
+   harness keeps for it in its own home (below) — and hands it over a reach link: end to end
+   encrypted, in pieces within a window, started over if the link drops (`Ask::Adopt`,
+   `Say::AdoptGot`, `Say::Adopted`). A package in words is version 2 of the format, one with what
+   the harness keeps version 3, which an older runner refuses whole (the agent stays where it was
+   rather than arrive without them); the others stay version 1, which older runners take.
+5. **The take-over** (the other runner). It puts the record where its harness looks for it, then what
+   the harness keeps, starts the session under the same id with its timeline as it was, and says so
+   (what came, what went beside, what stayed); the server follows the session
    there and viewers stay on it. Only then does the first runner let go of it. A runner that can't take
    it over says why, and the session goes on where it was. The agent starts only once its folder there
    has taken the sync log as far as it stood on the other machine ("Waiting for its folder's last
@@ -286,6 +292,52 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    repository's copy at its commit, the differences written over it, its HEAD and index put as they
    were; one there already (the agent coming back) keeps what changed in it, stashed. What couldn't
    come is said, and stays on the machine it left: nothing is deleted on either side.
+
+**What its harness keeps** (`harness/homes.rs`). Its memories and the session's own files go with
+the conversation, and land where the harness looks for them for the folder the agent works in there:
+
+| Harness | What goes | Where it lands there |
+|---|---|---|
+| Claude Code | its auto memory of the project (`MEMORY.md` and its files; not a team's) | the project's `projects/<project>/memory/`, the project being the repository's main folder (a worktree's too), else the folder |
+| | the session's own: its subagents' transcripts, tool results and title; its checkpoints for rewind; its tasks and todos; the plans its transcript names | beside its transcript (`projects/<folder>/<session>/`), `file-history/<session>/`, `tasks/<session>/`, `todos/`, `plans/` |
+| Codex | its memories (`memories/`, but `raw_memories.md`, which it makes again; `memories_extensions/`) | the same folders |
+| | the thread's goal, read from its database | set on the new thread once the conversation is in (`thread/goal/set`) |
+| Gemini CLI | its memory of the project (`tmp/<project>/memory/`) | the project's, by the name Gemini CLI knows the folder by there, else the one it would give it, marked (`.project_root`) so it finds it |
+| Antigravity | its knowledge (`knowledge/`) | the same folder |
+| Goose | its memories (`memory/<category>.txt`) | the same folder |
+| opencode, Amp, Devin | nothing: what they keep is the session's own record | |
+
+A memory there is never written over: one that isn't there is written; one that differs stays, and
+the one that came goes beside it (`builds.from-<machine>.md`); an index (`MEMORY.md`) takes the
+lines it lacks, pointing at what went beside, and Goose's memories the entries they lack. The
+session's own files take the place of the ones it left there coming back, as its record does. A
+file over 16 MB, or past 64 MB in all, stays and is said: memories go first, checkpoints last.
+
+What stays, and why:
+- **The person's own instructions** (`~/.claude/CLAUDE.md` and `rules/`, `~/.codex/AGENTS.md`,
+  `~/.gemini/GEMINI.md`, opencode's and Amp's `AGENTS.md`, Goose's `.goosehints`). They are the
+  machine's, for every project and agent on it, and can hold what is true of that machine alone:
+  written there by a move, they would change every other agent's instructions. The package carries
+  a digest of them, and when the ones where it lands differ, the timeline says it goes on with that
+  machine's. Those in the repository go with it (`CLAUDE.local.md` among the files git ignores).
+- **Codex's databases** (`goals_*`, `memories_*`, `state_*`, `thread_history_*.sqlite`), never
+  written: Codex's other processes use them, their schema is its version's, and they're keyed by a
+  thread that doesn't go on there. The goal goes over its protocol instead, its memories as the
+  files Codex makes of them.
+- **Codex's rollout.** The conversation goes as the new thread's history, which Codex records there
+  in a rollout of its own; a copy of the old one would be a second thread of the same conversation
+  there, in a folder that isn't. It stays, whole, where it was.
+- **Credentials and settings**: `.credentials.json`, `auth.json`, `oauth_creds.json`,
+  `credentials.toml`, secrets files, keys; `~/.claude.json` (the account, and per-project MCP
+  servers with their tokens), settings, hooks, skills, plugins. And what is the machine's: running
+  processes and their keys (`sessions/`), shell snapshots, hook environments, logs, caches.
+- **Records of a session that starts anew there**: an ACP agent and Antigravity go on in a new
+  session, given the conversation in words, so Gemini CLI's chats and checkpoints, Antigravity's
+  conversation and its artifacts (`brain/<conversation>/`), and opencode's, Goose's and Devin's
+  sessions stay.
+- The project's memory when the agent's folder isn't on the machine it goes to (it works in the home
+  folder there), or Claude Code keeps it elsewhere (`autoMemoryDirectory`); and all of it when the
+  agent goes on from the server's copy, or in another harness.
 
 **Into another harness.** `move {"to": …, "kind": "codex", "model": "…"}` moves it to a runner that
 has that harness instead of its own, the conversation carried over as a switch of harness carries it
@@ -329,6 +381,8 @@ agent stays where it is.
 - Agents that agents start (`kiln spawn`): kiln doesn't record whom they act for yet, so on a kiln
   others sign in to they can't call kiln's operations (the machines they can).
 - Moving agents of ACP harnesses (Gemini, opencode, goose, amp) and Antigravity keeps their
-  conversation, but not the harness's own record of it: kiln's timeline goes with them in words, and
-  the harness starts a new session there with it (`moving::Carry::Words`).
+  conversation and their memories, but not the harness's own record of the session: kiln's timeline
+  goes with them in words, and the harness starts a new session there with it
+  (`moving::Carry::Words`), so what it keeps of that session (Gemini CLI's checkpoints, Antigravity's
+  artifacts) stays.
 - Moving the tasks an agent left running (shells, monitors): they stay, and stop, where they were.

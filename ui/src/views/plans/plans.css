@@ -734,16 +734,17 @@ a.plan-row-main:hover {
   margin: 0;
 }
 
-/* A plan's steps as their graph (graph.tsx): rounds across (down, narrow), a line from each step a
-   step waits for; where each stands drawn as the console draws work (status.tsx). Only a step at
-   work moves (its mark's light, its title's shimmer: transforms the GPU moves); waiting steps are
+/* A plan's steps as their graph (graph.tsx): rounds across, a line from each step a step waits for;
+   narrow (a phone, a side pane), down, a step a row the graph's width, a round's steps close
+   together. Where each stands is drawn as the console draws work (status.tsx). Only a step at work
+   moves (its mark's light, its title's shimmer: transforms the GPU moves); waiting steps are
    sketched and still; the lines never move. */
-.pg {
+.ptree {
   position: relative;
   container-type: inline-size;
   margin: 12px 0 4px;
 }
-.pg-lines {
+.ptree-lines {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -751,20 +752,20 @@ a.plan-row-main:hover {
   overflow: visible;
   pointer-events: none;
 }
-.pg-lines path {
+.ptree-lines path {
   fill: none;
   stroke: #343a45;
   stroke-width: 1.2;
   stroke-dasharray: 3 4;
 }
-.pg-lines path[data-s="met"] {
+.ptree-lines path[data-s="met"] {
   stroke: #5d7a74;
   stroke-dasharray: none;
 }
-.pg-lines path[data-s="live"] {
+.ptree-lines path[data-s="live"] {
   stroke-dasharray: none;
 }
-.pg-rounds {
+.ptree-rounds {
   position: relative;
   display: grid;
   grid-auto-columns: minmax(0, 1fr);
@@ -772,20 +773,20 @@ a.plan-row-main:hover {
   align-items: center;
   gap: 34px;
 }
-.pg-round {
+.ptree-round {
   display: grid;
   gap: 10px;
 }
 @container (max-width: 560px) {
-  .pg-rounds {
+  .ptree-rounds {
     grid-auto-flow: row;
-    gap: 22px;
+    gap: 18px;
   }
-  .pg-round {
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  .ptree-round {
+    gap: 6px;
   }
 }
-.pg-node {
+.ptree-node {
   position: relative;
   z-index: 1;
   display: grid;
@@ -799,28 +800,49 @@ a.plan-row-main:hover {
   color: var(--color-bright);
   text-decoration: none;
 }
-a.pg-node:hover {
+a.ptree-node:hover,
+button.ptree-node:hover {
   border-color: #353b46;
 }
-.pg-node[data-stand="working"] {
+/* A step to pick (a plan's page): tapped, it's picked, ringed in the prism's blue and ticked. */
+button.ptree-node {
+  width: 100%;
+  padding-right: 26px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ptree-node[aria-pressed="true"] {
+  border-color: #a6c4ed;
+  background: #10151d;
+}
+.ptree-node[aria-pressed="true"]::after {
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  color: #a6c4ed;
+  font-size: 12px;
+  content: "✓";
+}
+.ptree-node[data-stand="working"] {
   border-color: #3a3f5a;
 }
-.pg-node[data-stand="needs_you"],
-.pg-node[data-stand="yours"] {
+.ptree-node[data-stand="needs_you"],
+.ptree-node[data-stand="yours"] {
   border-color: #5a4c37;
 }
-.pg-node .sg-beam,
-.pg-node .sg-optic {
+.ptree-node .sg-beam,
+.ptree-node .sg-optic {
   margin-top: 2px;
 }
-.pg .sg-beam[data-status="pending"] {
+.ptree .sg-beam[data-status="pending"] {
   animation: none;
 }
-.pg-text {
+.ptree-text {
   display: grid;
   min-width: 0;
 }
-.pg-title {
+.ptree-title {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: baseline;
@@ -828,17 +850,22 @@ a.pg-node:hover {
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
-.pg-node[data-stand="waiting"] .pg-title,
-.pg-node[data-stand="stopped"] .pg-title {
+.ptree-node[data-stand="waiting"] .ptree-title,
+.ptree-node[data-stand="stopped"] .ptree-title {
   color: #9a9ca3;
 }
-.pg-n {
+.ptree-code {
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+.ptree-n {
   margin-right: 5px;
   color: #7d818b;
   font-family: var(--font-mono);
   font-size: 10.5px;
 }
-.pg-word {
+.ptree-word {
   margin-top: 2px;
   color: #8d9099;
   font-family: var(--font-mono);
@@ -846,115 +873,116 @@ a.pg-node:hover {
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
-.pg-node[data-stand="met"] .pg-word {
+.ptree-node[data-stand="met"] .ptree-word {
   color: #a8c9bc;
 }
-.pg-node[data-stand="needs_you"] .pg-word,
-.pg-node[data-stand="yours"] .pg-word,
-.pg-node[data-stand="unmet"] .pg-word {
+.ptree-node[data-stand="needs_you"] .ptree-word,
+.ptree-node[data-stand="yours"] .ptree-word,
+.ptree-node[data-stand="unmet"] .ptree-word {
   color: #d8bb95;
 }
-.pg-who {
+/* A step whose line to a step it waits for would run behind another: what it waits for, said. */
+.ptree-after {
+  color: #8d9099;
+  font-size: 11px;
+}
+.ptree-who {
   overflow: hidden;
   color: #7d818b;
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.pg-bar {
+.ptree-bar {
   display: flex;
   gap: 2px;
   height: 4px;
   margin: 10px 0 2px;
 }
-.pg-bar i {
+.ptree-bar i {
   flex: 1;
   border-radius: 2px;
   background: #2a3039;
 }
-.pg-bar i[data-s="met"] {
+.ptree-bar i[data-s="met"] {
   background: #a8c9bc;
 }
-.pg-bar i[data-s="working"] {
+.ptree-bar i[data-s="working"] {
   background: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
 }
-.pg-bar i[data-s="needs_you"],
-.pg-bar i[data-s="yours"] {
+.ptree-bar i[data-s="needs_you"],
+.ptree-bar i[data-s="yours"] {
   background: #d8bb95;
 }
-.pg-bar i[data-s="unmet"] {
+.ptree-bar i[data-s="unmet"] {
   background: repeating-linear-gradient(90deg, #d8bb95 0 6px, transparent 6px 8px);
 }
-.pg-bar i[data-s="stopped"] {
+.ptree-bar i[data-s="stopped"] {
   background: #4a4f58;
 }
-/* A plan, read (steps-view.tsx): its overview, then its steps as cards in the graph's own look, each
-   to pick (to run just those) or run alone. */
+/* A plan, read (steps-view.tsx): its overview, then its steps as their graph, to pick; what each
+   picked step is under it, in the graph's own look, and Run for just those. */
 .plan-overview {
   color: var(--color-secondary);
   font-size: 14px;
 }
-.ps-top {
+.sv-top {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
   gap: 4px 12px;
 }
-.ps-hint {
+.sv-hint {
   font-size: 12px;
 }
-.ps-picked {
+.sv-picked {
   color: var(--color-bright);
   font-size: 12px;
 }
-.ps-list {
+.sv-picked-steps {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+.sv-details {
   display: grid;
   gap: 8px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
-.ps-step {
+.sv-detail {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: start;
-  gap: 12px;
+  gap: 10px;
   padding: 10px 12px;
   border: 1px solid #262a31;
   border-radius: 9px;
   background: #0d0f12;
+  font-size: 13px;
 }
-.ps-step[data-picked] {
-  border-color: var(--color-line-hover);
-  background: #12151a;
+.sv-body {
+  min-width: 0;
 }
-.ps-check {
-  margin-top: 3px;
+.sv-run {
+  justify-self: start;
 }
-.ps-title {
+.sv-title {
   margin: 0;
   color: var(--color-bright);
   font-size: 14px;
   overflow-wrap: anywhere;
 }
-.ps-n {
+.sv-n {
   display: inline-block;
   min-width: 1.7em;
   color: var(--color-meta);
   font-family: var(--font-mono);
   font-size: 12px;
 }
-.ps-after {
-  margin: 2px 0 0;
-  color: var(--color-meta);
-  font-size: 12px;
-}
-.ps-detail {
-  margin-top: 8px;
-  font-size: 13px;
-}
-.ps-link {
+.sv-link {
   margin: -6px 0;
   padding: 6px 0;
   border: 0;
@@ -967,16 +995,47 @@ a.pg-node:hover {
   text-underline-offset: 3px;
   cursor: pointer;
 }
-.ps-link:hover {
+.sv-link:hover {
   color: var(--color-bright);
 }
-/* On a phone, Run goes under the step's words. */
-@media (max-width: 640px) {
-  .ps-step {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-  .ps-step > :last-child {
-    grid-column: 2;
-    justify-self: start;
-  }
+/* An agent's own plan, in its Plan tab (its-plan.tsx): its to-do list as the tree of a plan's steps;
+   the plan it proposed in its words, kept by kiln. */
+.ip {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.ip-head {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.ip-head a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+}
+.ip-words {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.ip-words:hover {
+  color: var(--color-bright);
+}
+.ip-meta {
+  color: var(--color-meta);
+  font-size: 12px;
+}
+.ip-todos .ptree-bar {
+  margin-top: 2px;
 }

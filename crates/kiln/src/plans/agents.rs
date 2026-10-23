@@ -1026,6 +1026,27 @@ mod tests {
         })
     }
 
+    /// The plan an agent proposes (plan mode) is kept as one of kiln's plans: one an agent, a new
+    /// version each time it proposes another, the same words again changing nothing.
+    #[test]
+    fn an_agents_proposed_plan_is_kept_one_an_agent() -> anyhow::Result<()> {
+        on_a_hub(|hub| {
+            Box::pin(async move {
+                let keep = |agent: &'static str, words: &'static str| super::super::keep_proposed(&hub, agent, words);
+                let first = keep("a1", "# Fix the mount\n\n1. Read the log\n2. Fix the rule").await?;
+                anyhow::ensure!(first.title == "Fix the mount" && first.version == 1 && first.steps.len() == 2, "{first:?}");
+                anyhow::ensure!(first.source.as_ref().is_some_and(|s| s.proposed && s.session.as_deref() == Some("a1")), "{:?}", first.source);
+                let same = keep("a1", "# Fix the mount\n\n1. Read the log\n2. Fix the rule\n").await?;
+                anyhow::ensure!(same.id == first.id && same.version == 1, "the same words change nothing: {same:?}");
+                let next = keep("a1", "# Fix the mount, again\n\n1. Read the log\n2. Fix the rule\n3. Test it").await?;
+                anyhow::ensure!(next.id == first.id && next.version == 2 && next.title == "Fix the mount, again" && next.steps.len() == 3, "{next:?}");
+                let other = keep("a2", "1. Something else").await?;
+                anyhow::ensure!(other.id != first.id, "one an agent");
+                Ok(())
+            })
+        })
+    }
+
     /// A run of some of a plan's steps (`only`) keeps each step's number; the steps they wait for
     /// outside the run are taken as done (and the run says so), those inside it still wait.
     #[test]

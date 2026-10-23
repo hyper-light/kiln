@@ -106,6 +106,9 @@ pub struct Task {
     /// What its clone checked out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
+    /// A sync's: what the copies keep the same.
+    #[serde(default, skip_serializing_if = "super::Mode::is_files")]
+    pub mode: super::Mode,
 }
 
 impl Task {
@@ -152,6 +155,9 @@ pub struct Ask {
     pub to: Vec<Target>,
     #[serde(default)]
     pub delete: bool,
+    /// A sync's: what the copies keep the same (their files, their git refs, or both).
+    #[serde(default)]
+    pub mode: super::Mode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,11 +346,30 @@ impl Tasks {
         Some((self.bundle_file(batch)?, b.hash.clone()?, b.size))
     }
 
-    fn bundled(&self, batch: &str) -> Option<(String, u64)> {
+    pub fn bundled(&self, batch: &str) -> Option<(String, u64)> {
         self.inner.lock().bundles.get(batch).and_then(|b| b.hash.clone().map(|h| (h, b.size)))
     }
 
-    fn drop_bundle(&self, batch: &str) {
+    /// A bundle `from` sends to batch `batch` for the machines `to` (`crate::sync::share`): kept
+    /// as it is when it's there already, its machines then `to`.
+    pub fn open_bundle(&self, batch: &str, from: &str, to: HashSet<String>) {
+        let mut inner = self.inner.lock();
+        match inner.bundles.get_mut(batch) {
+            Some(b) => b.to = to,
+            None => {
+                inner.bundles.insert(batch.to_owned(), Bundle { from: Some(from.to_owned()), to, hash: None, size: 0 });
+            }
+        }
+    }
+
+    /// `machine` may fetch batch `batch`'s bundle too.
+    pub fn allow(&self, batch: &str, machine: &str) {
+        if let Some(b) = self.inner.lock().bundles.get_mut(batch) {
+            b.to.insert(machine.to_owned());
+        }
+    }
+
+    pub fn drop_bundle(&self, batch: &str) {
         self.inner.lock().bundles.remove(batch);
         if let Some(f) = self.bundle_file(batch) {
             let _ = std::fs::remove_file(f);
@@ -373,6 +398,8 @@ struct Batch {
     source_copy: Option<(String, u64)>,
     /// The repository's synced repo, when it has one.
     synced: Option<String>,
+    /// What a new synced repo keeps the same.
+    mode: super::Mode,
 }
 
 fn row_of(view: &super::places::View, key: &str) -> Result<Row, String> {
@@ -480,6 +507,7 @@ pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
             updated: now,
             synced: None,
             head: None,
+            mode: if ask.kind == Kind::Sync { ask.mode } else { super::Mode::Files },
         })
         .collect();
     {
@@ -501,6 +529,7 @@ pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
         source_git,
         source_copy,
         synced: row.synced.clone(),
+        mode: if ask.kind == Kind::Sync { ask.mode } else { super::Mode::Files },
     };
     let h = hub.clone();
     crate::rt::spawn(async move { drive(h, b).await });
@@ -542,6 +571,7 @@ async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View
         updated: now,
         synced: None,
         head: None,
+        mode: super::Mode::Files,
     };
     hub.tasks.inner.lock().tasks.push(task.clone());
     hub.tasks.save();
@@ -583,6 +613,7 @@ pub async fn retry(hub: &Arc<Hub>, id: &str) -> Result<Vec<Task>, String> {
         branch: t.branch.clone(),
         to: if t.kind == Kind::Remove { Vec::new() } else { vec![Target { machine: t.machine.clone(), path: t.path.clone() }] },
         delete: t.delete,
+        mode: t.mode,
     };
     let started = start(hub, ask).await?;
     hub.tasks.dismiss(id);
@@ -642,20 +673,23 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         Source::Machine { .. } => Commits::Folder,
         Source::Url { url } => Commits::Url(url.clone()),
     };
-    // 2. Each machine's clone, all at once.
-    let clones = futures::future::join_all(b.tasks.iter().map(|(id, m, p)| clone_on(hub, b, id, m, p, &source))).await;
+    // 2. Each machine's clone, all at once. A clone alone is over on a machine as soon as that
+    // machine's is: a slow one keeps no other waiting.
     if b.kind == Kind::Clone {
-        for ((id, m, p), r) in b.tasks.iter().zip(clones) {
-            match r {
+        let source = &source;
+        futures::future::join_all(b.tasks.iter().map(|(id, m, p)| async move {
+            match clone_on(hub, b, id, m, p, source).await {
                 Ok((head, _)) => {
                     hub.tasks.update(hub, id, |t| t.head.clone_from(&head));
                     hub.tasks.done(hub, id, format!("cloned into {p} on {m}"));
                 }
                 Err(e) => hub.tasks.fail(hub, id, e),
             }
-        }
+        }))
+        .await;
         return Ok(());
     }
+    let clones = futures::future::join_all(b.tasks.iter().map(|(id, m, p)| clone_on(hub, b, id, m, p, &source))).await;
     // 3. The group each new folder joins.
     let cloned: Vec<(&String, &String, &String, bool)> = b
         .tasks
@@ -694,7 +728,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         _ => {
             let Some(&(id, m, p, _)) = cloned.first() else { return Ok(()) };
             hub.tasks.set(hub, id, "joining", format!("{} starts syncing", m));
-            let repo = hub.sync.ask(super::server::Ask::Create { name: unique_name(hub, &b.name), copies: vec![(m.clone(), p.clone())], exclude: Vec::new(), transient: None }).await?;
+            let repo = hub.sync.ask(super::server::Ask::Create { name: unique_name(hub, &b.name), copies: vec![(m.clone(), p.clone())], exclude: Vec::new(), mode: b.mode, transient: None }).await?;
             let member = member_at(hub, &repo, m, p).ok_or_else(|| "the new synced repo has no copy".to_owned())?;
             joined.push((id, m, p, repo.clone(), member));
             (repo, false)
@@ -776,7 +810,8 @@ async fn seed(hub: &Arc<Hub>, b: &Batch, machine: &str, path: &str, transient: b
         hub.tasks.set(hub, id, "joining", format!("{machine} starts syncing {path}"));
     }
     let name = if transient { unique_name(hub, &format!("{} (moving)", b.name)) } else { unique_name(hub, &b.name) };
-    let repo = hub.sync.ask(super::server::Ask::Create { name, copies: vec![(machine.to_owned(), path.to_owned())], exclude: Vec::new(), transient: transient.then(|| b.id.clone()) }).await?;
+    let mode = if transient { super::Mode::Files } else { b.mode };
+    let repo = hub.sync.ask(super::server::Ask::Create { name, copies: vec![(machine.to_owned(), path.to_owned())], exclude: Vec::new(), mode, transient: transient.then(|| b.id.clone()) }).await?;
     let member = member_at(hub, &repo, machine, path).ok_or_else(|| "the new synced repo has no copy".to_owned())?;
     wait_in_step(hub, &repo, member, ids, &format!("the copy on {machine}")).await?;
     Ok(repo)
@@ -952,6 +987,7 @@ mod tests {
             updated,
             synced: None,
             head: None,
+            mode: super::super::Mode::Files,
         };
         let saved = vec![task("running", "cloning", now), task("done", "done", now), task("ancient", "done", now - KEEP_FOR - 10)];
         std::fs::write(dir.path().join("tasks.json"), serde_json::to_vec(&saved)?)?;
@@ -967,6 +1003,71 @@ mod tests {
         assert_eq!(t.bundle_file("../etc"), None);
         assert!(t.bundle_file("0199aa").is_some());
         Ok(())
+    }
+
+    /// Whether `ok` holds within ten seconds.
+    async fn soon(ok: impl Fn() -> bool) -> bool {
+        let start = Instant::now();
+        while !ok() && start.elapsed() < Duration::from_secs(10) {
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        ok()
+    }
+
+    #[test]
+    fn each_machine_s_clone_is_done_once_that_machine_says_so_however_slow_the_others() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let now = crate::util::now_unix();
+            let from = Source::Url { url: "https://github.com/a/b".into() };
+            let task = |id: &str, machine: &str| Task {
+                id: id.into(),
+                batch: "b1".into(),
+                kind: Kind::Clone,
+                key: "github.com/a/b".into(),
+                name: "a/b".into(),
+                from: from.clone(),
+                branch: None,
+                machine: machine.into(),
+                path: "/src/b".into(),
+                delete: false,
+                state: "queued".into(),
+                detail: String::new(),
+                error: None,
+                notes: Vec::new(),
+                created: now,
+                updated: now,
+                synced: None,
+                head: None,
+                mode: crate::sync::Mode::Files,
+            };
+            hub.tasks.inner.lock().tasks.extend([task("quick", "laptop"), task("slow", "busy-box")]);
+            let b = Batch {
+                id: "b1".into(),
+                kind: Kind::Clone,
+                key: "github.com/a/b".into(),
+                name: "a/b".into(),
+                from: from.clone(),
+                branch: None,
+                tasks: vec![("quick".into(), "laptop".into(), "/src/b".into()), ("slow".into(), "busy-box".into(), "/src/b".into())],
+                delete: false,
+                origin: None,
+                source_git: false,
+                source_copy: None,
+                synced: None,
+                mode: crate::sync::Mode::Files,
+            };
+            let h = hub.clone();
+            crate::rt::spawn(async move { drive(h, b).await });
+            let state = |id: &str| hub.tasks.get(id).map(|t| t.state).unwrap_or_default();
+            anyhow::ensure!(soon(|| state("quick") == "cloning" && state("slow") == "cloning").await, "both machines were told to clone");
+            // The laptop is done; the busy box says nothing yet.
+            hub.tasks.heard("laptop", TaskNews { head: Some("c0ffee".into()), ..TaskNews::new("quick", "done", "cloned main into /src/b") });
+            anyhow::ensure!(soon(|| state("quick") == "done").await, "the laptop's clone shows done at once");
+            assert_eq!(hub.tasks.get("quick").and_then(|t| t.head).as_deref(), Some("c0ffee"));
+            assert_eq!(state("slow"), "cloning", "the busy box's clone is still under way");
+            Ok(())
+        })
     }
 
     #[test]

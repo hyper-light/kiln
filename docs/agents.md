@@ -123,7 +123,8 @@ usage, with the workers, slots and weights the person sets there ([programs.md](
   purpose (by name, age, activity, runner, harness or cost) is followed as it is.
 - **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
   says what each agent has for you, the most pressing first: its oldest request (a tool call is
-  allowed or denied there, a question or plan opens the agent); goals it paused for you
+  allowed or denied there, a plan it proposes approved there, **Review** to keep it planning with
+  what to change; a question opens the agent); goals it paused for you
   (**Review the plan**, when they wait on one, and **Resume**); a stop of its own, its harness
   ended with an error (**Restart**); a usage limit it reached, only said, with when it goes on.
   Two at once (one on a phone), then a line for the rest. Where kiln's other notifications are,

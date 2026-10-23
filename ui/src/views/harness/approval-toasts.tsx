@@ -156,7 +156,7 @@ function RequestCard({ card }: { card: Card }) {
   if (!ap) return null;
   const href = `/agents/${a.id}`;
   const { lead, line } = what(ap);
-  const asks = ap.tool === "question" || ap.tool === "plan";
+  const plan = ap.tool === "plan";
   // Answered at once (answered.ts): the card goes now, and is back if the answer doesn't go.
   const decide = (decision: "allow" | "deny") => {
     setBusy(true);
@@ -167,18 +167,21 @@ function RequestCard({ card }: { card: Card }) {
   };
   return (
     <Shell card={card} lead={lead} line={line} busy={busy}>
-      {asks ? (
+      {ap.tool === "question" ? (
         <Button size="xs" onClick={() => navigate(href)}>
-          {ap.tool === "plan" ? "Review the plan" : "Answer"}
+          Answer
         </Button>
       ) : (
         <>
+          {/* A plan is approved here; to keep it planning (with what to change), review it on its page. */}
           <Button size="xs" disabled={busy} onClick={() => void decide("allow")}>
-            Allow
+            {plan ? "Approve" : "Allow"}
           </Button>
-          <Button size="xs" variant="secondary" disabled={busy} onClick={() => void decide("deny")}>
-            Deny
-          </Button>
+          {!plan && (
+            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void decide("deny")}>
+              Deny
+            </Button>
+          )}
           <Link to={href} className="rq-open">
             Review <ArrowUpRight size={12} aria-hidden="true" />
           </Link>

@@ -1648,11 +1648,16 @@ export interface SyncConflict {
   beside: string;
 }
 
+/** What a synced repo keeps the same on its copies: its files (uncommitted work too), its branches and commits, or both. */
+export type SyncMode = "files" | "files_and_git" | "git";
+
 export interface SyncRepo {
   id: string;
   name: string;
   created: number;
   exclude: string[];
+  /** Older servers: none, files. */
+  mode?: SyncMode;
   files: number;
   index: number;
   conflicts: SyncConflict[];
@@ -1759,6 +1764,8 @@ export interface GitState {
   active: number;
   /** kiln cloned it there. */
   kiln: boolean;
+  /** Its branch against the same branch on the other machines that hold it (their work, taken in as `kiln/<machine>/<branch>`). */
+  peers?: { machine: string; ahead: number; behind: number; wip: boolean }[];
 }
 
 /** `copy`: kept in step by sync; `clone`: kiln cloned it there; `found`: it was there. */
@@ -1845,6 +1852,8 @@ export interface PlaceAsk {
   branch?: string;
   to?: { machine: string; path: string }[];
   delete?: boolean;
+  /** A new sync's: what its copies keep the same. */
+  mode?: SyncMode;
 }
 
 /** What to plan (`/api/cd/plans`): one commit, a stack (`head`, from where it leaves trunk or
