@@ -209,18 +209,25 @@ pub(crate) fn place_binary(dest: &Path) -> anyhow::Result<()> {
 /// The binary's folder on the user's PATH, so `kiln` works in every new terminal: on Windows in
 /// the user's own PATH; elsewhere, when this terminal's PATH hasn't it (`~/.local/bin` on a Mac),
 /// through a line in the startup file of the user's shell.
-fn put_on_path(bin: &Path) {
-    let Some(dir) = bin.parent() else { return };
+fn put_on_path(bin: &Path) -> Option<crate::os::PathAdded> {
+    let dir = bin.parent()?;
     match crate::os::add_to_user_path(dir) {
         Ok(Some(added)) => {
-            let place = added.file.map(|f| format!(" in {}", f.display())).unwrap_or_default();
+            let place = added.file.as_ref().map(|f| format!(" in {}", f.display())).unwrap_or_default();
             say(format!("path        {} added to your PATH{place} (new terminals find `kiln`)", dir.display()));
-            if let Some(now) = added.now {
+            if let Some(now) = &added.now {
                 say(format!("            for this terminal too, run: {now}"));
             }
+            Some(added)
         }
-        Ok(None) => say(format!("path        {} is on your PATH", dir.display())),
-        Err(e) => say(format!("path        {} not added to your PATH ({e}): run kiln as {}", dir.display(), bin.display())),
+        Ok(None) => {
+            say(format!("path        {} is on your PATH", dir.display()));
+            None
+        }
+        Err(e) => {
+            say(format!("path        {} not added to your PATH ({e}): run kiln as {}", dir.display(), bin.display()));
+            None
+        }
     }
 }
 
@@ -274,6 +281,9 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     let had_data = data_dir.exists();
     let ours = ["server".to_owned()];
     let running_before = if fresh { supervisors_of(&ours) } else { Vec::new() };
+    // The folders a fresh install makes: taken back with it, when they're empty again.
+    let new_dirs: Vec<PathBuf> = [bin.parent(), config_path.parent(), data_dir.parent()].into_iter().flatten().flat_map(missing_ancestors).collect();
+    let mut on_path = None;
     if fresh {
         let addr = crate::config::Config::load(&config_path)?.server.http_addr;
         if let Err(e) = std::net::TcpListener::bind(&addr) {
@@ -281,12 +291,23 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
         }
     }
     eprintln_header(if a.agent { "Installing kiln agent" } else { "Installing kiln server" });
-    match install_here(&a, system, &bin, &config_path).await {
+    match install_here(&a, system, &bin, &config_path, &mut on_path).await {
         Err(e) if fresh => {
             say("");
             say("taking back the install, which didn't come up");
             let started: Vec<u32> = supervisors_of(&ours).into_iter().filter(|p| !running_before.contains(p)).collect();
             take_back(&started, &config_path, (!had_bin).then_some(bin.as_path()), (!had_data).then_some(data_dir.as_path()));
+            if let (Some(added), Some(dir)) = (&on_path, bin.parent()) {
+                match crate::os::remove_from_user_path(dir, added) {
+                    Ok(()) => say(format!("removed     {} from your PATH{}", dir.display(), added.file.as_ref().map(|f| format!(" ({})", f.display())).unwrap_or_default())),
+                    Err(e) => say(format!("not removed {} from your PATH ({e})", dir.display())),
+                }
+            }
+            let mut new_dirs = new_dirs;
+            new_dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+            for d in new_dirs {
+                let _ = std::fs::remove_dir(&d);
+            }
             Err(e.context("kiln didn't come up on this machine; nothing was left: what the install made was removed"))
         }
         done => done,
@@ -295,10 +316,10 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
 
 /// Installs kiln on this machine: its binary at `bin`, its config at `config_path`, started at
 /// boot and now. A server's install ends once it answers, its UI loads and its runner is connected.
-async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &Path) -> anyhow::Result<()> {
+async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &Path, on_path: &mut Option<crate::os::PathAdded>) -> anyhow::Result<()> {
     place_binary(bin)?;
     say(format!("binary      {}", bin.display()));
-    put_on_path(bin);
+    *on_path = put_on_path(bin);
 
     let mut state_dir = crate::config::default_data_dir().join("agent");
     let (unit, args): (&str, Vec<String>) = if a.agent {
@@ -360,6 +381,11 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
         }
     }
     Ok(())
+}
+
+/// `dir` and those of its parents that don't exist yet, deepest first.
+fn missing_ancestors(dir: &Path) -> Vec<PathBuf> {
+    dir.ancestors().take_while(|d| !d.as_os_str().is_empty() && !d.exists()).map(Path::to_path_buf).collect()
 }
 
 /// Takes back a server's install on this machine that didn't come up: its service at boot, the
@@ -1497,6 +1523,16 @@ mod tests {
         assert_eq!(win_quote(""), "\"\"");
         assert_eq!(win_quote(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(win_quote(r"C:\Program Files\kiln\"), r#""C:\Program Files\kiln\\""#);
+    }
+
+    #[test]
+    fn a_fresh_install_knows_which_folders_it_makes() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let bin = home.path().join(".local/bin");
+        assert_eq!(missing_ancestors(&bin), [bin.clone(), home.path().join(".local")]);
+        std::fs::create_dir_all(&bin)?;
+        assert!(missing_ancestors(&bin).is_empty());
+        Ok(())
     }
 
     #[test]
