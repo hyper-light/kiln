@@ -74,12 +74,11 @@ KNOWN = [
     (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
     # bat's: the pull request's own changelog line, by its number and its author on GitHub.
     (r"Search for added line in changelog", "it looks for the pull request's own changelog line (its number, its author from GitHub's API); the corpus's pull request is the whole tree"),
-    # `actions/upload-artifact@master` is that repository's old branch: 2.0.1 (2020), on the artifact
-    # protocol GitHub retired on 2025-01-30.
-    (r"Unable to create a container for the artifact", "its `upload-artifact@master` is 2.0.1, on the artifact protocol GitHub retired in January 2025: it fails there too"),
     # A test that waits a few seconds for a message, or a minute for a release to boot, run while
     # the lab's pacer froze its work (the machine's disks busy): to be run again quietly.
     (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
+    # buildx's debug adapter tests wait 5 s for a build to end (`require.Fail(t, "timeout reached")`).
+    (r"Error:\s+timeout reached", "a test's timed wait (buildx's debug adapter waits 5 s for a build to end), in the lab, which runs at nice 19 and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
     (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
     # The lab's firewall keeps containers on networks of their own from its server, so its legs
     # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
