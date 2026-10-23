@@ -2,7 +2,8 @@
 
 CP-T10.1's part of merge train 1 (the critical path's CP-M4; its master plan's §6): what it
 delivers, what deploying it does and how to watch it, its risks and its rollback, and what's still
-open: the metric names Kiln Metrics hasn't answered and the decisions that are Ada's.
+open: one metric name Kiln Metrics hasn't confirmed, the change to events it asked for, and the
+decisions that are Ada's.
 
 **Where it stands (2026-10-22):**
 - **Merged** on main at 25159ff, landed at 03:17Z on Ada's word as a fast-forward from 40cd59b.
@@ -71,11 +72,22 @@ On production's `/metrics` (public there), its logs and its dashboard:
 - **The dashboard:** the "Blobs" row of the Kiln overview dashboard
   (deploy/grafana/dashboards/kiln-overview.json).
 
-## Metric names awaiting Kiln Metrics
+## Metric names, agreed with Kiln Metrics
 
 The names went to Kiln Metrics (Observe's owner, agent 01a14bf7c0ce7451a5fd7c6f0a9764d0) on
 2026-10-21 at 08:53Z. Updates followed at 21:19Z and at 01:28Z on 2026-10-22, and a reminder at
-03:28Z. There's no answer yet. Once deployed, production exports them under these names:
+03:28Z.
+
+Kiln Metrics answered on 2026-10-23:
+- **Agreed:** the first four families below suit Observe's conventions and stay as they are on
+  main. Nothing is dropped.
+- **Why they suit:** their cardinality is bounded, and no label key collides with the tag Observe
+  adds (`host`) or the ones it reserves (service, source, env, version).
+- **`outcome` stays,** although most of kiln's registry says `result`.
+- **The fifth,** `kiln_blobs_archives_given_up_total`, wasn't named in the answer. It was asked at
+  03:37Z whether that one is fine as it is, with no answer yet.
+
+Once deployed, production exports them under these names:
 
 | Family | Type | Labels |
 |---|---|---|
@@ -88,6 +100,12 @@ The names went to Kiln Metrics (Observe's owner, agent 01a14bf7c0ce7451a5fd7c6f0
 Events go on target `kiln.blobs`, where `event` is put, get, list, adopt, collect, refused or
 given_up. A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.rs, docs/blobs.md
 ("Watching it") and the dashboard's Blobs row. Nothing else reads the names.
+
+**One change Kiln Metrics asked for,** in T10's next goal (it needs a gate): once Observe's span
+bridge keeps `kiln.blobs`, it makes an Observe event of every line that has an `event` field. So:
+- per-request lines lose the field: refusals at debug, and the CAS's "kept" on every put;
+- the per-request warning for an unavailable store says `event = "unavailable"`, not `refused`;
+- every other event keeps its field.
 
 ## Risks
 
