@@ -366,7 +366,6 @@ export function Inspector({
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
               <section>
-                <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
                 {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
                 {todos.length > 0 && (
                   <div className="hx-stack">

@@ -77,7 +77,7 @@ function lines(el: HTMLElement, steps: GraphStep[]): Drawn {
 const MARK_X = 18;
 
 /** A step's title: code as code, a long name broken where its parts meet. */
-function TitleText({ parts }: { parts: TitlePart[] }) {
+export function TitleText({ parts }: { parts: TitlePart[] }) {
   return parts.map((p, i) =>
     p.code ? (
       <code key={i} className="pg-code">

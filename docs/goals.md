@@ -19,12 +19,19 @@ work their own stack", below).
 An agent's **Plan** tab has its **Goal stack** (`/goals` opens it), in a panel of its own below its plans: what's met, under way and next,
 each with how it came out; a field to add goals (a line each); and:
 
-Each goal is a link of a chain, drawn as the agent's conversation draws its work: under way while
-the agent is at work, hyperlight's mark with its light turning and the goal's words in the
-holographic shimmer; met, the loop closed; not met, broken; skipped, dashed; to come (or under way
-while the agent is idle, or paused), only sketched, still. A goal's parts are smaller links before
-it, and a step's own parts (its acceptance criteria and tests) smaller still; a goal turned into a
-plan links to it, and a part waiting for a plan's run to the run.
+Each goal is a numbered link of a chain, its number ringed by where it stands: under way while the
+agent is at work, the console's light turning around it and the goal's words in the holographic
+shimmer; met in mint; not met in amber; skipped, dashed. A goal whose parts or plan steps are under
+way is under way too. Under a goal, on its line, are its steps (its plan's, or the parts it was
+split into), each in the console's glyph for where it stands (met, the loop closed; not met,
+broken; skipped, dashed; stopped, faint; needs you, the amber rings; waiting, sketched; at work,
+the light turning in it and its words in the shimmer), the word for it at the right, and who's at
+one that's worked on or needs you ("Devin · fedora"). Steps that run at once hang on one branch
+beside the goal's line ("3 at once"), however many there are, so a plan is never more than two
+lines wide; a step that waits for something further up says so ("after “Write the install
+matrix”"); a crowded plan (more than 8 steps) folds its finished stretch at the top into one line
+("4 steps met · show them"); a step with criteria and tests says how many are met. A planned goal
+says how many of its steps are met (its plan to open), its run and its research.
 
 - **Start**: the first goal goes to the agent at once, whatever it's doing (behind a turn under
   way, its harness queues it: "One message at a time", below); each next one once it's free (idle,
@@ -127,7 +134,7 @@ doesn't need a person for any of it:
   once they're all met, so is the goal, at once ("Met: each of its acceptance criteria and tests is
   met.").
 - **Turning a goal into a plan: `goals_plan`**, or a goal's **Make a plan** on its agent's Plan
-  tab. A goal that's become one shows its plan's steps under it, as their graph, each as it stands
+  tab. A goal that's become one shows its plan's steps under it on its line, each as it stands
   (its part on the stack, or its run's step), with how many are met and the plan to open; a long
   goal folds to its first lines (**More**). The goal under way (or the one `id` names) becomes
   a plan in its planning phase, with research of its own (docs/plans.md, "Planning a goal"): its
