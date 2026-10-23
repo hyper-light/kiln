@@ -142,19 +142,24 @@ async fn delete_row(store: Recs<'_>, family: &str, key: Vec<u8>) -> anyhow::Resu
     Ok(true)
 }
 
-/// Rows of `family` under `prefix`, in key order, at most `max`: page by page, every page read at
-/// one revision, so the list is one moment's.
+/// Rows of `family` under `prefix`, in key order: page by page, every page read at one revision,
+/// so the list is one moment's. More than `max` is refused, not cut short without a word.
 async fn rows(store: Recs<'_>, family: &str, prefix: &[u8], max: usize) -> anyhow::Result<Vec<Row>> {
     let at = Consistency::Snapshot(store.head().await.map_err(refused)?);
     let mut out: Vec<Row> = Vec::new();
     let mut after = None;
+    let mut more = false;
     while out.len() < max {
         let page = store.scan(family, Scan { prefix: prefix.to_vec(), after: after.clone(), limit: max.saturating_sub(out.len()).clamp(1, 1000), at }).await.map_err(refused)?;
         after = page.rows.last().map(|r| r.key.clone());
         out.extend(page.rows);
-        if !page.more {
+        more = page.more;
+        if !more {
             break;
         }
+    }
+    if more {
+        anyhow::bail!("{family} holds more than {max} rows under its prefix, more than deploy reads of it");
     }
     Ok(out)
 }
@@ -683,6 +688,23 @@ mod tests {
             anyhow::ensure!(release(st, 8).await?.is_some(), "release 8 is still there");
             let next = insert_release(st, &Release { id: 0, ..made }).await?.0;
             anyhow::ensure!(next.id == 9, "no number comes back: {}", next.id);
+            Ok(())
+        })
+    }
+
+    /// A family holding more than its bound is refused, not read short: a list isn't cut off
+    /// without a word, nor a claim blind to the leases past it.
+    #[test]
+    fn a_family_past_its_bound_is_refused_not_read_short() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let recs = kiln_seams::records::SimRecords::new();
+            let st: Recs<'_> = &recs;
+            for i in 0..5 {
+                schedule(st, i, 10).await?;
+            }
+            anyhow::ensure!(rows(st, WORK, b"", 5).await?.len() == 5, "at its bound, every row");
+            let past = rows(st, WORK, b"", 3).await;
+            anyhow::ensure!(past.as_ref().is_err_and(|e| e.to_string().contains("deploy.work holds more than 3 rows")), "past it, refused: {past:?}");
             Ok(())
         })
     }
