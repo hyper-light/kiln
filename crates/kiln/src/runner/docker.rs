@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
@@ -55,35 +55,77 @@ pub fn find() -> Option<String> {
     None
 }
 
-/// Whether this machine can run containers, probed once (for `CAP_DOCKER`, W13-R01).
-pub fn available() -> bool {
-    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBED.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(find().is_some());
-        });
-        rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
-    })
+/// How long a probe of the container engine is waited for: a runner's report of what it can do
+/// waits on it as it connects. A daemon too busy to answer by then isn't taken for absent.
+const PROBE_WAIT: Duration = Duration::from_secs(10);
+/// A probe under way this long is taken for hung (`docker version` against a daemon that never
+/// answers), and the next ask starts another.
+const PROBE_HUNG: Duration = Duration::from_secs(600);
+
+/// A probe's answer, once it has one, and since when one is under way.
+struct Probe {
+    state: std::sync::Mutex<(Option<bool>, Option<Instant>)>,
+    done: std::sync::Condvar,
 }
 
-/// Whether this machine's engine runs rootless, probed once (for `CAP_DOCKER_ROOTLESS`: untrusted
-/// legs use Docker only so, docs/ci.md W18-R07).
+impl Probe {
+    const fn new() -> Probe {
+        Probe { state: std::sync::Mutex::new((None, None)), done: std::sync::Condvar::new() }
+    }
+
+    /// `probe`'s answer, kept once there is one. Until then, one probe at a time runs, and it is
+    /// waited for until [`PROBE_WAIT`] after it began: one not answered by then (a daemon too
+    /// busy) is `false` for now, and asked again next time (a runner's next connection), so a
+    /// runner that started on a busy machine doesn't go without Docker for good. Blocks: call it
+    /// off the runtime.
+    fn answer(&'static self, probe: fn() -> bool) -> bool {
+        self.answer_within(PROBE_WAIT, probe)
+    }
+
+    fn answer_within(&'static self, wait: Duration, probe: fn() -> bool) -> bool {
+        let Ok(mut g) = self.state.lock() else { return false };
+        if let Some(v) = g.0 {
+            return v;
+        }
+        let under_way = g.1;
+        let since = match under_way {
+            Some(t) if t.elapsed() < PROBE_HUNG => t,
+            _ => {
+                let now = Instant::now();
+                g.1 = Some(now);
+                std::thread::spawn(move || {
+                    let v = probe();
+                    if let Ok(mut g) = self.state.lock() {
+                        *g = (Some(v), None);
+                    }
+                    self.done.notify_all();
+                });
+                now
+            }
+        };
+        let wait = wait.saturating_sub(since.elapsed());
+        self.done.wait_timeout_while(g, wait, |g| g.0.is_none()).ok().and_then(|(g, _)| g.0).unwrap_or(false)
+    }
+}
+
+/// Whether this machine can run containers (for `CAP_DOCKER`, W13-R01).
+pub fn available() -> bool {
+    static PROBED: Probe = Probe::new();
+    PROBED.answer(|| find().is_some())
+}
+
+/// Whether this machine's engine runs rootless (for `CAP_DOCKER_ROOTLESS`: untrusted legs use
+/// Docker only so, docs/ci.md W18-R07).
 pub fn rootless_engine() -> bool {
-    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBED.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let rootless = find().is_some_and(|bin| {
-                let format = if bin.ends_with("podman") { "{{.Host.Security.Rootless}}" } else { "{{json .SecurityOptions}}" };
-                std::process::Command::new(&bin).args(["info", "--format", format]).stderr(std::process::Stdio::null()).output().is_ok_and(|o| {
-                    let out = String::from_utf8_lossy(&o.stdout);
-                    o.status.success() && (out.trim() == "true" || out.contains("rootless"))
-                })
-            });
-            let _ = tx.send(rootless);
-        });
-        rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+    static PROBED: Probe = Probe::new();
+    PROBED.answer(|| {
+        find().is_some_and(|bin| {
+            let format = if bin.ends_with("podman") { "{{.Host.Security.Rootless}}" } else { "{{json .SecurityOptions}}" };
+            std::process::Command::new(&bin).args(["info", "--format", format]).stderr(std::process::Stdio::null()).output().is_ok_and(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                o.status.success() && (out.trim() == "true" || out.contains("rootless"))
+            })
+        })
     })
 }
 
@@ -179,6 +221,7 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
     // prebuilt tools by it.
     // And the release's ICU, which PowerShell needs.
     let (base, os, icu) = match name {
+        "ubuntu-26.04" => ("ubuntu:26.04", "ubuntu26", "libicu78"),
         "ubuntu-24.04" => ("ubuntu:24.04", "ubuntu24", "libicu74"),
         "ubuntu-22.04" => ("ubuntu:22.04", "ubuntu22", "libicu70"),
         _ => return None,
@@ -228,9 +271,20 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              && curl -fsSL -o \"/tmp/$f\" \"$u/$f\" && echo \"$(curl -fsSL \"$u/gh_2.102.0_checksums.txt\" | grep \"  $f$\" | cut -d' ' -f1)  /tmp/$f\" | sha256sum -c - \\\n    \
              && tar -xzf \"/tmp/$f\" -C /tmp && install -m 0755 \"/tmp/gh_2.102.0_linux_$g/bin/gh\" /usr/local/bin/gh && rm -rf \"/tmp/$f\" \"/tmp/gh_2.102.0_linux_$g\"\n"
         ));
-        if os == "ubuntu24" {
-            // pip installs as it does on GitHub's Ubuntu 24.04 machines, whose `/etc/pip.conf`
-            // says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
+        // Go, as GitHub's images have it on `PATH` (prometheus's `promci-setup` asks `go env` for its
+        // caches' paths without setting Go up): the newest release, checked against the sums
+        // go.dev lists. Its own `PATH` here, so the layers before stay as they were.
+        d.push_str(
+            "RUN case \"$(dpkg --print-architecture)\" in amd64) a=amd64 ;; arm64) a=arm64 ;; esac \\\n    \
+             && curl -fsSL -o /tmp/go.json 'https://go.dev/dl/?mode=json' && v=$(jq -r '.[0].version' /tmp/go.json) && f=\"$v.linux-$a.tar.gz\" \\\n    \
+             && s=$(jq -r --arg f \"$f\" '.[0].files[] | select(.filename == $f) | .sha256' /tmp/go.json) \\\n    \
+             && curl -fsSL -o \"/tmp/$f\" \"https://go.dev/dl/$f\" && echo \"$s  /tmp/$f\" | sha256sum -c - \\\n    \
+             && tar -xzf \"/tmp/$f\" -C /usr/local && rm -f \"/tmp/$f\" /tmp/go.json\n\
+             ENV PATH=/usr/local/go/bin:$PATH\n",
+        );
+        if os != "ubuntu22" {
+            // pip installs as it does on GitHub's Ubuntu 24.04 and 26.04 machines, whose
+            // `/etc/pip.conf` says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
             d.push_str("RUN printf '[global]\\nbreak-system-packages = true\\n' > /etc/pip.conf\n");
         }
         // Git as GitHub's images have it, the git-core PPA's (2.55 when added) rather than the
@@ -295,31 +349,44 @@ pub async fn sweep(work: &Path) {
     let Ok(Some(bin)) = crate::rt::blocking(find).await else { return };
     let cli = Cli::new(&bin, work.join("_docker_config")).owned_by(work);
     let Some(owner) = cli.owner.clone() else { return };
+    // And what its legs made through their own sockets.
+    let mut labels = vec![owner.clone()];
+    labels.extend(super::docker_sock::runner_label(&owner));
+    let [containers, networks, volumes] = remove_labelled(&cli, &labels, SWEEP).await;
+    if containers + networks + volumes > 0 {
+        tracing::info!(containers, networks, volumes, "removed what this runner left running when it last stopped");
+    }
+}
+
+/// Removes what has one of `labels` (`key=value`): the containers (their anonymous volumes with
+/// them), then the networks and volumes they may have used. How many of each it found.
+async fn remove_labelled(cli: &Cli, labels: &[String], wait: Duration) -> [usize; 3] {
     let none = BTreeMap::new();
-    let filter = [s("--filter"), format!("label={owner}")];
-    let mut ps = vec![s("ps"), s("-aq")];
-    ps.extend(filter.clone());
-    let ids: Vec<String> = cli.run(&ps, &none, SWEEP).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
-    if !ids.is_empty() {
-        let mut rm = vec![s("rm"), s("--force")];
-        rm.extend(ids.iter().cloned());
-        if let Err(e) = cli.run(&rm, &none, SWEEP).await {
-            tracing::warn!(error = %format!("{e:#}"), "what this runner left running could not be removed");
+    let mut found = [0; 3];
+    for (count, kind) in found.iter_mut().zip([None, Some("network"), Some("volume")]) {
+        let mut ids = Vec::new();
+        for label in labels {
+            let mut ls = kind.map_or_else(|| vec![s("ps"), s("-aq")], |k| vec![s(k), s("ls"), s("-q")]);
+            ls.extend([s("--filter"), format!("label={label}")]);
+            ids.extend(cli.run(&ls, &none, wait).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()));
+        }
+        ids.sort();
+        ids.dedup();
+        *count = ids.len();
+        if ids.is_empty() {
+            continue;
+        }
+        let mut rm = match kind {
+            None => vec![s("rm"), s("--force"), s("--volumes")],
+            Some("volume") => vec![s("volume"), s("rm"), s("--force")],
+            Some(k) => vec![s(k), s("rm")],
+        };
+        rm.extend(ids);
+        if let Err(e) = cli.run(&rm, &none, wait).await {
+            tracing::warn!(error = %format!("{e:#}"), kind = kind.unwrap_or("container"), "what was left could not all be removed");
         }
     }
-    let mut ls = vec![s("network"), s("ls"), s("-q")];
-    ls.extend(filter);
-    let nets: Vec<String> = cli.run(&ls, &none, SWEEP).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
-    if !nets.is_empty() {
-        let mut rm = vec![s("network"), s("rm")];
-        rm.extend(nets.iter().cloned());
-        if let Err(e) = cli.run(&rm, &none, SWEEP).await {
-            tracing::warn!(error = %format!("{e:#}"), "the networks this runner left could not be removed");
-        }
-    }
-    if !ids.is_empty() || !nets.is_empty() {
-        tracing::info!(containers = ids.len(), networks = nets.len(), "removed what this runner left running when it last stopped");
-    }
+    found
 }
 
 /// The CLI, with the leg's own credential store.
@@ -571,6 +638,23 @@ impl PathMap {
         out
     }
 
+    /// A step's environment as a container sees it: each value [`translated`](Self::translate),
+    /// and `GH_HOST` too, which names a host and port with no scheme: the host's loopback there is
+    /// its alias, as in the URLs beside it (and the checkout's remote), or `gh` finds no remote of
+    /// that host.
+    pub fn translate_env<'a>(&self, env: impl IntoIterator<Item = (&'a String, &'a String)>) -> BTreeMap<String, String> {
+        env.into_iter()
+            .map(|(k, v)| {
+                let v = if k == "GH_HOST" {
+                    ["127.0.0.1:", "localhost:", "[::1]:"].iter().find_map(|lo| v.strip_prefix(lo)).map_or_else(|| self.translate(v), |port| format!("{HOST_ALIAS}:{port}"))
+                } else {
+                    self.translate(v)
+                };
+                (k.clone(), v)
+            })
+            .collect()
+    }
+
     /// A container's path as the host has it, when it is under a mount.
     pub fn to_host(&self, path: &str) -> Option<PathBuf> {
         self.0
@@ -606,6 +690,10 @@ pub struct JobContainer {
     pub user: Option<String>,
     /// `HOME` for its steps.
     pub home: String,
+    /// The name its steps' user goes by (`USER`, `LOGNAME`): kiln's runner image's `runner`, as a
+    /// hosted runner's steps have it (scripts lean on it: ORT's action makes its container's paths
+    /// with `${PROJECT_PATH/$USER/ort}`). None in another image, where GitHub gives steps none.
+    pub login: Option<String>,
     /// The image's `PATH`, to which `GITHUB_PATH` entries are prepended.
     pub path: String,
     /// It has `sh`, which a step's cancel reaches the step through ([`Cli::signal_in`]).
@@ -822,11 +910,11 @@ impl Containers {
                     Err(_) => (false, false),
                 };
                 let musl = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s(MUSL_PROBE)], &none, CALL).await.is_ok_and(|o| o.trim() == "musl");
-                let (user, home) = match user {
-                    Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
-                    None => (as_runner, "/github/home".to_owned()),
+                let (user, home, login) = match user {
+                    Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned(), Some(if uid == 0 { "root" } else { "runner" }.to_owned())),
+                    None => (as_runner, "/github/home".to_owned(), None),
                 };
-                c.job = Some(JobContainer { id, user, home, path, has_sh, has_bash, musl, map });
+                c.job = Some(JobContainer { id, user, home, login, path, has_sh, has_bash, musl, map });
             }
             // Health checks, then the ports the host got.
             let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();
@@ -993,23 +1081,12 @@ impl Containers {
         Ok((out, port))
     }
 
+    /// Removes the leg's containers and networks (the relay's among them, all labelled the leg's)
+    /// and what the leg made through its own socket ([`super::docker_sock`]), as the end of a
+    /// machine of its own would.
     pub async fn stop(&self) {
-        let none = BTreeMap::new();
-        let ids = self.cli.run(&[s("ps"), s("-aq"), s("--filter"), format!("label={}", self.label)], &none, CALL).await.unwrap_or_default();
-        let ids: Vec<String> = ids.lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
-        if !ids.is_empty() {
-            let mut args = vec![s("rm"), s("--force")];
-            args.extend(ids);
-            if let Err(e) = self.cli.run(&args, &none, CALL).await {
-                tracing::warn!(error = %format!("{e:#}"), "the leg's containers could not be removed");
-            }
-        }
-        let relay = self.relay.as_ref().map(|(n, _)| n.clone());
-        for network in std::iter::once(self.network.clone()).filter(|n| n != "host").chain(relay) {
-            if let Err(e) = self.cli.run(&[s("network"), s("rm"), network], &none, CALL).await {
-                tracing::warn!(error = %format!("{e:#}"), "the leg's network could not be removed");
-            }
-        }
+        let made = super::docker_sock::leg_label(self.label.strip_prefix("kiln.leg=").unwrap_or(&self.label));
+        remove_labelled(&self.cli, &[self.label.clone(), made], CALL).await;
     }
 }
 
@@ -1083,6 +1160,24 @@ pub fn action_run_args(name: &str, labels: &[String], user: Option<&str>, networ
 mod tests {
     use super::*;
 
+    /// A probe the engine hasn't answered in time is `false` for now, not for good: the one under
+    /// way is waited for next time (not another started), and its answer is kept.
+    #[test]
+    fn a_probe_not_answered_in_time_is_asked_again() {
+        static SLOW: Probe = Probe::new();
+        static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn slow() -> bool {
+            RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            true
+        }
+        assert!(!SLOW.answer_within(Duration::from_millis(20), slow), "not answered yet");
+        assert!(SLOW.answer_within(Duration::from_secs(10), slow), "the probe under way answers");
+        let at = Instant::now();
+        assert!(SLOW.answer_within(Duration::ZERO, slow) && at.elapsed() < Duration::from_millis(100), "kept");
+        assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), 1, "one probe");
+    }
+
     /// A start that fails partway takes what it made with it: here the leg's network, made before
     /// a service whose image there is no pulling.
     #[test]
@@ -1155,11 +1250,15 @@ mod tests {
             "/usr/bin/pwsh",
             "libicu74",
             "cli/cli/releases",
+            "https://go.dev/dl/$f",
+            "PATH=/usr/local/go/bin:",
             "break-system-packages",
         ] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
         assert!(full.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {full}");
+        let resolute = runner_dockerfile("kiln/runner-ubuntu-26.04", None).unwrap_or_default();
+        assert!(resolute.starts_with("FROM ubuntu:26.04\n") && resolute.contains(" ImageOS=ubuntu26\n") && resolute.contains("libicu78") && resolute.contains("break-system-packages"), "{resolute}");
         let jammy = runner_dockerfile("kiln/runner-ubuntu-22.04", None).unwrap_or_default();
         assert!(jammy.contains(" ImageOS=ubuntu22\n") && jammy.contains("libicu70") && !jammy.contains("break-system-packages"), "{jammy}");
         assert!(runner_dockerfile("ubuntu:24.04", None).is_none());
@@ -1182,6 +1281,26 @@ mod tests {
         assert_eq!(m.to_host("/opt/hostedtoolcache/node/x"), Some(PathBuf::from("/w/_tool/node/x")));
         assert_eq!(m.to_host("/__w/repo/repository"), None, "a prefix of a name is not its directory");
         assert_eq!(m.to_host("/etc/passwd"), None);
+    }
+
+    /// A step's environment in a container: the host's loopback is its alias there, in URLs and
+    /// in `GH_HOST` (a host and port alone), so `gh` finds the checkout's remote of that host.
+    #[test]
+    fn a_containers_environment_names_the_host_by_its_alias() {
+        let m = PathMap::new(vec![(PathBuf::from("/w/leg/repo"), "/__w/repo/repo".into())]);
+        let env: BTreeMap<String, String> =
+            [("GH_HOST", "127.0.0.1:42511"), ("GITHUB_SERVER_URL", "http://127.0.0.1:42511"), ("GITHUB_WORKSPACE", "/w/leg/repo"), ("NO_PROXY", "localhost,127.0.0.1,::1")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+        let inside = m.translate_env(&env);
+        let get = |k: &str| inside.get(k).map(String::as_str);
+        assert_eq!(get("GH_HOST"), Some("host.docker.internal:42511"));
+        assert_eq!(get("GITHUB_SERVER_URL"), Some("http://host.docker.internal:42511"));
+        assert_eq!(get("GITHUB_WORKSPACE"), Some("/__w/repo/repo"));
+        assert_eq!(get("NO_PROXY"), Some("localhost,127.0.0.1,::1"), "a list of hosts isn't a URL");
+        let elsewhere: BTreeMap<String, String> = [("GH_HOST".to_owned(), "kiln.example:8443".to_owned())].into_iter().collect();
+        assert_eq!(m.translate_env(&elsewhere).get("GH_HOST").map(String::as_str), Some("kiln.example:8443"));
     }
 
     #[test]

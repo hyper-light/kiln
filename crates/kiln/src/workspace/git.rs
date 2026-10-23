@@ -32,6 +32,10 @@ pub struct Facts {
     pub remotes: Vec<Remote>,
     /// The branch the `origin` remote calls its default, when it says.
     pub default_branch: Option<String>,
+    /// In a linked worktree (`git worktree add`, Claude Code's `EnterWorktree`): the branch its
+    /// repository's own checkout has, the one the worktree's work is likely for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,7 +105,64 @@ pub async fn facts(cwd: &Path) -> anyhow::Result<Facts> {
     let mut c = git(&dir);
     c.args(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
     let default_branch = ask(c).await.and_then(|r| r.strip_prefix("origin/").map(str::to_owned));
-    Ok(Facts { top, head, branch, remotes, default_branch })
+    let mut c = git(&dir);
+    c.args(["worktree", "list", "--porcelain"]);
+    let main_branch = main_checkout(&ask(c).await.unwrap_or_default()).filter(|(path, _)| Path::new(path) != dir).and_then(|(_, b)| b);
+    Ok(Facts { top, head, branch, remotes, default_branch, main_branch })
+}
+
+/// The repository's own checkout, as `git worktree list --porcelain` lists it first: its path and
+/// its branch (none detached).
+fn main_checkout(porcelain: &str) -> Option<(String, Option<String>)> {
+    let first = porcelain.split("\n\n").next()?;
+    let path = first.lines().find_map(|l| l.strip_prefix("worktree "))?.to_owned();
+    let branch = first.lines().find_map(|l| l.strip_prefix("branch refs/heads/")).map(str::to_owned);
+    Some((path, branch))
+}
+
+/// Where a path is in git, read from the folders alone: the top of the working tree it's in, and
+/// its repository's git folder, which the repository's linked worktrees share (`git worktree add`,
+/// Claude Code's `EnterWorktree`). A checkout's top has a `.git` folder; a linked worktree's, a
+/// `.git` file naming its folder under the repository's `.git/worktrees/`, whose `commondir`
+/// names the shared one. A submodule is a repository of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub top: PathBuf,
+    pub repo: PathBuf,
+}
+
+/// [`Place`] of `path`, a file or a folder; one that's gone, by the nearest folder above it left.
+pub fn place(path: &Path) -> Option<Place> {
+    let mut dir = path;
+    while !dir.is_dir() {
+        dir = dir.parent()?;
+    }
+    let canonical = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+    loop {
+        let dot = dir.join(".git");
+        match std::fs::symlink_metadata(&dot) {
+            Ok(m) if m.is_dir() => return Some(Place { top: dir.to_path_buf(), repo: canonical(dot) }),
+            Ok(m) if m.is_file() => {
+                let text = std::fs::read_to_string(&dot).ok()?;
+                let own = dir.join(text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
+                let repo = std::fs::read_to_string(own.join("commondir")).ok().map_or_else(|| own.clone(), |c| own.join(c.trim()));
+                return Some(Place { top: dir.to_path_buf(), repo: canonical(repo) });
+            }
+            _ => dir = dir.parent()?,
+        }
+    }
+}
+
+/// The working tree file `abs` is in, when it's one of the repository of `home` (an agent's
+/// folder): its top, and the file's path within it (as git names it, `/`-separated).
+pub fn within(abs: &Path, home: &Path) -> Option<(PathBuf, String)> {
+    let file = place(abs)?;
+    if place(home)?.repo != file.repo {
+        return None;
+    }
+    let rel = abs.strip_prefix(&file.top).ok()?.to_string_lossy().into_owned();
+    let rel = if cfg!(windows) { rel.replace('\\', "/") } else { rel };
+    (!rel.is_empty()).then_some((file.top, rel))
 }
 
 /// `git remote -v`'s lines, each remote once (by its fetch URL).
@@ -499,6 +560,33 @@ mod tests {
             assert!(!e.is_empty() && !e.contains("kiln_agt_secret"), "{e}");
             anyhow::Ok(())
         })?;
+        Ok(())
+    }
+
+    /// An agent in a worktree of its folder's repository (`git worktree add`, Claude Code's
+    /// `EnterWorktree`): its files are placed there, by their paths in it, and its facts say the
+    /// checkout's branch beside its own.
+    #[test]
+    fn a_worktree_s_files_are_placed_in_it_and_another_repository_s_are_not() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "git worktree add -q -b feature .claude/worktrees/feature && echo x > .claude/worktrees/feature/a")?;
+        let wt = top.join(".claude/worktrees/feature");
+        let other = repo()?;
+        assert_eq!(within(&wt.join("a"), &top), Some((wt.clone(), "a".to_owned())), "from the checkout, the worktree's own file");
+        assert_eq!(within(&top.join("src/s.rs"), &wt), Some((top.clone(), "src/s.rs".to_owned())), "from the worktree, the checkout's: one repository");
+        assert_eq!(within(&wt.join("src/gone.rs"), &top), Some((wt.clone(), "src/gone.rs".to_owned())), "a file that's gone, by its folder");
+        assert_eq!(within(&other.path().join("a"), &top), None, "another repository's isn't the agent's");
+        assert_eq!(place(&wt).map(|p| p.repo), place(&top).map(|p| p.repo));
+        let (w, t) = (wt.clone(), top.clone());
+        let (worktree, checkout) = crate::rt::block_on(async move { anyhow::Ok((facts(&w).await?, facts(&t).await?)) })?;
+        assert_eq!((worktree.branch.as_deref(), worktree.main_branch.as_deref()), (Some("feature"), Some("main")));
+        assert_eq!(checkout.main_branch, None, "the checkout itself is no worktree");
+        assert_eq!(
+            main_checkout("worktree /w/app\nHEAD abc\nbranch refs/heads/main\n\nworktree /w/app/.claude/worktrees/f\nHEAD def\nbranch refs/heads/f\n"),
+            Some(("/w/app".to_owned(), Some("main".to_owned())))
+        );
+        assert_eq!(main_checkout("worktree /w/app\nHEAD abc\ndetached\n"), Some(("/w/app".to_owned(), None)));
         Ok(())
     }
 

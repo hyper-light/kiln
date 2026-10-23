@@ -97,7 +97,7 @@ pub(super) async fn manifest(hub: &Hub, m: &Mirror, name: &str, upstream_name: &
     let size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             tx.execute("INSERT INTO registry_repos (name, created_at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING", params![n, now])?;
             tx.execute(

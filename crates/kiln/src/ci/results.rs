@@ -129,7 +129,7 @@ pub async fn ingest(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
     let report_id: i64 = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "INSERT INTO test_reports (leg, step_idx, path, format, object, cases, failed, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![l, step, p, fmt, obj, i64::try_from(cases.len()).unwrap_or(i64::MAX), i64::try_from(failed).unwrap_or(i64::MAX), now],
@@ -573,7 +573,7 @@ pub async fn metrics(hub: &Hub, leg: &str, idx: u32, points: &[Value], fingerpri
         .collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             for (p, cmp) in &rows {
                 tx.execute(
                     "INSERT INTO metrics (repo_id, run_id, leg, leg_key, attempt, branch, sha, step_idx, name, value, unit, better, tags, samples, fingerprint, comparison, ts)

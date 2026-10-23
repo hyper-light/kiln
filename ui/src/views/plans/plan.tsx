@@ -227,15 +227,7 @@ function PlanEditor({ id }: { id: string }) {
               <Prose text={withoutTitle(plan.body, plan.title)} />
             </div>
           )}
-          <PlanSteps
-            plan={plan}
-            picked={picked}
-            onPick={setPicked}
-            onRun={(n) => {
-              setPicked([n]);
-              document.getElementById("plan-run")?.scrollIntoView({ behavior: "smooth", block: "start" });
-            }}
-          />
+          <PlanSteps plan={plan} picked={picked} onPick={setPicked} onRun={() => document.getElementById("plan-run")?.scrollIntoView({ behavior: "smooth", block: "start" })} />
         </>
       ) : (
         <>

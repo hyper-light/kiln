@@ -233,7 +233,7 @@ async fn part(hub: &Arc<Hub>, claims: &Claims, id: &str, req: Request) -> Result
 }
 
 /// Writes a request body of exactly `len` bytes at `offset` in `path` (created if missing).
-async fn write_at(req: Request, path: &std::path::Path, offset: u64, len: u64) -> anyhow::Result<()> {
+pub(super) async fn write_at(req: Request, path: &std::path::Path, offset: u64, len: u64) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         let d = dir.to_path_buf();
         crate::rt::blocking(move || std::fs::create_dir_all(d)).await??;
@@ -326,7 +326,7 @@ pub async fn evict(hub: &Hub, repo: Option<&str>) -> anyhow::Result<usize> {
         crate::ci::notify::cache_use(hub, r.clone(), used, quota).await;
         hub.store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 for id in &ids {
                     tx.execute("DELETE FROM ci_caches WHERE id = ?1", [id])?;
                 }

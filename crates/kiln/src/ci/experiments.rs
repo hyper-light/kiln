@@ -240,7 +240,7 @@ async fn record_decision(hub: &Hub, e: &mut Experiment, d: Decision) {
 async fn next_id(hub: &Hub) -> anyhow::Result<String> {
     hub.store
         .call(|c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let n: i64 = tx.query_row("SELECT v FROM kv WHERE k = 'ci/experiment-next'", [], |r| r.get::<_, String>(0)).optional()?.and_then(|v| v.parse().ok()).unwrap_or(1);
             tx.execute("INSERT INTO kv (k, v) VALUES ('ci/experiment-next', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v", [(n + 1).to_string()])?;
             tx.commit()?;

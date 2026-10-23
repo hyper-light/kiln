@@ -127,7 +127,7 @@ pub async fn record(hub: &Hub, repo: &Repo, provider: &str, run: &ExtRun, jobs: 
     let id = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let known: Option<String> = tx.query_row("SELECT id FROM runs WHERE repo_id = ?1 AND provider = ?2 AND external_id = ?3", params![repo_id, provider, run.external_id], |r| r.get(0)).optional()?;
             let id = match known {
                 Some(id) => {

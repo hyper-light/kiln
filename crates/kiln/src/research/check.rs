@@ -8,7 +8,9 @@
 //!   output; a record of kiln's in kiln (a plan's words, an agent's conversation).
 //!
 //! A quote is found when its words are there in order, however they're spaced, in any case, with
-//! curly quotes and dashes as plain ones (`…` or `...` in a quote stands for words left out).
+//! curly quotes and dashes as plain ones (`…` or `...` in a quote stands for words left out, a line
+//! break for lines left out), the full stops, commas, colons and quote marks it starts or ends with
+//! not counting.
 //! What can't be read (a PDF, a page its scripts draw, one behind a sign-in, a machine whose kiln is
 //! older) is left unchecked, saying why: it counts as quoted, not as found.
 
@@ -104,22 +106,33 @@ pub fn norm(text: &str) -> String {
     out
 }
 
-/// Whether `text` holds `quote`: its words in order (`...` standing for words left out).
+/// Whether `text` holds `quote`: its stretches in order ([`stretches`]).
 pub fn holds(text: &str, quote: &str) -> bool {
     let t = norm(text);
-    let q = norm(quote);
-    let pieces: Vec<&str> = q.split("...").map(str::trim).filter(|p| !p.is_empty()).collect();
+    let pieces = stretches(quote);
     if pieces.is_empty() {
         return false;
     }
     let mut at = 0;
-    for p in pieces {
-        match t.get(at..).and_then(|rest| rest.find(p)) {
+    for p in &pieces {
+        match t.get(at..).and_then(|rest| rest.find(p.as_str())) {
             Some(i) => at += i + p.len(),
             None => return false,
         }
     }
     true
+}
+
+/// A quote's stretches, each as it's looked for ([`norm`]): its lines (an agent quoting output
+/// picks the lines that matter), each cut where `...` leaves words out, without the full stops,
+/// commas, colons and quote marks a stretch starts or ends with (a sentence quoted whole ends with
+/// a full stop where its page went on with a colon) unless that's all it is.
+fn stretches(quote: &str) -> Vec<String> {
+    let bare = |p: &str| -> String {
+        let core = p.trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\''));
+        if core.is_empty() { p.trim() } else { core }.to_owned()
+    };
+    quote.lines().flat_map(|line| norm(line).split("...").map(bare).filter(|p| !p.is_empty()).collect::<Vec<_>>()).collect()
 }
 
 /// A page's words: its markup, scripts, styles and comments gone, its entities read.
@@ -364,21 +377,48 @@ fn by(source: &super::Source, quote: Option<&str>, agent_machine: Option<&str>) 
     }
 }
 
-/// The words of a conversation's events (each event's text, its tools' output) that hold `quote`,
-/// in agent `agent`'s conversation: whether any does.
+/// Whether agent `agent`'s conversation holds `quote` in one of its events (its text, its tools'
+/// input and output, whole).
 async fn in_conversation(hub: &Hub, agent: &str, quote: &str) -> Option<bool> {
     let store = hub.harness.convo.clone()?;
-    let words: Vec<&str> = quote.split_whitespace().filter(|w| w.chars().any(char::is_alphanumeric)).take(8).collect();
-    let q = crate::convo::store::Query { q: words.join(" "), session: Some(agent.to_owned()), limit: Some(50), ..Default::default() };
-    let rows = crate::rt::blocking(move || store.search(q)).await.ok()?.ok()?;
-    let quote = quote.to_owned();
-    Some(rows.iter().any(|r| {
+    let (agent, quote) = (agent.to_owned(), quote.to_owned());
+    crate::rt::blocking(move || in_store(&store, &agent, &quote)).await.ok()?.ok()
+}
+
+/// [`in_conversation`], in `store`: the events whose words hold the quote's longest
+/// ([`search_words`]); then, as those words are an event's first [`SEARCH_TEXT_MAX`] bytes (a long
+/// output's last lines, where a test run says how it went, aren't among them), its newest events
+/// with more. Blocking.
+///
+/// [`SEARCH_TEXT_MAX`]: crate::convo::rows::SEARCH_TEXT_MAX
+fn in_store(store: &crate::convo::store::Store, agent: &str, quote: &str) -> anyhow::Result<bool> {
+    let ask = |q: String| store.search(crate::convo::store::Query { q, session: Some(agent.to_owned()), limit: Some(crate::convo::store::SEARCH_MAX), ..Default::default() });
+    let held = |r: &crate::convo::rows::EventRow| {
         let mut text = String::new();
         if let Ok(v) = serde_json::from_str::<Value>(&r.body) {
             strings(&v, &mut text);
         }
-        holds(&text, &quote)
-    }))
+        holds(&text, quote)
+    };
+    let words = search_words(quote);
+    let any = words.is_empty();
+    if ask(words.join(" "))?.iter().any(held) {
+        return Ok(true);
+    }
+    // Asked for any, they were all looked through whole.
+    Ok(!any && ask(String::new())?.iter().filter(|r| r.text.len() + 4 > crate::convo::rows::SEARCH_TEXT_MAX).any(held))
+}
+
+/// The words an agent's events are searched by for `quote`, as the store matches them (each among
+/// an event's words, any case of an ASCII letter): its longest runs of ASCII letters and digits,
+/// so a quote's punctuation (its full stop, `…`, curly quotes) isn't asked for and the events found
+/// are few.
+fn search_words(quote: &str) -> Vec<String> {
+    let mut runs: Vec<String> = quote.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_ascii_lowercase).collect();
+    runs.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    runs.dedup();
+    runs.truncate(8);
+    runs
 }
 
 /// Every string in `v`, one after another.
@@ -497,6 +537,74 @@ mod tests {
         assert!(!holds(text, "by an index ... fn search"), "in order");
         assert!(!holds(text, "fn find"));
         assert!(!holds(text, "   "), "nothing to look for");
+    }
+
+    /// The lab's quotes (2026-10-23): a command's output with lines picked from it, and a page's
+    /// sentence going on with a colon, quoted ending with a full stop.
+    #[test]
+    fn a_quote_may_pick_lines_and_end_as_a_sentence_does() {
+        let printed = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\nList the n most common elements and their counts from the most\ncommon to the least.\n\n[('b', 2), ('c', 2), ('a', 1)]\nHi\n";
+        assert!(holds(printed, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\nHi"), "lines picked");
+        assert!(!holds(printed, "Hi\n!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"), "in order");
+        assert!(holds(printed, "\"[('b', 2), ('c', 2), ('a', 1)]\""), "in quote marks of its own");
+        assert!(holds(printed, "the most common to the least"), "a line break in the text is a space");
+        assert!(!holds(printed, "..."), "nothing to look for");
+        let page = html_text("<p>Elements with equal counts are ordered in the order first encountered:</p><pre>&gt;&gt;&gt; Counter('abracadabra')</pre>");
+        assert!(holds(&page, "Elements with equal counts are ordered in the order first encountered."));
+        assert!(!holds(&page, "Elements with equal counts are ordered in the order last encountered."));
+    }
+
+    #[test]
+    fn an_agent_s_events_are_searched_by_a_quote_s_longest_words() {
+        assert_eq!(search_words("“Elements” with equal counts… are ordered, first encountered."), ["encountered", "elements", "ordered", "counts", "equal", "first", "with", "are"]);
+        assert_eq!(search_words("don’t STOP"), ["stop", "don", "t"]);
+        assert!(search_words("!\"#$% …").is_empty());
+    }
+
+    #[test]
+    fn a_measurement_is_found_in_its_agent_s_tool_output_however_long() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, ToolCall, ToolKind, ToolStatus};
+        let ran = |id: &str, seq: u64, command: &str, output: String| Event {
+            id: id.into(),
+            seq,
+            at: 1_000 + seq as i64,
+            parent: None,
+            by: None,
+            body: Body::Tool(Box::new(ToolCall {
+                tool_id: id.into(),
+                name: "Bash".into(),
+                tool: ToolKind::Shell,
+                title: command.into(),
+                detail: None,
+                input: serde_json::json!({ "command": command }),
+                status: ToolStatus::Done,
+                output: Some(output),
+                truncated: false,
+                diffs: Vec::new(),
+                todos: Vec::new(),
+                task: None,
+                exit_code: Some(0),
+                started: 0,
+                ended: None,
+                server: None,
+                tool_short: None,
+                skill: None,
+                runner: None,
+            })),
+        };
+        let (_dir, store) = crate::convo::store::scratch()?;
+        // A test run's output, how it went at its end, far past the words an event is searched by.
+        let long = format!("{}test result: ok. 412 passed; 0 failed\n", "test a::b ... ok\n".repeat(2_000));
+        store.send("a", &Update::Events { events: vec![ran("a1", 1, "cargo test", long), ran("a2", 2, "python3 -c", "!\"#$%\n[('b', 2)]\nHi\n".into())] });
+        store.send("b", &Update::Events { events: vec![ran("b1", 1, "echo", "only b printed this".into())] });
+        assert!(in_store(&store, "a", "test result: ok. 412 passed; 0 failed.")?, "at a long output's end");
+        assert!(in_store(&store, "a", "!\"#$%\nHi")?, "lines picked");
+        assert!(in_store(&store, "a", "!\"#$%")?, "no words to search by");
+        assert!(!in_store(&store, "a", "test result: ok. 413 passed")?);
+        assert!(!in_store(&store, "a", "only b printed this")?, "another agent's");
+        assert!(in_store(&store, "b", "only b printed this")?);
+        Ok(())
     }
 
     #[test]

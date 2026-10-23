@@ -596,6 +596,14 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   edits in the same folder stay theirs, and git's ignore rules apply. Its message is the title,
   the body, and a `Kiln-Agent: <name> (<harness>, <id>)` line; its author is the machine's own
   git identity.
+- **In a worktree:** an agent that goes into a worktree of its folder's repository (`git worktree
+  add`, Claude Code's `EnterWorktree`) works there: each file it changes is placed in the working
+  tree it's in, by its path there, and its work is where its latest change is. Its change request
+  takes that working tree's files, committed on its last commit (the worktree's branch, not the
+  checkout's), its trunk the checkout's branch when the remote names none; so do its facts, a plan
+  step's commits, and the Changes tab, where a file in another working tree than the agent's
+  folder is shown where it is. Claude Code's agent moves into a worktree as it enters it, and back
+  as it leaves.
 - **Where it goes:** the branch `agents/<what it's about>-<the start of its id>`.
   - A repository kiln hosts: pushed to kiln's git as a change request
     (`refs/for/<trunk>/branch/agents/…`), with an agent token minted for that push alone

@@ -403,7 +403,7 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     let (published, drafts) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             // What the review publishes, for whom it's news (W19-R06).
             let drafts: Vec<(String, String)> = {

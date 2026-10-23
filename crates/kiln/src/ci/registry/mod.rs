@@ -705,7 +705,7 @@ async fn put_manifest(hub: &Hub, who: &Who, name: &str, reference: &str, req: Re
     let fresh_tag = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             tx.execute("INSERT INTO registry_repos (name, created_at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING", params![n, now])?;
             tx.execute(
@@ -768,7 +768,7 @@ async fn delete_manifest(hub: &Hub, name: &str, reference: &str) -> Answer {
     let gone = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let gone = if by_digest {
                 tx.execute("DELETE FROM registry_tags WHERE repo = ?1 AND digest = ?2", params![n, r])?;
                 tx.execute("DELETE FROM registry_manifests WHERE repo = ?1 AND digest = ?2", params![n, r])?
@@ -990,7 +990,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
     let (stale, blobs): (Vec<String>, usize) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let stale: Vec<String> = {
                 let mut q = tx.prepare("SELECT id FROM registry_uploads WHERE updated_at < ?1")?;
                 let rows = q.query_map([now - UPLOAD_TTL], |r| r.get::<_, String>(0))?;

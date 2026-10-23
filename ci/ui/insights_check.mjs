@@ -11,7 +11,7 @@
 // - W10: dev's home their repository's, without the server's runners; lead's the server's;
 // - no page errors, no failed requests, nothing wider than the page.
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
-import { checkLayout } from "./layout.mjs";
+import { checkLayout, pageErrors } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.INSIGHTS);
 const shots = "/shots";
@@ -59,8 +59,7 @@ for (const [name, type, phone] of [
     ]) {
       const ctx = await signedIn(browser, who, options);
       const page = await ctx.newPage();
-      const errors = [];
-      page.on("pageerror", (e) => errors.push(String(e)));
+      const errors = pageErrors(page, cfg.base);
       const bad = [];
       page.on("response", (r) => {
         // This server has no UI server: its pages answer 503 with the app's shell, as kiln does then.

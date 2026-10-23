@@ -268,6 +268,7 @@ pub struct Run {
 pub struct New {
     pub title: String,
     pub body: String,
+    #[serde(deserialize_with = "given_items")]
     pub items: Vec<Item>,
     pub tags: Vec<String>,
     pub source: Option<Source>,
@@ -279,8 +280,21 @@ pub struct New {
 pub struct Patch {
     pub title: Option<String>,
     pub body: Option<String>,
+    #[serde(deserialize_with = "given_some_items")]
     pub items: Option<Vec<Item>>,
     pub tags: Option<Vec<String>>,
+}
+
+/// Steps as given, what's wrong with one saying which it is ("step 2: criterion 1: …").
+fn given_items<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Item>, D::Error> {
+    given_some_items(d).map(Option::unwrap_or_default)
+}
+
+fn given_some_items<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<Item>>, D::Error> {
+    use serde::de::Error as _;
+    let Some(items) = Option::<Vec<serde_json::Value>>::deserialize(d)? else { return Ok(None) };
+    let step = |n: usize, v| serde_json::from_value(v).map_err(|e| D::Error::custom(format!("step {n}: {e}")));
+    items.into_iter().enumerate().map(|(i, v)| step(i + 1, v)).collect::<Result<_, _>>().map(Some)
 }
 
 /// Where a plan runs.
@@ -639,7 +653,7 @@ pub async fn create_in(hub: &Hub, n: New, by: &str, phase: &'static str) -> R<Pl
     let plan = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "INSERT INTO plans (id, title, body, items, tags, source, version, created_at, updated_at, phase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8)",
                 params![id, title, body, items, tags, source, now, phase],
@@ -717,7 +731,7 @@ pub async fn update(hub: &Hub, id: &str, patch: Patch, by: &str) -> R<Plan> {
     let plan = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let version = if new_version { old.version.saturating_add(1) } else { old.version };
             tx.execute("UPDATE plans SET title = ?2, body = ?3, items = ?4, tags = ?5, version = ?6, updated_at = ?7 WHERE id = ?1", params![id, title, body, items, tags, version, now])?;
             if new_version {
@@ -742,7 +756,7 @@ pub async fn delete(hub: &Hub, id: &str) -> R<()> {
     let gone = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let n = tx.execute("DELETE FROM plans WHERE id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_versions WHERE plan_id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_runs WHERE plan_id = ?1", params![id])?;
@@ -1049,6 +1063,17 @@ mod tests {
         assert_eq!(title_of(""), "Plan");
         assert_eq!(title_of("- [ ] read the test\n- fix it"), "read the test");
         assert!(title_of(&"x".repeat(200)).ends_with('…'));
+    }
+
+    #[test]
+    fn a_step_given_wrong_says_which_it_is() {
+        let given = serde_json::json!({"items": [{"title": "a"}, {"title": "b", "acceptance": [{"kind": "quantitative", "target": "x", "op": "equals", "value": 1}]}]});
+        let e = serde_json::from_value::<Patch>(given).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.starts_with("step 2: criterion 1: unknown variant `equals`"), "{e}");
+        let p = serde_json::from_value::<Patch>(serde_json::json!({"title": "t"})).ok();
+        assert!(p.is_some_and(|p| p.items.is_none()), "steps not given stay as they are");
+        let n = serde_json::from_value::<New>(serde_json::json!({"title": "t", "items": [{"title": "a"}]})).ok();
+        assert_eq!(n.map(|n| n.items.len()), Some(1));
     }
 
     #[test]

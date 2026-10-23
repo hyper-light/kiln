@@ -69,8 +69,19 @@ pub enum Msg {
     RunnerFacts { agent: String },
     Event { agent: String, leg: String, json: String },
     Finished { agent: String, result: JobResult },
-    Rejected { agent: String, leg: String },
-    Cancel { run: String, reason: String },
+    /// A repository deleted (its runs' records with it): its runs end here, their legs stopped
+    /// where they run.
+    RepoDeleted {
+        repo: String,
+    },
+    Rejected {
+        agent: String,
+        leg: String,
+    },
+    Cancel {
+        run: String,
+        reason: String,
+    },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
@@ -487,6 +498,8 @@ struct LegSt {
     /// The last of the attempt's events taken (their `seq`): a runner sends them again after a
     /// reconnect, and those taken already are skipped.
     seq: u64,
+    /// Gone with its repository while it ran: its end frees its slot, and nothing is written.
+    gone: bool,
 }
 
 /// An event's place in its attempt (`seq`, from runners that send events again after a reconnect).
@@ -787,6 +800,10 @@ impl Dispatch {
             }
             Msg::Event { agent, leg, json } => self.event(&agent, &leg, &json).await,
             Msg::Finished { agent, result } => self.finished(&agent, result).await,
+            Msg::RepoDeleted { repo } => {
+                self.repo_deleted(&repo).await;
+                Ok(())
+            }
             Msg::Rejected { agent, leg } => {
                 self.hub.release_slot(&agent, &leg);
                 if let Some(l) = self.legs.get_mut(&leg) {
@@ -994,6 +1011,10 @@ impl Dispatch {
     async fn lose(&mut self, gone: Vec<(String, u32)>, why: &str) -> Vec<Command> {
         let mut cmds = Vec::new();
         for (leg, attempt) in gone {
+            if self.legs.get(&leg).is_some_and(|l| l.gone) {
+                self.forget_gone(&leg, attempt).await;
+                continue;
+            }
             let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.to_owned()), peak_rss: None, cpu_seconds: None };
             if let Err(e) = runs::attempt_finished(&self.hub, &leg, attempt, end).await {
                 tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the attempt could not be recorded");
@@ -1645,7 +1666,10 @@ impl Dispatch {
         self.hub.ci.legs.lock().insert(id.clone());
         let leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci);
         let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
-        self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0 });
+        self.legs.insert(
+            id.clone(),
+            LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false },
+        );
         self.hub.emit_job(&id).await;
         if let Some(m) = dockerless {
             runs::annotation(&self.hub, &id, None, "error", Some("executor".into()), &m, None, None, None, None, None).await?;
@@ -2318,6 +2342,11 @@ impl Dispatch {
     /// A leg's attempt ended on its runner: the scheduler decides on a retry, else the plan hears.
     async fn finished(&mut self, agent: &str, r: JobResult) -> anyhow::Result<()> {
         self.hub.release_slot(agent, &r.job);
+        // Gone with its repository: its slot is free now, and there's nothing to write.
+        if let Some(attempt) = self.legs.get(&r.job).filter(|l| l.gone).map(|l| l.attempt) {
+            self.forget_gone(&r.job, attempt).await;
+            return Ok(());
+        }
         // A result sent again (its receipt was lost with the connection), or of a leg given up
         // while its runner was away: the leg has gone on without it.
         if self.legs.get(&r.job).is_some_and(|l| l.agent.as_deref() != Some(agent)) {
@@ -2377,6 +2406,44 @@ impl Dispatch {
         let cmds = self.sched.handle(Input::AttemptFinished { leg: r.job.clone(), attempt, outcome }, now_ms());
         self.commands(cmds).await;
         Ok(())
+    }
+
+    /// A leg gone with its repository that ended (or was lost with its runner): out of the
+    /// dispatcher, and its slot the scheduler's to give.
+    async fn forget_gone(&mut self, leg: &str, attempt: u32) {
+        self.legs.remove(leg);
+        self.hub.ci.legs.lock().remove(leg);
+        self.hub.logs.finish(leg);
+        let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: Outcome::Cancelled }, now_ms());
+        Box::pin(self.commands(cmds)).await;
+    }
+
+    /// A deleted repository's runs, gone with their records: each leg out of the scheduler, a
+    /// running one stopped on its runner and its slot free once it ended; nothing written,
+    /// there's nowhere to.
+    async fn repo_deleted(&mut self, repo: &str) {
+        let runs: Vec<String> = self.runs.iter().filter(|(_, r)| r.repo.id == repo).map(|(id, _)| id.clone()).collect();
+        for run in runs {
+            let legs: Vec<String> = self.legs.iter().filter(|(_, l)| l.run == run).map(|(id, _)| id.clone()).collect();
+            for leg in legs {
+                // Its runner hears the cancel while the leg still says where it runs.
+                let cmds = self.sched.handle(Input::LegGone { leg: leg.clone() }, now_ms());
+                self.commands(cmds).await;
+                match self.legs.get_mut(&leg) {
+                    // Running: kept until its runner says it ended (its slot is the runner's until then).
+                    Some(l) if l.agent.is_some() => l.gone = true,
+                    _ => {
+                        self.legs.remove(&leg);
+                        self.held.remove(&leg);
+                        self.hub.ci.legs.lock().remove(&leg);
+                    }
+                }
+            }
+            self.runs.remove(&run);
+            self.hub.ci.runs.lock().remove(&run);
+            let cmds = self.sched.handle(Input::RunFinished { run }, now_ms());
+            self.commands(cmds).await;
+        }
     }
 
     /// The leg is done for good: its row, then its plan (W04-R02).
@@ -2595,7 +2662,22 @@ impl Dispatch {
                 }
             };
             self.hub.ci.legs.lock().insert(id.clone());
-            self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0 });
+            self.legs.insert(
+                id.clone(),
+                LegSt {
+                    run: run.to_owned(),
+                    key,
+                    spec: spec.clone(),
+                    attempt: attempt.max(1),
+                    agent: agent.clone(),
+                    report: LegReport::default(),
+                    class: None,
+                    deployment: None,
+                    env_url: None,
+                    seq: 0,
+                    gone: false,
+                },
+            );
             let li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci);
             match (s, agent) {
                 // Running on `a` as the store has it; `a` says whether it still is. A runner that
@@ -2730,7 +2812,7 @@ async fn seal_secret_outputs(hub: &Hub, run: &str, leg: &str, values: &std::coll
     let (run, leg) = (run.to_owned(), leg.to_owned());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             for (name, sealed, nonce) in rows {
                 tx.execute(
                     "INSERT INTO ci_secret_outputs (run_id, leg_id, name, sealed, nonce) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(leg_id, name) DO UPDATE SET sealed = excluded.sealed, nonce = excluded.nonce",

@@ -346,11 +346,30 @@ impl Tasks {
         Some((self.bundle_file(batch)?, b.hash.clone()?, b.size))
     }
 
-    fn bundled(&self, batch: &str) -> Option<(String, u64)> {
+    pub fn bundled(&self, batch: &str) -> Option<(String, u64)> {
         self.inner.lock().bundles.get(batch).and_then(|b| b.hash.clone().map(|h| (h, b.size)))
     }
 
-    fn drop_bundle(&self, batch: &str) {
+    /// A bundle `from` sends to batch `batch` for the machines `to` (`crate::sync::share`): kept
+    /// as it is when it's there already, its machines then `to`.
+    pub fn open_bundle(&self, batch: &str, from: &str, to: HashSet<String>) {
+        let mut inner = self.inner.lock();
+        match inner.bundles.get_mut(batch) {
+            Some(b) => b.to = to,
+            None => {
+                inner.bundles.insert(batch.to_owned(), Bundle { from: Some(from.to_owned()), to, hash: None, size: 0 });
+            }
+        }
+    }
+
+    /// `machine` may fetch batch `batch`'s bundle too.
+    pub fn allow(&self, batch: &str, machine: &str) {
+        if let Some(b) = self.inner.lock().bundles.get_mut(batch) {
+            b.to.insert(machine.to_owned());
+        }
+    }
+
+    pub fn drop_bundle(&self, batch: &str) {
         self.inner.lock().bundles.remove(batch);
         if let Some(f) = self.bundle_file(batch) {
             let _ = std::fs::remove_file(f);

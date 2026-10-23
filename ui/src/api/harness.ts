@@ -289,7 +289,10 @@ function withFiles(was: KeptFile[], added: KeptFile[]): KeptFile[] {
 }
 
 export interface FileChange {
+  /** Relative to its working tree's top (`tree`) when it's in one, else to the agent's folder. */
   path: string;
+  /** The top of the git working tree it's in: its folder's repository's own, or a worktree of it. */
+  tree?: string;
   created?: boolean;
   deleted?: boolean;
   added: number;
@@ -481,6 +484,8 @@ export interface GoalStack {
   cleared?: number;
   /** Paused for a while: when it resumes by itself (unix ms). */
   resume_at?: number;
+  /** Its big goals planned first (docs/goals.md, "Big goals, planned first"): on unless turned off. */
+  plan_big?: boolean;
 }
 
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */
@@ -643,6 +648,8 @@ export interface AgentInfo {
   name: string;
   shell?: string;
   cwd: string;
+  /** The working tree its work is in (its latest change's): git's questions about its work go there. */
+  tree?: string;
   created_at: number;
   status: Status;
   title: string;
@@ -983,6 +990,8 @@ export const harnessApi = {
   /** Start (or resume), pause, skip the goal under way, clear, or bring back the goals cleared last. */
   goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
   /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
+  /** Whether its stack plans its big goals first (a person's setting, not the agent's). */
+  goalSettings: (id: string, settings: { plan_big: boolean }) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/settings`, settings),
   planGoal: (id: string, goal: string) => call<{ plan: string; research: string; goal: string; part: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/plan`, { id: goal }),
   /** The terminals beside an agent (its shell, its harness's own screen), live ones first. */
   terminals: (id: string) => call<BesideTerminal[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`),

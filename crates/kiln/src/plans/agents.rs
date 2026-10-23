@@ -278,7 +278,7 @@ pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
     let (run_c, note_c) = (run.clone(), note.clone());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, state, config, note) VALUES (?1, ?2, ?3, '', 'agents', ?4, ?5, 'running', ?6, ?7)",
                 params![run_c, plan_id, version, now, by, config, note_c],

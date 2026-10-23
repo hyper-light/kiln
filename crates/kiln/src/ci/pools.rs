@@ -122,7 +122,7 @@ pub async fn sample_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
         let kept = hub
             .store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 for (pool, [starting, idle, busy, waiting]) in rows {
                     tx.execute("INSERT OR REPLACE INTO ci_pool_samples (pool, ts, starting, idle, busy, waiting) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![pool, now, starting, idle, busy, waiting])?;
                 }
@@ -295,6 +295,7 @@ pub async fn stop_pod(hub: &Hub, executor: &str, runner: &str) {
         names.push(runner.to_owned());
     }
     for n in names {
+        tracing::info!(pod = %n, executor = %executor, "an executor pod goes: its executor stopped");
         hub.pod_executors.lock().remove(&n);
         if let Err(e) = k.delete_pod(&n).await {
             tracing::debug!(pod = %n, error = %format!("{e:#}"), "an executor pod couldn't be deleted");
@@ -346,6 +347,14 @@ pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
                 failed(&hub, &p.executor, format!("pod {}: {why}", p.name));
             }
             if ended || orphan || stuck.is_some() {
+                let why = if ended {
+                    "it ended"
+                } else if orphan {
+                    "the scheduler has no such executor"
+                } else {
+                    "it can't start"
+                };
+                tracing::info!(pod = %p.name, executor = %p.executor, phase = %p.phase, reason = why, "an executor pod goes");
                 hub.pod_executors.lock().remove(&p.name);
                 if let Err(e) = k.delete_pod(&p.name).await {
                     tracing::debug!(pod = %p.name, error = %format!("{e:#}"), "an executor pod couldn't be deleted");

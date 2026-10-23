@@ -209,9 +209,15 @@ struct Tree {
 impl Tree {
     /// `acme/restart`, made on `s` with a first commit, once the server has polled it.
     fn new(dir: &Path, s: &Server) -> anyhow::Result<Tree> {
-        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/restart", "mode": "native" })))?;
+        Tree::named(dir, s, "acme/restart")
+    }
+
+    /// `name`, made on `s` with a first commit, once the server has polled it.
+    fn named(dir: &Path, s: &Server, name: &str) -> anyhow::Result<Tree> {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
         anyhow::ensure!(st == 200, "{st} {body}");
-        let t = Tree { home: dir.join("githome"), work: dir.join("tree"), push: format!("http://x:{}@127.0.0.1:{}/git/acme/restart.git", s.admin, s.port) };
+        let key = name.replace('/', "_");
+        let t = Tree { home: dir.join("githome"), work: dir.join(format!("tree-{key}")), push: format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port) };
         std::fs::create_dir_all(&t.home)?;
         std::fs::create_dir_all(t.work.join(".kiln"))?;
         git(&t.home, &t.work, &["init", "-q", "-b", "main"])?;
@@ -235,9 +241,14 @@ impl Tree {
 
 /// The newest run of `workflow`'s id, once there is one.
 fn run_of(s: &Server, workflow: &str) -> anyhow::Result<String> {
+    run_in(s, "acme/restart", workflow)
+}
+
+/// The newest run of `repo`'s `workflow`, once there is one.
+fn run_in(s: &Server, repo: &str, workflow: &str) -> anyhow::Result<String> {
     let mut run = String::new();
     until(s, 120, "the run", || {
-        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo=acme/restart&workflow={workflow}&limit=1"), &s.admin, None)?;
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo={repo}&workflow={workflow}&limit=1"), &s.admin, None)?;
         run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
         Ok(run.is_empty().then_some(body))
     })?;
@@ -260,7 +271,8 @@ fn first_attempts(s: &Server, ids: &[String]) -> anyhow::Result<Vec<(String, Str
 /// W05-R05 across a restart: the server killed while its own runner runs two legs, which go with
 /// it, under a queue whose rebuild outlasts the runner's reconnecting (so it says hello first,
 /// running nothing). The legs it ran were lost with it, not held: each attempt fails `runner-lost`
-/// and the leg goes on to its next attempt (W05-R16), the runner's slots free for the next leg.
+/// and the next runs on it, the only runner that can take them (W05-R16's default); then its
+/// slots are free for the next leg.
 #[test]
 fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -269,7 +281,7 @@ fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
     let axis = (0..QUEUED).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     tree.commit(
         ".kiln/queue.yaml",
-        &format!("on: push\njobs:\n  slow:\n    runs-on: local\n    matrix: {{ n: [1, 2] }}\n    steps:\n      - run: sleep 120\n  queued:\n    runs-on: nowhere\n    matrix: {{ i: [{axis}] }}\n    steps:\n      - run: echo never\n"),
+        &format!("on: push\njobs:\n  slow:\n    runs-on: local\n    matrix: {{ n: [1, 2] }}\n    steps:\n      - run: if [ \"$KILN_ATTEMPT\" = 1 ]; then sleep 120; fi\n  queued:\n    runs-on: nowhere\n    matrix: {{ i: [{axis}] }}\n    steps:\n      - run: echo never\n"),
     )?;
     let run = run_of(&s, ".kiln/queue.yaml")?;
     let mut slow: Vec<String> = Vec::new();
@@ -283,7 +295,7 @@ fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
     until(&s, 120, "the lost legs' next attempts", || {
         let all = legs(&s, &run)?;
         let on: Vec<_> = all.iter().filter(|(id, _, _, _)| slow.contains(id)).collect();
-        Ok((on.len() < 2 || on.iter().any(|(_, _, st, attempt)| *attempt < 2 || st == "running")).then(|| format!("{on:?}")))
+        Ok((on.len() < 2 || on.iter().any(|(_, _, st, attempt)| *attempt < 2 || st != "succeeded")).then(|| format!("{on:?}")))
     })?;
     for (conclusion, class) in first_attempts(&s, &slow)? {
         assert_eq!((conclusion.as_str(), class.as_str()), ("failure", "runner-lost"), "lost with the runner:\n{}", s.log());
@@ -331,6 +343,39 @@ fn w05_r25_a_cancel_holds_over_a_restart() -> anyhow::Result<()> {
     tree.commit(".kiln/next.yaml", "on: push\njobs:\n  next:\n    runs-on: local\n    steps:\n      - run: echo next\n")?;
     let next = run_of(&s, ".kiln/next.yaml")?;
     until(&s, 120, "the next leg on the runner", || {
+        let all = legs(&s, &next)?;
+        Ok((!all.iter().any(|(_, _, st, _)| st == "succeeded")).then(|| format!("{all:?}")))
+    })?;
+    Ok(())
+}
+
+/// A repository deleted while its legs run takes them with it, as a deleted GitHub repository
+/// does: its runner stops them, and a slot they held goes to the next repository's leg.
+#[test]
+fn a_deleted_repository_takes_its_legs_with_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let held = Tree::new(dir.path(), &s)?;
+    held.commit(".kiln/hold.yaml", "on: push\njobs:\n  hold:\n    runs-on: local\n    matrix: { n: [1, 2, 3] }\n    steps:\n      - run: sleep 300\n")?;
+    let run = run_of(&s, ".kiln/hold.yaml")?;
+    until(&s, 300, "both of the runner's slots held", || {
+        let all = legs(&s, &run)?;
+        Ok((all.iter().filter(|(_, _, st, _)| st == "running").count() < 2).then(|| format!("{all:?}")))
+    })?;
+    // Another repository's leg waits for a slot.
+    let other = Tree::named(dir.path(), &s, "acme/other")?;
+    other.commit(".kiln/next.yaml", "on: push\njobs:\n  next:\n    runs-on: local\n    steps:\n      - run: echo next\n")?;
+    let next = run_in(&s, "acme/other", ".kiln/next.yaml")?;
+    let (_, repos) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+    let id = serde_json::from_str::<Value>(&repos)?
+        .as_array()
+        .and_then(|r| r.iter().find(|x| x.get("name").and_then(Value::as_str) == Some("acme/restart")))
+        .and_then(|x| x.get("id").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned();
+    let (st, body) = http(s.port, "DELETE", &format!("/api/repos/{id}"), &s.admin, None)?;
+    anyhow::ensure!((200..300).contains(&st), "delete: {st} {body}");
+    until(&s, 120, "the next repository's leg, on a slot the deleted one's legs held", || {
         let all = legs(&s, &next)?;
         Ok((!all.iter().any(|(_, _, st, _)| st == "succeeded")).then(|| format!("{all:?}")))
     })?;

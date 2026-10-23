@@ -3,7 +3,7 @@
 // password of their own in Settings → Sign-in; then the sign-in page asks for a name and offers
 // the passkey, and both sign lead in. WebKit and phones: the same pages laid out, nothing over.
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
-import { checkLayout } from "./layout.mjs";
+import { checkLayout, pageErrors } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
 const shots = "/shots";
@@ -52,8 +52,7 @@ await flow("chromium wide", async () => {
   try {
     const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();
-    const errors = [];
-    page.on("pageerror", (e) => errors.push(String(e)));
+    const errors = pageErrors(page, cfg.base);
     const cdp = await ctx.newCDPSession(page);
     await cdp.send("WebAuthn.enable");
     await cdp.send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
@@ -123,8 +122,7 @@ for (const [name, type, phone] of [
       if (name === "chromium" && tag === "wide") continue;
       const ctx = await browser.newContext(options);
       const page = await ctx.newPage();
-      const errors = [];
-      page.on("pageerror", (e) => errors.push(String(e)));
+      const errors = pageErrors(page, cfg.base);
       await signInPage(page);
       check(name, `${tag}: the name, the passkey and GitHub offered`, (await page.locator("#who").isVisible()) && (await page.getByRole("button", { name: "Sign in with a passkey" }).count()) === 1 && (await page.getByRole("link", { name: "Continue with GitHub" }).count()) === 1);
       check(name, `${tag}: the sign-in page fits`, (await overflow(page)) <= 0, String(await overflow(page)));

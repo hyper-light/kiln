@@ -109,6 +109,10 @@ The tree keeps each ref's last bundle, for a copy that takes the tree whole.
 - **Behind:** a bundle builds on what the log's refs held; a copy that missed one no longer kept
   asks the repository's remote (`git fetch origin`, at most a minute), else says what it couldn't
   take.
+- **Tested** on a scratch server and two runners, files, branches and commits: a commit on one was
+  the other's within 5 s, its file there and `git status` clean; commits on both at once kept the
+  first on `main` and the other beside it, `main.conflict-<machine>-<time>`, on both, listed as a
+  conflict, and both copies' files and `git status` the same.
 
 ## Catching up
 
@@ -226,6 +230,42 @@ it adopts the group's files through) and its status `looked` and `adopting`.
 **Not carried**: what is staged arrives unstaged; stashes, hooks and a repository's own config stay;
 commits made after a sync joined move between copies with `git` (fetch, pull) until git refs
 (phase 3) carry them. Line endings a Windows checkout converts are a difference like any other.
+
+## Work between machines
+
+What an agent or a person does in a repository on one machine reaches every other machine that
+holds the same repository (the same key, [above](#repositories-on-machines)), with no one starting
+it, and nothing of theirs moves (`crate::sync::share`):
+
+- **Who shares:** each machine says what it holds (`Msg::Repos`, when it connects and when that
+  changes); the server tells each one the repositories others hold too (`Msg::Shares`, a batch
+  for its work in each).
+- **What goes:** when its work in one changes (a branch moved, a folder's `HEAD`, its files), a
+  machine sends its branches, and each folder's **work in progress**: a commit of its files as they
+  are (what git ignores left out), on the commit checked out, made from an index of its own so
+  nothing in the folder changes. The commits they name that the remote lacks go in a bundle (`git
+  bundle … --not --remotes=origin`), and the work in progress beyond them in a second: each goes
+  only when it changed, so a moved branch sends the first and an edit only the second, small. A
+  bundle over 256 MiB stays (the others take the branches whose commits they hold). The work in
+  progress is the folders' git worked in this week, the 16 latest; one whose changed files are
+  more than 5,000 or 64 MiB is left out. A repository's work goes at most every two minutes. A
+  machine with several clones of a repository shares the one git last worked in (with its
+  worktrees).
+- **Tested** on a scratch server and two runners: a commit and work in progress (an edit, a new
+  file) on one reached the other as `kiln/<machine>/main` and its work in progress, nothing of its
+  own moved; then commits on both showed as diverged on each.
+- **Where it lands:** the others take it in beside their own, `kiln/<machine>/<branch>`
+  (`refs/remotes/kiln/…`, as `git branch -r` shows), and its work in progress as
+  `refs/kiln/wip/<machine>/<branch>` (`git stash apply refs/kiln/wip/fedora/main`, `git checkout
+  refs/kiln/wip/fedora/main -- <file>`); what that machine no longer has goes. No branch of their
+  own, no `HEAD`, no file moves: a person or an agent merges what they want, when they want.
+- **Conflict-aware:** each folder says how its branch stands against the same branch of the others
+  (`peers` in what it holds: ahead, behind, both: diverged, and whether there's work in progress),
+  and the Repositories page shows it on each place: "fedora 2 ahead", "diverged from fedora",
+  "work in progress on fedora".
+- A machine that connects later is given the others' latest work at once. The server keeps the
+  latest of each machine in each repository (not across its own restart: the machines share again
+  then).
 
 ## Watching it
 

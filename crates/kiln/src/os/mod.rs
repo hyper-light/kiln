@@ -105,6 +105,8 @@ pub struct PathAdded {
     pub file: Option<PathBuf>,
     /// What puts it on this terminal's PATH too: only new terminals read that file.
     pub now: Option<String>,
+    /// Whether that file was made for it.
+    pub created: bool,
 }
 
 /// A Windows `Path` value (`;`-separated, as the registry keeps it) with `dir` added at its end,
@@ -121,6 +123,15 @@ pub fn path_list_with(list: &str, dir: &str, var: impl Fn(&str) -> Option<String
     }
     let kept = list.trim_end_matches(';');
     Some(if kept.is_empty() { dir.to_owned() } else { format!("{kept};{dir}") })
+}
+
+/// A Windows `Path` value without its entries that are `dir` (compared as [`path_list_with`]
+/// does), or `None` when none is.
+pub fn path_list_without(list: &str, dir: &str, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let norm = |entry: &str| expand_percent_vars(entry.trim().trim_matches('"'), &var).trim_end_matches(['\\', '/']).to_lowercase();
+    let want = norm(dir);
+    let kept: Vec<&str> = list.split(';').filter(|e| e.is_empty() || norm(e) != want).collect();
+    (kept.len() != list.split(';').count()).then(|| kept.join(";"))
 }
 
 /// `%NAME%` replaced by `var(NAME)`; a name it doesn't know, and a lone `%`, stay as they are.
@@ -304,6 +315,17 @@ mod tests {
         // A variable it can't expand stays as written, and is no match.
         assert!(path_list_with(r"%NOPE%\Programs\kiln", kiln, var).is_some());
         assert_eq!(expand_percent_vars(r"%NOPE%\x;100%;%%", &var), r"%NOPE%\x;100%;%%");
+    }
+
+    #[test]
+    fn a_folder_comes_off_a_windows_path_as_it_went_on() {
+        let var = |name: &str| (name == "LOCALAPPDATA").then(|| r"C:\Users\me\AppData\Local".to_owned());
+        let kiln = r"C:\Users\me\AppData\Local\Programs\kiln";
+        let list = r"C:\a;C:\b";
+        let added = path_list_with(list, kiln, var).unwrap_or_default();
+        assert_eq!(path_list_without(&added, kiln, var).as_deref(), Some(list));
+        assert_eq!(path_list_without(r"C:\a;%LOCALAPPDATA%\Programs\kiln\;;C:\b", kiln, var).as_deref(), Some(r"C:\a;;C:\b"));
+        assert_eq!(path_list_without(list, kiln, var), None, "not there: nothing to change");
     }
 
     #[test]

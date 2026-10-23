@@ -143,7 +143,7 @@ impl Backend for KilnBackend {
             self.hub
                 .store
                 .call(move |c| {
-                    let tx = c.transaction()?;
+                    let tx = crate::store::tx(c)?;
                     let last: Option<u32> = tx.query_row("SELECT MAX(version) FROM secret_versions WHERE scope = ?1 AND name = ?2", params![scope, name], |r| r.get(0))?;
                     let version = last.unwrap_or(0) + 1;
                     let (key_id, k) = current_key(&hub, &tx)?;
@@ -171,7 +171,7 @@ impl Backend for KilnBackend {
             self.hub
                 .store
                 .call(move |c| {
-                    let tx = c.transaction()?;
+                    let tx = crate::store::tx(c)?;
                     let last: Option<(u32, bool)> = tx
                         .query_row("SELECT version, deleted FROM secret_versions WHERE scope = ?1 AND name = ?2 ORDER BY version DESC LIMIT 1", params![scope, name], |r| Ok((r.get(0)?, r.get(1)?)))
                         .optional()?;
@@ -261,7 +261,7 @@ impl Backend for KilnBackend {
             self.hub
                 .store
                 .call(move |c| {
-                    let tx = c.transaction()?;
+                    let tx = crate::store::tx(c)?;
                     let old = keys(&hub, &tx)?;
                     let (new_id, fresh) = new_key(&hub, &tx)?;
                     let rows: Vec<(String, String, u32, Vec<u8>, Vec<u8>, String)> = {
@@ -291,7 +291,7 @@ impl Backend for KilnBackend {
             self.hub
                 .store
                 .call(move |c| {
-                    let tx = c.transaction()?;
+                    let tx = crate::store::tx(c)?;
                     let live: Vec<(String, u32)> = newest(&tx, &scope)?.into_iter().filter(|r| !r.5).map(|r| (r.0, r.1)).collect();
                     let now = crate::util::now_unix();
                     for (name, version) in &live {

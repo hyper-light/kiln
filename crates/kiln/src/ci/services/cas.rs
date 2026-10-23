@@ -18,7 +18,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use kiln_seams::blobs::Refusal;
 use parking_lot::Mutex;
-use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{OptionalExtension as _, params};
 use sha2::Digest as _;
 
 use crate::hub::Hub;
@@ -105,7 +105,7 @@ async fn record(hub: &Hub, digest: &str, size: u64) -> anyhow::Result<bool> {
     let (d, now) = (digest.to_owned(), crate::util::now_unix());
     hub.store
         .call(move |c| {
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = crate::store::tx(c)?;
             let was: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM cas_index WHERE digest = ?1)", [&d], |r| r.get(0))?;
             tx.execute(
                 "INSERT INTO cas_index (digest, size, created_at, last_used_at) VALUES (?1, ?2, ?3, ?3)
@@ -316,7 +316,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
         let gone: Option<i64> = hub
             .store
             .call(move |c| {
-                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::store::tx(c)?;
                 let size = tx.query_row(&format!("SELECT size FROM cas_index WHERE digest = ?1 AND last_used_at < ?2 AND {UNREFERENCED}"), params![d, cutoff], |r| r.get::<_, i64>(0)).optional()?;
                 if size.is_some() {
                     tx.execute("DELETE FROM cas_index WHERE digest = ?1", [&d])?;

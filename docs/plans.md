@@ -137,9 +137,11 @@ what it waits for instead (**after 2, 3**).
 
 ## Planning a goal
 
-An agent turns a goal of its stack into a plan kiln keeps with `goals_plan` (docs/goals.md): a plan
-in its **planning phase**, the goal's words its brief, with research of its own (docs/research.md).
-The goal gets one part first, planning it; the plan isn't run until it's ready.
+An agent turns a goal of its stack into a plan kiln keeps with `goals_plan` (docs/goals.md), as a
+person does with **Make a plan**, and kiln does by itself for a big goal about to start (docs/goals.md,
+"Big goals, planned first"): a plan in its **planning phase**, the goal's words its brief, with
+research of its own (docs/research.md). The goal gets one part first, planning it; the plan isn't
+run until it's ready.
 
 1. **Research.** The agent looks inside (its machine's files and others': code, documents, data,
    pictures, frames of video; kiln's records: `conversations_search`, plans, CI runs, deployments)
@@ -182,7 +184,7 @@ the plan**, for keeping it in another kiln.
 
 ## API
 
-A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing, needs?, basis?}]` (up to 100; `needs`: the steps it waits for, by number from 1; `basis`: the findings of its research it rests on, by id). A plan says its `phase` (`planning` or `ready`), its `research` (an id), and in `source.goal` the goal it was made from (`{agent, id, text}`). `acceptance` is a list of criteria: `{kind: "qualitative", text}` or `{kind: "quantitative", target, op, value, value2?, unit?, baseline?, measured?}`, `op` one of `lt`, `le`, `eq`, `ne`, `ge`, `gt`, `between` (`value2` the upper bound), `within` (`value2` the tolerance), `rises_at_least`, `falls_at_least`, `rises_at_most`, `falls_at_most` (`value` a percentage against `baseline`). `testing` is a list of `{scenario, criteria}`. A threshold is a number. `steps` is what runs, one string a step, the criteria and tests as sentences.
+A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing, needs?, basis?}]` (up to 100; `needs`: the steps it waits for, by number from 1; `basis`: the findings of its research it rests on, by id). A plan says its `phase` (`planning` or `ready`), its `research` (an id), and in `source.goal` the goal it was made from (`{agent, id, text}`). `acceptance` is a list of criteria: `{kind: "qualitative", text}` or `{kind: "quantitative", target, op, value, value2?, unit?, baseline?, measured?}`, `op` one of `lt`, `le`, `eq`, `ne`, `ge`, `gt`, `between` (`value2` the upper bound), `within` (`value2` the tolerance), `rises_at_least`, `falls_at_least`, `rises_at_most`, `falls_at_most` (`value` a percentage against `baseline`). `testing` is a list of `{scenario, criteria}`. A threshold is a number (`0`, or `"0"`). What's wrong with a step says which it is (`step 2: criterion 1: unknown variant …`). `steps` is what runs, one string a step, the criteria and tests as sentences.
 
 
 | Method | Path | |

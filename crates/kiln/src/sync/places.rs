@@ -7,7 +7,7 @@
 //! (`github.com/hyper-light/kiln`), so a clone over ssh and one over https are the same
 //! repository. One with no remote is a place of its own.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
@@ -105,6 +105,11 @@ impl Places {
             self.save();
         }
         changed
+    }
+
+    /// Each machine's repositories that have a remote, by key (`crate::sync::share`).
+    pub fn keys(&self) -> BTreeMap<String, BTreeSet<String>> {
+        self.held.lock().iter().map(|(m, h)| (m.clone(), h.repos.iter().filter_map(|f| f.origin.as_deref().and_then(key_of)).collect())).collect()
     }
 
     /// A machine kiln forgot.

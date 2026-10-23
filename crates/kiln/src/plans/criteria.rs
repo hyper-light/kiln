@@ -4,7 +4,9 @@
 //! 200 ms, measured by the soak test"); that's what goes to the agent, in a step's message and in
 //! its /goal.
 
+use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 /// One criterion: in words, or a measure against a threshold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,15 +17,17 @@ pub enum Criterion {
     /// A measure: `target` (what's measured, "p99.9 latency") compared by `op` with `value` (and
     /// `value2`: the upper bound of `between`, the tolerance of `within`), in `unit`; the
     /// rises/falls comparisons are percentages against `baseline`. `measured`: how it's measured.
+    /// The numbers are kept as given: a number (as the tools ask for them) or its words.
     Quantitative {
         target: String,
         op: Op,
+        #[serde(deserialize_with = "number_or_words")]
         value: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
+        #[serde(default, deserialize_with = "number_or_words", skip_serializing_if = "String::is_empty")]
         value2: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         unit: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
+        #[serde(default, deserialize_with = "number_or_words", skip_serializing_if = "String::is_empty")]
         baseline: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         measured: String,
@@ -144,34 +148,38 @@ impl Test {
     }
 }
 
-/// Criteria as given: a list, or (as plans kept them before) words, one criterion.
-pub fn criteria_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Criterion>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Given {
-        Words(String),
-        List(Vec<Criterion>),
+/// A number as given: a number, or its words.
+fn number_or_words<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    match Value::deserialize(d)? {
+        Value::String(s) => Ok(s),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Null => Ok(String::new()),
+        other => Err(D::Error::custom(format!("a number or words, not {other}"))),
     }
-    Ok(match Option::<Given>::deserialize(d)? {
-        Some(Given::List(l)) => l,
-        Some(Given::Words(w)) if !w.trim().is_empty() => vec![Criterion::Qualitative { text: w }],
-        _ => Vec::new(),
-    })
 }
 
-/// Tests as given: a list, or (as plans kept them before) words, one test.
+/// Criteria as given: a list, one criterion, or (as plans kept them before) words, one criterion.
+/// What's wrong with one says which it is.
+pub fn criteria_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Criterion>, D::Error> {
+    given(d, ("criterion", "criteria"), |text| Criterion::Qualitative { text })
+}
+
+/// Tests as given: a list, one test, or (as plans kept them before) words, one test.
 pub fn test_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Test>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Given {
-        Words(String),
-        List(Vec<Test>),
+    given(d, ("test", "tests"), |scenario| Test { scenario, criteria: Vec::new() })
+}
+
+/// A list as given (`one`, `many`: its items' word): a list, one of them, or words (`words` makes
+/// them one); what's wrong with one says which it is ("criterion 2: unknown variant `equals` …").
+fn given<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D, (one, many): (&str, &str), words: impl FnOnce(String) -> T) -> Result<Vec<T>, D::Error> {
+    let item = |n: usize, v: Value| serde_json::from_value(v).map_err(|e| D::Error::custom(format!("{one} {n}: {e}")));
+    match Option::<Value>::deserialize(d)? {
+        Some(Value::Array(items)) => items.into_iter().enumerate().map(|(i, v)| item(i + 1, v)).collect(),
+        Some(v @ Value::Object(_)) => Ok(vec![item(1, v)?]),
+        Some(Value::String(w)) if !w.trim().is_empty() => Ok(vec![words(w)]),
+        Some(Value::String(_) | Value::Null) | None => Ok(Vec::new()),
+        Some(other) => Err(D::Error::custom(format!("{many} are a list, not {other}"))),
     }
-    Ok(match Option::<Given>::deserialize(d)? {
-        Some(Given::List(l)) => l,
-        Some(Given::Words(w)) if !w.trim().is_empty() => vec![Test { scenario: w, criteria: Vec::new() }],
-        _ => Vec::new(),
-    })
 }
 
 #[cfg(test)]
@@ -230,5 +238,29 @@ mod tests {
         assert_eq!(s.a, vec![measure("x", Op::Ge, "1", "")]);
         let s: S = serde_json::from_str(r#"{"a": "", "t": null}"#).unwrap_or(S { a: vec![measure("x", Op::Ge, "1", "")], t: vec![] });
         assert!(s.a.is_empty() && s.t.is_empty());
+    }
+
+    #[test]
+    fn a_measure_s_numbers_come_as_numbers_and_what_is_wrong_says_where() -> anyhow::Result<()> {
+        use serde_json::json;
+        #[derive(Debug, Deserialize)]
+        struct S {
+            #[serde(default, deserialize_with = "criteria_list")]
+            a: Vec<Criterion>,
+        }
+        let first = |s: S| s.a.first().map(Criterion::sentence).unwrap_or_default();
+        // As the lab's agent gave it (2026-10-23), the tools asking for a number.
+        let s: S = serde_json::from_value(json!({"a": [{"kind": "quantitative", "target": "failing tests", "op": "eq", "value": 0, "measured": "python3 -m unittest"}]}))?;
+        assert_eq!(first(s), "failing tests is exactly 0, measured by python3 -m unittest");
+        // One criterion, not in a list.
+        let s: S = serde_json::from_value(json!({"a": {"kind": "quantitative", "target": "heap", "op": "between", "value": 64, "value2": 128.5, "unit": "MB"}}))?;
+        assert_eq!(first(s), "heap is between 64 MB and 128.5 MB");
+        let wrong = |v: Value| serde_json::from_value::<S>(v).err().map(|e| e.to_string()).unwrap_or_default();
+        let e = wrong(json!({"a": [{"kind": "qualitative", "text": "ok"}, {"kind": "quantitative", "target": "x", "op": "equals", "value": 1}]}));
+        assert!(e.starts_with("criterion 2: unknown variant `equals`"), "{e}");
+        let e = wrong(json!({"a": [{"kind": "quantitative", "target": "x", "op": "eq", "value": [1]}]}));
+        assert!(e.starts_with("criterion 1: a number or words, not [1]"), "{e}");
+        assert!(wrong(json!({"a": 5})).starts_with("criteria are a list"));
+        Ok(())
     }
 }

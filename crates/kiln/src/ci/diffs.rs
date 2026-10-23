@@ -407,7 +407,7 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
     let (outcomes, fresh, asked) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             // Reviewers asked for the first time, by diff: they hear of it (W19-R06).
             let mut asked: Vec<(u32, String, String)> = Vec::new();
@@ -704,7 +704,7 @@ pub(crate) async fn add_version(hub: &Arc<Hub>, repo: &Repo, path: &str, d: &Dif
     let (n, by): (u32, Option<String>) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let n: u32 = tx.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM diff_versions WHERE diff_id = ?1", [&id], |r| r.get(0))?;
             // The same commits, rebased: whom the version before came from (W10-R02's `secrets.use`).
             let by: Option<String> = tx.query_row("SELECT started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [&id], |r| r.get(0)).optional()?.flatten();
@@ -1007,14 +1007,30 @@ async fn files(hub: &Hub, d: &Diff, v: &Version, viewer: &str, latest: &Version)
 }
 
 /// Which of `paths` the repository's `.gitattributes` (as of `commit`) marks generated
-/// (`linguist-generated`) or not to diff (`-diff`, as `binary` does): the review folds them.
+/// (`linguist-generated`) or not to diff (`-diff`, as `binary` does): the review folds them. Read
+/// as of the commit with git 2.40's `check-attr --source`; a git before it (Debian 12's 2.39) has
+/// no such option, so there the commit is read into an index of its own and asked (`--cached`).
 async fn generated_files(hub: &Hub, repo: &str, commit: &str, paths: &[String]) -> HashSet<String> {
     let mut out = HashSet::new();
     let source = format!("--source={commit}");
+    let mut index: Option<std::path::PathBuf> = None;
     for chunk in paths.chunks(500) {
-        let mut args: Vec<&str> = vec!["-C", repo, "check-attr", &source, "-z", "linguist-generated", "diff", "--"];
-        args.extend(chunk.iter().map(String::as_str));
-        let Ok(said) = gitops::run_git(hub, &args, LS_REMOTE_TIMEOUT).await else { continue };
+        let mut asked: Vec<&str> = vec!["-z", "linguist-generated", "diff", "--"];
+        asked.extend(chunk.iter().map(String::as_str));
+        let said = if index.is_none() {
+            let mut args: Vec<&str> = vec!["-C", repo, "check-attr", &source];
+            args.extend(asked.iter().copied());
+            match gitops::run_git(hub, &args, LS_REMOTE_TIMEOUT).await {
+                Ok(said) => Some(said),
+                Err(_) => {
+                    index = commit_index(hub, repo, commit).await;
+                    cached_attrs(hub, repo, index.as_deref(), &asked).await
+                }
+            }
+        } else {
+            cached_attrs(hub, repo, index.as_deref(), &asked).await
+        };
+        let Some(said) = said else { continue };
         let text = String::from_utf8_lossy(&said);
         let mut parts = text.split('\0');
         while let (Some(path), Some(attr), Some(value)) = (parts.next(), parts.next(), parts.next()) {
@@ -1028,7 +1044,30 @@ async fn generated_files(hub: &Hub, repo: &str, commit: &str, paths: &[String]) 
             }
         }
     }
+    if let Some(i) = index {
+        let _ = std::fs::remove_file(i);
+    }
     out
+}
+
+/// `commit` read into an index of its own, for `check-attr --cached` (a file the caller removes).
+async fn commit_index(hub: &Hub, repo: &str, commit: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("kiln-attrs-{}", crate::util::new_id()));
+    let mut cmd = gitops::git(hub);
+    cmd.env("GIT_INDEX_FILE", &path).args(["-C", repo, "read-tree", commit]);
+    if crate::proc::output(cmd, LS_REMOTE_TIMEOUT).await.is_ok_and(|o| o.status.success()) {
+        return Some(path);
+    }
+    let _ = std::fs::remove_file(&path);
+    None
+}
+
+/// What `check-attr --cached` says of `asked` with `index` as the index (none: nothing).
+async fn cached_attrs(hub: &Hub, repo: &str, index: Option<&std::path::Path>, asked: &[&str]) -> Option<Vec<u8>> {
+    let mut cmd = gitops::git(hub);
+    cmd.env("GIT_INDEX_FILE", index?).args(["-C", repo, "check-attr", "--cached"]).args(asked);
+    let out = crate::proc::output(cmd, LS_REMOTE_TIMEOUT).await.ok()?;
+    out.status.success().then_some(out.stdout)
 }
 
 /// The most of a file `/versions/:v/blob` serves.
@@ -1319,7 +1358,7 @@ async fn relabel(hub: &Hub, d: &Diff, caller: &Caller, add: Vec<String>, remove:
     let (added, removed) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut added = Vec::new();
             for n in &add {

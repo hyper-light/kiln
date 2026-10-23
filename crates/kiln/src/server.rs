@@ -56,6 +56,7 @@ pub fn token_path(cfg: &Config) -> PathBuf {
 
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
@@ -67,7 +68,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
-    let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
+    let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
+    tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
     let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
     let requeued = store.recover().await?;
     if requeued > 0 {

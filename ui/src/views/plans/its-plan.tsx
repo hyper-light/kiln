@@ -1,26 +1,30 @@
 /**
- * An agent's own plan, in its Plan tab: the plan it proposed (plan mode) as kiln keeps it, its
- * steps as cards to pick or run (its plan's page takes them), its words folded under them; and its
- * to-do list, each item as a step stands, the one under way in the prism's shimmer. A plan from
- * before kiln kept them shows as its words, to keep.
+ * An agent's own plan, in its Plan tab, as the tree of a plan's steps: its to-do list, one after
+ * another, each where it stands (the one under way in the prism's light and shimmer); or, keeping
+ * none, the plan it proposed (plan mode), kept by kiln as one of your plans, its steps as they'll
+ * run. Its words are there on asking, and its page runs its steps. A plan with no steps to draw
+ * shows as its words; one from before kiln kept them, as its words to keep.
  */
 import * as React from "react";
 import { planHref, plansApi, type Plan } from "@/api/plans";
-import { Button } from "@/components/ui/button";
-import { Link, useNavigate } from "@/lib/router";
+import { Link } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
 import { Prose } from "@/views/harness/parts";
+import { effectiveNeeds, PlanGraph, StepBar } from "./graph";
+import type { GraphStep } from "./graph-layout";
 import { SavePlan } from "./save";
-import { StandTitle, StepGlyph, type Stand } from "./status";
-import { PlanSteps, stepsWords } from "./steps-view";
+import type { Stand } from "./status";
 import "./plans.css";
 
-/** The plan agent `session` proposed, as kiln keeps it (`words`: its latest, as its conversation has them). */
-export function ProposedPlan({ session, words }: { session: string; words: string }) {
+/**
+ * The plan agent `session` proposed, as kiln keeps it (`words`: its latest, as its conversation has
+ * them). `tracked`: it keeps a to-do list, drawn above as how far it's come: the plan is a line.
+ */
+export function ProposedPlan({ session, words, tracked }: { session: string; words: string; tracked: boolean }) {
   // Asked again when it proposes another (kept within moments), and now and then.
   const kept = useSuspenseResource(`plans/proposed/${session}/${words.length}`, (s) => plansApi.proposedBy(session, s), { pollMs: 5000 }).data;
   const p = kept[0];
-  if (p) return <KeptPlan p={p} />;
+  if (p) return <KeptPlan p={p} tracked={tracked} />;
   if (!words) return null;
   return (
     <div className="hx-stack">
@@ -30,49 +34,45 @@ export function ProposedPlan({ session, words }: { session: string; words: strin
   );
 }
 
-function KeptPlan({ p }: { p: Plan }) {
-  const navigate = useNavigate();
-  const [picked, setPicked] = React.useState<number[]>([]);
-  const [words, setWords] = React.useState(false);
-  // Run on its page: the steps picked there, its Run it open.
-  const run = (n: number[]) => navigate(`${planHref(p.id)}?pick=${n.join(",")}`);
+function KeptPlan({ p, tracked }: { p: Plan; tracked: boolean }) {
+  const [open, setOpen] = React.useState(false);
+  const titles = p.items?.length ? p.items.map((it) => it.title || "Untitled step") : p.steps;
+  const waits = effectiveNeeds(titles.map((_, i) => p.items?.[i]?.needs));
+  const steps: GraphStep[] = titles.map((title, i) => ({ n: i + 1, title, needs: waits[i] ?? [] }));
+  // No steps to draw: its words, as it wrote them.
+  if (!tracked && steps.length === 0)
+    return (
+      <div className="ip">
+        <p className="ip-head">
+          Kept by kiln as <Link to={planHref(p.id)}>{p.title}</Link>
+        </p>
+        <Prose text={p.body} className="hx-plan-text" />
+      </div>
+    );
   return (
     <div className="ip">
+      {!tracked && <PlanGraph label={`Its plan, “${p.title}”`} steps={steps} />}
       <p className="ip-head">
         <Link to={planHref(p.id)}>{p.title}</Link>
-        <span className="ip-meta"> · v{p.version}, kept by kiln</span>
+        <span className="ip-meta"> · kept by kiln · </span>
+        <button type="button" className="ip-words" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? "hide its words" : "its words"}
+        </button>
       </p>
-      <PlanSteps plan={p} picked={picked} onPick={setPicked} onRun={(n) => run([n])} />
-      {picked.length > 0 && (
-        <div className="ip-run">
-          <Button size="xs" onClick={() => run(picked)}>
-            Run {stepsWords(picked)}
-          </Button>
-        </div>
-      )}
-      <button type="button" className="sv-link" aria-expanded={words} onClick={() => setWords(!words)}>
-        {words ? "Hide its words" : "Its words"}
-      </button>
-      {words && <Prose text={p.body} className="hx-plan-text" />}
+      {open && <Prose text={p.body} className="hx-plan-text" />}
     </div>
   );
 }
 
-/** A to-do list, each item as a step stands: done met, the one under way working, the rest waiting. */
+const TODO_STAND: Record<string, Stand> = { completed: "met", in_progress: "working" };
+
+/** A to-do list as the tree of a plan's steps, each after the one before: done met, the one under way working, the rest waiting. */
 export function TodoSteps({ todos }: { todos: readonly { text: string; status: string }[] }) {
+  const steps: GraphStep[] = todos.map((t, i) => ({ n: i + 1, title: t.text, needs: i ? [i] : [], stand: TODO_STAND[t.status] ?? "waiting" }));
   return (
-    <ol className="ip-todos">
-      {todos.map((t, i) => {
-        const stand: Stand = t.status === "completed" ? "met" : t.status === "in_progress" ? "working" : "waiting";
-        return (
-          <li key={i} className="ip-todo" data-stand={stand}>
-            <StepGlyph stand={stand} />
-            <span className="ip-todo-text">
-              <StandTitle stand={stand}>{t.text}</StandTitle>
-            </span>
-          </li>
-        );
-      })}
-    </ol>
+    <div className="ip-todos">
+      <StepBar stands={steps.map((s) => s.stand ?? "waiting")} />
+      <PlanGraph label="Its to-do list" steps={steps} />
+    </div>
   );
 }

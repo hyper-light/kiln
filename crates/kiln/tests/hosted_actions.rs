@@ -38,6 +38,53 @@ fn until(s: &Server, secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Resul
 }
 
 /// Whether github.com answers here.
+/// W13-R04: a `docker` leg in kiln's runner image has its hosted runner's user: `runner`, by
+/// `USER` and `LOGNAME` too, as a hosted runner's steps have them. ORT's action makes its
+/// container's paths with `${PROJECT_PATH/$USER/ort}`: without `USER` they stayed the host's, and
+/// the corpus's elixir found "path does not exist".
+#[test]
+fn w13_r04_a_hosted_legs_steps_say_their_user() -> anyhow::Result<()> {
+    if !docker_works() {
+        eprintln!("skipped: no Docker here");
+        return Ok(());
+    }
+    let images = Command::new("docker").args(["images", "--format", "{{.Repository}}"]).output()?;
+    if !String::from_utf8_lossy(&images.stdout).lines().any(|l| l == "kiln/runner-ubuntu-24.04") {
+        eprintln!("skipped: kiln's runner image isn't built on this machine");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    // On this machine's network: the server listens on its loopback only.
+    let rule = "[[ci.routing]]\nmatch = { labels = [\"hosted\"] }\nexecutor = [\"docker\"]\nimage = \"kiln/runner-ubuntu-24.04\"\n";
+    let s = common::start_env(dir.path(), &Options { agent: true, ci: "", extra: rule }, false, &[("KILN_CONTAINER_NETWORK", "host")])?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, dir.path(), &["clone", "-q", &url, "work"])?;
+    let work = dir.path().join("work");
+    git(&home, &work, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "README.md"])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    let who = "on: push\njobs:\n  who:\n    runs-on: hosted\n    steps:\n      - run: echo \"user=$USER logname=$LOGNAME home=$HOME ort=${GITHUB_WORKSPACE/$USER/ort}\"\n";
+    std::fs::write(work.join(".github/workflows/who.yml"), who)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "who"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    let (run, log) = finished(&s, "push", 900)?;
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{run}\n{log}\n{}", s.log());
+    assert!(log.contains("user=runner logname=runner home=/home/runner ort=/home/ort/work/app/app"), "{log}");
+    Ok(())
+}
+
 fn github() -> bool {
     Command::new("curl").args(["-fsSI", "--max-time", "10", "https://github.com/actions/checkout"]).output().is_ok_and(|o| o.status.success())
 }
@@ -176,9 +223,10 @@ fn w14_ac05_github_actions_on_a_native_repository() -> anyhow::Result<()> {
 
 /// `actions/checkout` v7 (as the corpus pins it, by commit): its credentials persisted in a
 /// configuration file of their own under `RUNNER_TEMP`, which a later `git fetch` in the job uses:
-/// on the host, in a job container, and in the `docker` executor. In the job container, root over
-/// a workspace this runner's user owns, git refuses the repository until it's a safe directory, as
-/// on GitHub (checkout adds it only to a global configuration of its own while it runs).
+/// on the host, and (`CHECKOUT_V7_DOCKER`, where Docker is) in a job container and in the `docker`
+/// executor. In the job container, root over a workspace this runner's user owns, git refuses the
+/// repository until it's a safe directory, as on GitHub (checkout adds it only to a global
+/// configuration of its own while it runs).
 const CHECKOUT_V7: &str = r#"on: push
 jobs:
   host:
@@ -186,7 +234,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: git fetch --tags && echo "fetched again"
-  container:
+"#;
+
+/// [`CHECKOUT_V7`]'s jobs that need Docker: a job container, and the `docker` executor.
+const CHECKOUT_V7_DOCKER: &str = r#"  container:
     runs-on: local
     container: docker.io/library/node:24-bookworm
     steps:
@@ -200,6 +251,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: git fetch --tags && echo "fetched again"
 "#;
+
+fn docker_works() -> bool {
+    Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]).output().is_ok_and(|o| o.status.success())
+}
 
 #[test]
 fn w07_r09_checkout_v7_persists_its_credentials() -> anyhow::Result<()> {
@@ -229,7 +284,13 @@ fn w07_r09_checkout_v7_persists_its_credentials() -> anyhow::Result<()> {
         Ok(body.contains("\"last_polled_at\":null").then_some(body))
     })?;
     std::fs::create_dir_all(work.join(".github/workflows"))?;
-    std::fs::write(work.join(".github/workflows/checkout.yml"), CHECKOUT_V7)?;
+    // Where no Docker answers (a CI pod), the host's job alone: the others would wait for it, and
+    // the run never end.
+    let docker = docker_works();
+    if !docker {
+        eprintln!("no Docker here: the host's job runs, not the job container's or the docker executor's");
+    }
+    std::fs::write(work.join(".github/workflows/checkout.yml"), if docker { format!("{CHECKOUT_V7}{CHECKOUT_V7_DOCKER}") } else { CHECKOUT_V7.to_owned() })?;
     git(&home, &work, &["add", "."])?;
     git(&home, &work, &["commit", "-qm", "checkout v7"])?;
     git(&home, &work, &["push", "-q", "origin", "main"])?;

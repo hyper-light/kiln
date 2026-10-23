@@ -549,7 +549,19 @@ impl Owner {
             }
             Msg::Move(news) => self.moved(machine, news),
             // Only the server says these, or they aren't for the groups (`crate::sync::places`).
-            Msg::Copies { .. } | Msg::Release | Msg::Want { .. } | Msg::Repos(_) | Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } | Msg::Task(_) => {}
+            Msg::Copies { .. }
+            | Msg::Release
+            | Msg::Want { .. }
+            | Msg::Repos(_)
+            | Msg::Look
+            | Msg::Bundle { .. }
+            | Msg::Clone(_)
+            | Msg::Delete { .. }
+            | Msg::Forget { .. }
+            | Msg::Task(_)
+            | Msg::Shares { .. }
+            | Msg::Shared(_)
+            | Msg::Take(_) => {}
         }
     }
 

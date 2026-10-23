@@ -88,6 +88,8 @@ pub struct Stack {
     /// that plan first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_for: Option<String>,
+    /// Its big goals planned first (`plans_first`): on unless you turn it off.
+    pub plan_big: bool,
     /// When kiln last cleared the goal in the agent itself (pause, skip, clear).
     #[serde(skip)]
     dropped_at: i64,
@@ -323,10 +325,12 @@ async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
-    let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>)> = c
-        .query_row("SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for FROM goal_stacks WHERE agent = ?1", params![agent], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
-        })
+    let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>, bool)> = c
+        .query_row(
+            "SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1) FROM goal_stacks WHERE agent = ?1",
+            params![agent],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        )
         .optional()?;
     let mut st = c.prepare(
         "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to FROM goal_items WHERE agent = ?1 ORDER BY pos",
@@ -357,8 +361,8 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None));
-    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, dropped_at })
+    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None, true));
+    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, dropped_at })
 }
 
 /// What a goal stack last said to its agent through its queue (`say`): the message, while it may
@@ -615,6 +619,16 @@ pub async fn set(hub: &Hub, agent: &str, given: Vec<Given>) -> R<Stack> {
 
 /// `set`, with the stacks held (`CHANGING`).
 async fn set_locked(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<String>, String)>) -> R<Stack> {
+    // A running stack whose goal under way changed: what's first now goes to the agent at once.
+    if set_unsent(hub, info, agent, given).await? {
+        push(hub, agent, crate::metrics::agents()).await;
+    }
+    get(hub, agent).await
+}
+
+/// [`set_locked`] but for sending what's first now: whether that goes at once (its goal under way
+/// changed on a running stack).
+async fn set_unsent(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<String>, String)>) -> R<bool> {
     let stack = get(hub, agent).await?;
     let (rows, gone) = arrange(&stack.items, given);
     let kept = rows.iter().filter(|r| matches!(r, Row::Kept(_) | Row::Reworded { .. })).count();
@@ -637,7 +651,7 @@ async fn set_locked(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
     let running = hub
         .store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             for (pos, row) in rows.iter().enumerate() {
                 let pos = i64::try_from(pos).unwrap_or(i64::MAX);
                 match row {
@@ -671,11 +685,7 @@ async fn set_locked(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
             Ok(state == "running")
         })
         .await?;
-    // A running stack whose goal under way changed: what's first now goes to the agent at once.
-    if moved && running {
-        push(hub, agent, crate::metrics::agents()).await;
-    }
-    get(hub, agent).await
+    Ok(moved && running)
 }
 
 /// Whether `kept` goals done or under way, and `given` more, fit in one stack.
@@ -826,7 +836,7 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
     let running = hub
         .store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             let mut met = tx.execute("UPDATE goal_items SET status = 'met', reason = ?2, ended_at = ?3 WHERE id = ?1", params![target_id, reason, now])?;
             for id in &ended_parts {
                 met += tx.execute("UPDATE goal_items SET status = 'met', reason = 'Met with the goal it is a part of.', ended_at = ?2 WHERE id = ?1", params![id, now])?;
@@ -895,7 +905,7 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
         let running = hub
             .store
             .call(move |c| {
-                let tx = c.unchecked_transaction()?;
+                let tx = crate::store::tx(c)?;
                 if active {
                     tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1", params![gone, now, format!("Taken out by {who}.")])?;
                     tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
@@ -1064,7 +1074,7 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
     let (running, skipped) = hub
         .store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             let mut skipped = 0;
             match action {
                 Action::Start => run_from_here(&tx, &agent_s, said_at, now)?,
@@ -1176,7 +1186,7 @@ fn merged(now: Vec<Item>, back: Vec<Item>, said_at: i64) -> Vec<Item> {
 /// and its agents (`hub: None`: a step tells no parents and moves no sessions), what it sends
 /// counted into `metrics`.
 async fn push(hub: &Hub, agent: &str, metrics: &crate::metrics::AgentMetrics) {
-    let d = Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub, hub: None, metrics };
+    let d = Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub, hub: None, metrics, planner: Some(hub) };
     if let Err(e) = step(&d, agent, true).await {
         tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
     }
@@ -1280,7 +1290,7 @@ where
 /// way to how it came out, and sends it again when the agent stops short of it. Goals set in an
 /// agent directly join its stack first.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: Some(&hub), metrics: crate::metrics::agents() }.drive().await
+    Driver { store: &hub.store, clock: hub.clock.as_ref(), shutdown: &hub.shutdown, port: hub.as_ref(), hub: Some(&hub), metrics: crate::metrics::agents(), planner: Some(hub.as_ref()) }.drive().await
 }
 
 /// What the goal driver works with: the stacks' store, its clock, what stops it, and its agents.
@@ -1295,6 +1305,9 @@ pub struct Driver<'a, P> {
     pub hub: Option<&'a Arc<Hub>>,
     /// What it counts its sends and the goals it saw end into (kiln's, `metrics::agents()`).
     pub metrics: &'a crate::metrics::AgentMetrics,
+    /// Where a big goal is planned first (`plans_first`): none for the driver alone (its tests),
+    /// whose goals go as they are.
+    pub planner: Option<&'a Hub>,
 }
 
 impl<P> Driver<'_, P>
@@ -1434,7 +1447,7 @@ where
             if !due {
                 return Ok(false);
             }
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             run_from_here(&tx, &a, said_at, now)?;
             let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0))?;
             tx.commit()?;
@@ -1477,7 +1490,7 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
             {
                 return Ok(());
             }
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             let active: Option<(String, String)> =
                 tx.query_row("SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active'", params![agent], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             if active.as_ref().is_some_and(|(_, t)| same(t, &text)) {
@@ -1552,6 +1565,18 @@ pub struct Planned {
 pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str) -> R<Planned> {
     let info = known(hub, agent)?;
     let _one = CHANGING.lock().await;
+    let (planned, sends) = plan_locked(hub, &info, agent, id, title, by).await?;
+    // The goal under way put back after its planning: that goes to the agent at once.
+    if sends {
+        push(hub, agent, crate::metrics::agents()).await;
+    }
+    Ok(planned)
+}
+
+/// [`plan`], with the stacks held (`CHANGING`), but for sending what's first now: the plan, and
+/// whether that goes at once (the goal under way put back after its planning, on a running stack).
+/// The driver plans a big goal with it, then decides what goes itself.
+async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, title: Option<&str>, by: &str) -> R<(Planned, bool)> {
     let stack = get(hub, agent).await?;
     let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
         Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
@@ -1575,7 +1600,7 @@ pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>,
     {
         let part = stack.items.iter().find(|i| i.part_of.as_deref() == Some(target.id.as_str()) && i.part_kind.as_deref() == Some("planning")).map(|i| i.id.clone()).unwrap_or_default();
         let research = crate::research::of_plan(hub, &pid).await.unwrap_or_default();
-        return Ok(Planned { plan: pid, research, goal: target.id.clone(), part });
+        return Ok((Planned { plan: pid, research, goal: target.id.clone(), part }, false));
     }
     let words = target.text.clone();
     let title = title.map(str::trim).filter(|t| !t.is_empty()).map_or_else(|| words.chars().take(80).collect::<String>(), str::to_owned);
@@ -1600,12 +1625,66 @@ pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>,
     let k = given.iter().position(|(g, _)| g.as_deref() == Some(target_id.as_str())).unwrap_or(given.len());
     given.insert(k, (None, part_text));
     let before: Vec<String> = stack.items.iter().map(|i| i.id.clone()).collect();
-    let s = set_locked(hub, &info, agent, given).await?;
+    let sends = set_unsent(hub, info, agent, given).await?;
+    let s = get(hub, agent).await?;
     let new_ids = added(&s, &before);
     let t = target_id.clone();
     let ids = new_ids.clone();
     hub.store.call(move |c| note(c, &ids, Noted { part_of: Some(&t), kind: Some("planning"), step: None, waits_on: None })).await?;
-    Ok(Planned { plan: pid, research: research.id, goal: target_id, part: new_ids.first().cloned().unwrap_or_default() })
+    Ok((Planned { plan: pid, research: research.id, goal: target_id, part: new_ids.first().cloned().unwrap_or_default() }, sends))
+}
+
+/// How long a goal is that's planned first ([`big`]): sentences, and for a long sentence or two,
+/// characters.
+const BIG_SENTENCES: usize = 3;
+const BIG_CHARS: usize = 280;
+
+/// Whether a goal is big: more than a couple of sentences (each of three words or more; a line ends
+/// one too, so a list of steps counts its lines), or as long as several.
+pub fn big(text: &str) -> bool {
+    let (mut sentences, mut words, mut in_word) = (0, 0, false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            in_word = false;
+        } else if !in_word {
+            words += 1;
+            in_word = true;
+        }
+        if c == '\n' || (matches!(c, '.' | '!' | '?') && chars.peek().is_none_or(|n| n.is_whitespace())) {
+            if words >= 3 {
+                sentences += 1;
+            }
+            words = 0;
+        }
+    }
+    if words >= 3 {
+        sentences += 1;
+    }
+    sentences >= BIG_SENTENCES || text.chars().count() > BIG_CHARS
+}
+
+/// Whether goal `id`, about to start, is planned first: its stack plans big goals first, and it's a
+/// big goal ([`big`]) of the agent's own: not a part of another, made from no plan's step, not
+/// planned already, and not handed to another agent.
+fn plans_first(stack: &Stack, id: &str) -> bool {
+    stack.plan_big
+        && stack.items.iter().find(|i| i.id == id).is_some_and(|i| i.part_of.is_none() && i.step.is_none() && i.planned_as.is_none() && i.waits_on.is_none() && i.on.is_none() && big(&i.text))
+}
+
+/// Agent `agent`'s stack set to plan its big goals first, or not (`plans_first`).
+pub async fn settings(hub: &Hub, agent: &str, plan_big: bool) -> R<Stack> {
+    known(hub, agent)?;
+    let _one = CHANGING.lock().await;
+    let (a, now) = (agent.to_owned(), now_ms(hub));
+    hub.store
+        .call(move |c| {
+            touch(c, &a, None, None, now)?;
+            c.execute("UPDATE goal_stacks SET plan_big = ?2 WHERE agent = ?1", params![a, plan_big])?;
+            Ok(())
+        })
+        .await?;
+    get(hub, agent).await
 }
 
 /// What a goal does once the plan it became is ready ([`planned`]).
@@ -1829,7 +1908,7 @@ where
                 if !still {
                     return Ok(false);
                 }
-                let tx = c.unchecked_transaction()?;
+                let tx = crate::store::tx(c)?;
                 run_from_here(&tx, &a, said_at, now)?;
                 let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0))?;
                 tx.commit()?;
@@ -1862,7 +1941,7 @@ pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, ite
     let like = format!("{}%", track.replace(['%', '_'], ""));
     let done = store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute("UPDATE goal_items SET delegated_to = NULL WHERE agent = ?1 AND delegated_to IS NOT NULL AND text LIKE ?2", params![agent, like])?;
             if let Some(item) = &item {
                 let n = if met {
@@ -1960,7 +2039,24 @@ where
         }
         return Ok(());
     }
-    let next = decide(&stack, info.as_ref(), now, children, push);
+    let mut next = decide(&stack, info.as_ref(), now, children, push);
+    // A big goal of the agent's own about to start, on a stack that plans those first: planned
+    // first, as Make a plan does (researched inside and out, its steps written), its planning going
+    // to the agent in its place and its steps after. One that can't be planned goes as it is.
+    let starts = if let Next::Start { id, .. } = &next { Some(id.clone()) } else { None };
+    if let (Some(id), Some(hub), Some(i)) = (starts, d.planner, info.as_ref())
+        && !rule.holds_new_goals()
+        && plans_first(&stack, &id)
+    {
+        match plan_locked(hub, i, agent, Some(&id), None, "kiln").await {
+            Ok((p, _)) => {
+                tracing::info!(%agent, goal = %id, plan = %p.plan, "a big goal planned first");
+                stack = stack_of(store, agent).await?;
+                next = decide(&stack, info.as_ref(), now, children, push);
+            }
+            Err(e) => tracing::warn!(%agent, goal = %id, error = %e, "planning a big goal first"),
+        }
+    }
     // What its harness last said of the goal it pursues: a verdict on what's sent now must be newer.
     let prior_at = info.as_ref().and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
     match next {
@@ -2246,7 +2342,7 @@ mod tests {
             assert!(port.open(id, Info { id: id.into(), status: Status::Idle, ..Info::default() }));
             assert!(port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]})));
             let metrics = crate::metrics::AgentMetrics::default();
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             store
                 .call(move |c| {
                     for (pos, (g, text)) in [("g1", "the first goal"), ("g2", "the second goal")].into_iter().enumerate() {
@@ -2348,7 +2444,7 @@ mod tests {
             assert!(port.open(id, Info { id: id.into(), status: Status::Idle, objective: Some(objective), ..Info::default() }));
             port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
             let metrics = crate::metrics::AgentMetrics::default();
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             let sent = || port.heard(id).iter().map(|d| d.at_ms).collect::<Vec<i64>>();
             let test = async {
                 clock.sleeping_since(0, 1).await;
@@ -2409,7 +2505,7 @@ mod tests {
             assert!(port.open(id, Info { id: id.into(), status: Status::Disconnected, ..Info::default() }));
             assert!(port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]})));
             let metrics = crate::metrics::AgentMetrics::default();
-            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             // A running stack, its goal under way just resumed.
             let (a, now) = (id.to_owned(), clock.unix_ms());
             store
@@ -2497,7 +2593,7 @@ mod tests {
             assert!(port.open(id, Info { id: id.into(), status: Status::Running, objective: Some(lint), ..Info::default() }));
             port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
             let metrics = crate::metrics::AgentMetrics::default();
-            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             let a = id.to_owned();
             store
                 .call(move |c| {
@@ -2628,7 +2724,7 @@ mod tests {
                 })
                 .await?;
             let metrics = crate::metrics::AgentMetrics::default();
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             let test = async {
                 clock.sleeping_since(0, 1).await;
                 clock.advance_and_settle(Duration::from_secs(60).saturating_sub(TICK)).await;
@@ -2680,7 +2776,7 @@ mod tests {
                 })
                 .await?;
             let metrics = crate::metrics::AgentMetrics::default();
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             let test = async {
                 clock.sleeping_since(0, 1).await;
                 clock.advance_and_settle(TICK).await;
@@ -3036,7 +3132,7 @@ mod stack_tests {
             assert!(port.open("loose", Info { id: "loose".into(), status: Status::Idle, parent: Some("coord".into()), limits: weekly(85.0), ..Info::default() }));
             assert!(port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]})));
             let metrics = crate::metrics::AgentMetrics::default();
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             store
                 .call(|c| {
                     c.execute("INSERT INTO plans (id, title, body, tags, items, created_at, updated_at) VALUES ('m', 'A program', '', '[\"lab\",\"master\"]', '[]', 1, 1)", [])?;
@@ -3110,7 +3206,7 @@ mod stack_tests {
             let id = "planned-a";
             assert!(port.open(id, Info { id: id.into(), status: Status::Idle, ..Info::default() }));
             let metrics = crate::metrics::AgentMetrics::default();
-            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics };
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             store
                 .call(|c| {
                     c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES ('g1', 'planned-a', 0, 'the planned goal', 'pending')", [])?;
@@ -3513,6 +3609,58 @@ mod stack_tests {
             let g = s.items.iter().find(|i| i.id == two).cloned().unwrap_or_default();
             assert_eq!((g.status.as_str(), g.reason.as_deref()), ("met", Some("Met with its plan: its run is done, every step met.")), "{:?}", words(&s));
             assert_eq!(metrics.goals_ended.get(&["met"]), 2, "the run's part and its goal");
+            Ok(())
+        })
+    }
+
+    /// Big: more than a couple of sentences of a few words, or as long as several; a list's lines
+    /// count as sentences, and a point inside a word (a version, "e.g.") doesn't end one.
+    #[test]
+    fn a_goal_is_big_past_a_couple_of_sentences() {
+        assert!(!big("Ship 0.3 to the fleet"));
+        assert!(!big("Beat Splinter DB and RocksDB by minimum 4-5x on fills, gets, and seeks without any sacrifice in correctness or robustness."));
+        assert!(!big("Fix the parser. Add tests. Ship it."), "two words aren't a sentence of a plan");
+        assert!(!big("Use v0.3.1 of hyper-quic, e.g. as the transport."));
+        assert!(big("Build the storage layer with hyper-raft. Move data over hyper-quic inside. Test it with ten thousand small files."));
+        assert!(big("Release 0.3:\n- tag it on main\n- build the images\n- deploy it to the fleet"));
+        assert!(big(&"word ".repeat(60)), "one long sentence");
+    }
+
+    /// A big goal about to start is planned first on a stack that plans its big goals first, as
+    /// stacks do unless that's turned off (a person's setting, not one of the agent's tools): its
+    /// planning goes in its place. Turned off, a big goal goes as it is.
+    #[test]
+    fn a_big_goal_is_planned_before_it_starts_unless_its_stack_says_not() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["ship it"]).await?;
+            let id = id.as_str();
+            let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let replicate = "Replicate the store over QUIC. Data moves between nodes over hyper-quic, even with an HTTP/1.1 front end. Test it with a thousand small files and check every replica.";
+            let document = "Document the replication protocol. Say how a node joins and how a replica catches up. Show the frames on the wire.";
+            let s = get(&hub, id).await?;
+            assert!(s.plan_big, "on unless turned off");
+            assert_eq!(under_way(&s).map(|u| u.0), Some("ship it".to_owned()), "a short goal goes as it is");
+            // Off: the big goal next goes as it is.
+            let off = call_ok(crate::ops::call(cx.clone(), "goals.settings", serde_json::json!({"agent": id, "plan_big": false})).await)?;
+            assert_eq!(off.get("plan_big"), Some(&serde_json::json!(false)), "{off}");
+            assert!(!crate::mcp::agent_ops().iter().any(|o| o.name == "goals.settings"), "not an agent's tool");
+            add(&hub, id, strs(&[replicate, document]), false).await?;
+            settled(&hub, id).await;
+            let s = done(&hub, id, None, Some("shipped"), &By::Itself).await?;
+            let first = s.items.iter().find(|i| i.text == replicate).cloned().unwrap_or_default();
+            assert_eq!((first.status.as_str(), first.planned_as.as_deref()), ("active", None), "{:?}", words(&s));
+            // On again: the next big goal is planned first, its planning under way in its place.
+            call_ok(crate::ops::call(cx.clone(), "goals.settings", serde_json::json!({"agent": id, "plan_big": true})).await)?;
+            settled(&hub, id).await;
+            let s = done(&hub, id, None, Some("replicated"), &By::Itself).await?;
+            let goal = s.items.iter().find(|i| i.text == document).cloned().unwrap_or_default();
+            let pid = goal.planned_as.clone().unwrap_or_default();
+            assert!(!pid.is_empty() && goal.status == "pending", "{:?}", words(&s));
+            let now = s.items.iter().find(|i| i.status == "active").cloned().unwrap_or_default();
+            assert_eq!((now.part_of.as_deref(), now.part_kind.as_deref()), (Some(goal.id.as_str()), Some("planning")), "{:?}", words(&s));
+            assert!(now.text.starts_with("Plan \"Document the replication protocol."), "{}", now.text);
+            let p = crate::plans::get(&hub, &pid).await?;
+            assert_eq!((p.phase.as_str(), p.research.is_some()), ("planning", true));
             Ok(())
         })
     }

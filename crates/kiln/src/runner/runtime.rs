@@ -902,8 +902,11 @@ impl Leg {
             self.note(0, &format!("{} ({}){}: {}", i.name, i.kind, if i.job { "" } else { ", for its steps" }, names.join(", "))).await;
             st.integrations.insert(i.name.clone(), applied);
         }
-        // For `kiln auth`: the leg's integrations, readable by this user alone, and the binary.
-        st.kiln_bin = super::auth::place_binary(&self.work_dir);
+        // For `kiln auth`: the leg's integrations, readable by this user alone, and the binary, put
+        // in place off the runtime: where the work directory is another filesystem (a pod's
+        // volumes), that's a copy of the whole binary.
+        let work = self.work_dir.clone();
+        st.kiln_bin = crate::rt::blocking(move || super::auth::place_binary(&work)).await.ok().flatten();
         let list = dir.join("integrations.json");
         if serde_json::to_vec(&a.integrations).ok().is_some_and(|b| super::auth::write_private(&list, &b).is_ok()) {
             st.env.insert("KILN_INTEGRATIONS".into(), list.to_string_lossy().into_owned());
@@ -1863,8 +1866,13 @@ impl Leg {
             Some(v) => st.value(v, Site::StepWith, "test-results.format").map(|x| x.coerce_string()).unwrap_or_default(),
             None => String::new(),
         };
-        // Patterns are the working directory's; the workspace is what they may reach.
+        // Patterns are the working directory's; the workspace is what they may reach. One in the
+        // job container's terms (`${{ github.workspace }}/…` there) is the host's first.
         let root = st.layout.workspace.clone();
+        let patterns = match st.containers.as_ref().and_then(|c| c.job.as_ref()) {
+            Some(j) => on_host(&j.map, &patterns),
+            None => patterns,
+        };
         let patterns = from_wd(&root, wd, &patterns);
         let files = match super::hashfiles::Workspace::new(&root).and_then(|w| w.matching(&patterns)) {
             Ok(f) => f,
@@ -2241,7 +2249,8 @@ impl Leg {
         let path = leg_socket_path(l);
         // One a runner that stopped short left behind.
         let _ = std::fs::remove_file(&path);
-        super::docker_sock::Socket::listen(path, PathBuf::from("/var/run/docker.sock")).await
+        let names = super::docker_sock::Names::for_leg(&self.a.job_id, Some(&super::docker::owner_label(&self.work_dir)));
+        super::docker_sock::Socket::listen(path, PathBuf::from("/var/run/docker.sock"), names).await
     }
 
     /// Whether the `docker` executor's container has GitHub's hosted runners' paths
@@ -2354,7 +2363,7 @@ impl Leg {
         let cmd = if let Some((cli, image, entrypoint, args)) = container_run {
             // A Docker action: GitHub's mounts, every value by name.
             let map = self.action_paths(st);
-            let mut inner: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), map.translate(v))).collect();
+            let mut inner = map.translate_env(&env);
             inner.remove("PATH");
             inner.insert("HOME".into(), "/github/home".into());
             inner.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
@@ -2369,13 +2378,18 @@ impl Leg {
             c
         } else if let Some((cli, j)) = job_container {
             // A job container's step: `docker exec`, paths translated (W13-R08).
-            let mut inner: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), j.map.translate(v))).collect();
+            let mut inner = j.map.translate_env(&env);
             let mut path = st.path.apply(&j.path, ':');
             if let Some(d) = &st.kiln_bin {
                 path = format!("{path}:{}", j.map.translate(&d.to_string_lossy()));
             }
             inner.insert("PATH".into(), path);
             inner.insert("HOME".into(), j.home.clone());
+            for k in ["USER", "LOGNAME"] {
+                if let Some(l) = &j.login {
+                    inner.entry(k.to_owned()).or_insert_with(|| l.clone());
+                }
+            }
             let args: Vec<String> = args.iter().map(|a| j.map.translate(a)).collect();
             // What it starts carries a mark of the step, so a cancel reaches it in the container
             // as GitHub's reaches a step on the host (`docker exec` passes no signal on).
@@ -2881,6 +2895,21 @@ fn stays_inside(root: &Path, dir: &Path) -> bool {
 }
 
 /// Patterns of the working directory `wd` as the workspace's (`!` negations kept).
+/// `patterns`' absolute ones in a container's terms, as the host has them (a `!` kept); the rest
+/// as they are.
+fn on_host(map: &super::docker::PathMap, patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|p| {
+            let (neg, body) = p.strip_prefix('!').map_or(("", p.as_str()), |b| ("!", b));
+            match Path::new(body).is_absolute().then(|| map.to_host(body)).flatten() {
+                Some(host) => format!("{neg}{}", host.to_string_lossy()),
+                None => p.clone(),
+            }
+        })
+        .collect()
+}
+
 fn from_wd(root: &Path, wd: &Path, patterns: &[String]) -> Vec<String> {
     let rel = wd.strip_prefix(root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
     patterns
@@ -5015,6 +5044,14 @@ jobs:
         let l = other.layout();
         assert_eq!(other.container_map(&l).translate(&l.workspace.to_string_lossy()), l.workspace.to_string_lossy());
         Ok(())
+    }
+
+    /// A test report's absolute pattern in the container's terms is the host's, a `!` kept.
+    #[test]
+    fn w16_r01_report_patterns_in_a_containers_terms() {
+        let map = super::super::docker::PathMap::new(vec![(PathBuf::from("/work/w/1234/app"), "/home/runner/work/app/app".into())]);
+        let got = on_host(&map, &["/home/runner/work/app/app/target/*.xml".into(), "!/home/runner/work/app/app/target/skip.xml".into(), "junit.xml".into(), "/elsewhere/x.xml".into()]);
+        assert_eq!(got, ["/work/w/1234/app/target/*.xml", "!/work/w/1234/app/target/skip.xml", "junit.xml", "/elsewhere/x.xml"]);
     }
 
     /// A cancelled leg's post steps run to their end, as GitHub's do: the cancel stops the step

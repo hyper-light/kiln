@@ -3,10 +3,12 @@
  * you, a stop of their own, a usage limit), kept for the whole app: read once when first asked for,
  * then kept from the server's events, and read again whenever the event stream comes back (what
  * changed while it was away isn't told). Only a change in what the cards show tells the page; an
- * agent's other news doesn't.
+ * agent's other news doesn't. Only for a person who may see agents (`agents.run` on the server, as
+ * the agents' routes need): one who may not gets no cards, and kiln isn't asked (it would refuse).
  */
 import { events } from "@/api/events";
 import { harnessApi, type AgentInfo } from "@/api/harness";
+import { useAuth } from "@/lib/auth";
 import { atLimit, notable, stoppedItself } from "./cards";
 
 const agents = new Map<string, AgentInfo>();
@@ -42,7 +44,16 @@ function publish() {
   listeners.forEach((l) => l());
 }
 
+/** Whether the person signed in may see agents: the owner may (no capabilities listed), anyone else with `agents.run` on the server. */
+function mayRead(): boolean {
+  const s = useAuth.getState();
+  if (s.kind !== "authed") return false;
+  const can = s.me?.can;
+  return !can || can["agents.run"] === "server";
+}
+
 async function read() {
+  if (!mayRead()) return;
   let list: AgentInfo[];
   try {
     list = await harnessApi.list();
@@ -79,10 +90,15 @@ function start() {
     if (now === "open" && was !== "open") void read();
     was = now;
   });
+  // Read once the person is known, if that's after the cards were first asked for.
+  const offAuth = useAuth.subscribe((now, before) => {
+    if (now.kind === "authed" && before.kind !== "authed") void read();
+  });
   void read();
   return () => {
     offEvents();
     offState();
+    offAuth();
   };
 }
 

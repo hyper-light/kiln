@@ -586,7 +586,7 @@ pub async fn labels(s: &Site<'_>, n: &str, job: &Job, method: &Method, body: Opt
         s.hub
             .store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 if set || clear {
                     tx.execute("DELETE FROM diff_labels WHERE diff_id = ?1", [&id])?;
                 }

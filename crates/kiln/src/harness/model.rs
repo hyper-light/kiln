@@ -216,8 +216,13 @@ pub struct Hunk {
 /// touched it to how it is now.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChange {
-    /// Relative to the session's directory when inside it.
+    /// Relative to its working tree's top ([`FileChange::tree`]) when it's in one, else to the
+    /// session's directory when inside it.
     pub path: String,
+    /// The top of the git working tree it's in, when that's one of the session's repository's: its
+    /// folder's own, or a worktree of it the agent works in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -952,6 +957,11 @@ pub struct State {
     pub reach: Option<String>,
     #[serde(default)]
     pub cwd: String,
+    /// The working tree its work is in: the top of the one its latest change is in (its folder's,
+    /// or a worktree of its repository), once it has changed a file in one. What's asked of git
+    /// about its work is asked there (`Info::work_dir`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     #[serde(default)]
     pub model: String,
     #[serde(default)]

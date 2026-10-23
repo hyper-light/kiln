@@ -494,6 +494,9 @@ impl Core {
         s.files_changed = u32::try_from(self.changes.len()).unwrap_or(u32::MAX);
         s.lines_added = self.changes.values().map(|c| c.added).sum();
         s.lines_removed = self.changes.values().map(|c| c.removed).sum();
+        // Its work is in the working tree of its latest change in one (a worktree it went into, or
+        // its folder's own): a scratch file elsewhere doesn't move it.
+        s.tree = self.changes.values().filter(|c| c.tree.is_some()).max_by_key(|c| c.at).and_then(|c| c.tree.clone());
         self.changes_dirty = true;
         self.state_dirty = true;
     }
@@ -992,7 +995,7 @@ mod tests {
         use super::super::model::FileChange;
         let mut c = Core::new();
         let change = |added, at| FileChange {
-            path: "a.rs".into(), created: false, deleted: false, added, removed: 1,
+            path: "a.rs".into(), tree: None, created: false, deleted: false, added, removed: 1,
             hunks: Vec::new(), truncated: true, at,
         };
         let before = change(1, 1);
@@ -1026,12 +1029,33 @@ mod tests {
     }
 
     #[test]
+    fn its_work_is_in_the_working_tree_of_its_latest_change_in_one() {
+        use super::super::model::FileChange;
+        let mut c = Core::new();
+        let change = |path: &str, tree: Option<&str>, at| FileChange {
+            path: path.into(), tree: tree.map(str::to_owned), created: true, deleted: false, added: 1, removed: 0,
+            hunks: Vec::new(), truncated: false, at,
+        };
+        c.set_change("/r/a.rs", Some(change("a.rs", Some("/r"), 1)), None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r"));
+        // Into a worktree of its repository: its work is there now.
+        c.set_change("/r/.claude/worktrees/w/b.rs", Some(change("b.rs", Some("/r/.claude/worktrees/w"), 2)), None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r/.claude/worktrees/w"));
+        // A scratch file in no working tree of it doesn't move it.
+        c.set_change("/tmp/x.txt", Some(change("/tmp/x.txt", None, 3)), None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r/.claude/worktrees/w"));
+        // Its change there undone, its work is back where its latest one is.
+        c.set_change("/r/.claude/worktrees/w/b.rs", None, None);
+        assert_eq!(c.state.tree.as_deref(), Some("/r"));
+    }
+
+    #[test]
     fn unchanged_diffs_do_not_resend_the_changeset() {
         use super::super::model::{FileChange, Hunk};
         let mut c = Core::new();
         c.take_out();
         let first = FileChange {
-            path: "a.rs".into(), created: true, deleted: false, added: 1, removed: 0,
+            path: "a.rs".into(), tree: None, created: true, deleted: false, added: 1, removed: 0,
             hunks: vec![Hunk { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+one".into()] }],
             truncated: false, at: 1,
         };

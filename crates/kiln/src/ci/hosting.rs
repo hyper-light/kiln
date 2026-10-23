@@ -485,7 +485,9 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
             Pusher::Caller(c) => c.is_owner() || c.can("diffs.read", &Scope::Repo { repo: repo.name.clone() }) || c.can("git.read", &Scope::Repo { repo: repo.name.clone() }),
             Pusher::Job(j) => j.repo == repo.id && j.may("contents", kiln_ci::plan::perms::Level::Read),
         };
-        if !read {
+        // A public repository is anyone's to read, a token's that may not (a job's whose
+        // `permissions` leave `contents` out, another repository's job) as well, as on GitHub.
+        if !read && (pushing || !hub.store.repo_public(repo.id.clone()).await.unwrap_or(false)) {
             return Err((StatusCode::FORBIDDEN, format!("{} may not read {}", who.name(), repo.name)));
         }
         if pushing && matches!(who, Pusher::Job(j) if j.repo != repo.id) {
@@ -681,7 +683,7 @@ async fn keep_pushers(hub: &Hub, repo: &Repo, updates: &[Update], started_by: Op
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             for (r, sha) in moved {
                 tx.execute("DELETE FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2", rusqlite::params![id, r])?;
                 // Whoever may use every secret leaves nothing to hold its runs to.

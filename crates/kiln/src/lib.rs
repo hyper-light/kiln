@@ -33,6 +33,7 @@ pub mod harness;
 pub mod host;
 pub mod hub;
 pub mod install;
+pub mod install_targets;
 pub mod instances;
 pub mod join;
 pub mod k8s;
