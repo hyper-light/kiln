@@ -416,7 +416,7 @@ fn loopback_up() -> anyhow::Result<()> {
         *d = *s as libc::c_char;
     }
     // SAFETY: `ifr` names `lo` and outlives the call, which writes its flags into it.
-    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) } < 0 {
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut ifr) } < 0 {
         return Err(io::Error::last_os_error().into());
     }
     // SAFETY: SIOCGIFFLAGS filled the union's flags, which are read and written as flags here.
@@ -424,7 +424,7 @@ fn loopback_up() -> anyhow::Result<()> {
         ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
     }
     // SAFETY: as above; the call reads `ifr`.
-    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) } < 0 {
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as _, &ifr) } < 0 {
         return Err(io::Error::last_os_error().into());
     }
     Ok(())
