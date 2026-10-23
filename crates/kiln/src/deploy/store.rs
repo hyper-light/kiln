@@ -44,6 +44,13 @@ const RELEASES: &[u8] = b"release";
 /// How often a write raced by another server's is tried again before it's given up.
 const TRIES: usize = 64;
 
+/// The most rows a list of a family reads: far more than deploy keeps (its environments, apps,
+/// registrations, a fleet's proposals, a registration's releases in flight).
+const LISTED: usize = 1_000_000;
+
+/// The most releases being followed at once that a claim reads: one lease each.
+const FOLLOWED: usize = 100_000;
+
 fn refused(r: Refusal) -> anyhow::Error {
     anyhow::anyhow!("deploy's records: {r}")
 }
@@ -154,7 +161,7 @@ async fn rows(store: Recs<'_>, family: &str, prefix: &[u8], max: usize) -> anyho
 
 /// Every record of a family under `prefix`, in key order.
 async fn all<T: serde::de::DeserializeOwned>(store: Recs<'_>, family: &str, prefix: &[u8]) -> anyhow::Result<Vec<T>> {
-    rows(store, family, prefix, usize::MAX).await?.iter().map(|r| from_json(&r.value)).collect()
+    rows(store, family, prefix, LISTED).await?.iter().map(|r| from_json(&r.value)).collect()
 }
 
 // ------------------------------------------------------------------ environments
@@ -342,7 +349,7 @@ pub async fn release_by_key(store: Recs<'_>, app: &str, env: &str, key: &str) ->
 /// first.
 pub async fn releases_keyed(store: Recs<'_>, prefix: &str) -> anyhow::Result<Vec<Release>> {
     let mut out = Vec::new();
-    for row in rows(store, KEYS, prefix.as_bytes(), usize::MAX).await? {
+    for row in rows(store, KEYS, prefix.as_bytes(), LISTED).await? {
         if let Some(r) = release(store, text(&row.value)?).await? {
             out.push(r);
         }
@@ -406,7 +413,7 @@ pub async fn releases(store: Recs<'_>, q: ReleaseQuery) -> anyhow::Result<Vec<Re
 /// The releases in flight for a registration, oldest first.
 async fn flying(store: Recs<'_>, app: &str, env: &str) -> anyhow::Result<Vec<Release>> {
     let mut out = Vec::new();
-    for row in rows(store, IN_FLIGHT, &under(&[app, env]), usize::MAX).await? {
+    for row in rows(store, IN_FLIGHT, &under(&[app, env]), LISTED).await? {
         let Some(id) = number(&row.key, false) else { continue };
         if let Some(r) = release(store, id).await?.filter(|r| r.state.in_flight()) {
             out.push(r);
@@ -460,7 +467,7 @@ pub async fn schedule(store: Recs<'_>, release: i64, due_at: i64) -> anyhow::Res
 /// server gone) is another's to take.
 pub async fn claim(store: Recs<'_>, owner: &str, now: i64, lease_secs: i64, max: usize) -> anyhow::Result<Vec<i64>> {
     let mut due: Vec<(i64, i64, kiln_seams::records::Rev, Work)> = Vec::new();
-    for row in rows(store, WORK, b"", usize::MAX).await? {
+    for row in rows(store, WORK, b"", FOLLOWED).await? {
         let (Some(id), Ok(w)) = (number(&row.key, false), from_json::<Work>(&row.value)) else { continue };
         if w.due_at <= now && (w.lease_until <= now || w.owner == owner) {
             due.push((w.due_at, id, row.rev, w));
@@ -517,7 +524,7 @@ pub async fn kv_set(store: Recs<'_>, key: &str, value: &str) -> anyhow::Result<(
 
 /// Deploy's state under a key's prefix, in key order.
 pub async fn kv_prefix(store: Recs<'_>, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
-    Ok(rows(store, STATE, prefix.as_bytes(), usize::MAX).await?.into_iter().map(|r| (String::from_utf8_lossy(&r.key).into_owned(), String::from_utf8_lossy(&r.value).into_owned())).collect())
+    Ok(rows(store, STATE, prefix.as_bytes(), LISTED).await?.into_iter().map(|r| (String::from_utf8_lossy(&r.key).into_owned(), String::from_utf8_lossy(&r.value).into_owned())).collect())
 }
 
 // ------------------------------------------------------------------ from before the seam
@@ -526,11 +533,20 @@ pub async fn kv_prefix(store: Recs<'_>, prefix: &str) -> anyhow::Result<Vec<(Str
 /// environment, app, template, registration, release (with its number, so links still work),
 /// lease and proposal, and deploy's key-value state. Once, at the first start that finds the
 /// counter row missing; it's written last, so a copy cut short is done again whole. The tables
-/// are left as they were, for the release before this one.
+/// are left as they were, for the release before this one. How many rows it copied: 0 when
+/// another server's copy was first.
 pub async fn adopt(store: Recs<'_>, old: &crate::store::Store) -> anyhow::Result<usize> {
     if store.get(COUNTER, RELEASES, Consistency::Linearizable).await.map_err(refused)?.is_some() {
         return Ok(0);
     }
+    copy(store, old).await
+}
+
+/// [`adopt`]'s copy. Each of its commits holds only while there's no counter row: two servers
+/// starting together both copy until one writes the counter, the other's commits are refused from
+/// then on, and what it copied before that was the same rows. So nothing it copies overwrites a
+/// release made, or changed, after the first copy, and no release number comes back.
+async fn copy(store: Recs<'_>, old: &crate::store::Store) -> anyhow::Result<usize> {
     let read = |sql: &'static str| {
         let old = old.clone();
         async move {
@@ -578,11 +594,17 @@ pub async fn adopt(store: Recs<'_>, old: &crate::store::Store) -> anyhow::Result
         writes.push(put(STATE, k.into_bytes(), v.into_bytes()));
     }
     let n = writes.len();
+    let first = || vec![Cond::Absent { family: COUNTER.into(), key: RELEASES.to_vec() }];
     // In commits the seam takes (1000 writes each), the counter in the last.
-    for chunk in writes.chunks(1000) {
-        store.commit(Tx { conds: Vec::new(), writes: chunk.to_vec() }).await.map_err(refused)?;
+    let counter = vec![put(COUNTER, RELEASES.to_vec(), last.to_string().into_bytes())];
+    for chunk in writes.chunks(1000).map(<[Write]>::to_vec).chain(std::iter::once(counter)) {
+        match store.commit(Tx { conds: first(), writes: chunk }).await {
+            Ok(_) => {}
+            // Another server's copy was first, and stands.
+            Err(Refusal::Conflict { .. }) => return Ok(0),
+            Err(e) => return Err(refused(e)),
+        }
     }
-    store.commit(Tx { conds: Vec::new(), writes: vec![put(COUNTER, RELEASES.to_vec(), last.to_string().into_bytes())] }).await.map_err(refused)?;
     Ok(n)
 }
 
@@ -628,6 +650,39 @@ mod tests {
             let next = Release { id: 0, idempotency_key: None, state: State::Waiting, ..release(st, 3).await?.ok_or_else(|| anyhow::anyhow!("release 3"))? };
             anyhow::ensure!(insert_release(st, &next).await?.0.id == 8, "numbered after the last");
             anyhow::ensure!(adopt(st, &old).await? == 0, "copied once");
+            Ok(())
+        })
+    }
+
+    /// Two servers starting together both find the counter missing. Whichever copies first stands;
+    /// the other's copy, refused once the counter is written, overwrites nothing: a release made
+    /// after the first copy keeps its number, and one changed keeps its change.
+    #[test]
+    fn two_servers_starting_together_copy_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let old = crate::store::Store::in_memory()?;
+            old.call(|c| {
+                c.execute_batch(
+                    r#"INSERT INTO deploy_releases (id, app, environment, state, spec, created_at, idempotency_key) VALUES
+                      (7, 'web', 'staging', 'delivering', '{"id":7,"app":"web","environment":"staging","kind":"deploy","state":"delivering","requested_by":"ada","created_at":1}', 1, NULL);"#,
+                )?;
+                Ok(())
+            })
+            .await?;
+            let recs = kiln_seams::records::SimRecords::new();
+            let st: Recs<'_> = &recs;
+            // Server A copies, then a release is made and another changed.
+            anyhow::ensure!(adopt(st, &old).await? > 0, "server A copies");
+            let seven = release(st, 7).await?.ok_or_else(|| anyhow::anyhow!("release 7"))?;
+            let made = insert_release(st, &Release { id: 0, state: State::Waiting, ..seven.clone() }).await?.0;
+            anyhow::ensure!(made.id == 8, "numbered after the copy: {}", made.id);
+            anyhow::ensure!(update_release(st, &Release { state: State::Succeeded, ..seven }, State::Delivering).await?, "release 7 lands");
+            // Server B found the counter missing too, before A wrote it: its copy is refused now.
+            anyhow::ensure!(copy(st, &old).await? == 0, "server B's copy stands down");
+            anyhow::ensure!(release(st, 7).await?.map(|r| r.state) == Some(State::Succeeded), "release 7 keeps its change");
+            anyhow::ensure!(release(st, 8).await?.is_some(), "release 8 is still there");
+            let next = insert_release(st, &Release { id: 0, ..made }).await?.0;
+            anyhow::ensure!(next.id == 9, "no number comes back: {}", next.id);
             Ok(())
         })
     }
