@@ -930,6 +930,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         name: spec.name.clone().unwrap_or_else(|| kind.map_or_else(|| spec.kind.clone(), |k| k.name.to_owned())),
         shell: spec.shell.clone(),
         cwd: spec.cwd.clone().unwrap_or_default(),
+        tree: None,
         created_at: now,
         status: Status::Exited,
         title: String::new(),

@@ -868,11 +868,16 @@ impl Store {
     }
 
     /// v1 jobs waiting for an agent, oldest first (legs of the CI engine, with a `job_id`, are its
-    /// dispatcher's, docs/ci.md §2.4).
+    /// dispatcher's, docs/ci.md §2.4). A run of a concurrency group waits while an older run of the
+    /// group is active: one of a group runs at a time.
     pub async fn queued_jobs(&self, limit: u32) -> anyhow::Result<Vec<Job>> {
         self.call(move |c| {
             let mut st = c.prepare(&format!(
-                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL ORDER BY queued_at, rowid LIMIT ?1"
+                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL AND NOT EXISTS (
+                   SELECT 1 FROM runs r JOIN runs o ON o.concurrency_group = r.concurrency_group
+                   WHERE r.id = jobs.run_id AND o.id != r.id AND o.status IN ('queued','running','pending')
+                     AND (o.created_at < r.created_at OR (o.created_at = r.created_at AND o.rowid < r.rowid)))
+                 ORDER BY queued_at, rowid LIMIT ?1"
             ))?;
             Ok(st.query_map([limit], row_job)?.collect::<Result<Vec<_>, _>>()?)
         })
@@ -1106,14 +1111,17 @@ impl Store {
         .await
     }
 
-    /// Runs in the same concurrency group that are still active (for cancel-in-progress).
-    pub async fn active_runs_in_group(&self, group: String, except: String) -> anyhow::Result<Vec<String>> {
+    /// The runs of `group` that run `new` supersedes, as GitHub's concurrency groups have it: with
+    /// `cancel-in-progress`, every older run still active; without it, the older ones waiting, as the
+    /// oldest active goes on and `new` waits for it ([`Store::queued_jobs`]).
+    pub async fn superseded_in_group(&self, group: String, new: String, cancel_in_progress: bool) -> anyhow::Result<Vec<String>> {
         self.call(move |c| {
             let mut st = c.prepare(
                 "SELECT id FROM runs WHERE concurrency_group = ?1 AND id != ?2
-                   AND status IN ('queued','running','pending')",
+                   AND status IN ('queued','running','pending') ORDER BY created_at, rowid",
             )?;
-            Ok(st.query_map(params![group, except], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?)
+            let older = st.query_map(params![group, new], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(older.into_iter().skip(usize::from(!cancel_in_progress)).collect())
         })
         .await
     }
@@ -1685,5 +1693,65 @@ mod tests {
         assert_eq!(s.queued_jobs(10).await?.len(), 1);
         Ok(())
     })
+    }
+
+    /// A concurrency group runs one run at a time: a newer run waits for the one under way, and a
+    /// newer one still drops the one waiting (the image pipeline built seven at once without it).
+    #[test]
+    fn a_group_runs_one_at_a_time() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let repo = s
+                .upsert_repo(Repo {
+                    id: "r1".into(),
+                    name: "hyper-light/x".into(),
+                    clone_url: "https://example/x".into(),
+                    branches: vec![],
+                    poll_seconds: 60,
+                    enabled: true,
+                    created_at: 0,
+                    last_polled_at: None,
+                    last_error: None,
+                    mode: "upstream".into(),
+                    default_branch: None,
+                    mirror: None,
+                })
+                .await?;
+            let p = pipeline::parse("name: image\njobs:\n  image: {steps: [{run: x}]}\n")?;
+            let run = |id: &str, at: i64, group: Option<&str>| Run {
+                id: id.into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 0,
+                pipeline: "image".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: id.into(),
+                message: String::new(),
+                author: String::new(),
+                status: Status::Queued,
+                created_at: at,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: group.map(str::to_owned),
+            };
+            for (id, at, group) in [("a", 1, Some("x:image")), ("b", 2, Some("x:image")), ("c", 2, Some("x:image")), ("free", 3, None)] {
+                s.create_run(run(id, at, group), pipeline::plan(&p, &pipeline::Context::default())?).await?;
+            }
+            let waiting = |s: Store| async move { anyhow::Ok(s.queued_jobs(10).await?.into_iter().map(|j| j.run_id).collect::<Vec<_>>()) };
+            // The oldest of the group goes, and a run of no group; b and c wait.
+            assert_eq!(waiting(s.clone()).await?, ["a", "free"]);
+            // c, the newest, drops b (waiting) and leaves a (under way), or cancels both.
+            assert_eq!(s.superseded_in_group("x:image".into(), "c".into(), false).await?, ["b"]);
+            assert_eq!(s.superseded_in_group("x:image".into(), "c".into(), true).await?, ["a", "b"]);
+            s.cancel_run("b".into(), "superseded by a newer run".into()).await?;
+            let a = s.jobs("a".into(), false).await?.first().map(|j| j.id.clone()).unwrap_or_default();
+            assert!(s.claim_job(a.clone(), "ag".into(), "baremetal".into()).await?);
+            assert_eq!(waiting(s.clone()).await?, ["free"], "c waits while a runs");
+            s.finish_job(a, Status::Succeeded, Some(0), None, None, None).await?;
+            assert_eq!(waiting(s.clone()).await?, ["c", "free"], "c goes once a is done");
+            Ok(())
+        })
     }
 }

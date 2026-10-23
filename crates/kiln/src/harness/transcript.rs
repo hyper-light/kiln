@@ -218,7 +218,7 @@ pub fn view(file: &Path, cwd: &str, started: Option<i64>) -> Option<serde_json::
     core.state.cwd = cwd.to_owned();
     load_for(&mut core, &lines, started);
     for job in std::mem::take(&mut core.change_jobs) {
-        let (change, resolved) = super::diff::file_change(&job);
+        let (change, resolved) = super::diff::placed_change(&job, cwd);
         core.set_change(&job.abs, change, resolved);
     }
     let events: Vec<&super::model::Event> = core.events().collect();

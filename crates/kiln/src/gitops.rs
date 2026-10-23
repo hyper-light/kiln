@@ -340,12 +340,11 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
             .await?;
         crate::metrics::global().runs_started.inc();
         tracing::info!(repo = %repo.name, run = run.number, event = t.event, branch = %t.branch, sha = %t.sha, "run created");
-        if let (Some(g), Some(c)) = (group, &p.concurrency)
-            && c.cancel_in_progress {
-                for old in hub.store.active_runs_in_group(g, run.id.clone()).await? {
-                    hub.cancel_run(&old, "superseded by a newer run").await?;
-                }
+        if let (Some(g), Some(c)) = (group, &p.concurrency) {
+            for old in hub.store.superseded_in_group(g, run.id.clone(), c.cancel_in_progress).await? {
+                hub.cancel_run(&old, "superseded by a newer run").await?;
             }
+        }
         report_status(hub, &run, Status::Pending).await;
         hub.emit_run(&run.id).await;
         runs.push(run);

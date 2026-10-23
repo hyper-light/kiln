@@ -1966,8 +1966,8 @@ W20.
 - *Done* (2026-10-23), R16's retry where only the runner that lost the leg could take it, which
   waited for good. Of the options put to the user (wait; prefer another runner and take the same
   one when none other can, at once or after a few minutes; don't retry; or the default prefers
-  another while an explicit `runner: different` stays strict), the last, recommended, is taken
-  while their decision is open; another is a small change:
+  another while an explicit `runner: different` stays strict), the last, recommended, is taken,
+  and the user chose it (2026-10-23):
   - The default retry goes to another runner when one could take it (connected, eligible and not
     draining, busy or not), else to the one that lost it, at once. A leg that stayed off it goes
     there first when the others go or drain.
@@ -6996,6 +6996,25 @@ and AC02.
   of a push (prometheus's, TypeScript's), which read the repository from an Enterprise Server's
   API only when `GH_HOST` names one, over HTTPS (the runner sets it only for a step that gives
   `gh` the job's token), and then sign their results through Sigstore's public instance (W18).
+- *Decided with the user* (2026-10-23), for the gaps above and W08's, W13's, W15 to W18's, W20's
+  and W23's (the plan "Closing KilnCI's remaining gaps", kept in kiln):
+  - the lab's legs go back on networks of their own: the user adds a ufw rule letting Docker's
+    address pools (172.16.0.0/12) reach the lab's port, which ends the host network's misses;
+  - a Mac, jupiter (Windows) and an arm64 Linux VM on the Mac join the lab, each running the
+    corpus's CI code as an unprivileged user of its own;
+  - kiln's runner image gets an opt-in Android layer (cmdline-tools and an NDK, where GitHub's
+    image has them), the SDK's licence accepted by the user once (uv's Android job);
+  - jobs that run podman themselves go to microVM legs (rails' `rails-new-docker`);
+  - AC03 and F-21's `attest-build-provenance` run on a public repository the user owns, with a
+    fine-grained token kept as a kiln secret;
+  - test tenants are free-tier AWS, Google Cloud and Azure accounts only, each with a $1 budget
+    alert, trusting kiln's issuer (no stored keys);
+  - KilnCI goes on in production once AC01's report is in, for W04-AC08, W05-AC11, W15's live
+    criteria, W16-AC05, W20-AC02 and AC05 (the user syncs KilnCD);
+  - shards and Slates (W13-AC06; W17's, W18's and W20's parts) come after the live cluster's
+    criteria;
+  - W23's test repositories are on free GitLab and Bitbucket accounts beside GitHub;
+  - W08-AC08's release figure is read once from the bench machine's `ci-bench` job.
 
 ---
 
