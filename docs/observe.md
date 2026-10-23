@@ -44,6 +44,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-30 | Containers (§10.10): every container each node runs, read from Linux's cgroups (v2 and v1; Docker, containerd, CRI-O, Podman, Kubernetes' pods, nested nodes'), named by Kubernetes' links and the engine's API (its socket, std alone), the engine's stats where cgroups are not seen (Docker Desktop on macOS and Windows); Datadog's container check's names (CPU, throttling, memory and working set, OOM kills, I/O, processes, uptime); listed by the server from the store's index; the API, OpenAPI, its pages; checked live (real Docker containers: a quota's CPU and throttling, OOM kills) and in browsers (§13), measured (§12.34) | done |
 | O-31 | Log indexes (§8.10): Datadog's indexes, exclusion filters (a rate, by an attribute's values or a trace), daily quotas (a warning, the quota reached, each an event; past it, records not kept for search until the day turns) and retention a part of the store each (§4.6: a file a part, each part's cutoff its own, replicated); routed where records are taken, every node told; what is not kept still seen live, archived and counted by metrics from logs; Datadog's estimated usage; the API, OpenAPI, the Indexes page and the explorer's pick of an index; checked live (§13) and measured (§12.35) | done |
 | O-32 | OpenTelemetry's containers (§10.11): Docker's, the kubelet's and the cluster's receivers' container metrics and the semantic conventions', read in their own names and units (cumulative time a rate, a working set for what Docker calls usage, limits in cores and bytes, devices and modes summed), a container kiln's check also sees one container, the kubelet's series joined by pod and name; each chart of its page drawn by the source that reported it; checked live against a real Collector and in browsers (§13), measured against O-30 (§12.34) | done |
+| O-33 | Continuous profiles (§8.11), Datadog's Continuous Profiler: what tracers' profilers upload (pprof in `multipart/form-data`) taken where they send it, kept, summed into flame graphs over a time, compared; its page; checked against Go's own profiles and live against a real profiler | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1464,6 +1465,39 @@ Datadog's are.
   every index; one past 100 indexes (Datadog's 422). Changing them is a maintainer's
   (`observe.manage`); reading them, a viewer's. A log search, aggregate, facets or patterns read the
   indexes named (`indexes`, Datadog's `filter.indexes`), else every one and kiln's events.
+
+### 8.11 Continuous profiles
+
+Datadog's Continuous Profiler (`crate::observe::profiles`, `kiln_obs::profile`): what an
+application's profiler sends (where its CPU went, what it allocated, what it waited on), kept a
+while, summed into flame graphs over a time and compared. Its sources' formats from their code and
+specs: dd-trace-go's upload (`profiler/upload.go`, `profile.go`), google/pprof's
+`proto/profile.proto`, OpenTelemetry's profiles signal (`profiles/v1development`, Development).
+
+- **Taken** where Datadog's tracers send their profiles: a runner's `127.0.0.1:8126`
+  `POST /profiling/v1/input` (where a tracer sends the Agent its profiles, beside its traces) and the
+  server's `POST /api/v2/profile` (Datadog's own intake, the ingest token): a `multipart/form-data`
+  body (RFC 7578) of a part a profile (its name the file's, `cpu.pprof`, `delta-heap.pprof`, …) and
+  an `event` part (`event.json`: its `start` and `end`, its `attachments` in order, its profiler's
+  `tags_profiler` joined by commas: `service`, `env`, `version`, `host`, `runtime`,
+  `profile_seq`, …; its `family`, `version` 4, `endpoint_counts`, `custom_attributes`). A profile is
+  pprof, gzip'd (or zstd'd: told by its first bytes, nothing says which); one upload is what Datadog
+  calls a profile, its types collected about the same time. A runner sends what it takes on to the
+  server, as it does its writes.
+- **Read** in place (`kiln_obs::profile::pprof`): its string table first (index 0 the empty
+  string), its sample types, functions and locations (a location's lines its inlined functions, the
+  last the caller), then each sample's stack (leaf first, its locations' functions in order) and
+  values, one a type, and labels (Go's `bytes`, a trace's `span id`, `local root span id`, `trace
+  endpoint`); every index and id checked, every size bounded (a million samples, locations and
+  functions; a stack's 512 leaf-most frames, a deeper one cut and counted). Checked against Go's own
+  profiles (a CPU and a heap profile written by Go 1.27's `runtime/pprof` in a container: their
+  totals what Go's `pprof -raw` sums, to the sample and the byte).
+- **Summed** into a flame graph (`kiln_obs::profile::flame`): each sample's stack root first, a node
+  a function under its caller's node; each node its total (its subtree's values) and its own;
+  functions and files interned; a graph bounded (a million nodes: a stack past it summed into its
+  deepest node's own, the totals whole).
+- Status: the reader and the sums are written and checked; the intake, the store, the API, the
+  page and the live checks are the milestone's rest (O-33).
 
 ## 9. Monitors
 

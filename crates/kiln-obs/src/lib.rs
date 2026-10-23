@@ -33,6 +33,7 @@ pub mod monitor;
 pub mod msgpack;
 pub mod otlp;
 pub mod outlier;
+pub mod profile;
 pub mod prom;
 pub mod promwrite;
 pub mod query;
