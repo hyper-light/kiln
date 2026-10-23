@@ -61,8 +61,9 @@ On production's `/metrics`, its logs and its dashboard:
 - **Lag notices:** `kiln_bus_lag_notices_total` moves only when a viewer stalls (a slow phone, a
   backgrounded tab). Many at once means viewers can't keep up with sessions' output.
 - **Memory:** `kiln_bus_memory_bytes` stays well under `kiln_bus_memory_limit_bytes`.
-- **Delivery:** `kiln_bus_delivery_seconds`, a frame's publish to a viewer's read: milliseconds at
-  most, since both are in the server's process.
+- **Delivery:** `kiln_bus_delivery_seconds`, a frame's publish to a viewer's read, timed in
+  microseconds: under a millisecond in the main, since both are in the server's process. A tail in
+  milliseconds means the server's own tasks are waiting for its CPUs.
 - **Events** on target `kiln.bus`: no warnings. A viewer that lost its live feed and starts over
   warns: `event = "feed.refused"` (a refused create, publish, read or wait) or
   `event = "feed.unreadable"` (a frame the feed didn't make). An ended session's topic the bus
