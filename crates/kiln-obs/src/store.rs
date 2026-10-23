@@ -332,6 +332,17 @@ pub struct TagSeen {
 /// resource or Agent says is on every series of it, so its first few say it.
 pub const SEEN_TAG_SERIES: usize = 64;
 
+/// What [`Store::tag_seen_each`] says of a value, its names borrowed from the store (`'s`):
+/// [`TagSeen`] without its namespaces.
+#[derive(Debug, Clone, Copy)]
+pub struct TagSeenRef<'t, 's> {
+    pub value: &'s str,
+    pub series: usize,
+    pub last_ms: i64,
+    /// The first value its series carry of each tag key asked for.
+    pub tags: &'t [(&'s str, &'s str)],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagSummary {
     pub key: String,
@@ -1842,6 +1853,36 @@ impl Store {
         }
         out.sort_by(|a, b| a.value.cmp(&b.value));
         out
+    }
+
+    /// As [`Store::tag_seen`], each value given to `each` as the index has it, in its order: nothing
+    /// copied, its namespaces not read (a list of 50,000 containers' made of their tags, §12.34).
+    pub fn tag_seen_each<'s>(&'s self, key: &str, since_ms: i64, keep: &[&str], each: &mut dyn FnMut(&TagSeenRef<'_, 's>)) {
+        let Some(k) = self.symbols.find(key) else { return };
+        let keep: Vec<Sym> = keep.iter().filter_map(|n| self.symbols.find(n)).collect();
+        let mut syms: Vec<(Sym, Sym)> = Vec::new();
+        let mut tags: Vec<(&'s str, &'s str)> = Vec::new();
+        for &v in self.index.values_of_tag(k) {
+            let ids = self.index.series_tagged(k, v);
+            let last = ids.iter().map(|&id| self.last.get(id as usize).copied().unwrap_or(i64::MIN)).max().unwrap_or(i64::MIN);
+            if last < since_ms {
+                continue;
+            }
+            syms.clear();
+            if !keep.is_empty() {
+                for &id in ids.iter().take(SEEN_TAG_SERIES) {
+                    let Some(info) = self.index.info(id) else { continue };
+                    for &(tk, tv) in self.index.tags(&info) {
+                        if keep.contains(&tk) && !syms.iter().any(|(x, _)| *x == tk) {
+                            syms.push((tk, tv));
+                        }
+                    }
+                }
+            }
+            tags.clear();
+            tags.extend(syms.iter().map(|&(k, v)| (self.symbols.get(k), self.symbols.get(v))));
+            each(&TagSeenRef { value: self.symbols.get(v), series: ids.len(), last_ms: last, tags: &tags });
+        }
     }
 
     /// Each series of `metric` whose newest sample is at or after `since_ms`, to `each`: its value

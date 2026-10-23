@@ -776,6 +776,9 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::GET, ["notebooks", id]) => super::notebooks::http::get_one(id).await,
         (&Method::PUT, ["notebooks", id]) => super::notebooks::http::update(id, req).await,
         (&Method::DELETE, ["notebooks", id]) => super::notebooks::http::remove(id).await,
+        // Containers (§10.10): every one listed, one whole.
+        (&Method::GET, ["containers"]) => super::containers::http::list(q).await,
+        (&Method::GET, ["containers", id]) => super::containers::http::one(id).await,
         // The infrastructure list (§10.9): Datadog's host list and totals, a host whole, a host
         // muted and unmuted.
         (&Method::GET, ["hosts"]) => super::infra::http::hosts(q).await,

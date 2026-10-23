@@ -2490,6 +2490,99 @@ const scenarios = {
       if (incident) await api("DELETE", `/api/observe/v1/incidents/${incident}`);
     }
   },
+
+  /** Containers as Datadog's Agent's container check reports them (§10.10): one running near its CPU
+   * quota and throttled, listed against its limits, its page read (its figures, its pod, its tags,
+   * its host's page and back); another whose samples stopped five minutes ago, among the stopped. */
+  async "a container is listed against its limits, read from its page and its host's, and one stopped is told apart"() {
+    const ingest = process.env.KILN_INGEST_TOKEN;
+    if (!ingest) return "skipped: no KILN_INGEST_TOKEN";
+    const host = `e2e-node-${run}`;
+    // Ids of their own: the four browsers' runs share a server.
+    const hex64 = () => (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", "");
+    const [api1, batch] = [`e2e-api-${run}`, `e2e-batch-${run}`];
+    const [apiId, batchId] = [hex64(), hex64()];
+    const t = Date.now() / 1000;
+    const tags = (name, id) => [
+      `container_id:${id}`,
+      `container_name:${name}`,
+      "image_name:registry.example.com/shop/api",
+      "image_tag:2.4.1",
+      "short_image:api",
+      "runtime:containerd",
+      "kube_namespace:shop",
+      `pod_name:${name}-7d9f`,
+      "kube_container_name:api",
+      "kube_qos:burstable",
+    ];
+    const at = (times, name, id) => (metric, v) => ({ metric, type: "gauge", host, tags: tags(name, id), points: times.map((s) => [t - s, v]) });
+    const now = at([20, 5], api1, apiId);
+    const gone = at([600, 300], batch, batchId);
+    const r = await fetch(`${BASE}/api/v1/series`, {
+      method: "POST",
+      headers: { "DD-API-KEY": ingest, "content-type": "application/json" },
+      body: JSON.stringify({
+        series: [
+          now("container.cpu.usage", 4.6e8),
+          now("container.cpu.limit", 5e8),
+          now("container.cpu.throttled", 1.5e8),
+          now("container.memory.usage", 200 * 2 ** 20),
+          now("container.memory.working_set", 180 * 2 ** 20),
+          now("container.memory.limit", 256 * 2 ** 20),
+          now("container.pid.count", 12),
+          now("container.io.read", 4096),
+          now("container.io.write", 1024),
+          now("container.uptime", 7200),
+          gone("container.cpu.usage", 1e8),
+          gone("container.memory.usage", 64 * 2 ** 20),
+        ],
+      }),
+    });
+    expect(r.status === 202 || r.status === 200, `its series sent: ${r.status}`);
+    // Listed once the list is made again (every 15 s at the most).
+    await until("listed with its figures", async () => (await api("GET", `/api/observe/v1/containers?filter=${api1}`)).body?.containers?.[0]?.figures?.cpu_nanocores === 4.6e8, 45_000);
+    await page.goto(`${BASE}/observe/containers?q=${encodeURIComponent(`kube_namespace:shop ${run}`)}`);
+    const row = page.locator("table.data-table tbody tr").filter({ has: page.getByRole("link", { name: api1, exact: true }) });
+    await until("its CPU and memory against its limits", async () => {
+      const text = (await row.textContent()) ?? "";
+      return phone ? /CPU 0\.46 cores/.test(text) && /memory 180 MiB/.test(text) : /0\.46 · 92%/.test(text) && /180 MiB · 70\.3%/.test(text) && /2h 00m/.test(text);
+    });
+    expect(/registry\.example\.com\/shop\/api:2\.4\.1 · containerd/.test((await row.textContent()) ?? ""), "its image and engine");
+    expect((await page.getByRole("link", { name: batch, exact: true }).count()) === 0, "the stopped one not among the running");
+    await fitsAcross("the containers");
+    // The stopped one, among the stopped: counted, listed, said to be stopped.
+    const states = page.getByRole("group", { name: "State", exact: true });
+    await states.getByRole("button", { name: /^Stopped/ }).click();
+    await page.waitForURL(/state=stopped/);
+    const stopped = page.locator("table.data-table tbody tr").filter({ has: page.getByRole("link", { name: batch, exact: true }) });
+    await until("listed among the stopped", async () => /stopped ·/.test((await stopped.textContent()) ?? ""));
+    expect(/^Stopped\s*1$/.test(((await states.getByRole("button", { name: /^Stopped/ }).textContent()) ?? "").trim()), "counted");
+    await states.getByRole("button", { name: /^Running/ }).click();
+    // Its page: its figures against its limits, its throttling told apart, where it runs, its tags.
+    await row.getByRole("link", { name: api1, exact: true }).click();
+    await page.waitForURL(new RegExp(`/observe/containers/${apiId}$`));
+    const facts = page.locator("dl.facts");
+    await until("its figures", async () => {
+      const text = (await facts.textContent()) ?? "";
+      return [/0\.46 · 92%/, /0\.5 cores/, /180 MiB · 70\.3%/, /256 MiB/, /150 ms\/s/, /4\.0 KiB\/s in · 1\.0 KiB\/s out/, /2h 00m/].every((re) => re.test(text));
+    });
+    expect((await facts.locator('[data-tone="fail"]').count()) >= 1, "its throttling told apart");
+    await page.getByText(`shop/${api1}-7d9f`, { exact: true }).waitFor();
+    await page.getByText("burstable", { exact: true }).waitFor();
+    await page.getByText("kube_qos:burstable", { exact: true }).waitFor();
+    const logs = await page.getByRole("link", { name: "Its logs", exact: true }).getAttribute("href");
+    expect(decodeURIComponent(logs ?? "").includes(`container_id:${apiId}`), `its logs a click away: ${logs}`);
+    await fitsAcross("a container's page");
+    // Its host's page lists it, and leads back to it (the host list made again since its series came).
+    await until("its host listed", async () => (await api("GET", `/api/observe/v1/hosts/${host}`)).status === 200, 45_000);
+    await page.getByRole("link", { name: host, exact: true }).click();
+    await page.waitForURL(new RegExp(`/observe/hosts/${host}$`));
+    await page.getByRole("link", { name: api1, exact: true }).click();
+    await page.waitForURL(new RegExp(`/observe/containers/${apiId}$`));
+    await page.getByRole("heading", { name: api1, level: 1 }).waitFor();
+    // And by the first 12 of its id, as `docker ps` shows it.
+    expect((await api("GET", `/api/observe/v1/containers/${apiId.slice(0, 12)}`)).body?.name === api1, "found by its short id");
+  },
 };
 
 let failed = 0;

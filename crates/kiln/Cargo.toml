@@ -127,3 +127,7 @@ harness = false
 [[bench]]
 name = "notebooks"
 harness = false
+
+[[bench]]
+name = "containers"
+harness = false

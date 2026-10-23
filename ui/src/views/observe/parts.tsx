@@ -46,6 +46,7 @@ const SECTIONS = [
   { to: "/observe/notebooks", label: "Notebooks" },
   { to: "/observe/metrics", label: "Metrics" },
   { to: "/observe/hosts", label: "Hosts" },
+  { to: "/observe/containers", label: "Containers" },
   { to: "/observe/logs", label: "Logs" },
   { to: "/observe/apm", label: "APM" },
   { to: "/observe/catalog", label: "Catalog" },
@@ -324,7 +325,8 @@ export function spacingOf(values: (number | null)[]): number {
   return apart[Math.floor(apart.length / 2)] ?? 1;
 }
 
-export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; labels: string[]; bands: Band[]; drawn: Drawn[] } {
+/** A chart's series and labels; each query's named by `names` where given (else by its place). */
+export function chartData(answers: QueryAnswer[], names?: readonly string[]): { data: (number | null)[][]; labels: string[]; bands: Band[]; drawn: Drawn[] } {
   const first = answers[0];
   if (!first) return { data: [[]], labels: [], bands: [], drawn: [] };
   const xs = Array.from({ length: first.grid.n }, (_, i) => bucketTime(first.grid, i) / 1000);
@@ -336,7 +338,8 @@ export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; 
   answers.forEach((a, qi) => {
     const same = a.grid.from === first.grid.from && a.grid.step === first.grid.step && a.grid.calendar === first.grid.calendar;
     for (const s of a.series) {
-      const label = answers.length > 1 ? `${qi + 1}: ${seriesLabel(s.tags)}` : seriesLabel(s.tags);
+      const name = names?.[qi];
+      const label = name !== undefined ? (a.series.length > 1 ? `${name}: ${seriesLabel(s.tags)}` : name) : answers.length > 1 ? `${qi + 1}: ${seriesLabel(s.tags)}` : seriesLabel(s.tags);
       const b = s.bounds;
       let values: (number | null)[];
       if (same) values = s.values.slice(0, xs.length);
@@ -386,6 +389,7 @@ export function QueryChart({
   legend,
   marks = [],
   ahead,
+  names,
 }: {
   queries: string[];
   range: Span;
@@ -396,9 +400,11 @@ export function QueryChart({
   marks?: Mark[];
   /** How far past now to draw a forecast (ms): half the range unless said. */
   ahead?: number;
+  /** Each query's name in the legend (a constant: it is compared by identity). */
+  names?: readonly string[];
 }) {
   const answers = useRes(queriesRes(queries, range, 240, ahead)).data;
-  const { data, labels, bands, drawn } = React.useMemo(() => chartData(answers), [answers]);
+  const { data, labels, bands, drawn } = React.useMemo(() => chartData(answers, names), [answers, names]);
   // Each series' spacing (a metric sent less often than the grid's step drawn across its empty
   // buckets), and whether it has one value alone (a point, there being no line).
   const sparse = React.useMemo(() => data.slice(1).map((ys) => ({ spacing: spacingOf(ys), lone: ys.filter((v) => v !== null).length === 1 })), [data]);

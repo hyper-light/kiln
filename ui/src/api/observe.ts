@@ -1165,6 +1165,44 @@ export interface CatalogScore {
   scorecards: { name: string; passed: number; total: number }[];
 }
 
+/** A container (docs/observe.md §10.10), as kiln's container check, Datadog's Agent or OpenTelemetry report it. */
+export interface Container {
+  id: string;
+  name: string | null;
+  state: "running" | "stopped";
+  host: string | null;
+  runtime: string | null;
+  image: { name: string | null; tag: string | null; short: string | null };
+  kube: { namespace: string | null; pod: string | null; container: string | null; qos: string | null };
+  compose: { service: string | null; project: string | null };
+  /** ms since the epoch: its newest sample. */
+  last_reported: number;
+  series: number;
+  /** Each its newest of the last ten minutes: CPU in nanocores, memory in bytes, I/O and throttling a second. */
+  figures: {
+    cpu_nanocores: number | null;
+    cpu_limit_nanocores: number | null;
+    cpu_throttled_ns: number | null;
+    memory_bytes: number | null;
+    working_set_bytes: number | null;
+    memory_limit_bytes: number | null;
+    pids: number | null;
+    io_read_bytes: number | null;
+    io_write_bytes: number | null;
+    uptime_seconds: number | null;
+  };
+  tags: string[];
+}
+
+export interface ContainerQuery {
+  state?: "running" | "stopped" | "all";
+  filter?: string;
+  sort_field?: "name" | "cpu" | "memory" | "cpu_limit" | "memory_limit" | "throttled" | "io" | "uptime" | "last_reported";
+  sort_dir?: "asc" | "desc";
+  start?: number;
+  count?: number;
+}
+
 /** A notebook's time, Datadog's: the last of a span, or from one time to another. */
 export type NotebookTime = { live_span: string } | { start: string; end: string; live?: boolean };
 export type NotebookType = "postmortem" | "runbook" | "investigation" | "documentation" | "report";
@@ -1396,21 +1434,9 @@ export interface Host {
 }
 
 /** A container on a host: its name, image and pod, when it last reported, its CPU (nanocores) and memory (bytes). */
-export interface HostContainer {
-  id: string;
-  name: string | null;
-  image: string | null;
-  image_tag: string | null;
-  pod: string | null;
-  namespace: string | null;
-  last_reported: number;
-  series: number;
-  cpu_nanocores: number | null;
-  memory_bytes: number | null;
-}
-
 export interface HostDetail extends Host {
-  containers: HostContainer[];
+  /** Its containers as the containers' API gives them (docs/observe.md §10.10): running, then stopped within the hour. */
+  containers: Container[];
 }
 
 export interface HostQuery {
@@ -1637,6 +1663,12 @@ export const observeApi = {
   createScanningGroup: (g: ScanningGroupIn) => request<ScanningGroup>("POST", `${BASE}/scanner/groups`, g),
   updateScanningGroup: (id: string, g: ScanningGroupIn) => request<ScanningGroup>("PUT", `${BASE}/scanner/groups/${enc(id)}`, g),
   deleteScanningGroup: (id: string) => request<void>("DELETE", `${BASE}/scanner/groups/${enc(id)}`),
+  containers: (q: ContainerQuery, signal?: AbortSignal) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
+    return request<{ containers: Container[]; total_matching: number; total_returned: number; totals: { running: number; stopped: number } }>("GET", `${BASE}/containers?${p}`, undefined, { signal });
+  },
+  container: (id: string, signal?: AbortSignal) => request<Container>("GET", `${BASE}/containers/${enc(id)}`, undefined, { signal }),
   /** Notebooks, as Datadog's list gives them, without their cells. */
   notebooks: (q: NotebookQuery, signal?: AbortSignal) => {
     const p = new URLSearchParams({ include_cells: "false" });

@@ -371,6 +371,23 @@ impl Observe {
         let _taken = self.write_within(series, WAITING_POINTS as u64, true);
     }
 
+    /// Samples of kiln's own in a decoding (from [`Observe::decoding`]: a check's look, its keys
+    /// made once and kept): as [`Observe::write`], taken up to the bound itself, else refused and
+    /// counted as dropped; the decoding comes back, its room kept, to be filled again.
+    pub fn write_samples(&self, d: kiln_obs::otlp::metrics::Decoded) {
+        let n = d.samples.len() as u64;
+        let a = &self.admission;
+        if n == 0 || !reserve(&a.points, &a.left_points, n, WAITING_POINTS as u64) {
+            a.refused.fetch_add(n, Ordering::Relaxed);
+            a.spares.give_decoded(d);
+            return;
+        }
+        if let Err(std::sync::mpsc::SendError(Input::Samples(d))) = self.tx.send(Input::Samples(d)) {
+            a.left_points.fetch_add(n, Ordering::AcqRel);
+            a.spares.give_decoded(d);
+        }
+    }
+
     /// Points an exporter or a client sent: taken up to three quarters of the bound (the rest is
     /// kiln's own), else not taken: answer 503, and it sends them again.
     #[must_use]

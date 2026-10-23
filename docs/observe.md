@@ -41,6 +41,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-27 | Infrastructure (§10.9), Datadog's host list: every host that reports (kiln's runners, Datadog's Agent, OpenTelemetry's resources, any series tagged `host:<name>`), whether it is up, its CPU, I/O wait, load, memory and disk, its apps, its platform and tags by source, its containers; what the Agent says of its host (its host metadata, checks and inventory) kept; a host muted (a downtime of every monitor's groups of it); the API (Datadog's list and totals), its pages; checked live and in browsers (§13), measured (§12.31) | done |
 | O-28 | Incident management (§9.5), Datadog's: incidents declared (from kiln's pages, Datadog's v2 API, or a monitor naming `@incident`), their severity and state, commander, customer impact and fields; their timeline (notes, each change, their monitor's alerts and recoveries), todos and attachments (a postmortem, links); Datadog's figures of each (time to detect, respond, repair, resolve); told to the integrations they name (PagerDuty's incident and Opsgenie's alert closed as one is resolved); searched with Datadog's syntax, counted by facet; kept a file each within bounds; the API, OpenAPI, its pages; checked live and in browsers (§13), measured (§12.32) | done |
 | O-29 | Notebooks (§11.1), Datadog's: Markdown and graph cells (Datadog's widget definitions, drawn as the dashboards draw them) over a time, fixed or the last of a span, cells' own times and sizes, types and templates; kept a file each, their heads alone read at the start; Datadog's v1 API (made, listed with its filters, order and pages, read, changed whole, removed); postmortems made of a template and an incident (Datadog's incident variables, kiln's template after the Google SRE book's) and attached to it; the charts on fixed times; their pages; checked live and in browsers (§13) | done |
+| O-30 | Containers (§10.10): every container each node runs, read from Linux's cgroups (v2 and v1; Docker, containerd, CRI-O, Podman, Kubernetes' pods, nested nodes'), named by Kubernetes' links and the engine's API (its socket, std alone), the engine's stats where cgroups are not seen (Docker Desktop on macOS and Windows); Datadog's container check's names (CPU, throttling, memory and working set, OOM kills, I/O, processes, uptime); listed by the server from the store's index; the API, OpenAPI, its pages; checked live (real Docker containers: a quota's CPU and throttling, OOM kills) and in browsers (§13), measured (§12.34) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -610,6 +611,7 @@ its schema (§13). Built:
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
 | `GET/POST incidents`, `GET incidents/search?query=`, `GET/PATCH/DELETE incidents/{id}`, `GET/POST incidents/{id}/relationships/todos`, `GET/PATCH/DELETE …/todos/{todo}`, `GET/POST incidents/{id}/attachments`, `PATCH/DELETE …/attachments/{id}`, `GET/POST incidents/{id}/timeline` | incidents (§9.5), Datadog's v2 API at kiln's paths (`{id}` its id or its public id): declared, listed, searched (Datadog's syntax; what matched counted by facet), read, changed and removed; their todos and attachments; their timeline (kiln's), a note put on it |
+| `GET containers`, `GET containers/{id}` | every container (§10.10): running, stopped or both, found, ordered and paged; one whole, by its id or the first 12 of its hex |
 | `GET/POST notebooks`, `GET/PUT/DELETE notebooks/{id}`, `POST incidents/{id}/postmortem` | notebooks (§11.1), Datadog's v1 API at kiln's paths: made, listed (Datadog's filters, order and pages), read (each graph cell with kiln's drawing of it), changed whole, removed; an incident's postmortem made of a template and attached to it |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
@@ -2218,6 +2220,72 @@ the ten figures' newest samples, the Agent's hosts, the hub's runners and the do
 blocking pool; reused 15 seconds, then still answered while one is made again (one at a time; one
 begun before a mute is not kept).
 
+### 10.10 Containers
+
+Every container the machines run (`crate::observe::containers`), as Datadog's container check
+sees them: each node looks at its own every 15 seconds, on a thread of its own.
+
+- **Found** on Linux in the cgroups (`/sys/fs/cgroup`, v2's unified hierarchy, or v1's controllers
+  where a node still mounts them), whatever runs it and asking it nothing: the scopes container
+  engines make (Docker's `docker-<id>.scope`, containerd's `cri-containerd-<id>.scope`, CRI-O's
+  `crio-<id>.scope`, Podman's `libpod-<id>.scope`, its `conmon`'s not one; cgroupfs's `docker/<id>`
+  and `kubepods/<class>/pod<uid>/<id>`), a Kubernetes pod's uid and QoS class from its slice, and
+  the containers nested in one (a minikube node's pods in its container). 1,000 containers a node at
+  the most; the walk itself bounded (100,000 directories, 12 deep), and a directory without
+  directories of its own (its links two, as cgroupfs counts them: services, most containers'
+  scopes) not read, its 60-odd files not listed.
+- **A pod's sandbox is not a container** (Datadog's check leaves it out too): the `pause` process
+  Kubernetes' runtimes start in a scope of its own to hold a pod's namespaces, one a pod. Told by its
+  first process's name (`cgroup.procs`, then `/proc/<pid>/comm`; asked once a container, its
+  answer kept while it runs), and by its image where the engine names it (`pause`, Rancher's
+  `mirrored-pause`, OpenShift's `origin-pod`: Docker's Kubernetes). Where neither can be told (kiln in
+  a container of its own PID namespace, the scope's process not shown), it is reported.
+- **Read**: v2's `cpu.stat` (in use, user, system, throttled time and periods), `cpu.max` (its
+  quota), `memory.current`, `memory.max`, `memory.stat` (its RSS, `anon`; its cache, `file`; its
+  working set, usage less `inactive_file`, what an out-of-memory kill reads), `memory.events` (its
+  OOM kills), `io.stat` (bytes and operations, by direction), `pids.current`; v1's of each
+  controller (`cpuacct`, `cpu`, `memory`, `blkio`, `pids`). In Datadog's names and units:
+  `container.cpu.usage`, `.user`, `.system`, `.limit` (nanocores), `.throttled` (ns a second),
+  `.throttled.periods` (a count); `container.memory.usage`, `.working_set`, `.rss`, `.cache`,
+  `.limit` (bytes), `.oom_events` (a count); `container.io.read`, `.write` (bytes a second),
+  `.read.operations`, `.write.operations`; `container.pid.count`; `container.uptime` (seconds, where
+  its engine says when it was made). Rates against the last look's counters; a container gone, its
+  counters let go.
+- **A look costs little**: its files read into one buffer (std's `read_to_string` asks a file's size
+  and place first, two system calls more a file, and a cgroup's files have none to give), the values
+  wanted picked from `memory.stat` in one pass; each container's series' keys made at its first look
+  and kept (made again when its tags change: a name learned); its samples written into a decoding
+  the store's owner hands back emptied, its room kept, as exporters' are. A node of 1,000
+  containers' look: §12.34.
+- **Named** by Kubernetes' links (`/var/log/containers/<pod>_<namespace>_<container>-<id>.log`,
+  whatever the engine: its pod, namespace and container) and by the engine's API where its socket
+  can be read (Docker's, Podman's rootful and rootless, Docker Desktop's; `DOCKER_HOST`'s): its name,
+  image (`image_name`, `image_tag`, `short_image`, Datadog's tags), Compose service and project.
+  The engine is asked (`GET /containers/json`, HTTP/1.0 over its socket, kiln's own few lines of
+  std) when a container it has not named and not been asked about appears, at most once a look, and
+  every five minutes besides; a node without either reports its containers by id.
+- **Where the cgroups are not seen** (Docker Desktop's VM, on macOS and Windows, its named pipe
+  there), the engine's stats are read instead (`GET /containers/{id}/stats?stream=false&one-shot=true`),
+  a container at a time, as `docker stats` reads them.
+- **Tags**: `host`, `container_id`, `runtime`; as known `container_name`, `image_name`, `image_tag`,
+  `short_image`, `kube_namespace`, `pod_name`, `kube_container_name`, `kube_qos`, `compose_service`,
+  `compose_project`. Datadog's Agent's container check reports the same names; OpenTelemetry's
+  receivers report theirs (`container.id`, `container.name`, `k8s.pod.name`, …), listed beside,
+  without figures as yet: their metrics differ in name and unit (`docker_stats`' CPU in
+  nanoseconds, `kubeletstats`' `container.cpu.usage` in cores), and are not read as the check's.
+- **Listed** by the server (`GET /api/observe/v1/containers`, `…/containers/{id}`: kiln's API): made
+  of the store's index, as the host list is (each container's series by its `container_id` or
+  OpenTelemetry's `container.id`, their tags and newest sample; `Store::tag_seen`), and of each
+  figure's series' newest sample (`Store::newest_by`); made again at most every 15 seconds. Running
+  while it has a sample within two minutes, listed an hour past its last; found by a part of its
+  name, image, id, pod, namespace or host, or by a tag (`*` any part of its value); ordered by its
+  CPU, memory, either's share of its limit, throttling, I/O or uptime; one found by its id or the
+  first 12 of its hex, as `docker ps` shows it. A search is read once and matched with nothing
+  allocated (a tag's key compared, its value's glob; a part of a name found case aside), and a page
+  is written as JSON from the list itself. A list older than 15 seconds is given while another is
+  made, one at a time, up to a minute old; the first asked after a quiet while is made first. A
+  host's page lists its containers from it: running ones, then those stopped within the hour.
+
 ## 11. UI
 
 Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
@@ -2344,6 +2412,14 @@ time range and the search in the address (a page is a link).
   and kiln's versions, what reports it), its tags by source, its apps, its containers, the Agent's
   checks (a failing one's error by name), its logs a click away; muted from it (an hour, four, a day,
   a week, or until unmuted, saying why) and unmuted.
+- **Containers** (§10.10): every container, running ones unless asked (stopped ones an hour after;
+  each state counted), found by a part of a name or a tag and ordered by a figure: each its name,
+  image and engine, its host (to its page) and pod, its CPU and memory against its limits (90% or
+  more of a limit told apart), how long it has run; on a phone, its name and a line of its figures. A
+  container's page: its state, id, figures against its limits, throttling, processes, I/O and
+  uptime; its CPU (with its limit), memory (in use, its working set, its limit), throttling and I/O
+  over a range; where it runs (host, image, engine, pod, QoS class, Compose service); its tags;
+  its logs a click away. A host's containers lead to theirs.
 - **Delivery** (§10.7): DORA's four keys over 7, 30 or 90 days, narrowed to a service, an
   environment or a team: each its value, what it was taken from, and the 2024 report's four ranges
   beside it, the one it falls in marked in words (a change failure rate beside the clusters' own
@@ -2421,7 +2497,10 @@ series sent less often than its chart's grid (a metric every minute on an hour's
 OpenTelemetry's SDKs export every 60 s unless told otherwise) is drawn across its empty buckets: a
 run of them no wider than twice its usual spacing (the median between its samples: one sample
 missed) is joined, a wider one left a gap, a lone value drawn as a point; as first drawn, a line was
-broken at every empty bucket, and such a series drew nothing (a notebook's graph found it). To
+broken at every empty bucket, and such a series drew nothing (a notebook's graph found it). A y
+axis is as wide as its longest label (52 px at the least, uPlot's own measure: `47.7 KiB/s` was cut
+to `.7 KiB/s`), and a page's chart names its queries' lines where it says them (In use, Limit)
+rather than numbering them (`1: *`). To
 come: series reduced to the chart's width with largest-triangle-three-buckets (Steinarsson 2013) when a range holds more
 buckets than pixels (today the query's `points` bounds them: 240 a chart).
 
@@ -4020,6 +4099,65 @@ store of 10,000 holds 3 MiB rather than its 54 MiB of cells made into JSON. A li
 out of the lock, nothing else: a part of the name is found case aside without a lowercase copy of
 each name (as first written, two a notebook), and names are ordered case aside a byte at a time.
 
+### 12.34 The container check and list
+
+`cargo bench -p kiln --bench containers` (adacachy, 2026-10-22, release; the machine's load 55–90 on
+32 cores from others' builds, so each time now is the least of nine runs and their median; as first
+written, their median alone). A node's
+look, on a copy of a busy node's cgroup v2 hierarchy (tmpfs): 1,000 containers (500 Docker's
+scopes; 500 of containerd's in 251 Kubernetes pods, each pod's sandbox beside them: 1,251 scopes),
+300 services, a user's session; each container's files as Linux 6.x writes them (`memory.stat`'s
+72 lines); 500 links in `/var/log/containers`. And this machine's own hierarchy as it is (its
+Docker containers, five minikube nodes' pods nested in theirs: some 200 containers, their
+sandboxes besides). The server's list: fleets of 10,000 and 50,000 containers on nodes of 1,000,
+each its 18 series as the check writes them (11 tags), a sixth stopped half an hour before:
+180,000 and 900,000 series.
+
+| what | as first written | now |
+| --- | --- | --- |
+| a node of 1,000: found (the walk) | 8.2 ms, 38,407 allocations | 0.84 / 0.90 ms, 8,522 |
+| a node of 1,000: looked at whole (16,416 series) | 41.6 ms, 151,776 (its 251 sandboxes reported) | 13.5 / 14.1 ms, 13,208 |
+| this machine's own: found | 41.3 ms, 92,693 | 1.7 / 1.8 ms, 16,327 |
+| this machine's own: looked at whole | 59.2 ms, 116,311 | 4.2 / 4.3 ms, 16,335 |
+| 10,000: the list made of the store | 34.7 ms, 373,508 | 16.5 / 17.5 ms, 40,069 |
+| 10,000: a page of 100 by name, answered | 0.27 ms, 10,613 | 0.10 ms, 25 |
+| 10,000: found by a part of a name | 1.3 ms, 58,331 | 0.50 / 0.58 ms, 12 |
+| 10,000: found by a tag's glob | 6.5 ms, 260,783 | 0.22 / 0.23 ms, 20 |
+| 10,000: ordered by CPU against its limit | 1.5 ms, 10,614 | 0.19 / 0.20 ms, 26 |
+| 50,000: the list made of the store | 233 ms, 1,866,862 | 129 / 142 ms, 200,115 |
+| 50,000: a page of 100 by name, answered | 0.53 ms, 10,615 | 0.19 / 0.22 ms, 27 |
+| 50,000: found by a part of a name | 15.9 ms, 292,480 | 4.5 / 8.2 ms, 17 |
+| 50,000: found by a tag's glob | 40.1 ms, 1,274,096 | 0.99 / 1.3 ms, 20 |
+| 50,000: ordered by CPU against its limit | 7.4 ms, 10,616 | 0.65 / 0.85 ms, 28 |
+| 50,000: the stopped, by when last seen | 1.4 ms, 10,614 | 0.22 / 0.24 ms, 26 |
+| 50,000: one by the first 12 of its id | 0.09 ms, 0 | 0.10 ms, 0 |
+
+As first written, a look read each file with std's `read_to_string` (a string a file, and two
+system calls more to ask its size and place), listed every directory's files (each container's
+scope's 60-odd), made each container's tags and series keys again (three allocations a key), and a
+`Vec` a sample; and it reported pods' sandboxes as containers. Now its files are read into one
+buffer, the values wanted picked from `memory.stat` in one pass, a directory without directories of
+its own (its links two) not read, a container's keys made at its first look and kept, its samples
+written into a decoding the owner hands back: a twelfth of the allocations, the walk nine times as
+fast, a look three times, and what is left of its time the kernel's (some 9,000 files opened and
+read). On this machine's hierarchy, five minikube nodes' nested in it, a look takes a fourteenth of
+what it took.
+
+The list was made of `Store::tag_seen`'s copies (each container's id, its namespaces, each tag's
+key and value: some 26 allocations a container) and each figure's samples by an id copied a
+container a figure. It is made of `Store::tag_seen_each` (the index's names borrowed under the
+store's hold), each tag's key `inventory::TAGS`' own and each value made once for every container that has
+it (a host's, an image's, a namespace's): 4 allocations a container, a ninth of what they were,
+half the time at 50,000, and less held between askings. A search is read once: a tag's key compared
+and its value's glob matched, nothing allocated; a part of a name found by memchr's search in each
+name lowercased into one buffer. `str::to_lowercase` of each name made 292,480 allocations at
+50,000; comparing a byte at a time without them was slower still (45 ms: each 64-character id
+compared at each of its places), hence memchr's SIMD search. A page is written as JSON from the
+list itself, 27 allocations where `serde_json::Value`s made 10,615. Ordered by a figure, each
+container's is read once (it was read again at each comparison, a match on the field's name among
+them) and the page selected before it alone is sorted (a selection is linear): 0.65 ms at 50,000
+where sorting all of them took 7.4.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -4709,6 +4847,36 @@ adacachy); and the whole suite, 38 scenarios, in all four. Looking at its pages 
 scenarios could not: the seeded latencies (a point a minute) drew no line on an hour's grid of 15 s
 (§11: now drawn across their empty buckets), and a notebook's Markdown went unstyled where no
 dashboard had been opened first (its styles were the dashboards' alone).
+
+**Containers** (`crates/kiln/tests/observe_containers.rs`, on a machine with Docker): a kiln server
+and a runner as processes of their own, the runner looking every 2 s. Two containers of its own
+(`alpine:latest`): one busy under a quota of half a core and 64 MiB; one whose `awk` doubles a
+string until the kernel kills it, again every second, under 32 MiB and no swap. The busy one listed
+by its name, with its id, engine and image (`docker`, `alpine`, `latest`); its CPU between 0.35 and
+0.55 cores, its limits (0.5 cores, 64 MiB), throttled, its processes. The other's OOM kills counted
+by Datadog's query (`sum:container.memory.oom_events{container_name:…}.as_count()`), it running on
+under its 32 MiB. Every container Docker ran before and after 20 s found among those listed
+(others' jobs' come and go here; five minikube nodes' pods besides); one found by the first 12 of
+its id; an id that is none, 404. The busy one removed: among the stopped (its samples stopped), no
+longer among the running, counted. 2026-10-22: passes (125–151 s; adacachy, its load 55–90). Its
+first run found no OOM kill in two minutes: the `awk` appended 32 bytes at a time, copying its
+string each time, and never reached its limit. In a browser (`ui/e2e/observe.mjs`; Chromium and
+WebKit, a desktop's width and a phone's): two containers as Datadog's Agent's container check sends
+them (`/api/v1/series`, its tags: id, name, image, `containerd`, a pod of `shop`, `burstable`): one
+reporting now, near its quota (0.46 of 0.5 cores: 92%, told apart), throttled 150 ms a second, its
+working set 180 MiB of 256 MiB, up two hours; one whose samples stopped five minutes before. Found
+by `kube_namespace:shop` and a part of its name: its CPU and memory against its limits, its image
+and engine (on a phone, a line of its figures); the other not among the running; under Stopped,
+counted and said to be stopped. Its page: its figures (0.46 · 92%, 0.5 cores, 180 MiB · 70.3%,
+256 MiB, 150 ms/s, its I/O, 2h 00m), its throttling told apart, its pod and QoS class, its tags, its
+logs a click away (`@container.id:… OR container_id:…`); its host's page lists it and leads back;
+found by the first 12 of its id. Nothing on either page wider than a phone. 2026-10-22: passes in
+all four (18.6–19.4 s each, most of it the list made again; adacachy); and the whole suite, 39
+scenarios, in all four. Looking at its pages with a node's worth of containers and this machine's
+own found what the scenario could not: a CPU of 0.000434 cores written `4.34e-4` (now `<0.001`), a
+host's name wrapping in its column, charts' lines named `1: *` and `2: *` (now In use, Limit, …;
+a host's page's too), and a y axis cutting `47.7 KiB/s` to `.7 KiB/s` (every chart's axis is now as
+wide as its longest label).
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,

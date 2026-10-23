@@ -37,8 +37,6 @@ pub const KEPT_MS: i64 = 7 * 86_400_000;
 /// An inventory is reused this long (the list asks every 30 s); past it, it is still answered while
 /// one is made again (a fleet of 20,000 hosts' takes some 400 ms, §12.31).
 pub const FRESH_MS: i64 = 15_000;
-/// The most series one figure's query reads: a fleet's hosts, a few series each.
-const FIGURE_SERIES: usize = 200_000;
 
 /// What a host's series carry that says its platform and where it runs: OpenTelemetry's resource
 /// attributes (`host.name` says one is OpenTelemetry's), a cluster's.
@@ -527,69 +525,14 @@ impl Infra {
     }
 }
 
-/// What a container's series carry that names it, its image and pod, and its host: Datadog's
-/// container tags, OpenTelemetry's resource attributes.
-pub const CONTAINER_TAGS: [&str; 12] =
-    ["host", "host.name", "container_name", "image_name", "short_image", "image_tag", "kube_namespace", "pod_name", "container.name", "container.image.name", "k8s.pod.name", "k8s.namespace.name"];
-
-/// A host's containers: each container (`container_id`, OpenTelemetry's `container.id`) whose
-/// series say it is on the host, its name, image and pod, when it last reported, and its CPU
-/// (nanocores) and memory (bytes) of the last ten minutes (Datadog's container metrics).
-pub async fn containers(host: &str, now_ms: i64) -> Option<Vec<serde_json::Value>> {
-    let host = host.to_owned();
-    super::api::apart(move |store| {
-        let mut seen = {
-            let s = store.read().unwrap_or_else(PoisonError::into_inner);
-            let mut all = s.tag_seen("container_id", now_ms - KEPT_MS, &CONTAINER_TAGS);
-            all.extend(s.tag_seen("container.id", now_ms - KEPT_MS, &CONTAINER_TAGS));
-            all
-        };
-        seen.retain(|c| c.tags.iter().any(|(k, v)| (k == "host" || k == "host.name") && *v == host));
-        // Their figures, where the host's name reads whole in a query.
-        let mut figures: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new();
-        if !seen.is_empty() && !host.contains(|c: char| c.is_whitespace() || "{}(),:\"".contains(c)) {
-            use kiln_obs::query::eval;
-            for (i, metric) in ["container.cpu.usage", "container.memory.usage"].iter().enumerate() {
-                for key in ["container_id", "container.id"] {
-                    let q = format!("avg:{metric}{{host:{host}}} by {{{key}}}");
-                    let mut r = eval::Request::new(&q, now_ms - FIGURES_MS, now_ms);
-                    r.step = Some(60_000);
-                    r.max_series = FIGURE_SERIES;
-                    let Ok((a, _)) = eval::eval_shared(store, &r) else { continue };
-                    for s in &a.series {
-                        let (Some(id), Some(v)) = (s.tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()), s.values.iter().rev().copied().find(|v| v.is_finite())) else { continue };
-                        let e = figures.entry(id).or_default();
-                        if i == 0 {
-                            e.0 = Some(v);
-                        } else {
-                            e.1 = Some(v);
-                        }
-                    }
-                }
-            }
-        }
-        let tag = |c: &kiln_obs::store::TagSeen, keys: &[&str]| keys.iter().find_map(|k| c.tags.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()));
-        Ok(seen
-            .iter()
-            .map(|c| {
-                let (cpu, memory) = figures.get(&c.value).copied().unwrap_or_default();
-                serde_json::json!({
-                    "id": c.value,
-                    "name": tag(c, &["container_name", "container.name"]),
-                    "image": tag(c, &["image_name", "short_image", "container.image.name"]),
-                    "image_tag": tag(c, &["image_tag"]),
-                    "pod": tag(c, &["pod_name", "k8s.pod.name"]),
-                    "namespace": tag(c, &["kube_namespace", "k8s.namespace.name"]),
-                    "last_reported": c.last_ms,
-                    "series": c.series,
-                    "cpu_nanocores": cpu,
-                    "memory_bytes": memory,
-                })
-            })
-            .collect())
-    })
-    .await
-    .ok()
+/// A host's containers (`docs/observe.md` §10.10) as the containers' list has them: running ones,
+/// then those stopped within the hour.
+pub async fn containers(host: &str) -> Option<Vec<serde_json::Value>> {
+    let inv = super::containers::inventory::get().inventory().await.ok()?;
+    match serde_json::to_value(super::containers::http::on_host(&inv, host)).ok()? {
+        serde_json::Value::Array(a) => Some(a),
+        _ => None,
+    }
 }
 
 /// What a host is made of, each taken as its host is.

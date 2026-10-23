@@ -8,6 +8,7 @@ pub mod archives;
 pub mod catalog;
 pub mod cloud;
 pub mod collect;
+pub mod containers;
 pub mod dashboards;
 pub mod ddash;
 pub mod ddagent;

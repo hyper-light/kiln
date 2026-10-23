@@ -4,6 +4,20 @@ import "uplot/dist/uPlot.min.css";
 import type { Band, ChartProps } from "./types";
 
 const AXIS_FONT = '10px "Geist Mono Variable", ui-monospace, monospace';
+
+/**
+ * A y axis as wide as its longest label, 52 px at the least ("47.7 KiB/s" whole, not cut to
+ * ".7 KiB/s"): uPlot's own way, its labels measured in the axis's font as they are drawn.
+ */
+const fitLabels: uPlot.Axis.Size = (u, values, axisIdx, cycleNum) => {
+  const axis = u.axes[axisIdx] as uPlot.Axis & { _size?: number; font?: string | [string, number]; gap?: number };
+  // Settled on the first cycles: a width that changes the labels does not change it again.
+  if (cycleNum > 1) return axis._size ?? 52;
+  const longest = (values ?? []).reduce((a, v) => (v.length > a.length ? v : a), "");
+  if (!longest) return 52;
+  u.ctx.font = (Array.isArray(axis.font) ? axis.font[0] : axis.font) ?? AXIS_FONT;
+  return Math.max(52, Math.ceil(u.ctx.measureText(longest).width / (window.devicePixelRatio || 1) + (axis.gap ?? 5) + 6));
+};
 const GRID = "#191c21";
 const AXIS = "#7f838d";
 
@@ -140,7 +154,7 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
             font: AXIS_FONT,
             grid: { stroke: GRID, width: 1 },
             ticks: { show: false },
-            size: 52,
+            size: fitLabels,
             values: (_u, splits) => splits.map((v) => yFormat(v)),
             space: 32,
           },
@@ -153,7 +167,7 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
                   font: AXIS_FONT,
                   grid: { show: false },
                   ticks: { show: false },
-                  size: 52,
+                  size: fitLabels,
                   values: (_u: uPlot, splits: number[]) => splits.map((v) => (y2Format ?? yFormat)(v)),
                 },
               ]

@@ -1365,7 +1365,7 @@ fn schemas() -> Map<String, Value> {
     };
     put("Host", object(&host_fields(), &["name", "up", "is_muted", "metrics", "kiln"]));
     let mut host_detail = host_fields();
-    host_detail.push(("containers", describe(array(map_of(any())), "its containers: id, name, image, pod, last reported, CPU (nanocores), memory (bytes)")));
+    host_detail.push(("containers", describe(array(schema("Container")), "its containers as the containers' API gives them: running ones, then those stopped within the hour")));
     put("HostDetail", object(&host_detail, &["name", "up", "is_muted", "metrics", "kiln"]));
     // Incidents (§9.5): Datadog's JSON:API.
     let rel = |t: &str| object(&[("data", nullable(object(&[("type", one_of(&[t])), ("id", string())], &["type", "id"])))], &["data"]);
@@ -1617,6 +1617,47 @@ fn schemas() -> Map<String, Value> {
                 ),
             )],
             &["data"],
+        ),
+    );
+    // Containers (§10.10).
+    put(
+        "Container",
+        object(
+            &[
+                ("id", string()),
+                ("name", nullable(string())),
+                ("state", one_of(&["running", "stopped"])),
+                ("host", nullable(string())),
+                ("runtime", nullable(string())),
+                ("image", object(&[("name", nullable(string())), ("tag", nullable(string())), ("short", nullable(string()))], &[])),
+                ("kube", object(&[("namespace", nullable(string())), ("pod", nullable(string())), ("container", nullable(string())), ("qos", nullable(string()))], &[])),
+                ("compose", object(&[("service", nullable(string())), ("project", nullable(string()))], &[])),
+                ("last_reported", describe(integer(), "ms since the epoch: its newest sample")),
+                ("series", integer()),
+                (
+                    "figures",
+                    describe(
+                        object(
+                            &[
+                                ("cpu_nanocores", nullable(number())),
+                                ("cpu_limit_nanocores", nullable(number())),
+                                ("cpu_throttled_ns", nullable(number())),
+                                ("memory_bytes", nullable(number())),
+                                ("working_set_bytes", nullable(number())),
+                                ("memory_limit_bytes", nullable(number())),
+                                ("pids", nullable(number())),
+                                ("io_read_bytes", nullable(number())),
+                                ("io_write_bytes", nullable(number())),
+                                ("uptime_seconds", nullable(number())),
+                            ],
+                            &[],
+                        ),
+                        "each its newest sample of the last ten minutes (I/O and throttling a second)",
+                    ),
+                ),
+                ("tags", array(string())),
+            ],
+            &["id", "state", "last_reported", "figures", "tags"],
         ),
     );
     // Downtimes (§9.3): Datadog's v2 downtime.
@@ -2712,6 +2753,43 @@ fn ops() -> Vec<Op<'static>> {
             )
         },
         Op { params: vec![id()], ..op("delete", "/notebooks/{id}", "Removes a notebook", "observe.write", None, vec![no_content()]) },
+        // Containers (§10.10).
+        Op {
+            params: vec![
+                param("state", "query", false, one_of(&["running", "stopped", "all"]), "running unless said"),
+                param("filter", "query", false, string(), "terms each a part of its name, image, id, pod, namespace or host, or a tag (key:value, `*` for any part)"),
+                param("sort_field", "query", false, one_of(&["name", "cpu", "memory", "cpu_limit", "memory_limit", "throttled", "io", "uptime", "last_reported"]), "name unless said"),
+                param("sort_dir", "query", false, one_of(&["asc", "desc"]), "asc by name, desc by a figure, unless said"),
+                param("start", "query", false, integer(), "the first of the page"),
+                param("count", "query", false, integer(), "100 unless said, 1,000 at the most"),
+            ],
+            ..op(
+                "get",
+                "/containers",
+                "Every container (kiln's container check's, Datadog's Agent's, OpenTelemetry's)",
+                "observe.read",
+                None,
+                vec![(
+                    "200",
+                    answer_of(
+                        "a page of them",
+                        object(
+                            &[
+                                ("containers", array(schema("Container"))),
+                                ("total_matching", integer()),
+                                ("total_returned", integer()),
+                                ("totals", object(&[("running", integer()), ("stopped", integer())], &[])),
+                            ],
+                            &["containers", "total_matching"],
+                        ),
+                    ),
+                )],
+            )
+        },
+        Op {
+            params: vec![id()],
+            ..op("get", "/containers/{id}", "A container, by its id or 12 or more of its first hex", "observe.read", None, vec![("200", answer_of("the container", schema("Container")))])
+        },
         // The infrastructure list (§10.9).
         Op {
             params: vec![

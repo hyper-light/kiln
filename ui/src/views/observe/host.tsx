@@ -17,8 +17,14 @@ import { formatBytes, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
+import { coresText, imageOf, nameOf } from "./containers";
 import { Percent, Status } from "./hosts";
 import { QueryChart, RangePicker, compact, useRange, type Range } from "./parts";
+
+// The charts' series, named.
+const CPU = ["User", "System", "I/O wait"];
+const LOAD = ["1 minute", "5 minutes", "15 minutes"];
+const MEMORY = ["Used", "Total"];
 
 const hostRes = (name: string): Res<HostDetail> => ({ key: `observe/hosts/${name}`, fetch: (s) => observeApi.host(name, s), opts: { pollMs: 30_000 } });
 
@@ -107,17 +113,17 @@ function HostView({ name, range, onRange }: { name: string; range: Range; onRang
       <div className="mb-8 grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Panel title="CPU" description="Of all its cores: user, system and waiting on I/O (%).">
           <Loadable label="its CPU" fallback={<Hold height={180} />}>
-            <QueryChart queries={[`avg:system.cpu.user{${q}}`, `avg:system.cpu.system{${q}}`, `avg:system.cpu.iowait{${q}}`]} range={range} unit="%" />
+            <QueryChart queries={[`avg:system.cpu.user{${q}}`, `avg:system.cpu.system{${q}}`, `avg:system.cpu.iowait{${q}}`]} names={CPU} range={range} unit="%" />
           </Loadable>
         </Panel>
         <Panel title="Load" description="Its load over 1, 5 and 15 minutes.">
           <Loadable label="its load" fallback={<Hold height={180} />}>
-            <QueryChart queries={[`avg:system.load.1{${q}}`, `avg:system.load.5{${q}}`, `avg:system.load.15{${q}}`]} range={range} />
+            <QueryChart queries={[`avg:system.load.1{${q}}`, `avg:system.load.5{${q}}`, `avg:system.load.15{${q}}`]} names={LOAD} range={range} />
           </Loadable>
         </Panel>
         <Panel title="Memory" description="In use, of all it has.">
           <Loadable label="its memory" fallback={<Hold height={180} />}>
-            <QueryChart queries={[`avg:system.mem.used{${q}}`, `avg:system.mem.total{${q}}`]} range={range} unit="MiB" />
+            <QueryChart queries={[`avg:system.mem.used{${q}}`, `avg:system.mem.total{${q}}`]} names={MEMORY} range={range} unit="MiB" />
           </Loadable>
         </Panel>
         <Panel title="Disks" description="Each disk's share in use.">
@@ -187,7 +193,7 @@ function HostView({ name, range, onRange }: { name: string; range: Range; onRang
           )}
         </Panel>
       </div>
-      <Panel title="Containers" description="Those its series say run on it: each one's CPU (cores) and memory, the last ten minutes." className="mb-8">
+      <Panel title="Containers" description="Those its series say run on it, and those stopped within the hour: each one's CPU (cores) and memory in use (its working set)." className="mb-8">
         {h.containers.length === 0 ? (
           <p className="empty-line">None reported.</p>
         ) : (
@@ -202,19 +208,26 @@ function HostView({ name, range, onRange }: { name: string; range: Range; onRang
                 </tr>
               </thead>
               <tbody>
-                {h.containers.map((c) => (
-                  <tr key={c.id}>
-                    <td className="truncate-cell">
-                      <span className="font-mono text-[12.5px] text-[#e4e5e7]">{c.name ?? c.id.slice(0, 12)}</span>
-                      <p className="truncate text-[11px] text-[#8c8f98]">
-                        {[c.image ? `${c.image}${c.image_tag ? `:${c.image_tag}` : ""}` : null, relativeTime(c.last_reported / 1000)].filter(Boolean).join(" · ")}
-                      </p>
-                    </td>
-                    <td className="hidden text-[12px] md:table-cell">{c.pod ? `${c.namespace ? `${c.namespace}/` : ""}${c.pod}` : <span className="text-[#8c8f98]">—</span>}</td>
-                    <td className="text-right font-mono text-[12px]">{c.cpu_nanocores !== null ? compact(c.cpu_nanocores / 1e9) : <span className="text-[#8c8f98]">—</span>}</td>
-                    <td className="hidden text-right font-mono text-[12px] sm:table-cell">{c.memory_bytes !== null ? formatBytes(c.memory_bytes) : <span className="text-[#8c8f98]">—</span>}</td>
-                  </tr>
-                ))}
+                {h.containers.map((c) => {
+                  const f = c.figures;
+                  const memory = f.working_set_bytes ?? f.memory_bytes;
+                  return (
+                    <tr key={c.id}>
+                      <td className="truncate-cell">
+                        <Link to={`/observe/containers/${c.id}`} className="font-mono text-[12.5px] text-[#e4e5e7] hover:text-white">
+                          {nameOf(c)}
+                        </Link>
+                        <p className="truncate text-[11px] text-[#8c8f98]">
+                          {c.state === "stopped" && <span className="text-[#d1aaad]">stopped · </span>}
+                          {[imageOf(c) || null, relativeTime(c.last_reported / 1000)].filter(Boolean).join(" · ")}
+                        </p>
+                      </td>
+                      <td className="hidden text-[12px] md:table-cell">{c.kube.pod ? `${c.kube.namespace ? `${c.kube.namespace}/` : ""}${c.kube.pod}` : <span className="text-[#8c8f98]">—</span>}</td>
+                      <td className="text-right font-mono text-[12px]">{f.cpu_nanocores !== null ? coresText(f.cpu_nanocores / 1e9) : <span className="text-[#8c8f98]">—</span>}</td>
+                      <td className="hidden text-right font-mono text-[12px] sm:table-cell">{memory !== null ? formatBytes(memory) : <span className="text-[#8c8f98]">—</span>}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

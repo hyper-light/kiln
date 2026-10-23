@@ -214,7 +214,7 @@ pub async fn host(name: &str) -> Result<Response, Fail> {
     let inv = infra()?.inventory().await?;
     let h = inv.host(name).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such host"))?;
     let mut o = host_json(h, inv.at_ms, true);
-    let containers = super::containers(name, inv.at_ms).await.unwrap_or_default();
+    let containers = super::containers(name).await.unwrap_or_default();
     if let Some(k) = o.get_mut("kiln").and_then(Value::as_object_mut) {
         if let Some(a) = &h.agent {
             k.insert("inventory".into(), Value::Object(a.inventory.clone()));

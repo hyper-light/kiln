@@ -762,6 +762,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // This machine's own figures, as the server's are.
         let every = std::env::var("KILN_OBSERVE_HOST_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(crate::observe::host::EVERY, Duration::from_secs);
         crate::observe::host::start(obs.clone(), name.clone(), "runner", every);
+        // Every container this machine runs, as Datadog's container check sees them.
+        crate::observe::containers::start(obs.clone(), name.clone(), every);
         // And its own registry (`crate::metrics`: what this process counts, its repositories' sync
         // and its moves among it), as the server's is read, of its host.
         crate::observe::kiln::start_registry(obs.clone(), name.clone(), every);
