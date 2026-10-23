@@ -3913,7 +3913,9 @@ enforcement points to W18, agent isolation to W20.
 
   It comes for Ubuntu 26.04 too (`kiln/runner-ubuntu-26.04`, `ImageOS=ubuntu26`, from
   `ubuntu-26.04` and `ubuntu-26.04-arm`; four of the corpus's repositories ask for it), and
-  `ubuntu-slim`, GitHub's lightweight runner, gets `kiln/runner-ubuntu-24.04-slim`. On Ubuntu
+  `ubuntu-slim`, GitHub's lightweight runner, gets the full `kiln/runner-ubuntu-24.04`: GitHub's
+  smaller set still has Node.js and npm, the Docker CLI, gh and PowerShell, which kiln's `-slim`
+  leaves out (TypeScript's format and tidy jobs run on it). On Ubuntu
   24.04 and 26.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's images'
   does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.
 

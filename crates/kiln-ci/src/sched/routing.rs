@@ -551,8 +551,10 @@ pub fn github_label_rules() -> Vec<Rule> {
         rule(&["ubuntu-26.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-22.04"),
-        // GitHub's lightweight Ubuntu 24.04 in a container, with a smaller set of tools.
-        rule(&["ubuntu-slim"], "linux", "x86_64", "kiln/runner-ubuntu-24.04-slim"),
+        // GitHub's lightweight Ubuntu 24.04 in a container. Its smaller set of tools still has
+        // Node.js and npm, the Docker CLI, gh and PowerShell, which kiln's own `-slim` (the basics
+        // alone) leaves out: the full image has them.
+        rule(&["ubuntu-slim"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["macos-latest"], "macos", "aarch64", ""),
         rule(&["macos-26"], "macos", "aarch64", ""),
         rule(&["macos-15"], "macos", "aarch64", ""),
@@ -928,7 +930,7 @@ mod tests {
         let other = LegRoute { repo: "other/x".into(), ..leg.clone() };
         assert!(resolve(&other, &[rule])?.rules.is_empty());
         // GitHub's newer labels, each its image.
-        for (label, image) in [("ubuntu-26.04", "kiln/runner-ubuntu-26.04"), ("ubuntu-26.04-arm", "kiln/runner-ubuntu-26.04"), ("ubuntu-slim", "kiln/runner-ubuntu-24.04-slim")] {
+        for (label, image) in [("ubuntu-26.04", "kiln/runner-ubuntu-26.04"), ("ubuntu-26.04-arm", "kiln/runner-ubuntu-26.04"), ("ubuntu-slim", "kiln/runner-ubuntu-24.04")] {
             let req = resolve(&LegRoute { labels: vec![label.into()], ..leg.clone() }, &github_label_rules())?;
             assert_eq!(req.image.as_deref(), Some(image), "{label}");
         }
