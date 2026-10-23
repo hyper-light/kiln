@@ -20,6 +20,7 @@ pub mod github;
 pub mod host;
 pub mod hub;
 pub mod incidents;
+pub mod indexes;
 pub mod infra;
 pub mod kafka;
 pub mod kiln;

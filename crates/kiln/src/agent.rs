@@ -764,6 +764,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::host::start(obs.clone(), name.clone(), "runner", every);
         // Every container this machine runs, as Datadog's container check sees them.
         crate::observe::containers::start(obs.clone(), name.clone(), every);
+        // What the records this machine takes come to, as Datadog's estimated usage counts it.
+        crate::observe::indexes::start_usage(obs.clone(), name.clone(), crate::observe::indexes::USAGE_EVERY);
         // And its own registry (`crate::metrics`: what this process counts, its repositories' sync
         // and its moves among it), as the server's is read, of its host.
         crate::observe::kiln::start_registry(obs.clone(), name.clone(), every);

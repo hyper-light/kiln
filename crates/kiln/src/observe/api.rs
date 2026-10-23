@@ -312,7 +312,7 @@ async fn log_metric_test(t: LogMetricTest, spans: bool) -> Result<Response, Fail
         // The records as they are, counted with the store let go: writes go on throughout.
         let at = {
             let s = store.read().unwrap_or_else(PoisonError::into_inner);
-            if spans { s.spans_at() } else { s.logs_at() }
+            if spans { s.spans_at() } else { s.logs_every() }
         };
         while w <= to.saturating_mul(1_000_000) {
             let counted = at.count_metrics(&metrics, w).map_err(|e| e.to_string())?;
@@ -640,6 +640,17 @@ pub(super) async fn read_apart<T: Send + 'static, R: Send + 'static>(
     then: impl FnOnce(T, Waited) -> Result<R, Fail> + Send + 'static,
 ) -> Result<R, Fail> {
     read_apart_in(shared()?, take, then).await
+}
+
+/// What a read of the logs takes, under a brief hold: a rehydration's view whole (a part of its
+/// own), or the live logs of the indexes asked (none asked: every index, and kiln's events), each
+/// part from its own cutoff.
+fn logs_take(view: Option<&str>, indexes: Option<&[String]>) -> Result<impl FnOnce(&kiln_obs::store::Store) -> kiln_obs::store::LogsAt + Send + 'static, Fail> {
+    let parts = if view.is_some() { None } else { super::indexes::http::searchable(indexes)? };
+    Ok(move |s: &kiln_obs::store::Store| match &parts {
+        Some(parts) => s.logs_scoped(&|p| parts.contains(&p)),
+        None => s.logs_at(),
+    })
 }
 
 /// [`read_apart`] of `store` (a rehydration's view, or the replicated one).
@@ -1336,6 +1347,17 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 false => Err(fail(StatusCode::NOT_FOUND, "no such pipeline")),
             }
         }
+        // Log indexes (§8.10), Datadog's API: listed, made, read, changed, removed, ordered.
+        (&Method::GET, ["logs", "config", "indexes"]) => super::indexes::http::list(),
+        (&Method::POST, ["logs", "config", "indexes"]) => super::indexes::http::create(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::GET, ["logs", "config", "indexes", name]) => super::indexes::http::get(name),
+        (&Method::PUT, ["logs", "config", "indexes", name]) => {
+            let name = (*name).to_owned();
+            super::indexes::http::update(&name, read_json(req.into_body(), QUERY_BODY).await?).await
+        }
+        (&Method::DELETE, ["logs", "config", "indexes", name]) => super::indexes::http::delete(name).await,
+        (&Method::GET, ["logs", "config", "index-order"]) => super::indexes::http::order(),
+        (&Method::PUT, ["logs", "config", "index-order"]) => super::indexes::http::set_order(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::PUT, ["pipeline_order"]) => {
             #[derive(Deserialize)]
             struct Order {
@@ -1767,6 +1789,9 @@ struct SearchBody {
     /// A rehydration's view to read (its id); none, the live logs.
     #[serde(default)]
     view: Option<String>,
+    /// The indexes read (§8.10); none, every one (and kiln's events).
+    #[serde(default)]
+    indexes: Option<Vec<String>>,
     /// Milliseconds since the epoch.
     from: i64,
     to: i64,
@@ -1779,7 +1804,7 @@ struct SearchBody {
 /// seen, its newest message, and its records by status; the most common first.
 async fn patterns(body: SearchBody) -> Result<Response, Fail> {
     use kiln_obs::logs::patterns::{Drain, Params, tokens};
-    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, _| {
+    read_apart_in(store_of(body.view.as_deref())?, logs_take(body.view.as_deref(), body.indexes.as_deref())?, move |at, _| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1858,7 +1883,7 @@ async fn patterns(body: SearchBody) -> Result<Response, Fail> {
 }
 
 async fn search(body: SearchBody) -> Result<Response, Fail> {
-    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, w| {
+    read_apart_in(store_of(body.view.as_deref())?, logs_take(body.view.as_deref(), body.indexes.as_deref())?, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1882,6 +1907,8 @@ struct AggregateBody {
     query: String,
     #[serde(default)]
     view: Option<String>,
+    #[serde(default)]
+    indexes: Option<Vec<String>>,
     from: i64,
     to: i64,
     /// Facets: `service`, `host`, `source`, `status`, `@attribute`.
@@ -1913,7 +1940,7 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
         other => return Err(fail(StatusCode::BAD_REQUEST, format!("a measure: {other} (count, cardinality, sum, avg, min, max)"))),
     };
     let by: Vec<Facet> = body.by.iter().map(|f| Facet::parse(f)).collect();
-    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, w| {
+    read_apart_in(store_of(body.view.as_deref())?, logs_take(body.view.as_deref(), body.indexes.as_deref())?, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -1943,6 +1970,8 @@ struct FacetsBody {
     query: String,
     #[serde(default)]
     view: Option<String>,
+    #[serde(default)]
+    indexes: Option<Vec<String>>,
     from: i64,
     to: i64,
     /// `service`, `host`, `source`, `status`, `@attribute`.
@@ -1961,7 +1990,7 @@ async fn facets(body: FacetsBody) -> Result<Response, Fail> {
         return Err(fail(StatusCode::BAD_REQUEST, "at most 32 facets"));
     }
     let top = body.top.unwrap_or(10).clamp(1, 1000);
-    read_apart_in(store_of(body.view.as_deref())?, kiln_obs::store::Store::logs_at, move |at, w| {
+    read_apart_in(store_of(body.view.as_deref())?, logs_take(body.view.as_deref(), body.indexes.as_deref())?, move |at, w| {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);

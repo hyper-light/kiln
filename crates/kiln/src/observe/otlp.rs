@@ -512,7 +512,7 @@ fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body:
             match decoded {
                 Ok(()) => {
                     let n = out.records;
-                    match o.offer_log_parts(super::ingest::Logs { parts: out.parts }) {
+                    match o.offer_log_parts(super::ingest::Logs::from(out.parts)) {
                         Ok(()) => Answer::Ok { json, points: n, rejected: 0 },
                         Err(back) => {
                             give(back.parts);

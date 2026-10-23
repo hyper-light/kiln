@@ -42,6 +42,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-28 | Incident management (§9.5), Datadog's: incidents declared (from kiln's pages, Datadog's v2 API, or a monitor naming `@incident`), their severity and state, commander, customer impact and fields; their timeline (notes, each change, their monitor's alerts and recoveries), todos and attachments (a postmortem, links); Datadog's figures of each (time to detect, respond, repair, resolve); told to the integrations they name (PagerDuty's incident and Opsgenie's alert closed as one is resolved); searched with Datadog's syntax, counted by facet; kept a file each within bounds; the API, OpenAPI, its pages; checked live and in browsers (§13), measured (§12.32) | done |
 | O-29 | Notebooks (§11.1), Datadog's: Markdown and graph cells (Datadog's widget definitions, drawn as the dashboards draw them) over a time, fixed or the last of a span, cells' own times and sizes, types and templates; kept a file each, their heads alone read at the start; Datadog's v1 API (made, listed with its filters, order and pages, read, changed whole, removed); postmortems made of a template and an incident (Datadog's incident variables, kiln's template after the Google SRE book's) and attached to it; the charts on fixed times; their pages; checked live and in browsers (§13) | done |
 | O-30 | Containers (§10.10): every container each node runs, read from Linux's cgroups (v2 and v1; Docker, containerd, CRI-O, Podman, Kubernetes' pods, nested nodes'), named by Kubernetes' links and the engine's API (its socket, std alone), the engine's stats where cgroups are not seen (Docker Desktop on macOS and Windows); Datadog's container check's names (CPU, throttling, memory and working set, OOM kills, I/O, processes, uptime); listed by the server from the store's index; the API, OpenAPI, its pages; checked live (real Docker containers: a quota's CPU and throttling, OOM kills) and in browsers (§13), measured (§12.34) | done |
+| O-31 | Log indexes (§8.10): Datadog's indexes, exclusion filters (a rate, by an attribute's values or a trace), daily quotas (a warning, the quota reached, each an event; past it, records not kept for search until the day turns) and retention a part of the store each (§4.6: a file a part, each part's cutoff its own, replicated); routed where records are taken, every node told; what is not kept still seen live, archived and counted by metrics from logs; Datadog's estimated usage; the API, OpenAPI, the Indexes page and the explorer's pick of an index; checked live (§13) and measured (§12.35) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -252,6 +253,19 @@ blocks and files (`.spans`), their own cutoff, never in a log search, nor a log 
 live tail. Spans come ten to a hundred times as many as logs, so a store of their own keeps a log
 search from reading their blocks, and lets them be kept for their own time (Datadog keeps indexed
 spans 15 days: `spans_retention_days`). A block of spans' filter holds its trace ids (§8.7).
+
+A store's logs have **parts** (`kiln_obs::logs::store::Part`): an index's records (§8.10) are a
+part of their own, with its own head, blocks and files (a cut writes a file a part, named by it:
+`0000000000000042.p00003.logs`) and its own cutoff, so an index kept for a week drops whole files a
+week on, whatever the others keep. The main part is every record before indexes (and Datadog's
+`main` index's); kiln's events are a part of their own; records not kept for search (excluded, of
+no index, past a quota) are one more, kept an hour. A batch's rows name their part (`LOGS_IN`, the
+main part's `LOGS` as before); a part's cutoff moves by a command of the leader's, `RETAIN_PART`,
+stated only for a part kept for its own time, so a group that never had one never sends an entry a
+build that knows no parts would stop at (the manifest is version 4 and the image `KOIMAGE3` only
+then, as spans made them 3 and `KOIMAGE2`). A read takes the parts it asks for, each from its own
+cutoff: a search, those kept for search (`Store::logs_at`); metrics from logs, archives and the live
+tail, every part.
 
 Events are records too, of source `kiln.event`: one store, one search. But they are not logs: a
 monitor's own alerts are events at error's severity, and a monitor of `status:error` that counted
@@ -611,6 +625,7 @@ its schema (§13). Built:
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET/POST downtimes`, `GET/PUT/DELETE downtimes/{id}` | downtimes (§9.3), Datadog's v2 shape: the monitors held (an id, or tags), the groups (a scope), once (times in ms or RFC 3339) or recurring (RRULEs in a timezone); each with its status (`active`, `scheduled`, `ended`, `canceled`) and its window now or next; DELETE cancels (kept); a monitor shows the downtimes that hold it now or will |
 | `GET/POST incidents`, `GET incidents/search?query=`, `GET/PATCH/DELETE incidents/{id}`, `GET/POST incidents/{id}/relationships/todos`, `GET/PATCH/DELETE …/todos/{todo}`, `GET/POST incidents/{id}/attachments`, `PATCH/DELETE …/attachments/{id}`, `GET/POST incidents/{id}/timeline` | incidents (§9.5), Datadog's v2 API at kiln's paths (`{id}` its id or its public id): declared, listed, searched (Datadog's syntax; what matched counted by facet), read, changed and removed; their todos and attachments; their timeline (kiln's), a note put on it |
+| `GET/POST logs/config/indexes`, `GET/PUT/DELETE logs/config/indexes/{name}`, `GET/PUT logs/config/index-order` | log indexes (§8.10), Datadog's API: listed in order (each its quota's word and kiln's day of it), made, read, changed whole but its name, removed, ordered; a log search's `indexes` |
 | `GET containers`, `GET containers/{id}` | every container (§10.10): running, stopped or both, found, ordered and paged; one whole, by its id or the first 12 of its hex |
 | `GET/POST notebooks`, `GET/PUT/DELETE notebooks/{id}`, `POST incidents/{id}/postmortem` | notebooks (§11.1), Datadog's v1 API at kiln's paths: made, listed (Datadog's filters, order and pages), read (each graph cell with kiln's drawing of it), changed whole, removed; an incident's postmortem made of a template and attached to it |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
@@ -1390,6 +1405,64 @@ replaces is never stored, replicated, archived or sent anywhere.
   may match); a line no group may find anything in keeps the collector's and OTLP's fast path (its
   row written from the line, no record made), and that is checked against every scan in tests:
   whatever the check passes over, no rule would have touched.
+
+### 8.10 Log indexes
+
+Datadog's log indexes (`crate::observe::indexes`): which records are kept for search, how many a day
+and how long. What is not kept is still seen live, archived and counted by metrics from logs, as
+Datadog's are.
+
+- **Routed** where a record is taken (each node: the server's API and intakes, a runner's OTLP
+  receiver and collectors), after the pipelines and the scanner: into the first index, in their
+  order, whose filter it matches; none, it is not kept for search. There, the first of the index's
+  enabled exclusion filters that matches it decides alone: it is excluded at the filter's rate, by a
+  hash so that every node decides alike (of the value of the filter's `sample_attribute` where it
+  names one, a record without it kept; else of its trace id, a trace's records together, as
+  Datadog's; else of the record itself, its message at its time). kiln's events are not an index's:
+  a part of their own, whatever the indexes say. Until one is made there is one index, `main`, of
+  every record: its part the main one, so nothing changes until an index is made. A run whose
+  records go to more than one part is split, and only then: records moved into runs made their
+  size, a collector's rows copied as written into buffers of their size (each row's time, its first
+  field, chained anew from its part's row before); a run whose records all go into one part goes on
+  whole. Where every record goes into one part (`main` as made), nothing is read but each record's
+  source, and a collector's rows not at all. The server keeps the indexes (`<observe>/indexes.json`) and tells
+  every runner, as it does pipelines.
+- **Kept** each index's records as a part of the store of its own (§4.6), for its own time
+  (`num_retention_days`; none, the store's); records not kept, an hour (archives take a cut's files
+  within a quarter of an hour and half a minute; metrics from logs count within seconds;
+  `KILN_OBSERVE_TRANSIT_MS` for tests). An index removed: its records no longer searched at once, its
+  files let go within a minute (its part's cutoff moved to now), and its name, Datadog's rule, never
+  used again (`main`'s aside, made again of the main part). Only a removal lets a part go: the list
+  keeps the parts of indexes removed, and a part no list names is kept as long as the logs are (a
+  leader that has not heard the list yet lets nothing go; a list that does not read is kept aside,
+  said, and `main` takes every record until indexes are made again, each given a part the store
+  holds nothing of).
+- **Daily quota** (`daily_limit`): the records an index kept since its day began (its
+  `daily_limit_reset`, `HH:00` at `±HH:00`; 14:00 UTC unless said, Datadog's), counted on the server
+  from every write it proposes (its items' rows, read from their heads: nothing decompressed); at its
+  warning threshold (50 to 99.99%), and at its quota, an event (`event.type:logs.quota`,
+  `@datadog_index`), once a day each; past its quota, the index's records go where those not kept go,
+  on every node (the server tells them at once), until its day turns: a write or two already on its
+  way past it at the most (Datadog's quota is an approximate one too). A server that starts counts
+  the day so far from the store, a block at a time (a block reaching back past the day's start
+  counted whole: a little more, never less).
+- **Estimated usage**, Datadog's metrics: `datadog.estimated_usage.logs.ingested_events` and
+  `…_bytes`, counts of what each node took, tagged `datadog_index` and `datadog_is_excluded` (`N/A`
+  for a record of no index), every 15 seconds of their own (a node may look at its host once an
+  hour, or never); a record over its index's quota counted its index's. A record's bytes are its
+  fields' (as its weight in the intake's bound is counted); a collector's rows, their bytes as
+  written, whether `main` takes them whole unread or indexes read and split them.
+  Not tagged by `service` or `status` as Datadog's events count is: the router reads no more of a
+  record than it must.
+- **The API**, Datadog's at kiln's paths: `GET/POST logs/config/indexes`, `GET/PUT/DELETE
+  logs/config/indexes/{name}` (`disable_daily_limit` to remove a quota), `GET/PUT
+  logs/config/index-order`; an index as Datadog gives one (`is_rate_limited`), and beside it, kiln's:
+  its part and its day against its quota. Refused, saying why: a name not Datadog's (a lowercase
+  letter, then lowercase letters, digits and hyphens), a query that does not read, a rate past 0 to
+  1, a reset not `HH:00` or an offset past -12 to +14, a threshold past 50 to 99.99, an order not of
+  every index; one past 100 indexes (Datadog's 422). Changing them is a maintainer's
+  (`observe.manage`); reading them, a viewer's. A log search, aggregate, facets or patterns read the
+  indexes named (`indexes`, Datadog's `filter.indexes`), else every one and kiln's events.
 
 ## 9. Monitors
 
@@ -2262,8 +2335,13 @@ sees them: each node looks at its own every 15 seconds, on a thread of its own.
   can be read (Docker's, Podman's rootful and rootless, Docker Desktop's; `DOCKER_HOST`'s): its name,
   image (`image_name`, `image_tag`, `short_image`, Datadog's tags), Compose service and project.
   The engine is asked (`GET /containers/json`, HTTP/1.0 over its socket, kiln's own few lines of
-  std) when a container it has not named and not been asked about appears, at most once a look, and
-  every five minutes besides; a node without either reports its containers by id.
+  std) at a look where a container appears that it has not named, once a look: a container is named
+  at the look it first appears in, or, its cgroup there before the engine lists it as it starts, at
+  the next; one the engine still does not name after 30 s (another engine's: a Kubernetes node's
+  containerd beside Docker) is no reason to ask again. And every five minutes besides; a node
+  without either reports its containers by id. (It was asked at most every 15 s, and about a
+  container the engine had not listed yet as it started, not again for five minutes: a runner
+  looking every 2 s wrote such a container's samples under a series without its name until then.)
 - **Where the cgroups are not seen** (Docker Desktop's VM, on macOS and Windows, its named pipe
   there), the engine's stats are read instead (`GET /containers/{id}/stats?stream=false&one-shot=true`),
   a container at a time, as `docker stats` reads them.
@@ -2429,6 +2507,12 @@ time range and the search in the address (a page is a link).
   that was found, what put it right and how soon), marked failed by hand in a dialog (what put it
   right: a later deployment of its service and environment, a rollback or a fix rolled forward) or
   not failed again.
+- **Indexes** (a link from the logs explorer): each index in the order records are routed, the
+  records it takes, its day against its quota (a meter; past its quota, until when), how long it
+  keeps them and its exclusion filters; moved, edited and removed from its row. Made and edited in a
+  form: a name, a search, its days, its quota (its day's hour and offset, its warning), each
+  exclusion filter in order (a name, a search, the share excluded, the attribute sampled by, on or
+  off), its tags. The logs explorer reads every index, or one picked.
 - **Pipelines** (a link from the logs explorer): kiln's own and yours in the order they apply, each
   its filter, processors and whether it is on; turned off and on, yours moved and removed, kiln's
   copied to be changed. A pipeline's page lists its processors in order, each edited as its type
@@ -4158,6 +4242,62 @@ container's is read once (it was read again at each comparison, a match on the f
 them) and the page selected before it alone is sorted (a selection is linear): 0.65 ms at 50,000
 where sorting all of them took 7.4.
 
+### 12.35 Log indexes
+
+`cargo bench -p kiln --bench indexes` (adacachy, 2026-10-23, release; the least of nine runs and
+their median, and the allocations of one; built holding the machine's heavy-job lock, run at normal
+priority once it was free, the load 78 to 115 on 32 cores from others' work). Records as a busy
+node takes them (an access log's lines of five services, a tenth debug, a third with a trace id),
+100,000 routed: as a collector's rows (segments of a block's text) and as records in runs of a
+thousand; by `main` as kiln makes it, and by four indexes (`payments`, `audit`, `errors`, and `main`
+last with two exclusion filters: every debug record, half of `web`'s). What routing gives back is
+let go after it is timed.
+
+| routed, a record | as first written | now |
+| --- | --- | --- |
+| `main` alone, a collector's rows | 7.0 / 8.5 ns, 0 | under 0.05 ns, 0 |
+| `main` alone, records | 69.7 / 121.4 ns, 0 | 11.5 / 22.9 ns, 0 |
+| four indexes, a collector's rows | 198.6 / 257.9 ns, 0.038 | 96.3 / 104.4 ns, 0.004 |
+| four indexes, records | 546.8 / 784.8 ns, 0.040 | 75.5 / 128.0 ns, 0.006 |
+
+As first written, the bench timed the records' freeing too (nine frees a record, and a collector's
+segments' buffers): most of `main`'s time and of the records' under four indexes. Under `main` as
+made, a collector's rows are handed on whole, nothing read: the time of a few hundred segments, none
+a record's. Of the rest: a run of records was read twice for kiln's events (a count, then each
+record's bytes counted alone), one pass now; a split run's records were pushed into growing runs,
+its rows written again field by field into growing buffers (`put_row_ref`: each attribute's key
+checked, each value cut). Now each record's part and bytes are read once into buffers kept from run
+to run, a run whose records go into one part goes on whole, and a split one's runs are made their
+size; a collector's rows are copied as written, but for each row's time, its first field, chained
+anew from its part's row before (`put_row_rechained`), into buffers made their size. What is left
+is reading each record against the indexes' filters (four, and `main`'s two exclusion filters, one
+of them sampled by a hash): a collector's rows, each read in place (its lengths' varints) and copied,
+96 ns; records, read where they lie and moved, 76 ns.
+
+A store of 2,000,000 of them, in one part, and in four (as four indexes keep them), written a
+thousand at a time (a head is sealed whole once it holds a block's text: writes of one size seal
+blocks alike, one part or four), searched:
+
+| searched | one part | four parts |
+| --- | --- | --- |
+| the newest 100 | 0.395 / 0.459 ms, 955 | 1.103 / 1.218 ms, 957 |
+| a service's newest 100 | 0.240 / 0.270 ms, 946 | 0.973 / 1.050 ms, 948 |
+| a count by status of all | 46.3 / 62.7 ms, 1,076 | 46.4 / 59.9 ms, 1,076 |
+
+As first written, a search made a record of each row that came among the best so far (some nine
+allocations) as it read: a block is read oldest first, so each newer row was made a record and most
+were let go again, 45,029 allocations for the newest 100 (1.78 ms, its writes then of 5,000, its
+blocks 5,000 rows) and 9,029 for a service's. The best are kept as their rows' bytes now (each
+copied as written, its time chained from 0, into one buffer written again, the best alone, once
+rows let go are most of it), a record made of each of the last alone: 955 allocations, nearly all
+of them the 100 records'. A count of all costs the same in one part as in four. The newest 100 of
+four parts cost three times one part's: the newest block of each part reaches back to the same
+minute, so four blocks are read where one was (a block's rows are read from its oldest; reading it
+from its newest would want an index of its rows' places, a change of the blocks' format left for
+when it is worth it). As first written, the four parts' count took 125 ms against one part's 80:
+their writes of 5,000 split four ways sealed blocks half the size, each read with its own cost; of
+writes alike, the same.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -4854,13 +4994,20 @@ and a runner as processes of their own, the runner looking every 2 s. Two contai
 string until the kernel kills it, again every second, under 32 MiB and no swap. The busy one listed
 by its name, with its id, engine and image (`docker`, `alpine`, `latest`); its CPU between 0.35 and
 0.55 cores, its limits (0.5 cores, 64 MiB), throttled, its processes. The other's OOM kills counted
-by Datadog's query (`sum:container.memory.oom_events{container_name:…}.as_count()`), it running on
-under its 32 MiB. Every container Docker ran before and after 20 s found among those listed
+by Datadog's query (`sum:container.memory.oom_events{container_name:…}.as_count()`), each once: over
+20 s the count grows as the kernel's own does (`memory.events`, read in the container), within a
+look's kills at either end, and is never more (the kills before kiln's first look are not counted,
+as Datadog's are not: a count begins at its first sample); it running on under its 32 MiB. Every container Docker ran before and after 20 s found among those listed
 (others' jobs' come and go here; five minikube nodes' pods besides); one found by the first 12 of
 its id; an id that is none, 404. The busy one removed: among the stopped (its samples stopped), no
-longer among the running, counted. 2026-10-22: passes (125–151 s; adacachy, its load 55–90). Its
-first run found no OOM kill in two minutes: the `awk` appended 32 bytes at a time, copying its
-string each time, and never reached its limit. In a browser (`ui/e2e/observe.mjs`; Chromium and
+longer among the running, counted. 2026-10-22: passes (125–151 s; adacachy, its load 55–90); with
+the kernel's count, passes (159 s). Its first run found no OOM kill in two minutes: the `awk`
+appended 32 bytes at a time, copying its string each time, and never reached its limit. The
+kernel's count found the check writing its per-look deltas (OOM kills, throttled periods) as
+cumulative counters, which `.as_count()` undercounts (counts now). A run whose server did not
+answer in a minute found the server's HTTP listener started 25 to 60 s late: as it began, the fleet
+loop hashed kiln's own binary (a debug build's 1.25 GB) on a runtime shard, and every task on that
+shard waited; it is hashed on the blocking pool first now (§13's servers listen within a second). In a browser (`ui/e2e/observe.mjs`; Chromium and
 WebKit, a desktop's width and a phone's): two containers as Datadog's Agent's container check sends
 them (`/api/v1/series`, its tags: id, name, image, `containerd`, a pod of `shop`, `burstable`): one
 reporting now, near its quota (0.46 of 0.5 cores: 92%, told apart), throttled 150 ms a second, its
@@ -4877,6 +5024,47 @@ own found what the scenario could not: a CPU of 0.000434 cores written `4.34e-4`
 host's name wrapping in its column, charts' lines named `1: *` and `2: *` (now In use, Limit, …;
 a host's page's too), and a y axis cutting `47.7 KiB/s` to `.7 KiB/s` (every chart's axis is now as
 wide as its longest label).
+
+**Log indexes** (`crates/kiln/tests/observe_indexes.rs`): a kiln server and a runner as processes of
+their own. `main` as kiln makes it: alone, of every record, of the main part. Refused, saying why
+(400): a name with a capital, a sample rate of 1.5, a reset at 14:30, a filter that does not read,
+`main` again; an index that is not, 404. `audit` made (of `service:audit`, a quota of 100 a day
+warned at 80%, kept 30 days), then `payments` (of `service:payments`), each of a part of its own; an
+order leaving one out refused, then `audit`, `payments`, `main`. `main` given two exclusion filters:
+every debug record, and half of `web`'s. A metric from logs of every `web` record. A viewer reads the
+indexes and is refused changing them (403). The runner joins, told the indexes as it connects.
+Through the server's API, 400 of `web`'s, 20 debug records, 30 of `payments`', and `audit`'s 150
+ten at a time; through the runner's OTLP receiver, 20 lines, half of them debug (routed there).
+Found: the runner's 10 of info (its debug ones excluded there), no debug record, about half of
+`web`'s (150 to 250), `audit`'s 100 to 120 (its quota, a write or two past it), `payments`' 30; a
+search of `audit` alone, of `payments` alone (its 30), none of `audit`'s in `main`; of an index
+that is not, 400. `audit` over its quota (`is_rate_limited`, its day's count against its limit),
+its warning and its reaching each an event, once. Those not kept still counted: every `web` record,
+400, by the metric from logs, each once; Datadog's estimated usage, `audit`'s 150 (those past its
+quota too), `payments`' 30, `main`'s 440 kept and excluded, 180 of them excluded at the least.
+`audit` removed: its records no longer found, its name refused again, the order `payments`, `main`.
+The server stopped and started: the indexes as they were (`main`'s two exclusion filters), and a
+moment on (the leader states each part's cutoff as it begins to lead) the records of `web`, the
+runner's and `payments`' all as they were, `audit`'s still not found. 2026-10-22: passes (141 s;
+adacachy). Its first run found the estimated usage never written on the server: it was written as
+often as a node looks at its host (the fleet's server once an hour; a node may be told never); it
+has its own 15 s now. Reviewing the code before it ran found worse: the leader let go every part of
+the logs no index named, `main`'s too, so a leader that had not yet heard the list (the server's,
+as it starts) or a list that did not read would have expired every record. Only a part said removed
+is let go now (the list keeps them); `payments`' part kept across the restart checks it. In a
+browser (`ui/e2e/observe.mjs`; Chromium and WebKit, a desktop's width and a phone's): an index made
+from its form (its records' filter, a daily quota of 1,000 warned at 80%, an exclusion filter of
+debug records), the API agreeing; moved up from its row until it is first; nothing wider than a
+phone; ten of its records sent, five of them debug: the explorer, its index picked, lists its five
+of info alone; its quota removed in its form (none on the server); removed from its row, gone.
+2026-10-23: passes in all four (3.3–7.8 s each; adacachy); and the whole suite, 40 scenarios, in
+all four but one: WebKit's phone failed the metrics from logs' scenario, which left the metrics
+explorer as it loaded (its query's fetch cut short, "Load failed", or the next page's load cut
+short by its own); the scenario waits for its chart now, as a person would (5 of 5 there since).
+Looking at the page with a team's indexes in it found its phone rows cutting their retention short
+("30 da…") beside their buttons, and an index past its warning told by a colour alone: the buttons
+go beside the name now, its day and time on a line of their own, and past its warning or over its
+quota is said in words on both widths.
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,

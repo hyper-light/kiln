@@ -316,6 +316,20 @@ impl LogPart {
     }
 }
 
+/// Appends a row as it was written (`row`: its bytes, its time first, chained from the row before
+/// it there), its time `ts` chained from `prev_ts` instead: the rest of it copied as it is (a run
+/// split, each part's rows chained anew without reading them again). `false`, nothing appended, if
+/// its time does not read.
+pub fn put_row_rechained(out: &mut Vec<u8>, row: &[u8], ts: i64, prev_ts: i64) -> bool {
+    let mut at = row;
+    if varint::get(&mut at).is_none() {
+        return false;
+    }
+    varint::put(out, varint::zig(ts.wrapping_sub(prev_ts)));
+    out.extend_from_slice(at);
+    true
+}
+
 /// Appends rows written as a run of their own (their times chained from 0) after a row of time
 /// `prev_ts`, as one run: the first's time chained from it, the rest as they are. `false`, nothing
 /// appended, if the first row's time does not read.
@@ -345,6 +359,13 @@ pub struct Rows<'a> {
 impl<'a> Rows<'a> {
     pub fn new(data: &'a [u8], rows: usize) -> Self {
         Self { at: data, prev_ts: 0, left: rows }
+    }
+
+    /// The next row, and its bytes as written (its time chained from the row before it).
+    pub fn next_row_bytes(&mut self) -> Result<Option<(RecordRef<'a>, &'a [u8])>, RowError> {
+        let before = self.at;
+        let Some(r) = self.next_row()? else { return Ok(None) };
+        Ok(Some((r, before.get(..before.len() - self.at.len()).unwrap_or_default())))
     }
 
     pub fn next_row(&mut self) -> Result<Option<RecordRef<'a>>, RowError> {

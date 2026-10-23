@@ -164,13 +164,29 @@ pub struct Batcher {
 #[derive(Debug, Default)]
 pub struct Logs {
     pub parts: Vec<LogPart>,
+    /// Each run's part of the store, by its place (`super::indexes::route_logs`); one not said,
+    /// the main part's.
+    pub into: Vec<u16>,
 }
 
 pub use kiln_obs::logs::record::LogPart;
 
 impl From<Vec<Record>> for Logs {
     fn from(records: Vec<Record>) -> Self {
-        Self { parts: if records.is_empty() { Vec::new() } else { vec![LogPart::Records(records)] } }
+        Self { parts: if records.is_empty() { Vec::new() } else { vec![LogPart::Records(records)] }, into: Vec::new() }
+    }
+}
+
+impl Logs {
+    /// kiln's events, of their own part of the store whatever the indexes say.
+    pub fn events(records: Vec<Record>) -> Self {
+        Self { parts: if records.is_empty() { Vec::new() } else { vec![LogPart::Records(records)] }, into: vec![kiln_obs::logs::store::EVENTS] }
+    }
+}
+
+impl From<Vec<LogPart>> for Logs {
+    fn from(parts: Vec<LogPart>) -> Self {
+        Self { parts, into: Vec::new() }
     }
 }
 
@@ -236,6 +252,8 @@ struct LogSegment {
     rows: u32,
     weight: usize,
     last_ts: i64,
+    /// Its part of the store.
+    part: u16,
 }
 
 /// A segment of rows the batcher writes records into: a log block's text (a write, a megabyte,
@@ -381,16 +399,19 @@ impl Batcher {
 
     /// Log records, and rows a collector wrote, waiting for the next write, in their order.
     pub fn logs(&mut self, logs: impl Into<Logs>, now: Instant) {
-        for part in logs.into().parts {
+        let Logs { parts, into } = logs.into();
+        for (i, part) in parts.into_iter().enumerate() {
+            let into = into.get(i).copied().unwrap_or(kiln_obs::logs::store::MAIN);
             match part {
-                LogPart::Records(records) => self.records(records, now),
-                LogPart::Rows { raw, rows, last_ts } => self.rows(raw, rows, last_ts, now),
+                LogPart::Records(records) => self.records(records, into, now),
+                LogPart::Rows { raw, rows, last_ts } => self.rows(raw, rows, last_ts, into, now),
             }
         }
     }
 
-    /// Records written as rows as they come, into segments (a record past the bound dropped).
-    fn records(&mut self, records: Vec<Record>, now: Instant) {
+    /// Records written as rows as they come, into segments of `into`'s (a record past the bound
+    /// dropped).
+    fn records(&mut self, records: Vec<Record>, into: u16, now: Instant) {
         let (mut seg, mut prev): (Option<LogSegment>, i64) = (None, 0);
         for r in records {
             let n = record_bytes(&r);
@@ -400,7 +421,7 @@ impl Batcher {
                 continue;
             }
             if seg.is_none() {
-                seg = Some(LogSegment { raw: self.log_spare.pop().unwrap_or_default(), rows: 0, weight: 0, last_ts: 0 });
+                seg = Some(LogSegment { raw: self.log_spare.pop().unwrap_or_default(), rows: 0, weight: 0, last_ts: 0, part: into });
                 prev = 0;
             }
             let Some(s) = seg.as_mut() else { continue };
@@ -419,8 +440,8 @@ impl Batcher {
         self.logs.extend(seg);
     }
 
-    /// A segment of rows a collector wrote, whole (dropped past the bound).
-    fn rows(&mut self, raw: Vec<u8>, n: u32, last_ts: i64, now: Instant) {
+    /// A segment of rows a collector wrote, whole, of `into`'s (dropped past the bound).
+    fn rows(&mut self, raw: Vec<u8>, n: u32, last_ts: i64, into: u16, now: Instant) {
         let bytes = raw.len();
         if n == 0 {
             self.spare_segment(raw);
@@ -434,7 +455,7 @@ impl Batcher {
         }
         self.log_bytes += bytes;
         self.logs_in += u64::from(n);
-        self.logs.push_back(LogSegment { raw, rows: n, weight: bytes, last_ts });
+        self.logs.push_back(LogSegment { raw, rows: n, weight: bytes, last_ts, part: into });
         self.first_waiting.get_or_insert(now);
     }
 
@@ -670,12 +691,13 @@ impl Batcher {
     fn take_logs(&mut self) {
         let room = ENTRY_BUDGET.saturating_sub(self.builder.byte_len()) * 255 / 256;
         let alone = self.builder.items() == 0;
-        let mut joined = std::mem::take(&mut self.log_joined);
-        joined.clear();
-        let (mut first, mut rows, mut last) = (true, 0u32, 0i64);
+        // Each part's segments joined (most writes: the main part's alone, in the buffer kept).
+        let mut joined: Vec<(u16, Vec<u8>, u32, i64)> = Vec::new();
+        let (mut first, mut taken) = (true, 0usize);
         while let Some(s) = self.logs.front() {
-            // A first time chained again is a byte longer at the most.
-            if !(alone && first) && joined.len() + s.raw.len() + 1 + 64 > room {
+            // A first time chained again is a byte longer at the most; an item's head, 64.
+            let new_part = !joined.iter().any(|(p, ..)| *p == s.part);
+            if !(alone && first) && taken + s.raw.len() + 1 + 64 * (1 + usize::from(new_part)) > room {
                 if first {
                     self.records_first = true;
                 }
@@ -683,22 +705,42 @@ impl Batcher {
             }
             let Some(s) = self.logs.pop_front() else { break };
             first = false;
-            if kiln_obs::logs::record::put_rows_after(&mut joined, &s.raw, last) {
-                rows += s.rows;
-                last = s.last_ts;
-            } else {
-                // Never so of rows written here; were it, they go, counted.
-                self.dropped += u64::from(s.rows);
+            let at = match joined.iter().position(|(p, ..)| *p == s.part) {
+                Some(at) => at,
+                None => {
+                    let mut buf = if joined.is_empty() { std::mem::take(&mut self.log_joined) } else { self.log_spare.pop().unwrap_or_default() };
+                    buf.clear();
+                    joined.push((s.part, buf, 0, 0));
+                    taken += 64;
+                    joined.len() - 1
+                }
+            };
+            if let Some((_, buf, rows, last)) = joined.get_mut(at) {
+                let before = buf.len();
+                if kiln_obs::logs::record::put_rows_after(buf, &s.raw, *last) {
+                    *rows += s.rows;
+                    *last = s.last_ts;
+                } else {
+                    // Never so of rows written here; were it, they go, counted.
+                    self.dropped += u64::from(s.rows);
+                }
+                taken += buf.len() - before;
             }
             self.logs_cut += u64::from(s.rows);
             self.log_bytes = self.log_bytes.saturating_sub(s.weight);
             self.left_log_bytes += s.weight as u64;
             self.spare_segment(s.raw);
         }
-        if rows > 0 {
-            self.builder.log_rows(&joined, rows);
+        for (i, (part, buf, rows, _)) in joined.into_iter().enumerate() {
+            if rows > 0 {
+                self.builder.log_rows_in(part, &buf, rows);
+            }
+            if i == 0 {
+                self.log_joined = buf;
+            } else {
+                self.spare_segment(buf);
+            }
         }
-        self.log_joined = joined;
     }
 
     /// Spans' segments, whole, as many as fit (one always fits a write of nothing else: a segment
@@ -1120,13 +1162,13 @@ mod tests {
         let parts = vec![LogPart::Records(vec![rec(5), rec(1)]), rows(&[4, 2]), LogPart::Records(vec![rec(6)]), rows(&[3])];
         let mut b = Batcher::new(9);
         let t0 = Instant::now();
-        b.logs(Logs { parts }, t0);
+        b.logs(Logs::from(parts), t0);
         let Some((_, entry)) = b.poll(t0 + FLUSH, 1_700_000_000_000) else { anyhow::bail!("no write") };
         let Ok(Command::Write { batch, .. }) = command::decode(&entry) else { anyhow::bail!("not a write") };
         let mut items = kiln_obs::batch::Reader::new(batch)?;
         let (mut read, mut logs_items) = (Vec::new(), 0);
         while let Some(item) = items.next_item()? {
-            if let kiln_obs::batch::Item::Logs { rows, raw_len, packed } = item {
+            if let kiln_obs::batch::Item::Logs { rows, raw_len, packed, .. } = item {
                 logs_items += 1;
                 let mut raw = Vec::new();
                 kiln_obs::lz4::decompress(packed, &mut raw, raw_len)?;

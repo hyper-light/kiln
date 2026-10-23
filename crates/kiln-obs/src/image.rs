@@ -18,6 +18,9 @@
 //!
 //! An image of a store that holds spans is `KOIMAGE2`, with their cutoff, and names spans files
 //! (kind 2); one of a store that never did is `KOIMAGE1`, as a build that knows no spans reads it.
+//! One whose logs have parts (`crate::logs::store::Part`: a part's files, named by it, or its own
+//! retention) is `KOIMAGE3`: as `KOIMAGE2`, and after the spans' cutoff each part's,
+//! `parts varint | (part u16-le | cutoff i64-le)*`.
 
 use std::collections::BTreeMap;
 
@@ -28,6 +31,8 @@ use crate::varint;
 pub const MAGIC: [u8; 8] = *b"KOIMAGE1";
 /// An image of a store that holds spans.
 pub const MAGIC_SPANS: [u8; 8] = *b"KOIMAGE2";
+/// An image of a store whose logs have parts.
+pub const MAGIC_PARTS: [u8; 8] = *b"KOIMAGE3";
 
 /// Files an image names at the most: a store keeps O(log n) blocks of n samples (Bentley–Saxe) and
 /// a logs file a cut, so this many is damage, not a store.
@@ -63,6 +68,8 @@ pub struct Image {
     pub sessions: BTreeMap<u64, Session>,
     /// In write order.
     pub files: Vec<ImageFile>,
+    /// Parts of the logs kept for their own time: their cutoffs (ms).
+    pub part_cutoffs: BTreeMap<u16, i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -77,7 +84,7 @@ pub enum ImageError {
 
 impl Default for Image {
     fn default() -> Self {
-        Self { cutoff: 0, logs_cutoff: 0, spans_cutoff: i64::MIN, max_series: 0, sessions: BTreeMap::new(), files: Vec::new() }
+        Self { cutoff: 0, logs_cutoff: 0, spans_cutoff: i64::MIN, max_series: 0, sessions: BTreeMap::new(), files: Vec::new(), part_cutoffs: BTreeMap::new() }
     }
 }
 
@@ -87,14 +94,33 @@ impl Image {
         self.spans_cutoff != i64::MIN || self.files.iter().any(|f| f.kind == FileKind::Spans)
     }
 
+    /// Whether its logs have parts.
+    fn has_parts(&self) -> bool {
+        !self.part_cutoffs.is_empty() || self.files.iter().any(|f| f.kind == FileKind::Logs && crate::manifest::part_of(&f.name) != crate::logs::store::MAIN)
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
         let start = out.len();
-        let spans = self.has_spans();
-        out.extend_from_slice(if spans { &MAGIC_SPANS } else { &MAGIC });
+        let parts = self.has_parts();
+        let spans = parts || self.has_spans();
+        out.extend_from_slice(if parts {
+            &MAGIC_PARTS
+        } else if spans {
+            &MAGIC_SPANS
+        } else {
+            &MAGIC
+        });
         out.extend_from_slice(&self.cutoff.to_le_bytes());
         out.extend_from_slice(&self.logs_cutoff.to_le_bytes());
         if spans {
             out.extend_from_slice(&self.spans_cutoff.to_le_bytes());
+        }
+        if parts {
+            varint::put(out, self.part_cutoffs.len() as u64);
+            for (part, cutoff) in &self.part_cutoffs {
+                out.extend_from_slice(&part.to_le_bytes());
+                out.extend_from_slice(&cutoff.to_le_bytes());
+            }
         }
         varint::put(out, self.max_series);
         varint::put(out, self.sessions.len() as u64);
@@ -123,9 +149,12 @@ impl Image {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ImageError> {
         let (body, crc) = bytes.split_last_chunk::<4>().ok_or(ImageError::Magic)?;
-        let (mut at, spans) = match body.strip_prefix(&MAGIC[..]) {
-            Some(at) => (at, false),
-            None => (body.strip_prefix(&MAGIC_SPANS[..]).ok_or(ImageError::Magic)?, true),
+        let (mut at, spans, parts) = if let Some(at) = body.strip_prefix(&MAGIC[..]) {
+            (at, false, false)
+        } else if let Some(at) = body.strip_prefix(&MAGIC_SPANS[..]) {
+            (at, true, false)
+        } else {
+            (body.strip_prefix(&MAGIC_PARTS[..]).ok_or(ImageError::Magic)?, true, true)
         };
         if crc32c::checksum(body) != u32::from_le_bytes(*crc) {
             return Err(ImageError::Checksum);
@@ -140,7 +169,28 @@ impl Image {
             spans_cutoff = i64::from_le_bytes(*c);
             at = rest;
         }
-        let mut image = Self { cutoff: i64::from_le_bytes(*cutoff), logs_cutoff: i64::from_le_bytes(*logs_cutoff), spans_cutoff, max_series: varint::get(&mut at).ok_or(d("max series"))?, ..Self::default() };
+        let mut part_cutoffs = BTreeMap::new();
+        if parts {
+            let n = varint::get(&mut at).ok_or(d("parts"))?;
+            // Each takes 10 bytes: a count past that is damage.
+            if n > (at.len() / 10) as u64 {
+                return Err(d("parts"));
+            }
+            for _ in 0..n {
+                let (p, rest) = at.split_first_chunk::<2>().ok_or(d("a part"))?;
+                let (c, rest) = rest.split_first_chunk::<8>().ok_or(d("a part"))?;
+                at = rest;
+                part_cutoffs.insert(u16::from_le_bytes(*p), i64::from_le_bytes(*c));
+            }
+        }
+        let mut image = Self {
+            cutoff: i64::from_le_bytes(*cutoff),
+            logs_cutoff: i64::from_le_bytes(*logs_cutoff),
+            spans_cutoff,
+            max_series: varint::get(&mut at).ok_or(d("max series"))?,
+            part_cutoffs,
+            ..Self::default()
+        };
         let sessions = varint::get(&mut at).ok_or(d("sessions"))?;
         // Each session takes 11 bytes at least: a count past that is damage.
         if sessions > (at.len() / 11) as u64 {
@@ -176,7 +226,7 @@ impl Image {
             let (name, rest) = at.split_at_checked(len).ok_or(d("a file's name"))?;
             at = rest;
             let name = std::str::from_utf8(name).map_err(|_| d("a file's name"))?;
-            if !plain_name(name) {
+            if !plain_name(name) || (kind == FileKind::Logs && !parts && crate::manifest::part_of(name) != crate::logs::store::MAIN) {
                 return Err(d("a file's name"));
             }
             image.files.push(ImageFile { kind, seq, name: name.to_owned(), bytes, crc: u32::from_le_bytes(*crc) });
@@ -209,6 +259,7 @@ mod tests {
                 ImageFile { kind: FileKind::Block, seq: 4, name: "0000000000000004.block".into(), bytes: 123_456, crc: 0xdead_beef },
                 ImageFile { kind: FileKind::Logs, seq: 5, name: "0000000000000005.logs".into(), bytes: 9, crc: 1 },
             ],
+            part_cutoffs: BTreeMap::new(),
         };
         let mut bytes = Vec::new();
         image.encode(&mut bytes);

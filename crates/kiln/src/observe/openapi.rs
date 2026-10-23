@@ -200,6 +200,7 @@ fn schemas() -> Map<String, Value> {
         ),
     );
     let view = describe(string(), "a rehydration's view to read (its id): the logs it read back from an archive; none, the live logs (logs only)");
+    let indexes = describe(array(string()), "the indexes read, by name (§8.10); none: every one, and kiln's events");
     put(
         "SearchRequest",
         object(
@@ -209,6 +210,7 @@ fn schemas() -> Map<String, Value> {
                 ("to", ms()),
                 ("limit", describe(integer(), "records at the most (100; 1,000)")),
                 ("view", view.clone()),
+                ("indexes", indexes.clone()),
             ],
             &["from", "to"],
         ),
@@ -257,6 +259,7 @@ fn schemas() -> Map<String, Value> {
                 ("of", describe(string(), "the facet or attribute measured (@duration)")),
                 ("step", describe(integer(), "buckets of so many ms: each group's value a bucket")),
                 ("view", view.clone()),
+                ("indexes", indexes.clone()),
             ],
             &["from", "to"],
         ),
@@ -280,7 +283,15 @@ fn schemas() -> Map<String, Value> {
     put(
         "FacetsRequest",
         object(
-            &[("query", string()), ("from", ms()), ("to", ms()), ("facets", array(string())), ("top", describe(integer(), "values a facet shows at the most (10)")), ("view", view)],
+            &[
+                ("query", string()),
+                ("from", ms()),
+                ("to", ms()),
+                ("facets", array(string())),
+                ("top", describe(integer(), "values a facet shows at the most (10)")),
+                ("view", view),
+                ("indexes", indexes),
+            ],
             &["from", "to", "facets"],
         ),
     );
@@ -942,6 +953,55 @@ fn schemas() -> Map<String, Value> {
         ("processors", array(processor)),
     ];
     put("PipelineIn", object(&pipeline_fields, &["name"]));
+    let exclusion = object(
+        &[
+            ("name", string()),
+            ("is_enabled", boolean()),
+            (
+                "filter",
+                object(
+                    &[
+                        ("query", describe(string(), "a log search: the records it matches (*, every one)")),
+                        ("sample_rate", describe(number(), "of those it matches, the share excluded: 0 to 1 (1, every one)")),
+                        ("sample_attribute", describe(string(), "whose values are sampled (@ci.job_id): a value's records all one way; a record without it kept")),
+                    ],
+                    &["sample_rate"],
+                ),
+            ),
+        ],
+        &["name", "filter"],
+    );
+    let index_fields = [
+        ("filter", object(&[("query", describe(string(), "a log search: the records it takes, the first index in order that matches"))], &[])),
+        ("exclusion_filters", describe(array(exclusion), "in order: the first enabled one that matches a record decides alone")),
+        ("daily_limit", describe(nullable(integer()), "records kept a day at the most; past it, not kept for search until its day turns")),
+        ("daily_limit_reset", object(&[("reset_time", describe(string(), "HH:00")), ("reset_utc_offset", describe(string(), "+HH:00 or -HH:00, -12 to +14"))], &["reset_time", "reset_utc_offset"])),
+        ("daily_limit_warning_threshold_percentage", describe(number(), "of the quota, the share at which a warning is said: 50 to 99.99")),
+        ("num_retention_days", describe(nullable(integer()), "days its records are kept for search (none: the store's own)")),
+        ("tags", array(string())),
+    ];
+    let mut index_in: Vec<(&str, Value)> = vec![("name", describe(string(), "a lowercase letter, then lowercase letters, digits and hyphens"))];
+    index_in.extend(index_fields.iter().cloned());
+    put("LogsIndexIn", object(&index_in, &["name", "filter"]));
+    let mut update: Vec<(&str, Value)> = index_fields.to_vec();
+    update.push(("disable_daily_limit", describe(boolean(), "its quota gone, whatever daily_limit says")));
+    put("LogsIndexUpdate", object(&update, &["filter"]));
+    let mut index_out = index_in.clone();
+    index_out.push(("is_rate_limited", describe(boolean(), "over its daily quota now")));
+    index_out.push((
+        "kiln",
+        object(
+            &[
+                ("part", describe(integer(), "its part of the store")),
+                ("created", integer()),
+                ("modified", integer()),
+                ("today", object(&[("count", integer()), ("limit", integer()), ("start", ms()), ("next_reset", ms()), ("warned", boolean())], &["count", "limit", "start", "next_reset", "warned"])),
+            ],
+            &["part"],
+        ),
+    ));
+    put("LogsIndex", object(&index_out, &["name", "filter", "is_rate_limited", "kiln"]));
+    put("LogsIndexesOrder", object(&[("index_names", array(string()))], &["index_names"]));
     let mut kept: Vec<(&str, Value)> = pipeline_fields.to_vec();
     kept.push(("id", string()));
     kept.push(("builtin", describe(boolean(), "kiln's own: read-only, but for whether it is on")));
@@ -2486,6 +2546,33 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: vec![id()], ..op("get", "/pipelines/{id}", "A log pipeline", "observe.read", None, vec![ok("Pipeline")]) },
         Op { params: vec![id()], ..op("put", "/pipelines/{id}", "Changes a log pipeline (kiln's own: whether it is on)", "observe.manage", Some(body("PipelineIn")), vec![ok("Pipeline")]) },
         Op { params: vec![id()], ..op("delete", "/pipelines/{id}", "Removes a log pipeline of yours (kiln's own are turned off instead: 400)", "observe.manage", None, vec![no_content()]) },
+        op(
+            "get",
+            "/logs/config/indexes",
+            "Lists the log indexes, in the order records are routed (Datadog's)",
+            "observe.read",
+            None,
+            vec![("200", answer_of("the indexes", object(&[("indexes", array(schema("LogsIndex")))], &["indexes"])))],
+        ),
+        op("post", "/logs/config/indexes", "Makes a log index, last in the order (Datadog's: 200; 422, one too many)", "observe.manage", Some(body("LogsIndexIn")), vec![ok("LogsIndex")]),
+        Op { params: vec![path_param("name", "the index's")], ..op("get", "/logs/config/indexes/{name}", "A log index, and its day against its quota", "observe.read", None, vec![ok("LogsIndex")]) },
+        Op {
+            params: vec![path_param("name", "the index's")],
+            ..op("put", "/logs/config/indexes/{name}", "Changes a log index whole, but its name (Datadog's)", "observe.manage", Some(body("LogsIndexUpdate")), vec![ok("LogsIndex")])
+        },
+        Op {
+            params: vec![path_param("name", "the index's")],
+            ..op(
+                "delete",
+                "/logs/config/indexes/{name}",
+                "Removes a log index: its records no longer searched, its files let go; its name never used again",
+                "observe.manage",
+                None,
+                vec![("200", answer("removed", None))],
+            )
+        },
+        op("get", "/logs/config/index-order", "The log indexes' order", "observe.read", None, vec![ok("LogsIndexesOrder")]),
+        op("put", "/logs/config/index-order", "Puts the log indexes in an order (every one, each once)", "observe.manage", Some(body("LogsIndexesOrder")), vec![ok("LogsIndexesOrder")]),
         op(
             "put",
             "/pipeline_order",

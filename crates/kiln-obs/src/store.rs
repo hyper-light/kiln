@@ -181,10 +181,26 @@ pub enum Written {
 pub enum Answer {
     /// A leader's empty entry.
     Empty,
-    Write { sender: u64, seq: u64, outcome: Written },
-    Retain { cutoff: i64, logs_cutoff: i64, series_dropped: u64 },
-    RetainSpans { spans_cutoff: i64 },
-    Limits { max_series: u64 },
+    Write {
+        sender: u64,
+        seq: u64,
+        outcome: Written,
+    },
+    Retain {
+        cutoff: i64,
+        logs_cutoff: i64,
+        series_dropped: u64,
+    },
+    RetainSpans {
+        spans_cutoff: i64,
+    },
+    RetainPart {
+        part: u16,
+        logs_cutoff: i64,
+    },
+    Limits {
+        max_series: u64,
+    },
     /// An entry that holds no command whole: applied as nothing, alike on every replica.
     Malformed(CommandError),
 }
@@ -229,6 +245,8 @@ pub struct Store {
     cutoff: i64,
     logs_cutoff: i64,
     spans_cutoff: i64,
+    /// Parts of the logs kept for their own time: their cutoffs (ms), in place of `logs_cutoff`.
+    part_cutoffs: BTreeMap<u16, i64>,
     max_series: u64,
     sessions: BTreeMap<u64, Session>,
     conf: Membership,
@@ -375,7 +393,8 @@ pub struct CutWritten {
     epoch: u64,
     manifest: Manifest,
     block: Option<OpenBlock>,
-    logs: Option<HeldFile>,
+    /// A file a part.
+    logs: Vec<HeldFile>,
     spans: Option<HeldFile>,
     /// The series whose samples the block holds.
     series: Vec<u32>,
@@ -595,6 +614,7 @@ impl Store {
             cutoff: i64::MIN,
             logs_cutoff: i64::MIN,
             spans_cutoff: i64::MIN,
+            part_cutoffs: BTreeMap::new(),
             max_series: 0,
             sessions: BTreeMap::new(),
             conf: Membership::default(),
@@ -660,14 +680,15 @@ impl Store {
         store.blocks.sort_by_key(|b| b.seq);
         for e in &manifest.logs {
             let log = LogFile::open(&dir.join(&e.file))?;
-            store.logs.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log: Arc::new(log) });
+            store.logs.files.push(HeldFile { seq: e.seq, file: e.file.clone(), part: manifest::part_of(&e.file), log: Arc::new(log) });
         }
         for e in &manifest.spans {
             let log = LogFile::open(&dir.join(&e.file))?;
-            store.spans.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log: Arc::new(log) });
+            store.spans.files.push(HeldFile { seq: e.seq, file: e.file.clone(), part: crate::logs::store::MAIN, log: Arc::new(log) });
         }
         store.cutoff = manifest.cutoff;
         store.logs_cutoff = manifest.logs_cutoff;
+        store.part_cutoffs = manifest.part_cutoffs.clone();
         store.spans_cutoff = manifest.spans_cutoff;
         store.max_series = manifest.max_series;
         store.sessions = manifest.sessions.clone();
@@ -780,6 +801,21 @@ impl Store {
     }
 
     /// No log record older is kept or read (ms), as of the last entry applied.
+    /// The parts of the logs it holds (rows in memory or in files).
+    pub fn log_parts(&self) -> Vec<u16> {
+        self.logs.parts()
+    }
+
+    /// Rows of a part of the logs since `from_ns`, from summaries alone ([`LogStore::rows_in`]).
+    pub fn log_rows_in(&self, part: u16, from_ns: i64) -> u64 {
+        self.logs.rows_in(part, from_ns, i64::MAX)
+    }
+
+    /// Parts of the logs kept for their own time, and their cutoffs (ms).
+    pub fn part_cutoffs(&self) -> &BTreeMap<u16, i64> {
+        &self.part_cutoffs
+    }
+
     pub fn logs_cutoff(&self) -> i64 {
         self.logs_cutoff
     }
@@ -859,6 +895,12 @@ impl Store {
                 // before spans were kept.
                 self.spans_cutoff = self.spans_cutoff.max(spans);
                 Answer::RetainSpans { spans_cutoff: self.spans_cutoff }
+            }
+            Command::RetainPart { part, logs, .. } => {
+                // Never back: a part's retention made longer keeps what it still holds.
+                let c = self.part_cutoffs.entry(part).or_insert(i64::MIN);
+                *c = (*c).max(logs);
+                Answer::RetainPart { part, logs_cutoff: *c }
             }
         })
     }
@@ -956,7 +998,7 @@ impl Store {
                         self.pending_at.insert_unique(fp, at, |&i| pending.get(i as usize).map_or(0, |p| p.fp));
                     }
                 }
-                Item::Logs { rows, raw_len, packed } => {
+                Item::Logs { part, rows, raw_len, packed } => {
                     let mut raw = Vec::with_capacity(raw_len);
                     crate::lz4::decompress(packed, &mut raw, raw_len).map_err(|_| ApplyError::LogRows)?;
                     if raw.len() != raw_len {
@@ -971,7 +1013,7 @@ impl Store {
                         {
                             f.publish(&raw, rows);
                         }
-                        self.logs.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
+                        self.logs.append_in(part, raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
                     }
                     done.counts.logs += u64::from(rows);
                 }
@@ -1104,33 +1146,34 @@ impl Store {
         manifest.cutoff = self.cutoff;
         manifest.logs_cutoff = self.logs_cutoff;
         manifest.spans_cutoff = self.spans_cutoff;
+        manifest.part_cutoffs.clone_from(&self.part_cutoffs);
         manifest.max_series = self.max_series;
         manifest.sessions.clone_from(&self.sessions);
         manifest.conf.clone_from(&self.conf);
-        let mut w = CutWritten { applied: self.applied, epoch: self.epoch, manifest, block: None, logs: None, spans: None, series: Vec::new(), done: Maintained::default() };
+        let mut w = CutWritten { applied: self.applied, epoch: self.epoch, manifest, block: None, logs: Vec::new(), spans: None, series: Vec::new(), done: Maintained::default() };
         let mut written: Vec<PathBuf> = Vec::new();
         let made = (|| -> Result<(), StoreError> {
-            // Logs first: a file of their own, listed with the blocks in the same manifest.
-            if self.logs.unwritten_rows() > 0 {
+            // Logs first: a file of their own a part, listed with the blocks in the same manifest.
+            for part in self.logs.unwritten_parts() {
                 let seq = w.manifest.next_seq;
-                let file = manifest::logs_file(seq);
+                let file = manifest::logs_file_in(seq, part);
                 written.push(dir.join(&file));
-                if let Some(log) = self.logs.write_unwritten(&dir.join(&file))? {
+                if let Some(log) = self.logs.write_unwritten(part, &dir.join(&file))? {
                     w.done.bytes_written += log.bytes;
                     w.manifest.next_seq = seq + 1;
                     w.manifest.logs.push(BlockEntry { seq, file: file.clone() });
-                    w.logs = Some(HeldFile { seq, file, log: Arc::new(log) });
+                    w.logs.push(HeldFile { seq, file, part, log: Arc::new(log) });
                 }
             }
             if self.spans.unwritten_rows() > 0 {
                 let seq = w.manifest.next_seq;
                 let file = manifest::spans_file(seq);
                 written.push(dir.join(&file));
-                if let Some(log) = self.spans.write_unwritten(&dir.join(&file))? {
+                if let Some(log) = self.spans.write_unwritten(crate::logs::store::MAIN, &dir.join(&file))? {
                     w.done.bytes_written += log.bytes;
                     w.manifest.next_seq = seq + 1;
                     w.manifest.spans.push(BlockEntry { seq, file: file.clone() });
-                    w.spans = Some(HeldFile { seq, file, log: Arc::new(log) });
+                    w.spans = Some(HeldFile { seq, file, part: crate::logs::store::MAIN, log: Arc::new(log) });
                 }
             }
             let mut borrowed: Vec<(u32, &[Chunk])> = Vec::new();
@@ -1196,7 +1239,7 @@ impl Store {
         if let Some(b) = w.block {
             self.blocks.push(b);
         }
-        if let Some(l) = w.logs {
+        for l in w.logs {
             self.logs.written(l);
         }
         if let Some(s) = w.spans {
@@ -1336,8 +1379,9 @@ impl Store {
     fn expired(&self) -> Option<Expired> {
         let dir = self.dir.clone()?;
         let cutoff = self.manifest.cutoff;
-        let logs = self.logs.expired(self.manifest.logs_cutoff.saturating_mul(1_000_000));
-        let spans = self.spans.expired(self.manifest.spans_cutoff.saturating_mul(1_000_000));
+        let logs = self.logs.expired(&|part| self.manifest.part_cutoffs.get(&part).copied().unwrap_or(self.manifest.logs_cutoff).saturating_mul(1_000_000));
+        let spans_cutoff = self.manifest.spans_cutoff.saturating_mul(1_000_000);
+        let spans = self.spans.expired(&|_| spans_cutoff);
         let blocks: Vec<String> = self.blocks.iter().filter(|b| b.block.max_ts < cutoff).map(|b| b.file.clone()).collect();
         if logs.is_empty() && spans.is_empty() && blocks.is_empty() {
             return None;
@@ -1382,7 +1426,15 @@ impl Store {
             files.push(ImageFile { kind: FileKind::Spans, seq: l.seq, name: l.file.clone(), bytes: l.log.bytes, crc: l.log.crc });
         }
         files.sort_by_key(|f| f.seq);
-        Image { cutoff: self.manifest.cutoff, logs_cutoff: self.manifest.logs_cutoff, spans_cutoff: self.manifest.spans_cutoff, max_series: self.manifest.max_series, sessions: self.manifest.sessions.clone(), files }
+        Image {
+            cutoff: self.manifest.cutoff,
+            logs_cutoff: self.manifest.logs_cutoff,
+            spans_cutoff: self.manifest.spans_cutoff,
+            max_series: self.manifest.max_series,
+            sessions: self.manifest.sessions.clone(),
+            files,
+            part_cutoffs: self.manifest.part_cutoffs.clone(),
+        }
     }
 
     /// Bytes of the files the durable state is in.
@@ -1451,6 +1503,7 @@ impl Store {
             blocks: Vec::new(),
             logs: Vec::new(),
             spans: Vec::new(),
+            part_cutoffs: image.part_cutoffs.clone(),
         };
         let mut files: Vec<&ImageFile> = image.files.iter().collect();
         files.sort_by_key(|f| f.seq);
@@ -1459,7 +1512,8 @@ impl Store {
             manifest.next_seq += 1;
             let name = match f.kind {
                 FileKind::Block => manifest::block_file(seq),
-                FileKind::Logs => manifest::logs_file(seq),
+                // Of the part its name says.
+                FileKind::Logs => manifest::logs_file_in(seq, manifest::part_of(&f.name)),
                 FileKind::Spans => manifest::spans_file(seq),
             };
             let to = dir.join(&name);
@@ -1663,15 +1717,34 @@ impl Store {
         Ok(())
     }
 
-    /// The logs as they are now, to read with no hold of the store ([`LogsAt`]): what an API's
+    /// A part's cutoff (ms): its own retention's, else the logs'.
+    pub fn part_cutoff(&self, part: u16) -> i64 {
+        self.part_cutoffs.get(&part).copied().unwrap_or(self.logs_cutoff)
+    }
+
+    /// The logs kept for search as they are now (every part but [`crate::logs::store::TRANSIT`],
+    /// each from its cutoff), to read with no hold of the store ([`LogsAt`]): what an API's
     /// reading takes under a brief hold, and reads after.
     pub fn logs_at(&self) -> LogsAt {
-        LogsAt { snap: self.logs.snapshot(), cutoff_ns: self.logs_cutoff.saturating_mul(1_000_000) }
+        self.logs_scoped(&|p| p != crate::logs::store::TRANSIT)
+    }
+
+    /// Every part's logs, those not kept for search too: what metrics from logs count.
+    pub fn logs_every(&self) -> LogsAt {
+        self.logs_scoped(&|_| true)
+    }
+
+    /// As [`Store::logs_at`], of the parts `keep` says (a search of some indexes).
+    pub fn logs_scoped(&self, keep: &dyn Fn(u16) -> bool) -> LogsAt {
+        let floor = |p: u16| self.part_cutoff(p).saturating_mul(1_000_000);
+        let complete_ns = self.logs.parts().into_iter().filter(|&p| keep(p)).map(floor).max().unwrap_or(self.logs_cutoff.saturating_mul(1_000_000));
+        LogsAt { snap: self.logs.snapshot().scoped(&|p| keep(p).then(|| floor(p))), complete_ns }
     }
 
     /// The spans as they are now ([`LogsAt`]).
     pub fn spans_at(&self) -> LogsAt {
-        LogsAt { snap: self.spans.snapshot(), cutoff_ns: self.spans_cutoff.saturating_mul(1_000_000) }
+        let floor = self.spans_cutoff.saturating_mul(1_000_000);
+        LogsAt { snap: self.spans.snapshot().scoped(&|_| Some(floor)), complete_ns: floor }
     }
 
     /// The newest `limit` log records in `[from, to]` (ns, none older than the logs' cutoff) that
@@ -1692,13 +1765,11 @@ impl Store {
         self.logs_at().aggregate_buckets(search, from, to, step, by, measure)
     }
 
-    /// Every metric from logs' points for the window that begins at `window` (ns): none when the
-    /// logs' cutoff reaches into it (not all its records are held).
+    /// Every metric from logs' points for the window that begins at `window` (ns), of every
+    /// part's records (those not kept for search too): none when a part's cutoff reaches into it
+    /// (not all its records are held).
     pub fn count_log_metrics(&self, metrics: &[crate::logs::metrics::LogMetric], window: i64) -> Result<Option<crate::logs::metrics::Counted>, StoreError> {
-        if window < self.logs_cutoff.saturating_mul(1_000_000) {
-            return Ok(None);
-        }
-        self.logs_at().count_metrics(metrics, window)
+        self.logs_every().count_metrics(metrics, window)
     }
 
     /// Each facet's most common values over the logs a search matches, in one pass
@@ -2025,6 +2096,9 @@ impl Store {
         if self.spans_cutoff != i64::MIN {
             d = d.wrapping_add(mix(self.spans_cutoff as u64 ^ 0x3));
         }
+        for (part, cutoff) in &self.part_cutoffs {
+            d = d.wrapping_add(mix(mix(u64::from(*part) ^ 0x6) ^ *cutoff as u64));
+        }
         for (sender, s) in &self.sessions {
             d = d.wrapping_add(mix(mix(*sender) ^ s.seq));
         }
@@ -2045,14 +2119,19 @@ impl Store {
             d = d.wrapping_add(term);
         }
         if full {
-            // Every record since the logs' cutoff, visited (a sum's terms: in no order, none kept),
-            // each as its own row.
+            // Every record of each part since its cutoff, visited (a sum's terms: in no order, none
+            // kept), each as its own row, a part's but the main one's told apart by its part.
             let mut row = Vec::new();
-            self.logs.each_record(self.logs_cutoff.saturating_mul(1_000_000), i64::MAX, |r| {
-                row.clear();
-                crate::logs::record::put_row_ref(&mut row, r, 0);
-                d = d.wrapping_add(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)));
-            })?;
+            let snap = self.logs.snapshot();
+            for part in self.logs.parts() {
+                let floor = self.part_cutoff(part).saturating_mul(1_000_000);
+                let apart = if part == crate::logs::store::MAIN { 0 } else { mix(u64::from(part) ^ 0x7) };
+                snap.scoped(&|p| (p == part).then_some(floor)).each_record(i64::MIN, i64::MAX, |r| {
+                    row.clear();
+                    crate::logs::record::put_row_ref(&mut row, r, 0);
+                    d = d.wrapping_add(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)) ^ apart);
+                })?;
+            }
             // Spans as records are, apart from them (a span is not the log it would be).
             self.spans.each_record(self.spans_cutoff.saturating_mul(1_000_000), i64::MAX, |r| {
                 row.clear();
@@ -2231,14 +2310,16 @@ pub fn cut_shared(store: &RwLock<Store>, at: Point) -> Result<Maintained, StoreE
 /// behind that write; none older than the store's cutoff then.
 #[derive(Debug, Clone)]
 pub struct LogsAt {
+    /// Each part read from its own cutoff.
     snap: crate::logs::store::LogSnapshot,
-    cutoff_ns: i64,
+    /// From here on, every part read holds every record it kept (the latest of their cutoffs).
+    complete_ns: i64,
 }
 
 impl LogsAt {
     /// The newest `limit` records in `[from, to]` (ns) that `search` matches.
     pub fn search(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
-        Ok(self.snap.search(search, from.max(self.cutoff_ns), to, limit)?)
+        Ok(self.snap.search(search, from, to, limit)?)
     }
 
     /// Records in `[from, to]` that `search` matches, grouped by `by` and measured.
@@ -2250,7 +2331,7 @@ impl LogsAt {
         by: &[crate::logs::store::Facet],
         measure: &crate::logs::store::Measure,
     ) -> Result<crate::logs::store::Aggregated, crate::logs::store::AggregateError> {
-        self.snap.aggregate(search, from.max(self.cutoff_ns), to, by, measure)
+        self.snap.aggregate(search, from, to, by, measure)
     }
 
     /// As [`LogsAt::aggregate`], in buckets of `step` ns aligned to it (the buckets follow `from`
@@ -2265,23 +2346,23 @@ impl LogsAt {
         measure: &crate::logs::store::Measure,
     ) -> Result<crate::logs::store::Bucketed, crate::logs::store::AggregateError> {
         let buckets = crate::logs::store::Buckets::over(from, to, step)?;
-        self.snap.aggregate_buckets(search, from.max(self.cutoff_ns), to, buckets, by, measure)
+        self.snap.aggregate_buckets(search, from, to, buckets, by, measure)
     }
 
     /// Each facet's most common values over the records a search matches, in one pass.
     pub fn facets(&self, search: &Search, from: i64, to: i64, facets: &[crate::logs::store::Facet], top: usize) -> Result<crate::logs::store::FacetCounts, crate::logs::store::AggregateError> {
-        self.snap.facet_counts(search, from.max(self.cutoff_ns), to, facets, top)
+        self.snap.facet_counts(search, from, to, facets, top)
     }
 
     /// Every record in `[from, to]` that `search` matches, to `f`, one at a time, none kept.
     pub fn each(&self, search: &Search, from: i64, to: i64, f: impl FnMut(&crate::logs::record::RecordRef<'_>)) -> Result<(), StoreError> {
-        Ok(self.snap.each_matching(search, from.max(self.cutoff_ns), to, f)?)
+        Ok(self.snap.each_matching(search, from, to, f)?)
     }
 
     /// Every metric from these records' points for the window that begins at `window` (ns): none
     /// when the cutoff reaches into it (not all its records are held).
     pub fn count_metrics(&self, metrics: &[crate::logs::metrics::LogMetric], window: i64) -> Result<Option<crate::logs::metrics::Counted>, StoreError> {
-        if window < self.cutoff_ns {
+        if window < self.complete_ns {
             return Ok(None);
         }
         Ok(Some(crate::logs::metrics::count(&self.snap, metrics, window)?))

@@ -158,6 +158,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::containers::start(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
+        crate::observe::indexes::start_usage(obs.clone(), crate::os::hostname(), crate::observe::indexes::USAGE_EVERY);
         crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         if let Some(n) = cfg.observe.query_helpers {
             kiln_obs::query::eval::set_helpers(n as usize);
@@ -253,6 +254,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             o.set_pipelines(pipelines.defs());
         }
         crate::observe::api::set_pipelines(pipelines);
+        // Log indexes: kept here, routed by here and by every runner; their quotas counted here.
+        let indexes = std::sync::Arc::new(crate::observe::indexes::Indexes::open(&cfg.data("observe")));
+        crate::observe::indexes::activate(&indexes.defs());
+        if let Some(o) = crate::observe::api::get() {
+            o.set_indexes(indexes.defs(), indexes.removed_parts());
+        }
+        crate::observe::indexes::http::set(indexes);
         // The sensitive data scanner's groups and key: kept here, run here and by every runner.
         let scanning = std::sync::Arc::new(crate::observe::scanner::kept::Groups::open(&cfg.data("observe")));
         let (groups, key) = scanning.defs();

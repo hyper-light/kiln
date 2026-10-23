@@ -443,6 +443,66 @@ fn logs_ride_batches_through_cuts_a_reopen_and_retention() {
     assert_eq!(s.search_logs(&all, 0, 13_000_000_000_000, 1).unwrap().records.len(), 1);
 }
 
+/// Parts of the logs (an index's; those not kept for search): each part's rows to files of its
+/// own at a cut, searched as the parts kept for search are (those not kept, apart), every part
+/// read for metrics from logs; a part's retention its own and never back, its files gone by it
+/// alone; a reopen keeps them all.
+#[test]
+fn parts_of_the_logs_are_kept_read_and_retained_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let rec = |i: i64, what: &str| Record { ts: i * 1_000_000_000, severity: 9, service: "api".into(), host: "h".into(), source: "app".into(), message: format!("{what} {i}"), ..Record::default() };
+    let put = |b: &mut Builder, part: u16, recs: &[Record]| {
+        let mut raw = Vec::new();
+        let mut prev = 0;
+        for r in recs {
+            crate::logs::record::put_row(&mut raw, r, prev);
+            prev = r.ts;
+        }
+        b.log_rows_in(part, &raw, recs.len() as u32);
+    };
+    let mut b = Builder::new();
+    for i in 0..10 {
+        put(&mut b, crate::logs::store::MAIN, &[rec(i, "main")]);
+        put(&mut b, INDEX, &[rec(i, "audit")]);
+        put(&mut b, crate::logs::store::TRANSIT, &[rec(i, "dropped")]);
+        assert_eq!(s.apply(&b.finish()).unwrap().counts.logs, 3);
+        if i == 4 {
+            s.cut(Point { index: 1, term: 1 }).unwrap();
+        }
+    }
+    let all = crate::logs::search::parse("*").unwrap();
+    let count = |at: &LogsAt, what: &str| {
+        let mut n = 0;
+        at.each(&all, i64::MIN, i64::MAX, |r| n += usize::from(r.message.starts_with(what))).unwrap();
+        n
+    };
+    assert_eq!((count(&s.logs_at(), "main"), count(&s.logs_at(), "audit"), count(&s.logs_at(), "dropped")), (10, 10, 0), "searched: those kept for search");
+    assert_eq!(count(&s.logs_every(), "dropped"), 10, "every part, for metrics from logs");
+    let newest: Vec<i64> = s.search_logs(&all, i64::MIN, i64::MAX, 3).unwrap().records.iter().map(|r| r.ts / 1_000_000_000).collect();
+    assert_eq!(newest, [9, 9, 8], "newest first across parts");
+    s.cut(Point { index: 2, term: 1 }).unwrap();
+    let mut parts: Vec<u16> = s.logs.files().iter().map(|f| f.part).collect();
+    parts.sort_unstable();
+    parts.dedup();
+    assert_eq!(parts, [crate::logs::store::MAIN, INDEX, crate::logs::store::TRANSIT], "a file a part");
+    // The index's retention its own: its records before 6 s go, the others' stay; never back.
+    assert_eq!(s.apply_entry(3, &crate::command::retain_part(INDEX, 6_000, 0)), Ok(Answer::RetainPart { part: INDEX, logs_cutoff: 6_000 }));
+    s.apply_entry(4, &crate::command::retain_part(INDEX, 2_000, 0)).unwrap();
+    assert_eq!(s.part_cutoff(INDEX), 6_000, "never back");
+    assert_eq!((count(&s.logs_at(), "main"), count(&s.logs_at(), "audit")), (10, 4));
+    // Its files go by its cutoff alone once durable: its first (0–4 s), none of the others'.
+    s.cut(Point { index: 4, term: 1 }).unwrap();
+    let before = s.logs.files().len();
+    s.retain_files().unwrap();
+    assert_eq!(s.logs.files().len(), before - 1);
+    assert!(s.logs.files().iter().all(|f| f.part != INDEX || f.log.max_ts >= 6_000_000_000));
+    drop(s);
+    let s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    assert_eq!(s.part_cutoffs().get(&INDEX), Some(&6_000), "reopened");
+    assert_eq!((count(&s.logs_at(), "main"), count(&s.logs_at(), "audit"), count(&s.logs_every(), "dropped")), (10, 4, 10));
+}
+
 /// Everything a replica answers, by the series' own keys: every series' samples, the names and
 /// values autocomplete gives, the replicated state, every log record in search order, and the
 /// answers to queries, to the bit.
@@ -456,6 +516,10 @@ struct View {
     max_series: u64,
     sessions: BTreeMap<u64, Session>,
     logs: Vec<Record>,
+    /// Each part's cutoff, an index's records, and those not kept for search.
+    part_cutoffs: BTreeMap<u16, i64>,
+    index_logs: Vec<Record>,
+    transit: Vec<Record>,
     spans_cutoff: i64,
     spans: Vec<Record>,
     /// One trace's spans, found by its id (a block of spans ruled out by its filter).
@@ -491,6 +555,9 @@ fn view(s: &Store) -> View {
         max_series: s.max_series(),
         sessions: s.sessions().clone(),
         logs: s.search_logs(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
+        part_cutoffs: s.part_cutoffs().clone(),
+        index_logs: s.logs_scoped(&|p| p == INDEX).search(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
+        transit: s.logs_scoped(&|p| p == crate::logs::store::TRANSIT).search(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
         spans_cutoff: s.spans_cutoff(),
         spans: s.search_spans(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
         trace: s.search_spans(&crate::logs::search::Search::trace(TRACE), i64::MIN, i64::MAX, usize::MAX).unwrap().records,
@@ -498,11 +565,20 @@ fn view(s: &Store) -> View {
     }
 }
 
+/// The part of the logs a stream with parts writes an index's records to.
+const INDEX: u16 = 3;
+
+/// [`stream_with`], its logs of one part, as a store's were before parts.
+fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
+    stream_with(seed, n, false)
+}
+
 /// A stream of entries: writes from three senders (some sent twice, as by a sender whose answer
 /// was lost), late samples and corrections, log records several to a time, empty entries,
 /// retention moving forward, a bound on series, and a series that expires and comes back of
-/// another kind.
-fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
+/// another kind. With `parts`, log records of an index's part and of those not kept for search
+/// too, and each of those parts' retention moving forward.
+fn stream_with(seed: u64, n: usize, parts: bool) -> Vec<Vec<u8>> {
     let mut rng = Rng::new(seed);
     let mut out = Vec::new();
     let mut seqs = [0u64; 3];
@@ -520,6 +596,8 @@ fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
         match rng.below(25) {
             0 => out.push(crate::command::retain(now - 60_000 + rng.below(10_000) as i64, now - 40_000 + rng.below(10_000) as i64, now)),
             3 => out.push(crate::command::retain_spans(now - 50_000 + rng.below(10_000) as i64, now)),
+            4 if parts => out.push(crate::command::retain_part(INDEX, now - 30_000 + rng.below(10_000) as i64, now)),
+            5 if parts => out.push(crate::command::retain_part(crate::logs::store::TRANSIT, now - 20_000 + rng.below(10_000) as i64, now)),
             1 => {
                 let i = rng.below(3) as usize;
                 if let Some(e) = &sent[i] {
@@ -569,7 +647,22 @@ fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
                             ..Record::default()
                         })
                         .collect();
-                    b.logs(&recs);
+                    if parts {
+                        let part = match rng.below(20) {
+                            0..=11 => crate::logs::store::MAIN,
+                            12..=16 => INDEX,
+                            _ => crate::logs::store::TRANSIT,
+                        };
+                        let mut raw = Vec::new();
+                        let mut prev = 0;
+                        for r in &recs {
+                            crate::logs::record::put_row(&mut raw, r, prev);
+                            prev = r.ts;
+                        }
+                        b.log_rows_in(part, &raw, recs.len() as u32);
+                    } else {
+                        b.logs(&recs);
+                    }
                 }
                 if rng.below(3) == 0 {
                     // Spans, several to a time, of a few traces, one of them most.
@@ -621,7 +714,7 @@ fn replicas_that_cut_compact_retain_and_restart_differently_answer_alike() {
     let seeds: u64 = std::env::var("KILN_OBS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     let mut refused_in_all = 0;
     for seed in 1..=seeds {
-        let entries = stream(seed, 400);
+        let entries = stream_with(seed, 400, true);
         let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         // C: in memory, never cut. A: cut every 7 entries, compacted and retained each time.
         // B: cut, compacted, retained and restarted at random.
@@ -680,7 +773,7 @@ fn replicas_that_cut_compact_retain_and_restart_differently_answer_alike() {
 
 #[test]
 fn an_image_installed_elsewhere_answers_as_its_source() {
-    let entries = stream(11, 300);
+    let entries = stream_with(11, 300, true);
     let (ds, dt, staging, snaps) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let mut source = Store::open(ds.path(), Keyed::with_keys(1, 2)).unwrap();
     let mut target = Store::open(dt.path(), Keyed::with_keys(3, 4)).unwrap();
@@ -749,7 +842,7 @@ fn an_image_installed_elsewhere_answers_as_its_source() {
 fn rewrites_built_apart_while_the_store_goes_on_answer_alike() {
     let seeds: u64 = std::env::var("KILN_OBS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     for seed in 1..=seeds {
-        let entries = stream(seed + 100, 400);
+        let entries = stream_with(seed + 100, 400, true);
         let d = tempfile::tempdir().unwrap();
         let mut c = Store::new(Keyed::with_keys(1, 1));
         let mut s = Store::open(d.path(), Keyed::with_keys(2, 2)).unwrap();
@@ -1005,7 +1098,7 @@ fn a_maintenance_thread_rewrites_while_the_store_applies_and_cuts() {
 fn files_changed_beside_queries_answer_as_one_store_and_open_again_alike() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, RwLock};
-    let entries = stream(23, 900);
+    let entries = stream_with(23, 900, true);
     let d = tempfile::tempdir().unwrap();
     let shared = Arc::new(RwLock::new(Store::open(d.path(), Keyed::with_keys(1, 1)).unwrap()));
     let stop = Arc::new(AtomicBool::new(false));

@@ -538,7 +538,8 @@ impl LogMetrics {
             st.mark(&spans, now);
             let Some(w) = st.due(now) else { return };
             drop(st);
-            let at = if self.spans { s.spans_at() } else { s.logs_at() };
+            // Every part's records: those not kept for search are counted too (Datadog's).
+            let at = if self.spans { s.spans_at() } else { s.logs_every() };
             drop(s);
             let counting = Instant::now();
             let counted = at.count_metrics(&metrics, w);

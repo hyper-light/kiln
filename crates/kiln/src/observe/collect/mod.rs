@@ -1561,7 +1561,7 @@ impl<M> InFlight<M> {
             }
         }
         b.processed = seen;
-        match offer(Logs { parts: std::mem::take(&mut b.parts) }, ack.clone()) {
+        match offer(Logs::from(std::mem::take(&mut b.parts)), ack.clone()) {
             Ok(()) => {
                 self.queue.push_back((ack, std::mem::take(&mut b.marks), n));
                 b.bytes = 0;

@@ -23,7 +23,7 @@ pub mod http;
 pub mod inventory;
 pub mod kube;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,10 @@ const FOUND: usize = 2 * CONTAINERS;
 /// How often the engine is asked again for its names when no container it does not know appears:
 /// a container renamed, or its labels changed.
 pub const RENAMED: Duration = Duration::from_secs(300);
+/// How long a container the engine did not name is asked about again at each look: one whose
+/// cgroup is there before the engine lists it, as it starts (its samples until then are written
+/// without its name: a series apart from its own).
+const UNNAMED_ASKED: Duration = Duration::from_secs(30);
 
 /// The check's metrics, in Datadog's names and kinds, in the order a container's keys are kept.
 const METRICS: [(&str, Kind); 18] = [
@@ -59,8 +63,8 @@ const METRICS: [(&str, Kind); 18] = [
     ("container.io.write", Kind::Gauge),
     ("container.io.read.operations", Kind::Gauge),
     ("container.io.write.operations", Kind::Gauge),
-    ("container.cpu.throttled.periods", Kind::Counter),
-    ("container.memory.oom_events", Kind::Counter),
+    ("container.cpu.throttled.periods", Kind::Count),
+    ("container.memory.oom_events", Kind::Count),
 ];
 
 /// An image's name, tag and short name (Datadog's `image_name`, `image_tag`, `short_image`): its
@@ -114,9 +118,10 @@ pub struct Check {
     /// saw it.
     sandboxes: HashMap<String, (bool, u64)>,
     named: HashMap<String, engine::Named>,
-    /// The containers the engine did not name when last asked (another engine's: a Kubernetes
-    /// node's containerd beside Docker): not a reason to ask it again.
-    unnamed: HashSet<String>,
+    /// The containers the engine did not name when last asked, and when it first did not: after
+    /// [`UNNAMED_ASKED`] another engine's (a Kubernetes node's containerd beside Docker), not a
+    /// reason to ask it again.
+    unnamed: HashMap<String, Instant>,
     asked: Option<Instant>,
     /// Kubernetes' names, read again when its links change.
     pods: kube::Names,
@@ -145,7 +150,7 @@ impl Check {
             kept: HashMap::new(),
             sandboxes: HashMap::new(),
             named: HashMap::new(),
-            unnamed: HashSet::new(),
+            unnamed: HashMap::new(),
             asked: None,
             pods: kube::Names::default(),
             looks: 0,
@@ -206,14 +211,17 @@ impl Check {
         }
     }
 
-    /// The engine's names asked for: at the first look; when a container appears that it has
-    /// neither named nor been asked about (at most once a look); every [`RENAMED`]; and every look
-    /// where there are no cgroups to read (its list is what there is).
+    /// The engine's names asked for: at the first look; at a look where a container appears that it
+    /// has not named, nor left unnamed for [`UNNAMED_ASKED`] (once a look: a container is named at
+    /// the look it first appears in, or the next); every [`RENAMED`]; and every look where there are
+    /// no cgroups to read (its list is what there is).
     fn rename(&mut self, ids: &[&str], now: Instant) {
         let Some(e) = &self.engine else { return };
         let due = match self.asked.map(|a| now.duration_since(a)) {
             None => true,
-            Some(since) => self.version.is_none() || since >= RENAMED || (since >= super::host::EVERY && ids.iter().any(|id| !self.named.contains_key(*id) && !self.unnamed.contains(*id))),
+            Some(since) => {
+                self.version.is_none() || since >= RENAMED || ids.iter().any(|id| !self.named.contains_key(*id) && self.unnamed.get(*id).is_none_or(|at| now.duration_since(*at) < UNNAMED_ASKED))
+            }
         };
         if !due {
             return;
@@ -221,7 +229,8 @@ impl Check {
         self.asked = Some(now);
         match engine::list(e) {
             Ok(named) => {
-                self.unnamed = ids.iter().filter(|id| !named.contains_key(**id)).map(|id| (*id).to_owned()).collect();
+                let before = std::mem::take(&mut self.unnamed);
+                self.unnamed = ids.iter().filter(|id| !named.contains_key(**id)).map(|id| ((*id).to_owned(), before.get(*id).copied().unwrap_or(now))).collect();
                 self.named = named;
             }
             Err(err) => tracing::debug!(error = %err, "the container engine was not asked its names"),

@@ -131,3 +131,7 @@ harness = false
 [[bench]]
 name = "containers"
 harness = false
+
+[[bench]]
+name = "indexes"
+harness = false

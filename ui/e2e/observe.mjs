@@ -1999,6 +1999,9 @@ const scenarios = {
       // Charted in the explorer in a click.
       await row.getByRole("link", { name: `Chart ${name}`, exact: true }).click();
       await page.waitForURL((u) => u.pathname === "/observe/metrics" && u.searchParams.get("q") === `sum:${name}{*} by {code}.as_count()`);
+      // Its chart drawn: the page settled before it is left (WebKit's phone, leaving it as it
+      // loaded, cut its query's fetch short, "Load failed", or had the next page's load cut short).
+      await page.getByRole("img", { name: `sum:${name}{*} by {code}.as_count()`, exact: true }).waitFor();
       await page.goto(`${BASE}/observe/log-metrics`);
       await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
       await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
@@ -2489,6 +2492,70 @@ const scenarios = {
       for (const n of [id, postmortem]) if (n) await api("DELETE", `/api/observe/v1/notebooks/${n}`);
       if (incident) await api("DELETE", `/api/observe/v1/incidents/${incident}`);
     }
+  },
+
+  /** A log index made from its form (§8.10): its records' filter, a daily quota with a warning, an
+   * exclusion filter of debug records; moved first; the explorer reads it alone, its debug records
+   * excluded; its quota removed in its form; removed, gone. */
+  async "an index is made with a quota and an exclusion filter, read alone, edited and removed"() {
+    const name = `ix-${run}`;
+    const service = `ix-svc-${run}`;
+    await page.goto(`${BASE}/observe/indexes`);
+    await page.getByRole("button", { name: "New index", exact: true }).click();
+    const d = page.getByRole("dialog");
+    await fillIn(d.getByLabel("Name", { exact: true }), name);
+    await fillIn(d.getByLabel("Of the records", { exact: true }).first(), `service:${service}`);
+    await fillIn(d.getByLabel("Daily quota (records)", { exact: true }), "1000");
+    await fillIn(d.getByLabel("Warn at (%)", { exact: true }), "80");
+    await d.getByRole("button", { name: "Exclusion filter", exact: true }).click();
+    const ex = d.locator("fieldset > div").last();
+    await fillIn(ex.getByLabel("Name", { exact: true }), "debug");
+    await fillIn(ex.getByLabel("Of the records", { exact: true }), "status:debug");
+    await d.getByRole("button", { name: "Make it", exact: true }).click();
+    await d.waitFor({ state: "detached" });
+    const made = (await api("GET", `/api/observe/v1/logs/config/indexes/${name}`)).body;
+    expect(
+      made?.filter?.query === `service:${service}` && made.daily_limit === 1000 && made.daily_limit_warning_threshold_percentage === 80 && made.exclusion_filters?.[0]?.filter?.sample_rate === 1,
+      `made as asked: ${JSON.stringify(made)}`,
+    );
+    // Moved up until it is first: an index before main takes its records.
+    for (let i = 0; i < 20; i++) {
+      const order = (await api("GET", "/api/observe/v1/logs/config/index-order")).body.index_names;
+      if (order[0] === name) break;
+      await page.getByRole("button", { name: `Move ${name} up`, exact: true }).click();
+      await until("moved", async () => (await api("GET", "/api/observe/v1/logs/config/index-order")).body.index_names.indexOf(name) < order.indexOf(name));
+    }
+    expect((await api("GET", "/api/observe/v1/logs/config/index-order")).body.index_names[0] === name, "first");
+    await fitsAcross("the indexes");
+    // Its records: its debug ones excluded.
+    const records = Array.from({ length: 10 }, (_, i) => ({ message: `ix line ${i}`, service, status: i % 2 ? "debug" : "info", hostname: "e2e" }));
+    expect((await api("POST", "/api/observe/v1/logs", records)).status === 202, "its records sent");
+    await until(
+      "its records kept",
+      async () =>
+        (await api("POST", "/api/observe/v1/logs/search", { query: `service:${service}`, from: Date.now() - 600_000, to: Date.now() + 60_000, limit: 50, indexes: [name] })).body?.records?.length ===
+        5,
+    );
+    await page.goto(`${BASE}/observe/logs?q=${encodeURIComponent(`service:${service}`)}&index=${name}`);
+    const statuses = page.locator('section[aria-label="Records"] li > button > span[aria-label]');
+    await until("read alone", async () => (await statuses.count()) === 5);
+    expect(
+      (await statuses.evaluateAll((els) => els.map((e) => e.getAttribute("aria-label")))).every((s) => s === "info"),
+      "its debug records excluded",
+    );
+    // Its quota removed in its form.
+    await page.goto(`${BASE}/observe/indexes`);
+    await page.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
+    const e = page.getByRole("dialog");
+    await fillIn(e.getByLabel("Daily quota (records)", { exact: true }), "");
+    await e.getByRole("button", { name: "Save", exact: true }).click();
+    await e.waitFor({ state: "detached" });
+    expect((await api("GET", `/api/observe/v1/logs/config/indexes/${name}`)).body.daily_limit === null, "no quota");
+    // Removed: gone, and its name not made again.
+    await page.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+    await until("removed", async () => (await api("GET", `/api/observe/v1/logs/config/indexes/${name}`)).status === 404);
+    await page.getByRole("button", { name: `Edit ${name}`, exact: true }).waitFor({ state: "detached" });
   },
 
   /** Containers as Datadog's Agent's container check reports them (§10.10): one running near its CPU

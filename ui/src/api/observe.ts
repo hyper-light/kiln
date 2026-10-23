@@ -45,6 +45,33 @@ export interface LogRecord {
   span_id: string | null;
 }
 
+/** A log index's exclusion filter (docs/observe.md §8.10), Datadog's: of the records it matches, `sample_rate` excluded (1, every one), by `sample_attribute`'s values where it names one. */
+export interface ExclusionFilter {
+  name: string;
+  is_enabled: boolean;
+  filter: { query: string; sample_rate: number; sample_attribute?: string };
+}
+
+/** A log index as made or changed (Datadog's `LogsIndex`). */
+export interface LogsIndexIn {
+  name: string;
+  filter: { query: string };
+  exclusion_filters: ExclusionFilter[];
+  /** Records kept a day at the most; none, no quota. */
+  daily_limit: number | null;
+  daily_limit_reset?: { reset_time: string; reset_utc_offset: string };
+  daily_limit_warning_threshold_percentage?: number;
+  /** Days its records are kept for search; none, the store's own. */
+  num_retention_days: number | null;
+  tags: string[];
+}
+
+/** A log index as kiln gives one: Datadog's, its quota's word, and its part of the store and its day. */
+export interface LogsIndex extends LogsIndexIn {
+  is_rate_limited: boolean;
+  kiln: { part: number; created: number; modified: number; today?: { count: number; limit: number; start: number; next_reset: number; warned: boolean } };
+}
+
 export interface LogSearch {
   records: LogRecord[];
   blocks: { total: number; pruned: number };
@@ -1600,13 +1627,19 @@ export const observeApi = {
   metrics: (match: string | undefined, signal?: AbortSignal) =>
     request<{ metrics: string[] }>("GET", `${BASE}/metrics${match ? `?match=${enc(match)}&limit=200` : "?limit=200"}`, undefined, { signal }),
   tagValues: (key: string, signal?: AbortSignal) => request<{ key: string; values: string[] }>("GET", `${BASE}/tags?key=${enc(key)}&limit=500`, undefined, { signal }),
-  logs: (body: { query: string; from: number; to: number; limit?: number; view?: string }, signal?: AbortSignal) => request<LogSearch>("POST", `${BASE}/logs/search`, body, { signal }),
-  histogram: (body: { query: string; from: number; to: number; step: number; by?: string[]; view?: string }, signal?: AbortSignal) =>
+  logs: (body: { query: string; from: number; to: number; limit?: number; view?: string; indexes?: string[] }, signal?: AbortSignal) =>
+    request<LogSearch>("POST", `${BASE}/logs/search`, body, { signal }),
+  histogram: (body: { query: string; from: number; to: number; step: number; by?: string[]; view?: string; indexes?: string[] }, signal?: AbortSignal) =>
     request<LogHistogram>("POST", `${BASE}/logs/aggregate`, body, { signal }),
-  facets: (body: { query: string; from: number; to: number; facets: string[]; top?: number; view?: string }, signal?: AbortSignal) =>
+  facets: (body: { query: string; from: number; to: number; facets: string[]; top?: number; view?: string; indexes?: string[] }, signal?: AbortSignal) =>
     request<LogFacets>("POST", `${BASE}/logs/facets`, body, { signal }),
   events: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<LogSearch>("POST", `${BASE}/events/search`, body, { signal }),
-  patterns: (body: { query: string; from: number; to: number; view?: string }, signal?: AbortSignal) => request<LogPatterns>("POST", `${BASE}/logs/patterns`, body, { signal }),
+  patterns: (body: { query: string; from: number; to: number; view?: string; indexes?: string[] }, signal?: AbortSignal) => request<LogPatterns>("POST", `${BASE}/logs/patterns`, body, { signal }),
+  indexes: (signal?: AbortSignal) => request<{ indexes: LogsIndex[] }>("GET", `${BASE}/logs/config/indexes`, undefined, { signal }).then((r) => r.indexes),
+  createIndex: (i: LogsIndexIn) => request<LogsIndex>("POST", `${BASE}/logs/config/indexes`, i),
+  updateIndex: (name: string, i: Omit<LogsIndexIn, "name"> & { disable_daily_limit?: boolean }) => request<LogsIndex>("PUT", `${BASE}/logs/config/indexes/${enc(name)}`, i),
+  deleteIndex: (name: string) => request<unknown>("DELETE", `${BASE}/logs/config/indexes/${enc(name)}`),
+  orderIndexes: (names: string[]) => request<{ index_names: string[] }>("PUT", `${BASE}/logs/config/index-order`, { index_names: names }),
   /** The live tail's WebSocket path: the search's records as they are applied. */
   tailPath: (query: string) => `${BASE}/logs/tail?query=${enc(query)}`,
   status: (signal?: AbortSignal) => request<ObserveStatus>("GET", `${BASE}/status`, undefined, { signal }),

@@ -39,6 +39,9 @@ const TMP: &str = "MANIFEST.tmp";
 const FIRST_LINE: &str = "kiln-obs manifest 2";
 /// The first line of a manifest that holds spans.
 const FIRST_LINE_SPANS: &str = "kiln-obs manifest 3";
+/// The first line of a manifest whose logs have parts of their own (`crate::logs::store::Part`):
+/// a part's files, or its own retention. A build that knows no parts refuses it.
+const FIRST_LINE_PARTS: &str = "kiln-obs manifest 4";
 
 /// A point of the group's log: an entry's index and its term.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,15 +90,31 @@ pub struct Manifest {
     pub conf: Membership,
     pub sessions: BTreeMap<u64, Session>,
     pub blocks: Vec<BlockEntry>,
-    /// Logs files.
+    /// Logs files, each of its part (its name says which: [`part_of`]).
     pub logs: Vec<BlockEntry>,
     /// Spans files (logs files of the span store).
     pub spans: Vec<BlockEntry>,
+    /// Parts of the logs kept for their own time: no record of one older (ms), in place of
+    /// `logs_cutoff`.
+    pub part_cutoffs: BTreeMap<u16, i64>,
 }
 
 impl Default for Manifest {
     fn default() -> Self {
-        Self { durable: Point::default(), next_seq: 0, cutoff: i64::MIN, logs_cutoff: i64::MIN, spans_cutoff: i64::MIN, max_series: 0, conf: Membership::default(), sessions: BTreeMap::new(), blocks: Vec::new(), logs: Vec::new(), spans: Vec::new() }
+        Self {
+            durable: Point::default(),
+            next_seq: 0,
+            cutoff: i64::MIN,
+            logs_cutoff: i64::MIN,
+            spans_cutoff: i64::MIN,
+            max_series: 0,
+            conf: Membership::default(),
+            sessions: BTreeMap::new(),
+            blocks: Vec::new(),
+            logs: Vec::new(),
+            spans: Vec::new(),
+            part_cutoffs: BTreeMap::new(),
+        }
     }
 }
 
@@ -115,6 +134,17 @@ pub fn block_file(seq: u64) -> String {
 /// A logs file's name for its sequence number.
 pub fn logs_file(seq: u64) -> String {
     format!("{seq:016}.logs")
+}
+
+/// A logs file's name for its sequence number and its part: the main part's as every logs file's
+/// was before parts, another's with its part (`0000000000000042.p00003.logs`).
+pub fn logs_file_in(seq: u64, part: u16) -> String {
+    if part == crate::logs::store::MAIN { logs_file(seq) } else { format!("{seq:016}.p{part:05}.logs") }
+}
+
+/// The part a logs file is of, by its name ([`logs_file_in`]).
+pub fn part_of(file: &str) -> u16 {
+    file.strip_suffix(".logs").and_then(|s| s.rsplit_once(".p")).and_then(|(_, p)| p.parse().ok()).unwrap_or(crate::logs::store::MAIN)
 }
 
 /// A spans file's name for its sequence number.
@@ -147,18 +177,36 @@ impl Manifest {
         self.spans_cutoff != i64::MIN || !self.spans.is_empty()
     }
 
+    fn has_parts(&self) -> bool {
+        !self.part_cutoffs.is_empty() || self.logs.iter().any(|e| part_of(&e.file) != crate::logs::store::MAIN)
+    }
+
     fn encode(&self) -> String {
         use std::fmt::Write as _;
         let mut body = String::new();
         let c = &self.conf;
         // Writing to a String cannot fail.
-        let spans = self.has_spans();
-        let _ = writeln!(body, "{}", if spans { FIRST_LINE_SPANS } else { FIRST_LINE });
+        let parts = self.has_parts();
+        let spans = parts || self.has_spans();
+        let _ = writeln!(
+            body,
+            "{}",
+            if parts {
+                FIRST_LINE_PARTS
+            } else if spans {
+                FIRST_LINE_SPANS
+            } else {
+                FIRST_LINE
+            }
+        );
         let _ = writeln!(body, "durable {} {}", self.durable.index, self.durable.term);
         let _ = writeln!(body, "next {}", self.next_seq);
         let _ = writeln!(body, "cutoff {} {}", self.cutoff, self.logs_cutoff);
         if spans {
             let _ = writeln!(body, "spans_cutoff {}", self.spans_cutoff);
+        }
+        for (part, cutoff) in &self.part_cutoffs {
+            let _ = writeln!(body, "part_cutoff {part} {cutoff}");
         }
         let _ = writeln!(body, "max_series {}", self.max_series);
         let _ = writeln!(body, "conf {} {} {} {} {}", ids(&c.voters), ids(&c.learners), ids(&c.voters_outgoing), ids(&c.learners_next), u8::from(c.auto_leave));
@@ -188,9 +236,10 @@ impl Manifest {
             return Err(damaged("checksum"));
         }
         let mut lines = body.lines();
-        let spans = match lines.next() {
-            Some(FIRST_LINE) => false,
-            Some(FIRST_LINE_SPANS) => true,
+        let (spans, parts) = match lines.next() {
+            Some(FIRST_LINE) => (false, false),
+            Some(FIRST_LINE_SPANS) => (true, false),
+            Some(FIRST_LINE_PARTS) => (true, true),
             _ => return Err(damaged("not a kiln-obs manifest of this version")),
         };
         let mut m = Self::default();
@@ -204,6 +253,9 @@ impl Manifest {
                     m.logs_cutoff = l.parse().map_err(|_| damaged("cutoff"))?;
                 }
                 ["spans_cutoff", c] if spans => m.spans_cutoff = c.parse().map_err(|_| damaged("spans_cutoff"))?,
+                ["part_cutoff", p, c] if parts => {
+                    m.part_cutoffs.insert(p.parse().map_err(|_| damaged("part_cutoff"))?, c.parse().map_err(|_| damaged("part_cutoff"))?);
+                }
                 ["max_series", n] => m.max_series = n.parse().map_err(|_| damaged("max_series"))?,
                 ["conf", v, l, vo, ln, al] => {
                     let p = |s: &str| parse_ids(s).ok_or_else(|| damaged("conf"));
@@ -215,7 +267,7 @@ impl Manifest {
                     m.sessions.insert(sender, s);
                 }
                 [kind @ ("block" | "logs" | "spans"), seq, file] => {
-                    if !plain_name(file) || (*kind == "spans" && !spans) {
+                    if !plain_name(file) || (*kind == "spans" && !spans) || (*kind == "logs" && !parts && part_of(file) != crate::logs::store::MAIN) {
                         return Err(damaged("block file"));
                     }
                     let e = BlockEntry { seq: seq.parse().map_err(|_| damaged("block"))?, file: (*file).to_owned() };
@@ -292,6 +344,7 @@ mod tests {
             logs: vec![BlockEntry { seq: 6, file: logs_file(6) }],
             spans_cutoff: i64::MIN,
             spans: Vec::new(),
+            part_cutoffs: BTreeMap::new(),
         };
         m.save(dir.path()).unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), Some(m.clone()));
@@ -306,6 +359,16 @@ mod tests {
         let body = text[..text.rfind("crc ").unwrap()].replace("manifest 3", "manifest 2");
         fs::write(dir.path().join(NAME), format!("{body}crc {:08x}\n", crc32c::checksum(body.as_bytes()))).unwrap();
         assert!(matches!(Manifest::load(dir.path()), Err(ManifestError::Damaged(_, "a line"))));
+        // Parts: their files and cutoffs, version 4; a version 3 one naming a part's file refused.
+        let parted = Manifest { part_cutoffs: [(3, 1_700_000_700_000)].into(), logs: vec![BlockEntry { seq: 8, file: logs_file_in(8, 3) }], ..with.clone() };
+        parted.save(dir.path()).unwrap();
+        assert_eq!(Manifest::load(dir.path()).unwrap(), Some(parted.clone()));
+        assert!(fs::read_to_string(dir.path().join(NAME)).unwrap().starts_with("kiln-obs manifest 4\n"));
+        assert_eq!((part_of(&logs_file_in(8, 3)), part_of(&logs_file_in(8, 0)), part_of("0000000000000008.logs")), (3, 0, 0));
+        let text = Manifest { part_cutoffs: BTreeMap::new(), ..parted }.encode();
+        let body = text[..text.rfind("crc ").unwrap()].replace("manifest 4", "manifest 3");
+        fs::write(dir.path().join(NAME), format!("{body}crc {:08x}\n", crc32c::checksum(body.as_bytes()))).unwrap();
+        assert!(matches!(Manifest::load(dir.path()), Err(ManifestError::Damaged(_, "block file"))));
         m.save(dir.path()).unwrap();
         let empty = Manifest::default();
         empty.save(dir.path()).unwrap();

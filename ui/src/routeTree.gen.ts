@@ -32,6 +32,7 @@ import { Route as AppObserveArchivesRouteImport } from './routes/_app.observe.ar
 import { Route as AppObserveDeliveryRouteImport } from './routes/_app.observe.delivery'
 import { Route as AppObserveDowntimesRouteImport } from './routes/_app.observe.downtimes'
 import { Route as AppObserveEventsRouteImport } from './routes/_app.observe.events'
+import { Route as AppObserveIndexesRouteImport } from './routes/_app.observe.indexes'
 import { Route as AppObserveIntegrationsRouteImport } from './routes/_app.observe.integrations'
 import { Route as AppObserveLiveRouteImport } from './routes/_app.observe.live'
 import { Route as AppObserveLogMetricsRouteImport } from './routes/_app.observe.log-metrics'
@@ -189,6 +190,11 @@ const AppObserveDowntimesRoute = AppObserveDowntimesRouteImport.update({
 const AppObserveEventsRoute = AppObserveEventsRouteImport.update({
   id: '/observe/events',
   path: '/observe/events',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppObserveIndexesRoute = AppObserveIndexesRouteImport.update({
+  id: '/observe/indexes',
+  path: '/observe/indexes',
   getParentRoute: () => AppRoute,
 } as any)
 const AppObserveIntegrationsRoute = AppObserveIntegrationsRouteImport.update({
@@ -440,6 +446,7 @@ export interface FileRoutesByFullPath {
   '/observe/delivery': typeof AppObserveDeliveryRoute
   '/observe/downtimes': typeof AppObserveDowntimesRoute
   '/observe/events': typeof AppObserveEventsRoute
+  '/observe/indexes': typeof AppObserveIndexesRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
   '/observe/live': typeof AppObserveLiveRoute
   '/observe/log-metrics': typeof AppObserveLogMetricsRoute
@@ -508,6 +515,7 @@ export interface FileRoutesByTo {
   '/observe/delivery': typeof AppObserveDeliveryRoute
   '/observe/downtimes': typeof AppObserveDowntimesRoute
   '/observe/events': typeof AppObserveEventsRoute
+  '/observe/indexes': typeof AppObserveIndexesRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
   '/observe/live': typeof AppObserveLiveRoute
   '/observe/log-metrics': typeof AppObserveLogMetricsRoute
@@ -578,6 +586,7 @@ export interface FileRoutesById {
   '/_app/observe/delivery': typeof AppObserveDeliveryRoute
   '/_app/observe/downtimes': typeof AppObserveDowntimesRoute
   '/_app/observe/events': typeof AppObserveEventsRoute
+  '/_app/observe/indexes': typeof AppObserveIndexesRoute
   '/_app/observe/integrations': typeof AppObserveIntegrationsRoute
   '/_app/observe/live': typeof AppObserveLiveRoute
   '/_app/observe/log-metrics': typeof AppObserveLogMetricsRoute
@@ -648,6 +657,7 @@ export interface FileRouteTypes {
     | '/observe/delivery'
     | '/observe/downtimes'
     | '/observe/events'
+    | '/observe/indexes'
     | '/observe/integrations'
     | '/observe/live'
     | '/observe/log-metrics'
@@ -716,6 +726,7 @@ export interface FileRouteTypes {
     | '/observe/delivery'
     | '/observe/downtimes'
     | '/observe/events'
+    | '/observe/indexes'
     | '/observe/integrations'
     | '/observe/live'
     | '/observe/log-metrics'
@@ -785,6 +796,7 @@ export interface FileRouteTypes {
     | '/_app/observe/delivery'
     | '/_app/observe/downtimes'
     | '/_app/observe/events'
+    | '/_app/observe/indexes'
     | '/_app/observe/integrations'
     | '/_app/observe/live'
     | '/_app/observe/log-metrics'
@@ -1000,6 +1012,13 @@ declare module '@tanstack/react-router' {
       path: '/observe/events'
       fullPath: '/observe/events'
       preLoaderRoute: typeof AppObserveEventsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/observe/indexes': {
+      id: '/_app/observe/indexes'
+      path: '/observe/indexes'
+      fullPath: '/observe/indexes'
+      preLoaderRoute: typeof AppObserveIndexesRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/observe/integrations': {
@@ -1333,6 +1352,7 @@ interface AppRouteChildren {
   AppObserveDeliveryRoute: typeof AppObserveDeliveryRoute
   AppObserveDowntimesRoute: typeof AppObserveDowntimesRoute
   AppObserveEventsRoute: typeof AppObserveEventsRoute
+  AppObserveIndexesRoute: typeof AppObserveIndexesRoute
   AppObserveIntegrationsRoute: typeof AppObserveIntegrationsRoute
   AppObserveLiveRoute: typeof AppObserveLiveRoute
   AppObserveLogMetricsRoute: typeof AppObserveLogMetricsRoute
@@ -1401,6 +1421,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppObserveDeliveryRoute: AppObserveDeliveryRoute,
   AppObserveDowntimesRoute: AppObserveDowntimesRoute,
   AppObserveEventsRoute: AppObserveEventsRoute,
+  AppObserveIndexesRoute: AppObserveIndexesRoute,
   AppObserveIntegrationsRoute: AppObserveIntegrationsRoute,
   AppObserveLiveRoute: AppObserveLiveRoute,
   AppObserveLogMetricsRoute: AppObserveLogMetricsRoute,

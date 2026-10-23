@@ -752,7 +752,7 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = store.cut(&dir.join("1.spans")).unwrap().unwrap();
     let blocks = file.blocks.len();
-    store.files.push(kiln_obs::logs::store::HeldFile { seq: 1, file: "1.spans".into(), log: std::sync::Arc::new(file) });
+    store.files.push(kiln_obs::logs::store::HeldFile { seq: 1, file: "1.spans".into(), part: kiln_obs::logs::store::MAIN, log: std::sync::Arc::new(file) });
     println!("\n{} spans in {} blocks, {:.1} MB on disk, taken in {:.2} s", 2000 * 512, blocks, store.disk_bytes() as f64 / 1e6, started.elapsed().as_secs_f64());
     let mut times = Vec::new();
     let mut read = Vec::new();

@@ -18,6 +18,7 @@ import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { cn } from "@/lib/utils";
+import { indexesRes } from "./indexes";
 import {
   Histogram,
   ObserveNav,
@@ -62,18 +63,18 @@ const KINDS = {
   },
 } as const;
 
-/** What the explorer reads: the live logs over the last `range`, or a rehydration's view over its range. */
-type Source = { range: Range; view?: undefined } | { view: Rehydration; range?: undefined };
+/** What the explorer reads: the live logs over the last `range` (of one index, or of every one), or a rehydration's view over its range. */
+type Source = { range: Range; view?: undefined; index?: string } | { view: Rehydration; range?: undefined; index?: undefined };
 
-/** A source's bounds now (ms), and its view's id when it is one: what each of its queries sends. */
-function bounds(s: Source): { from: number; to: number; view?: string } {
+/** A source's bounds now (ms), and its view's id or its index when it has one: what each of its queries sends. */
+function bounds(s: Source): { from: number; to: number; view?: string; indexes?: string[] } {
   if (s.view) return { from: s.view.from, to: s.view.to, view: s.view.id };
   const to = Date.now();
-  return { from: to - RANGES[s.range], to };
+  return { from: to - RANGES[s.range], to, ...(s.index ? { indexes: [s.index] } : {}) };
 }
 
 /** A source in its queries' keys (a view's again once it is read), its span, and how often its answers are read again (a view's while it fills). */
-const keyOf = (s: Source) => (s.view ? `view:${s.view.id}:${s.view.state}` : s.range);
+const keyOf = (s: Source) => (s.view ? `view:${s.view.id}:${s.view.state}` : s.index ? `${s.range}/index:${s.index}` : s.range);
 const spanOf = (s: Source) => (s.view ? s.view.to - s.view.from : RANGES[s.range]);
 const pollOf = (s: Source) => (s.view ? (s.view.state === "done" || s.view.state === "failed" ? undefined : 5_000) : pollFor(s.range));
 
@@ -132,6 +133,8 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
   const [view, setView] = useParam("view", "records");
   // The rehydration whose view is read; none, the live logs.
   const [rehydration] = useParam("rehydration");
+  // The index the live logs are read of; none, every one.
+  const [index] = useParam("index");
   const setParams = useParams();
   const [range, setRange] = useRange();
   const query = kind === "events" ? within(k.base, q) : logsOnly(q);
@@ -180,6 +183,9 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
           kind === "logs" ? (
             <div className="flex flex-wrap gap-2">
               <Button variant="secondary" asChild>
+                <Link to="/observe/indexes">Indexes</Link>
+              </Button>
+              <Button variant="secondary" asChild>
                 <Link to="/observe/pipelines">Pipelines</Link>
               </Button>
               <Button variant="secondary" asChild>
@@ -206,15 +212,36 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
           <div className="mb-5 flex flex-wrap items-center gap-3">
             <RangePicker value={range} onChange={setRange} />
             {kind === "logs" && (
+              <Loadable label="the indexes" fallback={null}>
+                <IndexPicker value={index} onPick={(v) => setParams({ index: v || null })} />
+              </Loadable>
+            )}
+            {kind === "logs" && (
               <Loadable label="the rehydrations" fallback={null}>
                 <ViewPicker value="" onPick={pick} />
               </Loadable>
             )}
           </div>
-          {body({ range })}
+          {body({ range, index: kind === "logs" && index ? index : undefined })}
         </>
       )}
     </div>
+  );
+}
+
+/** Which index's records are searched: every one, or one; not shown while there is one alone. */
+function IndexPicker({ value, onPick }: { value: string; onPick: (name: string) => void }) {
+  const all = useRes(indexesRes).data;
+  if (all.length < 2 && !value) return null;
+  return (
+    <SelectField
+      label="Index"
+      hideLabel
+      className="w-full sm:w-auto sm:min-w-[12rem]"
+      value={value}
+      onChange={onPick}
+      options={[{ value: "", label: "Every index" }, ...all.map((i) => ({ value: i.name, label: `${i.name} index` }))]}
+    />
   );
 }
 

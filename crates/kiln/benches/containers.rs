@@ -289,7 +289,7 @@ fn fleet(containers: usize) -> kiln_obs::machine::Shared {
                 ("kube_qos", "burstable"),
             ];
             for m in METRICS {
-                let k = SeriesKey::new(m, tags.iter().copied(), if m.ends_with("periods") || m.ends_with("oom_events") { Kind::Counter } else { Kind::Gauge }).unwrap();
+                let k = SeriesKey::new(m, tags.iter().copied(), if m.ends_with("periods") || m.ends_with("oom_events") { Kind::Count } else { Kind::Gauge }).unwrap();
                 b.define(&k);
                 keys.push((k, n));
             }

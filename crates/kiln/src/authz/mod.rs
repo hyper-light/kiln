@@ -434,6 +434,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/observe/v1/archives", "observe.manage", At::Server),
     any("/api/observe/v1/archives/**", "observe.manage", At::Server),
     any("/api/observe/v1/archive_order", "observe.manage", At::Server),
+    // Log indexes decide which records are kept for search, how many a day and how long: a
+    // maintainer's.
+    any("/api/observe/v1/logs/config/**", "observe.manage", At::Server),
     // Rehydrations read archives with a cloud integration's credentials and keep what they read.
     any("/api/observe/v1/rehydrations", "observe.manage", At::Server),
     any("/api/observe/v1/rehydrations/**", "observe.manage", At::Server),

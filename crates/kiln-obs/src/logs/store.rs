@@ -26,17 +26,36 @@ pub enum LogStoreError {
 /// takes to start and its groups' merging.
 pub const SPLIT_ROWS: u64 = 1 << 16;
 
-/// A block a scan reads: one sealed in memory, or a file's (its `i`th).
+/// A partition of a log store (`docs/observe.md` §8.10): an index's records, or kiln's own. Each
+/// has its head, its blocks and its files apart, and is read from its own time (its retention's).
+pub type Part = u16;
+/// Records of no index of their own: every record before there were indexes, and Datadog's
+/// `main` index's.
+pub const MAIN: Part = 0;
+/// kiln's events (`source:kiln.event`), whatever the indexes say.
+pub const EVENTS: Part = u16::MAX - 1;
+/// Records not kept for search (excluded, of no index, past a quota): seen live, archived and
+/// counted by metrics from logs, then let go.
+pub const TRANSIT: Part = u16::MAX;
+
+/// A block a scan reads: one sealed in memory, or a file's (its `i`th); and the earliest time its
+/// part is read from (ns).
 #[derive(Clone, Copy)]
 enum Src<'a> {
-    Sealed(&'a LogBlock),
-    File(&'a LogFile, usize, &'a LogBlock),
+    Sealed(&'a LogBlock, i64),
+    File(&'a LogFile, usize, &'a LogBlock, i64),
 }
 
 impl<'a> Src<'a> {
     fn block(&self) -> &'a LogBlock {
         match self {
-            Self::Sealed(b) | Self::File(_, _, b) => b,
+            Self::Sealed(b, _) | Self::File(_, _, b, _) => b,
+        }
+    }
+
+    fn floor(&self) -> i64 {
+        match self {
+            Self::Sealed(_, f) | Self::File(_, _, _, f) => *f,
         }
     }
 }
@@ -46,6 +65,8 @@ struct Scan<'q> {
     search: &'q Search,
     from: i64,
     to: i64,
+    /// The earliest time of the part being read (its retention's).
+    floor: i64,
     scratch: RowScratch,
     text: Vec<u8>,
     raw: Vec<u8>,
@@ -53,26 +74,29 @@ struct Scan<'q> {
 
 impl<'q> Scan<'q> {
     fn new(search: &'q Search, from: i64, to: i64) -> Self {
-        Self { search, from, to, scratch: RowScratch::default(), text: Vec::new(), raw: Vec::new() }
+        Self { search, from, to, floor: i64::MIN, scratch: RowScratch::default(), text: Vec::new(), raw: Vec::new() }
     }
 
-    /// A row read: to `f` if it is in the range and matches.
+    /// A row read: to `f` if it is in the range (and its part's) and matches.
     fn row<E>(&mut self, r: &RecordRef<'_>, f: &mut impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<(), E> {
-        if r.ts < self.from || r.ts > self.to || !self.search.row(r, &mut self.scratch) {
+        if r.ts < self.from || r.ts < self.floor || r.ts > self.to || !self.search.row(r, &mut self.scratch) {
             return Ok(());
         }
         f(r)
     }
 
-    /// The head's rows: how many.
+    /// Every part's head's rows: how many.
     fn head<E: From<LogStoreError>>(&mut self, store: &LogSnapshot, f: &mut impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<u64, E> {
         let mut n = 0;
-        for seg in &store.head {
-            let (raw, rows) = &**seg;
-            let mut it = Rows::new(raw, *rows as usize);
-            while let Some(r) = it.next_row().map_err(LogStoreError::from)? {
-                n += 1;
-                self.row(&r, f)?;
+        for open in &store.open {
+            self.floor = open.floor;
+            for seg in &open.head {
+                let (raw, rows) = &**seg;
+                let mut it = Rows::new(raw, *rows as usize);
+                while let Some(r) = it.next_row().map_err(LogStoreError::from)? {
+                    n += 1;
+                    self.row(&r, f)?;
+                }
             }
         }
         Ok(n)
@@ -80,10 +104,11 @@ impl<'q> Scan<'q> {
 
     /// A block's rows: how many.
     fn block<E: From<LogStoreError>>(&mut self, src: Src<'_>, f: &mut impl FnMut(&RecordRef<'_>) -> Result<(), E>) -> Result<u64, E> {
+        self.floor = src.floor();
         let mut raw = std::mem::take(&mut self.raw);
         let read = match src {
-            Src::Sealed(b) => b.decompress(&mut raw).map_err(|_| LogStoreError::Text),
-            Src::File(file, i, b) => match file.read_text(i, &mut self.text) {
+            Src::Sealed(b, _) => b.decompress(&mut raw).map_err(|_| LogStoreError::Text),
+            Src::File(file, i, b, _) => match file.read_text(i, &mut self.text) {
                 Ok(_) => b.decompress_text(&self.text, &mut raw).map_err(|_| LogStoreError::Text),
                 Err(e) => Err(LogStoreError::from(e)),
             },
@@ -103,37 +128,100 @@ impl<'q> Scan<'q> {
     }
 }
 
-/// A logs file the store holds (shared: a [`LogSnapshot`] reads it while the store goes on).
+/// A logs file the store holds (shared: a [`LogSnapshot`] reads it while the store goes on), of
+/// one part.
 #[derive(Debug)]
 pub struct HeldFile {
     pub seq: u64,
     pub file: String,
+    pub part: Part,
     pub log: Arc<LogFile>,
 }
 
 /// A segment of rows as a batch brought them, its times chained from 0, and how many.
 type Segment = (Vec<u8>, u32);
 
-#[derive(Debug, Default)]
-pub struct LogStore {
-    /// Rows as batches brought them, each segment shared with the snapshots that read it.
+/// A part's rows not yet in a file: its head of rows as batches brought them, and its blocks
+/// sealed since its last cut.
+#[derive(Debug)]
+struct Open {
+    part: Part,
     head: Vec<Arc<Segment>>,
     head_bytes: usize,
     sealed: Vec<Arc<LogBlock>>,
+}
+
+impl Open {
+    fn new(part: Part) -> Self {
+        Self { part, head: Vec::new(), head_bytes: 0, sealed: Vec::new() }
+    }
+
+    /// Its head's rows, read in place.
+    fn head_refs(&self) -> Result<Vec<RecordRef<'_>>, LogStoreError> {
+        let mut refs: Vec<RecordRef<'_>> = Vec::new();
+        for seg in &self.head {
+            let (raw, n) = &**seg;
+            let mut rows = Rows::new(raw, *n as usize);
+            while let Some(r) = rows.next_row()? {
+                refs.push(r);
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Its head sealed into a block.
+    fn seal(&mut self, spans: bool) -> Result<(), LogStoreError> {
+        if self.head.is_empty() {
+            return Ok(());
+        }
+        let block = LogBlock::seal_in(&self.head_refs()?, spans);
+        self.sealed.push(Arc::new(block));
+        self.head.clear();
+        self.head_bytes = 0;
+        Ok(())
+    }
+
+    fn unwritten_rows(&self) -> u64 {
+        self.head.iter().map(|h| u64::from(h.1)).sum::<u64>() + self.sealed.iter().map(|b| u64::from(b.rows)).sum::<u64>()
+    }
+}
+
+/// A log store: each part's rows not yet in a file, and every part's files.
+#[derive(Debug, Default)]
+pub struct LogStore {
+    /// By part, in their order.
+    open: Vec<Open>,
+    /// Every part's, oldest first.
     pub files: Vec<HeldFile>,
     /// A store of spans: its blocks' filters hold their trace ids ([`LogBlock::seal_in`]).
     spans: bool,
 }
 
-/// What a log store holds at a moment, shared ([`LogStore::snapshot`]): its head's segments, its
-/// sealed blocks and its files, read with no hold of the store, however long (each part kept while
-/// it is read: a file deleted meanwhile stays readable, its open handle holding it). Taking one is
-/// a few dozen shared pointers copied.
+/// A part as a snapshot reads it: its head and sealed blocks, and the earliest time read (ns).
 #[derive(Debug, Clone)]
-pub struct LogSnapshot {
+struct OpenRead {
+    part: Part,
+    floor: i64,
     head: Vec<Arc<Segment>>,
     sealed: Vec<Arc<LogBlock>>,
-    files: Vec<Arc<LogFile>>,
+}
+
+/// A file as a snapshot reads it, and the earliest time read of its part (ns).
+#[derive(Debug, Clone)]
+struct FileRead {
+    part: Part,
+    floor: i64,
+    log: Arc<LogFile>,
+}
+
+/// What a log store holds at a moment, shared ([`LogStore::snapshot`]): its parts' heads' segments,
+/// sealed blocks and files, read with no hold of the store, however long (each part kept while it
+/// is read: a file deleted meanwhile stays readable, its open handle holding it). Taking one is a
+/// few dozen shared pointers copied. A snapshot reads every part unless [`LogSnapshot::scoped`].
+#[derive(Debug, Clone)]
+pub struct LogSnapshot {
+    open: Vec<OpenRead>,
+    files: Vec<FileRead>,
     spans: bool,
 }
 
@@ -160,15 +248,19 @@ impl LogStore {
         self.spans
     }
 
-    /// Its files, oldest first (their numbers ascending): each a cut's, written once, never
-    /// rewritten (only expired whole).
+    /// Its files, oldest first (their numbers ascending): each a cut's of one part, written once,
+    /// never rewritten (only expired whole).
     pub fn files(&self) -> &[HeldFile] {
         &self.files
     }
 
-    /// What it holds now, to read with no hold of it ([`LogSnapshot`]).
+    /// What it holds now, every part, to read with no hold of it ([`LogSnapshot`]).
     pub fn snapshot(&self) -> LogSnapshot {
-        LogSnapshot { head: self.head.clone(), sealed: self.sealed.clone(), files: self.files.iter().map(|f| Arc::clone(&f.log)).collect(), spans: self.spans }
+        LogSnapshot {
+            open: self.open.iter().map(|o| OpenRead { part: o.part, floor: i64::MIN, head: o.head.clone(), sealed: o.sealed.clone() }).collect(),
+            files: self.files.iter().map(|f| FileRead { part: f.part, floor: i64::MIN, log: Arc::clone(&f.log) }).collect(),
+            spans: self.spans,
+        }
     }
 
     /// Every record in `[from, to]` (ns), in no order: [`LogSnapshot::each_record`].
@@ -196,99 +288,110 @@ impl LogStore {
         self.snapshot().aggregate_buckets(search, from, to, buckets, by, measure)
     }
 
-    /// Takes a batch's rows (their encoding, decompressed).
+    /// Takes a batch's rows (their encoding, decompressed), of the main part.
     pub fn append(&mut self, raw: Vec<u8>, rows: u32) -> Result<(), LogStoreError> {
+        self.append_in(MAIN, raw, rows)
+    }
+
+    /// Takes a batch's rows of `part`.
+    pub fn append_in(&mut self, part: Part, raw: Vec<u8>, rows: u32) -> Result<(), LogStoreError> {
         if rows == 0 {
             return Ok(());
         }
-        self.head_bytes += raw.len();
-        self.head.push(Arc::new((raw, rows)));
-        if self.head_bytes >= BLOCK_TEXT {
-            self.seal()?;
-        }
-        Ok(())
-    }
-
-    /// Seals the head into a block.
-    fn seal(&mut self) -> Result<(), LogStoreError> {
-        if self.head.is_empty() {
-            return Ok(());
-        }
-        let mut refs: Vec<RecordRef<'_>> = Vec::new();
-        for seg in &self.head {
-            let (raw, n) = &**seg;
-            let mut rows = Rows::new(raw, *n as usize);
-            while let Some(r) = rows.next_row()? {
-                refs.push(r);
+        let at = match self.open.binary_search_by_key(&part, |o| o.part) {
+            Ok(at) => at,
+            Err(at) => {
+                self.open.insert(at, Open::new(part));
+                at
             }
+        };
+        let spans = self.spans;
+        let Some(o) = self.open.get_mut(at) else { return Ok(()) };
+        o.head_bytes += raw.len();
+        o.head.push(Arc::new((raw, rows)));
+        if o.head_bytes >= BLOCK_TEXT {
+            o.seal(spans)?;
         }
-        let block = LogBlock::seal_in(&refs, self.spans);
-        drop(refs);
-        self.sealed.push(Arc::new(block));
-        self.head.clear();
-        self.head_bytes = 0;
         Ok(())
     }
 
-    /// Seals what is left and writes every unwritten block to `path`; none if there was nothing.
+    /// Seals what is left of the main part and writes its unwritten blocks to `path`; none if
+    /// there was nothing. For a store of one part (a test's, a bench's).
     pub fn cut(&mut self, path: &Path) -> Result<Option<LogFile>, LogStoreError> {
-        self.seal()?;
-        if self.sealed.is_empty() {
+        let spans = self.spans;
+        let Some(o) = self.open.iter_mut().find(|o| o.part == MAIN) else { return Ok(None) };
+        o.seal(spans)?;
+        if o.sealed.is_empty() {
             return Ok(None);
         }
-        let blocks: Vec<&LogBlock> = self.sealed.iter().map(|b| &**b).collect();
+        let blocks: Vec<&LogBlock> = o.sealed.iter().map(|b| &**b).collect();
         let f = super::file::write_refs(path, &blocks)?;
-        self.sealed.clear();
+        o.sealed.clear();
         Ok(Some(f))
     }
 
-    /// Writes every unwritten row to `path` (the head sealed as a copy), the store left as it is
-    /// (a cut writing under a shared hold); none if there was nothing. [`LogStore::written`] takes
-    /// the file in after.
-    pub fn write_unwritten(&self, path: &Path) -> Result<Option<LogFile>, LogStoreError> {
-        let head = if self.head.is_empty() {
-            None
-        } else {
-            let mut refs: Vec<RecordRef<'_>> = Vec::new();
-            for seg in &self.head {
-                let (raw, n) = &**seg;
-                let mut rows = Rows::new(raw, *n as usize);
-                while let Some(r) = rows.next_row()? {
-                    refs.push(r);
-                }
-            }
-            Some(LogBlock::seal_in(&refs, self.spans))
-        };
-        let blocks: Vec<&LogBlock> = self.sealed.iter().map(|b| &**b).chain(head.as_ref()).collect();
+    /// Its parts: those with rows in memory or in files, in their order.
+    pub fn parts(&self) -> Vec<Part> {
+        let mut parts: Vec<Part> = self.open.iter().filter(|o| o.unwritten_rows() > 0).map(|o| o.part).chain(self.files.iter().map(|f| f.part)).collect();
+        parts.sort_unstable();
+        parts.dedup();
+        parts
+    }
+
+    /// The parts with rows not yet in a file, in their order.
+    pub fn unwritten_parts(&self) -> Vec<Part> {
+        self.open.iter().filter(|o| o.unwritten_rows() > 0).map(|o| o.part).collect()
+    }
+
+    /// Writes every unwritten row of `part` to `path` (its head sealed as a copy), the store left
+    /// as it is (a cut writing under a shared hold); none if there was nothing.
+    /// [`LogStore::written`] takes the file in after.
+    pub fn write_unwritten(&self, part: Part, path: &Path) -> Result<Option<LogFile>, LogStoreError> {
+        let Some(o) = self.open.iter().find(|o| o.part == part) else { return Ok(None) };
+        let head = if o.head.is_empty() { None } else { Some(LogBlock::seal_in(&o.head_refs()?, self.spans)) };
+        let blocks: Vec<&LogBlock> = o.sealed.iter().map(|b| &**b).chain(head.as_ref()).collect();
         if blocks.is_empty() {
             return Ok(None);
         }
         Ok(Some(super::file::write_refs(path, &blocks)?))
     }
 
-    /// The file [`LogStore::write_unwritten`] wrote, taken in: the rows it holds leave memory.
+    /// The file [`LogStore::write_unwritten`] wrote, taken in: the rows of its part it holds leave
+    /// memory.
     pub fn written(&mut self, file: HeldFile) {
-        self.head.clear();
-        self.head_bytes = 0;
-        self.sealed.clear();
+        if let Some(o) = self.open.iter_mut().find(|o| o.part == file.part) {
+            o.head.clear();
+            o.head_bytes = 0;
+            o.sealed.clear();
+        }
         self.files.push(file);
     }
 
-    /// Rows of the blocks (and the head) whose time reaches into `[from, to]` (ns), from their
+    /// Rows of the blocks (and the heads) whose time reaches into `[from, to]` (ns), from their
     /// summaries alone: what a scan of the range reads, at the most.
     pub fn rows_between(&self, from: i64, to: i64) -> u64 {
-        let head: u64 = self.head.iter().map(|h| u64::from(h.1)).sum();
-        let blocks = self.sealed.iter().map(|b| &**b).chain(self.files.iter().flat_map(|f| f.log.blocks.iter()));
+        let head: u64 = self.open.iter().flat_map(|o| o.head.iter()).map(|h| u64::from(h.1)).sum();
+        let blocks = self.open.iter().flat_map(|o| o.sealed.iter().map(|b| &**b)).chain(self.files.iter().flat_map(|f| f.log.blocks.iter()));
         head + blocks.filter(|b| b.max_ts >= from && b.min_ts <= to).map(|b| u64::from(b.rows)).sum::<u64>()
     }
 
-    /// Rows held in memory (head and sealed blocks not yet written).
+    /// Rows of `part` whose time reaches into `[from, to]` (ns), from its summaries alone (a block
+    /// reaching into it counted whole; its head, whole).
+    pub fn rows_in(&self, part: Part, from: i64, to: i64) -> u64 {
+        let open = self.open.iter().filter(|o| o.part == part);
+        let head: u64 = open.clone().flat_map(|o| o.head.iter()).map(|h| u64::from(h.1)).sum();
+        let blocks = open.flat_map(|o| o.sealed.iter().map(|b| &**b)).chain(self.files.iter().filter(|f| f.part == part).flat_map(|f| f.log.blocks.iter()));
+        head + blocks.filter(|b| b.max_ts >= from && b.min_ts <= to).map(|b| u64::from(b.rows)).sum::<u64>()
+    }
+
+    /// Rows held in memory (heads and sealed blocks not yet written).
     pub fn unwritten_rows(&self) -> u64 {
-        self.head.iter().map(|h| u64::from(h.1)).sum::<u64>() + self.sealed.iter().map(|b| u64::from(b.rows)).sum::<u64>()
+        self.open.iter().map(Open::unwritten_rows).sum()
     }
 
     pub fn heap_bytes(&self) -> usize {
-        self.head.iter().map(|h| h.0.capacity()).sum::<usize>() + self.sealed.iter().map(|b| b.text.capacity() + b.summary_bytes()).sum::<usize>() + self.files.iter().map(|f| f.log.heap_bytes()).sum::<usize>()
+        self.open.iter().map(|o| o.head.iter().map(|h| h.0.capacity()).sum::<usize>() + o.sealed.iter().map(|b| b.text.capacity() + b.summary_bytes()).sum::<usize>()).sum::<usize>()
+            + self.files.iter().map(|f| f.log.heap_bytes()).sum::<usize>()
     }
 
     pub fn disk_bytes(&self) -> u64 {
@@ -297,14 +400,14 @@ impl LogStore {
 
     /// Drops files wholly older than `cutoff` (ns); their names, for the caller to delete.
     pub fn retain(&mut self, cutoff: i64) -> Vec<String> {
-        let gone = self.expired(cutoff);
+        let gone = self.expired(&|_| cutoff);
         self.drop_files(&gone);
         gone
     }
 
-    /// The names of the files wholly older than `cutoff` (ns).
-    pub fn expired(&self, cutoff: i64) -> Vec<String> {
-        self.files.iter().filter(|f| f.log.max_ts < cutoff).map(|f| f.file.clone()).collect()
+    /// The names of the files wholly older than their part's cutoff (ns).
+    pub fn expired(&self, cutoff: &dyn Fn(Part) -> i64) -> Vec<String> {
+        self.files.iter().filter(|f| f.log.max_ts < cutoff(f.part)).map(|f| f.file.clone()).collect()
     }
 
     /// Files named no longer read (their manifest durable without them).
@@ -650,62 +753,72 @@ fn order_free(measure: &Measure) -> bool {
 }
 
 impl LogSnapshot {
+    /// Of its parts, those `floor` keeps, each read from the time it says (ns: its retention's);
+    /// the others not read.
+    #[must_use]
+    pub fn scoped(&self, floor: &dyn Fn(Part) -> Option<i64>) -> Self {
+        Self {
+            open: self.open.iter().filter_map(|o| Some(OpenRead { floor: floor(o.part)?, ..o.clone() })).collect(),
+            files: self.files.iter().filter_map(|f| Some(FileRead { floor: floor(f.part)?, ..f.clone() })).collect(),
+            spans: self.spans,
+        }
+    }
+
     /// The newest `limit` records in `[from, to]` (ns) that `search` matches.
     pub fn search(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, LogStoreError> {
         let mut found = Found::default();
         if limit == 0 || to < from {
             return Ok(found);
         }
-        // Every block, newest end first; the head last examined but always (it has no summary).
+        // Every block, newest end first; the heads first examined, always (they have no summary).
         enum Src<'a> {
             File(&'a LogFile, usize),
             Sealed(&'a LogBlock),
         }
-        let mut srcs: Vec<(i64, i64, Src<'_>)> = Vec::new();
+        let mut srcs: Vec<(i64, i64, i64, Src<'_>)> = Vec::new();
         for f in &self.files {
-            for (i, b) in f.blocks.iter().enumerate() {
-                srcs.push((b.min_ts, b.max_ts, Src::File(f, i)));
+            for (i, b) in f.log.blocks.iter().enumerate() {
+                srcs.push((b.min_ts, b.max_ts, f.floor, Src::File(&f.log, i)));
             }
         }
-        for b in &self.sealed {
-            srcs.push((b.min_ts, b.max_ts, Src::Sealed(b)));
+        for o in &self.open {
+            for b in &o.sealed {
+                srcs.push((b.min_ts, b.max_ts, o.floor, Src::Sealed(b)));
+            }
         }
         srcs.sort_by_key(|s| std::cmp::Reverse(s.1));
         found.blocks_total = srcs.len() as u64;
-        // The best `limit` so far, kept sorted newest first.
-        let mut best: Vec<(i64, Record)> = Vec::with_capacity(limit.min(4096));
+        // The best `limit` so far, kept sorted newest first: each its time and its row's place in
+        // `kept`, where it is written alone (its time from 0). A row is made a record once it is
+        // among the last: a block is read oldest first, and each newer row made a record at once
+        // was most often let go again (45,000 allocations for the newest 100 of 2,000,000).
+        let mut best: Best = Best { rows: Vec::with_capacity(limit.min(4096) + 1), kept: Vec::new(), live: 0, limit };
         let mut scratch = RowScratch::default();
         let (mut text, mut raw) = (Vec::new(), Vec::new());
-        // Newest first; records of one time by their contents, so that which of them a limit keeps
-        // is the same on every replica, however its blocks fell.
-        let before = |x: &(i64, Record), r: &RecordRef<'_>| x.0 > r.ts || (x.0 == r.ts && cmp_contents(r, &x.1) != std::cmp::Ordering::Less);
-        let consider = |r: &RecordRef<'_>, best: &mut Vec<(i64, Record)>, scratch: &mut RowScratch, found: &mut Found| {
+        let consider = |r: &RecordRef<'_>, row: &[u8], floor: i64, best: &mut Best, scratch: &mut RowScratch, found: &mut Found| {
             found.rows_scanned += 1;
-            if r.ts < from || r.ts > to || !search.row(r, scratch) {
+            if r.ts < from || r.ts < floor || r.ts > to || !search.row(r, scratch) {
                 return;
             }
-            if best.len() >= limit && best.last().is_some_and(|w| before(w, r)) {
-                return;
-            }
-            let at = best.partition_point(|x| before(x, r));
-            best.insert(at, (r.ts, r.to_owned()));
-            best.truncate(limit);
+            best.offer(r, row);
         };
-        // The head first: it is the newest, in arrival order.
-        for seg in &self.head {
-            let (raw, n) = &**seg;
-            let mut rows = Rows::new(raw, *n as usize);
-            while let Some(r) = rows.next_row()? {
-                consider(&r, &mut best, &mut scratch, &mut found);
+        // The heads first: they are the newest, in arrival order.
+        for o in &self.open {
+            for seg in &o.head {
+                let (raw, n) = &**seg;
+                let mut rows = Rows::new(raw, *n as usize);
+                while let Some((r, row)) = rows.next_row_bytes()? {
+                    consider(&r, row, o.floor, &mut best, &mut scratch, &mut found);
+                }
             }
         }
-        for (min_ts, max_ts, src) in srcs {
-            if max_ts < from || min_ts > to {
+        for (min_ts, max_ts, floor, src) in srcs {
+            if max_ts < from || max_ts < floor || min_ts > to {
                 found.blocks_pruned += 1;
                 continue;
             }
             // Nothing in this block or any after it is newer than the worst kept.
-            if best.len() >= limit && best.last().is_some_and(|w| w.0 > max_ts) {
+            if best.rows.len() >= limit && best.rows.last().is_some_and(|w| w.0 > max_ts) {
                 break;
             }
             let summary = match &src {
@@ -728,11 +841,11 @@ impl LogSnapshot {
                 }
             };
             let mut rows = block.rows(&raw);
-            while let Some(r) = rows.next_row()? {
-                consider(&r, &mut best, &mut scratch, &mut found);
+            while let Some((r, row)) = rows.next_row_bytes()? {
+                consider(&r, row, floor, &mut best, &mut scratch, &mut found);
             }
         }
-        found.records = best.into_iter().map(|(_, r)| r).collect();
+        found.records = best.rows.iter().filter_map(|(_, at)| best.row(at).map(|r| r.to_owned())).collect();
         Ok(found)
     }
 
@@ -775,11 +888,12 @@ impl LogSnapshot {
     /// The blocks a scan of `[from, to]` for `search` reads, sealed then files' in order, and how
     /// many it rules out.
     fn candidates(&self, search: &Search, from: i64, to: i64) -> (Vec<Src<'_>>, u64) {
-        let consider = |b: &LogBlock| b.max_ts >= from && b.min_ts <= to && search.block_in(b, self.spans) != Maybe::No;
-        let all = self.sealed.iter().map(|b| Src::Sealed(b)).chain(self.files.iter().flat_map(|f| f.blocks.iter().enumerate().map(|(i, b)| Src::File(f, i, b))));
+        let consider = |b: &LogBlock, floor: i64| b.max_ts >= from && b.max_ts >= floor && b.min_ts <= to && search.block_in(b, self.spans) != Maybe::No;
+        let sealed = self.open.iter().flat_map(|o| o.sealed.iter().map(move |b| Src::Sealed(b, o.floor)));
+        let all = sealed.chain(self.files.iter().flat_map(|f| f.log.blocks.iter().enumerate().map(move |(i, b)| Src::File(&f.log, i, b, f.floor))));
         let (mut srcs, mut pruned) = (Vec::new(), 0u64);
         for s in all {
-            if consider(s.block()) {
+            if consider(s.block(), s.floor()) {
                 srcs.push(s);
             } else {
                 pruned += 1;
@@ -994,16 +1108,69 @@ impl LogSnapshot {
 
 /// Two records of one time, by their contents: severity, service, host, source, message,
 /// attributes, trace and span.
-fn cmp_contents(a: &RecordRef<'_>, b: &Record) -> std::cmp::Ordering {
+fn cmp_contents(a: &RecordRef<'_>, b: &RecordRef<'_>) -> std::cmp::Ordering {
     a.severity
         .cmp(&b.severity)
-        .then_with(|| a.service.cmp(b.service.as_str()))
-        .then_with(|| a.host.cmp(b.host.as_str()))
-        .then_with(|| a.source.cmp(b.source.as_str()))
-        .then_with(|| a.message.cmp(b.message.as_str()))
-        .then_with(|| a.attrs().cmp(b.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str()))))
+        .then_with(|| a.service.cmp(b.service))
+        .then_with(|| a.host.cmp(b.host))
+        .then_with(|| a.source.cmp(b.source))
+        .then_with(|| a.message.cmp(b.message))
+        .then_with(|| a.attrs().cmp(b.attrs()))
         .then_with(|| a.trace_id.cmp(&b.trace_id))
         .then_with(|| a.span_id.cmp(&b.span_id))
+}
+
+/// A search's best rows so far, newest first (records of one time by their contents, so that which
+/// of them a limit keeps is the same on every replica, however its blocks fell): each its time and
+/// its place in `kept`, where it is written alone, its time from 0; `live` the bytes of `kept` they
+/// hold.
+struct Best {
+    rows: Vec<(i64, std::ops::Range<usize>)>,
+    kept: Vec<u8>,
+    live: usize,
+    limit: usize,
+}
+
+impl Best {
+    /// A kept row read again.
+    fn row(&self, at: &std::ops::Range<usize>) -> Option<RecordRef<'_>> {
+        Rows::new(self.kept.get(at.clone())?, 1).next_row().ok().flatten()
+    }
+
+    /// Whether the kept row `x` comes before `r`.
+    fn before(&self, x: &(i64, std::ops::Range<usize>), r: &RecordRef<'_>) -> bool {
+        x.0 > r.ts || (x.0 == r.ts && self.row(&x.1).is_some_and(|k| cmp_contents(r, &k) != std::cmp::Ordering::Less))
+    }
+
+    /// `r` (its bytes as written, `row`) kept if it is among the best `limit`: its bytes copied, its
+    /// time chained from 0; the worst let go; `kept` written again, the best alone, once rows let
+    /// go are most of it.
+    fn offer(&mut self, r: &RecordRef<'_>, row: &[u8]) {
+        if self.rows.len() >= self.limit && self.rows.last().is_some_and(|w| self.before(w, r)) {
+            return;
+        }
+        let at = self.rows.partition_point(|x| self.before(x, r));
+        let start = self.kept.len();
+        if !crate::logs::record::put_row_rechained(&mut self.kept, row, r.ts, 0) {
+            return;
+        }
+        self.live += self.kept.len() - start;
+        self.rows.insert(at, (r.ts, start..self.kept.len()));
+        if self.rows.len() > self.limit
+            && let Some((_, gone)) = self.rows.pop()
+        {
+            self.live -= gone.len();
+        }
+        if self.kept.len() > 2 * self.live + (64 << 10) {
+            let mut fresh = Vec::with_capacity(2 * self.live);
+            for (_, at) in &mut self.rows {
+                let s = fresh.len();
+                fresh.extend_from_slice(self.kept.get(at.clone()).unwrap_or_default());
+                *at = s..fresh.len();
+            }
+            self.kept = fresh;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1035,6 +1202,50 @@ mod tests {
         }
     }
 
+    /// A store's parts: each its own rows and blocks; a snapshot scoped to some reads each from
+    /// its own time, and not the others; a file of a part is written of its rows alone, and is
+    /// expired by its part's cutoff.
+    #[test]
+    fn parts_are_kept_apart_and_read_from_their_own_times() {
+        let mut s = LogStore::default();
+        for (part, what) in [(MAIN, "main"), (7, "seven"), (TRANSIT, "gone")] {
+            for chunk in (0..3_000).collect::<Vec<i64>>().chunks(500) {
+                let recs: Vec<Record> = chunk.iter().map(|&i| Record { message: format!("{what} {i}"), ..rec(i) }).collect();
+                let (raw, n) = segment(&recs);
+                s.append_in(part, raw, n).unwrap();
+            }
+        }
+        assert_eq!(s.parts(), [MAIN, 7, TRANSIT]);
+        let all = parse("*").unwrap();
+        let n = |snap: &LogSnapshot, what: &str| {
+            let mut n = 0;
+            snap.each_record(i64::MIN, i64::MAX, |r| n += usize::from(r.message.starts_with(what))).unwrap();
+            n
+        };
+        let snap = s.snapshot();
+        assert_eq!((n(&snap, "main"), n(&snap, "seven"), n(&snap, "gone")), (3_000, 3_000, 3_000));
+        // Part 7 from its 2,500th record's time; those not kept for search not read.
+        let t = rec(2_500).ts;
+        let scoped = snap.scoped(&|p| match p {
+            MAIN => Some(i64::MIN),
+            7 => Some(t),
+            _ => None,
+        });
+        assert_eq!((n(&scoped, "main"), n(&scoped, "seven"), n(&scoped, "gone")), (3_000, 500, 0));
+        let found = scoped.search(&all, i64::MIN, i64::MAX, 2_000).unwrap().records;
+        assert_eq!(found.iter().filter(|r| r.message.starts_with("seven")).count(), 500);
+        assert!(found.windows(2).all(|w| w[0].ts >= w[1].ts), "newest first across parts");
+        // Part 7 written: a file of its rows alone; expired by its cutoff, not another's.
+        let dir = tempfile::tempdir().unwrap();
+        let f = s.write_unwritten(7, &dir.path().join("7.logs")).unwrap().unwrap();
+        assert_eq!(f.blocks.iter().map(|b| u64::from(b.rows)).sum::<u64>(), 3_000);
+        s.written(HeldFile { seq: 1, file: "7.logs".into(), part: 7, log: Arc::new(f) });
+        assert_eq!(s.unwritten_parts(), [MAIN, TRANSIT]);
+        assert_eq!(n(&s.snapshot(), "seven"), 3_000, "read from its file");
+        assert!(s.expired(&|p| if p == 7 { i64::MIN } else { i64::MAX }).is_empty());
+        assert_eq!(s.expired(&|p| if p == 7 { i64::MAX } else { i64::MIN }), ["7.logs"]);
+    }
+
     /// The store of 30,000 records the tests read: in batches of 500, several blocks sealed, two
     /// files written.
     fn store_of_30k(dir: &Path) -> LogStore {
@@ -1046,7 +1257,7 @@ mod tests {
             if chunk[0] == 10_000 || chunk[0] == 20_000 {
                 let path = dir.join(format!("{}.logs", chunk[0]));
                 let f = s.cut(&path).unwrap().unwrap();
-                s.files.push(HeldFile { seq: chunk[0] as u64, file: path.file_name().unwrap().to_string_lossy().into_owned(), log: Arc::new(f) });
+                s.files.push(HeldFile { seq: chunk[0] as u64, file: path.file_name().unwrap().to_string_lossy().into_owned(), part: MAIN, log: Arc::new(f) });
             }
         }
         s
@@ -1152,8 +1363,8 @@ mod tests {
         let (raw, n) = segment(&recs);
         s.append(raw, n).unwrap();
         let path = dir.path().join("late.logs");
-        let f = s.write_unwritten(&path).unwrap().unwrap();
-        s.written(HeldFile { seq: 99, file: "late.logs".into(), log: Arc::new(f) });
+        let f = s.write_unwritten(MAIN, &path).unwrap().unwrap();
+        s.written(HeldFile { seq: 99, file: "late.logs".into(), part: MAIN, log: Arc::new(f) });
         let oldest = s.files.first().map(|f| f.file.clone()).unwrap();
         let gone: u64 = s.files.first().map(|f| f.log.blocks.iter().map(|b| u64::from(b.rows)).sum()).unwrap();
         s.drop_files(std::slice::from_ref(&oldest));
@@ -1236,7 +1447,7 @@ mod tests {
             assert!(raw.len() >= BLOCK_TEXT);
             s.append(raw, 510).unwrap();
         }
-        assert_eq!(s.sealed.len(), 400);
+        assert_eq!(s.open.iter().map(|o| o.sealed.len()).sum::<usize>(), 400);
         let mut reads: Vec<u64> = (0..300u64)
             .map(|q| {
                 let t = (q * 7_919 % 400) * 1_000 + 77;

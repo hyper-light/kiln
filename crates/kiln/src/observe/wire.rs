@@ -71,6 +71,12 @@ pub enum Msg {
     LogSources { sources: Vec<(String, super::collect::Source)> },
     /// Server → runner: the log pipelines every node applies (`super::pipeline`), in order.
     Pipelines { pipelines: Vec<super::pipeline::PipelineDef> },
+    /// Server → runner: the log indexes every node routes records by (`super::indexes`), in
+    /// order, and the parts of those over their daily quota now.
+    Indexes {
+        indexes: Vec<super::indexes::Kept>,
+        limited: Vec<u16>,
+    },
     /// Server → runner: the scanning groups every node runs (`super::scanner`), in order, and the
     /// key their hashes are made with.
     Scanner {

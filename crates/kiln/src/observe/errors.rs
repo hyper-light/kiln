@@ -389,7 +389,7 @@ impl Issues {
                     |id, first, now| {
                         let (spans, logs) = {
                             let s = held();
-                            (s.spans_at(), s.logs_at())
+                            (s.spans_at(), s.logs_every())
                         };
                         sample_of(&spans, &logs, id, first, now)
                     },

@@ -202,6 +202,9 @@ enum Input {
     Pipelines(Vec<super::pipeline::PipelineDef>),
     /// The server's scanning groups, in order, and their key: every runner is told them.
     Scanner(Vec<super::scanner::GroupDef>, String),
+    /// The server's log indexes, in order, and the parts of those removed: every runner is told
+    /// them, and those over their quota.
+    Indexes(Vec<super::indexes::Kept>, Vec<u16>),
     /// The server's synthetic tests, all of them: each runner is told those it runs; and one of
     /// them to run now everywhere.
     Synthetics(Vec<(String, super::synthetics::Test)>),
@@ -484,6 +487,12 @@ impl Observe {
         let _ = self.tx.send(Input::Pipelines(all));
     }
 
+    /// The server's log indexes now: routed by here from the next record, every runner told, now
+    /// and when it connects.
+    pub fn set_indexes(&self, all: Vec<super::indexes::Kept>, removed: Vec<u16>) {
+        let _ = self.tx.send(Input::Indexes(all, removed));
+    }
+
     /// The server's scanning groups now, and their key: every runner is told them, now and when it
     /// connects.
     pub fn set_scanner(&self, groups: Vec<super::scanner::GroupDef>, key: String) {
@@ -595,6 +604,9 @@ impl Observe {
         for r in logs.records_mut() {
             kiln_obs::errors::put_log_issue(r);
         }
+        // Each record's part of the store: its index's, kiln's events', or not kept for search
+        // (`super::indexes`); what that came to counted once they are taken.
+        let usage = super::indexes::route_logs(&mut logs);
         let n = logs.bytes();
         let a = &self.admission;
         if !logs.is_empty() && ((!count && (a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire))) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max)) {
@@ -615,6 +627,7 @@ impl Observe {
             });
         }
         self.write(statuses);
+        super::indexes::count(&usage);
         Ok(())
     }
 
@@ -810,6 +823,10 @@ struct Owner {
     log_sources: Vec<(String, super::collect::Source)>,
     pipelines: Vec<super::pipeline::PipelineDef>,
     scanner: (Vec<super::scanner::GroupDef>, String),
+    /// The server's log indexes: every runner is told them.
+    indexes: Vec<super::indexes::Kept>,
+    /// The parts of indexes removed: let go by the leader (none until the server says).
+    removed_parts: Vec<u16>,
     joiner: Joiner,
     part: u64,
     error: Option<String>,
@@ -888,6 +905,8 @@ impl Owner {
             log_sources: Vec::new(),
             pipelines: Vec::new(),
             scanner: (Vec::new(), String::new()),
+            indexes: Vec::new(),
+            removed_parts: Vec::new(),
             joiner: Joiner::default(),
             part: 0,
             error: None,
@@ -1136,6 +1155,26 @@ impl Owner {
                     self.send(&machine, Msg::Pipelines { pipelines: self.pipelines.clone() }, Vec::new());
                 }
             }
+            Input::Indexes(all, removed) => {
+                super::indexes::activate(&all);
+                if self.is_server() {
+                    let now = super::clock_ms();
+                    let store = self.rep.as_ref().map(|rep| rep.r.machine());
+                    let counted = |part: u16, from_ns: i64| store.as_ref().map_or(0, |s| s.read().log_rows_in(part, from_ns));
+                    let over = {
+                        let mut q = super::indexes::quota::global().lock().unwrap_or_else(PoisonError::into_inner);
+                        q.set(&all, now, store.is_some().then_some(&counted as &dyn Fn(u16, i64) -> u64));
+                        q.over()
+                    };
+                    super::indexes::set_limited(over);
+                }
+                self.indexes = all;
+                self.removed_parts = removed;
+                let up: Vec<String> = self.up.iter().cloned().collect();
+                for machine in up {
+                    self.send_indexes(&machine);
+                }
+            }
             Input::Scanner(groups, key) => {
                 self.scanner = (groups, key);
                 let up: Vec<String> = self.up.iter().cloned().collect();
@@ -1220,6 +1259,41 @@ impl Owner {
         self.send_log_sources(machine);
         self.send(machine, Msg::Pipelines { pipelines: self.pipelines.clone() }, Vec::new());
         self.send(machine, Msg::Scanner { groups: self.scanner.0.clone(), key: self.scanner.1.clone() }, Vec::new());
+        self.send_indexes(machine);
+    }
+
+    /// Tells `machine` the log indexes, and those over their quota now.
+    fn send_indexes(&mut self, machine: &str) {
+        let limited = super::indexes::snapshot().limited().to_vec();
+        self.send(machine, Msg::Indexes { indexes: self.indexes.clone(), limited }, Vec::new());
+    }
+
+    /// A write the server proposes, counted against its indexes' daily quotas: what that says,
+    /// said as events; the indexes over their quota, routed by from now on here and on every
+    /// runner.
+    fn count_quotas(&mut self, entry: &[u8]) {
+        let now = super::clock_ms();
+        let (said, over) = {
+            let mut q = super::indexes::quota::global().lock().unwrap_or_else(PoisonError::into_inner);
+            let said = q.count(entry, now);
+            (said, q.over())
+        };
+        for s in said {
+            self.batcher.logs(super::ingest::Logs::events(vec![super::indexes::quota_event(&s, now)]), Instant::now());
+        }
+        self.set_over(over);
+    }
+
+    /// The parts over their quota now: routed by here, every runner told, when they change.
+    fn set_over(&mut self, over: Vec<u16>) {
+        if super::indexes::snapshot().limited() == over.as_slice() {
+            return;
+        }
+        super::indexes::set_limited(over);
+        let up: Vec<String> = self.up.iter().cloned().collect();
+        for machine in up {
+            self.send_indexes(&machine);
+        }
     }
 
     /// Tells `machine` the scrape targets it reads.
@@ -1284,6 +1358,7 @@ impl Owner {
                 let _ = seq;
                 let mut entry = entry;
                 self.stamp(machine, &mut entry);
+                self.count_quotas(&entry);
                 if let Some(rep) = &mut self.rep {
                     let _ = rep.r.propose(Vec::new(), entry);
                 }
@@ -1298,6 +1373,7 @@ impl Owner {
             | Msg::Scrapes { .. }
             | Msg::LogSources { .. }
             | Msg::Pipelines { .. }
+            | Msg::Indexes { .. }
             | Msg::Scanner { .. }
             | Msg::Synthetics { .. }
             | Msg::RunSynthetic { .. }
@@ -1322,7 +1398,20 @@ impl Owner {
                 (format!("{machine}'s clock agrees with the server's again"), 9)
             };
             let attrs = vec![("event.type".to_owned(), "observe.clock_skew".to_owned()), ("machine".to_owned(), machine.to_owned()), ("skew_ms".to_owned(), skew.to_string())];
-            self.batcher.logs(vec![Record { ts: now.saturating_mul(1_000_000), severity, service: "kiln.observe".into(), host: machine.to_owned(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }], Instant::now());
+            self.batcher.logs(
+                super::ingest::Logs::events(vec![Record {
+                    ts: now.saturating_mul(1_000_000),
+                    severity,
+                    service: "kiln.observe".into(),
+                    host: machine.to_owned(),
+                    source: "kiln.event".into(),
+                    message,
+                    attrs,
+                    trace_id: None,
+                    span_id: None,
+                }]),
+                Instant::now(),
+            );
         }
     }
 
@@ -1371,6 +1460,29 @@ impl Owner {
             if rep.r.machine().read().holds_spans() {
                 let _ = rep.r.propose(Vec::new(), kiln_obs::command::retain_spans(back(self.retention.2), now));
             }
+            // Each part of the logs kept for its own time (an index's; those of indexes removed;
+            // those not kept for search): stated only for such a part, so a group that never had
+            // one never sends an entry a build that knows no parts would stop at. Only a part said
+            // removed is let go: before the indexes are heard, none is.
+            let (held, parts) = {
+                let s = rep.r.machine().read();
+                let parts: Vec<u16> = s.part_cutoffs().keys().copied().collect();
+                (s.log_parts(), parts)
+            };
+            for (part, cutoff) in super::indexes::retentions(&self.indexes, &self.removed_parts, &held, &|p| parts.contains(&p), now, back(self.retention.1)) {
+                let _ = rep.r.propose(Vec::new(), kiln_obs::command::retain_part(part, cutoff, now));
+            }
+        }
+        // Indexes' days turned: their quotas over again; a day set before the store opened, read.
+        let turned = {
+            let store = rep.r.machine();
+            let mut q = super::indexes::quota::global().lock().unwrap_or_else(PoisonError::into_inner);
+            let read = q.read_unread(&|part, from_ns| store.read().log_rows_in(part, from_ns));
+            q.tick(super::clock_ms()) || read
+        };
+        if turned {
+            let over = super::indexes::quota::global().lock().unwrap_or_else(PoisonError::into_inner).over();
+            self.set_over(over);
         }
     }
 
@@ -1429,6 +1541,10 @@ impl Owner {
                 }
             }
             Msg::Pipelines { pipelines } => super::pipeline::kept::activate(&pipelines),
+            Msg::Indexes { indexes, limited } => {
+                super::indexes::activate(&indexes);
+                super::indexes::set_limited(limited);
+            }
             Msg::Scanner { groups, key } => super::scanner::kept::activate(&groups, &key),
             Msg::Synthetics { tests } => {
                 if let Some(r) = super::synthetics::runner() {
@@ -1493,6 +1609,7 @@ impl Owner {
         // server measures this machine's clock by.
         kiln_obs::command::write_at(&mut entry, Some(super::clock_ms()));
         if self.is_server() {
+            self.count_quotas(&entry);
             if let Some(rep) = &mut self.rep {
                 let _ = rep.r.propose(Vec::new(), entry);
             }
@@ -1628,7 +1745,20 @@ impl Owner {
             };
             tracing::warn!("{message}");
             let attrs = vec![("event.type".to_owned(), "observe.disk".to_owned()), ("disk_free".to_owned(), free.to_string())];
-            self.batcher.logs(vec![Record { ts: super::clock_ms().saturating_mul(1_000_000), severity, service: "kiln.observe".into(), host: crate::os::hostname(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }], Instant::now());
+            self.batcher.logs(
+                super::ingest::Logs::events(vec![Record {
+                    ts: super::clock_ms().saturating_mul(1_000_000),
+                    severity,
+                    service: "kiln.observe".into(),
+                    host: crate::os::hostname(),
+                    source: "kiln.event".into(),
+                    message,
+                    attrs,
+                    trace_id: None,
+                    span_id: None,
+                }]),
+                Instant::now(),
+            );
         }
     }
 

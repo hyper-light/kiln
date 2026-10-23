@@ -108,6 +108,28 @@ fn a_machine_s_containers_are_listed_with_their_limits_throttling_and_oom_kills(
         let kills: f64 = a["series"].as_array().into_iter().flatten().flat_map(|s| s["values"].as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
         Ok(kills >= 1.0)
     })?;
+    // Each kill counted once: what kiln counts grows as the kernel's own count does (its
+    // `memory.events`, read in the container), but for the kills of a look or so at either end;
+    // never more than the kernel's. (The container ran before the fleet started: the kills before
+    // kiln's first look are not counted, as Datadog's are not, a count beginning at its first
+    // sample.)
+    let kills_of = || -> anyhow::Result<f64> {
+        let a = f.call(
+            "POST",
+            "/api/observe/v1/query",
+            Some(&json!({ "query": format!("sum:container.memory.oom_events{{container_name:{oom}}}.as_count()"), "from": since, "to": now_ms(), "step": 60_000 })),
+        )?;
+        Ok(a["series"].as_array().into_iter().flatten().flat_map(|s| s["values"].as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum())
+    };
+    let kernel = || -> anyhow::Result<f64> {
+        let events = docker(&["exec", &oom, "cat", "/sys/fs/cgroup/memory.events"])?;
+        events.lines().find_map(|l| l.strip_prefix("oom_kill ")).and_then(|v| v.trim().parse::<f64>().ok()).ok_or_else(|| anyhow::anyhow!("no oom_kill in {events}"))
+    };
+    let (c0, k0) = (kills_of()?, kernel()?);
+    std::thread::sleep(Duration::from_secs(20));
+    let (c1, k1) = (kills_of()?, kernel()?);
+    anyhow::ensure!(k1 - k0 >= 10.0, "the kernel kept killing it: {k0} then {k1}");
+    anyhow::ensure!(c1 <= k1 && ((c1 - c0) - (k1 - k0)).abs() <= 4.0, "each kill counted once: {c0} then {c1} counted, the kernel's {k0} then {k1}");
     let o = named(&listed(&f, &format!("filter={oom}"))?, &oom).cloned().ok_or_else(|| anyhow::anyhow!("the OOM one listed"))?;
     anyhow::ensure!(o["id"] == oom_id.as_str() && o["state"] == "running" && o["figures"]["memory_limit_bytes"] == 33_554_432.0, "alive under its limit: {o}");
 

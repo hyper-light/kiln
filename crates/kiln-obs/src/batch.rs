@@ -11,11 +11,13 @@
 //!        | RUN u8 | fp u64-le | samples varint | chunk varint-length bytes
 //!        | LOGS u8 | rows varint | raw length varint | LZ4 of the rows varint-length bytes
 //!        | SPANS u8 | rows varint | raw length varint | LZ4 of the rows varint-length bytes
+//!        | LOGS_IN u8 | part varint | rows varint | raw length varint | LZ4 of the rows bytes
 //! key   := metric | tags varint | (tag-key, tag-value)*          (each varint-length bytes)
 //! ```
 //!
 //! Spans are rows as log records are (`crate::logs::record`), for the span store
-//! (`crate::otlp::traces`).
+//! (`crate::otlp::traces`). Log rows are of a part of the log store (`crate::logs::store::Part`):
+//! `LOGS`, the main part's (as every batch before parts wrote them); `LOGS_IN`, another's.
 //!
 //! A run names a series defined in its batch (earlier) or in an earlier batch. A definition takes
 //! effect with the first of its series' samples a replica keeps, never alone: no replica holds a
@@ -35,6 +37,7 @@ const DEF: u8 = 0;
 const RUN: u8 = 1;
 const LOGS: u8 = 2;
 const SPANS: u8 = 3;
+const LOGS_IN: u8 = 4;
 
 /// The most bytes a batch's log rows decompress to: three times the largest request the
 /// OpenTelemetry Collector's HTTP receiver takes by default (`confighttp` `max_request_body_size`,
@@ -271,9 +274,17 @@ impl Builder {
 
     /// An item of rows, `raw` LZ4-compressed: its tag, how many, their size, and their bytes.
     fn packed_item(&mut self, tag: u8, raw: &[u8], rows: u64) {
+        self.packed_item_in(tag, None, raw, rows);
+    }
+
+    /// [`Builder::packed_item`], its part said after its tag where it has one.
+    fn packed_item_in(&mut self, tag: u8, part: Option<u16>, raw: &[u8], rows: u64) {
         self.packed.clear();
         crate::lz4::compress(raw, &mut self.packed);
         self.body.push(tag);
+        if let Some(p) = part {
+            varint::put(&mut self.body, u64::from(p));
+        }
         varint::put(&mut self.body, rows);
         varint::put(&mut self.body, raw.len() as u64);
         put_bytes(&mut self.body, &self.packed);
@@ -293,10 +304,20 @@ impl Builder {
     /// batcher as they came; their times chained from 0), as one item: what [`Builder::logs`]
     /// writes of records.
     pub fn log_rows(&mut self, raw: &[u8], rows: u32) {
+        self.log_rows_in(crate::logs::store::MAIN, raw, rows);
+    }
+
+    /// [`Builder::log_rows`] of `part` of the log store: the main part's as `LOGS`, another's as
+    /// `LOGS_IN`.
+    pub fn log_rows_in(&mut self, part: u16, raw: &[u8], rows: u32) {
         if rows == 0 {
             return;
         }
-        self.packed_item(LOGS, raw, u64::from(rows));
+        if part == crate::logs::store::MAIN {
+            self.packed_item(LOGS, raw, u64::from(rows));
+        } else {
+            self.packed_item_in(LOGS_IN, Some(part), raw, u64::from(rows));
+        }
     }
 
     pub fn items(&self) -> u64 {
@@ -348,8 +369,14 @@ impl Builder {
 pub enum Item<'a> {
     Def { fp: u64, kind: Kind, key: &'a [u8] },
     Run { fp: u64, samples: ChunkRef<'a> },
-    /// Log rows: how many, their size decompressed, and their LZ4 bytes.
-    Logs { rows: u32, raw_len: usize, packed: &'a [u8] },
+    /// Log rows of a part of the log store: how many, their size decompressed, and their LZ4
+    /// bytes.
+    Logs {
+        part: u16,
+        rows: u32,
+        raw_len: usize,
+        packed: &'a [u8],
+    },
     /// Span rows, as log rows are.
     Spans { rows: u32, raw_len: usize, packed: &'a [u8] },
 }
@@ -379,12 +406,13 @@ impl<'a> Reader<'a> {
         }
         let (&tag, rest) = self.at.split_first().ok_or(BatchError::Malformed("item tag"))?;
         self.at = rest;
-        if tag == LOGS || tag == SPANS {
+        if tag == LOGS || tag == SPANS || tag == LOGS_IN {
+            let part = if tag == LOGS_IN { varint::get(&mut self.at).and_then(|p| u16::try_from(p).ok()).ok_or(BatchError::Malformed("log rows' part"))? } else { crate::logs::store::MAIN };
             let rows = varint::get(&mut self.at).and_then(|r| u32::try_from(r).ok()).ok_or(BatchError::Malformed("log rows"))?;
             let raw_len = varint::get(&mut self.at).and_then(|r| usize::try_from(r).ok()).filter(|&r| r <= MAX_LOG_ROWS_BYTES).ok_or(BatchError::Malformed("log rows' size"))?;
             let packed = get_bytes(&mut self.at).ok_or(BatchError::Malformed("log rows"))?;
             self.left -= 1;
-            return Ok(Some(if tag == LOGS { Item::Logs { rows, raw_len, packed } } else { Item::Spans { rows, raw_len, packed } }));
+            return Ok(Some(if tag == SPANS { Item::Spans { rows, raw_len, packed } } else { Item::Logs { part, rows, raw_len, packed } }));
         }
         let fp = get_u64(&mut self.at).ok_or(BatchError::Malformed("fingerprint"))?;
         let item = match tag {
