@@ -157,6 +157,23 @@ The server keeps the stacks and drives them, so they go on with no console open 
 restarts. A stack holds at most 500 goals, those met or under way included, so a program of a
 hundred goals and more fits, its met goals kept for the record.
 
+## Big goals, planned first
+
+Agents are told to plan a goal that takes several steps before starting on it, and left to that,
+they often don't. So a stack plans its big goals itself, unless you turn it off (its `plan_big`
+setting: `goals/settings`, below). When a big goal of the agent's own is
+next to start, kiln turns it into a plan first, as **Make a plan** does: its planning (research
+inside and outside, its steps written, said ready) goes to the agent in its place, then its steps,
+and once they're all met, so is the goal.
+
+- **Big** is more than a couple of sentences (three or more of three words or more; each line of
+  a list counts as one) or longer than 280 characters. "Ship 0.3 to the fleet" goes as it is;
+  a paragraph of what to build and how to test it is planned.
+- A part of another goal, a goal made from a plan's step, one planned already and one handed to
+  another agent go as they are. So does a big goal kiln can't plan (kiln's log says why).
+- It's a person's setting: agents don't have it as a tool, so an agent can't turn off what you
+  turned on.
+
 ## Held or paused for usage
 
 An agent of a program (its coordinator, or a track's worker, as assigned:
@@ -238,11 +255,12 @@ What the driver sends, and the goals it sees end, are counted on `/metrics`
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?}], updated_at, cleared?, resume_at?}` (`part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits for you to look at) |
+| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?}], updated_at, cleared?, resume_at?}` (`part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits for you to look at; `plan_big`: whether it plans its big goals first) |
 | POST | `/api/harness/sessions/:id/goals` | `{goals: [text], start?, next?, before?, after?}`: goals after the others, or right after the goal under way (`next`), or before or after a goal still to go (by id) (a stack that was done, given more, is paused until started) |
 | POST | `/api/harness/sessions/:id/goals/done` | `{id?, evidence?}`: the goal under way (or `id`) is met |
 | POST | `/api/harness/sessions/:id/goals/split` | `{id?, goals?}`: the goal under way (or `id`) split into parts pursued first (none given: a plan step's acceptance criteria and tests) |
 | POST | `/api/harness/sessions/:id/goals/plan` | `{id?, title?}`: the goal under way (or `id`) turned into a plan in its planning phase: `{plan, research, goal, part, next}` |
+| POST | `/api/harness/sessions/:id/goals/settings` | `{plan_big}`: whether the stack plans its big goals first ("Big goals, planned first"); answers the stack (`goals.settings`, not an agent's tool) |
 | PATCH | `/api/harness/sessions/:id/goals/:goal` | `{text?, next?, before?, after?, remove?}`: one goal still to go changed, moved or taken out |
 | PUT | `/api/harness/sessions/:id/goals` | `{goals: [{id?, text}]}`: the goals still to go, as they should be (reordered, edited, removed, added; one without `id` is the goal still to go with its words, if one wasn't named, else a new one). The goal under way may be among them: first, it stays (with other words, it's sent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done, given by id, are left as they are, not added again |
 | POST | `/api/harness/sessions/:id/goals/{start,resume,pause,skip,done,clear,restore}` | as above (`resume`: `start`; `restore`: **Bring back**); `pause` takes `{why?, resume_in_s?, resume_at?}` |
