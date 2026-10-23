@@ -171,6 +171,10 @@ async fn answer(hub: &Arc<Hub>, i: &Integration, who: &Speaker, text: &str, key:
     let url = |id: i64| format!("{}/deployments/releases/{id}", hub.cfg.server.public_url.trim_end_matches('/'));
     Ok(match &command {
         Command::Deploy { .. } | Command::Rollback { .. } => format!("Asked: {}", said_of(&v, &url)),
+        // Still held until the worker looks again: what it waits for may be this very approval.
+        Command::Approve { .. } if v.get("state").and_then(Value::as_str) == Some("waiting_approval") => {
+            format!("You approved {}: it goes on once it has every approval it needs · {}", headline(&v), url(v.get("id").and_then(Value::as_i64).unwrap_or_default()))
+        }
         Command::Approve { .. } => format!("You approved it: {}", said_of(&v, &url)),
         Command::Reject { .. } => format!("You rejected it: {}", said_of(&v, &url)),
         Command::Status(Status::Release(_)) => said_of(&v, &url),
@@ -219,8 +223,8 @@ fn approvers(r: &Value) -> Vec<String> {
     r.get("approvers").or(from_gate).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
 }
 
-/// What a release is: `release 42, web 1.4.2 → production, waits for approval (grace) · <its page>`.
-pub fn said_of(r: &Value, url: &dyn Fn(i64) -> String) -> String {
+/// Which release it is: `release 42, web 1.4.2 → production`.
+fn headline(r: &Value) -> String {
     let get = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default();
     let id = r.get("id").and_then(Value::as_i64).unwrap_or_default();
     let what = match get("kind") {
@@ -230,7 +234,13 @@ pub fn said_of(r: &Value, url: &dyn Fn(i64) -> String) -> String {
         "disable" => "disabling".to_owned(),
         _ => get("version").to_owned(),
     };
-    format!("release {id}, {} {what} → {}, {} · {}", get("app"), get("environment"), state_words(r), url(id))
+    format!("release {id}, {} {what} → {}", get("app"), get("environment"))
+}
+
+/// What a release is: `release 42, web 1.4.2 → production, waits for approval (grace) · <its page>`.
+pub fn said_of(r: &Value, url: &dyn Fn(i64) -> String) -> String {
+    let id = r.get("id").and_then(Value::as_i64).unwrap_or_default();
+    format!("{}, {} · {}", headline(r), state_words(r), url(id))
 }
 
 /// What runs for an app in one environment, and what's on its way there.

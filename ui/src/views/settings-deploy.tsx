@@ -671,7 +671,8 @@ function ChatCommands({ a, id }: { a: Integration; id: string }) {
         </p>
       )}
       <p className="dep-status" data-tone={missing ? undefined : "succeeded"} role="status">
-        {missing ?? "kiln takes its commands: deploy, approve, reject, rollback, status. Each runs as the person who said it, once they've linked their account (Settings → You → Chat accounts)."}
+        {missing ??
+          `kiln takes its commands: deploy, approve, reject, rollback, status. Each runs as the person who said it: whoever linked that account (Settings → You → Chat accounts)${a.kind === "slack" ? ", or the one person here with its email" : ""}.`}
       </p>
       {asks && (
         <form

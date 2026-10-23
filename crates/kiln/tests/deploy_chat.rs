@@ -309,7 +309,7 @@ fn p5_chat_slack_one_message_per_release_and_commands_as_their_person() -> anyho
     assert_eq!(press("UGRACE", "grace", "kiln_approve")?, 200);
     until(&s, 30, "grace's approval", || {
         let a = answers_for("UGRACE");
-        Ok((!a.iter().any(|t| t.starts_with("You approved it: release"))).then(|| format!("{a:?}")))
+        Ok((!a.iter().any(|t| t.starts_with("You approved release") && t.contains("it goes on once it has every approval it needs"))).then(|| format!("{a:?}")))
     })?;
     until(&s, 60, "the release going on", || {
         let r = release(&s, id)?;
@@ -340,7 +340,9 @@ fn p5_chat_slack_one_message_per_release_and_commands_as_their_person() -> anyho
 
     // Status reads as anyone who may read; a deploy needs a deployer; a rollback needs something to go back to.
     let said = slash("UBOB", "bob", "status web")?;
-    assert!(said.starts_with("web\n") && said.contains("staging: nothing runs there yet") && said.contains(&format!("release {id}")), "{said}");
+    assert!(said.starts_with("web\n") && said.contains("staging: nothing runs there yet") && said.contains("production: "), "{said}");
+    let said = slash("UBOB", "bob", &format!("status {id}"))?;
+    assert!(said.starts_with(&format!("release {id}, web 1.4.2 → production, ")), "{said}");
     let said = slash("UBOB", "bob", "deploy web 1.4.4 to staging")?;
     assert!(said.contains("kiln won't, as user:bob") && said.contains("environments.deploy"), "{said}");
     let said = slash("UADA", "ada", "rollback web in staging")?;
@@ -484,7 +486,7 @@ fn p5_chat_discord_telegram_and_teams() -> anyhow::Result<()> {
     assert_eq!(telegram(press)?, 200);
     until(&s, 30, "the button's answer", || {
         let a: Vec<Value> = seen(&got).into_iter().filter(|(_, p, _)| p == "/telegram/bot123:abc/answerCallbackQuery").map(|(_, _, v)| v).collect();
-        Ok((!a.iter().any(|v| str_at(v, "/text").starts_with("You approved it") && v.get("show_alert") == Some(&json!(true)))).then(|| format!("{a:?}")))
+        Ok((!a.iter().any(|v| str_at(v, "/text").starts_with("You approved release") && v.get("show_alert") == Some(&json!(true)))).then(|| format!("{a:?}")))
     })?;
     until(&s, 60, "the release going on", || {
         let r = release(&s, id)?;
