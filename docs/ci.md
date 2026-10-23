@@ -5172,7 +5172,11 @@ with W11-AC03's tenants).
     - `GET /api/ci/legs/:id/logs/search?q=`: one leg's lines, read from its files, so a running
       leg's too;
     - `GET /api/ci/legs/:id/logs/failure`: the failed step's log from just before its first line
-      that reads like an error (else its end), with its exit code;
+      that reads like an error (else its end), with its exit code. A line that starts as one
+      (`error:`, `error[`, `--- FAIL`, a traceback) or says it panicked comes before one that only
+      has an error's words, and a log record at a lower level (`level=info msg="fetch failed"`,
+      `[INFO]`, `warning:`) or a test runner's progress (`=== RUN`, `--- PASS`) is neither: an
+      info line 3,000 lines before buildx's failed test had been the excerpt;
     - operations `ci.logs.search`, `ci.legs.search`, `ci.legs.failure_excerpt` and
       `ci.runs.compare` (W20), which the `kiln-ci-diagnose` skill now uses.
   - **The page** (`/logs`, from Runs) takes the text, repository, branch, conclusion and window.
