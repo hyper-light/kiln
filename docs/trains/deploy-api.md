@@ -36,7 +36,20 @@ rollback, and what's still open.
     approval, given in the fake Slack, then succeeded.
 
   Its pods ran on kilncd-e2e and on deploy-argo.
-- **Rolling back past P6, drilled:** on a scratch copy of test server A's database, 94924e5
+- **Under the cluster group:** a write can still be refused after it ran (its change unreadable
+  for the log, or the group's commit failing). Kiln's Records move their head in memory only once
+  a commit is kept, so no read sees a revision the tables don't hold.
+- **Rolling back, drilled again on this train with P1** (2026-10-23, 21:28Z), on a scratch copy of
+  test server A's database. It had no cluster to reach: KilnCD's clusters aren't in kiln.db, and its
+  kubeconfig was empty.
+  1. This train's build started grouped (it made `data/cluster`), and changed an app's project
+     on the seam through the group.
+  2. A build from before P1 and P6 started on what it left: the deploy-api build of 2026-10-22,
+     which has early P5 but not P1 or P6, not production's a53a8bc itself. Its health answered
+     in 3 s, its repositories and runs read back, and it read deploy's apps from its own tables,
+     as they were when P6 first started (7, without the 2 made since), with no error.
+  3. This train's build started again: all 9 apps, the change kept, no error.
+- **Rolling back past P6, drilled first:** on a scratch copy of test server A's database, 94924e5
   migrated it and copied its rows onto the seam. Then a build from before P6 started on it: the
   ci-actions worktree's, holding 7656471, the release production ran that day. Its health answered
   in 2 s, its repositories and runs read back, and it left P6's migration alone.
@@ -135,12 +148,6 @@ Each item's row in docs/deploy-api.md's Status table has the detail and how it w
   - The flip side: one row the copy can't read (a release or registration whose JSON doesn't
     parse) keeps it down until that row is mended or removed. Kiln's other services run on.
   - Production has nothing to copy.
-- **Under the cluster group, memory can run a revision ahead.** Since main's P1 (7c8774c), kiln.db's
-  writes go through the cluster group, and so do kiln's Records'. Their commit moves its head in
-  memory inside the write. If the group then can't keep the write (its change unreadable, or its
-  commit failing), memory runs one revision ahead of the database until the next start. The next
-  commit's revision skips a number, and a wait can wake for nothing. Conditions are checked
-  against the database, so no commit is wrong.
 - **Several servers are tested in one process.** The two-server test runs two hubs in one process
   over one Records. Two processes need Amphora as its own process (CP-T1.2) or replicated groups.
 - **P7's platforms are tested against fakes of their APIs**, not against real accounts. Each
