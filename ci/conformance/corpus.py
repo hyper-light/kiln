@@ -491,6 +491,18 @@ def run_repo(api, args, repo, commit):
 ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == (macos|windows)|arch == (aarch64|arm64|arm)\b|runs-on \[[^\]]*(macos|windows|-arm))")
 
 
+# Failures that are kiln's, of work docs/ci.md has left: what each is, and where it's tracked.
+LEFT = [
+    # zizmor's online audits pass GH_TOKEN, the job's, to a container that reads github.com.
+    (r"401 Unauthorized\) for url \(https://github\.com/", "a tool sends the job's token to github.com itself (zizmor's online audits), which refuses kiln's: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
+]
+
+
+def left(note):
+    """What kiln's work left a leg's miss is, by its note, or None."""
+    return next((r for pat, r in LEFT if re.search(pat, note)), None)
+
+
 def not_kilns(note):
     """Why a leg's miss (its note) isn't kiln's to fix, or None when it is."""
     if ELSEWHERE.search(note):
@@ -534,7 +546,7 @@ def write(out_dir):
         f"**{len(passed)} of {len(ran)} workflows that ran passed.** {len(explained)} more missed only for reasons not kiln's, each leg's named below,"
         f" and {len(missed) - len(explained)} for one that is kiln's to fix ({len(rows)} in all) in {len(done)} of {len(ORDER)} repositories run so far.",
         "",
-        "A cell says why each of its legs that missed did, when none is kiln's; `kiln's` when one is, or says nothing.",
+        "A cell says why each of its legs that missed did, when none is kiln's; `kiln's` when one is, or says nothing (with what of kiln's work it is, when docs/ci.md has it left).",
         "",
     ]
     for d in done:
@@ -550,7 +562,8 @@ def write(out_dir):
                 result = w["result"]
                 if result not in ("pass", "no run"):
                     why = miss(w)
-                    result += f": {'; '.join(why)}" if why else ": kiln's"
+                    known = sorted({x for x in (left(n) for n in w.get("notes", []) if not not_kilns(n)) if x})
+                    result += f": {'; '.join(why)}" if why else (f": kiln's, left: {'; '.join(known)}" if known else ": kiln's")
                 cells.append(result)
                 said = ([w["legs"]] if w.get("legs") else []) + said
                 if said:
