@@ -792,7 +792,7 @@ mod tests {
             let integration = |name: &str, url: String, token: &str| {
                 let hub = Arc::clone(&d.hub);
                 let (name, token) = (name.to_owned(), token.to_owned());
-                async move { crate::ci::integrations::create(&hub, "kiln", &name, json!({ "url": url }), Some(&token), None, None, "test").await.map_err(anyhow::Error::msg) }
+                async move { crate::ci::integrations::create(&hub, "kiln", &name, json!({ "url": url }), crate::ci::integrations::Secrets { secret: Some(&token), signing: None }, None, "test").await.map_err(anyhow::Error::msg) }
             };
             integration("eu", format!("http://{addr}"), "reader").await?;
             let gates = json!({ "after": ["staging@eu"], "soak": "5m" });

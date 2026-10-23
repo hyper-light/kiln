@@ -748,7 +748,7 @@ pub fn ops() -> &'static [Op] {
                 route: |_| Ok((Method::POST, path(&["integrations"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let config = v.get("config").cloned().filter(|c| !c.is_null()).unwrap_or_else(|| json!({}));
-                    let made = super::integrations::create(&cx.hub, &text(&v, "kind")?, &text(&v, "name")?, config, v.get("secret").and_then(Value::as_str), v.get("signing_secret").and_then(Value::as_str), v.get("scope").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+                    let made = super::integrations::create(&cx.hub, &text(&v, "kind")?, &text(&v, "name")?, config, super::integrations::Secrets { secret: v.get("secret").and_then(Value::as_str), signing: v.get("signing_secret").and_then(Value::as_str) }, v.get("scope").and_then(Value::as_str), &by(&cx)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
                     Ok(serde_json::to_value(made).unwrap_or_default())
                 }),
             op!("ci.integrations.get", "One integration: its kind, config, scope and what it's for (never its secret).", ro: true, destructive: false,

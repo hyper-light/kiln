@@ -551,9 +551,17 @@ pub async fn get(hub: &Hub, name: &str) -> anyhow::Result<Option<Integration>> {
     hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM ci_integrations WHERE name = ?1"), params![name], row).optional()?)).await
 }
 
-/// Creates an integration; `secret` is its token or password, kept as a W09 secret, and `signing`
-/// its signing secret, for a kind that keeps one.
-pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secret: Option<&str>, signing: Option<&str>, scope: Option<&str>, by: &str) -> Result<Integration, String> {
+/// What an integration is made with that's secret: its token or password, and its signing secret
+/// for a kind that keeps one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Secrets<'a> {
+    pub secret: Option<&'a str>,
+    pub signing: Option<&'a str>,
+}
+
+/// Creates an integration; its secrets are kept as W09 secrets.
+pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secrets: Secrets<'_>, scope: Option<&str>, by: &str) -> Result<Integration, String> {
+    let Secrets { secret, signing } = secrets;
     let info = kind(kind_name).ok_or_else(|| format!("no integration kind `{kind_name}` (kinds: {})", KINDS.iter().map(|k| k.kind).collect::<Vec<_>>().join(", ")))?;
     let name = check_name(name)?;
     check_config(info, &config)?;
@@ -883,7 +891,8 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
         (&Method::POST, ["integrations"]) => {
             let c: Create = srv::body_json(body, 256 << 10).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             let config = if c.config.is_null() { json!({}) } else { c.config };
-            let i = create(hub, &c.kind, &c.name, config, c.secret.as_deref(), c.signing_secret.as_deref(), c.scope.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            let secrets = Secrets { secret: c.secret.as_deref(), signing: c.signing_secret.as_deref() };
+            let i = create(hub, &c.kind, &c.name, config, secrets, c.scope.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             Ok(srv::json(StatusCode::CREATED, &i))
         }
         (&Method::GET, ["integrations", "kinds"]) => Ok(srv::json(StatusCode::OK, &json!({ "kinds": KINDS }))),

@@ -170,7 +170,7 @@ fn address(s: &Server, name: &str) -> anyhow::Result<(String, String)> {
     anyhow::ensure!(st == 200, "{name}'s address: {st} {body}");
     let url = serde_json::from_str::<Value>(&body)?.get("address").and_then(Value::as_str).unwrap_or_default().to_owned();
     let path = url.split_once("://").and_then(|(_, rest)| rest.find('/').map(|i| rest.get(i..).unwrap_or_default().to_owned())).unwrap_or_default();
-    anyhow::ensure!(path.starts_with(&format!("/api/ci/chat/")), "{body}");
+    anyhow::ensure!(path.starts_with("/api/ci/chat/"), "{body}");
     let key = path.rsplit('/').next().unwrap_or_default().to_owned();
     Ok((path, key))
 }
