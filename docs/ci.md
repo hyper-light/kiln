@@ -3426,12 +3426,25 @@ enforcement points to W18, agent isolation to W20.
   host's Docker they could start any container they like, and the filter kept debuggers from
   turning ASLR off (`personality`, which lldb needs to launch a program: cargo's `lldb` tests).
 
-  The daemon is still the host's, one for every leg on that runner: the names a step gives its
-  containers, networks and volumes are the daemon's. Two legs at once that use the same ones
-  collide, as cargo's test suite does on a runner of two slots (it names its containers
-  `cargo_test_0`, …). A hosted runner gives each job a machine and a daemon of its own. Until
-  the leg's socket gives each leg names of its own, such a job runs `exclusive: true`, or on a
-  runner of one slot.
+  The daemon is still the host's, one for every leg on that runner, so the socket gives each leg
+  names of its own. A hosted runner gives each job a machine and a daemon of its own.
+  - What a step makes through the socket gets a suffix of the leg's own on the daemon (`-k` and
+    8 hex digits from the leg's id): a container (`--name`), a network, or a volume (made, or
+    named by a container's mount, which makes it on a machine of its own).
+  - The leg's later requests by that name are taken to it: paths, `rename`, `commit`, a create's
+    network, links, `--volumes-from`, `--pid` and `--ipc container:`, a network's connect.
+  - A container is found on its networks by the name it was given (an alias).
+  - The daemon's answers say the names as the leg gave them. Its lists and events leave out what
+    other legs made, and a prune takes only the leg's own.
+  - Ids, and names the leg didn't make (kiln's for its services, what was there before), go on
+    as they came.
+
+  So two legs at once can both make cargo's `cargo_test_0`, or the same compose project, as two
+  hosted jobs can (`w13_r04_two_legs_make_the_same_names`). Before, they collided. What a leg
+  made carries the labels `kiln.socket.leg` and `kiln.socket.runner`. It goes when the leg ends,
+  as the end of its machine would take it, and in the sweep when a runner that stopped short
+  starts again. The leg's containers' anonymous volumes go with them (kiln's own services' left
+  theirs before). Images and the build cache stay the daemon's, every leg's cache.
 - *Done.* In kiln's runner image, a `docker` leg has GitHub's hosted runners' paths:
   `/home/runner/work/<repo>/<repo>` for the workspace, `/home/runner/work/_temp` and
   `/home/runner/work/_actions` beside it, the event file and the file commands under `_temp`, and
