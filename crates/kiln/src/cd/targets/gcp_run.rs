@@ -138,11 +138,10 @@ mod tests {
     use std::sync::Arc;
 
     use kiln_cd::model::Health;
-    use kiln_cd::providers::Target;
 
     use super::*;
     use crate::cd::targets::fake::{MemFiles, MemRecords};
-    use crate::cd::targets::fake_gcp::{self, FakeGcp};
+    use crate::cd::targets::fake_gcp::{self, FakeGcp, synced};
     use crate::cd::targets::fake_query::released_to;
     use crate::cd::targets::{Conn, Creds, key_of};
 
@@ -163,13 +162,11 @@ mod tests {
         crate::rt::block_on(async {
             let gcp = Arc::new(FakeGcp::default());
             fake_gcp::start(gcp.clone()).await?;
-            let target = Target::parse("gcp-run/gcp-test/acme-prod/us-central1").ok_or_else(|| anyhow::anyhow!("target"))?;
+            let (target, place) = fake_gcp::target("gcp-run")?;
             let def = target.def().ok_or_else(|| anyhow::anyhow!("provider"))?;
-            assert!(def.built);
             let conn = Conn::quick(target, def);
             let (records, files) = (MemRecords::default(), MemFiles::default());
             let cx = Cx { conn: &conn, creds: Creds::Bearer(fake_gcp::TOKEN.into()), records: &records, files: &files };
-            let place = json!({ "account": "gcp-test", "project": "acme-prod", "region": "us-central1" });
             let release = |version: &str, digest: &str| -> anyhow::Result<Value> {
                 released_to("gcp-run", &place, spec(), version, &[], &[("image", digest)])?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no service"))
             };
@@ -178,12 +175,6 @@ mod tests {
             let h = |o: &Value| kiln_cd::providers::health(o).map(|s| s.health);
             let revision_of = |o: &Value| o.pointer("/spec/template/revision").and_then(Value::as_str).unwrap_or_default().to_owned();
             let last_call = || gcp.state.lock().calls.last().cloned().unwrap_or_default();
-            // As the engine compares: what kiln sets, against the object as it reads.
-            let synced = |desired: &Value, live: &Value| {
-                let mut d = desired.clone();
-                kiln_cd::diff::normalize_desired(&mut d);
-                matches!(kiln_cd::diff::compare(&d, live, None), kiln_cd::diff::Verdict::Synced)
-            };
 
             // The first release: the service, its revision, and all the traffic once it started.
             let svc1 = release("1.0.0", "sha256:aaaa")?;
@@ -194,7 +185,7 @@ mod tests {
             assert_eq!(gcp.state.lock().calls, [format!("CreateService shop revision={rev1} traffic={rev1}:100")]);
             assert_eq!(up.pointer("/spec/template"), svc1.pointer("/spec/template"), "Cloud Run's defaults aren't drift: {up}");
             assert_eq!(up.pointer("/spec/traffic"), svc1.pointer("/spec/traffic"));
-            assert!(synced(&svc1, &up), "in sync: {up}");
+            assert!(synced(&svc1, &cx.with_applied(up.clone())), "in sync: {up}");
             assert_eq!(obj::label(&up, kiln_cd::engine::APP_LABEL), obj::label(&svc1, kiln_cd::engine::APP_LABEL), "tracking in the service's labels");
 
             // The same release again: nothing changes.
@@ -231,7 +222,7 @@ mod tests {
             gcp.state.lock().follow_latest("shop");
             let moved = read().await?;
             assert_eq!(moved.pointer("/spec/traffic/0/type"), Some(&json!(p::LATEST)), "{moved}");
-            assert!(!synced(&svc2, &moved), "drift");
+            assert!(!synced(&svc2, &cx.with_applied(moved.clone())), "drift");
             apply(&cx, &svc2).await?;
             assert_eq!(last_call(), format!("UpdateService shop traffic={rev2}:100"));
 

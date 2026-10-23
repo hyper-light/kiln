@@ -21,6 +21,9 @@ pub mod aws_lambda;
 pub mod aws_static;
 pub mod cloudflare_workers;
 pub mod cloudformation;
+pub mod gcp_appengine;
+pub mod gcp_compute;
+pub mod gcp_functions;
 pub mod gcp_run;
 pub mod vercel;
 
@@ -277,11 +280,18 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "gcp",
         place: &["project", "region"],
         scope: None,
-        settings: &[s("function", true, "the function"), s("source", true, "the source or build (${{ artifacts.* }})")],
+        settings: &[
+            s("function", true, "the function"),
+            s("source", true, "the source: a zip CI built (${{ release.artifacts.<name>.digest }}), or gs://bucket/object"),
+            s("runtime", false, "its runtime: nodejs22, python312, go123, … (or buildConfig.runtime in spec)"),
+            s("entry-point", false, "the function in the source it runs"),
+            s("spec", false, "the function: a file in the source or an object (Cloud Functions' v2 Function: serviceConfig, eventTrigger, labels, …)"),
+            s("set", false, "values to set by path: {\"serviceConfig.environmentVariables.MODE\": \"prod\"}"),
+        ],
         kinds: &[kind("functions.gcp.kiln.dev", "Function", "Function")],
-        capabilities: &[Traffic, Versions, Logs, Drift, Adopt],
+        capabilities: &[Drift, Adopt],
         reads: &[],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "gcp-appengine",
@@ -289,11 +299,19 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "gcp",
         place: &["project"],
         scope: None,
-        settings: &[s("service", true, "the service"), s("version", false, "the version's name (by default the commit)")],
-        kinds: &[kind("appengine.gcp.kiln.dev", "Service", "Service"), child(kind("appengine.gcp.kiln.dev", "Version", "Version"))],
-        capabilities: &[Traffic, Versions, Logs, Drift, Adopt],
+        settings: &[
+            s("service", true, "the service (`default`, the app's first)"),
+            s("source", false, "the zip CI built (${{ release.artifacts.<name>.digest }}), or gs://bucket/object.zip"),
+            s("image", false, "for the flexible environment: the image, instead of source"),
+            s("app", false, "app.yaml in the source, or the version as an object (the Admin API's Version)"),
+            s("version", false, "the version's id (by default named for its content, so a rollback moves the traffic back to it)"),
+            s("bucket", false, "where kiln puts the zip (the app's staging bucket, staging.<project>.appspot.com)"),
+            s("set", false, "values to set by path: {\"envVariables.MODE\": \"prod\"}"),
+        ],
+        kinds: &[kind("appengine.gcp.kiln.dev", "Version", "Version"), kind("appengine.gcp.kiln.dev", "Service", "Service")],
+        capabilities: &[Versions, Drift, Adopt],
         reads: &["app.yaml"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "gcp-compute",
@@ -301,11 +319,19 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "gcp",
         place: &["project", "zone"],
         scope: None,
-        settings: &[s("group", true, "the managed instance group"), s("template", true, "the instance template")],
+        settings: &[
+            s("group", true, "the managed instance group (zonal)"),
+            s("template", true, "the name kiln makes the group's instance templates under: <template>-<hash>, one for each release's properties"),
+            s("image", false, "the boot disk's image (projects/<project>/global/images/<name>, ${{ release.artifacts.<name>.digest }})"),
+            s("properties", false, "the template's properties: a JSON file in the source or an object (InstanceProperties: machineType, disks, networkInterfaces, metadata, serviceAccounts, …)"),
+            s("set", false, "values to set in the properties by path: {\"machineType\": \"e2-standard-2\"}"),
+            s("group-spec", false, "the group's settings: targetSize, baseInstanceName, autoHealingPolicies, namedPorts, targetPools, …"),
+            s("update", false, "the rolling update's policy: {maxSurge: {fixed: 1}, maxUnavailable: {fixed: 0}, minimalAction: REPLACE}"),
+        ],
         kinds: &[kind("compute.gcp.kiln.dev", "InstanceTemplate", "Instance template"), kind("compute.gcp.kiln.dev", "InstanceGroupManager", "Managed instance group"), child(kind("compute.gcp.kiln.dev", "Instance", "Instance"))],
-        capabilities: &[Traffic, Events, Drift, Adopt],
+        capabilities: &[Versions, Drift, Adopt],
         reads: &[],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "azure-containerapps",
@@ -689,6 +715,9 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "aws-static" => aws_static::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
         "cloudformation" => cloudformation::render(input),
+        "gcp-appengine" => gcp_appengine::render(input),
+        "gcp-compute" => gcp_compute::render(input),
+        "gcp-functions" => gcp_functions::render(input),
         "gcp-run" => gcp_run::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
@@ -709,6 +738,9 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "aws-static" => aws_static::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
         "cloudformation" => cloudformation::files(spec),
+        "gcp-appengine" => gcp_appengine::files(spec),
+        "gcp-compute" => gcp_compute::files(spec),
+        "gcp-functions" => gcp_functions::files(spec),
         "gcp-run" => gcp_run::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
@@ -731,6 +763,9 @@ pub fn health(obj: &Value) -> Option<Status> {
         "aws-static" => aws_static::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
         "cloudformation" => cloudformation::health(obj),
+        "gcp-appengine" => gcp_appengine::health(obj),
+        "gcp-compute" => gcp_compute::health(obj),
+        "gcp-functions" => gcp_functions::health(obj),
         "gcp-run" => gcp_run::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,
