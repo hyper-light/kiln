@@ -72,6 +72,8 @@ KNOWN = [
     # The corpus submits the whole tree against an empty trunk: a check that compares a pull
     # request with its base finds nothing there to compare.
     (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
+    # bat's: the pull request's own changelog line, by its number and its author on GitHub.
+    (r"Search for added line in changelog", "it looks for the pull request's own changelog line (its number, its author from GitHub's API); the corpus's pull request is the whole tree"),
     # `actions/upload-artifact@master` is that repository's old branch: 2.0.1 (2020), on the artifact
     # protocol GitHub retired on 2025-01-30.
     (r"Unable to create a container for the artifact", "its `upload-artifact@master` is 2.0.1, on the artifact protocol GitHub retired in January 2025: it fails there too"),
