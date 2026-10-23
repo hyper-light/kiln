@@ -790,6 +790,16 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         // Containers (§10.10): every one listed, one whole.
         (&Method::GET, ["containers"]) => super::containers::http::list(q).await,
         (&Method::GET, ["containers", id]) => super::containers::http::one(id).await,
+        // Continuous profiles (§8.11): uploads listed and read, their tags' values and their types,
+        // flame graphs, an upload's profile as pprof.
+        (&Method::GET, ["profiles"]) => super::profiles::http::list(q).await,
+        (&Method::GET, ["profiles", "facets"]) => super::profiles::http::facets(q).await,
+        (&Method::GET, ["profiles", "types"]) => super::profiles::http::kinds(q).await,
+        (&Method::GET, ["profiles", "flame"]) => super::profiles::http::flame(q).await,
+        (&Method::GET, ["profiles", "compare"]) => super::profiles::http::compare(q).await,
+        (&Method::GET, ["profiles", "status"]) => super::profiles::http::status(),
+        (&Method::GET, ["profiles", id]) => super::profiles::http::one(id).await,
+        (&Method::GET, ["profiles", id, name]) => super::profiles::http::download(id, name).await,
         // The infrastructure list (§10.9): Datadog's host list and totals, a host whole, a host
         // muted and unmuted.
         (&Method::GET, ["hosts"]) => super::infra::http::hosts(q).await,

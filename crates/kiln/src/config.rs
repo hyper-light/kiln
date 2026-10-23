@@ -410,6 +410,11 @@ pub struct Observe {
     /// How long spans are kept: Datadog's for indexed spans, 15 days ("Trace Retention",
     /// docs.datadoghq.com).
     pub spans_retention_days: u32,
+    /// How long profilers' uploads are kept: Datadog's for profiles, 8 days ("Continuous Profiler",
+    /// docs.datadoghq.com).
+    pub profiles_retention_days: u32,
+    /// The most GiB profiles take on the server's disk; unset, a quarter of that disk.
+    pub profiles_max_gb: Option<u32>,
     /// The most series the group holds (0: no bound); past it, new series are refused and counted.
     pub max_series: u64,
     /// How often the server looks at its own host, container and process (`crate::observe::host`;
@@ -423,7 +428,17 @@ pub struct Observe {
 
 impl Default for Observe {
     fn default() -> Self {
-        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, spans_retention_days: 15, max_series: 0, host_seconds: 15, query_helpers: None }
+        Self {
+            enabled: true,
+            metrics_retention_days: 455,
+            logs_retention_days: 15,
+            spans_retention_days: 15,
+            profiles_retention_days: 8,
+            profiles_max_gb: None,
+            max_series: 0,
+            host_seconds: 15,
+            query_helpers: None,
+        }
     }
 }
 

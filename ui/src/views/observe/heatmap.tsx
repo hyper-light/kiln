@@ -38,7 +38,7 @@ const timeLabel = (ms: number, day: boolean) => {
  * A canvas drawn by `paint` at its own size (redrawn as it resizes, and when `paint` changes): a
  * ref, as the timeseries chart's, not an effect.
  */
-function useCanvas(paint: (ctx: CanvasRenderingContext2D, w: number, h: number) => void, height: number) {
+export function useCanvas(paint: (ctx: CanvasRenderingContext2D, w: number, h: number) => void, height: number) {
   return React.useCallback(
     (el: HTMLCanvasElement | null) => {
       if (!el) return;

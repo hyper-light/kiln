@@ -112,3 +112,19 @@ pub fn disk_free(path: &std::path::Path) -> Option<u64> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     disks.list().iter().filter(|d| path.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).map(sysinfo::Disk::available_space)
 }
+
+/// Bytes the volume `path` is on holds in all, where the system says.
+#[cfg(unix)]
+#[allow(clippy::useless_conversion)] // u64 on Linux, narrower elsewhere (macOS's block counts)
+pub fn disk_total(path: &std::path::Path) -> Option<u64> {
+    let s = nix::sys::statvfs::statvfs(path).ok()?;
+    Some(u64::from(s.blocks()).saturating_mul(u64::from(s.fragment_size())))
+}
+
+/// Bytes the volume `path` is on holds in all: the disk whose mount point holds it, nearest first.
+#[cfg(not(unix))]
+pub fn disk_total(path: &std::path::Path) -> Option<u64> {
+    let path = std::fs::canonicalize(path).ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks.list().iter().filter(|d| path.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).map(sysinfo::Disk::total_space)
+}

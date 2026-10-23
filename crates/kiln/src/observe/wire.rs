@@ -90,6 +90,16 @@ pub enum Msg {
     /// Server → runner: the DogStatsD listeners this machine opens (`super::statsd`), as scrape
     /// targets.
     Statsd { listeners: Vec<(String, super::statsd::Listener)> },
+    /// Runner → server: a profiler's upload its Agent took (`super::profiles::pack`), whole or in
+    /// parts as a raft message's.
+    Profile {
+        #[serde(default)]
+        id: u64,
+        #[serde(default)]
+        part: u32,
+        #[serde(default)]
+        parts: u32,
+    },
 }
 
 /// What a write came to, as its sender needs it.

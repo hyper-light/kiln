@@ -135,7 +135,7 @@ fn info() -> srv::Response {
         StatusCode::OK,
         &json!({
             "version": format!("kiln {}", env!("CARGO_PKG_VERSION")),
-            "endpoints": ["/v0.4/traces", "/v0.5/traces"],
+            "endpoints": ["/v0.4/traces", "/v0.5/traces", "/profiling/v1/input"],
             "client_drop_p0s": false,
             "span_meta_structs": false,
             "long_running_spans": false,
@@ -147,6 +147,11 @@ fn info() -> srv::Response {
 /// A tracer's request, on the loopback (no key asked).
 pub async fn answer(o: &Observe, req: srv::Request) -> srv::Response {
     let path = req.uri().path().to_owned();
+    // Its profiler's uploads (`super::profiles`), sent on to the server.
+    if path == "/profiling/v1/input" {
+        let host = NODE.get().map_or_else(crate::os::hostname, |(h, _, _)| h.clone());
+        return super::profiles::from_tracer(o, &host, req).await;
+    }
     let v5 = match (req.method(), path.as_str()) {
         (&Method::GET, "/info") => return info(),
         (&Method::PUT | &Method::POST, "/v0.4/traces") => false,

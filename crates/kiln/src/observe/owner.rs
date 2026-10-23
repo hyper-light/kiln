@@ -87,6 +87,10 @@ const SIZED_EVERY: Duration = Duration::from_secs(30);
 const WRITERS: usize = kiln_obs::store::MAX_SESSIONS;
 /// A snapshot's file fetched over HTTP, at the most (a store keeps O(log n) blocks of n samples).
 const SNAPSHOT_FILE_MAX: u64 = 1 << 40;
+/// Profilers' uploads a node's Agent took and has not sent on, at the most (their bytes); and the
+/// frames waiting on the lane past which none is taken: profiles yield to the group's own messages.
+const PROFILE_BYTES: u64 = 64 << 20;
+const PROFILE_ROOM: usize = 64;
 
 /// What this node is in the group.
 pub enum Role {
@@ -211,6 +215,9 @@ enum Input {
     RunSynthetic(String),
     /// The server's DogStatsD listeners, all of them: each runner is told those it opens.
     Statsd(Vec<(String, super::statsd::Listener)>),
+    /// A profiler's upload this node's Agent took, to send on to the server
+    /// (`super::profiles::pack`'d).
+    Profile(Vec<u8>),
 }
 
 /// What a node has taken to write and not yet cut into a write, against the batcher's bound: taken
@@ -230,6 +237,8 @@ struct Admission {
     congested: AtomicBool,
     /// The disk has too little room for the next cut: exporters are refused until a cut frees it.
     disk_low: AtomicBool,
+    /// Profilers' uploads taken and not yet sent on (their bytes).
+    profile_bytes: AtomicU64,
     /// Requests' buffers handed back for the next request.
     spares: Spares,
 }
@@ -652,6 +661,26 @@ impl Observe {
             for (rows, _) in segments {
                 a.spares.give_bytes(rows);
             }
+        }
+        true
+    }
+
+    /// A profiler's upload this node's Agent took (`super::profiles::pack`'d), to send on to the
+    /// server: refused (false) past [`PROFILE_BYTES`] waiting, or while the lane holds
+    /// [`PROFILE_ROOM`] frames.
+    #[must_use]
+    pub fn offer_profile(&self, payload: Vec<u8>) -> bool {
+        let (a, n) = (&self.admission, payload.len() as u64);
+        if self.out.len() >= PROFILE_ROOM {
+            return false;
+        }
+        if a.profile_bytes.fetch_add(n, Ordering::AcqRel).saturating_add(n) > PROFILE_BYTES {
+            a.profile_bytes.fetch_sub(n, Ordering::AcqRel);
+            return false;
+        }
+        if self.tx.send(Input::Profile(payload)).is_err() {
+            a.profile_bytes.fetch_sub(n, Ordering::AcqRel);
+            return false;
         }
         true
     }
@@ -1182,6 +1211,10 @@ impl Owner {
                     self.send(&machine, Msg::Scanner { groups: self.scanner.0.clone(), key: self.scanner.1.clone() }, Vec::new());
                 }
             }
+            Input::Profile(payload) => {
+                self.admission.profile_bytes.fetch_sub(payload.len() as u64, Ordering::AcqRel);
+                self.send_profile(payload);
+            }
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::LogsAcked(records, ack) => self.batcher.logs_acked(records, ack, Instant::now()),
             Input::Spans(segments) => self.batcher.spans(segments, Instant::now()),
@@ -1365,6 +1398,11 @@ impl Owner {
             }
             Msg::Status(s) => {
                 self.statuses.insert(machine.to_owned(), s);
+            }
+            Msg::Profile { id, part, parts } => {
+                if let Some(payload) = self.joiner.add(machine, id ^ (1 << 62), part, parts, bytes) {
+                    super::profiles::from_runner(machine, payload);
+                }
             }
             Msg::Written { .. }
             | Msg::Member { .. }
@@ -1561,7 +1599,7 @@ impl Owner {
                     s.set(&listeners);
                 }
             }
-            Msg::Write { .. } | Msg::Status(_) => {}
+            Msg::Write { .. } | Msg::Status(_) | Msg::Profile { .. } => {}
         }
     }
 
@@ -1593,6 +1631,22 @@ impl Owner {
 
     fn send(&self, machine: &str, msg: Msg, bytes: Vec<u8>) {
         let _ = self.out.try_send(Out { machine: machine.to_owned(), msg, bytes });
+    }
+
+    /// A profiler's upload sent on to the server (kept here, on the server): one the server is not
+    /// connected for is dropped, as Datadog's Agent drops what it cannot forward.
+    fn send_profile(&mut self, payload: Vec<u8>) {
+        if self.is_server() {
+            super::profiles::from_runner(&crate::os::hostname(), payload);
+            return;
+        }
+        if !self.server_up {
+            return;
+        }
+        self.part = self.part.wrapping_add(1);
+        for (msg, b) in wire::frames(self.part, payload, |id, part, parts| Msg::Profile { id, part, parts }) {
+            self.send("", msg, b);
+        }
     }
 
     fn send_raft(&mut self, machine: &str, bytes: Vec<u8>) {

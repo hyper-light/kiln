@@ -13,6 +13,8 @@
 //! - `POST /api/v0.2/traces`: its tracers' spans (its trace agent's, `apm_config.apm_dd_url`),
 //!   into the span store (`kiln_obs::ddtrace`);
 //! - `POST /api/v0.2/stats`: its counts of every span before it sampled, as kiln's trace metrics;
+//! - `POST /api/v2/profile`: its tracers' profiles (its trace agent's, `apm_config.profiling_dd_url`),
+//!   or a tracer's without an Agent (`super::profiles`);
 //! - `GET /api/v1/validate`: whether its key is one;
 //!
 //! zstd (what it compresses with), deflate or gzip, or none. Anything else under Datadog's paths
@@ -114,6 +116,10 @@ pub async fn answer(o: &Observe, path: &[&str], req: srv::Request) -> srv::Respo
     // Datadog's host API (`super::infra`): a writer's token reads and mutes no host.
     if matches!(path, ["api", "v1", "hosts", ..] | ["api", "v1", "host", ..]) {
         return super::infra::http::datadog();
+    }
+    // Profilers' uploads (`super::profiles`): an Agent's, or a tracer's without one.
+    if matches!(path, ["api", "v2", "profile"]) {
+        return super::profiles::datadog_intake(req).await;
     }
     if req.method() != Method::POST {
         return srv::json(StatusCode::METHOD_NOT_ALLOWED, &json!({ "errors": ["Datadog's intake takes POST"] }));

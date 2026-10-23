@@ -16,6 +16,11 @@ pub const MAX_TYPES: usize = 32;
 /// Frames a stack keeps, its leaf's (a deeper stack's root-most frames dropped and said: pprof's
 /// own tools cut it so too).
 pub const MAX_DEPTH: usize = 512;
+/// Frames a profile holds in all (128 MiB of them): a location's inlined functions are frames of
+/// every sample that names it, so a message of a few MiB could otherwise ask for gigabytes. A
+/// minute of a busy service's CPU profile holds some 500,000; 64 cores' every sample a stack of
+/// its own, some 20 million.
+pub const MAX_FRAMES: usize = 1 << 25;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PprofError {
@@ -298,6 +303,9 @@ pub fn read(msg: &[u8]) -> Result<Profile<'_>, PprofError> {
                     p.cut += 1;
                     break 'stack;
                 }
+                if p.stacks.len() == MAX_FRAMES {
+                    return Err(PprofError::Bound("frames"));
+                }
                 p.stacks.push(f);
                 depth += 1;
             }
@@ -466,5 +474,37 @@ mod tests {
         bad.str(6, "x");
         assert!(matches!(read(&bad.buf), Err(PprofError::Table)));
         assert!(read(&good[..good.len() - 3]).is_err(), "cut short");
+    }
+
+    /// A location of 512 inlined functions named by every sample: a message of half a MiB whose
+    /// stacks would pass the frames' bound is refused at it, not grown past it.
+    #[test]
+    fn inlined_frames_past_the_bound_are_refused() {
+        let mut w = Writer::default();
+        w.message(1, |m| {
+            m.varint(1, 1);
+            m.varint(2, 2);
+        });
+        for _ in 0..=MAX_FRAMES / MAX_DEPTH {
+            w.message(2, |m| {
+                m.bytes(1, &[1]);
+                m.bytes(2, &[1]);
+            });
+        }
+        w.message(4, |m| {
+            m.varint(1, 1);
+            for _ in 0..MAX_DEPTH {
+                m.message(4, |l| l.varint(1, 1));
+            }
+        });
+        w.message(5, |m| {
+            m.varint(1, 1);
+            m.varint(2, 3);
+        });
+        for st in ["", "cpu", "nanoseconds", "main"] {
+            w.str(6, st);
+        }
+        assert!(w.buf.len() < 1 << 20, "{} bytes", w.buf.len());
+        assert!(matches!(read(&w.buf), Err(PprofError::Bound("frames"))));
     }
 }

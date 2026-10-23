@@ -200,7 +200,7 @@ function TopList({ queries, range, height, unit, how, limit, ascending }: { quer
  * 0.10). In a ring any two slices may touch, so every pair is held apart, and three are the most
  * that are: worst CVD ΔE 10.3 (8 the target), worst normal-vision ΔE 16.6 (15 the floor), 15.1
  * beside the grey "Other", each ≥ 3:1 on the panel (the dataviz validator, all pairs). */
-const PIE_HUES = ["#9f71dc", "#416aa2", "#994e5d"];
+export const PIE_HUES = ["#9f71dc", "#416aa2", "#994e5d"];
 /** Slices a pie draws at the most: the largest three, the rest one ("Other", grey). */
 const SLICES = PIE_HUES.length + 1;
 

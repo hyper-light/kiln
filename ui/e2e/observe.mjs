@@ -8,6 +8,7 @@
 //   [RECEIVER=http://127.0.0.1:17199 RECEIVED=<the jsonl it keeps what it is sent in>] \
 //   [LOGS_DIR=<a folder this script writes in and the server reads>] \
 //   [KILN_INGEST_TOKEN=<observe's ingest token: what Datadog's Agent sends with, <data>/observe/ingest.token>] \
+//   [PPROF_DIR=<crates/kiln-obs/src/fixtures/pprof, where the browsers' container sees it>] \
 //   node ui/e2e/observe.mjs
 //
 // The server needs observe's data to look at: metrics of `app.latency.p95` by `service` and logs
@@ -2611,6 +2612,104 @@ const scenarios = {
   /** Containers as Datadog's Agent's container check reports them (§10.10): one running near its CPU
    * quota and throttled, listed against its limits, its page read (its figures, its pod, its tags,
    * its host's page and back); another whose samples stopped five minutes ago, among the stopped. */
+  /** Continuous profiles (§8.11): a service's profilers' uploads (Go's own profiles, as dd-trace-go
+   * sends them, to the server's intake as an Agent forwards them) summed into a flame graph, its
+   * hottest function first by self; a frame clicked fills the width and the whole comes back; a
+   * function found; the uploads listed, one read alone with its profiles to download. */
+  async "a service's profiles are summed into a flame graph, zoomed, searched, and read upload by upload"() {
+    const ingest = process.env.KILN_INGEST_TOKEN;
+    if (!ingest) return "skipped: no KILN_INGEST_TOKEN";
+    const service = `e2e-prof-${run}`;
+    // Go's own profiles (kiln-obs's fixtures): where the suite mounts them (PPROF_DIR), else beside this file in the repository.
+    const pprofDir = process.env.PPROF_DIR ? new URL(`file://${process.env.PPROF_DIR.replace(/\/?$/, "/")}`) : new URL("../../crates/kiln-obs/src/fixtures/pprof/", import.meta.url);
+    const fixture = (name) => fs.readFileSync(new URL(name, pprofDir));
+    const [cpu, heap] = [fixture("go-cpu.pprof"), fixture("go-heap.pprof")];
+    for (const ago of [90_000, 30_000]) {
+      const start = new Date(Date.now() - ago);
+      const form = new FormData();
+      form.append("cpu.pprof", new Blob([cpu]), "cpu.pprof");
+      form.append("delta-heap.pprof", new Blob([heap]), "delta-heap.pprof");
+      const event = {
+        start: start.toISOString(),
+        end: new Date(start.getTime() + 60_000).toISOString(),
+        attachments: ["cpu.pprof", "delta-heap.pprof"],
+        tags_profiler: `service:${service},env:e2e,version:1.0.0,runtime:go,profile_seq:${ago}`,
+        family: "go",
+        version: "4",
+      };
+      form.append("event", new Blob([JSON.stringify(event)], { type: "application/json" }), "event.json");
+      const r = await fetch(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest, "X-Datadog-Additional-Tags": `host:e2e-prof-host-${run}` }, body: form });
+      expect(r.status === 202, `an upload taken: ${r.status} ${await r.text()}`);
+    }
+    await until("both listed", async () => (await api("GET", `/api/observe/v1/profiles?query=${encodeURIComponent(`service:${service}`)}`)).body?.matched === 2, 30_000);
+    await page.goto(`${BASE}/observe/profiles?q=${encodeURIComponent(`service:${service}`)}`);
+    const graph = page.getByRole("img", { name: /^A flame graph of/ });
+    await graph.waitFor();
+    await page.getByText(/^CPU time: 3 s in 2 uploads/).waitFor();
+    // The hottest function by self: the fixtures' hashing loop.
+    const first = page.locator("table.data-table tbody tr").first();
+    expect(/sha256\./.test((await first.locator("button").textContent()) ?? ""), "SHA-256's block function the hottest by self");
+    // A frame clicked (the second row's, under the root) fills the width; the whole comes back.
+    const box = await graph.boundingBox();
+    expect(box !== null, "the graph drawn");
+    await graph.click({ position: { x: box.width / 2, y: 27 } });
+    const whole = page.getByRole("button", { name: "Whole graph", exact: true });
+    await whole.waitFor();
+    await whole.click();
+    await until("the whole again", async () => (await whole.count()) === 0);
+    // A function found: its row clicked finds it in the graph (the field says what is found).
+    await first.locator("button").click();
+    const find = page.getByRole("searchbox", { name: "Find a function in the graph", exact: true });
+    expect(/sha256/.test(await find.inputValue()), "the function found");
+    // Compared with another service's: its own profile, half its CPU (one upload of the same).
+    const base = `e2e-prof-base-${run}`;
+    {
+      const start = new Date(Date.now() - 60_000);
+      const form = new FormData();
+      form.append("cpu.pprof", new Blob([cpu]), "cpu.pprof");
+      const event = {
+        start: start.toISOString(),
+        end: new Date(start.getTime() + 60_000).toISOString(),
+        attachments: ["cpu.pprof"],
+        tags_profiler: `service:${base},env:e2e`,
+        family: "go",
+        version: "4",
+      };
+      form.append("event", new Blob([JSON.stringify(event)], { type: "application/json" }), "event.json");
+      const r = await fetch(`${BASE}/api/v2/profile`, { method: "POST", headers: { "DD-API-KEY": ingest }, body: form });
+      expect(r.status === 202, `the other service's upload: ${r.status}`);
+    }
+    await until("the other listed", async () => (await api("GET", `/api/observe/v1/profiles?query=${encodeURIComponent(`service:${base}`)}`)).body?.matched === 1, 30_000);
+    await page.getByLabel("Compare with", { exact: true }).selectOption({ label: "Another search" });
+    const other = page.getByRole("searchbox", { name: "The search compared with", exact: true });
+    await fillIn(other, `service:${base}`);
+    await other.press("Enter");
+    await page.getByText(new RegExp(`^CPU time: 3 s in 2 uploads, against 1\\.5 s in 1 upload of .service:${base}.`)).waitFor();
+    await page.getByRole("heading", { name: "Functions by change", exact: true }).waitFor();
+    await graph.waitFor();
+    await fitsAcross("a comparison");
+    await page.getByLabel("Compare with", { exact: true }).selectOption({ label: "Nothing" });
+    await page.getByRole("heading", { name: "Functions by self", exact: true }).waitFor();
+    // Another type: the heap's allocations.
+    await page.getByLabel("Type", { exact: true }).selectOption({ label: "Allocated memory · 2" });
+    await page.getByText(/^Allocated memory: 25(\.0)? MiB in 2 uploads/).waitFor();
+    await fitsAcross("a flame graph");
+    // The uploads: listed, one read alone, its profiles to download, back to every upload.
+    await page.getByRole("group", { name: "View", exact: true }).getByRole("button", { name: "Uploads", exact: true }).click();
+    const rows = page.locator("table.data-table tbody tr");
+    await until("both rows", async () => (await rows.count()) === 2);
+    expect(/e2e/.test((await rows.first().textContent()) ?? ""), "its env on its row");
+    await rows.first().getByRole("button").first().click();
+    await page.waitForURL(/[?&]id=/);
+    await page.getByText(/^One upload:/).waitFor();
+    expect((await page.getByRole("link", { name: "cpu.pprof", exact: true }).getAttribute("href"))?.includes("/api/observe/v1/profiles/"), "its profile to download");
+    // The type chosen stays chosen: its allocations, of the one.
+    await page.getByText(/^Allocated memory: 12\.5 MiB in 1 upload/).waitFor();
+    await fitsAcross("one upload's flame graph");
+    await page.getByRole("button", { name: "Every upload", exact: true }).click();
+    await until("every upload again", async () => !page.url().includes("id="));
+  },
+
   async "a container is listed against its limits, read from its page and its host's, and one stopped is told apart"() {
     const ingest = process.env.KILN_INGEST_TOKEN;
     if (!ingest) return "skipped: no KILN_INGEST_TOKEN";

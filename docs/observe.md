@@ -44,7 +44,8 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-30 | Containers (§10.10): every container each node runs, read from Linux's cgroups (v2 and v1; Docker, containerd, CRI-O, Podman, Kubernetes' pods, nested nodes'), named by Kubernetes' links and the engine's API (its socket, std alone), the engine's stats where cgroups are not seen (Docker Desktop on macOS and Windows); Datadog's container check's names (CPU, throttling, memory and working set, OOM kills, I/O, processes, uptime); listed by the server from the store's index; the API, OpenAPI, its pages; checked live (real Docker containers: a quota's CPU and throttling, OOM kills) and in browsers (§13), measured (§12.34) | done |
 | O-31 | Log indexes (§8.10): Datadog's indexes, exclusion filters (a rate, by an attribute's values or a trace), daily quotas (a warning, the quota reached, each an event; past it, records not kept for search until the day turns) and retention a part of the store each (§4.6: a file a part, each part's cutoff its own, replicated); routed where records are taken, every node told; what is not kept still seen live, archived and counted by metrics from logs; Datadog's estimated usage; the API, OpenAPI, the Indexes page and the explorer's pick of an index; checked live (§13) and measured (§12.35) | done |
 | O-32 | OpenTelemetry's containers (§10.11): Docker's, the kubelet's and the cluster's receivers' container metrics and the semantic conventions', read in their own names and units (cumulative time a rate, a working set for what Docker calls usage, limits in cores and bytes, devices and modes summed), a container kiln's check also sees one container, the kubelet's series joined by pod and name; each chart of its page drawn by the source that reported it; checked live against a real Collector and in browsers (§13), measured against O-30 (§12.34) | done |
-| O-33 | Continuous profiles (§8.11), Datadog's Continuous Profiler: what tracers' profilers upload (pprof in `multipart/form-data`) taken where they send it, kept, summed into flame graphs over a time, compared; its page; checked against Go's own profiles and live against a real profiler | in progress |
+| O-33 | Continuous profiles (§8.11), Datadog's Continuous Profiler: what tracers' profilers upload (pprof in `multipart/form-data`, gzip'd, zstd'd or in LZ4's frames) taken where they send it (a runner's tracer port, sent on over the observe lane; the server's intake), kept by the server (segments of blobs and headers, an index of 40 bytes an upload), searched by tags, summed into flame graphs over a time (a snapshot's type averaged), compared path by path; its page (canvas flame graph, functions by self or by change, uploads); checked against Go's own profiles and live against dd-trace-go and ddtrace through a runner and Datadog's Agent; measured (§12.36) | done |
+| O-34 | Java's profiles: JFR recordings (dd-trace-java's `main.jfr`: the JDK's chunks and ddprof's) read and turned into the same profiles, its CPU, wall time, allocations, live heap, locks and exceptions | next |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -1481,9 +1482,78 @@ specs: dd-trace-go's upload (`profiler/upload.go`, `profile.go`), google/pprof's
   an `event` part (`event.json`: its `start` and `end`, its `attachments` in order, its profiler's
   `tags_profiler` joined by commas: `service`, `env`, `version`, `host`, `runtime`,
   `profile_seq`, …; its `family`, `version` 4, `endpoint_counts`, `custom_attributes`). A profile is
-  pprof, gzip'd (or zstd'd: told by its first bytes, nothing says which); one upload is what Datadog
-  calls a profile, its types collected about the same time. A runner sends what it takes on to the
-  server, as it does its writes.
+  pprof, gzip'd, zstd'd or in LZ4's frame format (libdatadog's exporter, under Python's, Ruby's,
+  PHP's and .NET's tracers; told by its first bytes, nothing says which; LZ4's frames read by
+  `kiln_obs::lz4::decompress_frames`, every checksum they carry checked: XXH32 of the descriptor,
+  of each block and of the content); one upload is what Datadog calls a profile, its types collected
+  about the same time. Each is read whole before it is taken (its event, its times, every profile
+  inflated within 64 MiB and read as pprof, its types' values summed): a tracer hears what is wrong
+  with it (400). An upload holding no pprof (Java's JFR recordings) is taken and not kept, counted.
+  Checked against what the tracers send, captured on the loopback: dd-trace-go v2.11.2's (gzip'd
+  profiles, `metrics.json` beside) and ddtrace 4.16's for Python (libdatadog 1.0.0's exporter: a
+  zstd'd `profile.pprof` of 19 sample types, a zstd'd `code-provenance.json` beside it, and
+  `endpoint_counts` sent as `null`, which kiln first refused, so no Python profile ever came in:
+  every optional field of `event.json` is read as none when it is `null` now). Any attachment not
+  plainly another format (`.json`, `.jfr`, a trace) is read as pprof whatever its name; one named
+  `.pprof` that does not read refuses the upload. A tracer's container is its
+  `Datadog-Container-ID`, or libdatadog's `Datadog-Entity-ID` of a container id (`ci-…`).
+- **Sent on** by a runner as the Agent does: the tags an Agent adds (`host:` this runner,
+  `container_id:` the tracer's `Datadog-Container-ID`) beside it, over the observe lane to the
+  server (`wire::Msg::Profile`, in the lane's 512 KiB parts, 16 MiB at the most), only while the
+  lane has room (64 frames waiting) and 64 MiB at the most waiting for it: profiles yield to the
+  group's own messages, and one that finds no room is refused (503), as the Agent refuses past its
+  queue. The server's intake adds an Agent's `X-Datadog-Additional-Tags` alike; a tag the profiler
+  said itself is kept.
+- **Kept** by the server alone (`crate::observe::profiles::store`), not replicated: a profile is
+  read where it is asked of, and a server's disk lost, its profiles are (Datadog keeps them eight
+  days, and so does kiln: `profiles_retention_days`). On a writer thread of its own, a bounded queue
+  before it (256 MiB, 1,024 uploads: past it, 503), uploads taken in batches (32, or 64 MiB), each
+  batch synced once. A segment is a blob file and a header file (`<observe>/profiles/<made ms>.kprof`,
+  `.khead`), written for an hour or 256 MiB: each profile kept as it came (gzip'd, zstd'd, LZ4's
+  frames; one sent as it was LZ4'd, or kept as it was where that is no smaller) and its endpoints'
+  counts in the blob file, written and synced first; then the upload's header (its times, all its
+  tags, each profile's name, its sample types and their values summed, its place, length and
+  CRC-32C) framed by its length and CRC-32C in the header file, and indexed. The index holds 40 bytes
+  an upload (its start and end, its series and its set of profiles interned, its header's place):
+  a series is its family and its tags but `profile_seq`, which changes every upload; a million
+  uploads (a hundred services profiled for a week) take some 40 MB. Starting, the server reads the
+  header files alone (on the writer's thread: uploads are refused until it has); a torn tail (a
+  crash mid-write) ends a file's reading, a header whose blobs pass its blob file's end is not
+  indexed, and each start writes a segment of its own, so no file is written past a tail. A write
+  that fails is cut back and its segment written no more. Whole segments are let go once their
+  newest upload is past the retention; past the store's bytes (`profiles_max_gb`, a quarter of its
+  disk unless said), the oldest first; and while the disk has under 1 GiB free beside what a batch
+  needs, the oldest first again, a batch refused (counted) where that frees too little: profiles
+  yield the disk to the group's own store. Never the segment being written for the last two.
+- **Asked** (`/api/observe/v1/profiles…`, `crate::observe::profiles::query`): uploads chosen by
+  their start and a search of their tags in log search's syntax (`service:checkout env:prod
+  -host:web-2`, `version:1.4.*`: `service` and `host` a record's own fields, the family its
+  `source`, every other tag an attribute), decided once a series; listed newest first (each with
+  its header's types' totals); each tag's values counted (facets); the sample types they hold (a
+  type named by its profile and its type: Go's mutex and block profiles both have `delay`); one type
+  summed into a flame graph, of one upload or of all chosen (500 read unless asked, 5,000 at the
+  most, evenly across the time where more hold it, the answer saying how many of how many), read on
+  a quarter of the cores (eight at the most, each its own graph and reader at a lower priority, the
+  graphs merged); a type of what happened over the profile's time (CPU, allocations, contention)
+  summed, a snapshot's (the heap live, goroutines) averaged over time, each process's summed, as
+  Datadog shows the heap (two snapshots summed would count the same memory twice); drawn root first, each node's children after it by their functions' names (as
+  Brendan Gregg's flame graphs and pprof's), a node under one in ten thousand of the whole, or past
+  50,000 nodes, left out with all under it; and its functions by self, a recursive function's
+  total counted once. **Compared** (Datadog's comparison; Brendan Gregg's differential flame
+  graphs): the same type over another time or another search (the period before, a day or a week
+  before; a version against another), summed alike, the two graphs' paths joined (a path only one
+  has is of none in the other), drawn as one side sizes them, and the functions by how much their
+  self's share of each whole changed. An upload's profile is read back as pprof, inflated, for `go
+  tool pprof`.
+- **Shown** (Observe → Profiles): the flame graph root at the top, Datadog's way up, a frame clicked
+  filling the width with its callers across above it; frames coloured by where their function
+  comes from (your code, a library, the runtime and standard library: kiln's three hues any two of
+  which may touch, and grey), each named where it is wide enough, a function found by name lit and
+  the rest dimmed; the functions by self beside it; compared, each frame coloured by how its share
+  of the whole changed, rose for larger and blue for smaller (kiln's pair, grey between), as far as
+  the most changed, its share before in its tooltip, the functions by change beside it; the uploads
+  listed, one chosen its own graph and its profiles to download; the unified service tags as
+  choices.
 - **Read** in place (`kiln_obs::profile::pprof`): its string table first (index 0 the empty
   string), its sample types, functions and locations (a location's lines its inlined functions, the
   last the caller), then each sample's stack (leaf first, its locations' functions in order) and
@@ -1494,10 +1564,14 @@ specs: dd-trace-go's upload (`profiler/upload.go`, `profile.go`), google/pprof's
   totals what Go's `pprof -raw` sums, to the sample and the byte).
 - **Summed** into a flame graph (`kiln_obs::profile::flame`): each sample's stack root first, a node
   a function under its caller's node; each node its total (its subtree's values) and its own;
-  functions and files interned; a graph bounded (a million nodes: a stack past it summed into its
-  deepest node's own, the totals whole).
-- Status: the reader and the sums are written and checked; the intake, the store, the API, the
-  page and the live checks are the milestone's rest (O-33).
+  functions and files interned, a node found under its parent by a table of node ids hashed by
+  (parent, function) with kiln-obs's keyed hash (the node itself the key: four bytes a node); a
+  graph bounded (a million nodes: a stack past it summed into its deepest node's own, the totals
+  whole); graphs summed apart merged path by path.
+- Status: done (O-33). Checked against Go's own profiles and a ddtrace capture in unit tests; live
+  against dd-trace-go v2.11.2 through a runner and ddtrace 4.16 through Datadog's Agent 7.84 (§13); in
+  a browser; measured (§12.36). Java's profiles are JFR recordings, not pprof: taken and not kept yet
+  (the next milestone reads them).
 
 ## 9. Monitors
 
@@ -4413,6 +4487,41 @@ when it is worth it). As first written, the four parts' count took 125 ms agains
 their writes of 5,000 split four ways sealed blocks half the size, each read with its own cost; of
 writes alike, the same.
 
+### 12.36 Continuous profiles
+
+`cargo bench -p kiln --bench profiles` and `cargo bench -p kiln-obs --bench flame` (2026-10-23, adacachy, release; the
+least of nine runs and their median, allocations of one run; the machine shared, its load near 60, so the times are
+noisy and only compared run against run). A busy service's minute of CPU: synthetic, its shape a real one's (8,000
+functions under four entry points, 40,000 distinct stacks 10 to 40 deep, a million frames; 3.1 MiB inflated, 1.7 MiB
+gzip'd).
+
+| | Time | Allocations |
+|---|---:|---:|
+| An upload read (Go's fixtures: CPU and heap, 6.6 KB) | 0.068 ms | 162 |
+| An upload read (the busy CPU profile: inflated, read, its types summed) | 20.0 ms (163 MB/s) | 173 |
+| The busy profile read alone (`pprof::read`) | 11.2 ms (292 MB/s) | 130 |
+| Summed into a new graph (750,000 nodes) | 22.2 ms | 9,990 |
+| Summed into a graph that has its nodes | 22.2 ms | 0 |
+| A graph drawn (one node in 10,000 of the whole the least drawn: 4,664 of 750,000) | 3.3 ms | 35 |
+| Its functions by self | 10.3 ms | 28 |
+| 20,000 uploads kept, batches of 32, a sync a batch | 132 ms (6.6 µs an upload) | 6 an upload |
+| The store opened again (its header files read) | 14.7 ms | 67 bytes held an upload |
+| 500 uploads of a service summed (Go's CPU fixture), one thread / eight | 13.6 / 5.4 ms | 57 an upload |
+
+The flame graph's sums, before (std's `HashMap` of (parent, function) and of interned strings, SipHash) and after
+(hashbrown's `HashTable` of node ids on kiln-obs's keyed hash, the node itself the key), the same bench run in turn,
+three rounds each:
+
+| A million frames | Before | After |
+|---|---:|---:|
+| Into a new graph | 50–53 ns a frame, 19,889 allocations | 22–25 ns a frame, 9,990 |
+| Into a graph that has its nodes | 31–40 ns a frame | 26 ns a frame, 0 |
+| Ten profiles in turn (a million nodes, the bound) | 14–16 ns a frame | 11–13 ns a frame |
+
+Left for the next pass: a query reads an upload with 57 allocations (its header's lists, its blob's buffer, gzip's
+state, `pprof::read`'s lists grown as it reads), and merging eight threads' graphs is serial (58 ms for two graphs of
+750,000 nodes).
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -5196,6 +5305,36 @@ Looking at the page with a team's indexes in it found its phone rows cutting the
 ("30 da…") beside their buttons, and an index past its warning told by a colour alone: the buttons
 go beside the name now, its day and time on a line of their own, and past its warning or over its
 quota is said in words on both widths.
+
+**Continuous profiles** (`crates/kiln/tests/observe_profiles.rs`): a kiln server and a runner as
+processes of their own. Go's own profiles (a CPU and a heap profile, gzip'd as Go writes them) sent
+as dd-trace-go sends them: to the runner's tracer port, the tracer's container in its
+`Datadog-Container-ID` (taken, 202); a malformed one there refused (400); to the server's intake
+without a key refused, with the ingest token and an Agent's `X-Datadog-Additional-Tags` taken. Both
+listed: the runner's host and the container on the one it sent on, the Agent's tags on the other,
+its start its event's, its pprof profiles and not its `metrics.json`; found by searches of their
+tags (`service:checkout env:prod`, `host:agent-host OR host:web-1`, `-env:prod`); their CPU summed
+(3 s, 1.5 s each, as Go's own `pprof -raw` sums them), its hottest function by self SHA-256's
+block function, nine tenths of it; one service's alone; the heap's allocations of the one that sent
+them; the two services compared, path by path the same share; a profile read back byte for byte as
+`go tool pprof` reads it; its endpoints. The store's status: two uploads in one segment, both kept.
+The server killed and started again: all of it the same, read again from its files. Then real
+profilers, in Docker: a Go service with dd-trace-go v2.11.2's profiler (a period of 10 s) hashing
+in one loop and allocating in another, uploading to the runner; its uploads listed with the
+runner's host and its own tags; its CPU graph its hashing loop's for half of it at the least, its
+allocations its allocating loop's. And a Python service with ddtrace 4.16's (libdatadog's
+exporter), through Datadog's Agent 7.84 whose profiling proxy points at the server's intake: its
+uploads with the Agent's host on each; its CPU time (`cpu-time`, whatever its profile is named) its
+hashing loop's for half of it at the least. In a browser (`ui/e2e/observe.mjs`; Chromium and
+WebKit, a desktop's width and a phone's): two uploads of a service sent to the intake; its flame
+graph's summary (3 s in 2 uploads), the hottest function by self SHA-256's; a frame clicked fills
+the width, and the whole comes back; a function found from its row; compared with another
+service's upload (another search), its summary and its functions by change; the heap's allocations
+(25 MiB in 2); the uploads listed, one read alone (its allocations, 12.5 MiB: the type chosen stays
+chosen), its profiles to download; nothing wider than a phone. 2026-10-23: passes (the three live tests one at a time, 189 s; adacachy), and in all four browsers
+(3.2–8.0 s each). Their first run found what no fixture of kiln's own had: libdatadog's `"endpoint_counts": null`
+refused every Python upload (each read as none now, a capture of a real one kept as a fixture), and dd-trace-go's
+own `host` tag (its machine's name), which the runner's does not replace.
 
 **DORA metrics** (`crates/kiln/tests/observe_dora.rs`): a kiln server as a process of its own,
 mirroring a git repository (`[[repos]]`, a `file://` URL) made with known author times: a commit,

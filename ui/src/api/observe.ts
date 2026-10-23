@@ -1232,6 +1232,96 @@ export interface ContainerDetail extends Container {
   charts: { cpu: ChartLine[]; memory: ChartLine[]; throttled: ChartLine[]; io: ChartLine[] };
 }
 
+/** A profiler's upload (docs/observe.md §8.11): its times, its profiler's language and tags (`key:value`), and each profile's sample types, their values summed. */
+export interface ProfileUpload {
+  id: string;
+  start_ms: number;
+  end_ms: number;
+  family: string;
+  tags: string[];
+  profiles: { name: string; types: { type: string; unit: string; total: number }[] }[];
+}
+
+export interface ProfileUploadDetail extends ProfileUpload {
+  /** Requests by endpoint while it was collected. */
+  endpoints: { endpoint: string; count: number }[];
+}
+
+/** A sample type the uploads hold: its profile (`cpu.pprof`), its type (`cpu`) and unit, and how many uploads hold it. */
+export interface ProfileType {
+  profile: string;
+  type: string;
+  unit: string;
+  uploads: number;
+}
+
+export interface ProfileFacet {
+  key: string;
+  values: { value: string; uploads: number }[];
+}
+
+/**
+ * A type summed into a flame graph: its functions' names and files; its nodes root first, each node's children after it by name, as
+ * `[function, parent, total, self]` (the root's function -1, a parent a place in `nodes`); its functions by self, as `[function, self, total]`.
+ */
+export interface FlameGraph {
+  profile: string;
+  type: string;
+  unit: string;
+  /** Whether the graph is the uploads' average over time (a snapshot's type: the heap live, goroutines), each process's summed; else their sum. */
+  averaged: boolean;
+  /** Uploads that held the type, were read (evenly across the time, past the limit), and failed to read. */
+  matched: number;
+  read: number;
+  failed: number;
+  samples: number;
+  total: number;
+  names: string[];
+  files: string[];
+  nodes: [number, number, number, number][];
+  top: [number, number, number][];
+}
+
+/** One side of a comparison: its uploads (held the type, read, failed), its whole and samples. */
+export interface FlameSide {
+  matched: number;
+  read: number;
+  failed: number;
+  total: number;
+  samples: number;
+}
+
+/**
+ * Two graphs compared path by path: `after` (what is compared) and `before` (what it is compared with); each node
+ * `[function, parent, total after, self after, total before, self before]`, sized by one side; functions by how much their self's
+ * share of its whole changed, as `[function, self after, self before, total after, total before]`.
+ */
+export interface FlameComparison {
+  profile: string;
+  type: string;
+  unit: string;
+  averaged: boolean;
+  after: FlameSide;
+  before: FlameSide;
+  names: string[];
+  files: string[];
+  nodes: [number, number, number, number, number, number][];
+  top: [number, number, number, number, number][];
+}
+
+/** Uploads chosen: their time (ms) and a search of their tags in log search's syntax. */
+export interface ProfileQuery {
+  from: number;
+  to: number;
+  query?: string;
+}
+
+const profileParams = (q: object) => {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
+  return p;
+};
+
 export interface ContainerQuery {
   state?: "running" | "stopped" | "all";
   filter?: string;
@@ -1713,6 +1803,17 @@ export const observeApi = {
     return request<{ containers: Container[]; total_matching: number; total_returned: number; totals: { running: number; stopped: number } }>("GET", `${BASE}/containers?${p}`, undefined, { signal });
   },
   container: (id: string, signal?: AbortSignal) => request<ContainerDetail>("GET", `${BASE}/containers/${enc(id)}`, undefined, { signal }),
+  profiles: (q: ProfileQuery & { limit?: number }, signal?: AbortSignal) =>
+    request<{ uploads: ProfileUpload[]; matched: number }>("GET", `${BASE}/profiles?${profileParams(q)}`, undefined, { signal }),
+  profileUpload: (id: string, signal?: AbortSignal) => request<ProfileUploadDetail>("GET", `${BASE}/profiles/${enc(id)}`, undefined, { signal }),
+  profileFacets: (q: ProfileQuery, signal?: AbortSignal) => request<{ facets: ProfileFacet[]; matched: number }>("GET", `${BASE}/profiles/facets?${profileParams(q)}`, undefined, { signal }),
+  profileTypes: (q: ProfileQuery, signal?: AbortSignal) => request<{ types: ProfileType[] }>("GET", `${BASE}/profiles/types?${profileParams(q)}`, undefined, { signal }).then((r) => r.types),
+  flame: (q: ProfileQuery & { profile: string; type: string; id?: string; limit?: number }, signal?: AbortSignal) =>
+    request<FlameGraph>("GET", `${BASE}/profiles/flame?${profileParams(q)}`, undefined, { signal }),
+  compareFlames: (q: ProfileQuery & { profile: string; type: string; id?: string; base_from?: number; base_to?: number; base_query?: string; by?: "after" | "before" }, signal?: AbortSignal) =>
+    request<FlameComparison>("GET", `${BASE}/profiles/compare?${profileParams(q)}`, undefined, { signal }),
+  /** Where an upload's profile is read as pprof, inflated (what `go tool pprof` reads). */
+  profileDownload: (id: string, name: string) => `${BASE}/profiles/${enc(id)}/${enc(name)}`,
   /** Notebooks, as Datadog's list gives them, without their cells. */
   notebooks: (q: NotebookQuery, signal?: AbortSignal) => {
     const p = new URLSearchParams({ include_cells: "false" });

@@ -1734,6 +1734,77 @@ fn schemas() -> Map<String, Value> {
         ),
     ));
     put("ContainerDetail", object(&detail_fields, &["id", "state", "last_reported", "figures", "tags", "charts"]));
+    // Continuous profiles (§8.11).
+    let upload_fields = [
+        ("id", describe(string(), "its place in the server's store")),
+        ("start_ms", integer()),
+        ("end_ms", integer()),
+        ("family", describe(string(), "its profiler's language: go, python, …")),
+        ("tags", describe(array(string()), "key:value, as its profiler and its Agent said them")),
+        (
+            "profiles",
+            array(object(
+                &[
+                    ("name", describe(string(), "its file's name: cpu.pprof, delta-heap.pprof, …")),
+                    ("types", array(object(&[("type", string()), ("unit", string()), ("total", describe(integer(), "its values summed over the profile's samples"))], &["type", "unit", "total"]))),
+                ],
+                &["name", "types"],
+            )),
+        ),
+    ];
+    put("ProfileUpload", object(&upload_fields, &["id", "start_ms", "end_ms", "family", "tags", "profiles"]));
+    let mut upload_detail = upload_fields.to_vec();
+    upload_detail.push(("endpoints", describe(array(object(&[("endpoint", string()), ("count", integer())], &["endpoint", "count"])), "requests by endpoint while it was collected")));
+    put("ProfileUploadDetail", object(&upload_detail, &["id", "start_ms", "end_ms", "family", "tags", "profiles", "endpoints"]));
+    let side = object(
+        &[("matched", integer()), ("read", integer()), ("failed", integer()), ("total", describe(integer(), "its whole")), ("samples", integer())],
+        &["matched", "read", "failed", "total", "samples"],
+    );
+    put(
+        "FlameComparison",
+        object(
+            &[
+                ("profile", string()),
+                ("type", string()),
+                ("unit", string()),
+                ("averaged", boolean()),
+                ("after", describe(side.clone(), "what is compared")),
+                ("before", describe(side, "what it is compared with")),
+                ("names", array(string())),
+                ("files", array(string())),
+                ("nodes", describe(array(array(integer())), "[function, parent, total after, self after, total before, self before], as FlameGraph's nodes, sized by `by`'s side")),
+                ("top", describe(array(array(integer())), "[function, self after, self before, total after, total before], by how much the self's share of its whole changed, most first")),
+            ],
+            &["profile", "type", "unit", "averaged", "after", "before", "names", "files", "nodes", "top"],
+        ),
+    );
+    put(
+        "FlameGraph",
+        object(
+            &[
+                ("profile", string()),
+                ("type", string()),
+                ("unit", string()),
+                ("averaged", describe(boolean(), "the graph the uploads' average over time (a snapshot's type: the heap live, goroutines), each process's summed; else their sum")),
+                ("matched", describe(integer(), "uploads that held the type")),
+                ("read", describe(integer(), "uploads read: `limit` at the most, evenly across the time")),
+                ("failed", describe(integer(), "uploads that could not be read")),
+                ("samples", integer()),
+                ("total", describe(integer(), "the whole: the root's total")),
+                ("names", describe(array(string()), "its functions' names")),
+                ("files", describe(array(string()), "its functions' files, as `names`")),
+                (
+                    "nodes",
+                    describe(
+                        array(array(integer())),
+                        "[function, parent, total, self], root first, each node's children after it by name: function a place in `names` (the root's -1), parent a place in `nodes`; a node under `min_share` of the whole, or past 50,000 nodes, left out with all under it",
+                    ),
+                ),
+                ("top", describe(array(array(integer())), "[function, self, total], by self, most first (a recursive function's total counted once)")),
+            ],
+            &["profile", "type", "unit", "averaged", "matched", "read", "failed", "samples", "total", "names", "files", "nodes", "top"],
+        ),
+    );
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
@@ -2898,6 +2969,136 @@ fn ops() -> Vec<Op<'static>> {
                 vec![("200", answer_of("the container, and its charts", schema("ContainerDetail")))],
             )
         },
+        // Continuous profiles (§8.11).
+        Op {
+            params: profile_params(&[param("limit", "query", false, integer(), "50 unless said, 500 at the most")]),
+            ..op(
+                "get",
+                "/profiles",
+                "Profilers' uploads, newest first",
+                "observe.read",
+                None,
+                vec![("200", answer_of("the newest", object(&[("uploads", array(schema("ProfileUpload"))), ("matched", integer())], &["uploads", "matched"])))],
+            )
+        },
+        Op {
+            params: profile_params(&[]),
+            ..op(
+                "get",
+                "/profiles/facets",
+                "The uploads' tags' values, each with how many uploads have it (the most common 50)",
+                "observe.read",
+                None,
+                vec![(
+                    "200",
+                    answer_of(
+                        "the tags",
+                        object(
+                            &[
+                                ("facets", array(object(&[("key", string()), ("values", array(object(&[("value", string()), ("uploads", integer())], &["value", "uploads"])))], &["key", "values"]))),
+                                ("matched", integer()),
+                            ],
+                            &["facets", "matched"],
+                        ),
+                    ),
+                )],
+            )
+        },
+        Op {
+            params: profile_params(&[]),
+            ..op(
+                "get",
+                "/profiles/types",
+                "The sample types the uploads hold",
+                "observe.read",
+                None,
+                vec![(
+                    "200",
+                    answer_of(
+                        "the types",
+                        object(
+                            &[("types", array(object(&[("profile", string()), ("type", string()), ("unit", string()), ("uploads", integer())], &["profile", "type", "unit", "uploads"])))],
+                            &["types"],
+                        ),
+                    ),
+                )],
+            )
+        },
+        Op {
+            params: profile_params(&[
+                param("profile", "query", true, string(), "the profile's name: cpu.pprof"),
+                param("type", "query", true, string(), "its sample type: cpu"),
+                param("id", "query", false, string(), "one upload's alone"),
+                param("limit", "query", false, integer(), "uploads read: 500 unless said, 5,000 at the most, evenly across the time"),
+                param("min_share", "query", false, number(), "the smallest share of the whole a node is drawn at: 0.0001 unless said"),
+            ]),
+            ..op("get", "/profiles/flame", "A sample type summed into a flame graph over the uploads, and its functions by self", "observe.read", None, vec![ok("FlameGraph")])
+        },
+        Op {
+            params: profile_params(&[
+                param("profile", "query", true, string(), "the profile's name: cpu.pprof"),
+                param("type", "query", true, string(), "its sample type: cpu"),
+                param("id", "query", false, string(), "one upload's alone"),
+                param("base_from", "query", false, integer(), "ms since the epoch: the other side's time (the same unless said, with base_to)"),
+                param("base_to", "query", false, integer(), "ms since the epoch"),
+                param("base_query", "query", false, string(), "the other side's search (the same unless said)"),
+                param("base_id", "query", false, string(), "one upload's alone, the other side"),
+                param("by", "query", false, one_of(&["after", "before"]), "whose totals size the graph: after unless said"),
+                param("limit", "query", false, integer(), "uploads read a side: 500 unless said, 5,000 at the most"),
+                param("min_share", "query", false, number(), "the smallest share of the whole a node is drawn at: 0.0001 unless said"),
+            ]),
+            ..op(
+                "get",
+                "/profiles/compare",
+                "A sample type over the uploads compared with another time's or search's, path by path, and its functions by how much their share changed",
+                "observe.read",
+                None,
+                vec![ok("FlameComparison")],
+            )
+        },
+        op(
+            "get",
+            "/profiles/status",
+            "The profiles' store's size, and what became of the uploads since the server started",
+            "observe.read",
+            None,
+            vec![(
+                "200",
+                answer_of(
+                    "its size and counts",
+                    object(
+                        &[
+                            ("uploads", integer()),
+                            ("segments", integer()),
+                            ("bytes", integer()),
+                            ("series", integer()),
+                            ("oldest_ms", integer()),
+                            ("newest_ms", integer()),
+                            (
+                                "counts",
+                                describe(
+                                    object(&[("kept", integer()), ("busy", integer()), ("disk", integer()), ("malformed", integer()), ("not_pprof", integer()), ("failed", integer())], &[]),
+                                    "kept; refused (the writer's queue full, the disk short); malformed; holding no pprof (not kept); lost to a failed write",
+                                ),
+                            ),
+                        ],
+                        &["uploads", "segments", "bytes", "series", "counts"],
+                    ),
+                ),
+            )],
+        ),
+        Op { params: vec![id()], ..op("get", "/profiles/{id}", "An upload: its tags, its profiles' types, its endpoints", "observe.read", None, vec![ok("ProfileUploadDetail")]) },
+        Op {
+            params: vec![id(), name()],
+            ..op(
+                "get",
+                "/profiles/{id}/{name}",
+                "An upload's profile as pprof, inflated (what `go tool pprof` reads)",
+                "observe.read",
+                None,
+                vec![("200", json!({ "description": "the profile", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }))],
+            )
+        },
         // The infrastructure list (§10.9).
         Op {
             params: vec![
@@ -3142,6 +3343,14 @@ fn ops() -> Vec<Op<'static>> {
         Op { params: dd_key(), body: Some(dd_body("service checks' runs, JSON")), ..op("post", "/api/v1/check_run", "Datadog's Agent's service checks", "ingest", None, vec![("202", answer("taken", None))]) },
         Op { params: dd_key(), body: Some(dd_body("events by source, and host metadata (passed over), JSON")), ..op("post", "/intake/", "Datadog's Agent's events", "ingest", None, vec![("202", answer("taken", None))]) },
         Op { params: dd_key(), body: Some(dd_body("log records, JSON")), ..op("post", "/api/v2/logs", "Datadog's Agent's logs", "ingest", None, vec![("202", answer("taken", None))]) },
+        Op {
+            params: vec![
+                param("DD-API-KEY", "header", false, string(), "observe's ingest token (or ?api_key=)"),
+                param("X-Datadog-Additional-Tags", "header", false, string(), "key:value tags an Agent adds (its host), each whose key the upload has not added"),
+            ],
+            body: Some(json!({ "required": true, "content": { "multipart/form-data": { "schema": { "type": "object" } } }, "description": "a profiler's upload: an `event` part (event.json) and a part a profile (pprof: gzip'd, zstd'd, in LZ4's frames, or as it is)" })),
+            ..op("post", "/api/v2/profile", "A profiler's upload, an Agent's or a tracer's without one (docs/observe.md §8.11)", "ingest", None, vec![("202", answer("taken", None)), ("413", answer("past 15.9 MiB", None))])
+        },
         Op { params: dd_key(), ..op("get", "/api/v1/validate", "Whether a Datadog API key is one", "ingest", None, vec![("200", answer_of("valid", object(&[("valid", boolean())], &["valid"]))), ("403", answer("not one", None))]) },
         // Datadog's service definition API (docs/observe.md §10.8).
         Op {
@@ -3168,6 +3377,17 @@ fn ops() -> Vec<Op<'static>> {
             ..op("post", "/v1/pubsub", "A Pub/Sub push subscription's message: a Cloud Logging sink's entry (docs/observe.md §10.2)", "ingest", None, vec![("204", answer("taken (or taken before), acknowledged", None))])
         },
     ]);
+    v
+}
+
+/// The uploads a profiles route reads: their time and a search of their tags; and `more`.
+fn profile_params(more: &[Value]) -> Vec<Value> {
+    let mut v = vec![
+        param("from", "query", false, integer(), "ms since the epoch: an hour before `to` unless said"),
+        param("to", "query", false, integer(), "ms since the epoch: now unless said"),
+        param("query", "query", false, string(), "a search of the uploads' tags in log search's syntax (service:checkout env:prod -host:web-2); every upload unless said"),
+    ];
+    v.extend_from_slice(more);
     v
 }
 

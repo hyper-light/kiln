@@ -25,13 +25,15 @@ pub enum MultipartError {
     Text,
 }
 
-/// A part: its form field's name, its file name where it has one, its type, its body.
+/// A part: its form field's name, its file name where it has one, its type, its body and where its
+/// body begins in the whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Part<'a> {
     pub name: &'a str,
     pub filename: Option<&'a str>,
     pub content_type: Option<&'a str>,
     pub body: &'a [u8],
+    pub at: usize,
 }
 
 /// The `boundary` parameter of a `multipart/form-data` content type (quoted or a token); none where
@@ -92,7 +94,7 @@ pub fn parts<'a>(body: &'a [u8], boundary: &str) -> Result<Vec<Part<'a>>, Multip
                 content_type = Some(v);
             }
         }
-        out.push(Part { name: name.ok_or(MultipartError::NoName)?, filename, content_type, body: content.get(..len).unwrap_or_default() });
+        out.push(Part { name: name.ok_or(MultipartError::NoName)?, filename, content_type, body: content.get(..len).unwrap_or_default(), at: body.len() - content.len() });
         // Past this part's body and its delimiter.
         at = body.len() - content.len() + len + delimiter.len();
     }
@@ -118,6 +120,7 @@ mod tests {
         let ps = parts(&body, b).unwrap();
         assert_eq!(ps.len(), 2);
         assert_eq!((ps[0].name, ps[0].filename, ps[0].body), ("cpu.pprof", Some("cpu.pprof"), &[0x1f, 0x8b, 0, 13, 10, 45, 45][..]));
+        assert_eq!(body.get(ps[0].at..ps[0].at + ps[0].body.len()), Some(ps[0].body), "its place in the whole");
         assert_eq!((ps[1].name, ps[1].content_type, ps[1].body), ("event", Some("application/json"), &b"{\"family\":\"go\"}"[..]));
     }
 

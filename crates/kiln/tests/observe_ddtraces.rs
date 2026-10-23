@@ -406,7 +406,7 @@ fn datadog_s_tracer_straight_to_a_kiln_runner_is_kiln_s_traces_and_their_trace_m
     )?;
     let (code, info) = common::raw(apm, "GET", "/info", "", b"")?;
     let info: Value = serde_json::from_slice(&info)?;
-    anyhow::ensure!(code == 200 && at(&info, &["endpoints"]) == &json!(["/v0.4/traces", "/v0.5/traces"]) && at(&info, &["client_drop_p0s"]) == false, "{info}");
+    anyhow::ensure!(code == 200 && at(&info, &["endpoints"]) == &json!(["/v0.4/traces", "/v0.5/traces", "/profiling/v1/input"]) && at(&info, &["client_drop_p0s"]) == false, "{info}");
     let ids = orders(apm)?;
     let kept_n = the_traces_and_their_metrics(&f, t0, &ids, "web-1", &|| f.logs())?;
     eprintln!("  ddtrace    {ORDERS} requests across two services straight to a kiln runner: the {kept_n} traces their tracers kept, whole; every request counted by the runner, once");

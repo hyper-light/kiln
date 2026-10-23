@@ -181,6 +181,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::api::set_issues(issues.clone());
         crate::rt::spawn(issues.run(shutdown.clone()));
         child!("observe", h => crate::observe::hub::send_loop(h));
+        // Profilers' uploads (`crate::observe::profiles`), kept here alone: opened on a thread of their
+        // own (their headers read), taken once it has.
+        crate::observe::profiles::start(
+            cfg.data("observe").join("profiles"),
+            i64::from(cfg.observe.profiles_retention_days.max(1)) * 86_400_000,
+            cfg.observe.profiles_max_gb.map(|g| u64::from(g) << 30),
+        );
         // Incidents (`crate::observe::incidents`), told to their handles through the monitors'
         // integrations.
         let incidents = crate::observe::incidents::Incidents::open(&cfg.data("observe"));

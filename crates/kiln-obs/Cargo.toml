@@ -121,5 +121,9 @@ harness = false
 name = "m4"
 harness = false
 
+[[bench]]
+name = "flame"
+harness = false
+
 [lints]
 workspace = true

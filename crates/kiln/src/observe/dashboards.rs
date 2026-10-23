@@ -7,8 +7,8 @@
 //! states (`monitors`), text (`note`), or widgets of its own (`group`, Datadog's: a titled set of
 //! widgets on a grid of their own, no group among them). The UI draws them; the API keeps them
 //! (`<observe>/dashboards.json`), and takes and gives Datadog's dashboard JSON (`super::ddash`).
-//! kiln's own dashboards (`builtin:…`: its hosts, CI and CD) are always there and read-only: a copy
-//! is the way to change one.
+//! kiln's own dashboards (`builtin:…`: its hosts, CI, CD, repositories' sync, blobs, agents and
+//! their live feed) are always there and read-only: a copy is the way to change one.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -260,7 +260,8 @@ fn search_widget(title: &str, kind: &str, search: &str, (x, y, w, h): (u32, u32,
     Widget { id: format!("{}-{x}-{y}", kind), title: title.into(), kind: kind.into(), queries: Vec::new(), search: search.into(), text: String::new(), layout: Layout { x, y, w, h }, options: Value::Null, widgets: Vec::new() }
 }
 
-/// kiln's own dashboards: its hosts, its CI, its CD, its repositories' sync.
+/// kiln's own dashboards: its hosts, its CI, its CD, its repositories' sync, the store it keeps its
+/// bytes in, its agents, and their sessions' live feed.
 pub fn builtins() -> Vec<Dashboard> {
     let host = vec![TemplateVariable { name: "host".into(), tag: "host".into(), default: "*".into() }];
     vec![
@@ -336,6 +337,86 @@ pub fn builtins() -> Vec<Dashboard> {
                 widget("Moves", "timeseries", &["sum:kiln_moves_total{*} by {result}.as_count()"], (0, 16, 4, 4), json!({ "display": "bars" })),
                 widget("A move's barrier, p95 (s)", "timeseries", &["p95:kiln_move_barrier_seconds{*}", "p95:kiln_move_files_wait_seconds{*}"], (4, 16, 4, 4), json!({ "unit": "s" })),
                 search_widget("Sync's events", "events", "service:kiln.sync", (8, 16, 4, 4)),
+            ],
+            builtin: true,
+            created: 0,
+            modified: 0,
+        },
+        Dashboard {
+            id: "builtin:blobs".into(),
+            title: "Blobs".into(),
+            description: "The store kiln keeps its bytes in: its requests by operation and how they went, how long they took, the bytes moved, and what was let go.".into(),
+            template_variables: vec![TemplateVariable { name: "store".into(), tag: "store".into(), default: "*".into() }],
+            widgets: vec![
+                widget("Requests, by operation", "timeseries", &["sum:kiln_blobs_requests_total{$store} by {op}.as_count()"], (0, 0, 4, 4), json!({ "display": "bars" })),
+                widget(
+                    "Refused and unavailable",
+                    "timeseries",
+                    &["sum:kiln_blobs_requests_total{$store,outcome:refused} by {op}.as_count()", "sum:kiln_blobs_requests_total{$store,outcome:unavailable} by {op}.as_count()"],
+                    (4, 0, 4, 4),
+                    json!({ "display": "bars" }),
+                ),
+                widget("A request's time, p50 and p99 (s)", "timeseries", &["p50:kiln_blobs_request_seconds{$store} by {op}", "p99:kiln_blobs_request_seconds{$store} by {op}"], (8, 0, 4, 4), json!({ "unit": "s" })),
+                widget("Bytes moved (bytes/s)", "timeseries", &["sum:kiln_blobs_bytes_total{$store} by {direction}"], (0, 4, 4, 4), json!({ "unit": "B/s" })),
+                widget("Let go, by what kept them", "timeseries", &["sum:kiln_blobs_collected_total{*} by {kind}.as_count()"], (4, 4, 4, 4), json!({ "display": "bars" })),
+                widget("Archives given up", "query_value", &["sum:kiln_blobs_archives_given_up_total{*}.as_count()"], (8, 4, 4, 4), json!({ "aggregator": "sum" })),
+            ],
+            builtin: true,
+            created: 0,
+            modified: 0,
+        },
+        Dashboard {
+            id: "builtin:agents".into(),
+            title: "kiln agents".into(),
+            description: "Agents' goals and sessions: goals sent and how they ended, each harness host's looks, its records and its journal, and messages sent to sessions: each taken once, a repeat answered as the first was and never delivered again, those refused and why, those not answered in time.".into(),
+            template_variables: host.clone(),
+            widgets: vec![
+                // The goal driver is the server's: its counts are the server's alone.
+                widget("Goals sent", "timeseries", &["sum:kiln_goals_sent_total{*} by {kind}.as_count()"], (0, 0, 4, 4), json!({ "display": "bars" })),
+                widget("Goals ended", "timeseries", &["sum:kiln_goals_ended_total{*} by {status}.as_count()"], (4, 0, 4, 4), json!({ "display": "bars" })),
+                widget("Harness looks, by host", "timeseries", &["sum:kiln_harness_polls_total{$host} by {host}.as_count()"], (8, 0, 4, 4), json!({ "display": "bars" })),
+                widget("Records written, by host", "timeseries", &["sum:kiln_harness_records_written_total{$host} by {host}.as_count()"], (0, 4, 4, 4), json!({ "display": "bars" })),
+                widget(
+                    "Journal commits, and those that could not be written",
+                    "timeseries",
+                    &["sum:kiln_harness_journal_commits_total{$host} by {outcome}.as_count()", "sum:kiln_harness_journal_rehanded_total{$host}.as_count()"],
+                    (4, 4, 4, 4),
+                    json!({ "display": "bars" }),
+                ),
+                widget("A journal commit, p50 and p99 (s)", "timeseries", &["p50:kiln_harness_journal_commit_seconds{$host} by {host}", "p99:kiln_harness_journal_commit_seconds{$host} by {host}"], (8, 4, 4, 4), json!({ "unit": "s" })),
+                widget("Messages taken", "timeseries", &["sum:kiln_sends_accepted_total{*}.as_count()"], (0, 8, 4, 4), json!({ "display": "bars" })),
+                widget("Repeats, answered and not delivered again", "timeseries", &["sum:kiln_sends_repeated_total{*}.as_count()"], (4, 8, 4, 4), json!({ "display": "bars" })),
+                widget(
+                    "Not answered within 10 s, and handed on unchecked",
+                    "timeseries",
+                    &["sum:kiln_sends_unanswered_total{*}.as_count()", "sum:kiln_sends_unchecked_total{*}.as_count()"],
+                    (8, 8, 4, 4),
+                    json!({ "display": "bars" }),
+                ),
+                widget("Messages refused, by reason", "timeseries", &["sum:kiln_sends_refused_total{*} by {reason}.as_count()"], (0, 12, 6, 4), json!({ "display": "bars" })),
+                widget("An inbox's take, p50 and p99 (s)", "timeseries", &["p50:kiln_sends_inbox_seconds{$host} by {host}", "p99:kiln_sends_inbox_seconds{$host} by {host}"], (6, 12, 6, 4), json!({ "unit": "s" })),
+            ],
+            builtin: true,
+            created: 0,
+            modified: 0,
+        },
+        Dashboard {
+            id: "builtin:live-feed".into(),
+            title: "Live feed".into(),
+            description: "Agent sessions' live feeds on kiln's bus, server to every browser watching: frames published, how long one took to reach a viewer, viewers that fell behind or were refused and started over, the bus's topics and viewers, and its memory against its limit.".into(),
+            template_variables: host.clone(),
+            widgets: vec![
+                widget("Frames published", "timeseries", &["sum:kiln_bus_published_total{$host}.as_count()"], (0, 0, 4, 4), json!({ "display": "bars" })),
+                widget("A frame's delivery, p50 and p99 (s)", "timeseries", &["p50:kiln_bus_delivery_seconds{$host}", "p99:kiln_bus_delivery_seconds{$host}"], (4, 0, 4, 4), json!({ "unit": "s" })),
+                widget(
+                    "Viewers behind and resynced, and refused by operation",
+                    "timeseries",
+                    &["sum:kiln_bus_lag_notices_total{$host}.as_count()", "sum:kiln_bus_refused_total{$host} by {op}.as_count()"],
+                    (8, 0, 4, 4),
+                    json!({ "display": "bars" }),
+                ),
+                widget("Viewers and topics", "timeseries", &["max:kiln_bus_viewers{$host}", "max:kiln_bus_topics{$host}"], (0, 4, 6, 4), json!({})),
+                widget("Memory against its limit (bytes)", "timeseries", &["max:kiln_bus_memory_bytes{$host}", "max:kiln_bus_memory_limit_bytes{$host}"], (6, 4, 6, 4), json!({ "unit": "B" })),
             ],
             builtin: true,
             created: 0,
