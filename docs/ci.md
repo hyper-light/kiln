@@ -1958,6 +1958,12 @@ W20.
     machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
     ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
 - *Left.* AC11 on the live cluster.
+- *Open, for the user to decide:* R16's retry after `runner-lost` avoids the runner that lost the
+  leg, so where only one runner can take it, the retry waits for good. The options: wait (today);
+  prefer another runner and take the same one when none other can (at once, or after a few
+  minutes); don't retry when no other runner can; or the default prefers another while an
+  explicit `runner: different` stays strict and says it waits for a runner other than the one
+  lost. The last is recommended.
 
 ### W06 Step runtime on the runner
 
