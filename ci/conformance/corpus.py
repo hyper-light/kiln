@@ -671,17 +671,61 @@ def write(out_dir):
         f.write("\n".join(lines))
 
 
+def renote(api, out_dir, only=None):
+    """Reads each failed leg's note in `out_dir`'s results again from the server, from its runs
+    there (the repository's at the result's commit, by event and workflow), as after a fix to
+    how kiln picks a failure's excerpt; the rest of each result stays as it was (a run since
+    cancelled says no more why its legs waited). Then the report."""
+    for repo in ORDER:
+        p = os.path.join(out_dir, repo.replace("/", "_") + ".json")
+        if (only and repo not in only) or not os.path.exists(p):
+            continue
+        with open(p) as f:
+            d = json.load(f)
+        listing = api.call("GET", "/api/ci/runs?" + urllib.parse.urlencode({"repo": repo, "limit": 200}))["runs"]
+        changed = 0
+        for event, by_name in d.get("events", {}).items():
+            for n, w in by_name.items():
+                notes = w.get("notes") or []
+                if not any(re.match(r"^`[^`]+`: ", x) for x in notes):
+                    continue
+                runs = [r for r in listing if r.get("event") == event and r.get("sha") == d.get("sha") and os.path.basename(r.get("workflow", "")) == n]
+                if not runs:
+                    continue
+                r = max(runs, key=lambda r: int(r.get("created_at") or 0))
+                fresh = {}
+                for leg in api.call("GET", "/api/ci/runs/" + r["id"]).get("legs") or []:
+                    if leg.get("conclusion") in ("failure", "timed_out", "startup_failure"):
+                        step, msg = leg_detail(api, leg)
+                        fresh[leg.get("key")] = f"`{leg.get('key')}`: {step}" + (f": {msg}" if msg else "")
+                new = [fresh.get(m.group(1), x) if (m := re.match(r"^`([^`]+)`: ", x)) else x for x in notes]
+                changed += sum(1 for a, b in zip(notes, new) if a != b)
+                w["notes"] = new
+        if changed:
+            with open(p, "w") as f:
+                json.dump(d, f, indent=1)
+        print(f"{repo}: {changed} notes read again", flush=True)
+    write(out_dir)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", required=True)
     ap.add_argument("--token-file", required=True)
-    ap.add_argument("--work", required=True, help="where the repositories are made")
+    ap.add_argument("--work", help="where the repositories are made")
     ap.add_argument("--out", required=True, help="where each repository's results go")
     ap.add_argument("--only", nargs="*", help="these repositories (owner/name)")
     ap.add_argument("--timeout", type=int, default=7200, help="seconds to wait for one repository's runs")
     ap.add_argument("--pass", dest="pass_name", help="a pass of its own (new commits, so new runs, as after a change to kiln); the same name and --out go on with it")
+    ap.add_argument("--renote", action="store_true", help="read the failed legs' notes of the results in --out again from the server (`renote`), and nothing else")
     args = ap.parse_args()
     api = Api(args.server, open(args.token_file).read().strip())
+    if args.renote:
+        renote(api, args.out, args.only)
+        print(f"wrote {OUT}")
+        return
+    if not args.work:
+        ap.error("--work is needed for a pass")
     os.makedirs(args.work, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
     srcs = sources()
