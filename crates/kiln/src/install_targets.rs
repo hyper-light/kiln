@@ -72,7 +72,8 @@ impl Via<'_> {
                 let status = r.status();
                 Ok((status, r.bytes(8 << 20).await?))
             }
-            Via::Proxy(cluster, base) => cluster.request(Method::GET, &format!("{base}{path}"), None, None).await,
+            // As a browser asks: kiln serves its page to no one who takes JSON alone.
+            Via::Proxy(cluster, base) => cluster.request_as(Method::GET, &format!("{base}{path}"), None, None, "*/*").await,
         }
     }
 }
@@ -774,7 +775,8 @@ mod tests {
     /// A kiln stand-in on a port of its own: `/healthz`, its page (naming its script, when `ui`),
     /// the script, and `/healthz/server` with `runners` connected; at those paths, and through an
     /// API server's proxy to kiln's service in namespace `kiln`, which rewrites the page's links to
-    /// go through it, as Kubernetes' does.
+    /// go through it, as Kubernetes' does. Its page, as kiln's, isn't for a request that takes JSON
+    /// alone (406).
     fn stand_in(ui: bool, runners: u64) -> anyhow::Result<String> {
         use std::io::Write as _;
         let l = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -795,8 +797,11 @@ mod tests {
                     Some(_) => page.replace("src=\"/", &format!("src=\"https://10.0.0.1:6443{}/", proxy_base("kiln"))),
                     None => page.to_owned(),
                 };
+                let accept = req.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("accept:").map(|v| v.trim().to_owned()));
+                let html = accept.is_none_or(|a| a.contains("text/html") || a.contains("*/*"));
                 let (status, body) = match proxied.unwrap_or(path) {
                     "/healthz" => ("200 OK", "ok".to_owned()),
+                    "/" if !html => ("406 Not Acceptable", String::new()),
                     "/" => ("200 OK", page),
                     "/assets/index-x1.js" => ("200 OK", "export {}".to_owned()),
                     "/healthz/server" => ("200 OK", format!(r#"{{"runners":{{"connected":{runners},"before":0,"back":1.0}}}}"#)),

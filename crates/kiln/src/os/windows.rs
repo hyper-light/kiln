@@ -37,7 +37,18 @@ pub fn add_to_user_path(dir: &Path) -> io::Result<Option<super::PathAdded>> {
     };
     super::win32::set_user_path(&list, kind)?;
     super::win32::announce_environment();
-    Ok(Some(super::PathAdded { file: None, now: None }))
+    Ok(Some(super::PathAdded { file: None, now: None, created: false }))
+}
+
+/// Take `dir` back off the user's PATH, as [`add_to_user_path`] put it there.
+pub fn remove_from_user_path(dir: &Path, _added: &super::PathAdded) -> io::Result<()> {
+    let Some((list, kind)) = super::win32::user_path()? else { return Ok(()) };
+    let Some(list) = super::path_list_without(&list, &dir.display().to_string(), |name| std::env::var(name).ok()) else {
+        return Ok(());
+    };
+    super::win32::set_user_path(&list, kind)?;
+    super::win32::announce_environment();
+    Ok(())
 }
 
 /// Windows identifies users by SID, not a numeric id; nothing on Windows asks for one.
