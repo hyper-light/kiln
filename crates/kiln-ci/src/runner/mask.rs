@@ -4,8 +4,10 @@
 //! the three byte alignments), percent-encoded and JSON-escaped. Values shorter than 4 characters
 //! are not masked (they would wreck logs); the secret's page warns.
 //!
-//! A stream is masked across chunk boundaries: [`Masker::push`] holds back up to the longest
-//! mask's length minus one byte, so a match that could start in what it emits is always whole.
+//! A stream is masked across chunk boundaries: [`Masker::push`] holds back what could be the start
+//! of a mask still arriving (the longest end of the stream that begins one), so a match that could
+//! start in what it emits is always whole, and the rest goes at once: a whole line, which no
+//! secret begins at its end, isn't held for the next.
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use base64::Engine;
@@ -111,6 +113,15 @@ fn mask_tokens(s: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// How much of the end of `held` may be `mask` still arriving: the longest end of it that `mask`
+/// begins with, shorter than `mask` (a whole one is matched where it is).
+fn arriving(held: &[u8], mask: &[u8]) -> usize {
+    let Some(first) = mask.first() else { return 0 };
+    let from = held.len().saturating_sub(mask.len().saturating_sub(1));
+    let tail = held.get(from..).unwrap_or_default();
+    tail.iter().enumerate().find(|(j, b)| *b == first && tail.get(*j..).is_some_and(|rest| mask.starts_with(rest))).map_or(0, |(j, _)| tail.len() - j)
+}
+
 /// `safe`, moved back to the start of a token it would cut: a prefix (or, at the end of `held`,
 /// the start of one) whose token characters reach `safe`.
 fn token_safe(held: &[u8], safe: usize) -> usize {
@@ -129,7 +140,6 @@ fn token_safe(held: &[u8], safe: usize) -> usize {
 pub struct Masker {
     masks: Vec<String>,
     ac: Option<AhoCorasick>,
-    longest: usize,
     held: Vec<u8>,
 }
 
@@ -152,7 +162,6 @@ impl Masker {
     }
 
     fn rebuild(&mut self) {
-        self.longest = self.masks.iter().map(String::len).max().unwrap_or(0);
         self.ac = if self.masks.is_empty() { None } else { AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&self.masks).ok() };
     }
 
@@ -170,7 +179,7 @@ impl Masker {
     /// The masked part of the stream so far.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.held.extend_from_slice(chunk);
-        let keep = self.longest.saturating_sub(1);
+        let keep = self.masks.iter().map(|m| arriving(&self.held, m.as_bytes())).max().unwrap_or(0);
         // A token is never cut: it is held back whole while it may still be arriving.
         let safe = token_safe(&self.held, self.held.len().saturating_sub(keep));
         self.emit(safe)
@@ -284,6 +293,21 @@ mod tests {
                 assert_eq!(s, "start *** mid *** *** abc end ***");
             }
         }
+    }
+
+    /// A whole line goes out as it comes, however long a mask is: only what may begin one waits
+    /// (a step's live log isn't a job token's length behind its output).
+    #[test]
+    fn a_line_goes_out_at_once() {
+        let token = format!("eyJ{}", "x".repeat(1200));
+        let mut m = Masker::new(&[token.as_str(), "s3cr3t-value"]);
+        assert_eq!(m.push(b"tick 1\r\n"), b"tick 1\r\n");
+        assert_eq!(m.push(b"a line ending s3cr"), b"a line ending ", "the start of a secret waits");
+        assert_eq!(m.push(b"3t-value\r\n"), b"***\r\n");
+        assert_eq!(m.push(b"tick 2\r\neyJ"), b"tick 2\r\n");
+        let mut out = m.push(b"x more\r\n");
+        out.extend(m.finish());
+        assert_eq!(out, b"eyJx more\r\n", "not the token after all");
     }
 
     #[test]

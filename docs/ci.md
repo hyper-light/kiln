@@ -2040,7 +2040,8 @@ It replaces `exec.rs` for `AssignV2`.
 - **W06-R08 Masking.** Secrets the leg receives, values from `::add-mask::`, and every line of a
   multi-line secret are replaced by `***` in logs, annotations, summaries, step names and outputs
   before anything leaves the runner. Masking works across chunk boundaries (a streaming matcher
-  keeps the longest mask's length minus one byte of look-behind). kiln also masks each secret's
+  holds back what could be the start of a mask still arriving, and lets the rest go at once, so a
+  step's live log keeps up with whole lines). kiln also masks each secret's
   base64, percent-encoded and JSON-escaped forms (secrets of 8 or more characters). Values shorter
   than 4 characters are not masked (that would destroy logs); the secret's settings page warns.
 - **W06-R09 Logs.** Raw bytes per step as today (ANSI kept), plus `JobEvent`s for groups and
