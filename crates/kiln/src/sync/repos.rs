@@ -7,7 +7,7 @@
 //! Bundles travel over HTTP to and from the server (`/api/sync/bundles/:batch`), with the token the
 //! server gives this machine with its copies: the same links, the same ports.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 
 use super::git::{self, Kept, Registry};
-use super::wire::{self, CloneOrder, Msg, Repos, TaskNews};
+use super::wire::{self, CloneOrder, Msg, Repos, ShareSlot, TaskNews, Work};
 use crate::http::client::Client;
 use crate::proto::AgentMsg;
 
@@ -68,6 +68,13 @@ struct Shared {
     /// Folders a task is cloning into or deleting now: never two at once.
     busy: Mutex<BTreeSet<String>>,
     scan: Scan,
+    /// The repositories others hold too, and where this machine's work in each goes next
+    /// (`super::share`); its folders of each, as it last looked, with when git last worked there;
+    /// what its work in each was when it last shared it; and whether it is sharing now.
+    slots: Mutex<Vec<ShareSlot>>,
+    folders: Mutex<HashMap<String, Vec<(PathBuf, i64)>>>,
+    shared: Mutex<HashMap<String, String>>,
+    sharing: AtomicBool,
 }
 
 impl Shared {
@@ -126,6 +133,10 @@ fn start_with(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: 
         kick: tx.clone(),
         busy: Mutex::new(BTreeSet::new()),
         scan,
+        slots: Mutex::new(Vec::new()),
+        folders: Mutex::new(HashMap::new()),
+        shared: Mutex::new(HashMap::new()),
+        sharing: AtomicBool::new(false),
     });
     crate::rt::spawn(async move { Worker { s: shared, paths: Vec::new(), told: None, told_at: None, looked: None, looking: false, soon: true }.run(rx).await });
     tx
@@ -187,6 +198,14 @@ impl Worker {
             }
             Job::Order(Msg::Look) => self.soon = true,
             Job::Looked(looked) => self.report(looked),
+            Job::Order(Msg::Shares { shares }) => {
+                *self.s.slots.lock() = shares;
+                share_soon(&self.s);
+            }
+            Job::Order(Msg::Take(w)) => {
+                let s = self.s.clone();
+                crate::rt::spawn(async move { take_work(&s, *w).await });
+            }
             Job::Order(Msg::Forget { path }) => {
                 let changed = self.s.registry.lock().clones.remove(&path).is_some();
                 if changed {
@@ -258,6 +277,15 @@ impl Worker {
         self.looking = false;
         self.looked = Some(Instant::now());
         let report = Repos { home: self.s.home.to_string_lossy().into_owned(), repos: looked.repos, error: looked.error, at: crate::util::now_unix() };
+        // Its folders of each repository with a remote, for sharing its work and taking others'.
+        let mut folders: HashMap<String, Vec<(PathBuf, i64)>> = HashMap::new();
+        for f in &report.repos {
+            if let Some(key) = f.origin.as_deref().and_then(super::places::key_of) {
+                folders.entry(key).or_default().push((PathBuf::from(&f.path), f.active));
+            }
+        }
+        *self.s.folders.lock() = folders;
+        share_soon(&self.s);
         let same = self.told.as_ref().is_some_and(|t| Repos { at: report.at, ..t.clone() } == report);
         let stale = self.told_at.is_none_or(|t| t.elapsed() >= SAY_EVERY);
         if !same || stale {
@@ -317,7 +345,7 @@ async fn bundle(s: &Arc<Shared>, task: &str, path: &str) {
         git::bundle(&git::expand(path, &s.home), &file).await?;
         let size = std::fs::metadata(&file)?.len();
         s.tell(TaskNews::new(task, "sending", format!("sending the bundle ({})", bytes(size))));
-        send_bundle(s, task, &file, size).await
+        send_bundle(s, Some(task), task, &file, size).await
     }
     .await;
     let _ = std::fs::remove_file(&file);
@@ -327,24 +355,27 @@ async fn bundle(s: &Arc<Shared>, task: &str, path: &str) {
     }
 }
 
-async fn send_bundle(s: &Arc<Shared>, task: &str, file: &Path, size: u64) -> anyhow::Result<(String, u64)> {
+/// Sends a bundle to the server for batch `batch`, saying how it goes on task `task`, if one.
+async fn send_bundle(s: &Arc<Shared>, task: Option<&str>, batch: &str, file: &Path, size: u64) -> anyhow::Result<(String, u64)> {
     let src = crate::rt::file_source(file.to_path_buf())?;
     let (tx, rx) = async_channel::bounded(8);
-    let (s2, t2) = (s.clone(), task.to_owned());
+    let (s2, t2) = (s.clone(), task.map(str::to_owned));
     crate::rt::spawn(async move {
         let (mut sent, mut said) = (0u64, Instant::now());
         while let Ok(chunk) = src.recv().await {
             sent = sent.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-            if said.elapsed() >= PROGRESS {
+            if let Some(t) = &t2
+                && said.elapsed() >= PROGRESS
+            {
                 said = Instant::now();
-                s2.tell(TaskNews::new(&t2, "sending", format!("sent {} of {}", bytes(sent), bytes(size))));
+                s2.tell(TaskNews::new(t, "sending", format!("sent {} of {}", bytes(sent), bytes(size))));
             }
             if tx.send(chunk).await.is_err() {
                 break;
             }
         }
     });
-    let resp = s.http.put(&s.url(task)).bearer(&s.token()).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(4 * 3600)).send().await?;
+    let resp = s.http.put(&s.url(batch)).bearer(&s.token()).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(4 * 3600)).send().await?;
     let status = resp.status();
     if !(200..300).contains(&status) {
         let body = resp.bytes(64 << 10).await.unwrap_or_default();
@@ -360,7 +391,7 @@ async fn send_bundle(s: &Arc<Shared>, task: &str, file: &Path, size: u64) -> any
 }
 
 /// Fetches a batch's bundle into `file`, checking it is the one named.
-async fn fetch_bundle(s: &Arc<Shared>, task: &str, batch: &str, hash: &str, size: u64, file: &Path) -> anyhow::Result<()> {
+async fn fetch_bundle(s: &Arc<Shared>, task: Option<&str>, batch: &str, hash: &str, size: u64, file: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(size <= BUNDLE_MAX, "the bundle is {}: more than this machine fetches", bytes(size));
     let mut resp = s.http.get(&s.url(batch)).bearer(&s.token()).timeout(Duration::from_secs(900)).send().await?;
     anyhow::ensure!(resp.is_success(), "the server gave no bundle ({})", resp.status());
@@ -373,7 +404,9 @@ async fn fetch_bundle(s: &Arc<Shared>, task: &str, batch: &str, hash: &str, size
             Ok(Some(chunk)) => {
                 h.update(&chunk);
                 got = got.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-                if said.elapsed() >= PROGRESS {
+                if let Some(task) = task
+                    && said.elapsed() >= PROGRESS
+                {
                     said = Instant::now();
                     s.tell(TaskNews::new(task, "fetching", format!("fetched {} of {}", bytes(got), bytes(size))));
                 }
@@ -406,7 +439,7 @@ async fn clone(s: &Arc<Shared>, order: CloneOrder) {
         let source: OsString = match (&order.bundle, &order.hash, &order.url) {
             (Some(batch), Some(hash), _) => {
                 s.tell(TaskNews::new(&task, "fetching", format!("fetching the bundle ({})", bytes(order.size))));
-                fetch_bundle(s, &task, batch, hash, order.size, &bundle).await?;
+                fetch_bundle(s, Some(&task), batch, hash, order.size, &bundle).await?;
                 bundle.clone().into_os_string()
             }
             (_, _, Some(url)) => url.into(),
@@ -436,6 +469,95 @@ async fn clone(s: &Arc<Shared>, order: CloneOrder) {
         }
         Err(e) => s.tell(TaskNews::failed(&task, format!("{e:#}"))),
     }
+}
+
+/// Shares this machine's work in the repositories others hold too, unless it is already at it.
+fn share_soon(s: &Arc<Shared>) {
+    if s.sharing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let s = s.clone();
+    crate::rt::spawn(async move {
+        share_all(&s).await;
+        s.sharing.store(false, Ordering::SeqCst);
+    });
+}
+
+/// For each repository others hold too, this machine's work in it, if it changed since it last
+/// went (or the server has none of it): from the repository among its folders of it that git last
+/// worked in, sent to the slot's batch.
+async fn share_all(s: &Arc<Shared>) {
+    let slots = s.slots.lock().clone();
+    for slot in slots {
+        let Some(mine) = s.folders.lock().get(&slot.key).cloned() else { continue };
+        let mut repos: BTreeMap<PathBuf, (i64, Vec<PathBuf>)> = BTreeMap::new();
+        for (f, active) in mine {
+            let Some(r) = super::share::repository_of(&f).await else { continue };
+            let e = repos.entry(r).or_default();
+            e.0 = e.0.max(active);
+            e.1.push(f);
+        }
+        let Some((_, (_, group))) = repos.into_iter().max_by_key(|(_, (active, _))| *active) else { continue };
+        let print = super::share::fingerprint(&group).await;
+        if !slot.fresh && s.shared.lock().get(&slot.key) == Some(&print) {
+            continue;
+        }
+        let file = s.bundle_file(&format!("share-{}", slot.batch));
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let out = async {
+            let (mut w, made) = super::share::work(&group, &s.me, &file).await?;
+            w.key.clone_from(&slot.key);
+            w.batch.clone_from(&slot.batch);
+            if made {
+                let size = std::fs::metadata(&file)?.len();
+                let (hash, size) = send_bundle(s, None, &slot.batch, &file, size).await?;
+                (w.hash, w.size) = (Some(hash), size);
+            }
+            anyhow::Ok(w)
+        }
+        .await;
+        let _ = std::fs::remove_file(&file);
+        match out {
+            Ok(w) => {
+                s.shared.lock().insert(slot.key.clone(), print);
+                s.send(&Msg::Shared(Box::new(w)));
+            }
+            Err(e) => tracing::warn!(target: "kiln.sync", repo = %slot.key, error = %format!("{e:#}"), "this machine's work couldn't be shared"),
+        }
+    }
+}
+
+/// Takes another machine's work into each repository of it this machine holds.
+async fn take_work(s: &Arc<Shared>, w: Work) {
+    let Some(mine) = s.folders.lock().get(&w.key).cloned() else { return };
+    let mut repos: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    for (f, _) in mine {
+        if let Some(r) = super::share::repository_of(&f).await {
+            repos.entry(r).or_insert(f);
+        }
+    }
+    let file = s.bundle_file(&format!("take-{}", w.batch));
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let bundle = match &w.hash {
+        Some(hash) => match fetch_bundle(s, None, &w.batch, hash, w.size, &file).await {
+            Ok(()) => Some(file.clone()),
+            Err(e) => {
+                tracing::warn!(target: "kiln.sync", repo = %w.key, from = %w.from, error = %format!("{e:#}"), "another machine's work couldn't be fetched");
+                None
+            }
+        },
+        None => None,
+    };
+    for folder in repos.values() {
+        if let Err(e) = super::share::take(folder, &w, bundle.as_deref()).await {
+            tracing::warn!(target: "kiln.sync", repo = %w.key, from = %w.from, folder = %folder.display(), error = %format!("{e:#}"), "another machine's work couldn't be taken in");
+        }
+    }
+    let _ = std::fs::remove_file(&file);
 }
 
 /// Deletes the folder of a repository moved away (or given up), if it is safe to.

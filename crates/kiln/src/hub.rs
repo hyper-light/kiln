@@ -213,6 +213,8 @@ pub struct Hub {
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
     pub tasks: crate::sync::tasks::Tasks,
+    /// Work kept in step between the machines that hold a repository (`crate::sync::share`).
+    pub shares: crate::sync::share::Shares,
     /// Notifications to people's devices (`crate::push`).
     pub push: crate::push::Service,
     /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
@@ -307,6 +309,7 @@ impl Hub {
             reach: Mutex::new(crate::reach::relay::Relay::default()),
             places,
             tasks,
+            shares: crate::sync::share::Shares::default(),
             push: crate::push::Service::default(),
             blobs,
         }))
@@ -385,7 +388,10 @@ impl Hub {
                 if self.places.heard(machine, r) {
                     self.emit(&serde_json::json!({ "type": "places" }));
                 }
+                // Said when it connects, and when what it holds changes: what it shares.
+                self.shares.arrange(self);
             }
+            Some(crate::sync::wire::Msg::Shared(w)) => self.shares.shared(self, machine, *w),
             Some(crate::sync::wire::Msg::Task(news)) => self.tasks.heard(machine, news),
             Some(msg) => self.sync.from_runner(machine, msg, raft),
             None => {}

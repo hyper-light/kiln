@@ -1766,6 +1766,8 @@ export interface GitState {
   active: number;
   /** kiln cloned it there. */
   kiln: boolean;
+  /** Its branch against the same branch on the other machines that hold it (their work, taken in as `kiln/<machine>/<branch>`). */
+  peers?: { machine: string; ahead: number; behind: number; wip: boolean }[];
 }
 
 /** `copy`: kept in step by sync; `clone`: kiln cloned it there; `found`: it was there. */
