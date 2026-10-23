@@ -8,6 +8,7 @@
  *   POST /api/harness/sessions/:id/goals                 {goals, start?}: goals after the others
  *   PUT  /api/harness/sessions/:id/goals                 {goals: [{id?, text}]}: the goals still to go
  *   POST /api/harness/sessions/:id/goals/:action         start, pause, skip, clear, restore
+ *   POST /api/harness/sessions/:id/goals/settings        {plan_big}: big goals planned first, or not
  */
 import type http from "node:http";
 import type { GoalItem, GoalStack } from "../src/api/harness.ts";
@@ -31,6 +32,8 @@ interface Kept {
   updated_at: number;
   /** The goals the last clear kept. */
   cleared?: GoalItem[];
+  /** Big goals planned first: on unless turned off. */
+  plan_big?: boolean;
 }
 
 const PAUSED_BY_YOU = "Paused by you: the agent isn't held to its goal (its own goal is cleared) until you resume.";
@@ -151,7 +154,7 @@ function stackOf(agent: string): Kept {
 }
 
 function view(agent: string, s: Kept): GoalStack {
-  return { agent, state: s.state, reason: s.reason, items: s.items, updated_at: s.updated_at, ...(s.cleared?.length ? { cleared: s.cleared.length } : {}) };
+  return { agent, state: s.state, reason: s.reason, items: s.items, updated_at: s.updated_at, plan_big: s.plan_big ?? true, ...(s.cleared?.length ? { cleared: s.cleared.length } : {}) };
 }
 
 /** What's next goes to the agent now: the goal under way (sent again), else the next one. */
@@ -276,6 +279,11 @@ export async function handleGoals(req: http.IncomingMessage, res: http.ServerRes
   } else if (!action && method === "PUT") {
     const b = await body<{ goals?: { id?: string; text: string }[] }>(req);
     if (set(s, b.goals ?? [])) push(s);
+  } else if (action === "settings" && method === "POST") {
+    const b = await body<{ plan_big?: boolean }>(req);
+    if (typeof b.plan_big !== "boolean") return (json(res, 400, { error: "`plan_big` is true or false" }), true);
+    s.plan_big = b.plan_big;
+    s.updated_at = Date.now();
   } else if (action === "plan" && method === "POST") {
     // Turned into a plan: planning it goes first, a part of it, and the goal waits after it.
     const b = await body<{ id?: string }>(req);

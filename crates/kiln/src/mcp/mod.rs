@@ -193,13 +193,14 @@ const RUNNER_ANSWER_MAX: usize = 4 << 20;
 const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.ready", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
 
 /// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
-/// …): `agents.*`, `goals.*`, most of `plans.*`, and `research.*`. The server says which
+/// …): `agents.*`, `goals.*` but a stack's settings, most of `plans.*`, and `research.*`. The server says which
 /// ([`runner_ask`]'s registry answer), so its agents' MCP servers offer what it has, however old
 /// their runner: a deploy reaches the agents at work.
 pub fn agent_ops() -> Vec<crate::ops::Op> {
     crate::harness::ops::list_ops()
         .into_iter()
-        .chain(crate::goals::ops::list_ops())
+        // Whether a stack plans its big goals first is the person's to say, not its agent's.
+        .chain(crate::goals::ops::list_ops().into_iter().filter(|o| o.name != "goals.settings"))
         .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
         .chain(crate::research::ops::list_ops())
         .collect()

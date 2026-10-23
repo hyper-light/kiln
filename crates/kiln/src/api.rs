@@ -859,6 +859,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 "done" => ("goals.done", None),
                 "split" => ("goals.split", None),
                 "plan" => ("goals.plan", None),
+                "settings" => ("goals.settings", None),
                 action => ("goals.control", Some(("action", (*action).to_owned()))),
             };
             let mut body = boxed(|| body_value(req)).await?;

@@ -145,6 +145,15 @@ async fn plan(cx: Cx, v: Value) -> Out {
     Ok(json!({"plan": p.plan, "research": p.research, "goal": p.goal, "part": p.part, "next": PLANNING}))
 }
 
+async fn settings(cx: Cx, v: Value) -> Out {
+    let agent = agent_of(&v)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    let plan_big = v.get("plan_big").and_then(Value::as_bool).ok_or_else(|| (StatusCode::BAD_REQUEST, "`plan_big` is true or false".to_owned()))?;
+    let s = super::settings(&cx.hub, &agent, plan_big).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.settings".into(), format!("{agent}: plan big goals first {}", if plan_big { "on" } else { "off" })).await;
+    json_of(&s)
+}
+
 async fn split(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
@@ -281,6 +290,15 @@ pub fn list_ops() -> Vec<Op> {
             },
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "plan"]))),
             run: |cx, v| Box::pin(plan(cx, v)),
+        },
+        Op {
+            name: "goals.settings",
+            summary: "Whether an agent's goal stack plans its big goals first (`plan_big`, on unless turned off): a goal of the agent's own longer than a couple of sentences is researched and planned before it's worked on, as goals_plan does, its planning going to the agent in its place. A person's setting: not one of the agents' own tools.",
+            read_only: false,
+            destructive: false,
+            input: || schema(json!({"agent": {"type": "string", "description": AGENT}, "plan_big": {"type": "boolean", "description": "Plan big goals first."}}), &["agent", "plan_big"]),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "settings"]))),
+            run: |cx, v| Box::pin(settings(cx, v)),
         },
         Op {
             name: "goals.split",

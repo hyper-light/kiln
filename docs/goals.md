@@ -19,12 +19,19 @@ work their own stack", below).
 An agent's **Plan** tab has its **Goal stack** (`/goals` opens it), in a panel of its own below its plans: what's met, under way and next,
 each with how it came out; a field to add goals (a line each); and:
 
-Each goal is a link of a chain, drawn as the agent's conversation draws its work: under way while
-the agent is at work, hyperlight's mark with its light turning and the goal's words in the
-holographic shimmer; met, the loop closed; not met, broken; skipped, dashed; to come (or under way
-while the agent is idle, or paused), only sketched, still. A goal's parts are smaller links before
-it, and a step's own parts (its acceptance criteria and tests) smaller still; a goal turned into a
-plan links to it, and a part waiting for a plan's run to the run.
+Each goal is a numbered link of a chain, its number ringed by where it stands: under way while the
+agent is at work, the console's light turning around it and the goal's words in the holographic
+shimmer; met in mint; not met in amber; skipped, dashed. A goal whose parts or plan steps are under
+way is under way too. Under a goal, on its line, are its steps (its plan's, or the parts it was
+split into), each in the console's glyph for where it stands (met, the loop closed; not met,
+broken; skipped, dashed; stopped, faint; needs you, the amber rings; waiting, sketched; at work,
+the light turning in it and its words in the shimmer), the word for it at the right, and who's at
+one that's worked on or needs you ("Devin · fedora"). Steps that run at once hang on one branch
+beside the goal's line ("3 at once"), however many there are, so a plan is never more than two
+lines wide; a step that waits for something further up says so ("after “Write the install
+matrix”"); a crowded plan (more than 8 steps) folds its finished stretch at the top into one line
+("4 steps met · show them"); a step with criteria and tests says how many are met. A planned goal
+says how many of its steps are met (its plan to open), its run and its research.
 
 - **Start**: the first goal goes to the agent at once, whatever it's doing (behind a turn under
   way, its harness queues it: "One message at a time", below); each next one once it's free (idle,
@@ -127,7 +134,7 @@ doesn't need a person for any of it:
   once they're all met, so is the goal, at once ("Met: each of its acceptance criteria and tests is
   met.").
 - **Turning a goal into a plan: `goals_plan`**, or a goal's **Make a plan** on its agent's Plan
-  tab. A goal that's become one shows its plan's steps under it, as their graph, each as it stands
+  tab. A goal that's become one shows its plan's steps under it on its line, each as it stands
   (its part on the stack, or its run's step), with how many are met and the plan to open; a long
   goal folds to its first lines (**More**). The goal under way (or the one `id` names) becomes
   a plan in its planning phase, with research of its own (docs/plans.md, "Planning a goal"): its
@@ -156,6 +163,23 @@ doesn't need a person for any of it:
 The server keeps the stacks and drives them, so they go on with no console open and across
 restarts. A stack holds at most 500 goals, those met or under way included, so a program of a
 hundred goals and more fits, its met goals kept for the record.
+
+## Big goals, planned first
+
+Agents are told to plan a goal that takes several steps before starting on it, and left to that,
+they often don't. So a stack plans its big goals itself, unless you turn it off (its `plan_big`
+setting: `goals/settings`, below). When a big goal of the agent's own is
+next to start, kiln turns it into a plan first, as **Make a plan** does: its planning (research
+inside and outside, its steps written, said ready) goes to the agent in its place, then its steps,
+and once they're all met, so is the goal.
+
+- **Big** is more than a couple of sentences (three or more of three words or more; each line of
+  a list counts as one) or longer than 280 characters. "Ship 0.3 to the fleet" goes as it is;
+  a paragraph of what to build and how to test it is planned.
+- A part of another goal, a goal made from a plan's step, one planned already and one handed to
+  another agent go as they are. So does a big goal kiln can't plan (kiln's log says why).
+- It's a person's setting: agents don't have it as a tool, so an agent can't turn off what you
+  turned on.
 
 ## Held or paused for usage
 
@@ -238,11 +262,12 @@ What the driver sends, and the goals it sees end, are counted on `/metrics`
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?}], updated_at, cleared?, resume_at?}` (`part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits for you to look at) |
+| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?}], updated_at, cleared?, resume_at?}` (`part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits for you to look at; `plan_big`: whether it plans its big goals first) |
 | POST | `/api/harness/sessions/:id/goals` | `{goals: [text], start?, next?, before?, after?}`: goals after the others, or right after the goal under way (`next`), or before or after a goal still to go (by id) (a stack that was done, given more, is paused until started) |
 | POST | `/api/harness/sessions/:id/goals/done` | `{id?, evidence?}`: the goal under way (or `id`) is met |
 | POST | `/api/harness/sessions/:id/goals/split` | `{id?, goals?}`: the goal under way (or `id`) split into parts pursued first (none given: a plan step's acceptance criteria and tests) |
 | POST | `/api/harness/sessions/:id/goals/plan` | `{id?, title?}`: the goal under way (or `id`) turned into a plan in its planning phase: `{plan, research, goal, part, next}` |
+| POST | `/api/harness/sessions/:id/goals/settings` | `{plan_big}`: whether the stack plans its big goals first ("Big goals, planned first"); answers the stack (`goals.settings`, not an agent's tool) |
 | PATCH | `/api/harness/sessions/:id/goals/:goal` | `{text?, next?, before?, after?, remove?}`: one goal still to go changed, moved or taken out |
 | PUT | `/api/harness/sessions/:id/goals` | `{goals: [{id?, text}]}`: the goals still to go, as they should be (reordered, edited, removed, added; one without `id` is the goal still to go with its words, if one wasn't named, else a new one). The goal under way may be among them: first, it stays (with other words, it's sent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done, given by id, are left as they are, not added again |
 | POST | `/api/harness/sessions/:id/goals/{start,resume,pause,skip,done,clear,restore}` | as above (`resume`: `start`; `restore`: **Bring back**); `pause` takes `{why?, resume_in_s?, resume_at?}` |
