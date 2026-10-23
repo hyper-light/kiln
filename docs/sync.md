@@ -109,6 +109,10 @@ The tree keeps each ref's last bundle, for a copy that takes the tree whole.
 - **Behind:** a bundle builds on what the log's refs held; a copy that missed one no longer kept
   asks the repository's remote (`git fetch origin`, at most a minute), else says what it couldn't
   take.
+- **Tested** on a scratch server and two runners, files, branches and commits: a commit on one was
+  the other's within 5 s, its file there and `git status` clean; commits on both at once kept the
+  first on `main` and the other beside it, `main.conflict-<machine>-<time>`, on both, listed as a
+  conflict, and both copies' files and `git status` the same.
 
 ## Catching up
 
@@ -240,10 +244,16 @@ it, and nothing of theirs moves (`crate::sync::share`):
   machine sends its branches, and each folder's **work in progress**: a commit of its files as they
   are (what git ignores left out), on the commit checked out, made from an index of its own so
   nothing in the folder changes. The commits they name that the remote lacks go in a bundle (`git
-  bundle … --not --remotes=origin`), at most 256 MiB: too big, the work in progress stays; too big
-  still, the branches go alone. A folder's work in progress stays when its changed files are more
-  than 5,000 or 64 MiB. A machine with several clones of a repository shares the one git last
-  worked in (with its worktrees).
+  bundle … --not --remotes=origin`), and the work in progress beyond them in a second: each goes
+  only when it changed, so a moved branch sends the first and an edit only the second, small. A
+  bundle over 256 MiB stays (the others take the branches whose commits they hold). The work in
+  progress is the folders' git worked in this week, the 16 latest; one whose changed files are
+  more than 5,000 or 64 MiB is left out. A repository's work goes at most every two minutes. A
+  machine with several clones of a repository shares the one git last worked in (with its
+  worktrees).
+- **Tested** on a scratch server and two runners: a commit and work in progress (an edit, a new
+  file) on one reached the other as `kiln/<machine>/main` and its work in progress, nothing of its
+  own moved; then commits on both showed as diverged on each.
 - **Where it lands:** the others take it in beside their own, `kiln/<machine>/<branch>`
   (`refs/remotes/kiln/…`, as `git branch -r` shows), and its work in progress as
   `refs/kiln/wip/<machine>/<branch>` (`git stash apply refs/kiln/wip/fedora/main`, `git checkout

@@ -51,6 +51,20 @@ pub enum Job {
 /// How the worker looks at the machine's repositories: [`git::look`], but for tests.
 type Scan = Arc<dyn Fn(PathBuf, Vec<PathBuf>, BTreeSet<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = git::Looked> + Send>> + Send + Sync>;
 
+/// What this machine's work in a repository was when it last went: its branches' and its folders'
+/// fingerprints, and when.
+struct Sent {
+    branches: String,
+    files: String,
+    at: Instant,
+}
+
+/// A repository's work goes at most this often (a new slot from the server aside).
+const SHARE_EVERY: Duration = Duration::from_secs(120);
+/// Its folders' work in progress goes for those git worked in this recently, the latest first, at most so many.
+const WIP_RECENT: i64 = 7 * 86_400;
+const WIP_FOLDERS: usize = 16;
+
 /// What the worker and the tasks it runs share.
 struct Shared {
     dir: PathBuf,
@@ -73,7 +87,7 @@ struct Shared {
     /// what its work in each was when it last shared it; and whether it is sharing now.
     slots: Mutex<Vec<ShareSlot>>,
     folders: Mutex<HashMap<String, Vec<(PathBuf, i64)>>>,
-    shared: Mutex<HashMap<String, String>>,
+    shared: Mutex<HashMap<String, Sent>>,
     sharing: AtomicBool,
 }
 
@@ -199,8 +213,12 @@ impl Worker {
             Job::Order(Msg::Look) => self.soon = true,
             Job::Looked(looked) => self.report(looked),
             Job::Order(Msg::Shares { shares }) => {
+                // Only new slots (a repository, a fresh one) start a share; looks do the rest.
+                let changed = *self.s.slots.lock() != shares;
                 *self.s.slots.lock() = shares;
-                share_soon(&self.s);
+                if changed {
+                    share_soon(&self.s);
+                }
             }
             Job::Order(Msg::Take(w)) => {
                 let s = self.s.clone();
@@ -485,43 +503,64 @@ fn share_soon(s: &Arc<Shared>) {
 
 /// For each repository others hold too, this machine's work in it, if it changed since it last
 /// went (or the server has none of it): from the repository among its folders of it that git last
-/// worked in, sent to the slot's batch.
+/// worked in. Its branches' bundle goes when they moved; its folders' work in progress (the ones git
+/// worked in lately) when it changed.
 async fn share_all(s: &Arc<Shared>) {
     let slots = s.slots.lock().clone();
+    let now = crate::util::now_unix();
     for slot in slots {
         let Some(mine) = s.folders.lock().get(&slot.key).cloned() else { continue };
-        let mut repos: BTreeMap<PathBuf, (i64, Vec<PathBuf>)> = BTreeMap::new();
+        let recent = s.shared.lock().get(&slot.key).is_some_and(|sent| sent.at.elapsed() < SHARE_EVERY);
+        if recent && !slot.fresh {
+            continue;
+        }
+        let mut repos: BTreeMap<PathBuf, (i64, Vec<(PathBuf, i64)>)> = BTreeMap::new();
         for (f, active) in mine {
             let Some(r) = super::share::repository_of(&f).await else { continue };
             let e = repos.entry(r).or_default();
             e.0 = e.0.max(active);
-            e.1.push(f);
+            e.1.push((f, active));
         }
-        let Some((_, (_, group))) = repos.into_iter().max_by_key(|(_, (active, _))| *active) else { continue };
-        let print = super::share::fingerprint(&group).await;
-        if !slot.fresh && s.shared.lock().get(&slot.key) == Some(&print) {
+        let Some((repo, (_, mut group))) = repos.into_iter().max_by_key(|(_, (active, _))| *active) else { continue };
+        group.retain(|(_, active)| now.saturating_sub(*active) <= WIP_RECENT);
+        group.sort_by_key(|(_, active)| std::cmp::Reverse(*active));
+        group.truncate(WIP_FOLDERS);
+        let folders: Vec<PathBuf> = group.into_iter().map(|(f, _)| f).collect();
+        let (branches_print, files_print) = super::share::fingerprints(&repo, &folders).await;
+        let before = s.shared.lock().get(&slot.key).map(|sent| (sent.branches.clone(), sent.files.clone()));
+        let branches_moved = slot.fresh || before.as_ref().is_none_or(|(b, _)| *b != branches_print);
+        let files_changed = slot.fresh || before.as_ref().is_none_or(|(_, f)| *f != files_print);
+        if !branches_moved && !files_changed {
             continue;
         }
-        let file = s.bundle_file(&format!("share-{}", slot.batch));
+        let (file, wip_file) = (s.bundle_file(&format!("share-{}", slot.batch)), s.bundle_file(&format!("share-{}", slot.wip_batch)));
         if let Some(dir) = file.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let out = async {
-            let (mut w, made) = super::share::work(&group, &s.me, &file).await?;
-            w.key.clone_from(&slot.key);
-            w.batch.clone_from(&slot.batch);
-            if made {
-                let size = std::fs::metadata(&file)?.len();
-                let (hash, size) = send_bundle(s, None, &slot.batch, &file, size).await?;
-                (w.hash, w.size) = (Some(hash), size);
+            let mut w = Work { key: slot.key.clone(), branches: super::share::branches(&repo).await?, wip: super::share::wips(&folders, &s.me).await, ..Work::default() };
+            if branches_moved {
+                w.batch.clone_from(&slot.batch);
+                if super::share::bundle_branches(&repo, &w.branches, &file).await? {
+                    let size = std::fs::metadata(&file)?.len();
+                    send_bundle(s, None, &slot.batch, &file, size).await?;
+                }
+            }
+            if files_changed {
+                w.wip_batch.clone_from(&slot.wip_batch);
+                if super::share::bundle_wip(&repo, &w.wip, &w.branches, &wip_file).await? {
+                    let size = std::fs::metadata(&wip_file)?.len();
+                    send_bundle(s, None, &slot.wip_batch, &wip_file, size).await?;
+                }
             }
             anyhow::Ok(w)
         }
         .await;
         let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&wip_file);
         match out {
             Ok(w) => {
-                s.shared.lock().insert(slot.key.clone(), print);
+                s.shared.lock().insert(slot.key.clone(), Sent { branches: branches_print, files: files_print, at: Instant::now() });
                 s.send(&Msg::Shared(Box::new(w)));
             }
             Err(e) => tracing::warn!(target: "kiln.sync", repo = %slot.key, error = %format!("{e:#}"), "this machine's work couldn't be shared"),
@@ -538,26 +577,27 @@ async fn take_work(s: &Arc<Shared>, w: Work) {
             repos.entry(r).or_insert(f);
         }
     }
-    let file = s.bundle_file(&format!("take-{}", w.batch));
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let mut files = Vec::new();
+    for (batch, hash, size) in [(&w.batch, &w.hash, w.size), (&w.wip_batch, &w.wip_hash, w.wip_size)] {
+        let Some(hash) = hash else { continue };
+        let file = s.bundle_file(&format!("take-{batch}"));
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match fetch_bundle(s, None, batch, hash, size, &file).await {
+            Ok(()) => files.push(file),
+            Err(e) => tracing::warn!(target: "kiln.sync", repo = %w.key, from = %w.from, error = %format!("{e:#}"), "another machine's work couldn't be fetched"),
+        }
     }
-    let bundle = match &w.hash {
-        Some(hash) => match fetch_bundle(s, None, &w.batch, hash, w.size, &file).await {
-            Ok(()) => Some(file.clone()),
-            Err(e) => {
-                tracing::warn!(target: "kiln.sync", repo = %w.key, from = %w.from, error = %format!("{e:#}"), "another machine's work couldn't be fetched");
-                None
-            }
-        },
-        None => None,
-    };
+    let bundles: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     for folder in repos.values() {
-        if let Err(e) = super::share::take(folder, &w, bundle.as_deref()).await {
+        if let Err(e) = super::share::take(folder, &w, &bundles).await {
             tracing::warn!(target: "kiln.sync", repo = %w.key, from = %w.from, folder = %folder.display(), error = %format!("{e:#}"), "another machine's work couldn't be taken in");
         }
     }
-    let _ = std::fs::remove_file(&file);
+    for f in &files {
+        let _ = std::fs::remove_file(f);
+    }
 }
 
 /// Deletes the folder of a repository moved away (or given up), if it is safe to.
