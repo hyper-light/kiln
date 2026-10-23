@@ -26,6 +26,7 @@ pub mod azure_web;
 pub mod cloudflare_workers;
 pub mod cloudformation;
 pub mod digitalocean;
+pub mod fly;
 pub mod gcp_appengine;
 pub mod gcp_compute;
 pub mod gcp_functions;
@@ -91,10 +92,6 @@ const fn traffic(k: KindDef) -> KindDef {
 
 const fn scoped(k: KindDef) -> KindDef {
     KindDef { namespaced: true, ..k }
-}
-
-const fn stateful(k: KindDef) -> KindDef {
-    KindDef { stateful: true, ..k }
 }
 
 const fn child(k: KindDef) -> KindDef {
@@ -500,11 +497,18 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "fly",
         place: &[],
         scope: None,
-        settings: &[s("app", true, "the app"), s("image", true, "the image (${{ artifacts.* }})"), s("config", false, "a fly.toml in the source (found by default)")],
-        kinds: &[kind("fly.kiln.dev", "App", "App"), kind("fly.kiln.dev", "Machine", "Machine"), stateful(kind("fly.kiln.dev", "Volume", "Volume")), kind("fly.kiln.dev", "Secret", "Secret")],
-        capabilities: &[Traffic, Logs, Drift, Adopt],
+        settings: &[
+            s("app", true, "the app (made if it isn't there)"),
+            s("image", true, "the image the machines run (${{ release.artifacts.<name>.digest }})"),
+            s("config", false, "fly.toml in the source (found by default), or the machines' config as the Machines API spells it"),
+            s("count", false, "how many machines (1)"),
+            s("region", false, "where kiln makes machines (fly.toml's primary_region)"),
+            s("set", false, "values to set by path: {\"config.env.MODE\": \"prod\"}"),
+        ],
+        kinds: &[kind("fly.kiln.dev", "App", "App"), child(kind("fly.kiln.dev", "Machine", "Machine"))],
+        capabilities: &[Drift, Adopt],
         reads: &["fly.toml"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "netlify",
@@ -777,6 +781,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "cloudflare-workers" => cloudflare_workers::render(input),
         "cloudformation" => cloudformation::render(input),
         "digitalocean" => digitalocean::render(input),
+        "fly" => fly::render(input),
         "gcp-appengine" => gcp_appengine::render(input),
         "gcp-compute" => gcp_compute::render(input),
         "gcp-functions" => gcp_functions::render(input),
@@ -808,6 +813,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "cloudflare-workers" => cloudflare_workers::files(spec),
         "cloudformation" => cloudformation::files(spec),
         "digitalocean" => digitalocean::files(spec),
+        "fly" => fly::files(spec),
         "gcp-appengine" => gcp_appengine::files(spec),
         "gcp-compute" => gcp_compute::files(spec),
         "gcp-functions" => gcp_functions::files(spec),
@@ -841,6 +847,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "cloudflare-workers" => cloudflare_workers::health(obj),
         "cloudformation" => cloudformation::health(obj),
         "digitalocean" => digitalocean::health(obj),
+        "fly" => fly::health(obj),
         "gcp-appengine" => gcp_appengine::health(obj),
         "gcp-compute" => gcp_compute::health(obj),
         "gcp-functions" => gcp_functions::health(obj),

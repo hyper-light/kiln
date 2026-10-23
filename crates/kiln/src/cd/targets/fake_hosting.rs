@@ -1,5 +1,5 @@
 //! A fake of the hosting platforms' APIs for tests (Render, DigitalOcean App Platform, Heroku,
-//! Netlify), in memory, behaving as each
+//! Netlify, Fly.io's Machines), in memory, behaving as each
 //! documents it where kiln depends on it: a deploy builds and goes live, the one before serving
 //! until it does, and one that fails leaves it serving; a rollback re-deploys an earlier deploy.
 //! Every request carries the platform's token.
@@ -58,9 +58,23 @@ pub struct NetlifySite {
     pub published: Option<String>,
 }
 
+/// A Fly machine as the fake keeps it.
+#[derive(Clone, Debug, Default)]
+pub struct FlyMachine {
+    pub id: String,
+    pub config: Value,
+    pub state: String,
+    pub instance: String,
+    pub region: String,
+    pub lease: Option<String>,
+    pub exit: Option<i64>,
+}
+
 #[derive(Default)]
 pub struct HostingState {
     pub base: String,
+    /// Fly's apps: their machines.
+    pub fly: BTreeMap<String, Vec<FlyMachine>>,
     pub netlify: BTreeMap<String, NetlifySite>,
     /// Files Netlify holds, by SHA-1.
     pub netlify_files: BTreeMap<String, Vec<u8>>,
@@ -109,6 +123,7 @@ impl srv::Handler for FakeHosting {
         let (method, path, query) = (req.method().clone(), req.uri().path().to_owned(), query_of(req.uri().query()));
         let auth = srv::header_str(&req, &http::header::AUTHORIZATION).unwrap_or("").to_owned();
         let accept = srv::header_str(&req, &http::header::ACCEPT).unwrap_or("").to_owned();
+        let nonce = req.headers().get("fly-machine-lease-nonce").and_then(|v| v.to_str().ok()).map(str::to_owned);
         let raw = srv::body_bytes(req.into_body(), 64 << 20).await.unwrap_or_default();
         let mut st = self.state.lock();
         // A place Heroku's sources signed: no token.
@@ -128,6 +143,7 @@ impl srv::Handler for FakeHosting {
         match parts.as_slice() {
             ["v1", "services", rest @ ..] => render(&mut st, &method, rest, &query, &body),
             ["v2", "apps", rest @ ..] => digitalocean(&mut st, &method, rest, &body),
+            ["v1", "apps", rest @ ..] => fly(&mut st, &method, rest, &query, &body, nonce.as_deref()),
             ["apps", ..] | ["sources"] if !accept.contains("application/vnd.heroku+json; version=3") => err(406, "variant_not_available", "Heroku's API wants its Accept header"),
             ["sources"] if method == http::Method::POST => {
                 let n = next(&mut st);
@@ -590,6 +606,126 @@ fn netlify(st: &mut HostingState, method: &http::Method, rest: &[&str], query: &
             }
         }
         _ => err(404, "not_found", "the fake has no such Netlify call"),
+    }
+}
+
+// ------------------------------------------------------------------ Fly.io's Machines
+
+fn fly_machine(m: &FlyMachine) -> Value {
+    let mut config = m.config.clone();
+    if let Some(c) = config.as_object_mut() {
+        c.entry("init").or_insert(json!({}));
+        c.entry("restart").or_insert(json!({ "policy": "on-failure" }));
+    }
+    let has_services = m.config.get("services").and_then(Value::as_array).is_some_and(|s| !s.is_empty());
+    let checks = if has_services && m.state == "started" { json!([{ "name": "servicecheck-00-http-8080", "status": "passing" }]) } else { json!([]) };
+    let events = match m.exit {
+        Some(code) => json!([{ "type": "exit", "status": "stopped", "request": { "exit_event": { "exit_code": code } } }]),
+        None => json!([]),
+    };
+    json!({ "id": m.id, "name": format!("m-{}", m.id), "state": m.state, "region": m.region, "instance_id": m.instance, "config": config, "checks": checks, "events": events })
+}
+
+/// A read: a machine starting starts, or exits on a broken image.
+fn fly_step(m: &mut FlyMachine) {
+    if matches!(m.state.as_str(), "starting" | "replacing" | "created") {
+        if m.config.get("image").and_then(Value::as_str).unwrap_or_default().contains("broken") {
+            m.state = "stopped".into();
+            m.exit = Some(1);
+        } else {
+            m.state = "started".into();
+            m.exit = None;
+        }
+    }
+}
+
+fn fly(st: &mut HostingState, method: &http::Method, rest: &[&str], query: &BTreeMap<String, String>, body: &Value, nonce: Option<&str>) -> Response {
+    let n = next(st);
+    match (method.as_str(), rest) {
+        ("GET", []) => {
+            let _ = query.get("org_slug");
+            ok(json!({ "total_apps": st.fly.len(), "apps": st.fly.iter().map(|(a, ms)| json!({ "name": a, "machine_count": ms.len() })).collect::<Vec<_>>() }))
+        }
+        ("POST", []) => {
+            let name = body.get("app_name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            if st.fly.contains_key(&name) {
+                return err(422, "unprocessable", "app already exists");
+            }
+            st.fly.insert(name.clone(), Vec::new());
+            st.calls.push(format!("CreateApp {name}"));
+            srv::json(http::StatusCode::CREATED, &json!({ "id": name }))
+        }
+        (_, [app, rest @ ..]) => {
+            let app = (*app).to_owned();
+            let Some(ms) = st.fly.get_mut(&app) else { return srv::json(http::StatusCode::NOT_FOUND, &json!({ "error": "app not found" })) };
+            match (method.as_str(), rest) {
+                ("DELETE", []) => {
+                    st.fly.remove(&app);
+                    st.calls.push(format!("DeleteApp {app}"));
+                    srv::status(http::StatusCode::ACCEPTED)
+                }
+                ("GET", ["machines"]) => ok(Value::Array(ms.iter().map(fly_machine).collect())),
+                ("POST", ["machines"]) => {
+                    let m = FlyMachine { id: format!("m{n}"), config: body.get("config").cloned().unwrap_or(Value::Null), state: "created".into(), instance: format!("i{n}"), region: body.get("region").and_then(Value::as_str).unwrap_or("iad").to_owned(), lease: None, exit: None };
+                    let answer = fly_machine(&m);
+                    ms.push(m);
+                    st.calls.push(format!("CreateMachine {app}"));
+                    ok(answer)
+                }
+                (_, ["machines", id, rest @ ..]) => {
+                    let Some(m) = ms.iter_mut().find(|m| m.id == *id) else { return srv::json(http::StatusCode::NOT_FOUND, &json!({ "error": "machine not found" })) };
+                    match (method.as_str(), rest) {
+                        ("GET", []) => {
+                            fly_step(m);
+                            ok(fly_machine(m))
+                        }
+                        ("POST", []) => {
+                            if m.lease.is_some() && m.lease.as_deref() != nonce {
+                                return srv::json(http::StatusCode::PRECONDITION_FAILED, &json!({ "error": "machine is leased: the lease's nonce is required" }));
+                            }
+                            m.config = body.get("config").cloned().unwrap_or(Value::Null);
+                            m.state = "replacing".into();
+                            m.instance = format!("i{n}");
+                            let image = m.config.get("image").and_then(Value::as_str).unwrap_or_default().to_owned();
+                            let answer = fly_machine(m);
+                            st.calls.push(format!("UpdateMachine {id} {image}"));
+                            ok(answer)
+                        }
+                        ("DELETE", []) => {
+                            let id = (*id).to_owned();
+                            ms.retain(|m| m.id != id);
+                            st.calls.push(format!("DestroyMachine {id}"));
+                            ok(json!({ "ok": true }))
+                        }
+                        ("POST", ["lease"]) => {
+                            if m.lease.is_some() {
+                                return srv::json(http::StatusCode::CONFLICT, &json!({ "error": "machine already leased" }));
+                            }
+                            let lease = format!("nonce{n}");
+                            m.lease = Some(lease.clone());
+                            ok(json!({ "status": "success", "data": { "nonce": lease, "expires_at": 9_999_999_999u64, "owner": "kiln" } }))
+                        }
+                        ("DELETE", ["lease"]) => {
+                            if m.lease.as_deref() != nonce {
+                                return srv::json(http::StatusCode::PRECONDITION_FAILED, &json!({ "error": "the lease's nonce is required" }));
+                            }
+                            m.lease = None;
+                            ok(json!({ "ok": true }))
+                        }
+                        ("GET", ["wait"]) => {
+                            fly_step(m);
+                            if query.get("instance_id").is_some_and(|i| *i != m.instance) {
+                                return srv::json(http::StatusCode::BAD_REQUEST, &json!({ "error": "no such instance" }));
+                            }
+                            if m.state == "started" { ok(json!({ "ok": true })) } else { srv::json(http::StatusCode::REQUEST_TIMEOUT, &json!({ "error": "deadline_exceeded: machine didn't reach started" })) }
+                        }
+                        _ => err(404, "not_found", "the fake has no such machine call"),
+                    }
+                }
+                _ => err(404, "not_found", "the fake has no such Fly call"),
+            }
+        }
+        _ => err(404, "not_found", "the fake has no such Fly call"),
     }
 }
 

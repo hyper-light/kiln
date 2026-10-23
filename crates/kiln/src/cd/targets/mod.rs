@@ -34,6 +34,7 @@ pub mod azure_web;
 pub mod cloudflare_workers;
 pub mod cloudformation;
 pub mod digitalocean;
+pub mod fly;
 pub mod gcp;
 pub mod gcp_appengine;
 pub mod gcp_compute;
@@ -606,6 +607,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "gcp-functions" => gcp_functions::list(cx, kind, names).await?,
         "gcp-run" => gcp_run::list(cx, kind, names).await?,
         "digitalocean" => digitalocean::list(cx, kind, names).await?,
+        "fly" => fly::list(cx, kind, names).await?,
         "heroku" => heroku::list(cx, kind, names).await?,
         "netlify" => netlify::list(cx, kind, names).await?,
         "render" => render::list(cx, kind, names).await?,
@@ -639,6 +641,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "gcp-functions" => gcp_functions::apply(cx, desired).await,
         "gcp-run" => gcp_run::apply(cx, desired).await,
         "digitalocean" => digitalocean::apply(cx, desired).await,
+        "fly" => fly::apply(cx, desired).await,
         "heroku" => heroku::apply(cx, desired).await,
         "netlify" => netlify::apply(cx, desired).await,
         "render" => render::apply(cx, desired).await,
@@ -667,6 +670,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "gcp-functions" => gcp_functions::delete(cx, key).await,
         "gcp-run" => gcp_run::delete(cx, key).await,
         "digitalocean" => digitalocean::delete(cx, key).await,
+        "fly" => fly::delete(cx, key).await,
         "heroku" => heroku::delete(cx, key).await,
         "netlify" => netlify::delete(cx, key).await,
         "render" => render::delete(cx, key).await,

@@ -119,6 +119,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
         ("gcp-run", None) => super::gcp_run::discover(&tcx).await,
         ("gcp-run", Some(n)) => super::gcp_run::adopt(&tcx, n).await,
         ("digitalocean", None) => super::digitalocean::discover(&tcx).await,
+        ("fly", None) => super::fly::discover(&tcx).await,
+        ("fly", Some(n)) => super::fly::adopt(&tcx, n).await,
         ("digitalocean", Some(n)) => super::digitalocean::adopt(&tcx, n).await,
         ("heroku", None) => super::heroku::discover(&tcx).await,
         ("heroku", Some(n)) => super::heroku::adopt(&tcx, n).await,
