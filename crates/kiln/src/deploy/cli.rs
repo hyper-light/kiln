@@ -508,67 +508,7 @@ enum EnvCmd {
     /// Add (or replace) an environment, deployed from a release repository on kiln's own git
     /// server or on GitHub, through KilnCD or through an Argo CD integration (`--provider
     /// argocd/<name>`).
-    Add {
-        env: String,
-        /// `kilncd`, or `argocd/<integration>`.
-        #[arg(long, default_value = "kilncd")]
-        provider: String,
-        /// Where the release repository is: `kiln` (kiln's git server), `github` (through kiln's
-        /// GitHub App), `gitlab` (a `[[ci.gitlab]]`) or `bitbucket` (`[ci.bitbucket]`); on another
-        /// host, kiln makes it if it isn't there.
-        #[arg(long, default_value = "kiln")]
-        host: String,
-        /// The release repository (`owner/name`; on GitLab `group/…/name`).
-        #[arg(long, default_value = "kiln/releases")]
-        repo: String,
-        #[arg(long, default_value = "main")]
-        branch: String,
-        #[arg(long, default_value = "")]
-        root: String,
-        /// A cluster it deploys to (KilnCD's name); none: the cluster kiln runs in.
-        #[arg(long = "cluster")]
-        clusters: Vec<String>,
-        /// On Argo CD, the KilnCD cluster that reaches one of Argo CD's, where kiln writes an app's
-        /// secrets (docs/deploy-api.md §3.5): `<Argo CD's name>=<KilnCD's>`, as `in-cluster=prod-k`.
-        #[arg(long = "kilncd", value_name = "ARGO=KILNCD")]
-        kilncd: Vec<String>,
-        /// Don't delete what git no longer holds.
-        #[arg(long)]
-        no_prune: bool,
-        /// Undo hand edits.
-        #[arg(long)]
-        self_heal: bool,
-        /// How long a release has to land, in seconds.
-        #[arg(long, default_value_t = 900)]
-        timeout: u64,
-        /// How long a landed release must stay synced and healthy, in seconds.
-        #[arg(long, default_value_t = 30)]
-        settle: u64,
-        /// How long the provider may refuse a release before it fails and its commit is
-        /// reverted, in seconds.
-        #[arg(long, default_value_t = 60)]
-        refused: u64,
-        /// A release asked for while another is in flight waits, rather than being refused.
-        #[arg(long)]
-        queue: bool,
-        /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
-        #[arg(long)]
-        agents: bool,
-        /// An app's owner teams may release it here without environments.deploy on it
-        /// (docs/deploy-api.md §15).
-        #[arg(long)]
-        owners_release: bool,
-        /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after (an
-        /// environment of a linked server as `staging@eu`), soak, approvals, windows, checks (built
-        /// in by name, or `{name, http: {url}}`, `{name, workflow: {repository, workflow, ref}}`),
-        /// require_provenance, freeze.
-        #[arg(long)]
-        gates: Option<PathBuf>,
-        /// On Argo CD, kiln writes each Application itself rather than through an ApplicationSet
-        /// (for an Argo CD that doesn't allow them).
-        #[arg(long)]
-        applications: bool,
-    },
+    Add(Box<EnvAdd>),
     Rm { env: String },
     /// Move an environment to another provider (docs/deploy-api.md §8.4): the new one compares in
     /// shadow and never writes; `--handover` hands what runs over once it agrees (`--force`: even
@@ -592,6 +532,70 @@ enum EnvCmd {
         #[arg(long)]
         no_wait: bool,
     },
+}
+
+/// `kiln deploy env add`'s arguments (boxed in [`EnvCmd`]: the variant is much the largest).
+#[derive(clap::Args)]
+struct EnvAdd {
+    env: String,
+    /// `kilncd`, or `argocd/<integration>`.
+    #[arg(long, default_value = "kilncd")]
+    provider: String,
+    /// Where the release repository is: `kiln` (kiln's git server), `github` (through kiln's
+    /// GitHub App), `gitlab` (a `[[ci.gitlab]]`) or `bitbucket` (`[ci.bitbucket]`); on another
+    /// host, kiln makes it if it isn't there.
+    #[arg(long, default_value = "kiln")]
+    host: String,
+    /// The release repository (`owner/name`; on GitLab `group/…/name`).
+    #[arg(long, default_value = "kiln/releases")]
+    repo: String,
+    #[arg(long, default_value = "main")]
+    branch: String,
+    #[arg(long, default_value = "")]
+    root: String,
+    /// A cluster it deploys to (KilnCD's name); none: the cluster kiln runs in.
+    #[arg(long = "cluster")]
+    clusters: Vec<String>,
+    /// On Argo CD, the KilnCD cluster that reaches one of Argo CD's, where kiln writes an app's
+    /// secrets (docs/deploy-api.md §3.5): `<Argo CD's name>=<KilnCD's>`, as `in-cluster=prod-k`.
+    #[arg(long = "kilncd", value_name = "ARGO=KILNCD")]
+    kilncd: Vec<String>,
+    /// Don't delete what git no longer holds.
+    #[arg(long)]
+    no_prune: bool,
+    /// Undo hand edits.
+    #[arg(long)]
+    self_heal: bool,
+    /// How long a release has to land, in seconds.
+    #[arg(long, default_value_t = 900)]
+    timeout: u64,
+    /// How long a landed release must stay synced and healthy, in seconds.
+    #[arg(long, default_value_t = 30)]
+    settle: u64,
+    /// How long the provider may refuse a release before it fails and its commit is
+    /// reverted, in seconds.
+    #[arg(long, default_value_t = 60)]
+    refused: u64,
+    /// A release asked for while another is in flight waits, rather than being refused.
+    #[arg(long)]
+    queue: bool,
+    /// Agents may release here (docs/cd-targets.md D6); only a person sets it.
+    #[arg(long)]
+    agents: bool,
+    /// An app's owner teams may release it here without environments.deploy on it
+    /// (docs/deploy-api.md §15).
+    #[arg(long)]
+    owners_release: bool,
+    /// The gates its releases pass (docs/deploy-api.md §9.1), a YAML or JSON file: after (an
+    /// environment of a linked server as `staging@eu`), soak, approvals, windows, checks (built
+    /// in by name, or `{name, http: {url}}`, `{name, workflow: {repository, workflow, ref}}`),
+    /// require_provenance, freeze.
+    #[arg(long)]
+    gates: Option<PathBuf>,
+    /// On Argo CD, kiln writes each Application itself rather than through an ApplicationSet
+    /// (for an Argo CD that doesn't allow them).
+    #[arg(long)]
+    applications: bool,
 }
 
 struct Api {
@@ -1323,7 +1327,8 @@ async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
             let v = api.call(Method::Get, &format!("/environments/{}", enc(&env)), None).await?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
-        EnvCmd::Add { env, provider, host, repo, branch, root, clusters, kilncd, no_prune, self_heal, timeout, settle, refused, queue, agents, owners_release, gates, applications } => {
+        EnvCmd::Add(a) => {
+            let EnvAdd { env, provider, host, repo, branch, root, clusters, kilncd, no_prune, self_heal, timeout, settle, refused, queue, agents, owners_release, gates, applications } = *a;
             let mut reaches = serde_json::Map::new();
             for pair in &kilncd {
                 let (argo, ours) = pair.split_once('=').filter(|(a, k)| !a.is_empty() && !k.is_empty()).with_context(|| format!("--kilncd {pair}: <Argo CD's cluster>=<KilnCD's cluster>"))?;
