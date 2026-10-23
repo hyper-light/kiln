@@ -2362,7 +2362,7 @@ impl Leg {
         let cmd = if let Some((cli, image, entrypoint, args)) = container_run {
             // A Docker action: GitHub's mounts, every value by name.
             let map = self.action_paths(st);
-            let mut inner: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), map.translate(v))).collect();
+            let mut inner = map.translate_env(&env);
             inner.remove("PATH");
             inner.insert("HOME".into(), "/github/home".into());
             inner.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
@@ -2377,7 +2377,7 @@ impl Leg {
             c
         } else if let Some((cli, j)) = job_container {
             // A job container's step: `docker exec`, paths translated (W13-R08).
-            let mut inner: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), j.map.translate(v))).collect();
+            let mut inner = j.map.translate_env(&env);
             let mut path = st.path.apply(&j.path, ':');
             if let Some(d) = &st.kiln_bin {
                 path = format!("{path}:{}", j.map.translate(&d.to_string_lossy()));

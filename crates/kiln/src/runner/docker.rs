@@ -614,6 +614,23 @@ impl PathMap {
         out
     }
 
+    /// A step's environment as a container sees it: each value [`translated`](Self::translate),
+    /// and `GH_HOST` too, which names a host and port with no scheme: the host's loopback there is
+    /// its alias, as in the URLs beside it (and the checkout's remote), or `gh` finds no remote of
+    /// that host.
+    pub fn translate_env<'a>(&self, env: impl IntoIterator<Item = (&'a String, &'a String)>) -> BTreeMap<String, String> {
+        env.into_iter()
+            .map(|(k, v)| {
+                let v = if k == "GH_HOST" {
+                    ["127.0.0.1:", "localhost:", "[::1]:"].iter().find_map(|lo| v.strip_prefix(lo)).map_or_else(|| self.translate(v), |port| format!("{HOST_ALIAS}:{port}"))
+                } else {
+                    self.translate(v)
+                };
+                (k.clone(), v)
+            })
+            .collect()
+    }
+
     /// A container's path as the host has it, when it is under a mount.
     pub fn to_host(&self, path: &str) -> Option<PathBuf> {
         self.0
@@ -1245,6 +1262,26 @@ mod tests {
         assert_eq!(m.to_host("/opt/hostedtoolcache/node/x"), Some(PathBuf::from("/w/_tool/node/x")));
         assert_eq!(m.to_host("/__w/repo/repository"), None, "a prefix of a name is not its directory");
         assert_eq!(m.to_host("/etc/passwd"), None);
+    }
+
+    /// A step's environment in a container: the host's loopback is its alias there, in URLs and
+    /// in `GH_HOST` (a host and port alone), so `gh` finds the checkout's remote of that host.
+    #[test]
+    fn a_containers_environment_names_the_host_by_its_alias() {
+        let m = PathMap::new(vec![(PathBuf::from("/w/leg/repo"), "/__w/repo/repo".into())]);
+        let env: BTreeMap<String, String> =
+            [("GH_HOST", "127.0.0.1:42511"), ("GITHUB_SERVER_URL", "http://127.0.0.1:42511"), ("GITHUB_WORKSPACE", "/w/leg/repo"), ("NO_PROXY", "localhost,127.0.0.1,::1")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+        let inside = m.translate_env(&env);
+        let get = |k: &str| inside.get(k).map(String::as_str);
+        assert_eq!(get("GH_HOST"), Some("host.docker.internal:42511"));
+        assert_eq!(get("GITHUB_SERVER_URL"), Some("http://host.docker.internal:42511"));
+        assert_eq!(get("GITHUB_WORKSPACE"), Some("/__w/repo/repo"));
+        assert_eq!(get("NO_PROXY"), Some("localhost,127.0.0.1,::1"), "a list of hosts isn't a URL");
+        let elsewhere: BTreeMap<String, String> = [("GH_HOST".to_owned(), "kiln.example:8443".to_owned())].into_iter().collect();
+        assert_eq!(m.translate_env(&elsewhere).get("GH_HOST").map(String::as_str), Some("kiln.example:8443"));
     }
 
     #[test]
