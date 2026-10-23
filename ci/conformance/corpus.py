@@ -85,6 +85,9 @@ KNOWN = [
     # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
     # answers. Prometheus's Triton test expects nothing at 127.0.0.1:443.
     (r"an error occurred unmarshaling the discovery response json: invalid character '<'", "the lab's legs share the host's network, where a server listens on 443; a hosted runner's own machine has nothing there"),
+    # Two legs at once on that network share one EPMD (Erlang's port mapper), and name their
+    # nodes alike: elixir's `primary@<host>`.
+    (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),
 ]
 
 
@@ -215,10 +218,16 @@ def snapshot(work, repo, commit):
     return dest, branch
 
 
-def nearest_tag(work, repo, commit):
+# A version's tag (`v1.2.3`, `1.2`, `release-1.2.3` aside): those a checkout of the whole history
+# fetches that a build reads (elixir's docs list them for their version chooser).
+VERSION_TAG = re.compile(r"^v?\d+(\.\d+)+([-.+][0-9A-Za-z.-]+)?$")
+
+
+def upstream_tags(work, repo, commit):
     """The upstream's tag nearest `commit`, as `git describe --tags --abbrev=0` finds it in a
-    checkout of the whole history there (`fetch-depth: 0`), or None. Only the commits are fetched,
-    none of their files."""
+    checkout of the whole history there (`fetch-depth: 0`), and its version tags (a thousand at
+    most, the newest first): `(None, [])` without them. Only the commits are fetched, none of
+    their files."""
     d = os.path.join(work, "describe", repo.replace("/", "_") + ".git")
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(os.path.dirname(d), exist_ok=True)
@@ -226,24 +235,27 @@ def nearest_tag(work, repo, commit):
         git(work, "clone", "-q", "--bare", "--filter=tree:0", f"https://github.com/{repo}.git", d)
         if not git(d, "rev-parse", "-q", "--verify", commit + "^{commit}", check=False):
             git(d, "fetch", "-q", "--filter=tree:0", "origin", commit)
-        return git(d, "describe", "--tags", "--abbrev=0", commit, check=False) or None
+        nearest = git(d, "describe", "--tags", "--abbrev=0", commit, check=False) or None
+        tags = [t for t in git(d, "tag", "--sort=-v:refname").splitlines() if VERSION_TAG.match(t)][:1000]
+        return nearest, tags
     except RuntimeError as e:
-        print(f"{repo}: no tag of the upstream's found ({e})", flush=True)
-        return None
+        print(f"{repo}: no tags of the upstream's found ({e})", flush=True)
+        return None, []
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-def version_tag(work, repo, commit, dest):
-    """`nearest_tag`, kept with the snapshot at `dest`."""
-    mark = os.path.join(dest, ".git", "kiln-snapshot-tag")
+def version_tags(work, repo, commit, dest):
+    """`upstream_tags`, kept with the snapshot at `dest`."""
+    mark = os.path.join(dest, ".git", "kiln-snapshot-tags.json")
     if os.path.exists(mark):
         with open(mark) as f:
-            return f.read().strip() or None
-    tag = nearest_tag(work, repo, commit)
+            kept = json.load(f)
+        return kept.get("nearest"), kept.get("tags", [])
+    nearest, tags = upstream_tags(work, repo, commit)
     with open(mark, "w") as f:
-        f.write((tag or "") + "\n")
-    return tag
+        json.dump({"nearest": nearest, "tags": tags}, f)
+    return nearest, tags
 
 
 def only_corpus(dest, repo):
@@ -352,13 +364,13 @@ def native(api, repo, branch):
         api.call("POST", "/api/repos", {"name": repo, "mode": "native", "default_branch": branch, "public": True})
 
 
-def push(api, dest, repo, refspec):
+def push(api, dest, repo, *refspecs):
     """Pushes to kiln's repository `repo`, the token in a header (not in the URL)."""
     import base64
 
     basic = base64.b64encode(f"x:{api.token}".encode()).decode()
     env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": "Authorization: Basic " + basic}
-    git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", refspec, env=env)
+    git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", *refspecs, env=env)
 
 
 def settle(api, repo, event, sha, timeout):
@@ -426,14 +438,21 @@ def run_repo(api, args, repo, commit):
     trunk, top = commits(dest, repo, args.pass_name or "")
     native(api, repo, branch)
     push(api, dest, repo, f"{trunk}:refs/heads/{branch}")
-    # The upstream's nearest tag, on the trunk: a build that says its version by `git describe`
-    # (buildx's, which compose checks) says `<tag>-1-g<sha>`, as a checkout of the whole history
-    # says `<tag>-<n>-g<sha>` on GitHub, not a bare sha. Annotated, so a `describe` without
-    # `--tags` finds it too. The trunk has no workflows: its push runs nothing.
-    tag = version_tag(args.work, repo, commit, dest)
-    if tag:
-        git(dest, "tag", "-f", "-a", "-m", f"F-03: {repo}'s nearest tag upstream", tag, trunk)
-        push(api, dest, repo, f"refs/tags/{tag}:refs/tags/{tag}")
+    # The upstream's tags, on the trunk, as a checkout of the whole history (`fetch-depth: 0`) has
+    # them on GitHub: a build that says its version by `git describe` (buildx's, which compose
+    # checks) says `<nearest>-1-g<sha>` there, not a bare sha, and one that lists the versions
+    # (elixir's docs) finds them. The nearest is annotated, which `describe` takes over the others
+    # on the same commit (and without `--tags`, alone). The trunk has no workflows: these pushes
+    # run nothing.
+    nearest, tags = version_tags(args.work, repo, commit, dest)
+    for t in tags:
+        if t != nearest:
+            git(dest, "tag", "-f", t, trunk)
+    if nearest:
+        git(dest, "tag", "-f", "-a", "-m", f"F-03: {repo}'s nearest tag upstream", nearest, trunk)
+    names = [t for t in tags if t != nearest] + ([nearest] if nearest else [])
+    for i in range(0, len(names), 200):
+        push(api, dest, repo, *[f"refs/tags/{t}:refs/tags/{t}" for t in names[i : i + 200]])
     corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
     out = {"repo": repo, "commit": commit, "branch": branch, "sha": top, "events": {}}
     for event in EVENTS:
