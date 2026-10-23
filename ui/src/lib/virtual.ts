@@ -51,3 +51,40 @@ export function useWindowedRows(
   );
   return [ref, { start: Math.min(win.start, count), end: Math.min(win.end, count) }];
 }
+
+/**
+ * A windowed list in a box of its own that scrolls (a side list): only the rows near what the box
+ * shows are rendered, `[data-row]` the rows, their height measured once from the first one drawn
+ * (`guess` until then). The ref measures as it attaches and on the box's scroll, once a frame.
+ */
+export function useWindowedBox(count: number, guess: number, { overscan = 10 }: { overscan?: number } = {}): [ref: (el: HTMLElement | null) => (() => void) | undefined, win: Window, row: number] {
+  const [state, setState] = React.useState({ start: 0, end: Math.min(count, 40), row: guess });
+  const ref = React.useCallback(
+    (el: HTMLElement | null) => {
+      if (!el) return;
+      let frame = 0;
+      let row = 0;
+      const measure = () => {
+        frame = 0;
+        if (!row) row = el.querySelector<HTMLElement>("[data-row]")?.getBoundingClientRect().height ?? 0;
+        const h = row || guess;
+        const start = Math.max(0, Math.floor(el.scrollTop / h) - overscan);
+        const end = Math.min(count, Math.ceil((el.scrollTop + el.clientHeight) / h) + overscan);
+        setState((s) => (s.start === start && s.end === end && s.row === h ? s : { start, end, row: h }));
+      };
+      const schedule = () => {
+        if (!frame) frame = requestAnimationFrame(measure);
+      };
+      measure();
+      el.addEventListener("scroll", schedule, { passive: true });
+      window.addEventListener("resize", schedule);
+      return () => {
+        el.removeEventListener("scroll", schedule);
+        window.removeEventListener("resize", schedule);
+        if (frame) cancelAnimationFrame(frame);
+      };
+    },
+    [count, guess, overscan],
+  );
+  return [ref, { start: Math.min(state.start, count), end: Math.min(state.end, count) }, state.row];
+}

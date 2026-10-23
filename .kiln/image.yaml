@@ -6,7 +6,10 @@ name: image
 on:
   push: { branches: [main] }
   manual: true
-concurrency: { group: image, cancel-in-progress: true }
+# One image builds at a time and finishes: pushes come faster than an image builds on a busy
+# machine, and cancelling the one under way left main with no image to deploy for hours. The newest
+# push waits for it (an older one waiting is dropped, as GitHub's single queue does).
+concurrency: { group: image, cancel-in-progress: false }
 jobs:
   image:
     name: build and publish kiln's image

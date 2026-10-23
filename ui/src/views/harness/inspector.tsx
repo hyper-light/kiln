@@ -11,10 +11,12 @@ import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
-import { TaskElapsed, TodoList } from "./timeline";
+import { TaskElapsed } from "./timeline";
 import { Background, isBackground } from "./background";
 import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
+import { ProposedPlan, TodoSteps } from "@/views/plans/its-plan";
+import { AgentResearch } from "@/views/research/research";
 import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
@@ -51,6 +53,7 @@ function ToolSection({ title, count, children }: { title: string; count?: number
 function fromServer(files: ServerChange[]): FileChange[] {
   return files.map((f) => ({
     path: f.path,
+    tree: f.tree,
     created: Boolean(f.created),
     add: f.added,
     del: f.removed,
@@ -76,8 +79,11 @@ export const Changes = React.memo(function Changes({
 }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
+  // A file in another working tree than its folder's (a worktree it left, the checkout it went
+  // from) is shown where it is; in its folder's, by its path there.
+  const nameOf = (f: FileChange) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
   const [sel, setSel] = React.useState<string | null>(null);
-  const shown: FileChange[] = sel ? files.filter((f) => f.path === sel) : files;
+  const shown: FileChange[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
   const add = files.reduce((n, f) => n + f.add, 0);
   const del = files.reduce((n, f) => n + f.del, 0);
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
@@ -92,7 +98,7 @@ export const Changes = React.memo(function Changes({
     <div className="hx-changes">
       {wsBar}
       {agentId && (
-        <Loadable label="Loading its change request" fallback={<div className="hx-change-bar" aria-busy="true" />}>
+        <Loadable label="Loading its change request" fallback={<div className="hx-cr" aria-busy="true" />}>
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}
@@ -102,10 +108,10 @@ export const Changes = React.memo(function Changes({
           <DiffStat add={add} del={del} />
         </button>
         {files.map((f) => {
-          const rel = relPath(f.path, cwd);
+          const rel = nameOf(f);
           const slash = rel.lastIndexOf("/");
           return (
-            <button key={f.path} type="button" className="hx-file" aria-pressed={sel === f.path} onClick={() => setSel(sel === f.path ? null : f.path)} title={rel}>
+            <button key={rel} type="button" className="hx-file" aria-pressed={sel === rel} onClick={() => setSel(sel === rel ? null : rel)} title={rel}>
               <span className="hx-file-name">
                 {slash > 0 && <span className="hx-dim">{rel.slice(0, slash + 1)}</span>}
                 {rel.slice(slash + 1)}
@@ -121,14 +127,14 @@ export const Changes = React.memo(function Changes({
       <div className="hx-stack">
         {shown.map((f) =>
           f.edits.map((e, i) => (
-            <div key={`${f.path}-${i}`}>
+            <div key={`${nameOf(f)}-${i}`}>
               {f.edits.length > 1 && (
                 <div className="hx-dim mb-1 text-[11px]">
                   edit {i + 1} of {f.edits.length}
                   {e.call?.status === "error" ? " · failed" : ""}
                 </div>
               )}
-              <FileDiffView diff={e.diff} label={relPath(f.path, cwd)} defaultOpen={shown.length <= 4} />
+              <FileDiffView diff={e.diff} label={nameOf(f)} defaultOpen={shown.length <= 4} />
               {f.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
             </div>
           )),
@@ -323,6 +329,8 @@ export function Inspector({
   // The folder its workspace of its own is laid over, once made (a string: Changes stays memoized).
   const volumeOver = useSession(store, (s) => (s.info?.workspace?.made ? (s.info.workspace.over ?? "") : undefined));
   const state = useSession(store, (s) => s.state);
+  // At work now: the goal under way shimmers.
+  const working = useSession(store, (s) => s.info?.status === "running");
   const meta = useSession(store, (s) => s.meta);
   // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
   const edits = useSameList(React.useMemo(() => (changes ? NO_EVENTS : editsOf(events)), [changes, events]));
@@ -362,30 +370,33 @@ export function Inspector({
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
               <section>
-                <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
-                {todos.length > 0 ? (
+                {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
+                {todos.length > 0 && (
                   <div className="hx-stack">
-                    <div className="hx-progress">
-                      <span style={{ width: `${(done / todos.length) * 100}%` }} />
-                    </div>
-                    <TodoList todos={todos} />
+                    <TodoSteps todos={todos} />
                     <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
                   </div>
-                ) : proposed ? (
-                  <div className="hx-stack">
-                    <Prose text={proposed} className="hx-plan-text" />
-                    <SavePlan body={proposed} />
-                  </div>
-                ) : (
-                  <p className="in-none">None yet: the plan it writes (or its to-do list) shows here, to keep as one of your plans.</p>
                 )}
+                {/* The plan it proposed (plan mode), in its words, kept by kiln. */}
+                {agentId ? (
+                  <Loadable label="its plan" fallback={null}>
+                    <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
+                  </Loadable>
+                ) : (
+                  proposed && (
+                    <div className="hx-stack">
+                      <Prose text={proposed} className="hx-plan-text" />
+                      <SavePlan body={proposed} />
+                    </div>
+                  )
+                )}
+                {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
               </section>
-              {todos.length > 0 && proposed && (
-                <section>
-                  <h3 className="in-sec-head">Proposed plan</h3>
-                  <Prose text={proposed} className="hx-plan-text" />
-                  <SavePlan body={proposed} />
-                </section>
+              {/* What it found out, graded by kiln (research.tsx): the newest in full. */}
+              {agentId && (
+                <Loadable label="its research" fallback={null}>
+                  <AgentResearch agent={agentId} />
+                </Loadable>
               )}
               {agentId && (
                 <section>
@@ -393,7 +404,7 @@ export function Inspector({
                   <PlansHere session={agentId} />
                 </section>
               )}
-              {agentId && <Goals agent={agentId} harness={harness} />}
+              {agentId && <Goals agent={agentId} harness={harness} working={working} />}
             </PlanSourceContext.Provider>
           </div>
         )}

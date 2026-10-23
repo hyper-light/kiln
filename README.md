@@ -25,17 +25,31 @@ UI. It runs the same way on bare metal and on Kubernetes.
   * jobs are requeued when an agent or the server dies;
   * orphaned build processes are reaped on restart.
 
-## Quick start (bare metal)
+## Quick start
 
 ```sh
 cargo build --release              # after building the UI: npm --prefix ui ci && npm --prefix ui run build
-./target/release/kiln install      # ~/.local/bin, ~/.config/kiln/kiln.toml, start on boot, start now
+./target/release/kiln install      # the cluster of your kubeconfig's current context (the default; without one, this machine)
+./target/release/kiln install --on docker    # a container on this machine
+./target/release/kiln install --on machine   # this machine: ~/.local/bin, ~/.config/kiln/kiln.toml, start on boot, start now
 kiln login                         # opens the UI with a one-time link; no password to type
 ```
 
-`kiln install --unattended` never prompts. `kiln install --system` installs system-wide (asks for
-sudo; add `--unattended` to use `sudo -n` only). The server runs a local agent by default, so
-`runs-on: [baremetal]` jobs work immediately.
+Each installs a whole kiln (server, UI, stores and a runner of its own) and ends only once it
+answers, its UI loads and its runner is connected, saying where to open it; a failure says what
+failed and takes back what the install made. In Kubernetes it goes in namespace `kiln`
+(`--namespace`, `--context`), reached at a node's address and a NodePort (or, when no node can be
+reached, through `kubectl port-forward`); Docker's is on port 7070 (`--port`), QUIC on the next.
+Both run an image built for the cluster's (or Docker's) CPU: from the binary that installs them
+when it's a Linux kiln for it, else (a Mac's, Windows', or another CPU) from the static Linux build
+of the kiln server this machine's runner is enrolled with (`--server` names another; `--image` runs
+an image of your own). minikube, kind and k3d clusters are loaded with it, and Docker Desktop's
+cluster (one node or more) and OrbStack's share it; any other cluster pulls it from a registry:
+`--registry`, else the one the cluster names (kube-public's `local-registry-hosting`).
+
+`kiln install --unattended` never prompts. `kiln install --system` installs system-wide on this
+machine (asks for sudo; add `--unattended` to use `sudo -n` only). The server runs a local agent by
+default, so `runs-on: [baremetal]` jobs work immediately.
 
 To add another machine with a join token, such as a benchmark box, copy the command from
 **Agents → Add agent** in the UI:
@@ -53,7 +67,7 @@ binaries and `SHA256SUMS` for `x86_64`/`aarch64-unknown-linux-musl` (fully stati
 
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| `kiln install` starts on boot with | systemd (else cron `@reboot`, else XDG autostart) | launchd (LaunchAgent; LaunchDaemon as root) | a Scheduled Task at boot that runs as you, whether or not anyone signs in (administrator rights, asked for once; without them, at sign-in) |
+| `kiln install --on machine` starts on boot with | systemd (else cron `@reboot`, else XDG autostart) | launchd (LaunchAgent; LaunchDaemon as root) | a Scheduled Task at boot that runs as you, whether or not anyone signs in (administrator rights, asked for once; without them, at sign-in) |
 | binary | `~/.local/bin` (`/usr/local/bin` as root), put on your PATH (a line in your shell's startup file, when it isn't) | same | `%LOCALAPPDATA%\Programs\kiln`, put on your PATH |
 | config / data | `~/.config/kiln`, `~/.local/share/kiln` (`/etc/kiln`, `/var/lib/kiln` as root) | same | `%APPDATA%\kiln`, `%LOCALAPPDATA%\kiln` |
 | job steps (no `shell:`) | `bash -eo pipefail`, else `sh -e` | same | PowerShell 7 (`pwsh`), else Windows PowerShell |

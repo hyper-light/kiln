@@ -14,6 +14,7 @@ import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
 import { useRes } from "@/lib/data";
 import { plansRes } from "./data";
 import { relativeTime } from "@/lib/format";
+import { ResearchList } from "@/views/research/research";
 import "./plans.css";
 
 const SORTS = [
@@ -55,6 +56,10 @@ export default function Plans() {
       />
       <Loadable label="the plans" fallback={<PlansHold />}>
         <PlansBody />
+      </Loadable>
+      {/* What agents found out, each graded by kiln: a plan's planning, or any question asked of them. */}
+      <Loadable label="the research" fallback={null}>
+        <ResearchList />
       </Loadable>
     </div>
   );
@@ -147,6 +152,7 @@ function PlansBody() {
                 {p.steps.length ? `${p.steps.length} step${p.steps.length === 1 ? "" : "s"}` : "one message"} · v{p.version} · changed {relativeTime(p.updated_at)}
                 {p.runs ? ` · run ${p.runs}×` : ""}
                 {p.share ? " · shared" : ""}
+                {p.research ? " · researched" : ""}
                 {p.source?.agent ? ` · from ${p.source.agent}` : ""}
               </div>
               {p.tags.length > 0 && (

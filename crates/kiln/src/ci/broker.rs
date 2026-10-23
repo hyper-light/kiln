@@ -10,9 +10,13 @@
 //!   (`latest` when none is named).
 //! - `azure-kv:<vault>/<secret>`: an Azure Key Vault secret's value.
 //!
-//! The stores are read with the repository's integration of their cloud (`@<integration>` names
-//! one), which exchanges kiln's identity for the leg (W11). Vault, Infisical, Doppler and
-//! 1Password wait for their integration kinds.
+//! - `vault:<path>#<key>`: a HashiCorp Vault secret's key (KV v1 or v2).
+//! - `infisical:<environment>[/<path…>]/<NAME>`: an Infisical project's secret.
+//! - `doppler:<project>/<config>/<NAME>`: a Doppler config's secret.
+//! - `1password:<vault>/<item>/<field>`: a 1Password item's field, through a Connect server.
+//!
+//! The stores are read with the repository's integration of their kind (`@<integration>` names
+//! one), which exchanges kiln's identity for the leg where the store takes it (W11).
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -28,6 +32,8 @@ pub enum Source {
     AwsSm { arn: String, via: Option<String> },
     GcpSm { name: String, via: Option<String> },
     AzureKv { vault: String, secret: String, via: Option<String> },
+    /// Vault's, Infisical's, Doppler's or 1Password's: the store's kind and the secret's path.
+    Store { kind: String, path: String, via: Option<String> },
 }
 
 /// `x@integration` → (`x`, the integration).
@@ -81,8 +87,26 @@ pub fn parse(from: &str) -> Result<Source, String> {
             }
             Ok(Source::AzureKv { vault: vault.to_owned(), secret: secret.to_owned(), via })
         }
-        "vault" | "infisical" | "doppler" | "1password" => Err(format!("`{kind}:` secrets need a {kind} integration, which this server doesn't have yet")),
-        other => Err(format!("`{other}:` isn't a source kiln brokers (integration:, aws-sm:, gcp-sm:, azure-kv:)")),
+        "vault" | "infisical" | "doppler" | "1password" => {
+            let (path, via) = via(rest);
+            let parts = path.split('/').filter(|p| !p.is_empty()).count();
+            let ok = match kind {
+                "vault" => path.rsplit_once('#').is_some_and(|(p, k)| !p.trim_matches('/').is_empty() && !k.is_empty()),
+                "infisical" => parts >= 2,
+                _ => parts == 3,
+            };
+            if !ok {
+                let shape = match kind {
+                    "vault" => "vault:<path>#<key> (vault:secret/data/ci#npm_token)",
+                    "infisical" => "infisical:<environment>[/<path>]/<NAME>",
+                    "doppler" => "doppler:<project>/<config>/<NAME>",
+                    _ => "1password:<vault>/<item>/<field>",
+                };
+                return Err(format!("`{path}` isn't a {kind} secret: {shape}"));
+            }
+            Ok(Source::Store { kind: kind.to_owned(), path, via })
+        }
+        other => Err(format!("`{other}:` isn't a source kiln brokers (integration:, aws-sm:, gcp-sm:, azure-kv:, vault:, infisical:, doppler:, 1password:)")),
     }
 }
 
@@ -141,6 +165,10 @@ pub async fn value(hub: &Hub, repo: &Repo, w: &kiln_ci::oidc::Workload<'_>, src:
             let data = v.pointer("/payload/data").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("{name} has no payload"))?;
             Ok(String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data)?).into_owned())
         }
+        Source::Store { kind, path, via } => {
+            let i = integration_for(hub, repo, kind, via.as_deref()).await?;
+            super::integrations::stores::read(hub, &i, w, path).await
+        }
         Source::AzureKv { vault, secret, via } => {
             let i = integration_for(hub, repo, "azure", via.as_deref()).await?;
             let t = azure::token(hub, &i, w, Some("https://vault.azure.net/.default")).await?;
@@ -169,7 +197,15 @@ mod tests {
         assert!(parse("gcp-sm:secrets/npm").is_err());
         assert_eq!(parse("azure-kv:kiln-vault/npm-token@az"), Ok(Source::AzureKv { vault: "kiln-vault".into(), secret: "npm-token".into(), via: Some("az".into()) }));
         assert!(parse("azure-kv:vault").is_err());
-        assert!(parse("vault:kv/data/ci#npm").is_err_and(|e| e.contains("integration")));
+        let store = |kind: &str, path: &str, via: Option<&str>| Ok(Source::Store { kind: kind.into(), path: path.into(), via: via.map(str::to_owned) });
+        assert_eq!(parse("vault:kv/data/ci#npm"), store("vault", "kv/data/ci#npm", None));
+        assert_eq!(parse("vault:secret/data/ci#token@prod-vault"), store("vault", "secret/data/ci#token", Some("prod-vault")));
+        assert!(parse("vault:kv/data/ci").is_err_and(|e| e.contains("#<key>")), "a key is named");
+        assert_eq!(parse("infisical:prod/backend/DB_PASSWORD"), store("infisical", "prod/backend/DB_PASSWORD", None));
+        assert!(parse("infisical:DB_PASSWORD").is_err());
+        assert_eq!(parse("doppler:web/prd/STRIPE_KEY"), store("doppler", "web/prd/STRIPE_KEY", None));
+        assert!(parse("doppler:web/STRIPE_KEY").is_err());
+        assert_eq!(parse("1password:CI/Registry/password"), store("1password", "CI/Registry/password", None));
         assert!(parse("nonsense").is_err() && parse("integration:").is_err());
     }
 }

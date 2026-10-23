@@ -160,6 +160,10 @@ struct Streamed {
     finals: u64,
 }
 
+/// The hook kiln registers on Claude Code's Agent tool (`initialize`): its subagents held to the
+/// most the agent may run at once (`State::max_subagents`).
+const SUBAGENTS_HOOK: &str = "kiln-subagents";
+
 /// Its whole state is plain data, written out when this process re-executes itself (an in-place
 /// upgrade) and read back by the next image, which goes on with the same CLI process.
 #[derive(Serialize, Deserialize)]
@@ -176,6 +180,10 @@ pub struct Claude {
     turn: bool,
     /// Tool calls we denied (their error result reads as a denial, not a failure).
     denied: BTreeSet<String>,
+    /// Subagents the Agent tool's hook let start that haven't yet (their tool_use ids): counted
+    /// with those running, so calls made together can't all start past the most it may run.
+    #[serde(default)]
+    agents_allowed: BTreeSet<String>,
     /// This run's tag, in the ids of the notices it makes ([`super::core::run_tag`]).
     #[serde(default = "super::core::run_tag")]
     run: String,
@@ -239,6 +247,17 @@ pub struct Claude {
     bg_files: HashMap<String, (String, String)>,
 }
 
+/// Whether two account ids name the same account: the short hash that ends an id says who it is,
+/// and different places name the same plan differently ("max", "claude_max"); ids without a who
+/// compare whole.
+fn same_account(a: &str, b: &str) -> bool {
+    let who = |id: &str| id.split(':').nth(2).map(str::to_owned);
+    match (who(a), who(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 impl Claude {
     pub fn new(allow_bypass: bool) -> Self {
         Self {
@@ -250,6 +269,7 @@ impl Claude {
             inflight: BTreeSet::new(),
             turn: false,
             denied: BTreeSet::new(),
+            agents_allowed: BTreeSet::new(),
             run: super::core::run_tag(),
             notice_seq: 0,
             allow_bypass,
@@ -399,6 +419,26 @@ impl Claude {
             // Signed in on this machine (kiln's /login): Claude Code takes the account when it
             // starts, so it starts again once nothing is under way, the conversation going on.
             "account" => {
+                // Signed in on its machine as someone else: the page names that account at once,
+                // and the old one's limits go for the new one's (Claude Code takes the machine's
+                // new credentials as it runs; starting again below makes sure of it).
+                if let Some(a) = value.as_ref().filter(|v| v.is_object()) {
+                    let field = |k: &str| a.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                    let plan = match (field("plan"), field("method")) {
+                        (Some(p), _) => plan_label(p),
+                        (None, Some(m)) if m.to_lowercase().contains("api") || m.to_lowercase().contains("console") => "API key".to_owned(),
+                        _ => "Claude account".to_owned(),
+                    };
+                    // `claude auth status` names the plan "max" where Claude Code says "claude_max": the
+                    // same plan, so the same id (and the person is what tells accounts apart).
+                    let plan = if plan.to_lowercase().starts_with("claude") || plan == "API key" { plan } else { format!("Claude {plan}") };
+                    let now = account_id("claude", &plan, field("email").or_else(|| field("org")));
+                    if core.state.account.as_deref().is_none_or(|was| !same_account(was, &now)) {
+                        core.state.account = Some(now);
+                        core.state.plan = Some(plan);
+                        self.switched_account(core);
+                    }
+                }
                 self.reload = Some("Signed in".to_owned());
                 if self.busy(core) {
                     self.notice(core, Level::Info, "Signed in: Claude Code starts again with that account when this turn ends (the conversation continues)".to_owned(), None);
@@ -564,7 +604,8 @@ impl Claude {
             .map(|s| (*s).to_owned())
             .collect();
         core.touch_meta();
-        self.request(core, Pending::Initialize, json!({"subtype": "initialize"}));
+        // Its Agent tool asks kiln first (whatever its permissions): the most subagents it runs.
+        self.request(core, Pending::Initialize, json!({"subtype": "initialize", "hooks": {"PreToolUse": [{"matcher": "Agent|Task", "hookCallbackIds": [SUBAGENTS_HOOK]}]}}));
     }
 
     /// The process ended: nothing in flight survives it.
@@ -582,7 +623,7 @@ impl Claude {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.activity = None;
         core.state.turn_started = None;
         core.state.doing = None;
@@ -664,7 +705,7 @@ impl Claude {
                 }
             }
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             Command::SetEffort { effort } => {
                 self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
                 core.state.effort = effort;
@@ -986,6 +1027,40 @@ impl Claude {
         core.touch_state();
     }
 
+    /// The account Claude Code says it runs on now, in its status (`get_status`'s Email,
+    /// Organization and Login method rows): a sign-in made after it started, wherever it was made
+    /// (`claude auth login` in a terminal, another tool), shows there and never in its initialize.
+    /// Another account than the page names is switched to.
+    fn status_account(&mut self, core: &mut Core, body: &Value) {
+        let row = |label: &str| {
+            body.get("sections")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|sec| sec.get("rows").and_then(Value::as_array))
+                .flatten()
+                .find(|r| str_of(r, "label") == Some(label))
+                .and_then(|r| str_of(r, "value"))
+                .map(|v| strip_ansi(v).trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
+        let Some(who) = row("Email").or_else(|| row("Organization")) else { return };
+        let Some(was) = core.state.account.clone() else { return };
+        // "Claude Max account": the plan; another way in ("API key"...) leaves the plan as it was.
+        let plan = row("Login method")
+            .and_then(|m| m.strip_suffix(" account").map(str::to_owned))
+            .filter(|p| p.to_lowercase().starts_with("claude "))
+            .map(|p| plan_label(&p))
+            .or_else(|| core.state.plan.clone())
+            .unwrap_or_else(|| "Claude account".to_owned());
+        let now = account_id("claude", &plan, Some(&who));
+        if !same_account(&was, &now) {
+            core.state.account = Some(now);
+            core.state.plan = Some(plan);
+            self.switched_account(core);
+        }
+    }
+
     /// Signed in as someone else (here, or on the machine it moved to for room): the old account's
     /// usage limits go, and a pause for one of them ends (reached, its stop point, or reached by
     /// another session on it); what the session cost so far stays, and adds up. The new account's
@@ -998,6 +1073,9 @@ impl Claude {
         {
             self.go_on(core, p);
         }
+        // A usage answer still on its way was asked for the old account: it's dropped, and the new
+        // one's is asked.
+        self.pending.retain(|_, p| !matches!(p, Pending::Usage));
         self.ask_usage(core);
     }
 
@@ -1554,7 +1632,9 @@ impl Claude {
                 if let Some(a) = body.get("account") {
                     let was = core.state.account.clone();
                     Self::account(core, a);
-                    if was.is_some() && core.state.account != was {
+                    if let (Some(was), Some(now)) = (was.as_deref(), core.state.account.as_deref())
+                        && !same_account(was, now)
+                    {
                         self.switched_account(core);
                     }
                 }
@@ -1723,6 +1803,7 @@ impl Claude {
                 }
             }
             Pending::Status => {
+                self.status_account(core, &body);
                 let rows: Vec<StatusItem> = body
                     .get("sections")
                     .and_then(Value::as_array)
@@ -1802,8 +1883,7 @@ impl Claude {
         let req = v.get("request").cloned().unwrap_or(Value::Null);
         match str_of(&req, "subtype").unwrap_or("") {
             "can_use_tool" => self.can_use_tool(core, id, &req),
-            // kiln registers no hooks or in-process MCP servers; answer so nothing hangs.
-            "hook_callback" => core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {}}})),
+            "hook_callback" => self.hook_callback(core, &id, &req),
             "elicitation" => self.elicitation(core, id, &req),
             other => core.write(&json!({"type": "control_response", "response": {"subtype": "error", "request_id": id, "error": format!("kiln does not handle {other}")}})),
         }
@@ -1836,6 +1916,34 @@ impl Claude {
         core.touch_state();
         self.asks.insert(id, Ask { input: req.clone(), elicitation: true });
         core.add_approval(approval);
+    }
+
+    /// A hook kiln registered fired: the Agent tool's holds the agent to the most subagents it
+    /// may run at once (`State::max_subagents`), counting those running and those it let start
+    /// that haven't yet. Anything else goes on as asked.
+    fn hook_callback(&mut self, core: &mut Core, id: &str, req: &Value) {
+        let mut out = json!({});
+        if str_of(req, "callback_id") == Some(SUBAGENTS_HOOK) {
+            let running = core.state.tasks.iter().filter(|t| t.live() && t.class.as_deref() == Some("agent") && !t.id.starts_with(super::survivors::LEFT)).count();
+            let under_way = running + self.agents_allowed.len();
+            let tool_id = str_of(req, "tool_use_id").or_else(|| req.get("input").and_then(|i| str_of(i, "tool_use_id")));
+            match core.state.max_subagents.and_then(|m| usize::try_from(m).ok()) {
+                Some(max) if under_way >= max => {
+                    let why = format!(
+                        "This agent runs at most {max} subagent{} at once (its Agent settings), and {under_way} {} running or starting. Wait for one to finish, or do this part yourself, then start another.",
+                        if max == 1 { "" } else { "s" },
+                        if under_way == 1 { "is" } else { "are" },
+                    );
+                    out = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": why}});
+                }
+                _ => {
+                    if let Some(t) = tool_id {
+                        self.agents_allowed.insert(t.to_owned());
+                    }
+                }
+            }
+        }
+        core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": out}}));
     }
 
     fn can_use_tool(&mut self, core: &mut Core, id: String, req: &Value) {
@@ -2027,6 +2135,10 @@ impl Claude {
             "task_started" => {
                 let Some(id) = str_of(v, "task_id") else { return };
                 let tool_id = str_of(v, "tool_use_id").map(str::to_owned);
+                // A subagent its hook let start has: it counts as running from here.
+                if let Some(t) = &tool_id {
+                    self.agents_allowed.remove(t);
+                }
                 let (tool_name, tool_input) = tool_id.as_deref().and_then(|t| self.tools.get(t).cloned()).unwrap_or_default();
                 let class = task_class(str_of(v, "task_type"), &tool_name, str_of(v, "subagent_type").is_some());
                 let output = tool_id.as_deref().and_then(|t| self.bg_files.remove(t)).map(|(_, f)| f);
@@ -2432,11 +2544,16 @@ impl Claude {
             let what = between(part, "<event>", "</event>").or_else(|| between(part, "<summary>", "</summary>")).unwrap_or("").trim();
             t.events += 1;
             t.last_event = Some(clip_middle(what.lines().last().unwrap_or(""), 300).0).filter(|e| !e.is_empty());
+            // Its events are its output: Claude Code keeps no file for a monitor, so kiln keeps them.
+            if !what.is_empty() {
+                core.task_output.entry(id.trim().to_owned()).or_default().append(format!("{what}\n").as_bytes());
+            }
             core.touch_state();
         }
     }
 
     fn tool_result(&mut self, core: &mut Core, tid: &str, block: &Value, structured: &Value) {
+        self.agents_allowed.remove(tid);
         let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let mut text = content_text(block.get("content"));
         let (name, input) = self.tools.get(tid).cloned().unwrap_or_default();
@@ -2486,6 +2603,7 @@ impl Claude {
         };
         if status == ToolStatus::Done {
             track_changes(core, structured);
+            follow_worktree(core, &name, structured);
         }
         let (output, truncated) = clip_middle(&text, OUTPUT_MAX);
         if let Some(ev) = core.get_mut(tid)
@@ -2588,6 +2706,7 @@ impl Claude {
 
     fn result(&mut self, core: &mut Core, v: &Value) {
         self.turn = false;
+        self.agents_allowed.clear();
         let started = core.state.turn_started;
         core.state.turn_started = None;
         core.state.doing = None;
@@ -3265,6 +3384,23 @@ fn track_changes(core: &mut Core, structured: &Value) {
     }
 }
 
+/// Claude Code's worktree tools move the session: into the worktree `EnterWorktree` made
+/// (`worktreePath`), back where `ExitWorktree` left it (`restoredCwd`). Its next turn's `init` says
+/// so too; followed at once, the agent's folder is where it works from that call on.
+fn follow_worktree(core: &mut Core, name: &str, structured: &Value) {
+    let to = match name {
+        "EnterWorktree" => structured.get("worktreePath"),
+        "ExitWorktree" => structured.get("restoredCwd"),
+        _ => None,
+    };
+    if let Some(to) = to.and_then(Value::as_str).filter(|t| !t.is_empty())
+        && core.state.cwd != to
+    {
+        core.state.cwd = to.to_owned();
+        core.touch_state();
+    }
+}
+
 fn prune_delivery(core: &mut Core) {
     const KEEP: usize = 300;
     if core.state.delivery.len() <= KEEP {
@@ -3925,6 +4061,47 @@ mod tests {
         Ok(())
     }
 
+    /// Its Agent tool's hook (`hook_callback`): Claude Code's answer to the hook for tool call `tool`.
+    fn agent_hook(c: &mut Claude, core: &mut Core, req: &str, tool: &str) -> anyhow::Result<Option<String>> {
+        let ask = json!({"type": "control_request", "request_id": req, "request": {"subtype": "hook_callback", "callback_id": SUBAGENTS_HOOK, "tool_use_id": tool, "input": {"hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_input": {"description": "look"}}}});
+        c.line(core, &ask.to_string());
+        let v: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        anyhow::ensure!(v.pointer("/response/request_id").and_then(Value::as_str) == Some(req), "{v}");
+        Ok(v.pointer("/response/response/hookSpecificOutput/permissionDecision").and_then(Value::as_str).map(str::to_owned))
+    }
+
+    #[test]
+    fn its_agent_tool_waits_once_it_runs_as_many_subagents_as_it_may() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let init: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(init.pointer("/request/hooks/PreToolUse/0/matcher").and_then(Value::as_str), Some("Agent|Task"));
+        assert_eq!(init.pointer("/request/hooks/PreToolUse/0/hookCallbackIds/0").and_then(Value::as_str), Some(SUBAGENTS_HOOK));
+        // No limit of its own: each goes.
+        assert_eq!(agent_hook(&mut c, &mut core, "h0", "t0")?, None);
+        // Two at once: one let start (not started yet) and another; a third waits.
+        core.state.max_subagents = Some(2);
+        assert_eq!(agent_hook(&mut c, &mut core, "h1", "t1")?, None);
+        assert_eq!(agent_hook(&mut c, &mut core, "h2", "t2")?.as_deref(), Some("deny"));
+        // One that started counts as running, no longer as let start: still two.
+        c.line(&mut core, &json!({"type": "system", "subtype": "task_started", "task_id": "a0", "tool_use_id": "t0", "description": "look", "task_type": "local_agent", "uuid": "u", "session_id": "s"}).to_string());
+        assert_eq!(agent_hook(&mut c, &mut core, "h3", "t3")?.as_deref(), Some("deny"));
+        // It ends: room for one.
+        c.line(&mut core, &json!({"type": "system", "subtype": "task_notification", "task_id": "a0", "status": "completed", "uuid": "u", "session_id": "s"}).to_string());
+        assert_eq!(agent_hook(&mut c, &mut core, "h4", "t4")?, None);
+        assert_eq!(agent_hook(&mut c, &mut core, "h5", "t5")?.as_deref(), Some("deny"));
+        // The turn's end lets go of those let start that never did.
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "", "session_id": "s", "uuid": "r"}).to_string());
+        core.take_writes();
+        assert_eq!(agent_hook(&mut c, &mut core, "h6", "t6")?, None);
+        // Another hook goes on as asked.
+        c.line(&mut core, &json!({"type": "control_request", "request_id": "h7", "request": {"subtype": "hook_callback", "callback_id": "other", "input": {}}}).to_string());
+        let v: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(v.pointer("/response/response"), Some(&json!({})));
+        Ok(())
+    }
+
     #[test]
     fn a_turn_with_an_approval_from_send_to_result() -> anyhow::Result<()> {
         let mut c = Claude::new(false);
@@ -4128,6 +4305,25 @@ mod tests {
         let _ = core.take_writes();
         c.command(&mut core, Command::Send { id: "m2".into(), text: "and another thing".into(), mode: Default::default(), attachments: Vec::new(), overrides: None });
         assert!(core.take_writes().iter().any(|w| w.contains("and another thing")), "sent at once");
+    }
+
+    /// Claude Code's worktree tools, as its stream says them (2.1.296, 2026-10-23): its folder is
+    /// the worktree from the call on, and the one it left it for after.
+    #[test]
+    fn a_worktree_it_goes_into_is_its_folder_at_once_and_where_it_leaves_it_for_after() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.cwd = "/w/repo".into();
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tw","name":"EnterWorktree","input":{"name":"feature"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tw","type":"tool_result","content":"Created worktree at /w/repo/.claude/worktrees/feature on branch worktree-feature."}]},"tool_use_result":{"worktreePath":"/w/repo/.claude/worktrees/feature","worktreeBranch":"worktree-feature","message":"Created worktree"}}"#);
+        assert_eq!(core.state.cwd, "/w/repo/.claude/worktrees/feature");
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"tx","name":"ExitWorktree","input":{"action":"keep"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tx","type":"tool_result","content":"Left the worktree."}]},"tool_use_result":{"action":"keep","originalCwd":"/w/repo","worktreePath":"/w/repo/.claude/worktrees/feature","worktreeBranch":"worktree-feature","restoredCwd":"/w/repo"}}"#);
+        assert_eq!(core.state.cwd, "/w/repo");
+        // Another tool's result naming a worktree doesn't move it.
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"tr","name":"Read","input":{"file_path":"/w/repo/a"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tr","type":"tool_result","content":"a"}]},"tool_use_result":{"worktreePath":"/elsewhere"}}"#);
+        assert_eq!(core.state.cwd, "/w/repo");
     }
 
     #[test]
@@ -4578,6 +4774,61 @@ mod tests {
         assert!(core.effects.iter().any(|e| matches!(e, Effect::Restart { .. })));
     }
 
+    /// Signed in on its machine as someone else outside kiln: Claude Code's next status names the
+    /// account it runs on, and the page switches to it; the same account changes nothing.
+    #[test]
+    fn a_sign_in_made_outside_kiln_shows_when_claude_code_next_says_its_status() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": [], "account": {"email": "a@example.com", "subscriptionType": "max", "tokenSource": "claude.ai"}}));
+        core.set_status(Status::Running);
+        let old = core.state.account.clone();
+        let status = |email: &str| json!({"sections": [{"title": "Session", "rows": [{"label": "Login method", "value": "Claude Max account"}, {"label": "Email", "value": email}]}]});
+        // Now and then it asks Claude Code for its usage and status.
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "get_usage", json!({}));
+        reply_to(&mut c, &mut core, &reqs, "get_status", status("a@example.com"));
+        assert_eq!(core.state.account, old, "the same account: nothing changes");
+        core.state.limits = vec![Limit { id: "seven_day".into(), label: "Weekly".into(), used_percent: Some(95.0), account: old.clone(), ..Limit::default() }];
+        // `claude auth login` in a terminal: Claude Code runs on b's credentials now.
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "get_status", status("b@example.com"));
+        assert_eq!(core.state.account, Some(account_id("claude", "Claude Max", Some("b@example.com"))));
+        assert!(core.state.limits.is_empty(), "the old account's usage isn't shown as the new one's");
+        assert!(requests(&mut core).iter().any(|r| r.1 == "get_usage"), "the new account's usage is asked");
+        assert!(core.state.harness_status.iter().all(|r| !r.value.contains("b@example.com")), "the status shown masks the email");
+    }
+
+    /// Signed in on its machine as someone else, mid-turn: its page names the new account at once,
+    /// the old one's usage goes and the new one's is asked; the same account changes nothing.
+    #[test]
+    fn a_sign_in_as_someone_else_shows_that_account_and_its_usage_at_once() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": [], "account": {"email": "a@example.com", "subscriptionType": "max", "tokenSource": "claude.ai"}}));
+        let old = core.state.account.clone();
+        core.state.limits = vec![Limit { id: "seven_day".into(), label: "Weekly".into(), used_percent: Some(95.0), account: old.clone(), ..Limit::default() }];
+        core.set_status(Status::Running);
+        let _ = requests(&mut core);
+        let same = json!({"email": "a@example.com", "plan": "max", "method": "Claude subscription"});
+        c.command(&mut core, Command::Control { id: "account".into(), value: Some(same) });
+        assert_eq!((core.state.account.clone(), core.state.limits.len()), (old.clone(), 1), "the same account: nothing changes");
+        let other = json!({"email": "b@example.com", "plan": "max", "method": "Claude subscription"});
+        c.command(&mut core, Command::Control { id: "account".into(), value: Some(other) });
+        assert!(core.state.account.as_deref().is_some_and(|now| same_account(now, &account_id("claude", "Max", Some("b@example.com")))), "{:?}", core.state.account);
+        assert!(!same_account(&account_id("claude", "Claude max", Some("b@example.com")), &account_id("claude", "Max", Some("a@example.com"))));
+        assert!(core.state.limits.is_empty(), "the old account's usage isn't shown as the new one's");
+        assert!(requests(&mut core).iter().any(|r| r.1 == "get_usage"), "the new account's usage is asked");
+    }
+
     #[test]
     fn an_api_key_session_has_no_plan_limits_and_a_status_without_rows_is_put_together() {
         let mut c = Claude::new(false);
@@ -4986,6 +5237,8 @@ mod tests {
         c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": "<system-reminder>\n<task-notification>\n<task-id>m9</task-id>\n<status>running</status>\n<summary>ERROR db down</summary>\n</task-notification>\n</system-reminder>"}, "parent_tool_use_id": null, "session_id": "s", "uuid": "e1"}).to_string());
         let mon = core.state.tasks.iter().find(|t| t.id == "m9").cloned().unwrap_or_default();
         assert_eq!((mon.events, mon.last_event.as_deref()), (1, Some("ERROR db down")));
+        // And they are its output, which Claude Code keeps no file of.
+        assert_eq!(core.task_output.get("m9").map(|o| String::from_utf8_lossy(&o.data.iter().copied().collect::<Vec<u8>>()).into_owned()).as_deref(), Some("ERROR db down\n"));
         // The turn is over; both are left running.
         c.line(&mut core, r#"{"type":"system","subtype":"session_state_changed","state":"idle","uuid":"u","session_id":"s"}"#);
         core.set_status(Status::Idle);

@@ -403,7 +403,7 @@ impl Feed {
         let mut moved = false;
         let lacking = |needs: Vec<String>| -> Vec<String> { needs.into_iter().filter(|h| !blobs.has(h)).collect() };
         if let Some(tree) = self.install.clone() {
-            let step = Step { by: "kiln".into(), member: 0, seq: 0, at: 0, changes: self.copy.state.tree.diff(&tree.files) };
+            let step = Step { by: "kiln".into(), member: 0, seq: 0, at: 0, changes: self.copy.state.tree.diff(&tree) };
             let missing = lacking(self.copy.needs(&step));
             if !missing.is_empty() {
                 return Ok(missing);
@@ -412,6 +412,7 @@ impl Feed {
             self.note(outcomes);
             let state = &mut self.copy.state;
             state.tree.seqs = tree.seqs.clone();
+            state.tree.bundles = tree.bundles.clone();
             // What the image holds of this copy's steps needn't be sent again.
             let taken = tree.seqs.get(&self.copy.member).copied().unwrap_or(0);
             state.sent.retain(|s| s.seq > taken);
@@ -507,10 +508,15 @@ impl Feed {
             Fed::Step(_, s) => Some(s),
             _ => None,
         });
-        let mut out: std::collections::HashSet<String> = queued.chain(self.copy.state.sent.iter()).flat_map(|s| s.changes.iter()).filter_map(|c| file(&c.to)).collect();
-        out.extend(self.copy.state.behind.iter().filter_map(|p| file(&self.copy.state.tree.files.get(p).cloned())));
+        let mut out: std::collections::HashSet<String> =
+            queued.chain(self.copy.state.sent.iter()).flat_map(|s| s.changes.iter()).flat_map(|c| file(&c.to).into_iter().chain(c.bundle.clone())).collect();
+        // The log's versions kept back from this copy (`State::behind`), brought at the look that
+        // finds the change here gone: their contents, and a ref's bundle.
+        let tree = &self.copy.state.tree;
+        out.extend(self.copy.state.behind.iter().flat_map(|p| file(&tree.files.get(p).cloned()).into_iter().chain(tree.bundles.get(p).cloned())));
         if let Some(t) = &self.install {
             out.extend(t.files.values().filter_map(|v| file(&Some(v.clone()))));
+            out.extend(t.bundles.values().cloned());
         }
         out
     }

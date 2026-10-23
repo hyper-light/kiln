@@ -53,7 +53,7 @@ function Database({ plate, big, id }: { plate: Plate; big: boolean; id: string }
 }
 
 /** A cable: its line, its direction, rows to come waiting at its start, and while batches move on
- * it, a light running along it about once a batch. */
+ * it, light flowing along it, about one comet arriving a batch. */
 function CableView({ cable, dim, delay, kind }: { cable: Cable; dim: boolean; delay: number; kind: "in" | "out" }) {
   const style = cable.period ? ({ "--rp-period": `${cable.period}s`, "--rp-delay": `${-delay}s` } as React.CSSProperties) : undefined;
   return (

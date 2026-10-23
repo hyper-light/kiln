@@ -5,6 +5,11 @@
 //! so it sees the page at once; one too slow for a chunk loses it, and the next key frame mends it.
 //! With nobody looking, the stream pauses (nothing is captured or sent), and after a while it
 //! closes.
+//!
+//! A recording's files are made on its stream's machine; once it ends the server copies them into
+//! kiln's store of bytes (docs/blobs.md, `recordings/<session>/<recording>/<file>`, each up to
+//! [`RECORDING_MAX`]) and serves them from there, so they show while the machine is away. They go
+//! when the conversation closes, as they do on the machine.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +28,11 @@ use crate::proto::{CAP_STREAM, LANE_STREAM, ServerMsg};
 const UNWATCHED: Duration = Duration::from_secs(600);
 /// Chunks a viewer may be behind before it loses one.
 const BEHIND: usize = 240;
+/// The largest recording file kiln copies into its store of bytes; a larger one is served from its
+/// machine alone.
+pub const RECORDING_MAX: u64 = 1 << 30;
+/// Recordings' copies under way at once, at most; past that, a recording is served from its machine.
+const COPIES_MAX: usize = 8;
 
 /// What a viewer is sent: a chunk (as its runner sent it) or an event (JSON).
 #[derive(Debug, Clone)]
@@ -62,6 +72,16 @@ pub struct Relay {
     ended: Mutex<HashMap<String, Owner>>,
     /// Recordings made of each session's streams, as their runners said (`crate::browser::record`).
     recordings: Mutex<HashMap<String, Vec<Recording>>>,
+    /// Recordings' copies into kiln's store of bytes under way.
+    copying: AtomicU64,
+}
+
+/// What's left to do once a runner's event is relayed ([`Relay::event`]).
+pub struct Evented {
+    /// As it opens, the stream and the size its viewer asked for meanwhile, to ask of it again.
+    pub again: Option<(Arc<Live>, Value)>,
+    /// A recording that ended, with its session, for its files to be kept ([`Relay::keep`]).
+    pub ended: Option<(String, Recording)>,
 }
 
 /// Whose a stream is: its session, its machine, its profile.
@@ -89,6 +109,9 @@ pub struct Recording {
     pub machine: String,
     #[serde(skip)]
     profile: Option<String>,
+    /// Its files kiln's store of bytes holds (`video`, `inputs`, `test`), as they were copied.
+    #[serde(skip)]
+    pub kept: HashMap<String, super::files::Meta>,
 }
 
 impl Recording {
@@ -188,31 +211,31 @@ impl Relay {
     }
 
     /// An event from a runner: kept when a joining viewer needs it, sent on to each viewer; a
-    /// stream that closed or failed to open goes. As it opens, the stream (and the size its viewer
-    /// asked for meanwhile, to ask of it again).
-    pub fn event(&self, machine: &str, id: &str, mut json: String) -> Option<(Arc<Live>, Value)> {
+    /// stream that closed or failed to open goes. What's left to do is answered ([`Evented`]).
+    pub fn event(&self, machine: &str, id: &str, mut json: String) -> Evented {
         let mut v: Value = serde_json::from_str(&json).unwrap_or_default();
         // A recording's end: kept, and said to its viewers with the id to get its files by.
-        if let Some(rid) = v.get("recorded").and_then(|r| self.recorded(machine, id, r)) {
+        let ended = v.get("recorded").and_then(|r| self.recorded(machine, id, r));
+        if let Some((_, rec)) = &ended {
             if let Some(r) = v.get_mut("recorded").and_then(Value::as_object_mut) {
-                r.insert("id".into(), json!(rid));
+                r.insert("id".into(), json!(rec.id));
             }
             json = v.to_string();
         }
-        let live = self.get(id).filter(|l| l.machine == machine)?;
+        let mut after = Evented { again: None, ended };
+        let Some(live) = self.get(id).filter(|l| l.machine == machine) else { return after };
         // Its tabs as they were before the ones it said last (said later, arrived first): no news.
         let seq = |v: &Value| v.pointer("/tabs/seq").and_then(Value::as_u64);
         if let Some(new) = seq(&v)
             && live.said.lock().get("tabs").and_then(|kept| serde_json::from_str::<Value>(kept).ok()).and_then(|kept| seq(&kept)).is_some_and(|kept| kept > new)
         {
-            return None;
+            return after;
         }
-        let mut again = None;
         if let Some(k) = v.as_object().and_then(|o| o.keys().next()).cloned() {
             if k == "opened"
                 && let Some(r) = live.resized.lock().clone()
             {
-                again = Some((live.clone(), json!({"resize": r})));
+                after.again = Some((live.clone(), json!({"resize": r})));
             }
             // What a viewer joining later needs to show it as it is now (whether its window can be
             // seen where it runs, too: Safari's on a locked Mac; its tabs).
@@ -228,7 +251,18 @@ impl Relay {
             }
         }
         live.send(&ToViewer::Event(json));
-        again
+        after
+    }
+
+    /// Copies a recording's files into kiln's store of bytes, in the background; past
+    /// [`COPIES_MAX`] copies under way, it's served from its machine alone.
+    pub fn keep(&self, hub: &Arc<Hub>, session: String, rec: Recording) {
+        if self.copying.fetch_add(1, Ordering::AcqRel) < COPIES_MAX as u64 {
+            crate::rt::spawn(keep_recording(Arc::clone(hub), session, rec));
+        } else {
+            self.copying.fetch_sub(1, Ordering::AcqRel);
+            tracing::warn!(target: "kiln.blobs", event = "put", recording = %rec.id, "too many recordings being copied: this one is served from its machine");
+        }
     }
 
     /// A viewer joins: what it needs first, then the stream as it comes (a fresh key frame asked
@@ -277,7 +311,7 @@ impl Relay {
 
     /// A recording of stream `id` done on `machine` (its runner's `recorded`): kept with its
     /// session, when the stream is that machine's.
-    fn recorded(&self, machine: &str, id: &str, r: &Value) -> Option<String> {
+    fn recorded(&self, machine: &str, id: &str, r: &Value) -> Option<(String, Recording)> {
         let owner = self.get(id).map(|l| Owner { session: l.session.clone(), machine: l.machine.clone(), profile: l.spec.get("profile").and_then(Value::as_str).map(str::to_owned) }).or_else(|| self.ended.lock().get(id).cloned());
         let owner = owner.filter(|o| o.machine == machine)?;
         let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
@@ -293,10 +327,22 @@ impl Relay {
             test: s("test"),
             machine: owner.machine,
             profile: owner.profile,
+            kept: HashMap::new(),
         };
-        let rid = rec.id.clone();
-        self.recordings.lock().entry(owner.session).or_default().push(rec);
-        Some(rid)
+        self.recordings.lock().entry(owner.session.clone()).or_default().push(rec.clone());
+        Some((owner.session, rec))
+    }
+
+    /// A recording's file copied into kiln's store of bytes: served from there from now on.
+    /// Whether the recording is known still (not, once its conversation has closed).
+    fn kept(&self, session: &str, rid: &str, what: &str, meta: super::files::Meta) -> bool {
+        match self.recordings.lock().get_mut(session).and_then(|v| v.iter_mut().find(|r| r.id == rid)) {
+            Some(r) => {
+                r.kept.insert(what.to_owned(), meta);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Session `session`'s recordings `person` may see.
@@ -314,12 +360,30 @@ impl Relay {
     }
 
     /// A conversation that's closed: its streams go, and its recordings (their files go with it on
-    /// its machine).
+    /// its machine, and from kiln's store of bytes).
     pub async fn forget(&self, hub: &Hub, session: &str) {
         for l in self.of(session) {
             self.close(hub, &l.id).await;
         }
         self.recordings.lock().remove(session);
+        let (blobs, prefix) = (Arc::clone(&hub.blobs.blobs), format!("{}/", recordings_prefix(session)));
+        crate::rt::spawn(async move {
+            let mut gone = 0u64;
+            for _ in 0..1000 {
+                let Ok(page) = blobs.list(&prefix, None, kiln_seams::blobs::LIST_MAX).await else { break };
+                for o in &page.objects {
+                    if blobs.delete(&o.key).await.is_ok() {
+                        gone = gone.saturating_add(1);
+                    }
+                }
+                if !page.truncated || page.objects.is_empty() {
+                    break;
+                }
+            }
+            if gone > 0 {
+                crate::metrics::blobs().collected.add(&["recordings"], gone);
+            }
+        });
     }
 
     /// A machine gone: its streams end (their viewers are told).
@@ -336,6 +400,85 @@ impl Relay {
             l.send(&ToViewer::Event(json!({"closed": {"why": format!("{machine} went away")}}).to_string()));
         }
     }
+}
+
+/// Where a session's recordings are kept in kiln's store of bytes: `recordings/<session>` (its id
+/// when that's a plain name, else its SHA-256).
+pub fn recordings_prefix(session: &str) -> String {
+    let name = if !session.is_empty() && session.len() <= 128 && session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        session.to_owned()
+    } else {
+        crate::util::sha256_hex(session.as_bytes())
+    };
+    format!("recordings/{name}")
+}
+
+/// Where a recording's file `what` is kept.
+pub fn recording_key(session: &str, rid: &str, what: &str) -> String {
+    format!("{}/{rid}/{what}", recordings_prefix(session))
+}
+
+/// Copies a recording's files from its machine into kiln's store of bytes, a piece at a time,
+/// each whole or not at all: one that changes on the way, or is larger than [`RECORDING_MAX`],
+/// stays on its machine alone.
+async fn keep_recording(hub: Arc<Hub>, session: String, rec: Recording) {
+    let location = super::registry::Location::Machine(rec.machine.clone());
+    for (what, path) in [("video", &rec.video), ("inputs", &rec.inputs), ("test", &rec.test)] {
+        if path.is_empty() {
+            continue;
+        }
+        let key = recording_key(&session, &rec.id, what);
+        match copy_file(&hub, &location, &session, path, &key).await {
+            Ok(meta) => {
+                // Its conversation closed while it was copied: the copy goes as the rest did.
+                if !hub.harness.streams.kept(&session, &rec.id, what, meta) && hub.blobs.blobs.delete(&key).await.is_ok() {
+                    crate::metrics::blobs().collected.inc(&["recordings"]);
+                }
+            }
+            Err(e) => tracing::warn!(target: "kiln.blobs", event = "put", recording = %rec.id, file = what, error = %format!("{e:#}"), "a recording's file stays on its machine alone"),
+        }
+    }
+    hub.harness.streams.copying.fetch_sub(1, Ordering::AcqRel);
+}
+
+async fn copy_file(hub: &Hub, location: &super::registry::Location, session: &str, path: &str, key: &str) -> anyhow::Result<super::files::Meta> {
+    use super::files::PIECE;
+    let mut at = 0u64;
+    let mut writer = crate::blobs::io::Writer::new(hub.blobs.blobs.as_ref(), key);
+    let mut first: Option<super::files::Meta> = None;
+    loop {
+        let piece = super::kept::piece(hub, location, session, path, at, PIECE).await?;
+        let Some((answer, data)) = piece else {
+            writer.abort().await;
+            anyhow::bail!("its machine's runner doesn't read files");
+        };
+        let Some(meta) = answer.meta else {
+            writer.abort().await;
+            anyhow::bail!(answer.error.unwrap_or_else(|| "it couldn't be read".to_owned()));
+        };
+        let m = first.get_or_insert_with(|| meta.clone());
+        if meta.size != m.size || meta.mtime != m.mtime || meta.size > RECORDING_MAX {
+            writer.abort().await;
+            anyhow::bail!("it's over {} MiB, or it changed while it was copied", RECORDING_MAX >> 20);
+        }
+        if data.is_empty() {
+            break;
+        }
+        at = at.saturating_add(data.len() as u64);
+        if let Err(e) = writer.write(&data).await {
+            writer.abort().await;
+            return Err(anyhow::anyhow!("{e}"));
+        }
+        if at >= meta.size {
+            break;
+        }
+    }
+    let Some(meta) = first.filter(|m| m.size == at) else {
+        writer.abort().await;
+        anyhow::bail!("{at} bytes of it were read: it ended short");
+    };
+    writer.finish().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(meta)
 }
 
 impl Live {
@@ -510,7 +653,7 @@ mod tests {
         assert!(l.said.lock().get("hidden").is_some_and(|h| h.contains("false")));
         // A size its viewer asked for before it opened is asked again as it does.
         *l.resized.lock() = Some(json!({"width": 400, "height": 300, "scale": 2}));
-        let again = r.event("m1", "v1", json!({"opened": {"width": 390}}).to_string());
+        let again = r.event("m1", "v1", json!({"opened": {"width": 390}}).to_string()).again;
         assert_eq!(again.map(|(_, c)| c), Some(json!({"resize": {"width": 400, "height": 300, "scale": 2}})));
         while rx.try_recv().is_ok() {}
         // Its tabs, as they are now; a list said before (arriving after) is no news.
@@ -585,5 +728,31 @@ mod tests {
         r.live.lock().insert("b".into(), live("b", "m2"));
         r.machine_lost("m1");
         assert!(r.get("a").is_none() && r.get("b").is_some());
+    }
+
+    /// CP-T10.1: a recording's file is copied into kiln's store of bytes whole (in parts, larger
+    /// than one), and goes from it when its conversation closes.
+    #[test]
+    fn a_recordings_file_is_kept_in_the_store_until_its_conversation_closes() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let video = dir.path().join("live-1.mp4");
+            let data = kiln_seams::blobs::noise((20 << 20) + 5, 9);
+            std::fs::write(&video, &data)?;
+            let key = recording_key("s1", "r1", "video");
+            let meta = copy_file(&hub, &super::super::registry::Location::Local, "s1", &video.to_string_lossy(), &key).await?;
+            assert_eq!(meta.size, data.len() as u64);
+            let (kept, got) = hub.blobs.blobs.get(&key, None).await?;
+            assert!(got == data && kept.etag == crate::util::sha256_hex(&data), "{} bytes kept", got.len());
+            hub.harness.streams.forget(&hub, "s1").await;
+            for _ in 0..500 {
+                if matches!(hub.blobs.blobs.head(&key).await, Err(kiln_seams::blobs::Refusal::NotFound(_))) {
+                    return Ok(());
+                }
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
+            anyhow::bail!("the recording outlived its conversation in the store")
+        })
     }
 }

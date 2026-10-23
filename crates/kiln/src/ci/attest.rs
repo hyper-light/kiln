@@ -198,7 +198,7 @@ async fn keep(hub: &Hub, run: String, leg: String, idx: u32, nonce: String, orig
     let digests: Vec<String> = subjects.iter().flat_map(|s| s.digest.iter().map(|(alg, hex)| format!("{}:{}", alg.to_ascii_lowercase(), hex.to_ascii_lowercase()))).collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut ids = Vec::new();
             for (kind, bundle) in made {
@@ -265,7 +265,34 @@ pub async fn reported(hub: &Hub, leg: &str, idx: u32, nonce: &str, mut subjects:
         })
         .flatten()
         .collect();
+    // Images in another registry carry them too where an `oci` integration names it, which
+    // gives kiln a way in (W18-R02): pushed there as referrers.
+    let elsewhere: Vec<(crate::ci::integrations::oci::Reference, String, Vec<(String, Value)>)> = subjects
+        .iter()
+        .filter(|sub| crate::ci::registry::local_name(hub, &sub.name).is_none())
+        .filter_map(|sub| {
+            let r = crate::ci::integrations::oci::parse_reference(&sub.name).ok()?;
+            let digest = sub.digest.iter().find(|(alg, _)| alg.eq_ignore_ascii_case("sha256")).map(|(_, hex)| format!("sha256:{}", hex.to_ascii_lowercase()))?;
+            Some((r, digest, made.clone()))
+        })
+        .collect();
     keep(hub, run, leg.to_owned(), idx, nonce.to_owned(), "kiln", &subjects, made).await?;
+    for (r, digest, bundles) in elsewhere {
+        let registry = match crate::ci::integrations::registry_for(hub, &r.registry).await {
+            Ok(Some(x)) => x,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(registry = %r.registry, error = %format!("{e:#}"), "an attestation couldn't reach its image's registry");
+                continue;
+            }
+        };
+        for (kind, bundle) in bundles {
+            match crate::ci::integrations::oci::attach(&registry, &r.repository, &digest, bundle.to_string().as_bytes(), &kind).await {
+                Ok(d) => tracing::info!(registry = %r.registry, repo = %r.repository, subject = %digest, referrer = %d, "an attestation attached to its image"),
+                Err(e) => tracing::warn!(registry = %r.registry, repo = %r.repository, error = %format!("{e:#}"), "an attestation couldn't be attached to its image"),
+            }
+        }
+    }
     for (repo, digest, kind, bundle) in attached {
         match crate::ci::registry::attach(hub, &repo, &digest, bundle.to_string().as_bytes(), &kind).await {
             Ok(Some(d)) => tracing::info!(repo = %repo, subject = %digest, referrer = %d, "an attestation attached to its image"),

@@ -1,0 +1,42 @@
+# F-22 (docs/ci.md W22-AC03, A.8): status functions under cancellation. A leg fails, fail-fast
+# cancels its sibling mid-step, and the sibling's later steps say which of `always()`,
+# `cancelled()`, `failure()`, `success()` and `!cancelled()` ran; a job needing the matrix says its
+# result. The run's conclusion is failure here: the probe compares what ran, not that.
+name: probe cancellation
+on: [push, workflow_dispatch]
+jobs:
+  m:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        leg: [fails, cancelled]
+    steps:
+      - if: matrix.leg == 'fails'
+        run: sleep 10; exit 1
+      # How a cancelled step is stopped (the grace docs/ci.md W06-R17's `cancel:` takes): which
+      # signals reach its shell, in what order, how many whole seconds apart.
+      - if: matrix.leg == 'cancelled'
+        run: |
+          trap 'echo "PROBE cancelled.sigint=yes"; ti=$(date +%s%N)' INT
+          trap 'if [ -n "$ti" ]; then echo "PROBE cancelled.sigint-to-sigterm=$(( ($(date +%s%N) - ti) / 1000000000 ))"; else echo "PROBE cancelled.sigterm-first=yes"; fi' TERM
+          sleep 300 & p=$!
+          while kill -0 "$p" 2>/dev/null; do wait "$p" || true; done
+      - if: always()
+        run: echo "PROBE ${{ matrix.leg }}.always=ran"
+      - if: cancelled()
+        run: echo "PROBE ${{ matrix.leg }}.cancelled=ran"
+      - if: failure()
+        run: echo "PROBE ${{ matrix.leg }}.failure=ran"
+      - if: success()
+        run: echo "PROBE ${{ matrix.leg }}.success=ran"
+      - if: "!cancelled()"
+        run: echo "PROBE ${{ matrix.leg }}.not-cancelled=ran"
+      - if: always()
+        run: echo "PROBE ${{ matrix.leg }}.job-status=${{ job.status }}"
+  after:
+    needs: m
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PROBE after.needs-result=${{ needs.m.result }}"

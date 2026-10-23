@@ -142,7 +142,7 @@ async fn sample(hub: &Hub, secs: f64) -> anyhow::Result<()> {
     let rows: Vec<(String, f64, f64)> = hub.agents.lock().values().filter(|a| a.connected && a.slots > 0 && !a.outpost).map(|a| (a.name.clone(), f64::from(a.slots), f64::from(a.busy.min(a.slots)))).collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             for (runner, slots, busy) in rows {
                 tx.execute(
                     "INSERT INTO ci_runner_time (bucket, runner, connected, slot_seconds, busy_seconds) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -214,7 +214,7 @@ async fn roll(hub: &Hub) -> anyhow::Result<()> {
 async fn write(hub: &Hub, grain: &'static str, bucket: i64, rows: HashMap<Key, Rollup>) -> anyhow::Result<()> {
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute("DELETE FROM ci_rollups WHERE grain = ?1 AND bucket = ?2", params![grain, bucket])?;
             {
                 let mut st = tx.prepare("INSERT INTO ci_rollups (grain, bucket, repo_id, workflow, job, step, executor, runner, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?;

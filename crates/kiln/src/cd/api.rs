@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 use kiln_cd::obj::ResKey;
 use serde_json::{Value, json};
 

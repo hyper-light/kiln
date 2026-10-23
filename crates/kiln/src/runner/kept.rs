@@ -77,6 +77,75 @@ impl Shell {
     }
 }
 
+/// What a terminal into a leg runs (W17-R01), or one command run there (W17-R05).
+pub struct Launch {
+    /// For a leg in a container, the program that opens a shell (or runs the command) in it.
+    pub program: Option<Vec<String>>,
+    pub env: Vec<(String, String)>,
+    /// Where a shell on the host starts.
+    pub cwd: Option<PathBuf>,
+    /// The shell on the host.
+    pub shell: Option<String>,
+    /// The command a shell on the host runs.
+    pub command: Option<String>,
+}
+
+impl Shell {
+    /// What opens `command` (or a terminal, without one) in the leg: in its container when it has
+    /// one, else the runner's shell (`configured`) in its workspace with its environment; a command
+    /// runs in bash, as a step would.
+    pub fn launch(&self, command: Option<&str>, configured: Option<&str>) -> Launch {
+        let (program, env) = match (&self.exec, command) {
+            (Some(_), Some(c)) => self.exec_with(c).map_or((None, Vec::new()), |(argv, env)| (Some(argv), env)),
+            (Some((argv, env)), None) => (Some(argv.clone()), env.clone()),
+            (None, _) => (None, self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        };
+        let cwd = program.is_none().then(|| self.workdir.clone());
+        let shell = if command.is_some() && !cfg!(windows) { Some("bash".to_owned()) } else { configured.map(str::to_owned) };
+        let command = command.filter(|_| program.is_none()).map(str::to_owned);
+        Launch { program, env, cwd, shell, command }
+    }
+}
+
+/// A terminal's output with `masks` masked (W17-R01). The masker holds back what could be the start
+/// of a secret (as long as the leg's longest, a token of a kilobyte); the rest shows, masked, as
+/// soon as output pauses for 25 ms.
+pub fn masked(rx: async_channel::Receiver<crate::terminal::PtyOut>, masks: &[String]) -> async_channel::Receiver<crate::terminal::PtyOut> {
+    use crate::terminal::PtyOut;
+    let (tx, out) = async_channel::bounded(64);
+    let mut masker = kiln_ci::runner::mask::Masker::new(masks);
+    crate::rt::spawn(async move {
+        loop {
+            let got = match crate::rt::timeout(Duration::from_millis(25), rx.recv()).await {
+                Ok(Ok(got)) => got,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    let held = masker.finish();
+                    if !held.is_empty() && tx.send(PtyOut::Data(held)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let (got, exit) = match got {
+                PtyOut::Data(d) => (PtyOut::Data(masker.push(&d)), false),
+                PtyOut::Exit(code) => {
+                    let rest = masker.finish();
+                    if !rest.is_empty() && tx.send(PtyOut::Data(rest)).await.is_err() {
+                        break;
+                    }
+                    (PtyOut::Exit(code), true)
+                }
+            };
+            let empty = matches!(&got, PtyOut::Data(d) if d.is_empty());
+            if (!empty && tx.send(got).await.is_err()) || exit {
+                break;
+            }
+        }
+    });
+    out
+}
+
 /// Whether `job` runs or is kept here: a terminal into it stays open while it is.
 pub fn live(job: &str) -> bool {
     LEGS.lock().contains_key(job)

@@ -1,13 +1,14 @@
 /**
  * One release: what it does and where, how far it has come, each gate's result with its evidence,
  * people's answers, and what its provider last said. While it waits for approval the answer is
- * here; while it is on its way it can be cancelled (one being delivered is reverted in git).
+ * here; while it is on its way it can be cancelled (one being delivered is reverted in git, one
+ * proposed as a pull request has it closed).
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
 import { CircleCheck, CircleX } from "lucide-react";
 
-import { boardHref, deployApi, describe, inFlight, releaseAppHref, releaseHref, STATE_WORDS, type Release } from "@/api/deploy";
+import { boardHref, deployApi, describe, inFlight, pullRequestOf, releaseAppHref, releaseHref, STATE_WORDS, type Release } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
@@ -107,7 +108,9 @@ function Answers({ r }: { r: Release }) {
 function ReleaseView({ id }: { id: number }) {
   const r = useSuspenseResource(`deploy/release/${id}`, (s) => deployApi.release(id, s), { on: DEPLOY_EVENTS }).data;
   const [asking, setAsking] = React.useState(false);
-  const cancellable = inFlight(r.state) && r.state !== "committing";
+  const pr = pullRequestOf(r);
+  // Committing, it can't be stopped halfway; proposed as a pull request, its pull request is closed.
+  const cancellable = inFlight(r.state) && (r.state !== "committing" || !!pr);
   const cancel = async () => {
     try {
       await deployApi.cancel(r.id);
@@ -126,6 +129,7 @@ function ReleaseView({ id }: { id: number }) {
     { label: "Asked", value: <RelTime ts={r.created_at} /> },
     ...(r.committed_at ? [{ label: "Committed", value: <RelTime ts={r.committed_at} /> }] : []),
     ...(r.ended_at ? [{ label: "Ended", value: <RelTime ts={r.ended_at} /> }] : []),
+    ...(pr ? [{ label: pr.name.startsWith("merge") ? "Merge request" : "Pull request", value: <a href={pr.url} target="_blank" rel="noreferrer">{pr.name.replace(/^\w+ request /, "")}</a> }] : []),
     ...(r.commit ? [{ label: "Commit", value: <code title={r.commit}>{r.commit.slice(0, 12)}</code> }] : []),
     ...(r.promoted_from ? [{ label: "Promotes", value: <Link to={releaseHref(r.promoted_from)}>release {r.promoted_from}</Link> }] : []),
     ...(r.rollback_of ? [{ label: "Back to", value: <Link to={releaseHref(r.rollback_of)}>release {r.rollback_of}</Link> }] : []),
@@ -174,7 +178,13 @@ function ReleaseView({ id }: { id: number }) {
         open={asking}
         onOpenChange={setAsking}
         title={`Cancel release ${r.id}?`}
-        description={r.state === "delivering" ? "It is being delivered: its commit is reverted, and its provider goes back to what ran before." : "It hasn't been committed: nothing changes."}
+        description={
+          r.state === "delivering"
+            ? "It is being delivered: its commit is reverted, and its provider goes back to what ran before."
+            : pr
+              ? `Its ${pr.name} is closed without merging.`
+              : "It hasn't been committed: nothing changes."
+        }
         confirmLabel="Cancel the release"
         danger
         onConfirm={cancel}

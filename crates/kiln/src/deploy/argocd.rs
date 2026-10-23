@@ -295,11 +295,12 @@ impl Argo {
         self.ok(Method::Post, "/api/v1/projects", Some(&json!({ "project": project, "upsert": true }))).await.map(|_| ())
     }
 
-    /// A repository Argo CD reads, and how its last connection went; `None` when it has none.
-    /// Argo CD answers 403 for a repository it doesn't have, as for one the token may not see:
-    /// putting it says which.
+    /// A repository Argo CD reads, and how connecting to it goes now (`forceRefresh`: Argo CD tries
+    /// it again; its cached answer can say a credential that was revoked still reads); `None` when
+    /// it has none. Argo CD answers 403 for a repository it doesn't have, as for one the token may
+    /// not see: putting it says which.
     pub async fn repository(&self, url: &str) -> Result<Option<Value>, String> {
-        let (status, v) = self.call(Method::Get, &format!("/api/v1/repositories/{}", enc(url)), None).await?;
+        let (status, v) = self.call(Method::Get, &format!("/api/v1/repositories/{}?forceRefresh=true", enc(url)), None).await?;
         match status {
             200 => Ok(Some(v)),
             403 | 404 => Ok(None),
@@ -311,6 +312,14 @@ impl Argo {
     /// tries the repository first: one it can't read is refused, with why.
     pub async fn put_repository(&self, url: &str, name: &str, username: &str, password: &str) -> Result<(), String> {
         let body = json!({ "repo": url, "type": "git", "name": name, "username": username, "password": password });
+        self.ok(Method::Post, "/api/v1/repositories?upsert=true", Some(&body)).await.map(|_| ())
+    }
+
+    /// Makes Argo CD read a git repository over SSH with `private_key` (a deploy key of kiln's),
+    /// tried first as [`Self::put_repository`] is. Argo CD checks the server's host key against
+    /// the ones it knows (`argocd-ssh-known-hosts-cm`).
+    pub async fn put_repository_ssh(&self, url: &str, name: &str, private_key: &str) -> Result<(), String> {
+        let body = json!({ "repo": url, "type": "git", "name": name, "sshPrivateKey": private_key });
         self.ok(Method::Post, "/api/v1/repositories?upsert=true", Some(&body)).await.map(|_| ())
     }
 

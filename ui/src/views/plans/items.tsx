@@ -21,6 +21,7 @@ function filledParts(it: PlanItem): string[] {
   if (it.acceptance.length) out.push(`${it.acceptance.length} criteri${it.acceptance.length === 1 ? "on" : "a"}`);
   if (it.testing.length) out.push(`${it.testing.length} test${it.testing.length === 1 ? "" : "s"}`);
   if (it.needs?.length) out.push(`after ${it.needs.join(", ")}`);
+  if (it.basis?.length) out.push(`rests on ${it.basis.join(", ")}`);
   return out;
 }
 

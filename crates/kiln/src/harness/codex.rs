@@ -362,6 +362,10 @@ pub struct Codex {
     seed: Option<Vec<Value>>,
     seeded: bool,
     injecting: bool,
+    /// The goal the thread it went on from pursued (a move), set on the new thread once its
+    /// conversation is in (`thread/goal/set`'s params, but the thread).
+    #[serde(default)]
+    goal: Option<Value>,
 }
 
 impl Codex {
@@ -434,13 +438,33 @@ impl Codex {
             seed: None,
             seeded: false,
             injecting: false,
+            goal: None,
         }
     }
 
-    /// Start the new thread with this conversation (one carried over from another harness).
+    /// Start the new thread with this conversation (one carried over from another harness), and
+    /// the goal it pursued, if one came with it (`moving::GOAL`).
     pub fn seed(&mut self, items: Vec<Value>) {
+        let (goals, items): (Vec<Value>, Vec<Value>) = items.into_iter().partition(|i| i.get("type").and_then(Value::as_str) == Some(super::moving::GOAL));
+        self.goal = goals.into_iter().last().map(|mut g| {
+            if let Some(o) = g.as_object_mut() {
+                o.remove("type");
+                o.retain(|_, v| !v.is_null());
+            }
+            g
+        });
         self.seeded = items.is_empty();
         self.seed = (!items.is_empty()).then_some(items);
+    }
+
+    /// The goal that came with the conversation, set on the thread it goes on in.
+    fn set_carried_goal(&mut self, core: &mut Core) {
+        let (Some(mut params), Some(thread)) = (self.goal.take(), self.thread.clone()) else { return };
+        if let Some(o) = params.as_object_mut() {
+            o.insert("threadId".into(), json!(thread));
+            o.insert("origin".into(), json!("user"));
+        }
+        self.request(core, Pending::Plain("Setting the goal it pursued again".into()), "thread/goal/set", params);
     }
 
     /// The conversation it was given is in its thread (or it was given none).
@@ -579,6 +603,17 @@ impl Codex {
     /// Stop a subagent's turn: it keeps the permissions it started with, and works under other
     /// ones than the session's. What it asked goes with the turn. False: it can't be (kiln
     /// tried for that turn, and Codex refused).
+    /// A person stops subagent `thread` (its row's Stop): the turn it works on is interrupted. Its
+    /// parent isn't told to start it again (that's for the permission change above). False: it
+    /// has no turn under way.
+    fn stop_child_asked(&mut self, core: &mut Core, thread: &str) -> bool {
+        let Some(turn) = self.children.get(thread).and_then(|c| c.turn.clone()) else { return false };
+        let name = core.state.tasks.iter().find(|t| t.id == thread).map(|t| t.description.trim().to_owned()).filter(|d| !d.is_empty()).unwrap_or_else(|| thread.to_owned());
+        self.notice(core, Level::Info, format!("Stopping subagent {name}, as asked."));
+        self.request(core, Pending::ChildInterrupt(thread.to_owned()), "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        true
+    }
+
     fn stop_child(&mut self, core: &mut Core, thread: &str, turn: Option<String>) -> bool {
         let Some(turn) = turn.or_else(|| self.children.get(thread).and_then(|c| c.turn.clone())) else { return false };
         let child = self.children.entry(thread.to_owned()).or_default();
@@ -874,6 +909,14 @@ impl Codex {
             // Older consoles' MCP controls (now commands of their own).
             "mcp_refresh" => self.command(core, Command::McpRefresh),
             "mcp_reload" => self.mcp_reload(core),
+            // Signed in on its machine (kiln's sign-in, `codex login`): it reads its account at
+            // once (another one: the old one's limits go and the new one's are read), and starts
+            // again when idle so its app-server certainly runs on the new login.
+            "account" => {
+                self.request(core, Pending::Account, "account/read", json!({}));
+                self.reload = Some("Signed in".to_owned());
+                self.reload_when_idle(core);
+            }
             // Settings changed outside it (its own screen, beside it): start again to load them.
             "reload_config" => {
                 self.reload = Some(value.as_ref().and_then(|v| v.get("what")).and_then(Value::as_str).unwrap_or("Changed settings").to_owned());
@@ -987,7 +1030,7 @@ impl Codex {
         self.stopped.clear();
         self.unheard.clear();
         core.state.approvals.clear();
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.activity = None;
         core.state.doing = None;
         core.state.turn_started = None;
@@ -1088,6 +1131,12 @@ impl Codex {
             Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
+            // A subagent: its turn under way is interrupted, as a person asked.
+            Command::StopTask { task } if self.children.contains_key(&task) => {
+                if !self.stop_child_asked(core, &task) {
+                    self.notice(core, Level::Info, "That subagent has no turn under way to stop.".to_owned());
+                }
+            }
             Command::StopTask { task } => self.stop_terminal(core, &task),
             Command::StopTasks => {
                 let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).map(|t| t.id.clone()).collect();
@@ -1096,7 +1145,7 @@ impl Codex {
                 }
             }
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             Command::McpEnable { name, enabled } => {
                 if !valid_server_name(&name) {
                     self.notice(core, Level::Warn, format!("{name}: not a server kiln can change"));
@@ -1305,9 +1354,11 @@ impl Codex {
         if core.state.mcp.iter().any(|m| m.status == McpStatus::Pending) && now - self.mcp_at > 4_000 {
             self.ask_mcp(core);
         }
-        if self.account_kind.as_deref() == Some("chatgpt") && now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits)) {
+        // Every few minutes its account, read again (one signed in outside kiln, `codex login` in a
+        // terminal, shows), and with a ChatGPT account its rate limits.
+        if now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits | Pending::Account)) {
             self.usage_at = now;
-            self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
+            self.request(core, Pending::Account, "account/read", json!({}));
         }
     }
 
@@ -1857,11 +1908,16 @@ impl Codex {
                 // Not stopped (its turn may have just ended): what it asked is the person's after
                 // all. It isn't tried again for that turn.
                 Pending::ChildInterrupt(thread) => {
+                    // Not a permission change's stop (that one is `stopping`): a person asked.
+                    let asked = self.children.get(&thread).is_some_and(|c| c.stopping.is_none());
                     if let Some(child) = self.children.get_mut(&thread) {
                         child.unstoppable = child.stopping.take();
                     }
                     self.stopped.retain(|s| *s != thread);
                     self.show_withheld(core, Some(&thread));
+                    if asked {
+                        self.notice(core, Level::Warn, format!("Codex couldn't stop that subagent: {msg}"));
+                    }
                 }
                 Pending::Models | Pending::Interrupt | Pending::PermissionInterrupt(_) | Pending::Hooks | Pending::Account => {}
                 // An older Codex can't list its terminals (the method is experimental): kiln
@@ -1902,6 +1958,8 @@ impl Codex {
                 Pending::Inject => {
                     self.injecting = false;
                     self.notice(core, Level::Error, format!("Codex did not take the conversation carried over: {msg}"));
+                    // Without the conversation, its goal would be pursued from nothing.
+                    self.goal = None;
                     self.ready(core);
                 }
                 Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
@@ -1995,6 +2053,8 @@ impl Codex {
                     self.settle(core);
                     return;
                 }
+                // A goal that came without a conversation to go in first.
+                self.set_carried_goal(core);
                 // A resumed thread's history: inline from a Codex that still sends it so, else
                 // its latest turns, listed (the session is ready once they are in).
                 let turns = thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -2206,6 +2266,8 @@ impl Codex {
                 // old account's limits go, and a pause for one ends.
                 if was.is_some() && core.state.account != was {
                     core.state.limits.clear();
+                    // What was read of the old account's limits is never shown as the new one's.
+                    self.rate_limits.clear();
                     if core.state.pause.is_some()
                         && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
                     {
@@ -2327,6 +2389,8 @@ impl Codex {
             Pending::Inject => {
                 self.injecting = false;
                 self.seeded = true;
+                // The conversation is in: the goal it pursued goes on too.
+                self.set_carried_goal(core);
                 self.ready(core);
             }
             Pending::Revert(ev) => {
@@ -2542,7 +2606,7 @@ impl Codex {
             core.state.doing = None;
             core.set_status(next);
         }
-        core.state.exit = (next == Status::Exited).then(|| ExitInfo { code: None, error: Some("Codex reported a thread error".into()) });
+        core.state.exit = (next == Status::Exited).then(|| ExitInfo::now(None, Some("Codex reported a thread error".into())));
         core.touch_state();
         self.settle(core);
     }
@@ -4057,6 +4121,8 @@ fn subagent(core: &mut Core, id: &str, tool: &str, desc: &str, status: &str, spa
             parent_task: parent_task.map(str::to_owned),
             started: Core::now(),
             ended: (!matches!(status, "running" | "pending" | "paused")).then(Core::now),
+            // Its turn under way can be interrupted (`stop_child_asked`).
+            stoppable: true,
             ..Task::default()
         }),
     }
@@ -4758,6 +4824,44 @@ mod tests {
         Ok(())
     }
 
+    /// A move's goal goes on in the new thread, once the conversation is in; without a
+    /// conversation, as soon as the thread is open; not when Codex didn't take the conversation.
+    #[test]
+    fn a_goal_carried_over_is_set_on_the_new_thread_once_the_conversation_is_in() {
+        let goal = json!({"type": super::super::moving::GOAL, "objective": "port the parser", "status": "active", "tokenBudget": 200_000});
+        let said = json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "port the parser"}]});
+        let open = |items: Vec<Value>| {
+            let mut core = Core::new();
+            core.state.cwd = "/work".into();
+            let mut c = Codex::new(None, None, None, false);
+            c.seed(items);
+            c.start(&mut core);
+            feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
+            feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th2", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
+            let w = written(&mut core);
+            (c, core, w)
+        };
+        let set = |w: &[Value]| w.iter().find(|v| v.get("method") == Some(&json!("thread/goal/set"))).and_then(|v| v.get("params")).cloned();
+        let (mut c, mut core, w) = open(vec![said.clone(), goal.clone()]);
+        let inject = w.iter().find(|v| v.get("method") == Some(&json!("thread/inject_items"))).cloned().unwrap_or_default();
+        // The conversation alone goes in; the goal waits for it.
+        assert_eq!(inject.pointer("/params/items"), Some(&json!([said.clone()])));
+        assert_eq!(set(&w), None);
+        respond(&mut c, &mut core, &w, "thread/inject_items", json!({}));
+        assert!(c.seeded());
+        assert_eq!(set(&written(&mut core)), Some(json!({"threadId": "th2", "objective": "port the parser", "status": "active", "tokenBudget": 200_000, "origin": "user"})));
+        // A goal alone: set once the thread is open.
+        let (c, _, w) = open(vec![goal.clone()]);
+        assert!(c.seeded());
+        assert!(w.iter().all(|v| v.get("method") != Some(&json!("thread/inject_items"))));
+        assert_eq!(set(&w).and_then(|p| p.get("threadId").cloned()), Some(json!("th2")));
+        // Codex didn't take the conversation: no goal to pursue from nothing.
+        let (mut c, mut core, w) = open(vec![said, goal]);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/inject_items"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no"}})]);
+        assert_eq!(set(&written(&mut core)), None);
+    }
+
     #[test]
     fn the_threads_goal_is_followed_to_complete() {
         let mut c = Codex::new(None, None, None, false);
@@ -5132,6 +5236,61 @@ mod tests {
         assert!(said.contains("Continue the work") && said.contains("kiln stopped your subagents") && said.contains("(kid)") && said.contains("(grandkid)"), "{said}");
         assert!(c.stopped.is_empty());
         Ok(())
+    }
+
+    /// Signed in on its machine: Codex reads its account at once, and a new account's sign-in takes
+    /// the old one's limits away and reads the new one's.
+    #[test]
+    fn a_sign_in_reads_the_account_again_and_shows_the_new_one_s_limits() {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"}}));
+        let old = core.state.account.clone();
+        core.state.limits = vec![Limit { id: "codex.primary".into(), label: "Weekly".into(), used_percent: Some(95.0), account: old.clone(), ..Limit::default() }];
+        let _ = written(&mut core);
+        c.command(&mut core, Command::Control { id: "account".into(), value: None });
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_ne!(core.state.account, old);
+        assert!(core.state.limits.is_empty(), "the old account's limits go");
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
+    }
+
+    /// Signed in as someone else outside kiln (`codex login` in a terminal): the account read every
+    /// few minutes names the new one, the old one's limits go and the new one's are read.
+    #[test]
+    fn a_sign_in_made_outside_kiln_shows_at_the_next_look_at_the_account() {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"}}));
+        let old = core.state.account.clone();
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "account/rateLimits/read", json!({"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 95.0, "windowDurationMins": 10080}}}));
+        assert!(!core.state.limits.is_empty());
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_eq!(core.state.account, Some(account_id("codex", "Pro", Some("b@example.com"))));
+        assert_ne!(core.state.account, old);
+        assert!(core.state.limits.is_empty(), "the old account's limits go");
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
+    }
+
+    /// A person stops a subagent from its row: its turn is interrupted, and its parent isn't told
+    /// to start it again (that's only for a permission change's stop).
+    #[test]
+    fn a_person_stops_a_subagent_from_its_row() {
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "work".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core);
+        respond(&mut c, &mut core, &start, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+        spawn(&mut c, &mut core, "th1", "t1", "kid");
+        assert!(core.state.tasks.iter().find(|t| t.id == "kid").is_some_and(|t| t.stoppable), "a subagent's row can stop it");
+        let _ = written(&mut core);
+        c.command(&mut core, Command::StopTask { task: "kid".into() });
+        assert_eq!(interrupts(&written(&mut core)), [pair("kid", "kid-turn")]);
+        assert!(c.stopped.is_empty(), "its parent isn't asked to start it again");
     }
 
     #[test]

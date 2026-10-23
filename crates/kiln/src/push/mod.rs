@@ -258,13 +258,46 @@ async fn tell(hub: &Arc<Hub>, n: watch::Note) {
     });
     hub.emit(&ev);
     crate::rt::spawn(crate::ci::notify::agent_event(Arc::clone(hub), ev));
-    if !hub.cfg.push.enabled {
+    if !hub.cfg.push.enabled || handled(hub, &opener, &n).await {
         return;
     }
     let payload = json!({ "title": title, "body": text, "tag": id, "url": format!("/agents/{id}"), "agent": id, "kind": event, "at": crate::util::now_ms() });
     let (urgency, ttl) = if n.kind == watch::Kind::NeedsYou { ("high", TTL_NEEDS) } else { ("normal", TTL_OTHER) };
     let sent = push_to(hub, &opener, event, Some(&id), &payload, urgency, &watch::topic(&id), ttl).await;
     tracing::debug!(agent = %id, event, devices = sent, "a note about an agent");
+}
+
+/// The notices note `n` is about, as cards and a person's marks name them (`store::Mark`), and
+/// since when its agent must have been seen for a finished turn to be dealt with.
+fn notices_of(n: &watch::Note) -> (Vec<String>, Option<i64>) {
+    let id = &n.info.id;
+    match n.kind {
+        watch::Kind::NeedsYou => (n.info.approvals.iter().map(|a| a.id.clone()).collect(), None),
+        watch::Kind::Stopped => (n.info.exit.as_ref().filter(|e| e.at > 0).map(|e| format!("stopped:{id}:{}", e.at)).into_iter().collect(), None),
+        watch::Kind::Paused => (n.info.pause.as_ref().map(|p| format!("limit:{id}:{}", p.since)).into_iter().collect(), None),
+        watch::Kind::Finished => (vec![format!("seen:{id}")], Some(n.info.last_turn.as_ref().map_or(i64::MAX, |t| t.at))),
+    }
+}
+
+/// Whether `principal` dealt with what note `n` says already, on any device: each request put
+/// away or acted on, the stop or pause put away, or (a finished turn) the agent seen since. No
+/// device hears it then; the event still goes to rules and webhooks.
+async fn handled(hub: &Hub, principal: &str, n: &watch::Note) -> bool {
+    let (keys, seen_since) = notices_of(n);
+    if keys.is_empty() {
+        return false;
+    }
+    let (p, k) = (principal.to_owned(), keys.clone());
+    let Ok(marks) = hub.store.call(move |c| store::marked(c, &p, &k)).await else { return false };
+    dealt_with(&keys, seen_since, &marks)
+}
+
+/// [`handled`], from the marks of `keys` the person has.
+fn dealt_with(keys: &[String], seen_since: Option<i64>, marks: &[store::Mark]) -> bool {
+    match seen_since {
+        Some(since) => marks.iter().any(|m| m.how == "seen" && m.at >= since),
+        None => keys.iter().all(|k| marks.iter().any(|m| &m.key == k && m.how != "seen")),
+    }
 }
 
 /// A machine with agents on it is low on battery: each person with an agent there hears it.
@@ -392,5 +425,26 @@ mod tests {
         assert_eq!(p.contact_for("http://adacachy:7070"), "mailto:kiln@localhost", "only an https URL says who runs it");
         p.contact = " mailto:ops@example.com ".into();
         assert_eq!(p.contact_for("https://kiln.example.com"), "mailto:ops@example.com");
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    fn mark(key: &str, how: &str, at: i64) -> store::Mark {
+        store::Mark { key: key.into(), how: how.into(), at }
+    }
+
+    #[test]
+    fn a_note_is_dealt_with_once_each_of_its_notices_is_or_its_agent_was_seen_since() {
+        let keys = vec!["q1".to_owned(), "q2".to_owned()];
+        assert!(!dealt_with(&keys, None, &[mark("q1", "away", 5)]), "one of two put away");
+        assert!(dealt_with(&keys, None, &[mark("q1", "away", 5), mark("q2", "done", 6)]));
+        assert!(!dealt_with(&keys, None, &[mark("q1", "seen", 5), mark("q2", "seen", 6)]), "seen isn't put away");
+        let seen = vec!["seen:ag1".to_owned()];
+        assert!(dealt_with(&seen, Some(100), &[mark("seen:ag1", "seen", 120)]), "seen after its turn ended");
+        assert!(!dealt_with(&seen, Some(100), &[mark("seen:ag1", "seen", 90)]), "seen before");
+        assert!(!dealt_with(&seen, Some(100), &[]));
     }
 }

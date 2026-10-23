@@ -48,9 +48,46 @@ pub struct Server {
     pub port: u16,
     pub admin: String,
     dir: std::path::PathBuf,
+    /// Its environment beyond the test's, kept for a restart.
+    #[allow(dead_code)]
+    env: Vec<(String, String)>,
+    /// What its runner left in Docker stays when it's dropped ([`Server::crash`]).
+    leave: bool,
 }
 
 impl Server {
+    /// Stopped (killed, as a crash or a host's restart would), then started again on its ports and
+    /// its data: its log goes on in `server.log`.
+    #[allow(dead_code)]
+    pub fn restart(&mut self) -> anyhow::Result<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let log = std::fs::OpenOptions::new().append(true).open(self.dir.join("server.log"))?;
+            let mut cmd = server_command(&self.dir, log)?;
+            cmd.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            self.child = cmd.spawn()?;
+            // Up once it answers; its ports may take a moment to be free again.
+            while self.child.try_wait()?.is_none() {
+                if let Ok((200, _)) = http(self.port, "GET", "/healthz", "", None) {
+                    return Ok(());
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the server didn't start again");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the server didn't start again:\n{}", self.log());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Killed, as a crash would be: what its runner left in Docker stays, for its next start on the
+    /// same directory to find (dropped, a server's leftovers go with it).
+    #[allow(dead_code)]
+    pub fn crash(mut self) {
+        self.leave = true;
+    }
+
     /// The end of the server's log.
     #[allow(dead_code)]
     pub fn log(&self) -> String {
@@ -62,8 +99,40 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Its process group with it: what it started (its UI server) is never left running.
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let work = self.dir.join("work");
+        if !self.leave && work.is_dir() {
+            sweep(&work);
+        }
+    }
+}
+
+/// What a killed server's runner left in Docker (its legs' and its pools' containers, then their
+/// networks) removed, as the runner would itself on its next start: found by the label it puts on
+/// all it makes (`runner::docker::owner_label` of its work directory), so no other server's. Left
+/// behind, each network holds one of the engine's few address pools until no leg on the machine
+/// can start.
+fn sweep(work: &Path) {
+    use sha2::Digest as _;
+    let path = std::path::absolute(work).unwrap_or_else(|_| work.to_path_buf());
+    let h = hex::encode(sha2::Sha256::digest(path.to_string_lossy().as_bytes()));
+    let label = format!("label=kiln.runner-work={}", h.get(..16).unwrap_or(&h));
+    let ids = |list: &[&str]| -> Vec<String> {
+        Command::new("docker").args(list).args(["--filter", &label]).output().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_owned).collect()).unwrap_or_default()
+    };
+    let containers = ids(&["ps", "-aq"]);
+    if !containers.is_empty() {
+        let _ = Command::new("docker").args(["rm", "--force"]).args(&containers).output();
+    }
+    let networks = ids(&["network", "ls", "-q"]);
+    if !networks.is_empty() {
+        let _ = Command::new("docker").args(["network", "rm"]).args(&networks).output();
     }
 }
 
@@ -80,6 +149,55 @@ pub struct Options<'a> {
 
 /// A server of its own under `dir`, up and answering.
 pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
+    start_with(dir, o, false)
+}
+
+/// `start`, serving HTTPS too (on the same port) when `https`: its address is `https://`, the
+/// kiln CA's certificate.
+pub fn start_with(dir: &Path, o: &Options<'_>, https: bool) -> anyhow::Result<Server> {
+    start_full(dir, o, https, false, &[])
+}
+
+/// [`start`], with KilnCD and deploying by API running (no cluster of its own).
+pub fn start_cd(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
+    start_full(dir, o, false, true, &[])
+}
+
+/// `start_with`, the server's environment given `env` too.
+pub fn start_env(dir: &Path, o: &Options<'_>, https: bool, env: &[(&str, &str)]) -> anyhow::Result<Server> {
+    start_full(dir, o, https, false, env)
+}
+
+/// A port picked here can be taken before the server binds it (tests run side by side): then the
+/// server exits, or another test's server answers on it and refuses this one's token. Either way it
+/// starts again, on new ports.
+fn start_full(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, &str)]) -> anyhow::Result<Server> {
+    let mut why = String::new();
+    for _ in 0..3 {
+        match start_once(dir, o, https, cd, env)? {
+            Ok(server) => return Ok(server),
+            Err(w) => why = w,
+        }
+    }
+    anyhow::bail!("the server didn't start: {why}")
+}
+
+/// `kiln server` with `dir`'s configuration, its home in `dir`, writing to `log`, in a process group
+/// of its own.
+fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home)?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
+    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CHAOS"] {
+        cmd.env_remove(var);
+    }
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    Ok(cmd)
+}
+
+fn start_once(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, &str)]) -> anyhow::Result<Result<Server, String>> {
     let (port, quic) = (free_port()?, free_port()?);
     let data = dir.join("data");
     let work = dir.join("work");
@@ -87,10 +205,10 @@ pub fn start(dir: &Path, o: &Options<'_>) -> anyhow::Result<Server> {
         r#"[server]
 http_addr = "127.0.0.1:{port}"
 quic_addr = "127.0.0.1:{quic}"
-public_url = "http://127.0.0.1:{port}"
+public_url = "{scheme}://127.0.0.1:{port}"
 quic_advertise = "127.0.0.1:{quic}"
 data_dir = "{data}"
-https = false
+https = {https}
 
 [gitops]
 auto_pipelines = false
@@ -101,12 +219,8 @@ labels = ["local"]
 slots = 2
 work_dir = "{work}"
 
-[kubernetes]
-enabled = false
-
-[terminal]
-enabled = false
-
+{kubernetes}
+{terminal}
 [discovery]
 enabled = false
 announce = false
@@ -114,9 +228,7 @@ browse = false
 join_requests = false
 tailscale = false
 
-[cd]
-enabled = false
-
+{cd}
 [ci]
 enabled = true
 {ci}
@@ -125,30 +237,53 @@ enabled = true
 "#,
         data = data.display(),
         work = work.display(),
+        scheme = if https { "https" } else { "http" },
         agent = o.agent,
         ci = o.ci,
         extra = o.extra,
+        // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
+        cd = if o.extra.contains("[cd]") {
+            ""
+        } else if cd {
+            "[cd]\nenabled = true\n"
+        } else {
+            "[cd]\nenabled = false\n"
+        },
+        // So do terminals (its own runner's, and into legs: docs/ci.md W17-R01).
+        terminal = if o.extra.contains("[terminal]") { "" } else { "[terminal]\nenabled = false\n" },
+        // And pods (a `k8s` pool's: docs/ci.md W13-R07).
+        kubernetes = if o.extra.contains("[kubernetes]") { "" } else { "[kubernetes]\nenabled = false\n" },
     );
-    let cfg = dir.join("kiln.toml");
-    std::fs::write(&cfg, config)?;
-    let home = dir.join("home");
-    std::fs::create_dir_all(&home)?;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    std::fs::write(dir.join("kiln.toml"), config)?;
     // Its log, for a test that wants to say why it failed (`Server::log`).
     let log = std::fs::File::create(dir.join("server.log"))?;
-    cmd.args(["--config", &cfg.to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG"] {
-        cmd.env_remove(var);
-    }
+    let mut cmd = server_command(dir, log)?;
+    cmd.envs(env.iter().copied());
     let child = cmd.spawn()?;
-    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf() };
+    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
+        if let Some(status) = server.child.try_wait()? {
+            return Ok(Err(format!("it exited ({status}) on ports {port} and {quic}")));
+        }
         if let Ok(t) = std::fs::read_to_string(data.join("admin.token"))
             && let Ok((200, _)) = http(port, "GET", "/healthz", "", None)
         {
-            server.admin = t.trim().to_owned();
-            return Ok(server);
+            let t = t.trim().to_owned();
+            // This server, not another test's on the same port.
+            match http(port, "GET", "/api/repos", &t, None) {
+                Ok((200, _)) => {
+                    // Its QUIC port too: when another test's server holds it, this one's runner
+                    // dials that one and never connects.
+                    if std::fs::read_to_string(dir.join("server.log")).is_ok_and(|l| l.contains(&format!("bind 127.0.0.1:{quic}"))) {
+                        return Ok(Err(format!("another server holds its QUIC port {quic}")));
+                    }
+                    server.admin = t;
+                    return Ok(Ok(server));
+                }
+                Ok((401, _)) => return Ok(Err(format!("another server answers on port {port}"))),
+                _ => {}
+            }
         }
         anyhow::ensure!(Instant::now() < deadline, "the server didn't start");
         std::thread::sleep(Duration::from_millis(200));

@@ -89,6 +89,15 @@ return leg.steps.slice(-1); // "Rerun: <name>", with its conclusion
 Release the leg when done (`kiln.ci.legs.release({ leg })`), or keep it longer
 (`kiln.ci.legs.keep({ leg, minutes })`).
 
+## Find the commit that broke it
+
+When a job that used to pass fails and the change isn't obvious, bisect it:
+`kiln.ci.runs.bisect({ run })` runs the failed job again on the commits since the last green run
+of its workflow on that branch, halving the range each time (`job`, `good` and `bad` to choose).
+Follow it with `kiln.ci.runs.bisects({ run, bisect })` until its `state` isn't `running`: `found`
+names the `culprit` (its commit, message and author), and `tried` lists each commit with its run.
+A culprit is a regression's evidence; open the revert or the fix as a diff.
+
 ## Fix, don't just rerun
 
 A fix is a change to the code or the workflow, proposed for review: validate and plan-preview a

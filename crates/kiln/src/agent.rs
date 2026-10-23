@@ -28,6 +28,9 @@ use crate::terminal::{self, PtyOut, PtySession};
 
 /// Bytes of output/results held while disconnected before the oldest log chunks are shed.
 const UPLINK_BUFFER: usize = 128 << 20;
+/// How long a job's result is kept for a server that never says it has it: well past the grace a
+/// runner gets to reconnect, after which the server has given its legs up.
+const UNRECEIVED_FOR: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -214,6 +217,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Running {
     cancel: Shutdown,
+    /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
+    pooled: bool,
 }
 
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
@@ -234,11 +239,15 @@ enum Ev {
     /// The front door's status changed.
     FrontDoor,
     /// A blue/green upgrade step done off the loop (`crate::bluegreen`).
+    #[cfg(unix)]
     Bg(Bg),
     /// A server frame about something another runner process of this machine handed over (or a
     /// rollback took back), handled as if the server had sent it here.
-    #[cfg_attr(not(unix), allow(dead_code))]
     Forwarded(Vec<u8>),
+    /// A test build's fault: the connection drops (W22-AC04).
+    ChaosDrop,
+    /// A test build's fault: a frame held back, due now (W22-AC04).
+    Delayed(crate::runner::chaos::Due),
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -272,6 +281,9 @@ enum Bg {
     /// A server frame for [`Ev::Forwarded`].
     #[cfg(unix)]
     Forwarded(Vec<u8>),
+    /// A server frame to take again ([`Ev::Forwarded`]): a terminal into a leg this runner holds,
+    /// asked for (by its session) before the leg had its shell.
+    Again(String, Vec<u8>),
 }
 
 /// What the new build said of one thing handed to it (blue/green).
@@ -346,6 +358,9 @@ impl Item {
 /// new build that it holds what was handed over.
 #[cfg(unix)]
 const RETIRE_QUIET: Duration = Duration::from_secs(8);
+/// How long a terminal into a leg this runner holds waits for the leg's shell (its workspace and
+/// environment set up, its images pulled) before it's refused.
+const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 use crate::upgrade::with_instance;
@@ -625,6 +640,14 @@ async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
     }
 }
 
+/// The next of `rx`, or never when there's none.
+async fn recv_opt<T>(rx: Option<&async_channel::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(r) => r.recv().await.ok(),
+        None => futures::future::pending().await,
+    }
+}
+
 async fn sleep_until_opt(t: Option<Instant>) {
     match t {
         Some(t) => crate::rt::sleep_until(t).await,
@@ -634,6 +657,7 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    crate::updates::warm_own_binary().await;
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
     if cfg!(target_os = "macos") && !o.ephemeral {
         std::thread::spawn(crate::os::macsign::keep_watching);
@@ -642,6 +666,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let orphans = crate::exec::reap_orphans(&o.work_dir);
     if orphans > 0 {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");
+    }
+    if let Some(max) = o.declared.cache_max.as_deref().filter(|m| crate::runner::cache::parse_size(m).is_none()) {
+        tracing::warn!(cache_max = max, "[agent] cache_max isn't a size (`20G`, `512M`): kiln/cache keeps up to 10G");
     }
     let (ca, leaf, enrolled_quic) = credentials(&o, &shutdown).await?;
     // This process's own files (a runner beside another one of the machine shares the state
@@ -675,6 +702,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("server QUIC address unknown (pass --quic)"))?;
     // HTTP(S) to the server (source archives, artifacts): public roots plus kiln's own CA.
     let http = Arc::new(Client::new(Roots::WebPkiPlusDer(ca.clone()), None)?);
+    // A microVM's leg reaches the server as this runner does, so it trusts the same CA (W13-R05).
+    #[cfg(target_os = "linux")]
+    let microvm_ca = ca.clone();
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -758,16 +788,47 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
+    // Jobs' results the server hasn't said it has (`ServerMsg::Received`), each encoded, by job:
+    // sent again after a reconnect, so one sent as the connection dropped isn't lost.
+    let mut unreceived: HashMap<String, (Instant, Vec<u8>)> = HashMap::new();
+    // Each job's events (`AgentMsg::JobEvent`, numbered by their `seq`), encoded, until its result
+    // is received, by job: sent again after a reconnect too, to a server that takes each once (it
+    // said so: `receipts`). The count goes on after (a kept leg's step rerun, W17-R04).
+    let mut journal: HashMap<String, (Instant, u64, Vec<Vec<u8>>)> = HashMap::new();
+    let mut receipts = false;
     let mut connected = false;
+    // The server has taken this connection's Hello (it said Welcome). Logs, on a lane of their own,
+    // wait for that, or the server, not knowing whose they are yet, drops them; and jobs' messages
+    // with them, to come after what was held.
+    let mut welcomed = false;
     let mut dial_backoff = Duration::from_millis(500);
     let mut redial: Option<Instant> = Some(Instant::now());
     let mut dialing_since: Option<Instant> = None;
+    // A test build's faults (W22-AC04): the connection dropped every so often, and what's sent the
+    // server late.
+    let chaos = crate::runner::chaos::get();
+    let mut chaos_drop: Option<Instant> = None;
+    let (delay_line, delayed) = match chaos.and_then(|c| c.delay).map(crate::runner::chaos::DelayLine::new) {
+        Some((line, due)) => (Some(line), Some(due)),
+        None => (None, None),
+    };
     let mut jobs: HashMap<String, Running> = HashMap::new();
+    // Pools' executors this runner started (docs/ci.md W13-R09).
+    let pool_execs = crate::runner::pool::Executors::default();
+    crate::runner::pool::sweep(&o.work_dir);
+    // And the containers and networks this runner left running when it last stopped.
+    crate::runner::docker::sweep(&o.work_dir).await;
+    // Its microVM deployments (W15-R02), booted again: they end with the runner.
+    #[cfg(target_os = "linux")]
+    crate::rt::spawn(crate::runner::firecracker::restore(o.work_dir.join("_firecracker")));
     let mut exclusive = false;
     let mut draining = false;
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and
     // announced again on every reconnect.
     let mut terms: HashMap<String, (PtySession, Arc<crate::termsess::Session>)> = HashMap::new();
+    // Terminals into legs asked for before the leg had its shell, by session: taken again once it
+    // has, with what was typed meanwhile.
+    let mut shell_waits: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
     // Upgrades: a new binary on disk is taken up once no job runs, every terminal handed on so
     // shells survive. On Linux this process re-executes itself (same pid). On macOS, where a
@@ -919,8 +980,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     };
 
     loop {
-        // Ephemeral agents leave once their one job is done and everything is delivered.
-        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() {
+        // Ephemeral agents leave once their one job is done and everything is delivered: its
+        // result received, or given 30 s (a server older than receipts never says).
+        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
             tracing::info!("ephemeral agent finished its job; exiting");
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
@@ -952,6 +1014,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
+            () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
+            d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
@@ -959,6 +1023,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             b = bg_rx.recv().fuse() => match b {
                 #[cfg(unix)]
                 Ok(Bg::Forwarded(data)) => Ev::Forwarded(data),
+                // Unless the terminal was closed meanwhile.
+                Ok(Bg::Again(session, data)) => if shell_waits.contains_key(&session) { Ev::Forwarded(data) } else { Ev::Watchdog },
+                #[cfg(unix)]
                 Ok(b) => Ev::Bg(b),
                 Err(_) => Ev::Watchdog,
             },
@@ -972,8 +1039,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 crate::browser::driven::stop_all().await;
                 return Ok(());
             }
-            #[cfg(not(unix))]
-            Ev::Bg(b) => match b {},
+            Ev::Delayed(crate::runner::chaos::Due { lane, kind, data, again }) => {
+                // As an undelayed frame goes: sent while connected and welcomed, kept otherwise,
+                // unless the next connection sends it again in its place (a leg's event or result).
+                if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    net.send(SERVER_PEER, lane, kind, data).await;
+                } else if kind != Kind::Term && !again {
+                    buffered += data.len();
+                    buffer.push_back((lane, kind, data));
+                }
+            }
+            Ev::ChaosDrop => {
+                chaos_drop = None;
+                if connected {
+                    tracing::warn!("chaos: dropping the connection to the server");
+                    net.command(Out::Disconnect { peer: SERVER_PEER }).await;
+                }
+            }
             #[cfg(unix)]
             Ev::Bg(b) => {
                 use crate::bluegreen::Frame;
@@ -1265,8 +1347,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         draining = false;
                         uplink.msg(AgentMsg::Instance(instance_hello.clone())).await;
                     }
-                    // Turned into Ev::Forwarded as it's received.
-                    Bg::Forwarded(_) => {}
+                    // Turned into Ev::Forwarded as they're received.
+                    Bg::Forwarded(_) | Bg::Again(..) => {}
                 }
             }
             Ev::Redial => {
@@ -1412,6 +1494,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // and dial directly; the tunnel stays open until that connection is up.
                 if paths.tick(connected, Instant::now()) {
                     connected = false;
+                    welcomed = false;
                     if let Some(s) = &sync {
                         s.connected(false);
                     }
@@ -1425,6 +1508,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Net(None) => anyhow::bail!("transport stopped"),
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+                chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
@@ -1434,13 +1518,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                let msg = AgentMsg::Hello(hello(jobs.keys().cloned().collect()));
+                // Jobs whose results the server hasn't said it has are its own still: they come
+                // again below. A server that never says (one older than receipts) has them for a
+                // while only.
+                unreceived.retain(|_, (at, _)| at.elapsed() < UNRECEIVED_FOR);
+                let mut running: Vec<String> = jobs.keys().cloned().collect();
+                running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
+                let msg = AgentMsg::Hello(hello(running));
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
                 // an outpost says it's one instead.
-                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
+                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
                 // It sends its conversations' store: the server keeps them from that.
                 if shipper.is_some()
                     && let AgentMsg::Build { caps, .. } = &mut build
@@ -1462,6 +1552,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
                     probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
                 }
+                // The pools' executors were the last connection's: the server starts what it wants
+                // again (docs/ci.md W13-R09).
+                for w in pool_execs.drain() {
+                    crate::rt::spawn(crate::runner::pool::discard(w));
+                }
+                #[cfg(target_os = "linux")]
+                crate::rt::spawn(crate::runner::firecracker::drain_warm());
                 // Whether this machine takes upgrades (an older server skips it).
                 if !o.ephemeral && !o.outpost {
                     let accept = takes_updates(&o);
@@ -1482,10 +1579,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Up);
-                }
-                while let Some((lane, kind, data)) = buffer.pop_front() {
-                    buffered = buffered.saturating_sub(data.len());
-                    net.send(SERVER_PEER, lane, kind, data).await;
                 }
                 // How the front door does, after everything older (an older server skips it).
                 front_door_sent = None;
@@ -1508,6 +1601,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     at_once = paths.dial_failed(now);
                 }
                 connected = false;
+                welcomed = false;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -1550,6 +1644,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 match msg {
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
+                        // What waited for the connection, in order: what was held while it was
+                        // down, the jobs' events again, then their results not yet received.
+                        welcomed = true;
+                        while let Some((lane, kind, data)) = buffer.pop_front() {
+                            buffered = buffered.saturating_sub(data.len());
+                            net.send(SERVER_PEER, lane, kind, data).await;
+                        }
+                        if receipts {
+                            for (_, _, events) in journal.values() {
+                                for data in events {
+                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                                }
+                            }
+                        }
+                        for (_, data) in unreceived.values() {
+                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                        }
                         // Drained or not is the server's to say again on each connection (it sends
                         // Drain next when this one isn't the machine's newest).
                         if !o.ephemeral && !retiring {
@@ -1610,6 +1721,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             anyhow::bail!("refused: {reason}");
                         }
                         connected = false;
+                        welcomed = false;
                         if let Some(s) = &sync {
                             s.connected(false);
                         }
@@ -1624,7 +1736,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // from here (NAT, NodePorts, cluster DNS all differ).
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
+                        let full = u32::try_from(jobs.values().filter(|j| !j.pooled).count()).unwrap_or(u32::MAX) >= o.slots.max(1);
                         if o.outpost || draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
@@ -1635,7 +1747,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         exclusive = a.spec.exclusive;
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone() });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -1735,17 +1847,32 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::TermInput { session, data } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::in_microvm(&session) {
+                            crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermInput { session: session.clone(), data });
+                            continue;
+                        }
                         if let Some((pty, _)) = terms.get(&session) {
                             pty.write(data);
+                        } else if let Some(typed) = shell_waits.get_mut(&session) {
+                            typed.push(data);
                         }
                     }
                     ServerMsg::TermResize { session, cols, rows } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermResize { session: session.clone(), cols, rows }) {
+                            continue;
+                        }
                         if let Some((pty, state)) = terms.get(&session) {
                             pty.resize(cols, rows);
                             state.send(crate::termsess::Input::Resize { cols, rows });
                         }
                     }
                     ServerMsg::TermAttach { session } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermAttach { session: session.clone() }) {
+                            continue;
+                        }
                         let msg = match terms.get(&session) {
                             Some((_, state)) => {
                                 let a = state.attach();
@@ -1757,6 +1884,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         uplink.0.send(Up::Term(msg)).await.ok();
                     }
                     ServerMsg::TermClose { session } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermClose { session: session.clone() }) {
+                            continue;
+                        }
+                        shell_waits.remove(&session);
                         terms.remove(&session);
                     }
                     ServerMsg::AiTranscript { req, pid } => match &ai {
@@ -2108,12 +2240,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let up = uplink.0.clone();
                         let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
                             let ws = s.spec.lock().workspace.clone();
-                            (std::path::PathBuf::from(s.info().cwd), ws)
+                            let info = s.info();
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, ws)) => crate::workspace::serve(&cwd, ws.as_ref(), &json).await,
+                                Some((cwd, work, ws)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), &json).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });
@@ -2142,12 +2275,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         };
                         let id = a.job_id.clone();
-                        let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
+                        // A pool's leg runs in its executor, beside this runner's own slots.
+                        let pooled = a.executor.slot.is_some();
+                        let own = jobs.values().filter(|j| !j.pooled).count();
+                        let full = !pooled && u32::try_from(own).unwrap_or(u32::MAX) >= o.slots.max(1);
                         if o.outpost || draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
+                        // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
+                        // then leaves.
+                        if o.ephemeral {
+                            served_dedicated = true;
+                        }
+                        // A new attempt: its events count from one.
+                        journal.remove(&id);
+                        unreceived.remove(&id);
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
@@ -2176,16 +2320,72 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         let cancel = Shutdown::new();
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone() });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone() };
+                        // Its pool's executor, when the leg can run in it as it is; else the leg
+                        // runs the usual way and the executor goes all the same.
+                        let warm = a.executor.slot.as_deref().and_then(|s| pool_execs.take(s));
+                        let warm = match warm {
+                            Some(w) if crate::runner::pool::adoptable(&a, &w) => Some(w),
+                            Some(w) => {
+                                crate::rt::spawn(crate::runner::pool::discard(w));
+                                None
+                            }
+                            None => None,
+                        };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
                         let done = done_tx.clone();
+                        // On the `firecracker` executor, in a microVM of its own (W13-R05).
+                        #[cfg(target_os = "linux")]
+                        let microvm = (leg.a.executor.kind == "firecracker").then(|| microvm_ca.clone());
                         crate::rt::spawn(async move {
+                            #[cfg(target_os = "linux")]
+                            let result = match microvm {
+                                Some(ca) => crate::runner::firecracker::run(leg, Some(ca)).await,
+                                None => leg.run().await,
+                            };
+                            #[cfg(not(target_os = "linux"))]
                             let result = leg.run().await;
                             let _ = done.send(result).await;
                         });
                     }
                     ServerMsg::ProbeFacts => probe_facts(&uplink, &o.work_dir, &o.declared, &probing),
+                    // Start or stop a pool's executor (docs/ci.md W13-R09).
+                    ServerMsg::Executor { json } => {
+                        let ask: crate::runner::pool::Ask = match serde_json::from_str(&json) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "an executor request this runner can't read");
+                                continue;
+                            }
+                        };
+                        let (execs, work, up) = (pool_execs.clone(), o.work_dir.clone(), uplink.clone());
+                        crate::rt::spawn(async move {
+                            if let Some(said) = crate::runner::pool::handle(&execs, &work, ask).await
+                                && let Ok(json) = serde_json::to_string(&said)
+                            {
+                                up.msg(AgentMsg::Executor { json }).await;
+                            }
+                        });
+                    }
+                    // A deployment this runner made, taken down: its environment, a preview, went
+                    // (docs/ci.md W15-R07).
+                    ServerMsg::Undeploy { json } => {
+                        let ask: kiln_ci::wire::Undeploy = match serde_json::from_str(&json) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "a request to take a deployment down this runner can't read");
+                                continue;
+                            }
+                        };
+                        let up = uplink.clone();
+                        crate::rt::spawn(async move {
+                            let error = crate::runner::runtime::undeploy(&ask).await.err().map(|e| format!("{e:#}"));
+                            if let Ok(json) = serde_json::to_string(&kiln_ci::wire::Undeployed { asked: ask, error }) {
+                                up.msg(AgentMsg::Undeployed { json }).await;
+                            }
+                        });
+                    }
                     // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
                     // there (W17-R05): its workspace and environment, or its container; the leg's
                     // secrets masked in what it shows.
@@ -2202,58 +2402,48 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if terms.contains_key(&session) {
                             continue;
                         }
+                        // A leg in a microVM here (W13-R05): its terminal opens in there.
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::open_terminal(&job, &session, cols, rows, command.clone()) {
+                            continue;
+                        }
                         let Some(shell) = crate::runner::kept::shell(&job) else {
+                            // A leg this runner holds but is still setting up: its shell comes once
+                            // its workspace and environment are ready, and the ask is taken again
+                            // then (or after LEG_SHELL_WAIT).
+                            if jobs.contains_key(&job) && !shell_waits.contains_key(&session) {
+                                shell_waits.insert(session.clone(), Vec::new());
+                                let (again, frame, waiting) = (bg_tx.clone(), data.clone(), session.clone());
+                                crate::rt::spawn(async move {
+                                    let until = Instant::now() + LEG_SHELL_WAIT;
+                                    while crate::runner::kept::shell(&job).is_none() && Instant::now() < until {
+                                        crate::rt::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    let _ = again.send(Bg::Again(waiting, frame)).await;
+                                });
+                                continue;
+                            }
+                            shell_waits.remove(&session);
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg isn't running or kept on this runner".into()) })).await.ok();
                             continue;
                         };
-                        let (program, env) = match (&shell.exec, &command) {
-                            (Some(_), Some(c)) => shell.exec_with(c).map_or((None, Vec::new()), |(argv, env)| (Some(argv), env)),
-                            (Some((argv, env)), None) => (Some(argv.clone()), env.clone()),
-                            (None, _) => (None, shell.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                        };
-                        let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                        let cwd = program.is_none().then_some(shell.workdir.as_path());
-                        // A command runs as a step would, in bash; a terminal opens the runner's shell.
-                        let sh = if command.is_some() && !cfg!(windows) { Some("bash") } else { o.shell.as_deref() };
-                        let cmd = command.as_deref().filter(|_| program.is_none());
-                        match terminal::spawn_at(sh, cmd, program.as_deref(), cwd, cols, rows, &env) {
+                        let typed = shell_waits.remove(&session).unwrap_or_default();
+                        let l = shell.launch(command.as_deref(), o.shell.as_deref());
+                        let env: Vec<(&str, String)> = l.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                        match terminal::spawn_at(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env) {
                             Ok((pty, rx)) => {
-                                let tx = term_tx.clone();
-                                let s = session.clone();
-                                let mut masker = kiln_ci::runner::mask::Masker::new(&shell.masks);
+                                let (tx, s, masked) = (term_tx.clone(), session.clone(), crate::runner::kept::masked(rx, &shell.masks));
                                 crate::rt::spawn(async move {
-                                    // The masker holds back what could be the start of a secret (as
-                                    // long as the leg's longest, a token of a kilobyte); a terminal
-                                    // shows the rest, masked, as soon as output pauses.
-                                    loop {
-                                        let out = match crate::rt::timeout(std::time::Duration::from_millis(25), rx.recv()).await {
-                                            Ok(Ok(out)) => out,
-                                            Ok(Err(_)) => break,
-                                            Err(_) => {
-                                                let held = masker.finish();
-                                                if !held.is_empty() && tx.send((s.clone(), PtyOut::Data(held))).await.is_err() {
-                                                    break;
-                                                }
-                                                continue;
-                                            }
-                                        };
-                                        let (out, exit) = match out {
-                                            PtyOut::Data(d) => (PtyOut::Data(masker.push(&d)), false),
-                                            PtyOut::Exit(code) => {
-                                                let rest = masker.finish();
-                                                if !rest.is_empty() && tx.send((s.clone(), PtyOut::Data(rest))).await.is_err() {
-                                                    break;
-                                                }
-                                                (PtyOut::Exit(code), true)
-                                            }
-                                        };
-                                        let empty = matches!(&out, PtyOut::Data(d) if d.is_empty());
-                                        if (!empty && tx.send((s.clone(), out)).await.is_err()) || exit {
+                                    while let Ok(out) = masked.recv().await {
+                                        if tx.send((s.clone(), out)).await.is_err() {
                                             break;
                                         }
                                     }
                                 });
                                 let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
+                                for data in typed {
+                                    pty.write(data);
+                                }
                                 terms.insert(session, (pty, state));
                             }
                             Err(e) => {
@@ -2263,14 +2453,33 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // A kept leg let go now, or kept longer (W17-R02).
                     ServerMsg::KeepRelease { job } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::Release) {
+                            continue;
+                        }
                         crate::rt::spawn(async move {
                             crate::runner::kept::release(&job).await;
                         });
                     }
                     ServerMsg::KeepExtend { job, minutes } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::Extend(minutes)) {
+                            continue;
+                        }
                         crate::runner::kept::extend(&job, minutes);
                     }
+                    ServerMsg::Received { job } if job.is_empty() => receipts = true,
+                    ServerMsg::Received { job } => {
+                        unreceived.remove(&job);
+                        if let Some((_, _, events)) = journal.get_mut(&job) {
+                            events.clear();
+                        }
+                    }
                     ServerMsg::JobRerunStep { job, step, idx } => {
+                        #[cfg(target_os = "linux")]
+                        if crate::runner::firecracker::to_leg(&job, crate::runner::guest::ToGuest::RerunStep { step, idx }) {
+                            continue;
+                        }
                         if !crate::runner::runtime::rerun_step(&job, step, idx) {
                             tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
                         }
@@ -2306,7 +2515,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 };
                 uplink.0.send(Up::Term(msg)).await.ok();
             }
-            Ev::Up(up) => {
+            Ev::Up(mut up) => {
+                // A job's event: numbered, and kept until the job's result is received.
+                let mut journaled = None;
+                if let Up::Msg(AgentMsg::JobEvent { job, json }) = &mut up {
+                    let (at, seq, _) = journal.entry(job.clone()).or_insert_with(|| (Instant::now(), 0, Vec::new()));
+                    *at = Instant::now();
+                    *seq += 1;
+                    if let Some(rest) = json.strip_prefix('{') {
+                        *json = format!("{{\"seq\":{seq}{}{rest}", if rest.trim_start().starts_with('}') { "" } else { "," });
+                    }
+                    journaled = Some(job.clone());
+                }
                 let (lane, kind, data) = match &up {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
                     Up::Log(c) => (LANE_LOGS, Kind::Log, proto::encode(c)),
@@ -2319,8 +2539,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
-                if connected {
-                    net.send(SERVER_PEER, lane, kind, data).await;
+                if let Some((_, _, events)) = journaled.as_ref().and_then(|j| journal.get_mut(j)) {
+                    events.push(data.clone());
+                }
+                // What the next connection sends again (a leg's result not yet received, its
+                // events once the server takes them again) needn't be kept for it.
+                let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some());
+                // Logs and jobs' messages wait for the Welcome too, and come after what waited.
+                if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    match &delay_line {
+                        Some(d) => d.send(lane, kind, data, again),
+                        None => {
+                            net.send(SERVER_PEER, lane, kind, data).await;
+                        }
+                    }
+                } else if again {
+                    // Sent from `unreceived` and `journal` once connected again.
                 } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
@@ -2350,6 +2584,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if jobs.is_empty() {
                         exclusive = false;
                     }
+                    if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
+                        unreceived.insert(r.job.clone(), (Instant::now(), b));
+                    }
                     uplink.msg(AgentMsg::JobFinished(r)).await;
                 } else {
                     // Reported over already: a cancelled job let go of after its grace that ended
@@ -2358,6 +2595,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
+                // Counts of jobs long done (a kept leg is let go well within a day).
+                journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
                 if connected {
                     let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;

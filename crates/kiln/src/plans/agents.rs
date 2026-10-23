@@ -94,6 +94,10 @@ pub struct Config {
     pub opener: Option<String>,
     /// Who ran it, as the audit trail names them.
     pub actor: String,
+    /// Only these steps, by their number from 0 (none: every step): the steps they wait for
+    /// outside them are taken as done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<usize>>,
 }
 
 /// One step of a run, as it stands.
@@ -210,8 +214,8 @@ fn steps_words(i: &[usize]) -> String {
 
 /// What a run says of how its steps run: which run side by side, and, side by side in one folder,
 /// that each step's agent keeps to its own files. None when every step waits for the one before.
-fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<String>]) -> Option<String> {
-    let rounds = super::rounds(needs);
+fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<String>], picked: &[usize]) -> Option<String> {
+    let rounds: Vec<Vec<usize>> = super::rounds(needs).into_iter().map(|r| r.into_iter().filter(|i| picked.contains(i)).collect()).collect();
     let together: Vec<&Vec<usize>> = rounds.iter().filter(|r| r.len() > 1).collect();
     if together.is_empty() {
         return None;
@@ -236,34 +240,53 @@ fn side_by_side(hub: &Hub, cfg: &Config, needs: &[Vec<usize>], given: &[Option<S
 
 /// Runs plan `p` as one agent per step, as `cfg` says. The steps that wait for none start at once.
 pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
+    super::ready_to_run(p)?;
     let n = p.steps.len().min(STEPS);
     if n == 0 {
         return Err(Error::Bad("this plan has no steps (no list in it) to give agents".into()));
     }
-    let given: Vec<Option<String>> = (0..n).map(|i| given_to(hub, &cfg, i)).collect::<R<_>>()?;
+    let picked = super::Pick { only: cfg.only.clone(), split: false }.of(n);
+    if picked.is_empty() {
+        return Err(Error::Bad(format!("none of those steps is in this plan: it has {n}")));
+    }
+    let given: Vec<Option<String>> = (0..n).map(|i| if picked.contains(&i) { given_to(hub, &cfg, i) } else { Ok(None) }).collect::<R<_>>()?;
     let blank = |k: &Option<String>| k.as_deref().is_none_or(|k| k.trim().is_empty());
-    if blank(&cfg.place.kind) && (0..n).any(|i| given.get(i).is_some_and(Option::is_none) && cfg.steps.get(i).is_none_or(|s| blank(&s.kind))) {
+    if blank(&cfg.place.kind) && picked.iter().any(|&i| given.get(i).is_some_and(Option::is_none) && cfg.steps.get(i).is_none_or(|s| blank(&s.kind))) {
         return Err(Error::Bad("say which harness runs its steps: `new.kind` (or each step's `kind`)".into()));
     }
-    let needs = super::waits(&p.items, n, cfg.parallel);
-    let note = side_by_side(hub, &cfg, &needs, &given);
-    let steps: Vec<(String, String, String, Option<String>)> = (0..n)
-        .map(|i| (title_of(p, i), goal_of(p, i, n), serde_json::to_string(needs.get(i).map_or(&[][..], Vec::as_slice)).unwrap_or_else(|_| "[]".into()), given.get(i).cloned().flatten()))
+    // The steps it takes wait only for each other: those outside the run are taken as done.
+    let all = super::waits(&p.items, n, cfg.parallel);
+    let needs: Vec<Vec<usize>> = all.iter().enumerate().map(|(i, d)| if picked.contains(&i) { d.iter().copied().filter(|j| picked.contains(j)).collect() } else { d.clone() }).collect();
+    let outside: Vec<String> = picked
+        .iter()
+        .filter_map(|&i| {
+            let o: Vec<usize> = all.get(i)?.iter().copied().filter(|j| !picked.contains(j)).collect();
+            (!o.is_empty()).then(|| format!("step {} waits for {}", i + 1, steps_words(&o)))
+        })
         .collect();
+    let outside = (!outside.is_empty()).then(|| format!("Not in this run, taken as done: {}.", outside.join("; ")));
+    let note = [side_by_side(hub, &cfg, &needs, &given, &picked), outside].into_iter().flatten().collect::<Vec<_>>();
+    let note = (!note.is_empty()).then(|| note.join(" "));
+    // Each step keeps its number in the plan.
+    let steps: Vec<(usize, String, String, String, Option<String>)> = picked
+        .iter()
+        .map(|&i| (i, title_of(p, i), goal_of(p, i, n), serde_json::to_string(needs.get(i).map_or(&[][..], Vec::as_slice)).unwrap_or_else(|_| "[]".into()), given.get(i).cloned().flatten()))
+        .collect();
+    let taken = steps.len();
     let (run, now, version, plan_id, by) = (crate::util::new_id(), crate::util::now_unix(), p.version, p.id.clone(), cfg.actor.clone());
     let config = serde_json::to_string(&cfg).map_err(anyhow::Error::from)?;
     let (run_c, note_c) = (run.clone(), note.clone());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by, state, config, note) VALUES (?1, ?2, ?3, '', 'agents', ?4, ?5, 'running', ?6, ?7)",
                 params![run_c, plan_id, version, now, by, config, note_c],
             )?;
-            for (i, (title, goal, needs, given)) in steps.iter().enumerate() {
+            for (i, title, goal, needs, given) in &steps {
                 tx.execute(
                     "INSERT INTO plan_run_steps (run_id, idx, title, goal, needs, given_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![run_c, i64::try_from(i).unwrap_or(0), title, goal, needs, given],
+                    params![run_c, i64::try_from(*i).unwrap_or(0), title, goal, needs, given],
                 )?;
             }
             tx.commit()?;
@@ -274,7 +297,7 @@ pub async fn start(hub: &Arc<Hub>, p: &Plan, cfg: Config) -> R<Started> {
     if let Err(e) = advance(hub, &run).await {
         tracing::warn!(%run, error = %format!("{e:#}"), "plan run");
     }
-    Ok(Started { run, steps: n, note })
+    Ok(Started { run, steps: taken, note })
 }
 
 struct Row {
@@ -514,7 +537,7 @@ async fn mark_started(hub: &Hub, run: &str, idx: i64, agent: &str) -> R<()> {
 async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     let at = usize::try_from(row.idx).unwrap_or(0);
     let step = StepRef { plan: head.plan.clone(), version: head.version, n: at + 1, run: Some(run.to_owned()) };
-    let goal = vec![NewGoal { text: row.goal.clone(), step: Some(step) }];
+    let goal = vec![NewGoal { text: row.goal.clone(), step: Some(step), ..NewGoal::default() }];
     if let Some(to) = row.given_to.as_deref() {
         if hub.harness.info(to).is_none() {
             return Err(Error::Bad("the agent it was given to has ended".into()));
@@ -1003,6 +1026,50 @@ mod tests {
         })
     }
 
+    /// The plan an agent proposes (plan mode) is kept as one of kiln's plans: one an agent, a new
+    /// version each time it proposes another, the same words again changing nothing.
+    #[test]
+    fn an_agents_proposed_plan_is_kept_one_an_agent() -> anyhow::Result<()> {
+        on_a_hub(|hub| {
+            Box::pin(async move {
+                let keep = |agent: &'static str, words: &'static str| super::super::keep_proposed(&hub, agent, words);
+                let first = keep("a1", "# Fix the mount\n\n1. Read the log\n2. Fix the rule").await?;
+                anyhow::ensure!(first.title == "Fix the mount" && first.version == 1 && first.steps.len() == 2, "{first:?}");
+                anyhow::ensure!(first.source.as_ref().is_some_and(|s| s.proposed && s.session.as_deref() == Some("a1")), "{:?}", first.source);
+                let same = keep("a1", "# Fix the mount\n\n1. Read the log\n2. Fix the rule\n").await?;
+                anyhow::ensure!(same.id == first.id && same.version == 1, "the same words change nothing: {same:?}");
+                let next = keep("a1", "# Fix the mount, again\n\n1. Read the log\n2. Fix the rule\n3. Test it").await?;
+                anyhow::ensure!(next.id == first.id && next.version == 2 && next.title == "Fix the mount, again" && next.steps.len() == 3, "{next:?}");
+                let other = keep("a2", "1. Something else").await?;
+                anyhow::ensure!(other.id != first.id, "one an agent");
+                Ok(())
+            })
+        })
+    }
+
+    /// A run of some of a plan's steps (`only`) keeps each step's number; the steps they wait for
+    /// outside the run are taken as done (and the run says so), those inside it still wait.
+    #[test]
+    fn a_run_of_some_steps_keeps_their_numbers_and_takes_the_rest_as_done() -> anyhow::Result<()> {
+        on_a_hub(|hub| {
+            Box::pin(async move {
+                let item = |t: &str, needs: Vec<usize>| Item { title: t.into(), needs, ..Item::default() };
+                let items = vec![item("Schema", vec![]), item("Server", vec![1]), item("Client", vec![2]), item("Docs", vec![])];
+                let p = super::super::create(&hub, super::super::New { title: "Some".into(), items, ..Default::default() }, "admin").await?;
+                let place = Place { on: Some("local".into()), kind: Some("claude".into()), cwd: Some("/nonexistent/kiln-plan-some".into()), ..Place::default() };
+                let cfg = Config { place, only: Some(vec![1, 2]), opener: Some("owner".into()), actor: "admin".into(), ..Config::default() };
+                let started = start(&hub, &p, cfg).await?;
+                anyhow::ensure!(started.steps == 2, "{started:?}");
+                anyhow::ensure!(started.note.as_deref().is_some_and(|n| n.contains("Not in this run, taken as done: step 2 waits for step 1.")), "{:?}", started.note);
+                let v = view(&hub, &started.run).await?;
+                let ns: Vec<usize> = v.steps.iter().map(|s| s.n).collect();
+                anyhow::ensure!(ns == [2, 3], "{ns:?}");
+                anyhow::ensure!(stands(&v) == strs(&["working", "waiting"]), "{:?}", stands(&v));
+                Ok(())
+            })
+        })
+    }
+
     /// Run side by side, steps of a plan that doesn't say what they wait for start together, as
     /// many at once as `max_parallel` lets: the next starts as one ends.
     #[test]
@@ -1106,7 +1173,22 @@ mod tests {
     }
 
     fn plan(items: Vec<Item>, steps: Vec<String>) -> Plan {
-        Plan { id: "p".into(), title: "Retry rework".into(), body: String::new(), tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps, items, runs: 0 }
+        Plan {
+            id: "p".into(),
+            title: "Retry rework".into(),
+            body: String::new(),
+            tags: vec![],
+            source: None,
+            share: None,
+            version: 1,
+            created_at: 0,
+            updated_at: 0,
+            steps,
+            items,
+            runs: 0,
+            phase: "ready".into(),
+            research: None,
+        }
     }
 
     #[test]

@@ -46,7 +46,8 @@ fn items_schema() -> Value {
             "examples": {"type": "string"},
             "acceptance": criteria_schema(),
             "testing": {"type": "array", "description": "Tests: each a scenario and the criteria it passes by.", "items": {"type": "object", "properties": {"scenario": {"type": "string"}, "criteria": criteria_schema()}}},
-            "needs": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "The steps (by number, from 1) this one waits for: run with an agent per step, it starts once each is met, and steps that don't wait for each other run side by side. Left out of every step: each waits for the one before."}
+            "needs": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "The steps (by number, from 1) this one waits for: run with an agent per step, it starts once each is met, and steps that don't wait for each other run side by side. Left out of every step: each waits for the one before."},
+            "basis": {"type": "array", "items": {"type": "string"}, "description": "The findings of the plan's research this step rests on (their ids: f1, f2 …)."}
         }, "required": ["title"]}
     })
 }
@@ -59,7 +60,11 @@ const ID: &str = "The plan's id.";
 
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
-    json_of(&json!({"plans": super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?}))
+    // An agent's (made in its conversation), and the one it proposed (plan mode), when asked.
+    let session = s("session").filter(|x| !x.trim().is_empty());
+    let proposed = v.get("proposed").and_then(|p| p.as_bool().or_else(|| p.as_str().map(|s| s == "true" || s == "1"))).unwrap_or(false);
+    let plans = super::of_source(super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?, session.as_deref(), proposed);
+    json_of(&json!({"plans": plans}))
 }
 
 async fn get(cx: Cx, v: Value) -> Out {
@@ -131,6 +136,81 @@ async fn runs_retry(cx: Cx, v: Value) -> Out {
     json_of(&super::agents::retry(&cx.hub, &run, step_of(&v)?, &cx.caller.name).await.map_err(fail)?)
 }
 
+fn goals_fail(e: crate::goals::Error) -> Fail {
+    match e {
+        crate::goals::Error::Bad(m) => (StatusCode::BAD_REQUEST, m),
+        crate::goals::Error::NoAgent => (StatusCode::NOT_FOUND, "the goal's agent isn't there".into()),
+        crate::goals::Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// Ends a plan's planning phase (`super::ready`); a plan made from a goal then goes on as `then`
+/// says: its steps the goal's parts on its agent (`goals`, the default), the same paused for a
+/// person to look first (`review`), or a run with an agent per step that the goal waits for
+/// (`agents`). Once every step is met, so is the goal.
+async fn ready(cx: Cx, v: Value) -> Out {
+    let id = id_of(&v)?;
+    let p = super::get(&cx.hub, &id).await.map_err(fail)?;
+    let goal = p.source.as_ref().and_then(|s| s.goal.clone());
+    if let Some(g) = &goal {
+        crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &g.agent)?;
+    }
+    let then = v.get("then").and_then(Value::as_str).unwrap_or("goals");
+    if !matches!(then, "goals" | "agents" | "review") {
+        return Err((StatusCode::BAD_REQUEST, "`then` is goals, agents or review".into()));
+    }
+    let skipped: Option<crate::research::Skipped> =
+        v.get("skipped").cloned().filter(|s| !s.is_null()).map(serde_json::from_value).transpose().map_err(|e| (StatusCode::BAD_REQUEST, format!("`skipped`: {e}")))?;
+    let was_planning = p.phase == "planning";
+    let (plan, said) = super::ready(&cx.hub, &id, skipped).await.map_err(fail)?;
+    let mut out = json!({"plan": plan, "warnings": said.warnings});
+    // Its research, to show: every claim with its sources and grade, as a person reads it.
+    if let (true, Some(rid)) = (was_planning, plan.research.as_deref())
+        && let Ok(r) = crate::research::get(&cx.hub, rid).await
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("research".into(), json!(crate::research::view(&r, true).markdown));
+        o.insert(
+            "say".into(),
+            json!("Show the person this research now, in your reply, as it is: every finding with its grade, score and sources, and the sources numbered; then the warnings, if any. Then carry on with the plan's first step."),
+        );
+    }
+    if let (Some(g), true) = (goal, was_planning) {
+        let by = crate::goals::By::of(&cx.hub, &cx.caller, &g.agent);
+        let info = cx.hub.harness.info(&g.agent).ok_or_else(|| (StatusCode::NOT_FOUND, "the goal's agent has ended: run the plan another way (plans_run)".to_owned()))?;
+        let (next, run) = if then == "agents" {
+            let place = super::agents::Place {
+                on: Some(crate::harness::wait::machine(&info.target).to_owned()),
+                kind: Some(info.kind.clone()),
+                cwd: Some(info.cwd.clone()),
+                ..super::agents::Place::default()
+            };
+            let cfg = super::agents::Config {
+                place,
+                main: Some(g.agent.clone()),
+                parent: Some(g.agent.clone()),
+                opener: cx.caller.opener(),
+                actor: cx.caller.name.clone(),
+                ..super::agents::Config::default()
+            };
+            let started = super::agents::start(&cx.hub, &plan, cfg).await.map_err(fail)?;
+            (crate::goals::Then::Run(started.run.clone()), started.run)
+        } else {
+            let run = super::note_run(&cx.hub, &plan, &g.agent, "goals", &cx.caller.name).await.map_err(fail)?;
+            (if then == "review" { crate::goals::Then::Review } else { crate::goals::Then::Goals }, run)
+        };
+        let stack = crate::goals::planned(&cx.hub, &g.agent, &g.id, &plan, &run, &next, &by).await.map_err(goals_fail)?;
+        if let Some(o) = out.as_object_mut() {
+            o.insert("then".into(), json!(then));
+            o.insert("goal".into(), json!(g.id));
+            o.insert("run".into(), json!(run));
+            o.insert("stack".into(), serde_json::to_value(&stack).unwrap_or(Value::Null));
+        }
+    }
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.ready".into(), format!("{} (v{})", plan.title, plan.version)).await;
+    Ok(out)
+}
+
 async fn versions(cx: Cx, v: Value) -> Out {
     json_of(&json!({"versions": super::versions(&cx.hub, &id_of(&v)?).await.map_err(fail)?}))
 }
@@ -148,7 +228,19 @@ pub fn agents_config(v: &Value, caller: &crate::authz::Caller) -> Result<super::
         Some(m) => Some(m.as_u64().filter(|m| *m > 0).and_then(|m| usize::try_from(m).ok()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`max_parallel` is a number of steps, 1 or more".to_owned()))?),
     };
     let main = v.get("session").and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).or_else(|| caller.agent.clone());
-    Ok(super::agents::Config { place, steps, parallel, max_parallel, main, parent: caller.agent.clone(), opener: caller.opener(), actor: caller.name.clone() })
+    Ok(super::agents::Config { place, steps, parallel, max_parallel, main, parent: caller.agent.clone(), opener: caller.opener(), actor: caller.name.clone(), only: only_of(v)? })
+}
+
+/// `only`: the steps a run takes, by their numbers from 1 (as from 0).
+fn only_of(v: &Value) -> Result<Option<Vec<usize>>, Fail> {
+    let Some(o) = v.get("only").filter(|o| !o.is_null()) else { return Ok(None) };
+    let bad = || (StatusCode::BAD_REQUEST, "`only` is a list of step numbers, from 1".to_owned());
+    let list = o.as_array().ok_or_else(bad)?;
+    let n: Vec<usize> = list.iter().map(|n| n.as_u64().filter(|n| *n >= 1).and_then(|n| usize::try_from(n - 1).ok()).ok_or_else(bad)).collect::<Result<_, _>>()?;
+    if n.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "`only` names no steps: leave it out to run every step".into()));
+    }
+    Ok(Some(n))
 }
 
 async fn run(cx: Cx, v: Value) -> Out {
@@ -194,7 +286,8 @@ async fn run(cx: Cx, v: Value) -> Out {
             None => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {target, kind, cwd}".into())),
         },
     };
-    let ran = super::run(&cx.hub, &id, target, mode, &crate::harness::ops::starter(&cx)?).await.map_err(fail)?;
+    let pick = super::Pick { only: only_of(&v)?, split: v.get("split").and_then(Value::as_bool).unwrap_or(false) };
+    let ran = super::run(&cx.hub, &id, target, mode, &pick, &crate::harness::ops::starter(&cx)?).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
     json_of(&ran)
 }
@@ -204,10 +297,10 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "plans.list",
-            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag.",
+            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"q": {"type": "string"}, "tag": {"type": "string"}}), &[]),
+            input: || schema(json!({"q": {"type": "string"}, "tag": {"type": "string"}, "session": {"type": "string"}, "proposed": {"type": "boolean"}}), &[]),
             route: |_| Ok((Method::GET, path(&["api", "plans"]))),
             run: |cx, v| Box::pin(list(cx, v)),
         },
@@ -250,6 +343,24 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(update(cx, v)),
         },
         Op {
+            name: "plans.ready",
+            summary: "Say a plan in its planning phase (one made from a goal: goals_plan) is ready: it has steps, its research has sources inside and outside (or `skipped` says why not), and each step rests only on findings of its research (`basis`). What's weak comes back as warnings: say them. A plan made from a goal then goes on as `then` says: `goals` (the default: its steps become the goal's parts on its agent, each splittable into its acceptance criteria and tests), `review` (the same, the stack paused for the person to look at the plan first), or `agents` (it runs with an agent per step, as its `needs` say; the goal waits for the run). Once every step is met, so is the goal.",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "id": {"type": "string", "description": ID},
+                        "then": {"type": "string", "enum": ["goals", "review", "agents"]},
+                        "skipped": {"type": "object", "properties": {"internal": {"type": "string"}, "external": {"type": "string"}}, "description": "Why its research has no internal, or no external, sources."}
+                    }),
+                    &["id"],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "ready"]))),
+            run: |cx, v| Box::pin(ready(cx, v)),
+        },
+        Op {
             name: "plans.versions",
             summary: "Every version of a plan, newest first.",
             read_only: true,
@@ -260,7 +371,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "plans.run",
-            summary: "Run a plan on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (each step a goal), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead.",
+            summary: "Run a plan, or some of its steps (`only`), on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (its steps become goals on that agent's goal stack; `split`: each step a goal stack of its acceptance criteria and tests), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead.",
             read_only: false,
             destructive: false,
             input: || {
@@ -272,7 +383,9 @@ pub fn list_ops() -> Vec<Op> {
                         "mode": {"type": "string", "enum": ["message", "steps", "goals", "agents"], "description": "message: the whole plan at once; steps: a message a turn; goals: each step a goal in the agent's goal stack; agents: each step held to as a goal by an agent of its own (with `new`: on, kind, cwd, model, effort, mode) or by the main agent, each starting once the steps it waits for are met."},
                         "steps": {"type": "array", "description": "agents: where and how each step runs, over `new` (by its place in the list): {on, kind, cwd, model, effort, mode}, or {agent: \"main\"} (or an agent's id) to give the step to that agent: its goal goes on that agent's goal stack, and no agent is started for it.", "items": {"type": "object"}},
                         "parallel": {"type": "boolean", "description": "agents: in a plan whose steps don't say what they wait for (`needs`), run them all side by side rather than each once the one before is met. Side by side in one folder, each step's agent keeps to its own files; give steps folders or machines of their own with `steps`."},
-                        "max_parallel": {"type": "integer", "minimum": 1, "description": "agents: steps at work at once, at the most (left out: every step that's ready)."}
+                        "max_parallel": {"type": "integer", "minimum": 1, "description": "agents: steps at work at once, at the most (left out: every step that's ready)."},
+                        "only": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "Only these steps, by their numbers from 1 (left out: every step); each keeps its number. The steps they wait for outside them are taken as done."},
+                        "split": {"type": "boolean", "description": "goals: each step goes on the stack as a goal stack of its own: its acceptance criteria and tests, a goal each, before it."}
                     }),
                     &["id"],
                 )

@@ -28,11 +28,11 @@ pub const MOST: usize = 400;
 /// Folder entries one look reads at the most: a folder of millions must not hold a runner.
 const ENTRIES: usize = 50_000;
 /// How long git may take over one repository when looking, and over a clone or bundle.
-const STATUS_TIME: Duration = Duration::from_secs(20);
-const LONG: Duration = Duration::from_secs(4 * 3600);
+pub(super) const STATUS_TIME: Duration = Duration::from_secs(20);
+pub(super) const LONG: Duration = Duration::from_secs(4 * 3600);
 
 /// A git command that never prompts, in `dir`.
-fn git(dir: Option<&Path>) -> Command {
+pub(super) fn git(dir: Option<&Path>) -> Command {
     let mut c = Command::new("git");
     crate::os::git_no_prompts(&mut c);
     c.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes").env("LC_ALL", "C");
@@ -43,9 +43,17 @@ fn git(dir: Option<&Path>) -> Command {
 }
 
 /// Runs git, its standard output on success; a failure says what git said.
-async fn run<S: AsRef<OsStr>>(dir: Option<&Path>, args: &[S], timeout: Duration) -> anyhow::Result<String> {
+pub(super) async fn run<S: AsRef<OsStr>>(dir: Option<&Path>, args: &[S], timeout: Duration) -> anyhow::Result<String> {
+    run_with(dir, args, &[], timeout).await
+}
+
+/// [`run`], with `env` set for git.
+pub(super) async fn run_with<S: AsRef<OsStr>>(dir: Option<&Path>, args: &[S], env: &[(&str, &OsStr)], timeout: Duration) -> anyhow::Result<String> {
     let mut c = git(dir);
     c.args(args);
+    for (k, v) in env {
+        c.env(k, v);
+    }
     let what = args.first().map(|a| a.as_ref().to_string_lossy().into_owned()).unwrap_or_default();
     let out = crate::proc::output(c, timeout).await.with_context(|| format!("git {what}"))?;
     if !out.status.success() {
@@ -233,6 +241,11 @@ pub async fn found_at(path: &Path) -> Option<Found> {
     let origin = run(Some(path), &["config", "--get", "remote.origin.url"], STATUS_TIME).await.ok().map(|o| strip_credentials(&o)).filter(|o| !o.is_empty());
     let dot = path.join(".git");
     let active = [dot.join("index"), dot.join("HEAD"), dot.join("FETCH_HEAD"), dot].iter().map(|p| mtime(p)).max().unwrap_or(0);
+    // Its branch against the same branch of the other machines that hold it (`super::share`).
+    let peers = match &s.branch {
+        Some(b) => super::share::peers(path, b).await,
+        None => Vec::new(),
+    };
     Some(Found {
         path: path.to_string_lossy().into_owned(),
         origin,
@@ -244,6 +257,7 @@ pub async fn found_at(path: &Path) -> Option<Found> {
         changed: s.changed,
         active,
         kiln: false,
+        peers,
     })
 }
 

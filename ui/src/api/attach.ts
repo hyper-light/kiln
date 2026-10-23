@@ -24,6 +24,11 @@ export interface AttachLimits {
   reruns_per_failure: number;
   /** How long a job waits for a runner before `stuck` wakes it. */
   stuck_minutes: number;
+  /** How much slower than its recent median a run's critical path gets, in percent, before `slow` wakes it. */
+  slow_percent?: number;
+  /** Tokens its agents spend in a day, and runner minutes their runs take: past either, an incident waits for a person. */
+  tokens_per_day?: number;
+  runner_minutes_per_day?: number;
 }
 
 export interface Attachment {
@@ -96,12 +101,15 @@ export interface AttachmentRow {
 }
 
 /** What wakes one that looks after code; one that looks after runners. */
-export const WAKES_CODE = ["failure", "flaky", "ejected", "stuck", "mention", "schedule"] as const;
+export const WAKES_CODE = ["failure", "flaky", "ejected", "stuck", "slow", "unroutable", "degraded", "mention", "schedule"] as const;
 export const WAKES_RUNNERS = ["offline", "upgrade", "check", "schedule"] as const;
 /** What its agent may do beyond reading what it looks after (W20-R09). */
 export const CAN = ["rerun", "cancel", "diagnose", "fix", "edit-pipelines", "quarantine", "comment", "experiment", "manage-runners", "deploy", "land"] as const;
 
 const enc = encodeURIComponent;
+
+/** The attachments page, its form open on what `on` names (`repo:acme/app`, `environment:acme/app:production`, …): a page's "Attach agent". */
+export const attachHref = (on: string) => `/agents/attached?on=${enc(on)}`;
 
 export type AttachmentInput = Omit<Attachment, "id" | "by" | "created_at" | "updated_at" | "paused"> & { paused?: boolean; attachment?: string };
 

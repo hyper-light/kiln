@@ -146,7 +146,9 @@ struct Sim {
 /// it does then for agents no stack drives, `keep`, is the process's, shared with other tests: the
 /// model's agents have it off). Its own lock for each change: `CHANGING` is the process's too.
 async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, shutdown: Shutdown) {
-    let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None };
+    // Its own counters and no planner, as the driver's tests have (the process's are shared).
+    let metrics = crate::metrics::AgentMetrics::default();
+    let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
     let changing = async_lock::Mutex::new(());
     loop {
         if !d.tick().await {

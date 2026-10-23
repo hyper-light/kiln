@@ -8,11 +8,19 @@
  *   /agents/fam-docs   "Update the docs" (Claude Code, metal-ryzen-02), finished
  *   /agents/fam-migr   "Check the migration" (Claude Code, metal-epyc-01), asks to run a command
  *
+ * And what agents leave running (the activity line by the composer, its Stop and output):
+ *
+ *   /agents/sub-busy   "System page" (Claude Code), its turn over, a subagent still at work, a
+ *                      shell whose output grows, and a monitor; working until they end
+ *   /agents/sub-done   "Release notes" (Claude Code), its subagents done: finished
+ *   /agents/sub-codex  "Scheduler audit" (Codex), a subagent kiln can't stop
+ *
  * The `agents.*` routes answer as the server's do, from these and nothing else.
  */
 import type http from "node:http";
 import type { WebSocket } from "ws";
-import type { AgentInfo, Approval, HEvent, Meta, State } from "../src/api/harness.ts";
+import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import { PROPOSED } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -34,6 +42,8 @@ interface Member {
   info: AgentInfo;
   events: HEvent[];
   approval?: Approval;
+  /** Its subagents and what it left running (`State.tasks`). */
+  tasks?: Task[];
 }
 
 const t0 = Date.now() - 18 * 60_000;
@@ -144,6 +154,37 @@ const family = new Map<string, Member>(
   if (m) m.info.approvals = [{ id: migrApproval.id, tool: migrApproval.tool, tool_name: migrApproval.tool_name, title: migrApproval.title, at: migrApproval.at }];
 }
 
+// Release prep proposed a plan (plan mode), kept by kiln (pages.ts `pl_proposed`), and works through its to-do list.
+{
+  const m = family.get("fam-orch");
+  m?.events.push({ id: "fam-orch-plan", seq: 3, at: t0 + 50_000, kind: "tool", tool_id: "tp1", name: "ExitPlanMode", tool: "plan", title: "Plan ready for review", input: { plan: PROPOSED }, status: "done", started: t0 + 50_000 } as unknown as HEvent);
+  // It records what it found in its research (pages.ts `rs_quic`), as kiln's MCP tool.
+  m?.events.push({
+    id: "fam-orch-research",
+    seq: 4,
+    at: t0 + 55_000,
+    kind: "tool",
+    tool_id: "tr1",
+    name: "mcp__kiln__research_add",
+    tool: "mcp",
+    server: "kiln",
+    tool_short: "research_add",
+    title: "research_add",
+    input: { id: "rs_quic", findings: [{ claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is." }] },
+    output: '{"id": "rs_quic", "question": "Add full hyperaraft dual UDP/QUIC stack replication"}',
+    status: "done",
+    started: t0 + 55_000,
+    ended: t0 + 56_000,
+  } as unknown as HEvent);
+}
+const ORCH_TODOS: Todo[] = [
+  { text: "Reproduce it with the CLI test", status: "completed" },
+  { text: "Key WritableOpens by handle and inode", status: "completed" },
+  { text: "Adopt unseen handles on a restored mount", status: "in_progress" },
+  { text: "Red-first tests: the CLI and coherence tests", status: "pending" },
+  { text: "Clippy, the doc gate and CI", status: "pending" },
+];
+
 /* ------------------------------------------------------------------ a plan run, one agent per step */
 
 const RUN = "pr_agents1";
@@ -160,6 +201,177 @@ for (const m of [
   }),
 ])
   family.set(m.info.id, m);
+
+/* ------------------------------------------------------------------ what agents leave running */
+
+const at = Date.now();
+/** Its entry as the list has it, from its tasks: its subagents, and how many tasks still run. */
+function leaves(m: Member) {
+  const tasks = m.tasks ?? [];
+  const live = tasks.filter((t) => t.status === "running" || t.status === "pending" || t.status === "paused");
+  m.info.subagents = tasks
+    .filter((t) => t.class === "agent")
+    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, started: t.started, ended: t.ended }));
+  m.info.tasks_running = live.length;
+  m.info.left_behind = live.length;
+}
+for (const [m, tasks] of [
+  [
+    member(
+      "sub-busy",
+      "claude",
+      "agent:metal-ryzen-01",
+      "System page",
+      "idle",
+      "acceptEdits",
+      "Bring the System page's figures, the table and the build logs up to date, and keep the mock running while you do.",
+      "Committed locally. The subagent is still on the figures; I'll review its screenshots when it reports.",
+      {
+        last_activity: at - 3 * 60_000,
+      },
+    ),
+    [
+      {
+        id: "a6f2e91c0b7d4e5f8",
+        tool_id: "toolu_figs",
+        description: "System page figures, table, build logs",
+        class: "agent",
+        kind: "local_agent",
+        status: "running",
+        background: true,
+        started: at - 17 * 60_000,
+        last_tool: "Bash",
+        stoppable: true,
+      },
+      {
+        id: "b7x4k2",
+        tool_id: "toolu_mock",
+        description: "Serve the mock",
+        command: "npm exec tsx mock/server.ts",
+        class: "shell",
+        kind: "local_bash",
+        status: "running",
+        background: true,
+        started: at - 7.5 * 60_000,
+        cwd: "/home/ada/src/kiln/ui",
+        output: "/tmp/claude-1000/tasks/b7x4k2.output",
+        stoppable: true,
+      },
+      {
+        id: "m9q1",
+        description: "Wake me if build 412 fails",
+        command: "tail -f build.log | grep -m1 ERROR",
+        class: "monitor",
+        kind: "local_bash",
+        status: "running",
+        started: at - 5 * 60_000,
+        events: 3,
+        last_event: "build 412: 61/80 tests",
+        wakes: "agent",
+        stoppable: true,
+      },
+    ],
+  ],
+  [
+    member(
+      "sub-done",
+      "claude",
+      "agent:metal-ryzen-02",
+      "Release notes",
+      "idle",
+      "default",
+      "Draft the 0.2.1 release notes from what merged this week, one subagent per area.",
+      "The notes are in docs/releases/0.2.1.md: three areas, each checked by its subagent.",
+      {
+        last_activity: at - 2 * 60_000,
+      },
+    ),
+    [
+      {
+        id: "c1",
+        tool_id: "toolu_c1",
+        description: "Notes for the scheduler",
+        class: "agent",
+        kind: "local_agent",
+        status: "completed",
+        started: at - 9 * 60_000,
+        ended: at - 4 * 60_000,
+        stoppable: true,
+      },
+      { id: "c2", tool_id: "toolu_c2", description: "Notes for the UI", class: "agent", kind: "local_agent", status: "completed", started: at - 9 * 60_000, ended: at - 3 * 60_000, stoppable: true },
+    ],
+  ],
+  [
+    member(
+      "sub-codex",
+      "codex",
+      "agent:metal-epyc-01",
+      "Scheduler audit",
+      "idle",
+      "untrusted",
+      "Audit the scheduler's retry paths; send a subagent through the backoff code.",
+      "The subagent is reading the backoff code; I'll fold in what it finds.",
+      {
+        last_activity: at - 60_000,
+      },
+    ),
+    [
+      {
+        id: "019a-child",
+        tool_id: "call_child",
+        description: "Read the backoff code",
+        class: "agent",
+        kind: "subagent",
+        status: "running",
+        started: at - 4 * 60_000,
+        last_tool: "rg backoff",
+        stoppable: false,
+      },
+    ],
+  ],
+] as [Member, Task[]][]) {
+  m.tasks = tasks;
+  leaves(m);
+  family.set(m.info.id, m);
+}
+
+/** A shell's output so far: a line a second while it runs, as a server's log grows. */
+function shellOutput(t: Task): string {
+  const lines = ["> kiln-ui@0.2.0 mock", "> tsx mock/server.ts", "", "mock kiln on http://localhost:7070 (MOCK_NO_AUTH)"];
+  const n = Math.floor(((t.ended ?? Date.now()) - t.started) / 1000);
+  const paths = ["/api/harness/sessions", "/api/overview", "/api/harness/sessions/sub-busy/goals", "/api/me", "/api/runners"];
+  for (let i = 0; i < n; i++) lines.push(`${new Date(t.started + i * 1000).toISOString().slice(11, 19)} GET ${paths[i % paths.length]} 200 ${2 + ((i * 7) % 11)}ms`);
+  if (t.ended) lines.push("^C", "stopped");
+  return `${lines.join("\n")}\n`;
+}
+
+/** A task's output (`taskOutput`), as the server reads it: a shell's file; a monitor keeps none. */
+function taskOutput(m: Member, id: string, since: number | undefined) {
+  const t = m.tasks?.find((x) => x.id === id);
+  if (!t) return { error: "no such task in this session" };
+  const live = t.status === "running" || t.status === "pending" || t.status === "paused";
+  if (t.class !== "shell") return { data: "", offset: since ?? 0, live, gone: true };
+  const text = shellOutput(t);
+  const from = since ?? Math.max(0, text.length - 64 * 1024);
+  return { data: text.slice(from), offset: text.length, live, truncated: from > 0 && since === undefined };
+}
+
+/** Each member's open pages: what changes reaches them. */
+const viewers = new Map<string, Set<WebSocket>>();
+
+/** Stop one of its tasks, as its harness would: it ends, and its entry says so. */
+function stopTask(m: Member, id: string) {
+  const t = m.tasks?.find((x) => x.id === id);
+  if (!t || !(t.status === "running" || t.status === "pending" || t.status === "paused") || !t.stoppable) return;
+  t.status = "stopped";
+  t.ended = Date.now();
+  leaves(m);
+  // A subagent stopped is reported back to it: the last word is new.
+  if (t.class === "agent") m.info.last_activity = Date.now();
+  const state = JSON.stringify({ t: "state", state: stateOf(m) });
+  for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+  emitEvent({ type: "harness", info: m.info });
+}
 
 interface MockStep {
   title: string;
@@ -309,7 +521,7 @@ const META: Meta = {
     { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
   ],
   models: [],
-  commands: [],
+  commands: [{ name: "btw", description: "Ask a side question without interrupting", hint: "<question>", group: "Session", args: "required", route: { kind: "prompt" } }],
   agents: [],
   features: ["interrupt", "set_mode", "steer"],
 };
@@ -326,8 +538,8 @@ function stateOf(m: Member): State {
     approvals: m.approval ? [m.approval] : [],
     queue: [],
     delivery: {},
-    tasks: [],
-    todos: [],
+    tasks: m.tasks ?? [],
+    todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
   } as State;
@@ -338,6 +550,17 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   const m = family.get(id);
   if (!m) return false;
   const send = (u: unknown) => ws.send(JSON.stringify(u));
+  const seen = viewers.get(id) ?? new Set<WebSocket>();
+  viewers.set(id, seen.add(ws));
+  ws.on("close", () => seen.delete(ws));
+  ws.on("message", (raw) => {
+    try {
+      const c = JSON.parse(raw.toString()) as { type?: string; task?: string };
+      if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+    } catch {
+      // Not a command.
+    }
+  });
   send({ t: "open", info: m.info });
   send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0" } });
   send({ t: "state", state: stateOf(m) });
@@ -536,6 +759,13 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
+  const om = p.match(/^\/api\/harness\/sessions\/([^/]+)\/tasks\/([^/]+)\/output$/);
+  const owner = om ? family.get(decodeURIComponent(om[1] ?? "")) : undefined;
+  if (om && owner && m === "GET") {
+    const since = url.searchParams.get("since");
+    json(res, 200, taskOutput(owner, decodeURIComponent(om[2] ?? ""), since === null ? undefined : Number(since)));
+    return true;
+  }
   if (p === "/api/harness/workspaces" && m === "GET") {
     json(res, 200, {
       local: { available: true },

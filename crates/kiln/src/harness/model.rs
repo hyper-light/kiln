@@ -216,8 +216,13 @@ pub struct Hunk {
 /// touched it to how it is now.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChange {
-    /// Relative to the session's directory when inside it.
+    /// Relative to its working tree's top ([`FileChange::tree`]) when it's in one, else to the
+    /// session's directory when inside it.
     pub path: String,
+    /// The top of the git working tree it's in, when that's one of the session's repository's: its
+    /// folder's own, or a worktree of it the agent works in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -952,6 +957,11 @@ pub struct State {
     pub reach: Option<String>,
     #[serde(default)]
     pub cwd: String,
+    /// The working tree its work is in: the top of the one its latest change is in (its folder's,
+    /// or a worktree of its repository), once it has changed a file in one. What's asked of git
+    /// about its work is asked there (`Info::work_dir`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
@@ -1057,6 +1067,11 @@ pub struct State {
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The most subagents it runs at once (Agent settings): its harness's own, and the agents it
+    /// starts through kiln, each. None: as many as its harness and kiln's `[agents] max_children`
+    /// let it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// A pause ends only when a person resumes it, not by itself at the reset.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manual_resume: bool,
@@ -1235,6 +1250,21 @@ pub struct ExitInfo {
     pub code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Unix ms it ended: what a stop is known by (its card, a person's mark of it), so a refresh
+    /// or a restart is never another stop.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub at: i64,
+}
+
+impl ExitInfo {
+    /// It ended now, with `code` and `error`.
+    pub fn now(code: Option<i32>, error: Option<String>) -> Self {
+        Self { code, error, at: crate::util::now_ms() }
+    }
+}
+
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
 }
 
 /// What rarely changes: what the harness supports and offers.
@@ -1468,6 +1498,11 @@ pub enum Command {
         #[serde(default)]
         percent: Option<u8>,
     },
+    /// The most subagents it runs at once (`State::max_subagents`). None: no limit of its own.
+    MaxSubagents {
+        #[serde(default)]
+        count: Option<u32>,
+    },
     /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`),
     /// and where (`State::move_plan`): a machine (`agent:<name>`), a harness and a model there.
     MoveOnLimit {
@@ -1479,8 +1514,8 @@ pub enum Command {
         #[serde(default)]
         model: Option<String>,
     },
-    /// Another session on the same account reached a usage limit: wait for its reset too (the
-    /// server sends it).
+    /// Another session on the same account reached a usage limit: wait for its reset too, if its
+    /// own usage says the limit is its own as well (the server sends it; `pause::account_hold`).
     LimitHold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window: Option<String>,

@@ -56,6 +56,7 @@ pub fn token_path(cfg: &Config) -> PathBuf {
 
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
@@ -67,7 +68,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
-    let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
+    let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
+    tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
     let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
     let requeued = store.recover().await?;
     if requeued > 0 {
@@ -97,8 +99,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     })?;
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
-    let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone())?;
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
+    // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
+    crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.
@@ -130,6 +134,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }};
     }
     child!("scheduler", h => h.scheduler_loop());
+    child!("blobs", h => crate::blobs::run(h));
+    child!("transcripts", h => crate::harness::archive::run(h));
     // `kiln workflow run`'s own server (docs/ci.md W17-R06) runs CI and nothing else: no polling
     // or schedules, terminals, agents, sync, fleet or UI.
     if !cfg.ci.local {
@@ -153,10 +159,21 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
         child!("land-queue", h => crate::ci::land::run_loop(h));
         child!("github-checks", h => crate::githost::github::checks_loop(h));
+        child!("host-statuses", h => crate::githost::statuses::statuses_loop(h));
         child!("ci-providers", h => crate::ci::providers::sync_loop(h));
+        child!("pool-samples", h => crate::ci::pools::sample_loop(h));
         child!("diff-runs", h => crate::ci::review::runs_loop(h));
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
         child!("attachments", h => crate::ci::attach::run(h));
+        child!("previews", h => crate::ci::previews::run(h));
+        child!("review-replies", h => crate::ci::replies::run(h));
+        // Bisections and experiments this server was driving when it stopped stopped with it
+        // (docs/ci.md W20).
+        let h = hub.clone();
+        crate::rt::spawn(async move {
+            crate::ci::bisect::interrupted(&h).await;
+            crate::ci::experiments::interrupted(&h).await;
+        });
         child!("registry-collect", h => crate::ci::registry::collect_loop(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));
@@ -195,6 +212,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 k.reap_loop(hub).await
             }
         });
+        // The `k8s` pools' executor pods (docs/ci.md W13-R07).
+        let h = hub.clone();
+        sup::spawn(reg, "k8s-pods", shutdown.clone(), move || crate::ci::pools::reap_pods(h.clone()));
     } else {
         let _ = hub.k8s.set(None);
     }
@@ -277,6 +297,51 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             tracing::warn!(error = %format!("{e:#}"), "the registry's accept failed");
+                            crate::rt::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // kiln's OIDC issuer on addresses of its own (docs/ci.md W10-R12): its two documents and
+    // nothing else, so they can face the internet without the rest of kiln.
+    let issuer_tls = match (&cfg.ci.oidc.listen_cert, &cfg.ci.oidc.listen_key) {
+        (Some(c), Some(k)) => {
+            let cert = std::fs::read_to_string(c).with_context(|| format!("[ci.oidc] listen_cert {}", c.display()))?;
+            let key = std::fs::read_to_string(k).with_context(|| format!("[ci.oidc] listen_key {}", k.display()))?;
+            Some(crate::http::tls::ServerTls::from_pem(&cert, &key).context("[ci.oidc] listen_cert and listen_key")?)
+        }
+        (None, None) => registry_tls.clone(),
+        _ => anyhow::bail!("[ci.oidc] listen_cert and listen_key go together"),
+    };
+    for listen in cfg.ci.oidc.listen.clone() {
+        let h = hub.clone();
+        let sd = shutdown.clone();
+        let tls = issuer_tls.clone();
+        sup::spawn(reg, &format!("issuer {listen}"), shutdown.clone(), move || {
+            let (hub, sd, tls, listen) = (h.clone(), sd.clone(), tls.clone(), listen.clone());
+            async move {
+                let addr: SocketAddr = listen.parse().with_context(|| format!("[ci.oidc] listen {listen}"))?;
+                let std_listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+                let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128).map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
+                tracing::info!(%addr, https = tls.is_some(), "the OIDC issuer listening");
+                let only = Arc::new(crate::ci::oidc::Only::new(hub));
+                loop {
+                    let accepted = futures::select_biased! {
+                        () = sd.cancelled().fuse() => return Ok(()),
+                        r = listener.accept().fuse() => r,
+                    };
+                    match accepted {
+                        Ok(stream) => {
+                            let (only, remote, tls) = (only.clone(), stream.peer_addr().ok(), tls.clone());
+                            crate::rt::spawn_spread(async move {
+                                crate::http::server::serve_accepted(stream, only, remote, tls.as_ref()).await;
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "the issuer's accept failed");
                             crate::rt::sleep(Duration::from_millis(100)).await;
                         }
                     }

@@ -14,7 +14,7 @@ use super::kept::{Job, Keeper, Kept};
 use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
-use super::session::{Info, MAX_NAME, Spec, SubagentBrief};
+use super::session::{Held, Info, MAX_NAME, Spec, SubagentBrief};
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
 use crate::rt::Broadcast;
@@ -263,6 +263,9 @@ pub struct Registry {
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
     /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
     epochs: Mutex<HashMap<String, u64>>,
+    /// The plan each session last proposed (plan mode), not yet kept as one of kiln's plans: the
+    /// goals' driver keeps it ([`Self::take_proposed`], `crate::plans::keep_proposed`).
+    proposed: Mutex<HashMap<String, String>>,
     /// Restoring the conversation store from a mirror's copy of it.
     restore: Mutex<Restore>,
     /// The mirrors to ask for their copy as they connect: the store was found empty at start
@@ -324,6 +327,11 @@ impl Registry {
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
+        // No record goes before kiln's store of bytes has it: held back entirely until the archive
+        // of transcripts (`super::archive`) says how far it has come.
+        if let Some(c) = &convo {
+            c.hold_prune(0);
+        }
         // Runners that keep a store send it here; the server keeps their sessions from that. What
         // a mirror sends back to restore the store from isn't sent to it again.
         let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
@@ -371,6 +379,7 @@ impl Registry {
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            proposed: Mutex::new(HashMap::new()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
             restore: Mutex::new(Restore::Idle),
@@ -520,6 +529,30 @@ impl Registry {
             m.info.clone()
         };
         hub.emit(&json!({"type": "harness", "info": info}));
+    }
+
+    /// The plans sessions proposed (plan mode) since the last look, by session, each its latest.
+    pub fn take_proposed(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.proposed.lock()).into_iter().collect()
+    }
+
+    /// What each agent's goals wait on a person for (`goals::held_stacks`, every tick of the goals'
+    /// driver): each one that changes told to every viewer.
+    pub fn set_held(&self, hub: &Hub, held: &HashMap<String, Held>) {
+        let mut changed = Vec::new();
+        {
+            let mut g = self.mirrors.lock();
+            for (id, m) in g.iter_mut() {
+                let now = held.get(id).cloned();
+                if m.info.held != now {
+                    m.info.held = now;
+                    changed.push(m.info.clone());
+                }
+            }
+        }
+        for info in changed {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
     }
 
     /// A session is given a name here (the "rename" control from any device; empty gives it its
@@ -702,12 +735,17 @@ impl Registry {
     }
 
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
+        #[cfg(not(test))]
+        super::acp::warm_models();
         let mut all = self.kinds.lock().clone();
         // The server's own harnesses: the models its sessions listed since it started.
         for k in all.get_mut("local").into_iter().flatten() {
             let m = super::kinds::models_of(&k.id);
             if !m.is_empty() {
                 k.models = m;
+            }
+            if k.id == "devin" && let Some(kind) = super::kinds::Kind::get(&k.id) {
+                k.efforts = kind.efforts();
             }
         }
         all
@@ -798,10 +836,13 @@ impl Registry {
         let mut gone = false;
         // Finished messages' mentions of files, to keep once the mirrors are let go.
         let mut jobs: Vec<Job> = Vec::new();
+        // The plan it proposed (plan mode) in these events, to keep as one of kiln's plans.
+        let mut proposed: Option<String> = None;
         let mut save_names = false;
         // The account's other sessions, which pause too (`hold_account`).
         let mut hold: Option<(Command, Vec<(String, Location)>)> = None;
-        let mut hold_for: Option<String> = None;
+        // Its account, and the window reached and when that starts over.
+        let mut hold_for: Option<(String, Option<String>, Option<i64>)> = None;
         // Where it runs, and the name given here, are the server's to say: to the mirror and to
         // viewers alike (a session announced again — a switch of harness, a reconnect — keeps its
         // machine and its name). The machine's own name is kept aside: it counts once it changes it.
@@ -835,7 +876,9 @@ impl Registry {
         {
             let mut g = self.mirrors.lock();
             if let Update::Open { info } = &u {
-                let info = (**info).clone();
+                let mut info = (**info).clone();
+                // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
+                info.held = g.get(id).and_then(|m| m.info.held.clone());
                 let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone()));
                 m.info = info.clone();
                 m.reported = reported;
@@ -896,7 +939,7 @@ impl Registry {
                         let c = Command::LimitHold { window: p.window.clone(), label: p.label.clone(), until: p.until, said: p.said.clone() };
                         hold = Some((c, Vec::new()));
                         // Collected below, once this mirror is let go.
-                        hold_for = Some(account);
+                        hold_for = Some((account, p.window.clone(), p.until));
                     }
                 }
                 Update::Meta { meta } => m.meta = serde_json::to_value(meta).unwrap_or(Value::Null),
@@ -905,6 +948,9 @@ impl Registry {
                     for e in events {
                         if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
                             jobs.push(job);
+                        }
+                        if let Some(plan) = proposed_in(e) {
+                            proposed = Some(plan);
                         }
                         if let Ok(v) = serde_json::to_value(e) {
                             m.upsert(v);
@@ -926,10 +972,14 @@ impl Registry {
                 g.remove(id);
                 save_names = self.names.lock().remove(id).is_some() || save_names;
             }
-            if let (Some(account), Some((_, targets))) = (hold_for.as_ref(), hold.as_mut()) {
+            if let (Some((account, window, until)), Some((_, targets))) = (hold_for.as_ref(), hold.as_mut()) {
+                let now = crate::util::now_ms();
                 *targets = g
                     .iter()
                     .filter(|(other, o)| other.as_str() != id && o.info.account.as_deref() == Some(account.as_str()) && o.info.pause.is_none() && o.info.status != Status::Exited)
+                    // Not one whose own limits show the limit isn't its own: another account's
+                    // (an account id gone stale), another model's.
+                    .filter(|(_, o)| super::pause::shares(&o.info.limits, &o.info.model, window.as_deref(), *until, now) != Some(false))
                     .map(|(other, o)| (other.clone(), o.location.clone()))
                     .collect();
             }
@@ -940,6 +990,9 @@ impl Registry {
         for job in jobs {
             self.keeper.enqueue(job);
         }
+        if let Some(plan) = proposed {
+            self.proposed.lock().insert(id.to_owned(), plan);
+        }
         if save_names {
             self.save_names();
         }
@@ -947,6 +1000,7 @@ impl Registry {
             self.keeper.forget(id);
             self.visuals.forget(id);
             self.opened.forget(id);
+            super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
@@ -954,7 +1008,8 @@ impl Registry {
     }
 
     /// A session reached its account's usage limit: the account's other sessions, on every machine,
-    /// pause until it resets too, rather than each finding out by failing.
+    /// pause until it resets too, rather than each finding out by failing; each one whose own usage
+    /// says the limit is its own as well (`pause::account_hold`).
     fn hold_account(&self, hub: &Hub, c: &Command, targets: Vec<(String, Location)>) {
         let Ok(json) = serde_json::to_string(c) else { return };
         for (id, loc) in targets {
@@ -1007,6 +1062,7 @@ impl Registry {
         };
         self.kinds.lock().insert(format!("agent:{machine}"), inv.kinds);
         for id in gone {
+            super::archive::closed(hub, &id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }
     }
@@ -1151,6 +1207,7 @@ impl Registry {
                         name: spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| default_name(&spec.kind)),
                         shell: spec.shell.clone(),
                         cwd: spec.cwd.clone().unwrap_or_default(),
+                        tree: None,
                         created_at: now,
                         status: Status::Starting,
                         title: String::new(),
@@ -1159,6 +1216,7 @@ impl Registry {
                         harness_session: spec.resume.clone(),
                         approvals: Vec::new(),
                         queued: 0,
+                        queue: Vec::new(),
                         tasks_running: 0,
                         subagents: Vec::new(),
                         cost_usd: 0.0,
@@ -1185,9 +1243,11 @@ impl Registry {
                         pause: None,
                         last_turn: None,
                         keep_off: false,
+                        held: None,
                         move_on_limit: false,
                         move_plan: Default::default(),
                         pause_at: None,
+                        max_subagents: None,
                         parent: spec.parent.clone(),
                         plan_run: spec.plan_run.clone(),
                         no_bypass: !spec.allow_bypass,
@@ -1306,10 +1366,13 @@ impl Registry {
     /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is
     /// told, to take up the account (Claude Code starts again with it once its turn ends; Codex reads
     /// it again).
-    pub async fn signed_in(&self, hub: &Hub, target: &str, kind: &str) {
+    pub async fn signed_in(&self, hub: &Hub, target: &str, kind: &str, account: Option<&crate::accounts::Account>) {
+        // Who it's signed in as now, so each session takes it at once rather than when it next
+        // starts (its page would show the old account, and that account's usage, until then).
+        let value = account.map(|a| serde_json::json!({"email": a.email, "org": a.org, "plan": a.plan, "method": a.method}));
         let ids: Vec<String> = self.list().into_iter().filter(|i| i.target == target && i.kind == kind).map(|i| i.id).collect();
         for id in ids {
-            let _ = self.command(hub, &id, Command::Control { id: "account".into(), value: None }).await;
+            let _ = self.command(hub, &id, Command::Control { id: "account".into(), value: value.clone() }).await;
         }
     }
 
@@ -1439,6 +1502,7 @@ impl Registry {
             if let Some(store) = &self.convo {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
+            super::archive::closed(hub, id);
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }
         ok || loc.is_some()
@@ -1452,6 +1516,12 @@ impl Registry {
     /// A session as lists show it.
     pub fn info(&self, id: &str) -> Option<Info> {
         self.mirrors.lock().get(id).map(|m| m.info.clone())
+    }
+
+    /// What waits in session `id`'s queue, as its machine last said, the messages whole.
+    pub fn queue(&self, id: &str) -> Vec<super::model::QueueItem> {
+        let g = self.mirrors.lock();
+        g.get(id).and_then(|m| m.state.get("queue")).and_then(|q| serde_json::from_value(q.clone()).ok()).unwrap_or_default()
     }
 
     /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as
@@ -1485,9 +1555,35 @@ fn default_name(kind: &str) -> String {
     super::kinds::Kind::get(kind).map_or_else(|| kind.to_owned(), |k| k.name.to_owned())
 }
 
+/// The plan an event proposes (plan mode): its main thread's plan tool, with its words.
+fn proposed_in(e: &super::model::Event) -> Option<String> {
+    let super::model::Body::Tool(call) = &e.body else { return None };
+    if e.parent.is_some() || call.tool != super::model::ToolKind::Plan {
+        return None;
+    }
+    call.input.get("plan").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan its main thread proposes (plan mode) is one to keep; a subagent's, another tool's,
+    /// or one without words isn't.
+    #[test]
+    fn a_plan_proposed_in_plan_mode_is_one_to_keep() -> anyhow::Result<()> {
+        let ev = |parent: Value, tool: &str, input: Value| -> anyhow::Result<crate::harness::model::Event> {
+            Ok(serde_json::from_value(
+                json!({"id": "e1", "seq": 1, "at": 1, "parent": parent, "kind": "tool", "tool_id": "t1", "name": "ExitPlanMode", "tool": tool, "title": "Plan", "input": input, "status": "pending", "started": 1}),
+            )?)
+        };
+        let plan = "# Fix it\n\n1. Read\n2. Fix";
+        assert_eq!(proposed_in(&ev(Value::Null, "plan", json!({ "plan": plan }))?).as_deref(), Some(plan));
+        assert_eq!(proposed_in(&ev(json!("task1"), "plan", json!({"plan": "1. a"}))?), None, "a subagent's");
+        assert_eq!(proposed_in(&ev(Value::Null, "shell", json!({"plan": "1. a"}))?), None, "another tool's");
+        assert_eq!(proposed_in(&ev(Value::Null, "plan", json!({"plan": "  "}))?), None, "no words");
+        Ok(())
+    }
 
     #[test]
     fn a_name_given_here_holds_whatever_the_machine_knows_of_names() {

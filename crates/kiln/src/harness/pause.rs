@@ -3,11 +3,12 @@
 //!
 //! A session pauses when its harness says its account reached a usage limit (Claude Code's
 //! `rate_limit` error, Codex's `usageLimitExceeded`, an ACP agent's limit error), when another
-//! session on the account did (`Command::LimitHold`, from the server), or once a limit is as full
-//! as `State::pause_at`: between turns, or in the middle of one at its next step (what runs then,
-//! a command or an edit, finishes first; [`stop_mid_turn`]). While it is paused nothing goes to
-//! the harness: kiln's queue, goals and plan steps wait, and a message sent meanwhile joins the
-//! queue. Its folder is kept as it was in a hidden git ref (`Effect::Checkpoint`).
+//! session on the account did and the limit is its own too (`Command::LimitHold`, from the server;
+//! [`account_hold`]), or once a limit is as full as `State::pause_at`: between turns, or in the
+//! middle of one at its next step (what runs then, a command or an edit, finishes first;
+//! [`stop_mid_turn`]). While it is paused nothing goes to the harness: kiln's queue, goals and
+//! plan steps wait, and a message sent meanwhile joins the queue. Its folder is kept as it was in
+//! a hidden git ref (`Effect::Checkpoint`).
 //!
 //! Once the window starts over (`Pause::until`, plus a margin and a spread across the account's
 //! sessions), kiln asks the harness for its usage. A limit no longer reached ends the pause: the
@@ -169,6 +170,71 @@ pub fn hold(core: &mut Core, reason: &str, by: &str, hit: Hit, cut: Option<Cut>)
     true
 }
 
+/// A limit another session on the account reached (`Command::LimitHold`) that this one's own
+/// limits didn't settle: its harness is asked for its usage, and the answer does ([`checked`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ask {
+    pub hit: Hit,
+    /// Unix ms the harness was asked, once it was.
+    pub asked: Option<i64>,
+}
+
+/// Another session on the account reached a usage limit (`Command::LimitHold`): this one pauses
+/// until it resets too, rather than finding out by failing, if the limit is its own as well. Its
+/// own limits say whether it is ([`shares`]): a limit they show isn't (another account's, another
+/// model's) leaves it be; one they don't settle is asked of its harness first ([`step`], then
+/// [`checked`]). Paused, it keeps to its own settings, as at any limit: whether it goes on by itself
+/// at the reset, and whether on another machine. True when it paused.
+pub fn account_hold(core: &mut Core, hit: Hit) -> bool {
+    // On no account kiln knows: no other session's limit is its own.
+    if core.state.account.is_none() {
+        return false;
+    }
+    match shares(&core.state.limits, &core.state.model, hit.window.as_deref(), hit.until, Core::now()) {
+        Some(true) => hold(core, LIMIT, "account", hit, None),
+        Some(false) => false,
+        None => {
+            core.limit_ask = Some(Ask { hit, asked: None });
+            false
+        }
+    }
+}
+
+/// Whether a limit another session on the account reached (its window, and when that starts over)
+/// is this session's too, as its own limits say. Some(false): they show it isn't: that window starts
+/// over at another time here (its usage is another account's), or the window is another model's
+/// (Weekly · Opus, to a session on Sonnet). Some(true): they show it reached here too. None: they
+/// don't say (nothing known of the window here, only from before it last started over, or not full
+/// when last reported). With no window said: whether any of its own is reached.
+pub fn shares(limits: &[Limit], model: &str, window: Option<&str>, until: Option<i64>, now: i64) -> Option<bool> {
+    let Some(window) = window else {
+        return limits.iter().any(|l| for_model(&l.id, model) && reached(l, now)).then_some(true);
+    };
+    if !for_model(window, model) {
+        return Some(false);
+    }
+    let own = limits.iter().find(|l| l.id == window && l.unit.is_none())?;
+    let resets = own.resets_at.filter(|r| *r > now)?;
+    if until.is_some_and(|u| resets.abs_diff(u) > SAME_RESET_MS.unsigned_abs()) {
+        return Some(false);
+    }
+    reached(own, now).then_some(true)
+}
+
+/// Whether a window counts for a session on `model`: the account's own windows count for every
+/// model; one model's (`seven_day_opus`, `model:fable`) for that model, or one kiln can't tell.
+fn for_model(window: &str, model: &str) -> bool {
+    let only = window.strip_prefix("model:").or_else(|| window.strip_prefix("seven_day_").filter(|m| matches!(*m, "opus" | "sonnet")));
+    let model = model.to_lowercase();
+    only.is_none_or(|m| !model.starts_with("claude-") || model.contains(m))
+}
+
+/// Whether a window is used up as last reported (or said reached, when its use isn't known), and
+/// hasn't started over since.
+fn reached(l: &Limit, now: i64) -> bool {
+    l.unit.is_none() && l.resets_at.is_none_or(|r| r > now) && l.used_percent.map_or(l.status.as_deref() == Some("rejected"), |u| u >= 100.0)
+}
+
 /// The timeline's one line about a pause; `cut`: it stopped a turn part-way.
 fn pause_words(reason: &str, by: &str, label: Option<&str>, said: &str, auto: bool, cut: bool) -> String {
     let limit = label.map_or_else(|| "a usage limit".to_owned(), |l| format!("its {l} limit"));
@@ -213,7 +279,19 @@ pub enum Step {
 
 /// A pause's timer, every tick: time to check whether its limit reset, or to give up waiting for
 /// the answer to a check and go on. `key` spreads one account's sessions apart (its session id).
+/// Another session's limit to ask about ([`account_hold`]) is asked first; with no answer, it's
+/// let be.
 pub fn step(core: &mut Core, now: i64, key: &str) -> Step {
+    match core.limit_ask.as_ref().map(|a| a.asked) {
+        Some(None) => {
+            if let Some(a) = core.limit_ask.as_mut() {
+                a.asked = Some(now);
+            }
+            return Step::Check;
+        }
+        Some(Some(at)) if now.saturating_sub(at) >= CHECK_WAIT_MS => core.limit_ask = None,
+        _ => {}
+    }
     let Some(p) = core.state.pause.as_ref() else { return Step::Nothing };
     if !p.auto {
         return Step::Nothing;
@@ -242,9 +320,25 @@ pub fn step(core: &mut Core, now: i64, key: &str) -> Step {
 
 /// The harness answered a check (its usage is in `State::limits` now): the pause ends when its
 /// limit isn't reached any more, else it waits for the window's next reset (or checks again
-/// later, when that isn't known). The pause ended is returned.
+/// later, when that isn't known). The pause ended is returned. Asked about another session's
+/// limit ([`account_hold`]), it pauses only if its own usage shows that limit reached.
 pub fn checked(core: &mut Core, now: i64) -> Option<Pause> {
+    if let Some(ask) = core.limit_ask.take()
+        && shares(&core.state.limits, &core.state.model, ask.hit.window.as_deref(), ask.hit.until, now) == Some(true)
+    {
+        hold(core, LIMIT, "account", ask.hit, None);
+    }
     let p = core.state.pause.as_ref()?;
+    // A limit the account no longer has (it was signed out of, or its limit started over early):
+    // the window waited for resets at another time now and isn't full. It goes on now rather than
+    // at a reset that won't come.
+    if p.checking.is_none() && !core.state.manual_resume && gone(&core.state.limits, p, cap_of(p, core.state.pause_at)) {
+        let why = match p.label.as_deref() {
+            Some(l) => format!("The {l} limit it waited for is gone; going on."),
+            None => "The limit it waited for is gone; going on.".to_owned(),
+        };
+        return release(core, &why);
+    }
     p.checking?;
     let cap = cap_of(p, core.state.pause_at);
     let reached = still_reached(&core.state.limits, p.window.as_deref(), cap, now);
@@ -269,6 +363,13 @@ pub fn checked(core: &mut Core, now: i64) -> Option<Pause> {
         None => "The limit reset; going on.".to_owned(),
     };
     release(core, &why)
+}
+
+/// Whether the window pause `p` waits for is gone: the usage now says it resets at another time
+/// than the pause waits for, and isn't full.
+fn gone(limits: &[Limit], p: &Pause, cap: f64) -> bool {
+    let (Some(window), Some(until)) = (p.window.as_deref(), p.until) else { return false };
+    limits.iter().filter(|l| l.id == window && l.unit.is_none()).any(|l| l.used_percent.is_some_and(|u| u < cap) && l.resets_at.is_some_and(|r| r.abs_diff(until) > SAME_RESET_MS.unsigned_abs()))
 }
 
 /// Whether the window a pause waits for is still as full as it may get: Some(true) yes,
@@ -593,6 +694,28 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_for_a_window_that_started_over_at_another_time_goes_on_at_the_next_usage() {
+        let mut core = Core::new();
+        let now = Core::now();
+        let until = now + 3 * 86_400_000;
+        core.state.limits = vec![window("seven_day", 100.0, until)];
+        hold(&mut core, LIMIT, "account", Hit { window: Some("seven_day".into()), until: Some(until), said: String::new() }, None);
+        assert!(checked(&mut core, now).is_none() && core.state.pause.is_some());
+        // The week it waits for, a little less full or its reset said a little differently: it waits.
+        core.state.limits = vec![window("seven_day", 97.0, until + 60_000)];
+        assert!(checked(&mut core, now).is_none() && core.state.pause.is_some());
+        // Its usage says the week starts over days later, and has room (another account now, or
+        // the limit started over early): it goes on.
+        core.state.limits = vec![window("seven_day", 67.0, until + 3 * 86_400_000)];
+        let ended = checked(&mut core, now);
+        assert!(ended.is_some() && core.state.pause.is_none());
+        // One a person resumes by hand waits for the person, whatever the usage says.
+        core.state.manual_resume = true;
+        hold(&mut core, LIMIT, "account", Hit { window: Some("seven_day".into()), until: Some(until), said: String::new() }, None);
+        assert!(checked(&mut core, now).is_none() && core.state.pause.is_some());
+    }
+
+    #[test]
     fn a_check_with_no_answer_goes_on() {
         let mut core = Core::new();
         hold(&mut core, LIMIT, "harness", Hit { window: None, until: Some(1_000), said: String::new() }, None);
@@ -723,6 +846,82 @@ mod tests {
         core.state.limits = vec![window("five_hour", 99.0, Core::now() - 1)];
         assert!(!stop_mid_turn(&mut core));
         assert!(core.state.pause.is_none());
+    }
+
+    #[test]
+    fn another_accounts_or_models_limit_isnt_its_own() {
+        let now = 1_000_000;
+        let reset = now + 3_600_000;
+        let own = [window("five_hour", 12.0, reset), window("seven_day", 39.0, reset + 86_400_000)];
+        // The window starts over hours apart from the one reached: another account's.
+        assert_eq!(shares(&own, "claude-opus-5-5", Some("five_hour"), Some(reset - 9_000_000), now), Some(false));
+        // The same window, not used up as last said here: its harness is asked.
+        assert_eq!(shares(&own, "claude-opus-5-5", Some("five_hour"), Some(reset + 1_000), now), None);
+        // Used up here too: its own.
+        let full = [window("five_hour", 100.0, reset)];
+        assert_eq!(shares(&full, "claude-opus-5-5", Some("five_hour"), Some(reset), now), Some(true));
+        // Nothing known of it here, or only from before it started over: asked.
+        assert_eq!(shares(&[], "claude-opus-5-5", Some("five_hour"), Some(reset), now), None);
+        assert_eq!(shares(&[window("five_hour", 100.0, now - 1)], "claude-opus-5-5", Some("five_hour"), Some(reset), now), None);
+        // One model's window, to a session on another model; to one on it, as its limits say.
+        let opus = [window("seven_day_opus", 100.0, reset)];
+        assert_eq!(shares(&opus, "claude-fable-5-1", Some("seven_day_opus"), Some(reset), now), Some(false));
+        assert_eq!(shares(&opus, "claude-opus-5-5", Some("seven_day_opus"), Some(reset), now), Some(true));
+        assert_eq!(shares(&[], "claude-opus-5-5", Some("model:fable"), Some(reset), now), Some(false));
+        // A model kiln can't tell: asked.
+        assert_eq!(shares(&[], "default", Some("model:fable"), Some(reset), now), None);
+        // No window said: any of its own used up.
+        assert_eq!(shares(&full, "claude-opus-5-5", None, None, now), Some(true));
+        assert_eq!(shares(&own, "claude-opus-5-5", None, None, now), None);
+    }
+
+    #[test]
+    fn another_sessions_limit_holds_it_only_when_its_own_usage_says_so() {
+        let reset = Core::now() + 3_600_000;
+        let session = |used: f64, resets_at: i64| {
+            let mut core = Core::new();
+            core.state.account = Some("claude:max:abc".into());
+            core.state.model = "claude-opus-5-5".into();
+            core.state.limits = vec![window("five_hour", used, resets_at)];
+            core
+        };
+        let hit = || Hit { window: Some("five_hour".into()), until: Some(reset), said: "You've hit your session limit".into() };
+        // Another account's: it goes on, and asks nothing.
+        let mut other = session(12.0, reset + 9_000_000);
+        assert!(!account_hold(&mut other, hit()));
+        assert!(other.state.pause.is_none() && other.limit_ask.is_none());
+        // Used up here too, as last said: it pauses now, as one held for the account.
+        let mut full = session(100.0, reset);
+        assert!(account_hold(&mut full, hit()));
+        assert_eq!(full.state.pause.as_ref().map(|p| p.by.as_str()), Some("account"));
+        // Not used up as last said: its harness is asked first, once, and its answer settles it.
+        let now = Core::now();
+        let mut near = session(97.0, reset);
+        assert!(!account_hold(&mut near, hit()));
+        assert!(near.state.pause.is_none());
+        assert_eq!(step(&mut near, now, "k"), Step::Check);
+        assert_eq!(step(&mut near, now + 1_000, "k"), Step::Nothing);
+        near.state.limits = vec![window("five_hour", 100.0, reset)];
+        assert!(checked(&mut near, now + 2_000).is_none());
+        assert_eq!(near.state.pause.as_ref().map(|p| (p.by.as_str(), p.until)), Some(("account", Some(reset))));
+        // The answer says there's room: it goes on.
+        let mut room = session(97.0, reset);
+        account_hold(&mut room, hit());
+        assert_eq!(step(&mut room, now, "k"), Step::Check);
+        room.state.limits = vec![window("five_hour", 98.0, reset)];
+        assert!(checked(&mut room, now + 2_000).is_none());
+        assert!(room.state.pause.is_none() && room.limit_ask.is_none());
+        // No answer: it's let be.
+        let mut quiet = session(97.0, reset);
+        account_hold(&mut quiet, hit());
+        assert_eq!(step(&mut quiet, now, "k"), Step::Check);
+        assert_eq!(step(&mut quiet, now + CHECK_WAIT_MS, "k"), Step::Nothing);
+        assert!(quiet.state.pause.is_none() && quiet.limit_ask.is_none());
+        // On no account kiln knows: no other session's limit is its own.
+        let mut none = session(100.0, reset);
+        none.state.account = None;
+        assert!(!account_hold(&mut none, hit()));
+        assert!(none.state.pause.is_none());
     }
 
     #[test]

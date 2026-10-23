@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use http::{Method, StatusCode};
-use hyper::body::Incoming;
+use kiln_http::Incoming;
 use serde_json::{Value, json};
 
 use super::flow::{self, Ask, Fail, RollbackAsk, Who};
@@ -268,6 +268,9 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         // For linked servers (§11): where this one is and what it signs with, and what runs of an
         // app in one of its environments, signed for the server asking (`audience`, its issuer).
         (&Method::GET, ["link"]) => ok(&link::about(&d.hub)),
+        // Where release repositories may be (§7): kiln's own git server, GitHub through kiln's App,
+        // each GitLab with the groups its token covers, Bitbucket with its workspaces.
+        (&Method::GET, ["git-hosts"]) => ok(&json!({ "hosts": boxed(|| git_hosts(&d.hub)).await })),
         (&Method::GET, ["apps", app, "environments", env, "statement"]) => {
             let audience = q.get("audience").map(|a| a.trim()).filter(|a| !a.is_empty() && a.len() <= 512).ok_or_else(|| bad("`audience`: the issuer of the server asking"))?;
             match boxed(|| link::statement(&d, app, env, audience)).await.map_err(internal)? {
@@ -318,6 +321,22 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
         }
         _ => Err((StatusCode::NOT_FOUND, "not found".into())),
     }
+}
+
+/// The git hosts release repositories may be on (docs/deploy-api.md §7).
+async fn git_hosts(hub: &Hub) -> Vec<Value> {
+    use super::model::{BITBUCKET_HOST, GITHUB_HOST, GITLAB_HOST, KILN_HOST};
+    let mut out = vec![json!({ "host": KILN_HOST, "name": "kiln's own git server" })];
+    if let Some(app) = crate::githost::github::app(hub).await {
+        out.push(json!({ "host": GITHUB_HOST, "name": "GitHub", "web": app.web }));
+    }
+    for g in crate::githost::gitlab::hosts(hub).await {
+        out.push(json!({ "host": GITLAB_HOST, "name": "GitLab", "web": g.web, "groups": g.groups() }));
+    }
+    if let Some(b) = crate::githost::bitbucket::host(hub).await {
+        out.push(json!({ "host": BITBUCKET_HOST, "name": "Bitbucket", "web": b.web, "groups": b.workspaces() }));
+    }
+    out
 }
 
 /// Every registration with what runs and what's in flight, and what waits for people: the
@@ -593,7 +612,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
-            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), hub: Arc::clone(&hub) };
+            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub: Arc::clone(&hub) };
             let st = &hub.store;
             store::put_environment(st, &env("staging", KILNCD)).await?;
             store::put_environment(st, &env("argo", "argocd/prod")).await?;

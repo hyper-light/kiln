@@ -1,7 +1,8 @@
 //! GitLab's and Bitbucket's webhooks (docs/ci.md W23-R04, R05; docs/deploy-api.md §7): checked
 //! with the host's webhook secret (GitLab's `X-Gitlab-Token`, Bitbucket's `X-Hub-Signature`), then
-//! a push hints that a poll is due, and a pipeline, job, deployment or build status brings the run
-//! it's about into kiln at once.
+//! a push hints that a poll is due, a pipeline, job, deployment or build status brings the run
+//! it's about into kiln at once, and a release repository's push or a release's merge or pull
+//! request moves that release.
 
 use std::sync::Arc;
 
@@ -34,6 +35,12 @@ pub async fn gitlab(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         return Err((StatusCode::UNAUTHORIZED, "bad token".into()));
     }
     let path = v.pointer("/project/path_with_namespace").and_then(Value::as_str).unwrap_or_default().to_owned();
+    // A release repository's push, or a release's merge request (docs/deploy-api.md §7).
+    if matches!(event.as_str(), "Push Hook" | "Merge Request Hook")
+        && let Some(d) = crate::deploy::get()
+    {
+        crate::deploy::remote::on_gitlab_event(&d, &event, &v).await;
+    }
     let Some(repo) = repo_named(hub, &path, |r| host.name_of(r)).await else {
         hub.gitops_kick.notify();
         return Ok(srv::status(StatusCode::ACCEPTED));
@@ -67,6 +74,12 @@ pub async fn bitbucket(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
     }
     let v: Value = serde_json::from_slice(&body).map_err(|e| (StatusCode::BAD_REQUEST, format!("not JSON: {e}")))?;
     let full = v.pointer("/repository/full_name").and_then(Value::as_str).unwrap_or_default().to_owned();
+    // A release repository's push, or a release's pull request (docs/deploy-api.md §7).
+    if (event == "repo:push" || event.starts_with("pullrequest:"))
+        && let Some(d) = crate::deploy::get()
+    {
+        crate::deploy::remote::on_bitbucket_event(&d, &event, &v).await;
+    }
     let Some(repo) = repo_named(hub, &full, |r| host.name_of(r)).await else {
         hub.gitops_kick.notify();
         return Ok(srv::status(StatusCode::ACCEPTED));

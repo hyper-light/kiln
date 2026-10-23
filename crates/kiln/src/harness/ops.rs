@@ -6,8 +6,9 @@
 //! An agent that calls them is the parent of what it starts (`Caller::agent`, from how it reached
 //! kiln), which gets no more than it has (`super::lineage`). An agent steers, interrupts and ends
 //! only the agents it started (and theirs); it may send a queued message to any agent that works
-//! for the same person, which is told who sent it. No operation answers what waits on a person: an
-//! agent's approvals, questions and plans are for people, in kiln.
+//! for the same person, which is told who sent it. An agent's `agents.wait` hands over the messages
+//! other agents sent it rather than leave them behind its turn. No operation answers what waits on
+//! a person: an agent's approvals, questions and plans are for people, in kiln.
 
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -121,7 +122,8 @@ async fn send(cx: Cx, v: Value) -> Out {
             return Err((StatusCode::FORBIDDEN, format!("an agent steers into a turn and sends now only to the agents it started (and theirs), and {} isn't one of them: send it a queued message instead", lineage::short(&id))));
         }
     };
-    let message = crate::util::new_id();
+    // From an agent, its id says who sent it: the receiver's agents_wait hands it over.
+    let message = cx.caller.agent.as_deref().map_or_else(crate::util::new_id, super::queued::from_agent);
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
     match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None }).await {
         Sent::Ok => Ok(json!({"sent": true, "message": message})),
@@ -136,6 +138,9 @@ fn from_peer(cx: &Cx, text: &str) -> String {
     peer_text(cx.hub.harness.info(me).as_ref(), me, text)
 }
 
+/// How what kiln says of a fellow agent's message ends (`peer_text`), before the message itself.
+const ANSWER_END: &str = "\"text\": …}.";
+
 /// `text` from agent `me` (`sender`, as kiln lists it): who sent it, that it isn't from the
 /// receiver's person, and how to answer.
 fn peer_text(sender: Option<&Info>, me: &str, text: &str) -> String {
@@ -143,7 +148,33 @@ fn peer_text(sender: Option<&Info>, me: &str, text: &str) -> String {
         Some(s) => format!("Agent “{}” ({}, {} on {})", s.name, lineage::short(me), s.kind, wait::machine(&s.target)),
         None => format!("Agent {}", lineage::short(me)),
     };
-    format!("{who}, which works for the same person as you, sent this message. It's from a fellow agent, not from your person. To answer, send it a message: agents_send {{\"agent\": \"{me}\", \"text\": …}}.\n\n{text}")
+    format!("{who}, which works for the same person as you, sent this message. It's from a fellow agent, not from your person. To answer, send it a message: agents_send {{\"agent\": \"{me}\", {ANSWER_END}\n\n{text}")
+}
+
+/// The words of a message from another agent: what follows what kiln says of a fellow agent
+/// (`peer_text`), or all of it.
+fn body_of(text: &str) -> &str {
+    text.split_once("\n\n").filter(|(said, _)| said.starts_with("Agent ") && said.ends_with(ANSWER_END)).map_or(text, |(_, body)| body)
+}
+
+/// The messages other agents sent the agent that waits, waiting behind the turn its wait began in
+/// (`wait::mail`), handed over: each taken for this wait alone and out of its queue (one that can't
+/// be stays, for after its turn), with who sent it and its words.
+async fn hand_over(hub: &crate::hub::Hub, me: &wait::Waiter) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mail = hub.harness.info(&me.id).map(|i| wait::mail(me, &i)).unwrap_or_default();
+    if mail.is_empty() {
+        return out;
+    }
+    for q in hub.harness.queue(&me.id).into_iter().filter(|q| mail.contains(&q.id)) {
+        let Some(from) = super::queued::sender_of(&q.id).map(str::to_owned) else { continue };
+        if !wait::claim(&q.id) || !matches!(hub.harness.command(hub, &me.id, Command::QueueRemove { id: q.id.clone() }).await, Sent::Ok) {
+            continue;
+        }
+        let name = hub.harness.info(&from).map(|i| i.name);
+        out.push(json!({"from": from, "name": name, "text": body_of(&q.text), "at": q.at}));
+    }
+    out
 }
 
 /// The agents a wait is for: `agent`, or `agents`.
@@ -184,7 +215,11 @@ async fn wait_for(cx: Cx, v: Value) -> Out {
         other => return Err((StatusCode::BAD_REQUEST, format!("`until` is settled or change, not {other:?}"))),
     };
     let secs = number(&v, "timeout_s").unwrap_or(wait::DEFAULT.as_secs_f64()).clamp(0.0, wait::MAX.as_secs_f64());
-    let out = wait::wait(&cx.hub, &ids, until, flag(&v, "any"), std::time::Duration::from_secs_f64(secs)).await;
+    // An agent waits in a turn of its own: what other agents sent it is handed over to that turn,
+    // unless it says not to (a program's waits in code mode don't, unless they ask).
+    let hands = v.get("hand_over").and_then(Value::as_bool).unwrap_or(true);
+    let me = cx.caller.agent.as_deref().filter(|_| hands).map(|me| wait::Waiter::of(&cx.hub, me));
+    let mut out = wait::wait(&cx.hub, &ids, until, flag(&v, "any"), std::time::Duration::from_secs_f64(secs), me.as_ref()).await;
     // What a parent saw settle here, it isn't told of again (`told`).
     for id in &ids {
         if let Some(info) = cx.hub.harness.info(id)
@@ -192,7 +227,16 @@ async fn wait_for(cx: Cx, v: Value) -> Out {
             && info.parent == cx.caller.agent
             && wait::settled(wait::stand(&info))
         {
-            super::told::saw(&info);
+            super::told::saw(&cx.hub, &info).await;
+        }
+    }
+    // The messages other agents sent it: delivered here, not after its turn.
+    if let Some(me) = &me {
+        let handed = hand_over(&cx.hub, me).await;
+        if !handed.is_empty()
+            && let Some(o) = out.as_object_mut()
+        {
+            o.insert("messages".into(), json!(handed));
         }
     }
     Ok(out)
@@ -209,7 +253,7 @@ async fn result(cx: Cx, v: Value) -> Out {
     let id = info.id.clone();
     // Its parent reading it now isn't told of it again (`told`).
     if info.parent.is_some() && info.parent == cx.caller.agent {
-        super::told::saw(&info);
+        super::told::saw(&cx.hub, &info).await;
     }
     let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     // Its last words, from its timeline; else as lists keep them (shortened).
@@ -219,7 +263,9 @@ async fn result(cx: Cx, v: Value) -> Out {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|f| json!({"path": f.get("path"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false)}))
+        .map(|f| {
+            json!({"path": f.get("path"), "tree": f.get("tree"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false)})
+        })
         .collect();
     Ok(json!({
         "agent": wait::brief(&info),
@@ -227,6 +273,8 @@ async fn result(cx: Cx, v: Value) -> Out {
         "last_turn": info.last_turn,
         "changes": {"files": files, "files_changed": info.files_changed, "lines_added": info.lines_added, "lines_removed": info.lines_removed},
         "cwd": info.cwd,
+        // The working tree its work is in, when it went into one (a worktree): its files' paths are its.
+        "tree": info.tree,
         "machine": wait::machine(&info.target),
         "cost_usd": info.cost_usd,
         // Its workspace of its own (docs/agentic.md, W): the folder it's laid over, and its volume.
@@ -377,13 +425,13 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.start",
-            summary: "Start agents to do part of the work: `kind` (claude, codex, gemini, opencode, goose, amp, antigravity), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
+            summary: "Start agents to do part of the work: `kind` (claude, codex, devin, gemini, opencode, goose, amp, antigravity), `on` a machine's name or what it needs (linux/amd64, macos, +gpu, cpus>=16; the idlest that suits and has the harness; by default your own machine), `cwd` (by default your folder, on your machine), `prompt` (the brief: what to do, what done looks like, what to report), `model`, `effort`, `mode` (at most your own: plan < ask < accept edits < auto < bypass), `name`, `count` (up to 16). An agent you start is your child: it gets no more than you have, and its approvals and questions go to a person, never to you. Carry on or end your turn: kiln tells you when it settles (its turn over, a person needed, stopped), then agents.result reads what it concluded; agents.wait when you can't go on without it.",
             read_only: false,
             destructive: false,
             input: || {
                 schema(
                     json!({
-                        "kind": {"type": "string", "description": "The harness: claude, codex, gemini, opencode, goose, amp or antigravity."},
+                        "kind": {"type": "string", "description": "The harness: claude, codex, devin, gemini, opencode, goose, amp or antigravity."},
                         "on": {"type": "string", "description": "A machine's name (local for the server), or what it needs: linux/amd64, macos, arm64, +gpu, cpus>=16, mem>=32g."},
                         "cwd": {"type": "string", "description": "Its folder there (a path, or ~/…)."},
                         "prompt": {"type": "string", "description": "Its first message: the task."},
@@ -411,7 +459,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.wait",
-            summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn. You needn't wait: kiln tells you when each agent you started settles; wait when you can't go on without it.",
+            summary: "Wait until agents settle (`until: settled`, the default: each is idle, needs a person, is paused for a usage limit, has stopped or has ended) or until anything about them changes (`until: change`), all of them or with `any` the first, up to `timeout_s` (default 300, at most 600; call again to wait longer). Returns where each stands. A message sent just before counts: an agent isn't settled until it has had its turn. Messages other agents send you don't wait behind your turn while you wait: it returns early once one is in your queue, with them in `messages` (who sent each, `from` and `name`, and its `text`), taken out of your queue since they're delivered now (a program's waits in code mode don't hand them over unless they pass `hand_over: true`, and then must return them). You needn't wait: kiln tells you when each agent you started settles; wait when you can't go on without it.",
             read_only: true,
             destructive: false,
             input: || {
@@ -421,7 +469,8 @@ pub fn list_ops() -> Vec<Op> {
                         "agents": {"type": "array", "items": {"type": "string"}, "description": "Several agents."},
                         "until": {"type": "string", "enum": ["settled", "change"]},
                         "any": {"type": "boolean", "description": "Return when the first of them is done, rather than all."},
-                        "timeout_s": {"type": "number", "minimum": 0, "maximum": 600}
+                        "timeout_s": {"type": "number", "minimum": 0, "maximum": 600},
+                        "hand_over": {"type": "boolean", "description": "Hand over the messages other agents sent you, taking them out of your queue (default true; false for a program's waits in code mode unless it says true)."}
                     }),
                     &[],
                 )
@@ -712,6 +761,178 @@ mod end_to_end {
         assert!(text.ends_with("\n\nWhich commit adds the embedding API?"), "{text}");
         // One kiln no longer lists still says who, by id.
         assert!(super::peer_text(None, me, "hi").starts_with("Agent 01a14887,"));
+        // A wait hands it over as its words, without what kiln says of its sender.
+        assert_eq!(super::body_of(&text), "Which commit adds the embedding API?");
+        assert_eq!(super::body_of(&super::peer_text(None, me, "First line.\n\nSecond.")), "First line.\n\nSecond.");
+        assert_eq!(super::body_of("Rebase on main, then go on.\n\nThanks."), "Rebase on main, then go on.\n\nThanks.", "a parent's own words, as they are");
+    }
+
+    /// Until `f` holds (the registry hears from the sessions' machines a moment later).
+    #[cfg(unix)]
+    async fn until(f: impl Fn() -> bool, what: &str) -> anyhow::Result<()> {
+        for _ in 0..500 {
+            if f() {
+                return Ok(());
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::bail!("{what}: never")
+    }
+
+    /// The incident, whole. A coordinator spends one long turn (its harness took its first message
+    /// and never ends the turn) while its three helpers, on a machine of their own, settle again
+    /// and again; two fellow agents send it messages; its goal stack is resumed now and then and
+    /// its first goal said met. When it waits for a helper still at work, the fellow agents'
+    /// messages come back with the wait and leave its queue. What's left there for when its turn
+    /// ends is one message of news, each helper's latest line in it once, and its goal under way,
+    /// once.
+    #[test]
+    #[cfg(unix)]
+    fn a_coordinator_in_one_long_turn_ends_it_with_one_message_of_news_its_goal_once_and_its_mail_handed_over() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::harness::core::Update;
+        use crate::harness::model::{State, Status, TurnEnd};
+        use crate::harness::registry::Location;
+        use crate::harness::session::Info;
+        run(async {
+            let hub = hub_with(|c| c.conversations.off = true).await?;
+            // A stand-in for Claude Code that takes what it's sent and never answers.
+            let dir = tempfile::tempdir()?.keep();
+            let busy = dir.join("busy-claude");
+            std::fs::write(&busy, "#!/bin/sh\nexec cat > /dev/null\n")?;
+            std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755))?;
+            let spec = Spec {
+                kind: "claude".into(),
+                name: Some("Coordinator".into()),
+                cwd: Some(dir.to_string_lossy().into_owned()),
+                program: Some(busy.to_string_lossy().into_owned()),
+                prompt: Some("Work the program's goals with your helpers.".into()),
+                ..Spec::default()
+            };
+            let p = hub.harness.open(&hub, "local", spec, 1).await?.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no coordinator"))?;
+            until(|| hub.harness.info(&p).is_some_and(|i| i.status == Status::Running), "the coordinator's turn").await?;
+            let me = as_agent(&hub, &p).await?;
+            // Two agents of the same person, apart from it: they only send.
+            let (a, b) = (parent(&hub, "default", true).await?, parent(&hub, "default", true).await?);
+            // Its helpers, as their machine reports them.
+            let there = Location::Machine("helpers".into());
+            let kids: Vec<String> = (0..3).map(|_| crate::util::new_id()).collect();
+            for (n, k) in kids.iter().enumerate() {
+                let info = Info { id: k.clone(), kind: "claude".into(), name: format!("Helper {}", n + 1), parent: Some(p.clone()), status: Status::Running, ..Info::default() };
+                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info) });
+            }
+            let report = |k: &str, status: Status, said: String, at: i64| {
+                let state = State { status, summary: said, last_turn: (at > 0).then(|| TurnEnd { at, how: "done".into(), ..TurnEnd::default() }), ..State::default() };
+                hub.harness.ingest(&hub, &there, k, Update::State { state: Box::new(state) });
+            };
+            let queue = || hub.harness.queue(&p);
+            let news = || queue().into_iter().filter(|q| q.text.contains("which you started")).collect::<Vec<_>>();
+            let goals = || queue().into_iter().filter(|q| q.text.starts_with("Your goal")).count();
+            // Its goals: the first goes behind its turn at once.
+            crate::goals::add(&hub, &p, vec!["the lab program passes".into(), "the view loads in 300 ms".into()], true).await?;
+            until(|| goals() == 1, "its first goal, queued").await?;
+            let mut now = 1_792_000_000_000_i64;
+            crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
+            for round in 0..6 {
+                // Each helper goes to work and ends a turn, and stands so a while.
+                for k in &kids {
+                    report(k, Status::Running, String::new(), 0);
+                }
+                now += 1_000;
+                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
+                for (n, k) in kids.iter().enumerate() {
+                    report(k, Status::Idle, format!("Helper {} finished round {round}.", n + 1), now + i64::try_from(n).unwrap_or(0));
+                }
+                now += 1_000;
+                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
+                now += 4_000;
+                crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
+                let latest = |q: &crate::harness::model::QueueItem| (1..=3).all(|n| q.text.contains(&format!("Helper {n} finished round {round}.")));
+                until(|| news().iter().any(latest), "the round's news, waiting").await?;
+                anyhow::ensure!(news().len() == 1, "round {round}: one message of news, not {:?}", news());
+                match round {
+                    // Fellow agents write.
+                    1 => {
+                        call(as_agent(&hub, &a).await?, "agents.send", json!({"agent": p, "text": "The registry's tests pass on my side."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                    }
+                    3 => {
+                        call(as_agent(&hub, &b).await?, "agents.send", json!({"agent": p, "text": "I'm holding fedora until 14:00."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                    }
+                    _ => {}
+                }
+                // Its stack resumed (its goal sent again, behind the turn); its first goal met.
+                if round % 2 == 0 {
+                    crate::goals::control(&hub, &p, crate::goals::Action::Start).await?;
+                }
+                if round == 4 {
+                    crate::goals::done(&hub, &p, None, Some("the lab program passed"), &crate::goals::By::Itself).await?;
+                    until(|| queue().iter().any(|q| q.text.starts_with("Your goal: the view loads")), "its next goal").await?;
+                }
+                anyhow::ensure!(goals() == 1, "round {round}: its goal once, not {}: {:?}", goals(), queue());
+                // It read the second helper's result: that line comes out of the news (and back once it settles again).
+                if round == 2 {
+                    let read = call(me.clone(), "agents.result", json!({"agent": kids.get(1)})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                    anyhow::ensure!(read.get("agent").is_some(), "{read}");
+                    until(|| news().iter().all(|q| !q.text.contains("Helper 2 finished")), "the line it saw, out of the news").await?;
+                }
+            }
+            until(|| queue().iter().filter(|q| crate::harness::queued::sender_of(&q.id).is_some()).count() == 2, "the fellow agents' messages, waiting").await?;
+            // The third helper goes back to work; it waits for it, and the wait returns at once with its mail.
+            if let Some(k) = kids.get(2) {
+                report(k, Status::Running, String::new(), 0);
+            }
+            // (A wait that says not to, as a program's in code mode does, hands nothing over.)
+            let program = call(me.clone(), "agents.wait", json!({"agent": kids.get(2), "timeout_s": 1, "hand_over": false})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(program.get("timed_out") == Some(&json!(true)) && program.get("messages").is_none(), "{program}");
+            anyhow::ensure!(queue().iter().filter(|q| crate::harness::queued::sender_of(&q.id).is_some()).count() == 2, "{:?}", queue());
+            let waited = call(me.clone(), "agents.wait", json!({"agent": kids.get(2), "timeout_s": 30})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(waited.get("timed_out") == Some(&json!(false)) && waited.pointer("/agents/0/stand") == Some(&json!("working")), "{waited}");
+            let mail: Vec<(String, String)> = waited.get("messages").and_then(Value::as_array).into_iter().flatten().map(|m| (m.get("from").and_then(Value::as_str).unwrap_or("").to_owned(), m.get("text").and_then(Value::as_str).unwrap_or("").to_owned())).collect();
+            anyhow::ensure!(mail == [(a.clone(), "The registry's tests pass on my side.".to_owned()), (b.clone(), "I'm holding fedora until 14:00.".to_owned())], "{waited}");
+            until(|| queue().iter().all(|q| crate::harness::queued::sender_of(&q.id).is_none()), "the messages handed over, out of its queue").await?;
+            // What waits for the end of its turn: one message of news, each helper's latest line once, and its goal once.
+            let left = queue();
+            let news = news();
+            anyhow::ensure!(left.len() == 2 && news.len() == 1 && goals() == 1, "{left:?}");
+            let text = news.first().map(|q| q.text.clone()).unwrap_or_default();
+            anyhow::ensure!(text.matches("which you started").count() == 3, "each helper once: {text}");
+            for n in 1..=3 {
+                anyhow::ensure!(text.contains(&format!("Helper {n} finished round 5.")), "helper {n}'s latest: {text}");
+                anyhow::ensure!(!text.contains(&format!("Helper {n} finished round 4.")), "helper {n}'s older line: {text}");
+            }
+            anyhow::ensure!(left.iter().any(|q| q.text.starts_with("Your goal: the view loads in 300 ms")), "{left:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_agent_held_to_fewer_subagents_starts_no_more_through_kiln() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let dir = tempfile::tempdir()?.keep();
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.to_string_lossy().into_owned()),
+                mode: Some("plan".into()),
+                program: Some(dir.join("no-claude").to_string_lossy().into_owned()),
+                max_subagents: Some(1),
+                ..Spec::default()
+            };
+            let infos = hub.harness.open(&hub, "local", spec, 1).await?;
+            let id = infos.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no parent"))?;
+            for _ in 0..200 {
+                if hub.harness.info(&id).is_some_and(|i| i.max_subagents == Some(1)) {
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            let cx = as_agent(&hub, &id).await?;
+            // Under kiln's own 24, its settings say one at once.
+            let two = call(cx, "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE, "count": 2})).await;
+            anyhow::ensure!(two.as_ref().is_err_and(|(_, m)| m.contains("its settings")), "{two:?}");
+            Ok(())
+        })
     }
 
     #[test]

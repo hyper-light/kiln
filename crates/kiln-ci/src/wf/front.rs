@@ -3,7 +3,7 @@
 //! problems become diagnostics; whatever can be read is still read, so the editor sees as much as
 //! possible.
 
-use super::diag::{Diag, Range, suggest};
+use super::diag::{Diag, Edit, Range, suggest};
 use super::ir::{
     Axis, Concurrency, Container, Defaults, Environment, Input, Job, JobKiln, JobSecrets, Matrix, MatrixSpec, Need, Output, Permissions, RunsOn, Schedule,
     SecretDecl, Step, StepKiln, Strategy, Tpl, Trigger, Workflow, YVal,
@@ -26,6 +26,18 @@ pub(crate) fn is_job_id(s: &str) -> bool {
 }
 
 impl Fe<'_> {
+    /// `kiln: { chain-depth }`: from 1 to 10 (W03-R13).
+    pub(crate) fn chain_depth(&mut self, v: &Node) -> Option<u32> {
+        let n = v.get("chain-depth")?;
+        match n.as_scalar() {
+            Some(Scalar::Int(i)) if (1..=10).contains(i) => u32::try_from(*i).ok(),
+            _ => {
+                self.err("KCI1015", "`chain-depth` is a number from 1 to 10 (GitHub's `workflow_run` chains stop at 3)", n.range, "kiln.chain-depth");
+                None
+            }
+        }
+    }
+
     fn kiln(&self) -> bool {
         self.dialect == Dialect::Kiln
     }
@@ -62,8 +74,15 @@ impl Fe<'_> {
                 Some(_) => out.push((name, v, k.range)),
                 None => {
                     let candidates = table.iter().filter(|c| self.kiln() || !c.kiln).map(|c| c.name);
-                    let hint = suggest(&name, candidates).map(|s| format!(" (did you mean `{s}`?)")).unwrap_or_default();
-                    self.err("KCI1010", format!("unknown key `{name}`{hint}"), k.range, &at);
+                    match suggest(&name, candidates) {
+                        // The key it likely means, the editor's quick fix (W21-R01).
+                        Some(s) => self.diags.push(
+                            Diag::error("KCI1010", format!("unknown key `{name}` (did you mean `{s}`?)"), k.range)
+                                .at(&at)
+                                .with_fix(format!("Rename it `{s}`"), vec![Edit { range: k.range, text: s.to_owned() }]),
+                        ),
+                        None => self.err("KCI1010", format!("unknown key `{name}`"), k.range, &at),
+                    }
                 }
             }
         }
@@ -205,7 +224,10 @@ impl Fe<'_> {
                 "supersede" => wf.supersede = Some(self.yval(v)),
                 "routing" => wf.routing_infer = v.get("infer").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)),
                 "run-env" => wf.run_env = self.bool(v, "run-env").unwrap_or(false),
-                "kiln" => wf.honour_skip_ci = v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)),
+                "kiln" => {
+                    wf.honour_skip_ci = v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true));
+                    wf.chain_depth = self.chain_depth(v);
+                }
                 "checkout" => wf.checkout = self.bool(v, "checkout").unwrap_or(true),
                 _ => {
                     let _ = kr;
@@ -726,6 +748,7 @@ impl Fe<'_> {
                 "quarantine" => kiln.quarantine_enforce = v.text().as_deref() == Some("enforce"),
                 "bench-gate" => kiln.bench_gate = Some(self.yval(v)),
                 "deploy" => kiln.deploy = Some(self.yval(v)),
+                "test-results" => kiln.test_results = Some(self.yval(v)),
                 "agents" => kiln.agents = Some(self.yval(v)),
                 "artifacts" => kiln.artifacts = self.str_list(v, &at),
                 "checkout" => kiln.checkout = self.bool(v, &at),
@@ -744,6 +767,17 @@ impl Fe<'_> {
             }
         }
         j.kiln = kiln;
+        // `deploy: { environment }` (kiln) binds the job to it, as `environment:` does (W15-R05).
+        if let Some(env) = j.kiln.deploy.as_ref().and_then(|d| d.get("environment")).and_then(YVal::as_str).map(str::to_owned) {
+            match &j.environment {
+                None => j.environment = Some(Environment { name: Tpl::new(env, Default::default()), url: None, deployment: None }),
+                Some(e) if !e.name.src.eq_ignore_ascii_case(&env) => {
+                    let range = entries.iter().find(|(k, _, _)| k == "deploy").map_or(n.range, |(_, v, _)| v.range);
+                    self.err("KCI1021", format!("`deploy.environment` is `{env}` but the job's `environment` is `{}`: a job deploys to its own environment", e.name.src), range, &format!("{path}.deploy.environment"));
+                }
+                Some(_) => {}
+            }
+        }
         if !self.overlay {
             self.job_shape(&j, n, &entries, &path);
         }
@@ -753,7 +787,8 @@ impl Fe<'_> {
     /// What every job must have, and what jobs calling a reusable workflow must not.
     fn job_shape(&mut self, j: &Job, n: &Node, entries: &[(String, &Node, Range)], path: &str) {
         if j.uses.is_some() {
-            const CALL_KEYS: &[&str] = &["name", "uses", "with", "secrets", "strategy", "needs", "if", "permissions", "concurrency"];
+            // `cache-mode` caps the called workflow's (W08-R14).
+            const CALL_KEYS: &[&str] = &["name", "uses", "with", "secrets", "strategy", "needs", "if", "permissions", "concurrency", "cache-mode"];
             for (k, _, kr) in entries {
                 if !CALL_KEYS.contains(&k.as_str()) && !(self.kiln() && keys::find(keys::JOB, k).is_some_and(|x| x.kiln)) {
                     self.err("KCI1016", format!("a job that calls a reusable workflow can't have `{k}`"), *kr, &format!("{path}.{k}"));
@@ -765,7 +800,10 @@ impl Fe<'_> {
             self.err("KCI1014", "a job needs `runs-on` (or `uses` to call a reusable workflow)", n.range, &format!("{path}.runs-on"));
         }
         if !entries.iter().any(|(k, _, _)| k == "steps") {
-            self.err("KCI1014", "a job needs `steps` (or `uses` to call a reusable workflow)", n.range, &format!("{path}.steps"));
+            // A kiln job that only deploys (`deploy:`) needs no steps of its own.
+            if j.kiln.deploy.is_none() {
+                self.err("KCI1014", "a job needs `steps` (or `uses` to call a reusable workflow)", n.range, &format!("{path}.steps"));
+            }
         } else if j.steps.is_empty() {
             self.err("KCI1014", "a job needs at least one step", n.range, &format!("{path}.steps"));
         }

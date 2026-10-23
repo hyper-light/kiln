@@ -17,7 +17,7 @@ use hyper_raft::wire::Record as _;
 use serde::{Deserialize, Serialize};
 
 use super::activity::{self, Activity, Event, Kind, Tone};
-use super::blobs::Blobs;
+use super::contents::Contents;
 use super::disk::{self, Store, SyncLog};
 use super::group::{self, Index, SERVER, TICK, Taken};
 use super::wire::{self, CopySpec, CopyStatus, Joiner, MoveNews, Msg};
@@ -57,6 +57,9 @@ pub struct Repo {
     pub copies: Vec<CopyRef>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Its files, its git refs, or both.
+    #[serde(default, skip_serializing_if = "super::Mode::is_files")]
+    pub mode: super::Mode,
     /// Synced only while a task moves the repository between machines (`crate::sync::tasks`): the
     /// task's batch, which stops syncing it once the move is done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,6 +86,7 @@ pub struct RepoView {
     pub name: String,
     pub created: i64,
     pub exclude: Vec<String>,
+    pub mode: super::Mode,
     /// Files in the repo as the log has it.
     pub files: usize,
     /// Through where the server's member applied the log.
@@ -169,7 +173,13 @@ pub enum Keep {
 /// What an admin asks.
 #[derive(Debug)]
 pub enum Ask {
-    Create { name: String, copies: Vec<(String, String)>, exclude: Vec<String>, transient: Option<String> },
+    Create {
+        name: String,
+        copies: Vec<(String, String)>,
+        exclude: Vec<String>,
+        mode: super::Mode,
+        transient: Option<String>,
+    },
     /// `adopt`: the folder is one kiln just cloned, to take the group's files ([`CopySpec::adopt`]).
     AddCopy { repo: String, machine: String, path: String, adopt: bool },
     RemoveCopy { repo: String, member: u64 },
@@ -194,41 +204,46 @@ pub struct Sync {
     out: async_channel::Receiver<Out>,
     /// What others send a machine's syncing runner process on the sync lane (`crate::sync::tasks`).
     say: async_channel::Sender<Out>,
-    blobs: Option<Arc<Blobs>>,
+    contents: Arc<Contents>,
     key: String,
 }
 
 impl Sync {
-    /// Starts the owner of the groups kept in `dir`. Blob tokens are signed with `key`.
-    pub fn start(dir: PathBuf, key: String) -> Self {
+    /// Starts the owner of the groups kept in `dir`, the contents their steps name in `contents`.
+    /// Blob tokens are signed with `key`.
+    pub fn start(dir: PathBuf, key: String, contents: Arc<Contents>) -> Self {
+        // Contents half-sent when the server stopped (`<data>/sync/incoming`): none is under way
+        // before it listens.
+        let incoming = dir.join("incoming");
+        if incoming.is_dir()
+            && let Err(e) = std::fs::remove_dir_all(&incoming)
+        {
+            tracing::warn!(target: "kiln.sync", event = "sync.incoming", error = %e, "contents half-sent before the server stopped couldn't be removed");
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out) = async_channel::unbounded();
         let view = Arc::new(Mutex::new(View::default()));
         let activity = Arc::new(Mutex::new(Activity::default()));
-        let blobs = Blobs::new(&dir.join("blobs")).map(Arc::new);
-        let blobs = match blobs {
-            Ok(b) => Some(b),
-            Err(e) => {
-                lock(&view).error = Some(format!("sync is off: its contents folder: {e}"));
-                None
-            }
-        };
         let say = out_tx.clone();
-        if let Some(b) = blobs.clone() {
-            let (v, a, wake_tx) = (view.clone(), activity.clone(), tx.clone());
-            let k = key.clone();
-            let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || match Owner::open(&dir, b, out_tx, v.clone(), a, wake_tx, k) {
+        let (v, a, wake_tx) = (view.clone(), activity.clone(), tx.clone());
+        let (k, c) = (key.clone(), Arc::clone(&contents));
+        let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || {
+            // What's held is judged from the store's listing: the thread waits for it.
+            if !c.wait_loaded(super::contents::LOAD_WAIT) {
+                tracing::warn!(target: "kiln.blobs", event = "list", "sync's contents weren't listed in time: what's held is known as it comes");
+            }
+            match Owner::open(&dir, c, out_tx, v.clone(), a, wake_tx, k) {
                 Ok(owner) => owner.run(&rx),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "repo sync is off");
                     lock(&v).error = Some(format!("sync is off: {e:#}"));
                 }
-            });
-            if let Err(e) = spawned {
-                lock(&view).error = Some(format!("sync is off: {e}"));
             }
+        });
+        if let Err(e) = spawned {
+            lock(&view).error = Some(format!("sync is off: {e}"));
         }
-        Self { tx, view, activity, out, say, blobs, key }
+        Self { tx, view, activity, out, say, contents, key }
     }
 
     pub fn view(&self) -> View {
@@ -251,8 +266,8 @@ impl Sync {
     }
 
     /// The server's contents.
-    pub fn blobs(&self) -> Option<&Blobs> {
-        self.blobs.as_deref()
+    pub fn contents(&self) -> &Arc<Contents> {
+        &self.contents
     }
 
     /// What a machine's runner said of its copies (`AgentMsg::Sync`, decoded).
@@ -353,7 +368,7 @@ pub struct Owner {
     view: Arc<Mutex<View>>,
     viewed: Instant,
     changed: bool,
-    blobs: Arc<Blobs>,
+    contents: Arc<Contents>,
     key: String,
     start: Instant,
     swept: Instant,
@@ -382,7 +397,7 @@ pub struct Owner {
 }
 
 impl Owner {
-    fn open(dir: &Path, blobs: Arc<Blobs>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
+    fn open(dir: &Path, contents: Arc<Contents>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let repos: Vec<Repo> = match std::fs::read(dir.join("repos.json")) {
             Ok(b) => serde_json::from_slice(&b)?,
@@ -411,7 +426,7 @@ impl Owner {
             view,
             viewed: Instant::now(),
             changed: true,
-            blobs,
+            contents,
             key,
             start: Instant::now(),
             swept: Instant::now(),
@@ -534,7 +549,19 @@ impl Owner {
             }
             Msg::Move(news) => self.moved(machine, news),
             // Only the server says these, or they aren't for the groups (`crate::sync::places`).
-            Msg::Copies { .. } | Msg::Release | Msg::Want { .. } | Msg::Repos(_) | Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } | Msg::Task(_) => {}
+            Msg::Copies { .. }
+            | Msg::Release
+            | Msg::Want { .. }
+            | Msg::Repos(_)
+            | Msg::Look
+            | Msg::Bundle { .. }
+            | Msg::Clone(_)
+            | Msg::Delete { .. }
+            | Msg::Forget { .. }
+            | Msg::Task(_)
+            | Msg::Shares { .. }
+            | Msg::Shared(_)
+            | Msg::Take(_) => {}
         }
     }
 
@@ -584,8 +611,8 @@ impl Owner {
     fn steps(&mut self, machine: &str, repo: &str, steps: Vec<Step>) {
         let mine = self.members_on(repo, machine);
         let Some(g) = self.groups.get_mut(repo) else { return };
-        let blobs = &self.blobs;
-        let Taking { again, dropped, mut want, proposed } = take_steps(&mut g.r, &mut g.next, |h| blobs.has(h), machine, &mine, steps);
+        let contents = &self.contents;
+        let Taking { again, dropped, mut want, proposed } = take_steps(&mut g.r, &mut g.next, |h| contents.has(h), machine, &mine, steps);
         for at in proposed {
             if g.arrived.len() >= ARRIVED {
                 g.arrived.clear();
@@ -631,6 +658,7 @@ impl Owner {
                     path: c.path.clone(),
                     exclude: r.exclude.clone(),
                     max_size: None,
+                    mode: r.mode,
                     adopt: c.adopt,
                 })
             })
@@ -736,10 +764,8 @@ impl Owner {
             if let Some(d) = commit {
                 m.commit_seconds.observe(&[name], d.as_secs_f64());
             }
-            let blobs = self.blobs.clone();
-            let step = activity::step_event(t.index, &t.step, &t.decisions, commit.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)), |hash| {
-                blobs.path(hash).and_then(|p| std::fs::metadata(p).ok()).map(|md| md.len())
-            });
+            let contents = Arc::clone(&self.contents);
+            let step = activity::step_event(t.index, &t.step, &t.decisions, commit.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)), |hash| contents.size(hash));
             m.steps_committed.inc(&[name]);
             for (kind, n) in [("added", step.added), ("changed", step.changed), ("deleted", step.deleted)] {
                 if n > 0 {
@@ -918,13 +944,13 @@ impl Owner {
 
     fn ask(&mut self, ask: Ask) -> anyhow::Result<String> {
         match ask {
-            Ask::Create { name, copies, exclude, transient } => {
+            Ask::Create { name, copies, exclude, mode, transient } => {
                 let name = name.trim().to_owned();
                 anyhow::ensure!(!name.is_empty(), "a synced repo needs a name");
                 anyhow::ensure!(!self.repos.iter().any(|r| r.name == name), "a synced repo named {name} exists already");
                 anyhow::ensure!(self.repos.len() < disk::GROUPS, "this server syncs {} repos at the most", disk::GROUPS);
                 let group = self.repos.iter().map(|r| r.group).max().unwrap_or(0).saturating_add(1);
-                let mut repo = Repo { id: crate::util::new_id(), name, group, created: now_s(), next_member: SERVER.saturating_add(1), copies: Vec::new(), exclude, transient };
+                let mut repo = Repo { id: crate::util::new_id(), name, group, created: now_s(), next_member: SERVER.saturating_add(1), copies: Vec::new(), exclude, mode, transient };
                 for (machine, path) in copies {
                     add_copy(&mut repo, &machine, &path)?;
                 }
@@ -989,14 +1015,17 @@ impl Owner {
                 let beside = group::conflicts(tree).remove(&path).ok_or_else(|| anyhow::anyhow!("{path} is no conflict copy"))?;
                 let theirs = tree.files.get(&path).cloned();
                 let ours = tree.files.get(&beside).cloned();
-                let gone = Change { path: path.clone(), to: None, base: theirs.clone() };
+                let gone = Change { path: path.clone(), to: None, base: theirs.clone(), bundle: None };
                 let (changes, said) = match keep {
                     Keep::Name => (vec![gone], format!("{beside} kept its version; the conflict copy {path} went")),
-                    Keep::Copy => (vec![Change { path: beside.clone(), to: theirs, base: ours }, gone], format!("{beside} took the conflict copy's version; {path} went")),
+                    Keep::Copy => (
+                        vec![Change { path: beside.clone(), to: theirs, base: ours, bundle: tree.bundles.get(&path).cloned() }, gone],
+                        format!("{beside} took the conflict copy's version; {path} went"),
+                    ),
                     Keep::Both => {
                         let kept = path.replacen(".conflict-", ".kept-", 1);
                         let said = format!("both kept: {beside} as it was, and the conflict copy as {kept}");
-                        (vec![Change { path: kept.clone(), to: theirs, base: tree.files.get(&kept).cloned() }, gone], said)
+                        (vec![Change { path: kept.clone(), to: theirs, base: tree.files.get(&kept).cloned(), bundle: tree.bundles.get(&path).cloned() }, gone], said)
                     }
                 };
                 let taken = tree.seqs.get(&SERVER).copied().unwrap_or(0);
@@ -1017,16 +1046,19 @@ impl Owner {
         let named: HashSet<&str> = self
             .groups
             .values()
-            .flat_map(|g| g.r.machine().tree.files.values())
-            .filter_map(|v| match v {
-                Version::File { hash, .. } => Some(hash.as_str()),
-                Version::Link { .. } => None,
+            .flat_map(|g| {
+                let tree = &g.r.machine().tree;
+                let files = tree.files.values().filter_map(|v| match v {
+                    Version::File { hash, .. } => Some(hash.as_str()),
+                    Version::Link { .. } | Version::Ref { .. } => None,
+                });
+                files.chain(tree.bundles.values().map(String::as_str))
             })
             .collect();
-        let Ok(all) = self.blobs.all() else { return };
-        for (hash, modified) in all {
-            if !named.contains(hash.as_str()) && modified.elapsed().unwrap_or_default() >= SWEEP_AGE {
-                let _ = self.blobs.remove(&hash);
+        let old = crate::util::now_ms().saturating_sub(i64::try_from(SWEEP_AGE.as_millis()).unwrap_or(i64::MAX));
+        for (hash, kept) in self.contents.all() {
+            if !named.contains(hash.as_str()) && kept <= old {
+                self.contents.remove(&hash);
             }
         }
     }
@@ -1065,7 +1097,8 @@ impl Owner {
                     name: r.name.clone(),
                     created: r.created,
                     exclude: r.exclude.clone(),
-                    files: g.map_or(0, |g| g.r.machine().tree.files.len()),
+                    mode: r.mode,
+                    files: g.map_or(0, |g| g.r.machine().tree.files.keys().filter(|p| !super::refs::is_ref(p)).count()),
                     index,
                     conflicts,
                     copies,
@@ -1124,13 +1157,19 @@ pub fn take_steps<L: LogStore>(r: &mut Replica<L, Index>, next: &mut HashMap<u64
             out.dropped.push(("out_of_order", format!("steps from {machine} came out of order (#{} before #{want_next}): they come again", step.seq)));
             break;
         }
+        // Its contents, and a ref's bundle.
         let lacking: Vec<String> = step
             .changes
             .iter()
-            .filter_map(|c| match &c.to {
-                Some(Version::File { hash, .. }) if !has(hash) => Some(hash.clone()),
-                _ => None,
+            .flat_map(|c| {
+                let file = match &c.to {
+                    Some(Version::File { hash, .. }) => Some(hash),
+                    _ => None,
+                };
+                file.into_iter().chain(c.bundle.as_ref())
             })
+            .filter(|hash| !has(hash))
+            .cloned()
             .collect();
         if !lacking.is_empty() {
             out.want.extend(lacking);
@@ -1230,12 +1269,20 @@ mod tests {
     #[test]
     fn a_committed_step_shows_with_its_files_and_a_stray_one_as_let_go() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let sync = Sync::start(dir.path().join("sync"), "key".into());
+        let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
+        let sync = Sync::start(dir.path().join("sync"), "key".into(), contents);
         let name = "activity-test";
-        let create = Ask::Create { name: name.into(), copies: vec![("mac".into(), "/src/kiln".into()), ("box".into(), "/src/kiln".into())], exclude: Vec::new(), transient: None };
+        let create = Ask::Create {
+            name: name.into(),
+            copies: vec![("mac".into(), "/src/kiln".into()), ("box".into(), "/src/kiln".into())],
+            exclude: Vec::new(),
+            mode: super::super::Mode::Files,
+            transient: None,
+        };
         let id = futures::executor::block_on(sync.ask(create)).map_err(anyhow::Error::msg)?;
-        let hash = sync.blobs().ok_or_else(|| anyhow::anyhow!("sync is off"))?.put_bytes(b"hello")?;
-        let step = Step { by: String::new(), member: 2, seq: 1, at: now_ms(), changes: vec![Change { path: "src/a.txt".into(), to: Some(Version::File { hash, exec: false }), base: None }] };
+        let hash = futures::executor::block_on(sync.contents().put_bytes(b"hello".to_vec()))?;
+        let step =
+            Step { by: String::new(), member: 2, seq: 1, at: now_ms(), changes: vec![Change { path: "src/a.txt".into(), to: Some(Version::File { hash, exec: false }), base: None, bundle: None }] };
         // From a machine with no copy of it: let go.
         sync.from_runner("elsewhere", Msg::Steps { repo: id.clone(), steps: vec![step.clone()] }, Vec::new());
         // Sent again until taken, as a runner does.
@@ -1291,7 +1338,7 @@ mod tests {
 
     #[test]
     fn a_copy_is_a_full_path_on_a_named_machine() {
-        let mut r = Repo { id: "r".into(), name: "n".into(), group: 1, created: 0, next_member: 2, copies: Vec::new(), exclude: Vec::new(), transient: None };
+        let mut r = Repo { id: "r".into(), name: "n".into(), group: 1, created: 0, next_member: 2, copies: Vec::new(), exclude: Vec::new(), mode: super::super::Mode::Files, transient: None };
         assert_eq!(add_copy(&mut r, "mac", "/Users/a/src/kiln").ok(), Some(2));
         assert_eq!(add_copy(&mut r, "box", "C:\\src\\kiln").ok(), Some(3));
         assert!(add_copy(&mut r, "mac", "/Users/a/src/kiln").is_err(), "twice");

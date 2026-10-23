@@ -519,9 +519,12 @@ fn now_ms() -> i64 {
 
 /// The contents a step carries.
 fn hashes(step: &Step) -> impl Iterator<Item = &String> {
-    step.changes.iter().filter_map(|c| match &c.to {
-        Some(Version::File { hash, .. }) => Some(hash),
-        _ => None,
+    step.changes.iter().flat_map(|c| {
+        let file = match &c.to {
+            Some(Version::File { hash, .. }) => Some(hash),
+            _ => None,
+        };
+        file.into_iter().chain(c.bundle.as_ref())
     })
 }
 
@@ -726,11 +729,11 @@ impl Owner {
                 self.resent = Instant::now().checked_sub(RESEND).unwrap_or_else(Instant::now);
             }
             // The machine's repositories' (`super::repos`), in the order the server sent them.
-            Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } => {
+            Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } | Msg::Shares { .. } | Msg::Take(_) => {
                 let _ = self.repos.try_send(super::repos::Job::Order(msg));
             }
             // Only a runner says these.
-            Msg::Steps { .. } | Msg::Status(_) | Msg::Repos(_) | Msg::Task(_) | Msg::Move(_) => {}
+            Msg::Steps { .. } | Msg::Status(_) | Msg::Repos(_) | Msg::Task(_) | Msg::Move(_) | Msg::Shared(_) => {}
         }
     }
 
@@ -801,7 +804,7 @@ impl Owner {
         };
         let store = disk::claim(log, u128::from(group))?;
         let depth = store.depth();
-        let limits = Limits { exclude: spec.exclude.clone(), ..spec.max_size.map_or_else(Limits::default, |max_size| Limits { max_size, ..Limits::default() }) };
+        let limits = Limits { exclude: spec.exclude.clone(), mode: spec.mode, ..spec.max_size.map_or_else(Limits::default, |max_size| Limits { max_size, ..Limits::default() }) };
         let file = self.state_file(spec);
         let fresh = !file.exists();
         let mut feed = Feed::open(&root, &self.me, spec.member, limits, file)?;

@@ -1378,6 +1378,18 @@ impl Engine for Turso {
         Ok(out)
     }
 
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        let mut stmt = self.prepare(sql::SESSIONS_ENDED_AFTER)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[int(after.0), txt(after.1), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
+            if let (Ok(id), Ok(at)) = (r.get::<String>(0), r.get::<i64>(1)) {
+                out.push((id, at));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
         let mut get = self.prepare(sql::SESSION_GET)?;
         let mut kept: Option<Kept> = None;

@@ -1,5 +1,6 @@
 /** The CI engine (docs/ci.md §4.1): the /api/ci routes the run, leg and editor pages read. */
 import { ApiError, request } from "./client";
+import type { Schema } from "@/lib/yaml-spot";
 
 const enc = encodeURIComponent;
 const at = (attempt?: number) => (attempt ? `?attempt=${attempt}` : "");
@@ -57,6 +58,21 @@ export interface CiLeg {
   kept_until?: number | null;
 }
 
+/** One attempt of a leg (W05-R14's retries): how it ended, why (its failure class), and where it ran. */
+export interface CiAttempt {
+  number: number;
+  status: string;
+  conclusion: string | null;
+  class: string | null;
+  runner: string | null;
+  executor: string | null;
+  queued_at: number | null;
+  started_at: number | null;
+  finished_at: number | null;
+  exit_code: number | null;
+  error: string | null;
+}
+
 export interface CiRunDetail {
   run: CiRun;
   legs: CiLeg[];
@@ -79,6 +95,125 @@ export interface CiGraph {
   nodes: { job: string; legs: CiGraphLeg[]; started_at: number | null; finished_at: number | null }[];
   edges: { from: string; to: string }[];
   critical_path: string[];
+  /** The workflow's jobs as the run's plan has them, those with no legs yet included. */
+  jobs?: CiPlanJob[];
+}
+
+/** A job as a run's plan has it (W21-R04), whether its legs are made yet or not. */
+export interface CiPlanJob {
+  job: string;
+  /** Its name as written (null: an expression makes it, or it has none). */
+  name: string | null;
+  needs: string[];
+  /** Its matrix comes from what it needs: how many legs it has is known once they're done. */
+  matrix_waits: boolean;
+  steps: number;
+  /** It calls a workflow: its legs are that workflow's jobs (`<job>/<theirs>`). */
+  calls: boolean;
+  /** How long it typically takes, in seconds: the median of its last 20 successful runs. */
+  typical: number | null;
+}
+
+/** What an environment deploys to (W15-R02). */
+export type CiEnvKind = "kubernetes" | "host" | "container" | "microvm" | "platform";
+
+/** Where an environment deploys: a kubernetes one's clusters and namespace, the runners a host,
+ * container or microVM one deploys on (a routing constraint), a platform one's integration. */
+export interface CiEnvTargets {
+  clusters?: string[];
+  namespace?: string;
+  runners?: string;
+  integration?: string;
+}
+
+/** An environment's protection rules, as `.kiln/environments.yaml` writes them. */
+export interface CiProtection {
+  reviewers?: string[];
+  "prevent-self-review"?: boolean;
+  "wait-timer"?: number;
+  branches?: string[] | null;
+  tags?: string[] | null;
+  windows?: { allow?: string; deny?: string; duration: string; timezone?: string }[];
+  after?: string;
+  soak?: string;
+  gates?: { workflow?: string; check?: string }[];
+}
+
+export interface CiDeployment {
+  id: number;
+  environment?: string;
+  sha: string;
+  ref: string;
+  creator: string;
+  run: string | null;
+  leg?: string | null;
+  created_at: number;
+  state: string | null;
+  url: string | null;
+}
+
+/** A leg waiting to deploy (W15-R08, R09): its run and why it waits (its wait reason). */
+export interface CiEnvWait {
+  leg: string;
+  run: string;
+  number: number;
+  key: string;
+  name: string | null;
+  wait: { reason: string; environment?: string; reviewers?: string[]; until?: number | null; window?: string | null; promotion?: string | null; gate?: string | null; limit?: number } | null;
+  queued_at: number | null;
+}
+
+/** A preview environment (W15-R07): what it was made from and for, and until when it lasts or why it went. */
+export interface CiPreview {
+  /** Its `previews:` entry in `.kiln/environments.yaml`: the name its jobs deploy to. */
+  template: string;
+  /** What it's for: `D12`, `CR7`, `#42`, or a stack's lowest diff. */
+  of: string;
+  kind: "diff" | "stack" | "change_request" | "pull_request" | string;
+  created_at: number;
+  expires_at: number;
+  /** Removed (kept an hour for its change's closing runs), and why: `D12 landed`. */
+  removed_at: number | null;
+  removed: string | null;
+}
+
+/** A repository's environment (W15). */
+export interface CiEnvironment {
+  name: string;
+  /** `file` (trunk's `.kiln/environments.yaml`), `kiln` (made here), `run` (named by a job), `preview` (one of the file's `previews:`, W15-R07). */
+  source: "file" | "kiln" | "run" | "preview" | string;
+  kind: CiEnvKind | null;
+  targets: CiEnvTargets;
+  protection: CiProtection;
+  url: string | null;
+  agents_can_approve: boolean;
+  concurrency: number | null;
+  latest_deployment: CiDeployment | null;
+  preview?: CiPreview | null;
+  /** On the board and one environment's page. */
+  repo?: string;
+  waiting?: CiEnvWait[];
+}
+
+/** A run's data flow (W04-R23): its outputs from where they're made to who reads them, and its exports. */
+export interface CiFlow {
+  outputs: {
+    job: string;
+    name: string;
+    /** The step whose output it reads (by index from 0, and id); null when the job sets it as a whole. */
+    step: { index: number; id: string } | null;
+    secret: boolean;
+    /** Each of the job's legs, with the value it gave (never a secret's). */
+    values: { leg: string; key: string; secret: boolean; value: string | null }[];
+    /** The jobs that read it, where in each (`if`, `env.VERSION`, `steps[1].run`), and their legs. */
+    readers: { job: string; at: string[]; legs: { leg: string; key: string; status: string }[] }[];
+  }[];
+  exports: {
+    job: string;
+    names: string[];
+    legs: { leg: string; key: string; names: string[] }[];
+    readers: { job: string; legs: { leg: string; key: string; status: string }[] }[];
+  }[];
 }
 
 export interface CiAnnotation {
@@ -126,6 +261,115 @@ export interface CiTest {
   retried: number;
   quarantined: boolean;
   flaky: { class: "flaky" | "probably_flaky"; why: string } | null;
+  /** Its last results on the run's branch, oldest first, a letter each: `p`assed, `f`ailed, `e`rror, `s`kipped (W16-R03). */
+  history?: string | null;
+}
+
+/** A test over a window on a repository's default branch (W16-R03). */
+export interface CiRepoTest {
+  id: string;
+  suite: string;
+  name: string;
+  file: string | null;
+  runs: number;
+  failures: number;
+  p50_ms: number | null;
+  p90_ms: number | null;
+  flaky: { class: "flaky" | "probably_flaky"; why: string } | null;
+}
+
+export type CiTestSort = "failing" | "slowest" | "flaky";
+
+/** A routing rule (W05-R21): what it matches, and what it adds to a leg's routing. */
+export interface CiRoutingRule {
+  match: { labels?: string[]; job?: string | null; repos?: string[] };
+  require?: string[];
+  executor?: string[];
+  image?: string | null;
+  prefer?: { fact?: string; label?: string; higher?: boolean; weight?: number }[];
+  docker?: string | null;
+}
+
+/** Where a leg with these needs would go (W05-R20): what's left for runners to match, and each runner's checks. */
+export interface CiRouteExplain {
+  labels: string[];
+  constraints: string[];
+  executors: string[];
+  image: string | null;
+  rules: { source: string; rule: CiRoutingRule }[];
+  runners: { name: string; eligible: boolean; room?: boolean; checks?: { requirement: string; value?: string; pass: boolean }[] }[];
+}
+
+/** An actions policy (W07-R04): globs a run may use, globs it may not, and whether every remote action is pinned by its SHA. */
+export interface CiActionsPolicy {
+  allow: string[];
+  deny: string[];
+  require_sha_pins: boolean;
+}
+
+/** kiln's OIDC issuer (W10-R06, R12): where it is, whether this server serves it, and its keys. */
+export interface CiOidc {
+  issuer: string;
+  discovery: string;
+  jwks_uri: string;
+  serving: boolean;
+  keys: { kid: string; created_at: number; sign_from: number; signing: boolean; published: boolean }[];
+  subject_claims: string[];
+  /** How providers reach it (R12): whether its URL looks public, its own addresses, and where it's published. */
+  reach?: { public: boolean; listen: string[]; publish: { to: string; at: number | null; checked_at: number | null; error: string | null } | null };
+}
+
+/** A secret as listed (W09): never its value. `from` for a brokered one, made at leg start. */
+export interface CiSecretMeta {
+  name: string;
+  size: number;
+  created_at: number;
+  updated_at: number;
+  last_used_at: number | null;
+  from?: string;
+}
+
+/** A variable (W09-R09): shown, unlike a secret. */
+export interface CiVariable {
+  name: string;
+  value: string;
+  updated_at: number;
+}
+
+/** A person's own notification rule (W19-R06): repository events, to their inbox or their email. */
+export interface MyRule {
+  on: string[];
+  to: ("inbox" | "email")[];
+  where?: string | null;
+  throttle?: string | null;
+  /** By name or glob; every repository they may read when empty. */
+  repos?: string[];
+  /** Only what's about them: runs they started, reviews asked of them, replies to and mentions of them. */
+  about_me?: boolean;
+}
+
+/** A person's own rules, the address `email` sends to, and the events a rule may take; `person` false for the owner, whose rules are the server's. */
+export interface MyNotifications {
+  person: boolean;
+  rules: MyRule[];
+  email: string | null;
+  events: string[];
+}
+
+/** A metric a repository's default branch recorded over a window (W16-R07): how many points, and the latest's time. */
+export interface CiRepoMetric {
+  name: string;
+  unit: string;
+  better: "lower" | "higher";
+  points: number;
+  last: number;
+}
+
+/** A metric's values over a window, one series per runner fingerprint (W16-AC05). */
+export interface CiMetricTrend {
+  name: string;
+  better: "lower" | "higher" | null;
+  series: { fingerprint: string; points: { sha: string; run: string; value: number; unit: string; ts: number }[] }[];
 }
 
 export interface CiSummary {
@@ -175,7 +419,14 @@ export interface CiDiagnostic {
   message: string;
   path: string;
   /** Lines and columns from 1; offsets (bytes) aren't always there. */
-  range: { start: { line: number; col: number; offset?: number }; end: { line: number; col: number; offset?: number } };
+  range: CiRange;
+  /** What would fix it: replacements of ranges by text, under a title (the editor's quick fix). */
+  fix?: { title: string; edits: { range: CiRange; text: string }[] };
+}
+
+export interface CiRange {
+  start: { line: number; col: number; offset?: number };
+  end: { line: number; col: number; offset?: number };
 }
 
 export interface CiPreview {
@@ -203,6 +454,18 @@ export interface CiPreview {
     later: string[];
     error?: string;
   } | null;
+  /** Each job's matrix as written (W21-R06's matrix view). */
+  matrices?: Record<string, CiMatrix>;
+}
+
+/** A job's matrix as written: its axes' values (or the expression that makes them), `include`, `exclude` and `where`; or the expression that makes it whole. */
+export interface CiMatrix {
+  axes?: { name: string; values: unknown[] | string }[];
+  include?: unknown;
+  exclude?: unknown;
+  where?: string | null;
+  platforms?: unknown;
+  expr?: string;
 }
 
 export type RerunMode = "all" | "failed" | "job";
@@ -250,12 +513,34 @@ export interface CiWorkflowSource {
   source: string;
   diagnostics: CiDiagnostic[];
   outline: CiOutline | null;
+  /** A workflow's, or an action's (W21-R07). */
+  kind?: "workflow" | "action";
+  /** Where the repository is kept (none: nowhere kiln writes), and what an edit of it may be saved as, the first its default (W21-R06). */
+  host?: "kiln" | "github" | "gitlab" | "bitbucket" | null;
+  saves?: CiSave[];
 }
 
+/** How an edited workflow is saved (W21-R06): a diff through review, a change (pull or merge request) on its host, a commit to a branch, or only the patch. */
+export type CiSave = "diff" | "change" | "branch" | "patch";
+
+export interface CiSaved {
+  to: CiSave;
+  diffs?: { name: string; title: string; kind: string; url: string }[];
+  branch?: string;
+  sha?: string;
+  change?: { number: number; url: string };
+  patch?: string;
+}
+
+/** An action the catalog has: one mirrored (its versions, its metadata), or kiln's own (W07-R10:
+ *  `uses` with its version, and what it does). */
 export interface CiCatalogEntry {
   uses: string;
-  versions: { ref: string; sha: string }[];
-  action: {
+  versions?: { ref: string; sha: string }[];
+  description?: string;
+  /** A built-in's inputs, as its `action.yml` would have them (a mirrored action's are in `action`). */
+  inputs?: Record<string, { description: string | null; required: boolean; default: string | null }>;
+  action?: {
     name: string | null;
     description: string | null;
     using: string;
@@ -421,35 +706,180 @@ export async function ciRun(id: string, attempt: number | undefined, signal?: Ab
   }
 }
 
+/** A pool's executor now (W13-R09). */
+export type CiPoolExecutor = { id: string; pool: string; runner: string; state: "starting" | "idle" | "busy"; leg?: string; since: number };
+/** A pool: its settings, where they come from (the configuration, or kiln's store), and its executors now. */
+export type CiPool = {
+  name: string;
+  executor: string;
+  image: string | null;
+  labels: string[];
+  hosts: string | null;
+  min_idle: number;
+  max: number;
+  per_host_max: number;
+  idle_timeout_ms: number;
+  starting: number;
+  idle: number;
+  busy: number;
+  waiting: number;
+  executors: CiPoolExecutor[];
+  /** The last failure to start one: on which host, and why. */
+  last_error: [string, string] | null;
+  source: "config" | "stored";
+};
+/** A runner image kiln built into its registry (W13-R11). */
+export type CiImage = { id: string; repo: string | null; name: string; reference: string; digest: string; image: string; platforms: string[]; run_id: string | null; created_at: number };
+/** A stored pool, as `PUT /api/ci/pools/:name` takes it. */
+export type CiPoolSpec = { name: string; executor: string; image?: string | null; labels: string[]; min_idle: number; max?: number | null; idle_timeout?: string | null };
+
+/** What runs a repository's CI (W23-R07): the providers chosen, and those its host makes possible. */
+export type CiProviders = { repo: string; providers: string[]; available: string[] };
+
 export const ci = {
+  providers: (repo: string, signal?: AbortSignal) => request<CiProviders>("GET", `/api/ci/repos/${enc(repo)}/providers`, undefined, { signal }),
+  setProviders: (repo: string, providers: string[]) => request<CiProviders>("PUT", `/api/ci/repos/${enc(repo)}/providers`, { providers }),
+  pools: (signal?: AbortSignal) => request<{ pools: CiPool[] }>("GET", "/api/ci/pools", undefined, { signal }).then((r) => r.pools),
+  /** A pool's scaling history (W21-R08): its executors and the legs waiting for it, a minute apart, oldest first. */
+  poolHistory: (name: string, hours: number, signal?: AbortSignal) =>
+    request<{ pool: string; hours: number; samples: { ts: number; starting: number; idle: number; busy: number; waiting: number }[] }>(
+      "GET",
+      `/api/ci/pools/${enc(name)}/history?hours=${hours}`,
+      undefined,
+      { signal },
+    ),
+  /** The pool, with what it does now (W20-R03): warnings, and the size it heads for. */
+  putPool: (spec: CiPoolSpec) => request<{ diagnostics?: { message: string }[]; preview?: { heading_for: number } }>("PUT", `/api/ci/pools/${enc(spec.name)}`, spec),
+  removePool: (name: string) => request<void>("DELETE", `/api/ci/pools/${enc(name)}`),
+  images: (signal?: AbortSignal) => request<{ images: CiImage[] }>("GET", "/api/ci/images", undefined, { signal }).then((r) => r.images),
+  /** An image's definition checked as the editor checks it (W13-R11): a Dockerfile by kiln's parser and lints; an Agentfile is shards' to check, where it builds. */
+  validateImage: (kind: "dockerfile" | "agentfile", content: string, signal?: AbortSignal) =>
+    request<{ kind: string; checked: boolean; diagnostics: CiDiagnostic[]; note?: string }>("POST", "/api/ci/images/validate", { kind, content }, { signal }),
+  /** A definition proposed as a diff adding `.kiln/images/<name>/` ("Save to repo"). */
+  proposeImage: (repo: string, body: { name: string; kind: "dockerfile" | "agentfile"; content: string }) =>
+    request<{ diffs: { name: string; title: string; kind: string; url: string }[] }>("POST", `/api/ci/images?repo=${enc(repo)}`, body),
+  /** A definition built once as the editor has it (W21-R08's Build), pushed and registered too with `push` (the server owner's). */
+  buildImage: (repo: string, body: { name: string; kind: "dockerfile" | "agentfile"; content: string; platforms: string[]; runs_on: string; push: boolean }) =>
+    request<{ run: string; sha: string; trusted: boolean }>("POST", `/api/ci/images/build?repo=${enc(repo)}`, body),
   graph: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<CiGraph>("GET", `/api/ci/runs/${enc(id)}/graph${at(attempt)}`, undefined, { signal }),
+  flow: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<CiFlow>("GET", `/api/ci/runs/${enc(id)}/flow${at(attempt)}`, undefined, { signal }),
   annotations: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ annotations: CiAnnotation[] }>("GET", `/api/ci/runs/${enc(id)}/annotations${at(attempt)}`, undefined, { signal }),
   summaries: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<{ summaries: CiSummary[] }>("GET", `/api/ci/runs/${enc(id)}/summary${at(attempt)}`, undefined, { signal }),
   artifacts: (id: string, signal?: AbortSignal) => request<{ artifacts: CiArtifact[] }>("GET", `/api/ci/runs/${enc(id)}/artifacts`, undefined, { signal }),
   /** The run's benchmark metrics (W16-R07). */
   metrics: (id: string, signal?: AbortSignal) => request<{ metrics: CiMetric[] }>("GET", `/api/ci/runs/${enc(id)}/metrics`, undefined, { signal }),
+  /** A repository's tests over `days` (W16-R03): the most failing, the slowest, or the flaky. */
+  repoTests: (repo: string, sort: CiTestSort, days: number, signal?: AbortSignal) =>
+    request<{ repo: string; branch: string; days: number; sort: CiTestSort; tests: CiRepoTest[] }>("GET", `/api/ci/repos/${enc(repo)}/tests?sort=${sort}&days=${days}&limit=50`, undefined, {
+      signal,
+    }),
+  /** The server's actions policy, and with `repo` that repository's: kiln's own setting and its `.kiln/config.yaml`'s. */
+  actionsPolicy: (repo: string | null, signal?: AbortSignal) =>
+    request<{ server: CiActionsPolicy; repository?: CiActionsPolicy | null; config_yaml?: CiActionsPolicy | null }>("GET", `/api/ci/actions/policy${repo ? `?repo=${enc(repo)}` : ""}`, undefined, {
+      signal,
+    }),
+  setActionsPolicy: (repo: string, p: CiActionsPolicy) => request<unknown>("PUT", `/api/ci/actions/policy?repo=${enc(repo)}`, p),
+  clearActionsPolicy: (repo: string) => request<unknown>("DELETE", `/api/ci/actions/policy?repo=${enc(repo)}`),
+  /** Mirrors `[ci.actions] prefetch` now: each action's pinned commit, or why not. */
+  syncActions: () => request<{ synced: { uses: string; sha?: string; error?: string }[] }>("POST", "/api/ci/actions/sync", {}),
+  /** kiln's issuer and its keys. */
+  oidc: (signal?: AbortSignal) => request<CiOidc>("GET", "/api/ci/oidc", undefined, { signal }),
+  /** A new signing key: signing in 7 days (published first, so relying parties fetch it), or `now`. */
+  oidcRotate: (now: boolean) => request<{ sign_from: number; published: string | null }>("POST", "/api/ci/oidc/rotate", { now }),
+  /** Publishes the issuer's documents to `[ci.oidc] publish_to` now. */
+  oidcPublish: () => request<{ published: string }>("POST", "/api/ci/oidc/publish", {}),
+  /** Every routing rule in the order they apply, each with where it comes from. */
+  routingRules: (signal?: AbortSignal) => request<{ rules: { index: number; source: string; rule: CiRoutingRule }[]; github_labels: boolean }>("GET", "/api/ci/routing/rules", undefined, { signal }),
+  /** Replaces a scope's stored rules (`server` or `org:<owner>`; a repository's are its `.kiln/routing.yaml`). */
+  /** The rules, with what they do now (W20-R03): a warning for each rule no runner meets. */
+  setRoutingRules: (scope: string, rules: CiRoutingRule[]) => request<{ diagnostics?: { message: string }[] }>("PUT", `/api/ci/routing/rules?scope=${enc(scope)}`, { rules }),
+  /** Where a leg with these labels and constraints would go, against the runners connected now. */
+  routingExplain: (body: { labels: string[]; repo?: string; requires?: string[] }) => request<CiRouteExplain>("POST", "/api/ci/routing/explain", body),
+  /** A scope's secrets (`server`, `org:acme`, `repo:acme/app`, `workflow:acme/app:<path>`, `env:acme/app:<name>`): names, never values. */
+  secrets: (scope: string, signal?: AbortSignal) => request<{ scope: string; secrets: CiSecretMeta[] }>("GET", `/api/ci/secrets?scope=${enc(scope)}`, undefined, { signal }),
+  setSecret: (scope: string, name: string, value: string) => request<void>("PUT", `/api/ci/secrets/${enc(name)}?scope=${enc(scope)}`, { value }),
+  deleteSecret: (scope: string, name: string) => request<void>("DELETE", `/api/ci/secrets/${enc(name)}?scope=${enc(scope)}`),
+  /** A scope's variables, with their values. */
+  variables: (scope: string, signal?: AbortSignal) => request<{ scope: string; variables: CiVariable[] }>("GET", `/api/ci/variables?scope=${enc(scope)}`, undefined, { signal }),
+  setVariable: (scope: string, name: string, value: string) => request<void>("PUT", `/api/ci/variables/${enc(name)}?scope=${enc(scope)}`, { value }),
+  deleteVariable: (scope: string, name: string) => request<void>("DELETE", `/api/ci/variables/${enc(name)}?scope=${enc(scope)}`),
+  /** What notification rules sent (W19-R06), newest first: each delivery's rule, event, channel, and why one didn't go. */
+  deliveries: (limit: number, signal?: AbortSignal) =>
+    request<{ deliveries: { ts: number; rule: string; event: string; run: string | null; channel: string; status: string; error: string | null; attempts: number }[] }>(
+      "GET",
+      `/api/ci/notify/deliveries?limit=${limit}`,
+      undefined,
+      { signal },
+    ),
+  /** Your own notification rules (W19-R06). */
+  myNotifications: (signal?: AbortSignal) => request<MyNotifications>("GET", "/api/me/notifications", undefined, { signal }),
+  /** Replaces your rules, and the address email goes to when given (`null` clears it). */
+  setMyNotifications: (rules: MyRule[], email?: string | null) => request<MyNotifications>("PUT", "/api/me/notifications", email === undefined ? { rules } : { rules, email }),
+  /** The metrics a repository's default branch recorded over `days` (W16-R07). */
+  repoMetrics: (repo: string, days: number, signal?: AbortSignal) =>
+    request<{ repo: string; branch: string; days: number; data: { metrics: CiRepoMetric[] } }>("GET", `/api/ci/repos/${enc(repo)}/metrics?days=${days}`, undefined, { signal }),
+  /** A metric's values on a repository's default branch over `days`, by runner fingerprint (W16-AC05). */
+  repoMetric: (repo: string, name: string, days: number, signal?: AbortSignal) =>
+    request<{ repo: string; branch: string; days: number; data: CiMetricTrend }>("GET", `/api/ci/repos/${enc(repo)}/metrics?name=${enc(name)}&days=${days}`, undefined, { signal }),
   /** The run's tests, failures first (W16-R03). */
   tests: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ counts: Record<string, number>; tests: CiTest[] }>("GET", `/api/ci/runs/${enc(id)}/tests${at(attempt)}`, undefined, { signal }),
-  rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean, keepFailed = false) =>
-    request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug, keep_failed: keepFailed }),
+  /** `fresh`: the actions pinned again now, not as the run pinned them (W07-R02). */
+  rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean, keepFailed = false, fresh = false) =>
+    request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug, keep_failed: keepFailed, fresh_actions: fresh }),
   /** A review of the run's deployments waiting on their environments (W15-R04), or, with none
    * named, of an outside contributor's run waiting to start (W18-R06). */
   approve: (id: string, environments: string[], state: "approved" | "rejected", comment: string) =>
     request<{ run: string; environments?: string[]; approval?: "run"; state: string }>("POST", `/api/ci/runs/${enc(id)}/approve`, { environments, state, comment }),
   cancel: (id: string) => request<void>("POST", `/api/ci/runs/${enc(id)}/cancel`, {}),
+  /** A repository's environments (W15). */
+  environments: (repo: string, signal?: AbortSignal) => request<{ repo: string; environments: CiEnvironment[] }>("GET", `/api/ci/environments?repo=${enc(repo)}`, undefined, { signal }),
+  /** Every environment of every repository the caller may read (W15-R09). */
+  environmentsBoard: (signal?: AbortSignal) => request<{ environments: CiEnvironment[] }>("GET", "/api/ci/environments/board", undefined, { signal }),
+  environment: (repo: string, name: string, signal?: AbortSignal) => request<CiEnvironment>("GET", `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`, undefined, { signal }),
+  /** Makes an environment in kiln, or changes one made here; what it would meet now comes back with it. */
+  saveEnvironment: (repo: string, name: string, body: { kind: CiEnvKind | null; targets: CiEnvTargets; protection: CiProtection; url: string | null; concurrency: number | null }) =>
+    request<CiEnvironment & { diagnostics?: { level: string; message: string }[]; preview?: { trunk: string; a_deployment_from_the_trunk: string } }>(
+      "PUT",
+      `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`,
+      body,
+    ),
+  deleteEnvironment: (repo: string, name: string) => request<void>("DELETE", `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`),
+  /** A repository's dev, staging and production, each unless it has one of that name (W15-R08). */
+  starterEnvironments: (repo: string) => request<{ repo: string; made: string[]; kept: string[] }>("POST", `/api/ci/environments/starter?repo=${enc(repo)}`, {}),
+  deployments: (repo: string, name: string, signal?: AbortSignal) =>
+    request<{ deployments: CiDeployment[] }>("GET", `/api/ci/environments/${enc(name)}/deployments?repo=${enc(repo)}&limit=50`, undefined, { signal }),
   /** A kept leg kept `minutes` more from now, or let go (W17-R02). */
   keep: (leg: string, minutes: number) => request<{ leg: string; kept_until: number }>("POST", `/api/ci/legs/${enc(leg)}/keep`, { minutes }),
   release: (leg: string) => request<void>("POST", `/api/ci/legs/${enc(leg)}/release`, {}),
   /** A kept leg's step run again in place, as a new section of its log (W17-R04). */
   rerunStep: (leg: string, idx: number) => request<{ leg: string; step: number; idx: number }>("POST", `/api/ci/legs/${enc(leg)}/rerun-step`, { idx }),
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
-  validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
+  /** A leg's attempts, oldest first, each with its failure class, and its outputs (W21-R05). */
+  legDetail: (leg: string, signal?: AbortSignal) =>
+    request<{ attempts: CiAttempt[]; outputs: Record<string, string>; steps?: { idx: number; name: string; action: string | null; status: string; conclusion: string | null }[] }>(
+      "GET",
+      `/api/ci/legs/${enc(leg)}`,
+      undefined,
+      { signal },
+    ),
+  /** An action as its editor has it, run once with `inputs` on what `runs_on` names (W21-R07's "Try it"). */
+  tryAction: (repo: string, body: { path: string; content: string; ref?: string; inputs: Record<string, string>; runs_on: string }) =>
+    request<{ run: string; sha: string; trusted: boolean }>("POST", `/api/ci/repos/${enc(repo)}/actions/try`, body),
+  /** A file checked; with `repo`, against what its run would meet too (W02-R12: labels no runner has, actions its policies refuse). */
+  validate: (path: string, content: string, repo?: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, repo ? { path, content, repo } : { path, content }, { signal }),
+  /** The JSON Schema of a kind of file (W02-R09): `gha`, `kiln`, `overlay` or `action`, for the editor's key completion and hover. */
+  schema: (kind: "gha" | "kiln" | "overlay" | "action") => request<Schema>("GET", `/api/ci/schema/${kind}`),
+  /** A workflow's new text saved as `to` says (W21-R06, `ci.workflows.edit`), checked first. */
+  saveWorkflow: (repo: string, path: string, body: { content: string; to: CiSave; branch?: string; title?: string }) =>
+    request<CiSaved>("POST", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}/edit`, body),
   workflows: (repo: string, ref: string, signal?: AbortSignal) =>
-    request<{ ref: string; sha: string; workflows: CiWorkflowFile[] }>("GET", `/api/ci/repos/${enc(repo)}/workflows${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
+    request<{ ref: string; sha: string; workflows: CiWorkflowFile[]; actions?: string[] }>("GET", `/api/ci/repos/${enc(repo)}/workflows${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
   workflow: (repo: string, path: string, ref: string, signal?: AbortSignal) =>
     request<CiWorkflowSource>("GET", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
+  /** What a `runs-on` of the repository's may name (W21-R06): runners', pools' and routing rules' labels, each with where it comes from. */
+  labels: (repo: string, signal?: AbortSignal) => request<{ labels: { label: string; from: ("runner" | "pool" | "rule")[] }[] }>("GET", `/api/ci/repos/${enc(repo)}/labels`, undefined, { signal }),
   names: (repo: string, path: string, signal?: AbortSignal) => request<{ secrets: string[]; variables: string[] }>("GET", `/api/ci/repos/${enc(repo)}/names?path=${enc(path)}`, undefined, { signal }),
   catalog: (q: string, signal?: AbortSignal) => request<{ actions: CiCatalogEntry[] }>("GET", `/api/ci/actions?q=${enc(q)}`, undefined, { signal }),
   searchLogs: (p: { q: string; repo?: string; branch?: string; conclusion?: string; days?: number }, signal?: AbortSignal) =>
@@ -503,7 +933,16 @@ export function waitSentence(w: unknown): string | null {
     at?: number;
     environment?: string;
     reviewers?: string[];
+    window?: string;
+    promotion?: string;
+    gate?: string;
     until?: number | null;
+    pool?: string;
+    starting?: number;
+    since?: number;
+    reservation?: string;
+    avoided?: string;
+    refused?: boolean;
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   switch (o.reason) {
@@ -515,18 +954,33 @@ export function waitSentence(w: unknown): string | null {
       return `No runner meets its requirements${list(o.failing)}.`;
     case "capability":
       return `The runners that match need a newer kiln${list(o.runners)}.`;
+    case "other-runner":
+      return o.refused
+        ? `Waiting for a runner other than ${o.avoided ?? "the one"} that refused it.`
+        : `Its retry waits for a runner other than ${o.avoided ?? "the one it ran on"}, as its policy asks (runner: different).`;
     case "concurrency":
+      if (o.environment) return `Waiting for ${o.environment}'s other deployments (at most ${o.limit ?? 1} at once).`;
       return `Waiting for concurrency group ${o.group ?? ""}${o.holders?.length ? `, held by ${o.holders.join(", ")}` : ""}.`;
     case "quota":
       return `The repository's limit of ${o.limit ?? 0} running legs is reached.`;
     case "exclusive":
       return "Waiting to run alone on a runner.";
+    case "scaling":
+      return `Pool ${o.pool ?? ""} is starting ${o.starting ?? 0} executor${o.starting === 1 ? "" : "s"}${o.since ? ` since ${new Date(o.since).toLocaleTimeString()}` : ""}.`;
+    case "reservation":
+      return `Its runners are reserved${o.reservation ? ` (${o.reservation})` : ""} until ${o.until ? new Date(o.until).toLocaleTimeString() : "the reservation ends"}.`;
     case "retry":
       return `Retrying at ${o.at ? new Date(o.at * 1000).toLocaleTimeString() : "a moment"}.`;
     case "approval":
       return `Waiting for a review to deploy to ${o.environment ?? "its environment"}${o.reviewers?.length ? ` (${o.reviewers.join(", ")})` : ""}${o.until ? `, and until ${new Date(o.until * 1000).toLocaleTimeString()}` : ""}.`;
     case "wait-timer":
       return `Waiting until ${o.until ? new Date(o.until * 1000).toLocaleTimeString() : "its wait timer ends"} to deploy to ${o.environment ?? "its environment"}.`;
+    case "window":
+      return `Waiting for a deploy window of ${o.environment ?? "its environment"}: ${o.window ?? "it is closed"}.`;
+    case "promotion":
+      return `Waiting for ${o.promotion ?? "this commit to deploy to the environment before it"}, to deploy to ${o.environment ?? "its environment"}.`;
+    case "gate":
+      return `Waiting for ${o.gate ?? "its environment's gates to pass"}, to deploy to ${o.environment ?? "its environment"}.`;
     default:
       return o.reason ? o.reason.replace(/-/g, " ") : null;
   }

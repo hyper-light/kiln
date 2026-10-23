@@ -1434,7 +1434,7 @@ mod tests {
             let bytes = filled("another machine's change\n", 6000);
             let hash = blobs.put_bytes(&bytes).map_err(e)?;
             let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
-            let change = Change { path: "docs/a.txt".into(), to: Some(Version::File { hash, exec: false }), base: None };
+            let change = Change { path: "docs/a.txt".into(), to: Some(Version::File { hash, exec: false }), base: None, bundle: None };
             copy.apply(&Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] }, &blobs).map_err(e)?;
             copy.sync_dirs().map_err(e)?;
             disk.power_loss();
@@ -1486,7 +1486,7 @@ mod tests {
             for (path, body) in [("a.txt", "one"), ("src/b.rs", "two"), ("docs/c/d.md", "three")] {
                 let hash = blobs.put_bytes(body.as_bytes()).map_err(e)?;
                 want.insert(path.to_owned(), body.as_bytes().to_vec());
-                changes.push(Change { path: path.into(), to: Some(Version::File { hash, exec: false }), base: None });
+                changes.push(Change { path: path.into(), to: Some(Version::File { hash, exec: false }), base: None, bundle: None });
             }
             let step = Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes };
             let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
@@ -1596,7 +1596,7 @@ mod tests {
             let mut copy = Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default());
             let base = if undone {
                 // a.txt as the log has it, then changed here.
-                copy.apply(&step(1, Change { path: "a.txt".into(), to: version(&zero), base: None }), &blobs).map_err(e)?;
+                copy.apply(&step(1, Change { path: "a.txt".into(), to: version(&zero), base: None, bundle: None }), &blobs).map_err(e)?;
                 version(&zero)
             } else {
                 // A file made here.
@@ -1604,7 +1604,7 @@ mod tests {
             };
             disk.write(file, b"mine").map_err(e)?;
             // Another machine's version: kept back, the file changed here.
-            let kept = copy.apply(&step(2, Change { path: "a.txt".into(), to: version(&one), base }), &blobs).map_err(e)?;
+            let kept = copy.apply(&step(2, Change { path: "a.txt".into(), to: version(&one), base, bundle: None }), &blobs).map_err(e)?;
             if !matches!(kept.as_slice(), [Outcome::Kept { .. }]) {
                 return Err(format!("the version wasn't kept back: {kept:?}"));
             }
@@ -1638,7 +1638,7 @@ mod tests {
         let one = blobs.put_bytes(b"one!").map_err(e)?;
         // A file made here, unproposed; another machine's version of it comes.
         disk.write("/home/m2/repo/a.txt", b"mine").map_err(e)?;
-        let change = Change { path: "a.txt".into(), to: Some(Version::File { hash: one.clone(), exec: false }), base: None };
+        let change = Change { path: "a.txt".into(), to: Some(Version::File { hash: one.clone(), exec: false }), base: None, bundle: None };
         let kept = feed.copy.apply(&Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] }, &blobs).map_err(e)?;
         if !matches!(kept.as_slice(), [Outcome::Kept { .. }]) {
             return Err(format!("the version wasn't kept back: {kept:?}"));
@@ -1756,7 +1756,7 @@ mod tests {
             let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
             let bytes = filled("another machine's file\n", 3000);
             let hash = blobs.put_bytes(&bytes).map_err(e)?;
-            let change = Change { path: "src/util/x.rs".into(), to: Some(Version::File { hash, exec: false }), base: None };
+            let change = Change { path: "src/util/x.rs".into(), to: Some(Version::File { hash, exec: false }), base: None, bundle: None };
             let step = Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] };
             if seed % 4 >= 2 {
                 // A process before a crash made them.
@@ -1841,7 +1841,7 @@ mod tests {
             let blobs = Blobs::on(Arc::clone(&fs), &PathBuf::from("/state/m2/blobs")).map_err(e)?;
             let bytes = filled("another machine's file\n", 3000);
             let hash = blobs.put_bytes(&bytes).map_err(e)?;
-            let change = Change { path: "agent/notes.md".into(), to: Some(Version::File { hash, exec: false }), base: None };
+            let change = Change { path: "agent/notes.md".into(), to: Some(Version::File { hash, exec: false }), base: None, bundle: None };
             let step = Step { by: "m3".into(), member: 3, seq: 1, at: SIM_EPOCH_MS, changes: vec![change] };
             // A process writes it, and crashes before it syncs the folders.
             Copy::on(Arc::clone(&fs), &root, "m2", 2, Limits::default(), State::default()).apply(&step, &blobs).map_err(e)?;

@@ -340,12 +340,11 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
             .await?;
         crate::metrics::global().runs_started.inc();
         tracing::info!(repo = %repo.name, run = run.number, event = t.event, branch = %t.branch, sha = %t.sha, "run created");
-        if let (Some(g), Some(c)) = (group, &p.concurrency)
-            && c.cancel_in_progress {
-                for old in hub.store.active_runs_in_group(g, run.id.clone()).await? {
-                    hub.cancel_run(&old, "superseded by a newer run").await?;
-                }
+        if let (Some(g), Some(c)) = (group, &p.concurrency) {
+            for old in hub.store.superseded_in_group(g, run.id.clone(), c.cancel_in_progress).await? {
+                hub.cancel_run(&old, "superseded by a newer run").await?;
             }
+        }
         report_status(hub, &run, Status::Pending).await;
         hub.emit_run(&run.id).await;
         runs.push(run);
@@ -538,6 +537,9 @@ pub async fn discover_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let sem = Arc::new(async_lock::Semaphore::new(hub.cfg.gitops.git_concurrency.max(1)));
     let inflight = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
+    // Kicked while their poll ran (a push meanwhile): polled again as that poll ends, not a whole
+    // interval later.
+    let again = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
     let mut force = true;
     loop {
         let now = crate::util::now_unix();
@@ -546,11 +548,17 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 continue;
             }
             let due = force || repo.last_polled_at.is_none_or(|t| now - t >= i64::from(repo.poll_seconds.max(10)));
-            if !due || inflight.lock().contains(&repo.id) {
+            if !due {
+                continue;
+            }
+            if inflight.lock().contains(&repo.id) {
+                if force {
+                    again.lock().insert(repo.id.clone());
+                }
                 continue;
             }
             inflight.lock().insert(repo.id.clone());
-            let (hub, sem, inflight) = (hub.clone(), sem.clone(), inflight.clone());
+            let (hub, sem, inflight, again) = (hub.clone(), sem.clone(), inflight.clone(), again.clone());
             crate::sup::spawn_guarded("poll-repo", async move {
                 let _permit = sem.acquire().await;
                 let r = poll_repo(&hub, &repo).await;
@@ -566,6 +574,9 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 }
                 hub.store.repo_polled(repo.id.clone(), err).await?;
                 inflight.lock().remove(&repo.id);
+                if again.lock().remove(&repo.id) {
+                    hub.gitops_kick.notify();
+                }
                 Ok(())
             });
         }

@@ -25,7 +25,7 @@ use crate::proto::{self, AgentMsg, Assignment, Hello, JobResult, LANE_CONTROL, L
 use crate::store::{AgentRow, Job, Status, Store};
 
 /// How long a persistent agent may be gone before its jobs are requeued.
-const AGENT_GRACE: Duration = Duration::from_secs(45);
+pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
 const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 /// Host samples kept per agent for the UI charts (1 h at 5 s).
@@ -71,6 +71,33 @@ impl OutpostInvites {
     pub fn take(&self, token: &str) -> bool {
         self.0.lock().remove(token).is_some_and(|until| until > Instant::now())
     }
+}
+
+/// Whether a runner carries a label a job asks for (`runs-on`), in any case: one of its own, its
+/// name, or what its platform says (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
+/// `aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled so.
+fn carries(labels: &[String], os: &str, arch: &str, name: &str, want: &str) -> bool {
+    want == name || labels.iter().any(|l| l.eq_ignore_ascii_case(want)) || platform_labels(os, arch).iter().any(|l| l.eq_ignore_ascii_case(want))
+}
+
+/// The labels a runner's platform gives it.
+fn platform_labels<'a>(os: &'a str, arch: &'a str) -> Vec<&'a str> {
+    let mut v = vec!["self-hosted", os, arch];
+    if os == "macos" {
+        v.push("darwin");
+    }
+    match arch {
+        "x86_64" => v.extend(["amd64", "x64"]),
+        "aarch64" => v.push("arm64"),
+        _ => {}
+    }
+    v.retain(|l| !l.is_empty());
+    v
+}
+
+/// How hard a runner is pressed, by its last sample (none yet: unknown, not overloaded).
+fn strain_of(a: &AgentLive) -> crate::reach::directory::Strain {
+    a.sample.as_ref().map(|s| crate::reach::directory::strain(s.cpus, s.cpu_pct, s.load1, s.mem_total, s.mem_used)).unwrap_or_default()
 }
 
 /// An outpost (`kiln outpost`) says so with its label and no slots; a runner given the label by
@@ -171,6 +198,11 @@ pub struct Hub {
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
     pub ephemeral_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    /// One-time enrollment tokens for a `k8s` pool's executor pods (docs/ci.md W13-R07): token →
+    /// (executor, the pod's name, which the runner must take, expiry).
+    pub executor_tokens: Mutex<HashMap<String, (String, String, Instant)>>,
+    /// The executor each executor pod's runner is, by the name it enrolled with.
+    pub pod_executors: Mutex<HashMap<String, String>>,
     /// One-time outpost invites (`POST /api/outposts/invite`).
     pub outpost_invites: OutpostInvites,
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
@@ -208,8 +240,13 @@ pub struct Hub {
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
     pub tasks: crate::sync::tasks::Tasks,
+    /// Work kept in step between the machines that hold a repository (`crate::sync::share`).
+    pub shares: crate::sync::share::Shares,
     /// Notifications to people's devices (`crate::push`).
     pub push: crate::push::Service,
+    /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
+    /// any S3.
+    pub blobs: crate::blobs::Opened,
 }
 
 impl Hub {
@@ -223,7 +260,7 @@ impl Hub {
         admin_token: String,
         join_token: String,
         shutdown: Shutdown,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_on(crate::rt::clock(), cfg, store, logs, net, pki, admin_token, join_token, shutdown)
     }
 
@@ -239,16 +276,18 @@ impl Hub {
         admin_token: String,
         join_token: String,
         shutdown: Shutdown,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
+        let blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
         let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock));
-        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
+        let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
+        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             cfg,
             store,
             logs,
@@ -276,6 +315,8 @@ impl Hub {
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
+            executor_tokens: Mutex::new(HashMap::new()),
+            pod_executors: Mutex::new(HashMap::new()),
             outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
@@ -295,8 +336,10 @@ impl Hub {
             reach: Mutex::new(crate::reach::relay::Relay::default()),
             places,
             tasks,
+            shares: crate::sync::share::Shares::default(),
             push: crate::push::Service::default(),
-        })
+            blobs,
+        }))
     }
 
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
@@ -311,18 +354,16 @@ impl Hub {
         if !path.exists() {
             return;
         }
-        let (cfg, run_c) = (self.cfg.clone(), run.clone());
-        let adopted = crate::rt::blocking(move || crate::updates::adopt_into(&cfg, &path, &run_c)).await;
-        match adopted {
-            Ok(Ok(kept)) if !kept.is_empty() => {
+        match crate::updates::adopt_into(self, &path, run).await {
+            Ok(kept) if !kept.is_empty() => {
                 let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
                 self.emit(&serde_json::json!({ "type": "updates" }));
                 self.updates.fleet.wake();
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) | Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
         }
     }
 
@@ -374,7 +415,10 @@ impl Hub {
                 if self.places.heard(machine, r) {
                     self.emit(&serde_json::json!({ "type": "places" }));
                 }
+                // Said when it connects, and when what it holds changes: what it shares.
+                self.shares.arrange(self);
             }
+            Some(crate::sync::wire::Msg::Shared(w)) => self.shares.shared(self, machine, *w),
             Some(crate::sync::wire::Msg::Task(news)) => self.tasks.heard(machine, news),
             Some(msg) => self.sync.from_runner(machine, msg, raft),
             None => {}
@@ -900,6 +944,12 @@ impl Hub {
         self.peers.lock().get(&peer).cloned()
     }
 
+    /// Whether `job` is one of the CI engine's legs: one it knows, or, while it rebuilds its runs
+    /// after a restart (knowing none yet), one the store has (its message waits for it then).
+    async fn ci_leg(&self, job: &str) -> bool {
+        self.ci.is_leg(job) || (self.ci.enabled() && self.ci.restored().is_none() && self.store.ci_legs(vec![job.to_owned()]).await.is_ok_and(|l| l.contains(job)))
+    }
+
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
         // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
@@ -1035,12 +1085,17 @@ impl Hub {
             }
             AgentMsg::JobSample { .. } => {}
             AgentMsg::JobFinished(r) => {
+                let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
-                    if self.ci.is_leg(&r.job) {
+                    if self.ci_leg(&r.job).await {
                         self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
                     } else {
                         self.job_done(&agent, r).await?;
                     }
+                }
+                // Heard (taken, or not this runner's to give any more): it needn't send it again.
+                if self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_RECEIVED != 0) {
+                    self.send_peer(peer, &ServerMsg::Received { job }).await;
                 }
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
@@ -1109,8 +1164,13 @@ impl Hub {
             // A streamed page's chunks and events (`crate::harness::streams`): to its viewers.
             AgentMsg::StreamFrame { stream, data } => self.harness.streams.chunk(&agent, &stream, data),
             AgentMsg::StreamEvent { stream, json } => {
+                let after = self.harness.streams.event(&agent, &stream, json);
+                // A recording that ended: its files kept in kiln's store of bytes.
+                if let Some((session, rec)) = after.ended {
+                    self.harness.streams.keep(self, session, rec);
+                }
                 // Opened: the size its viewer asked for while it was being set up, asked again.
-                if let Some((live, again)) = self.harness.streams.event(&agent, &stream, json) {
+                if let Some((live, again)) = after.again {
                     live.control(self, &again).await;
                 }
             }
@@ -1121,6 +1181,11 @@ impl Hub {
             AgentMsg::PortClose { conn, error } => self.harness.ports.ended(&agent, conn, error),
             AgentMsg::Build { build, caps } => {
                 self.instances.lock().set_build(peer, build.clone(), caps);
+                // It may send its legs' events and results again after a reconnect: they're taken
+                // once (a receipt without a job says so).
+                if caps & proto::CAP_RECEIVED != 0 {
+                    self.send_peer(peer, &ServerMsg::Received { job: String::new() }).await;
+                }
                 self.updates.on_build(self, &agent, &build);
                 self.updates.fleet.wake();
                 self.emit(&serde_json::json!({ "type": "updates" }));
@@ -1134,6 +1199,11 @@ impl Hub {
                 }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
+                // Previews' deployments it's left to take down (docs/ci.md W15-R07).
+                if caps & proto::CAP_UNDEPLOY != 0 {
+                    let (hub, agent) = (Arc::clone(self), agent.clone());
+                    crate::rt::spawn(async move { crate::ci::previews::runner_up(&hub, &agent).await });
+                }
             }
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
@@ -1172,6 +1242,10 @@ impl Hub {
                     self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json });
                 }
             }
+            // A pool's executor it was asked to start (docs/ci.md W13-R09).
+            AgentMsg::Executor { json } => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.clone(), json }),
+            // A preview's deployment it was asked to take down (docs/ci.md W15-R07).
+            AgentMsg::Undeployed { json } => crate::ci::previews::undeployed(self, &agent, &json).await,
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {
@@ -1381,8 +1455,23 @@ impl Hub {
                 self.emit_job(&j.id).await;
             }
         }
+        // Until the CI engine has rebuilt its runs after a restart it knows none of its legs: those
+        // the runner says it has are its own still, for the dispatcher to re-adopt or stop once it
+        // has (`dispatch::spawn`), never taken back as v1's jobs (which would cancel them).
+        let rebuilding = if self.ci.enabled() && self.ci.restored().is_none() {
+            let said: Vec<String> = h.running.iter().filter(|j| !keep.contains(j)).cloned().collect();
+            self.store.ci_legs(said).await.unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
         for j in &h.running {
             if keep.contains(j) {
+                continue;
+            }
+            // CI's legs are the dispatcher's to re-adopt, or to stop if they were given up while
+            // the runner was away (`Msg::RunnerUp` below, W05-R05).
+            if self.ci.is_leg(j) || rebuilding.contains(j) {
+                keep.push(j.clone());
                 continue;
             }
             // The server requeued this job while the agent was away, but the agent kept working:
@@ -1734,6 +1823,9 @@ impl Hub {
                 slow = Instant::now();
                 self.check_timeouts().await?;
                 self.check_lost_agents().await;
+                crate::ci::notify::runners_gone(&self);
+                crate::ci::notify::secrets_unused(&self);
+                crate::ci::notify::quarantined(&self);
             }
         }
     }
@@ -1968,13 +2060,16 @@ impl Hub {
                 Some(d) => d == &job.id,
                 None => true,
             })
-            .filter(|a| job.labels.iter().all(|l| a.labels.contains(l) || l == &a.name))
+            .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
             .filter(|a| if exclusive { a.running.is_empty() } else { a.busy < a.slots })
-            // Least loaded first, then most free slots.
-            .min_by(|a, b| {
-                let la = f64::from(a.busy) / f64::from(a.slots.max(1));
-                let lb = f64::from(b.busy) / f64::from(b.slots.max(1));
-                la.total_cmp(&lb).then(b.slots.cmp(&a.slots))
+            // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
+            // job goes to another, or waits for one (a pod made for it is its own).
+            .filter(|a| a.ephemeral || !strain_of(a).overloaded)
+            // The one with the most room: by its idle cores, free memory and CI slots taken, as
+            // reach measures it; then the most slots.
+            .max_by(|a, b| {
+                let (ra, rb) = (crate::reach::directory::room(strain_of(a), a.busy, a.slots), crate::reach::directory::room(strain_of(b), b.busy, b.slots));
+                ra.total_cmp(&rb).then(a.slots.cmp(&b.slots)).then(b.name.cmp(&a.name))
             })
             .map(|a| a.name.clone())
     }
@@ -2078,6 +2173,7 @@ impl Hub {
             }
         // Expire unused pod enrollment tokens.
         self.ephemeral_tokens.lock().retain(|_, (_, exp)| *exp > Instant::now());
+        self.executor_tokens.lock().retain(|_, (_, _, exp)| *exp > Instant::now());
     }
 
     /// Sample the server host itself for the UI ("server" series).
@@ -2130,6 +2226,21 @@ impl Hub {
 pub(crate) mod tests {
     use super::*;
 
+    /// A job's labels fit a runner by its own labels, its name, or its platform (`linux`, `amd64`,
+    /// `arm64`, `self-hosted`), in any case: `[linux]` isn't only for runners labelled so.
+    #[test]
+    fn a_job_for_linux_fits_every_linux_runner() {
+        let own = vec!["baremetal".to_owned(), "bench".to_owned(), "local".to_owned()];
+        let fits = |want: &str| carries(&own, "linux", "x86_64", "adacachy", want);
+        for w in ["linux", "Linux", "x86_64", "amd64", "X64", "self-hosted", "baremetal", "BENCH", "adacachy"] {
+            assert!(fits(w), "{w}");
+        }
+        for w in ["macos", "arm64", "gpu", "windows"] {
+            assert!(!fits(w), "{w}");
+        }
+        assert!(carries(&[], "macos", "aarch64", "mac", "arm64") && carries(&[], "macos", "aarch64", "mac", "darwin"));
+    }
+
     /// A hub of its own for a test: its data in a folder that lives as long as the process (tests
     /// end with it), a QUIC endpoint on a free loopback port, no runners, its agents off unless a
     /// test turns terminals on.
@@ -2165,7 +2276,7 @@ pub(crate) mod tests {
         let pki = Arc::new(pki);
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
-        Ok(Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new()))
+        Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }
 
     #[test]

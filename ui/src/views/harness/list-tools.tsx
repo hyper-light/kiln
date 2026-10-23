@@ -45,8 +45,8 @@ export const STANDS = [
 ];
 const RANK = new Map(STANDS.map((s, i) => [s.id, i]));
 
-/** Since when it has waited on you: its oldest request (or, without one, its last word). */
-const waitingSince = (a: AgentInfo) => a.approvals.reduce((at, p) => Math.min(at, p.at || at), a.approvals.length > 0 ? Infinity : a.last_activity);
+/** Since when it has waited on you: its oldest request (or, without one, when it paused its goals for you, or its last word). */
+const waitingSince = (a: AgentInfo) => a.approvals.reduce((at, p) => Math.min(at, p.at || at), a.approvals.length > 0 ? Infinity : (a.held?.since ?? a.last_activity));
 
 export interface ViewRow {
   a: AgentInfo;

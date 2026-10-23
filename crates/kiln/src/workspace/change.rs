@@ -121,7 +121,7 @@ pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Val
     let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     let answer = if machine == "local" {
-        super::serve(std::path::Path::new(&info.cwd), info.workspace.as_ref(), &json).await
+        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), &json).await
     } else {
         let id = info.id.clone();
         let got = hub
@@ -274,6 +274,8 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
         .or_else(|| previous.as_ref().map(|p| p.trunk.clone()))
         .or_else(|| found.as_ref().and_then(|(r, _)| r.default_branch.clone()))
         .or_else(|| facts.default_branch.clone())
+        // In a worktree, the branch its checkout has (its own branch is the agent's).
+        .or_else(|| facts.main_branch.clone())
         .or_else(|| facts.branch.clone())
         .unwrap_or_else(|| "main".to_owned());
     let title = title_of(info, &want);
@@ -383,7 +385,14 @@ fn lineage_short(id: &str) -> &str {
 /// The files agent `id` changed, as its changeset names them.
 pub fn paths_of(hub: &Hub, id: &str) -> Vec<String> {
     let (_, _, changes) = hub.harness.conclusion(id).unwrap_or_default();
-    changes.as_array().into_iter().flatten().filter_map(|f| f.get("path").and_then(Value::as_str)).map(str::to_owned).collect()
+    paths_in(&changes, hub.harness.info(id).and_then(|i| i.tree).as_deref())
+}
+
+/// The files of `changes` (a changeset) in working tree `tree`, as git names them there (a
+/// worktree's own, not the checkout's it was made from); with none, every file, as named.
+fn paths_in(changes: &Value, tree: Option<&str>) -> Vec<String> {
+    let mine = |f: &&Value| tree.is_none_or(|t| f.get("tree").and_then(Value::as_str) == Some(t));
+    changes.as_array().into_iter().flatten().filter(mine).filter_map(|f| f.get("path").and_then(Value::as_str)).map(str::to_owned).collect()
 }
 
 /// A record as `agents.change` and `agents.result` answer with it.
@@ -397,6 +406,19 @@ mod tests {
 
     fn repo(name: &str, url: &str, mode: &str) -> Repo {
         Repo { id: name.into(), name: name.into(), clone_url: url.into(), branches: Vec::new(), poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: mode.into(), default_branch: None, mirror: None }
+    }
+
+    #[test]
+    fn its_change_request_takes_the_files_of_the_working_tree_its_work_is_in() {
+        let changes = serde_json::json!([
+            {"path": "README.md", "tree": "/w/repo/.claude/worktrees/f"},
+            {"path": "notes.txt", "tree": "/w/repo/.claude/worktrees/f"},
+            {"path": "src/old.rs", "tree": "/w/repo"},
+            {"path": "/tmp/scratch.txt"}
+        ]);
+        assert_eq!(paths_in(&changes, Some("/w/repo/.claude/worktrees/f")), ["README.md", "notes.txt"]);
+        assert_eq!(paths_in(&changes, Some("/w/repo")), ["src/old.rs"]);
+        assert_eq!(paths_in(&changes, None), ["README.md", "notes.txt", "src/old.rs", "/tmp/scratch.txt"], "no working tree known: every file, as named");
     }
 
     #[test]

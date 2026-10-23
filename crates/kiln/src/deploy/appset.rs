@@ -25,8 +25,14 @@ const TOKEN_DAYS: i64 = 90;
 const TOKEN_MARGIN_SECS: i64 = 30 * 86_400;
 
 /// Where an Argo CD reads an environment's release repository: kiln's git server, at the address
-/// the instance reaches kiln at (its integration's `kiln_url`, or kiln's public URL).
-pub fn release_url(d: &Deploy, argo: &Argo, env: &Environment) -> String {
+/// the instance reaches kiln at (its integration's `kiln_url`, or kiln's public URL); or its host
+/// (GitHub, a GitLab, Bitbucket).
+pub async fn release_url(d: &Deploy, argo: &Argo, env: &Environment) -> String {
+    if super::model::remote_host(&env.release_repo.host)
+        && let Some(url) = super::remote::release_url(d, &env.release_repo).await
+    {
+        return url;
+    }
     argocd::release_repo_url(argo.kiln_url.as_deref().unwrap_or(&d.hub.cfg.server.public_url), &env.release_repo.repo)
 }
 
@@ -42,7 +48,7 @@ pub async fn shadow(d: &Deploy, argo: &Argo, env: &Environment) -> Result<(), Un
 }
 
 async fn put(d: &Deploy, argo: &Argo, env: &Environment, shadow: bool) -> Result<(), Undelivered> {
-    let url = release_url(d, argo, env);
+    let url = release_url(d, argo, env).await;
     register_repo(d, argo, env, &url).await?;
     argo.put_project(&argocd::app_project(&env.name, &allowed(d, env, &url).await?)).await?;
     argo.put_application_set(&argocd::application_set(&argo.namespace, env, &url, shadow)).await
@@ -52,6 +58,11 @@ async fn put(d: &Deploy, argo: &Argo, env: &Environment, shadow: bool) -> Result
 /// that repository only: made again a month before it ends, or when Argo CD can't read with the
 /// one it has; the one it replaces revoked.
 async fn register_repo(d: &Deploy, argo: &Argo, env: &Environment, url: &str) -> Result<(), String> {
+    // Another host's: read with credentials of that host's that read that repository.
+    if super::model::remote_host(&env.release_repo.host) {
+        super::flow::first_commit(d, env).await?;
+        return super::remote::argo_reader(d, argo, env, url).await;
+    }
     let repo_name = &env.release_repo.repo;
     let note = format!("Argo CD {} reads {repo_name}", argo.integration);
     let live = crate::authz::tokens::readers(&d.hub, &note, TOKEN_MARGIN_SECS).await.map_err(|e| format!("{e:#}"))?;
@@ -209,13 +220,16 @@ async fn holds(d: &Deploy, a: &App, env: &Environment, rev: &str, commit: &str) 
     if rev == commit {
         return Ok(true);
     }
-    let (hosted, rr) = (d.hosted.clone(), env.release_repo.clone());
-    let paths = [repo::release_file(&rr, a, &env.name), repo::values_file(&rr, a, &env.name)];
-    let (rev, commit) = (rev.to_owned(), commit.to_owned());
-    // A commit kiln's repository doesn't have isn't one that holds them.
-    crate::rt::blocking(move || paths.iter().all(|p| matches!((hosted.read(&rr.repo, &rev, p), hosted.read(&rr.repo, &commit, p)), (Ok(a), Ok(b)) if a == b)))
-        .await
-        .map_err(|e| format!("{e:#}"))
+    let rr = &env.release_repo;
+    let at = super::git::open(d, rr).await?;
+    // A commit the release repository doesn't have isn't one that holds them.
+    for p in [repo::release_file(rr, a, &env.name), repo::values_file(rr, a, &env.name)] {
+        match (at.read(rev, &p).await, at.read(commit, &p).await) {
+            (Ok(x), Ok(y)) if x == y => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

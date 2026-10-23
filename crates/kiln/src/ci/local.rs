@@ -87,7 +87,11 @@ pub struct RunArgs {
 /// `kiln workflow …`.
 pub async fn workflow(args: WorkflowArgs, cfg: &Config, shutdown: Shutdown) -> Result<()> {
     let WorkflowCmd::Run(a) = args.cmd;
-    let code = run(&a, cfg, &shutdown).await?;
+    // On a task of its own: polled beneath `real_main`, whose frame every command shares, the
+    // run's deep calls (a server, a runner and a client in one process) overflow a debug build's
+    // stack.
+    let cfg = cfg.clone();
+    let code = crate::rt::spawn(async move { run(&a, &cfg, &shutdown).await }).await.map_err(|_| anyhow::anyhow!("the run ended without an answer"))??;
     if code != 0 {
         return Err(anyhow::Error::new(crate::reach::cli::ExitWith(code)));
     }
@@ -486,8 +490,13 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
         "unroutable" => (format!("no runner meets its requirements ({})", list("failing")), true),
         "capability" => (format!("{} can't run what it uses (Docker, or actions)", list("runners")), true),
         "no-runner" => ("no runner that can take it is connected".to_owned(), false),
+        "other-runner" if o.get("refused").and_then(Value::as_bool) == Some(true) => (format!("a runner other than {}, which refused it", text("avoided")), true),
+        "other-runner" => (format!("a runner other than {}, as its retry asks (`runner: different`)", text("avoided")), true),
         "approval" => (format!("a reviewer's approval to deploy to {} ({})", text("environment"), list("reviewers")), true),
         "wait-timer" => (format!("the wait timer of {}", text("environment")), false),
+        "window" => (format!("a deploy window of {}: {}", text("environment"), text("window")), false),
+        "promotion" | "gate" => (format!("{} (to deploy to {})", text(if o.get("reason").and_then(Value::as_str) == Some("gate") { "gate" } else { "promotion" }), text("environment")), false),
+        "concurrency" if o.get("environment").is_some() => (format!("{}'s other deployments (at most {} at once)", text("environment"), o.get("limit").and_then(Value::as_u64).unwrap_or(1)), false),
         "concurrency" => (format!("its concurrency group {}", text("group")), false),
         other => (other.replace('-', " "), false),
     })

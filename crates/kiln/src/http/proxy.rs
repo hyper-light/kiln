@@ -8,7 +8,9 @@
 //! names (a proxy out on the internet can't reach them, and kiln servers on a LAN worked without
 //! one before), and whatever `NO_PROXY` (or the system's exceptions) lists: `*`, host and domain
 //! names (`example.com` and `.example.com` match the domain and every name under it), addresses,
-//! networks (`10.0.0.0/8`), each optionally with `:port`.
+//! networks (`10.0.0.0/8`), each optionally with `:port`. With `KILN_PROXY_PRIVATE=1` (in a
+//! microVM, whose one way out is its host's proxy: docs/ci.md W13-R05) private networks go through
+//! it too; only loopback and `localhost` don't.
 
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -31,6 +33,8 @@ pub struct Settings {
     https: Option<Proxy>,
     http: Option<Proxy>,
     except: Vec<String>,
+    /// Private networks through the proxy too (`KILN_PROXY_PRIVATE`).
+    private: bool,
 }
 
 impl Settings {
@@ -41,7 +45,8 @@ impl Settings {
         let https = var(&["HTTPS_PROXY", "https_proxy"]).or_else(|| all.clone()).and_then(|u| parse_url(&u));
         let http = var(&["HTTP_PROXY", "http_proxy"]).or(all).and_then(|u| parse_url(&u));
         let except = var(&["NO_PROXY", "no_proxy"]).map(|v| split_list(&v)).unwrap_or_default();
-        Self { https, http, except }
+        let private = get("KILN_PROXY_PRIVATE").is_some_and(|v| v.trim() == "1");
+        Self { https, http, except, private }
     }
 
     /// From `scutil --proxy` (macOS's system settings): its HTTPS and HTTP proxies, if enabled,
@@ -73,13 +78,13 @@ impl Settings {
                 .flatten()
                 .filter(|p| !p.host.is_empty())
         };
-        Self { https: proxy("HTTPS"), http: proxy("HTTP"), except }
+        Self { https: proxy("HTTPS"), http: proxy("HTTP"), except, private: false }
     }
 
     /// The proxy for a connection to `host:port` (`https`: the scheme it speaks), if any.
     pub fn choose(&self, https: bool, host: &str, port: u16) -> Option<&Proxy> {
         let p = if https { self.https.as_ref() } else { self.http.as_ref() }?;
-        if always_direct(host) || self.except.iter().any(|e| excepted(e, host, port)) {
+        if own(host) || (!self.private && nearby(host)) || self.except.iter().any(|e| excepted(e, host, port)) {
             return None;
         }
         Some(p)
@@ -174,15 +179,27 @@ fn split_list(v: &str) -> Vec<String> {
     v.split([',', ' ', ';']).map(str::trim).filter(|e| !e.is_empty()).map(str::to_owned).collect()
 }
 
-/// Names and addresses a proxy on the internet can't reach.
-fn always_direct(host: &str) -> bool {
+/// This machine's own names and addresses.
+fn own(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+    if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(a)) => a.is_loopback() || a.is_private() || a.is_link_local() || a.is_unspecified() || (a.octets()[0] == 100 && (a.octets()[1] & 0xc0) == 64),
-        Ok(IpAddr::V6(a)) => a.is_loopback() || a.is_unspecified() || (a.segments()[0] & 0xfe00) == 0xfc00 || (a.segments()[0] & 0xffc0) == 0xfe80,
+        Ok(a) => a.is_loopback() || a.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+/// Names and addresses of the networks nearby, which a proxy on the internet can't reach.
+fn nearby(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+    if host.ends_with(".local") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(a)) => a.is_private() || a.is_link_local() || (a.octets()[0] == 100 && (a.octets()[1] & 0xc0) == 64),
+        Ok(IpAddr::V6(a)) => (a.segments()[0] & 0xfe00) == 0xfc00 || (a.segments()[0] & 0xffc0) == 0xfe80,
         Err(_) => false,
     }
 }
@@ -322,6 +339,19 @@ mod tests {
         assert!(vars(&[("NO_PROXY", "*"), ("HTTPS_PROXY", "http://gw:8080")]).choose(true, "a.example", 443).is_none());
         // Proxies kiln can't speak to are ignored.
         assert!(vars(&[("HTTPS_PROXY", "socks5://gw:1080")]).choose(true, "a.example", 443).is_none());
+    }
+
+    /// In a microVM (`KILN_PROXY_PRIVATE`, docs/ci.md W13-R05): private networks through the
+    /// proxy too, its own loopback not.
+    #[test]
+    fn w13_r05_a_microvm_proxies_private_networks() {
+        let s = vars(&[("HTTPS_PROXY", "http://127.0.0.1:3128"), ("KILN_PROXY_PRIVATE", "1")]);
+        for h in ["192.168.1.50", "10.0.0.5", "100.101.102.103", "fd00::1", "box.local"] {
+            assert!(s.choose(true, h, 443).is_some(), "{h}");
+        }
+        for h in ["127.0.0.1", "localhost", "[::1]"] {
+            assert!(s.choose(true, h, 443).is_none(), "{h}");
+        }
     }
 
     #[test]

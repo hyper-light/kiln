@@ -10,7 +10,7 @@ import { Link, useParams } from "@/lib/router";
 import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
 import { api } from "@/api/client";
-import { boardHref, checkName, deployApi, describe, providerName, releaseAppHref, releaseHref, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
+import { boardHref, checkName, deployApi, describe, providerName, releaseAppHref, releaseHref, releaseRepoUrl, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
@@ -50,6 +50,7 @@ function gateLines(g: Gates): { label: string; value: string }[] {
   }
   if (g.checks?.length) out.push({ label: "Checks", value: g.checks.map(checkWords).join("; ") });
   if (g.require_provenance) out.push({ label: "Provenance", value: provenanceWords(g.require_provenance) });
+  if (g.via === "pull-request") out.push({ label: "Pull requests", value: "each release is a pull request (a merge request on GitLab): merging it is the approval, closing it cancels the release" });
   return out;
 }
 
@@ -115,11 +116,16 @@ function Settings({ e }: { e: Environment }) {
   );
   const [concurrency, setConcurrency] = React.useState(e.concurrency);
   const [agents, setAgents] = React.useState(e.agents);
+  const [pulls, setPulls] = React.useState(g.via === "pull-request");
   const [busy, setBusy] = React.useState(false);
+  // Pull requests (GitLab's merge requests) where the release repository is on another host.
+  const onHost = e.release_repo.host !== "kiln";
   const count = Number(approvals);
   const wrong =
     !Number.isInteger(count) || count < 0
       ? "Approvals: a whole number, 0 for none."
+      : pulls && count > 0
+        ? "With pull requests, merging one is the approval: set approvals to 0 (who may merge is the branch's protection on its host)."
       : windows.some((w) => !w.cron.trim() || !w.duration.trim())
         ? "Each window needs its schedule and how long it lasts."
         : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
@@ -143,6 +149,7 @@ function Settings({ e }: { e: Environment }) {
       checks: [...builtIn, ...external.map(checkSpec)],
       require_provenance: provenance ? { builder: g.require_provenance?.builder, workflows: names(provWorkflows), branches: names(provBranches) } : undefined,
       freeze: g.freeze,
+      via: onHost && pulls ? "pull-request" : undefined,
     };
     setBusy(true);
     try {
@@ -176,6 +183,11 @@ function Settings({ e }: { e: Environment }) {
         <label className="cd-new-check">
           <input type="checkbox" className="check" checked={provenance} onChange={(ev) => setProvenance(ev.target.checked)} /> Only what kiln's CI built and signed (provenance)
         </label>
+        {onHost && (
+          <label className="cd-new-check">
+            <input type="checkbox" className="check" checked={pulls} onChange={(ev) => setPulls(ev.target.checked)} /> Releases as pull requests: merging one releases it, closing it cancels it
+          </label>
+        )}
       </div>
       {provenance && (
         <div className="cd-new-grid">
@@ -494,6 +506,32 @@ function Here({ env }: { env: string }) {
   );
 }
 
+/** Another git host's name, as its repositories are called. */
+const HOSTS_OF: Record<string, string> = { github: "GitHub's", gitlab: "GitLab's", bitbucket: "Bitbucket's" };
+
+/** Where an environment's releases go: its release repository, linked where it's on another host. */
+function RepoLine({ e }: { e: Environment }) {
+  const hosts = useSuspenseResource("deploy/git-hosts", (s) => deployApi.gitHosts(s)).data;
+  const where = `${e.release_repo.repo}@${e.release_repo.branch}${e.release_repo.root ? `/${e.release_repo.root}` : ""}`;
+  const url = releaseRepoUrl(e, hosts);
+  const proposals = e.release_repo.host === "gitlab" ? "merge requests" : "pull requests";
+  return (
+    <>
+      releases {e.gates.via === "pull-request" ? `proposed as ${proposals} on` : "committed to"}{" "}
+      {url ? (
+        <>
+          {HOSTS_OF[e.release_repo.host] ?? "its host's"}{" "}
+          <a href={url} target="_blank" rel="noreferrer">
+            <code>{where}</code>
+          </a>
+        </>
+      ) : (
+        <code>{where}</code>
+      )}
+    </>
+  );
+}
+
 function EnvView({ name }: { name: string }) {
   const e = useSuspenseResource(`deploy/environment/${name}`, (s) => deployApi.environment(name, s), { on: DEPLOY_EVENTS }).data;
   const gates = gateLines(e.gates);
@@ -505,7 +543,7 @@ function EnvView({ name }: { name: string }) {
         <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: e.name }]} />
         <h1 className="cd-title">{e.name}</h1>
         <p className="cd-note">
-          {providerName(e.provider)} · releases committed to <code>{`${e.release_repo.repo}@${e.release_repo.branch}${e.release_repo.root ? `/${e.release_repo.root}` : ""}`}</code>
+          {providerName(e.provider)} · <RepoLine e={e} />
           {e.gates.freeze && " · frozen"}
         </p>
       </header>

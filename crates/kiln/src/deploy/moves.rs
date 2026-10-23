@@ -390,7 +390,7 @@ async fn compare(d: &Deploy, m: &mut Move) -> Result<bool, String> {
 /// knows the objects Argo CD deployed by Argo CD's own tracking (`tracking`, under the Argo CD
 /// Application's name), so it takes them over as they are. Put again as it is, it changes nothing.
 async fn shadow_on_kilncd(d: &Deploy, cd: &Arc<crate::cd::Cd>, target: &Environment, runs: &[Runs], by: &str, tracking: kiln_cd::model::Tracking) -> Result<(), String> {
-    let url = d.hosted.url(&target.release_repo.repo).map_err(|e| format!("{e:#}"))?;
+    let url = super::git::open(d, &target.release_repo).await?.url().map_err(|e| format!("{e:#}"))?;
     let actor = format!("deploy for {by}");
     for r in runs {
         let id = kilncd::app_id(&r.app, &target.name);

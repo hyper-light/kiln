@@ -16,7 +16,11 @@
 //! and conda channels, crates.io's sparse index, Go's module proxy (and its checksum database),
 //! Maven repositories (Maven Central, the Gradle Plugin Portal, Clojars), NuGet v3, RubyGems'
 //! compact index, pub.dev, Hex, CRAN, CPAN, Hackage, LuaRocks, Julia's package server, opam,
-//! CocoaPods' CDN, and plain HTTP for the rest (only the hosts named; Zig's packages, by hash).
+//! CocoaPods' CDN, Composer's v2 metadata (Packagist, its packages' archives through kiln too), a
+//! Swift Package Registry, Conan v2 (ConanCenter), Nimble's package list, and plain HTTP for the
+//! rest (only the hosts named; Zig's packages, by hash).
+//! - **vcpkg**'s binary cache is kept here: what a trusted run's job or a person `PUT`s (vcpkg's
+//!   `x-http` source) is served to every build after, an upstream's asked on a miss when named.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -59,8 +63,17 @@ pub enum Ecosystem {
     Julia,
     Opam,
     Cocoapods,
+    Composer,
+    Swift,
+    Conan,
+    Vcpkg,
+    Nimble,
     Http,
 }
+
+/// Where Composer packages' archives may come from (GitHub's, GitLab's and Bitbucket's), besides
+/// the hosts a proxy names.
+const COMPOSER_DISTS: &[&str] = &["api.github.com", "codeload.github.com", "github.com", "gitlab.com", "bitbucket.org"];
 
 impl Ecosystem {
     pub fn parse(s: &str) -> Option<Self> {
@@ -85,6 +98,11 @@ impl Ecosystem {
             "julia" => Self::Julia,
             "opam" | "ocaml" => Self::Opam,
             "cocoapods" | "pods" => Self::Cocoapods,
+            "composer" | "packagist" | "php" => Self::Composer,
+            "swift" | "swiftpm" => Self::Swift,
+            "conan" => Self::Conan,
+            "vcpkg" => Self::Vcpkg,
+            "nimble" | "nim" => Self::Nimble,
             "http" | "zig" => Self::Http,
             _ => return None,
         })
@@ -113,7 +131,11 @@ impl Ecosystem {
             Self::Julia => "https://pkg.julialang.org",
             Self::Opam => "https://opam.ocaml.org",
             Self::Cocoapods => "https://cdn.cocoapods.org",
-            Self::Http => "",
+            Self::Composer => "https://repo.packagist.org",
+            Self::Conan => "https://center2.conan.io",
+            Self::Nimble => "https://nim-lang.org/nimble",
+            // No public one: a registry, or a binary cache, the proxy names.
+            Self::Swift | Self::Vcpkg | Self::Http => "",
         }
     }
 
@@ -142,7 +164,14 @@ impl Ecosystem {
             Self::Julia => path.starts_with("registry/") || path.starts_with("package/") || path.starts_with("artifact/"),
             Self::Opam => path.starts_with("cache/"),
             Self::Cocoapods => path.starts_with("Specs/") && file.ends_with(".podspec.json"),
-            Self::Http => false,
+            Self::Composer => path.starts_with("dist/"),
+            // A release's archive and its manifests (`Package.swift`, `Package@swift-5.9.swift`).
+            Self::Swift => file.ends_with(".zip") || (path.matches('/').count() == 3 && file.starts_with("Package") && file.ends_with(".swift")),
+            // A recipe's or a package's files, by their revision.
+            Self::Conan => path.contains("/revisions/") && path.contains("/files/") && !path.contains("/revisions/latest"),
+            // Binary packages, addressed by their ABI hash.
+            Self::Vcpkg => true,
+            Self::Nimble | Self::Http => false,
         }
     }
 }
@@ -200,6 +229,15 @@ impl Upstream<'_> {
                 }
                 format!("https://{host}/{rest}{q}")
             }
+            // `dist/<host>/<path>`: a package's archive where Composer's metadata said it is.
+            Ecosystem::Composer if path.starts_with("dist/") => {
+                let (host, rest) = path.trim_start_matches("dist/").split_once('/')?;
+                if !COMPOSER_DISTS.contains(&host) && !self.cfg.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                    return None;
+                }
+                format!("https://{host}/{rest}{q}")
+            }
+            Ecosystem::Swift | Ecosystem::Vcpkg if self.base.is_empty() => return None,
             Ecosystem::Http => {
                 // `<host>/<path>`, for the hosts named (`http://host` for one without TLS).
                 let (host, rest) = path.split_once('/').unwrap_or((path, ""));
@@ -218,6 +256,7 @@ impl Upstream<'_> {
         match (self.eco, path) {
             (Ecosystem::Crates, "config.json") => Some(("application/json".into(), Bytes::from(serde_json::json!({ "dl": format!("{here}/dl/{{crate}}/{{version}}"), "api": null, "auth-required": !self.cfg.anonymous }).to_string()))),
             (Ecosystem::Go, p) if p.starts_with("sumdb/") && p.ends_with("/supported") => Some(("text/plain".into(), Bytes::new())),
+            (Ecosystem::Conan, "v2/users/check_credentials") => Some(("text/plain".into(), Bytes::from_static(b"ok"))),
             _ => None,
         }
     }
@@ -246,9 +285,108 @@ impl Upstream<'_> {
                 v.to_string()
             }
             Ecosystem::Nuget if !self.eco.immutable(path) => text.replace(&format!("{}/", self.base), &format!("{here}/")),
+            // The root's metadata URLs (relative to Packagist's host) through kiln.
+            Ecosystem::Composer if path == "packages.json" => {
+                let mut v: serde_json::Value = serde_json::from_str(text).ok()?;
+                if let Some(o) = v.as_object_mut() {
+                    for key in ["metadata-url", "providers-url", "providers-lazy-url"] {
+                        if let Some(serde_json::Value::String(u)) = o.get_mut(key) {
+                            *u = if u.starts_with('/') { format!("{here}{u}") } else { u.replace(&format!("{}/", self.base), &format!("{here}/")) };
+                        }
+                    }
+                    // Its download counts go nowhere.
+                    o.remove("notify-batch");
+                }
+                v.to_string()
+            }
+            // Each version's archive through kiln, where its host is one kiln reaches.
+            Ecosystem::Composer if !self.eco.immutable(path) => {
+                let mut v: serde_json::Value = serde_json::from_str(text).ok()?;
+                composer_dists(&mut v, &here, &self.cfg.hosts);
+                v.to_string()
+            }
+            Ecosystem::Swift if !self.eco.immutable(path) => text.replace(&format!("{}/", self.base), &format!("{here}/")),
             _ => return None,
         };
         Some(out.into_bytes())
+    }
+}
+
+/// Composer metadata's archives (`dist.url`, every version's) pointed at `here`'s `dist/<host>/…`
+/// where the host is one the proxy reaches.
+fn composer_dists(v: &mut serde_json::Value, here: &str, hosts: &[String]) {
+    match v {
+        serde_json::Value::Object(o) => {
+            if let Some(serde_json::Value::String(u)) = o.get_mut("dist").and_then(|d| d.get_mut("url")) {
+                let parsed = u.strip_prefix("https://").and_then(|r| r.split_once('/'));
+                if let Some((host, rest)) = parsed
+                    && (COMPOSER_DISTS.contains(&host) || hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+                {
+                    *u = format!("{here}/dist/{host}/{rest}");
+                }
+            }
+            for (_, x) in o.iter_mut() {
+                composer_dists(x, here, hosts);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for x in a {
+                composer_dists(x, here, hosts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a caller may add to a binary cache: a person, or a trusted run's job (an untrusted
+/// one's binaries would poison every build after, docs/ci.md W18-R07).
+async fn may_write(hub: &Hub, req: &Request) -> bool {
+    if let Some(job) = crate::ci::token::job_of_request(hub, req.headers()).await {
+        let run = job.run.clone();
+        return hub.store.call(move |c| Ok(c.query_row("SELECT trust = 'trusted' FROM runs WHERE id = ?1", [&run], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))).await.unwrap_or(false);
+    }
+    let raw = srv::header_str(req, &header::AUTHORIZATION).map(str::trim).unwrap_or_default();
+    match super::auth::credentials(hub, Some(raw)) {
+        super::auth::Credentials::Secret(s) => super::caller_of(hub, &s).await.is_some(),
+        _ => false,
+    }
+}
+
+/// `PUT` into vcpkg's binary cache: the package kept under its path, for good.
+async fn put(hub: &Hub, name: &str, sub: &str, req: Request) -> Response {
+    if sub.is_empty() || sub.split('/').any(|p| p.is_empty() || p == "." || p == "..") {
+        return fail(StatusCode::BAD_REQUEST, "a package's path, `<name>/<version>/<abi hash>`");
+    }
+    if !may_write(hub, &req).await {
+        let r = fail(StatusCode::FORBIDDEN, "a person's token or a trusted run's job adds to the cache");
+        return srv::with_header(r, header::WWW_AUTHENTICATE, "Basic realm=\"kiln\"");
+    }
+    let tmp: PathBuf = crate::ci::services::cas::staging(hub).join(format!("proxy-{}", crate::util::new_id()));
+    let stored = async {
+        let (sink, done) = crate::rt::file_sink(tmp.clone(), MAX_PACKAGE)?;
+        let mut body = req.into_body();
+        while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+            if let Ok(data) = frame?.into_data()
+                && sink.send(data).await.is_err()
+            {
+                break;
+            }
+        }
+        drop(sink);
+        done.await?;
+        let obj = crate::ci::services::cas::put_file(hub, &tmp).await?;
+        keep(hub, name, sub, &obj, "application/zip", true).await?;
+        anyhow::Ok(obj.size)
+    }
+    .await;
+    let t = tmp.clone();
+    let _ = crate::rt::blocking(move || std::fs::remove_file(t)).await;
+    match stored {
+        Ok(size) => {
+            tracing::info!(proxy = name, path = sub, size, "a binary package was kept");
+            srv::status(StatusCode::OK)
+        }
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
 
@@ -371,6 +509,13 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
     let rest = path.strip_prefix("/_kiln/proxy/").unwrap_or_default();
     let (name, sub) = rest.split_once('/').unwrap_or((rest, ""));
     let Some(up) = proxies(hub).find(|u| name_of(u.cfg) == name) else { return fail(StatusCode::NOT_FOUND, format!("no proxy `{name}` here ([[ci.registry.proxies]])")) };
+    // Conan asks what the server can do before it signs in: revisions (its v2 protocol).
+    if up.eco == Ecosystem::Conan && sub == "v2/ping" {
+        return srv::with_header(srv::status(StatusCode::OK), header::HeaderName::from_static("x-conan-server-capabilities"), "revisions");
+    }
+    if up.eco == Ecosystem::Vcpkg && *req.method() == Method::PUT {
+        return put(hub, name, sub, req).await;
+    }
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         return fail(StatusCode::METHOD_NOT_ALLOWED, "the proxy reads: publish with kiln/publish@v1");
     }
@@ -382,11 +527,35 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
     if let Some((ct, body)) = up.own(sub, &origin) {
         return srv::response(StatusCode::OK, &ct, srv::full(body));
     }
+    // Conan signs in once (Basic), then uses the token it's given: the kiln token it signed in with.
+    if up.eco == Ecosystem::Conan && sub == "v2/users/authenticate" {
+        let raw = srv::header_str(&req, &header::AUTHORIZATION).map(str::trim).unwrap_or_default();
+        return match super::auth::credentials(hub, Some(raw)) {
+            super::auth::Credentials::Secret(t) => srv::response(StatusCode::OK, "text/plain", srv::full(t)),
+            _ => fail(StatusCode::UNAUTHORIZED, "sign in with a kiln token as the password"),
+        };
+    }
     let query = req.uri().query().map(str::to_owned);
-    let Some(url) = up.url(sub, query.as_deref()) else { return fail(StatusCode::FORBIDDEN, format!("`{sub}` isn't one this proxy reaches")) };
-    // What a client asks for changes the answer (npm's abbreviated metadata, PyPI's JSON pages).
-    let accept = srv::header_str(&req, &header::ACCEPT).map(str::to_owned).filter(|a| matches!(up.eco, Ecosystem::Npm | Ecosystem::Pypi) && (a.contains("vnd.npm.install-v1") || a.contains("vnd.pypi.simple")));
-    let key = format!("{sub}{}{}", query.as_deref().map(|q| format!("?{q}")).unwrap_or_default(), accept.as_deref().map(|a| format!("#{}", if a.contains("npm") { "npm-install-v1" } else { "pypi-json" })).unwrap_or_default());
+    let url = up.url(sub, query.as_deref());
+    // A binary cache with no upstream serves what it keeps, and nothing else.
+    if url.is_none() && up.eco != Ecosystem::Vcpkg {
+        return fail(StatusCode::FORBIDDEN, format!("`{sub}` isn't one this proxy reaches"));
+    }
+    // What a client asks for changes the answer (npm's abbreviated metadata, PyPI's JSON pages, a
+    // Swift registry's JSON, archive or manifest).
+    let accept = srv::header_str(&req, &header::ACCEPT).map(str::to_owned).filter(|a| {
+        (matches!(up.eco, Ecosystem::Npm | Ecosystem::Pypi) && (a.contains("vnd.npm.install-v1") || a.contains("vnd.pypi.simple"))) || (up.eco == Ecosystem::Swift && a.contains("vnd.swift.registry"))
+    });
+    let variant = |a: &str| {
+        if a.contains("npm") {
+            "npm-install-v1".to_owned()
+        } else if a.contains("pypi") {
+            "pypi-json".to_owned()
+        } else {
+            a.split(';').next().unwrap_or(a).trim().to_owned()
+        }
+    };
+    let key = format!("{sub}{}{}", query.as_deref().map(|q| format!("?{q}")).unwrap_or_default(), accept.as_deref().map(|a| format!("#{}", variant(a))).unwrap_or_default());
     let immutable = up.eco.immutable(sub);
     let have = match kept(hub, name, &key).await {
         Ok(k) => k,
@@ -396,7 +565,7 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
     let fresh = have.as_ref().is_some_and(|k| immutable || crate::util::now_unix() - k.fetched_at < ttl);
     let (k, stale) = if fresh {
         (have, false)
-    } else {
+    } else if let Some(url) = url {
         let tmp: PathBuf = crate::ci::services::cas::staging(hub).join(format!("proxy-{}", crate::util::new_id()));
         let got = fetch(&up, &url, accept.as_deref(), &tmp).await;
         let outcome = match got {
@@ -423,6 +592,8 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
             }
             Err(why) => return fail(StatusCode::BAD_GATEWAY, format!("the upstream is out of reach and kiln has no copy: {why}")),
         }
+    } else {
+        return fail(StatusCode::NOT_FOUND, format!("the cache has no {sub}"));
     };
     let Some(k) = k else { return fail(StatusCode::NOT_FOUND, "nothing here") };
     let etag = format!("\"{}\"", k.digest);
@@ -430,22 +601,24 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
         return srv::with_header(srv::status(StatusCode::NOT_MODIFIED), header::ETAG, &etag);
     }
     let Ok(Some(obj)) = crate::ci::services::cas::object(hub, &k.digest).await else { return fail(StatusCode::BAD_GATEWAY, "kiln's copy is gone") };
-    let mut r = if matches!(up.eco, Ecosystem::Npm | Ecosystem::Jsr | Ecosystem::Pypi | Ecosystem::Nuget | Ecosystem::Pub) && !immutable && k.size <= MAX_INDEX as u64 {
-        // An index, its links written over for this origin.
-        let mut buf = Vec::with_capacity(usize::try_from(k.size).unwrap_or(0));
-        let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size);
-        while let Ok(b) = rx.recv().await {
-            buf.extend_from_slice(&b);
-        }
-        let body = up.rewrite(sub, &buf, &origin).unwrap_or(buf);
-        let len = body.len();
-        let r = srv::response(StatusCode::OK, &k.content_type, if *req.method() == Method::HEAD { srv::empty() } else { srv::full(body) });
-        srv::with_header(r, header::CONTENT_LENGTH, &len.to_string())
-    } else {
-        let body = if *req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(crate::ci::services::cas::read(hub, &obj, 0, obj.size)) };
-        let r = srv::response(StatusCode::OK, &k.content_type, body);
-        srv::with_header(r, header::CONTENT_LENGTH, &k.size.to_string())
-    };
+    let mut r =
+        if matches!(up.eco, Ecosystem::Npm | Ecosystem::Jsr | Ecosystem::Pypi | Ecosystem::Nuget | Ecosystem::Pub | Ecosystem::Composer | Ecosystem::Swift) && !immutable && k.size <= MAX_INDEX as u64
+        {
+            // An index, its links written over for this origin.
+            let mut buf = Vec::with_capacity(usize::try_from(k.size).unwrap_or(0));
+            let rx = crate::ci::services::cas::read(hub, &obj, 0, obj.size);
+            while let Ok(b) = rx.recv().await {
+                buf.extend_from_slice(&b);
+            }
+            let body = up.rewrite(sub, &buf, &origin).unwrap_or(buf);
+            let len = body.len();
+            let r = srv::response(StatusCode::OK, &k.content_type, if *req.method() == Method::HEAD { srv::empty() } else { srv::full(body) });
+            srv::with_header(r, header::CONTENT_LENGTH, &len.to_string())
+        } else {
+            let body = if *req.method() == Method::HEAD { srv::empty() } else { srv::channel_body(crate::ci::services::cas::read(hub, &obj, 0, obj.size)) };
+            let r = srv::response(StatusCode::OK, &k.content_type, body);
+            srv::with_header(r, header::CONTENT_LENGTH, &k.size.to_string())
+        };
     r = srv::with_header(r, header::ETAG, &etag);
     if stale {
         r = srv::with_header(r, header::WARNING, &format!("110 kiln \"served from kiln's copy: {} is out of reach\"", up.base));
@@ -485,6 +658,56 @@ mod tests {
         assert!(Ecosystem::Pub.immutable("api/archives/http-1.2.0.tar.gz") && !Ecosystem::Pub.immutable("api/packages/http"));
         assert!(Ecosystem::Cocoapods.immutable("Specs/0/0/0/Alamofire/5.9.1/Alamofire.podspec.json") && !Ecosystem::Cocoapods.immutable("all_pods_versions_0_0_0.txt"));
         assert_eq!((Ecosystem::parse("zig"), Ecosystem::parse("gleam")), (Some(Ecosystem::Http), Some(Ecosystem::Hex)));
+        // The rest of Appendix D.1: Composer, a Swift registry, Conan v2, vcpkg's binary cache, Nimble.
+        assert!(
+            Ecosystem::Composer.immutable("dist/api.github.com/repos/symfony/console/zipball/abc")
+                && !Ecosystem::Composer.immutable("p2/symfony/console.json")
+                && !Ecosystem::Composer.immutable("packages.json")
+        );
+        assert!(
+            Ecosystem::Swift.immutable("mona/LinkedList/1.1.1.zip")
+                && Ecosystem::Swift.immutable("mona/LinkedList/1.1.1/Package.swift")
+                && Ecosystem::Swift.immutable("mona/LinkedList/1.1.1/Package@swift-5.9.swift")
+        );
+        assert!(!Ecosystem::Swift.immutable("mona/LinkedList") && !Ecosystem::Swift.immutable("mona/LinkedList/1.1.1"));
+        let recipe = "v2/conans/zlib/1.3.1/_/_/revisions/b8bc2603263cf7eccbd6e17e66b0ed76/files/conanfile.py";
+        assert!(Ecosystem::Conan.immutable(recipe) && !Ecosystem::Conan.immutable("v2/conans/zlib/1.3.1/_/_/revisions/latest") && !Ecosystem::Conan.immutable("v2/conans/zlib/1.3.1/_/_/revisions"));
+        assert!(Ecosystem::Vcpkg.immutable("zlib/1.3.1/0a1b2c") && !Ecosystem::Nimble.immutable("packages.json"));
+        assert_eq!((Ecosystem::parse("packagist"), Ecosystem::parse("swiftpm"), Ecosystem::parse("nim")), (Some(Ecosystem::Composer), Some(Ecosystem::Swift), Some(Ecosystem::Nimble)));
+    }
+
+    #[test]
+    fn w12_r04_composer_swift_conan_and_vcpkg() {
+        let cfg = |eco: &str, upstream: Option<&str>| Proxy { ecosystem: eco.into(), name: Some(eco.into()), upstream: upstream.map(str::to_owned), ..Proxy::default() };
+        fn up(p: &Proxy) -> Upstream<'_> {
+            let eco = Ecosystem::parse(&p.ecosystem).unwrap_or(Ecosystem::Http);
+            Upstream { cfg: p, eco, base: p.upstream.clone().unwrap_or_else(|| eco.upstream().to_owned()) }
+        }
+        let text = |b: Option<Vec<u8>>| b.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        // Composer: the root's metadata URL and each version's archive through kiln, archives by host.
+        let composer = cfg("composer", None);
+        let root = br#"{"packages":[],"metadata-url":"/p2/%package%.json","notify-batch":"https://packagist.org/downloads/","search":"https://packagist.org/search.json?q=%query%"}"#;
+        let out = text(up(&composer).rewrite("packages.json", root, "http://k:1"));
+        assert!(out.contains(r#""metadata-url":"http://k:1/_kiln/proxy/composer/p2/%package%.json""#) && !out.contains("notify-batch") && out.contains("packagist.org/search.json"), "{out}");
+        let meta = br#"{"packages":{"psr/log":[{"version":"3.0.2","dist":{"type":"zip","url":"https://api.github.com/repos/php-fig/log/zipball/f16e1d5863e37f8d8c2a01719f5b34baa2b714d3","reference":"f16e"}},{"version":"3.0.1","dist":{"url":"https://elsewhere.example/x.zip"}}]}}"#;
+        let out = text(up(&composer).rewrite("p2/psr/log.json", meta, "http://k:1"));
+        assert!(out.contains("\"http://k:1/_kiln/proxy/composer/dist/api.github.com/repos/php-fig/log/zipball/f16e1d5863e37f8d8c2a01719f5b34baa2b714d3\""), "{out}");
+        assert!(out.contains("https://elsewhere.example/x.zip"), "a host kiln doesn't reach is left: {out}");
+        assert_eq!(up(&composer).url("dist/api.github.com/repos/php-fig/log/zipball/f16e", None).as_deref(), Some("https://api.github.com/repos/php-fig/log/zipball/f16e"));
+        assert_eq!(up(&composer).url("dist/elsewhere.example/x.zip", None), None);
+        assert_eq!(up(&composer).url("p2/psr/log.json", None).as_deref(), Some("https://repo.packagist.org/p2/psr/log.json"));
+        // A Swift registry: only the one named, its links through kiln.
+        assert_eq!(up(&cfg("swift", None)).url("mona/LinkedList", None), None);
+        let swift = cfg("swift", Some("https://swift.example"));
+        let releases = br#"{"releases":{"1.1.1":{"url":"https://swift.example/mona/LinkedList/1.1.1"}}}"#;
+        assert!(text(up(&swift).rewrite("mona/LinkedList", releases, "http://k:1")).contains("http://k:1/_kiln/proxy/swift/mona/LinkedList/1.1.1"));
+        // Conan: ConanCenter by default, its credentials check kiln's own.
+        assert_eq!(up(&cfg("conan", None)).url("v2/conans/zlib/1.3.1/_/_/revisions/latest", None).as_deref(), Some("https://center2.conan.io/v2/conans/zlib/1.3.1/_/_/revisions/latest"));
+        assert!(up(&cfg("conan", None)).own("v2/users/check_credentials", "http://k:1").is_some());
+        // vcpkg: kiln is the cache; an upstream only when named.
+        assert_eq!(up(&cfg("vcpkg", None)).url("zlib/1.3.1/abc", None), None);
+        assert_eq!(up(&cfg("vcpkg", Some("https://cache.example/vcpkg"))).url("zlib/1.3.1/abc", None).as_deref(), Some("https://cache.example/vcpkg/zlib/1.3.1/abc"));
+        assert_eq!(up(&cfg("nimble", None)).url("packages.json", None).as_deref(), Some("https://nim-lang.org/nimble/packages.json"));
     }
 
     #[test]

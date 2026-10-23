@@ -1,0 +1,278 @@
+/* Research (research.tsx): findings, each with its grade and what makes it, its quotes and their
+   sources; the sources, numbered. Quiet: the grade's chip is the one colour a finding has. */
+.rs {
+  display: grid;
+  gap: 10px;
+}
+.rs-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.rs-grades {
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rs-question {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 14px;
+}
+.rs-dim {
+  color: #8d9099;
+}
+.rs-bad {
+  color: #d8bb95;
+}
+.rs-findings,
+.rs-cites,
+.rs-sources {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rs-findings {
+  gap: 0;
+}
+.rs-finding {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--color-line);
+}
+.rs-claim-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rs-claim {
+  min-width: 0;
+  color: var(--color-bright);
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+.rs-grade {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+.rs-grade b {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 6px;
+  color: #0b0c0f;
+  font: 600 12px var(--font-mono);
+}
+.rs-grade b[data-g="A"] {
+  background: #a8c9bc;
+}
+.rs-grade b[data-g="B"] {
+  background: #a6c4ed;
+}
+.rs-grade b[data-g="C"] {
+  background: #d8cbb0;
+}
+.rs-grade b[data-g="D"] {
+  background: #d8bb95;
+}
+.rs-grade b[data-g="F"] {
+  background: #d5a4ad;
+}
+.rs-score {
+  color: #a3a6ad;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rs-factors {
+  display: grid;
+  grid-template-columns: max-content minmax(36px, 1fr) minmax(0, 15em);
+  align-items: center;
+  gap: 3px 10px;
+  color: #9a9ca3;
+  font-size: 11.5px;
+}
+.rs-factors > span {
+  overflow-wrap: anywhere;
+}
+.rs-factors [data-bad] {
+  color: #d8bb95;
+}
+.rs-meter {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: #1d2127;
+}
+.rs-meter i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: #a8c9bc;
+}
+.rs-meter i[data-against] {
+  background: #d8bb95;
+}
+.rs-cites {
+  gap: 4px;
+  font-size: 12px;
+}
+.rs-cite,
+.rs-sources li {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 4px;
+  color: #b7b9bf;
+  overflow-wrap: anywhere;
+}
+.rs-num {
+  color: #7d818b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rs-quote {
+  color: #c9cbd1;
+}
+.rs-check {
+  color: #8d9099;
+}
+.rs-check[data-state="found"] {
+  color: #a8c9bc;
+}
+.rs-check[data-state="not_found"],
+.rs-check[data-state="gone"] {
+  color: #d8bb95;
+}
+.rs-against {
+  margin: 0;
+  color: #c7b39a;
+  font-size: 12px;
+}
+.rs-note {
+  margin: 0;
+  font-size: 12px;
+}
+.rs-skipped p {
+  margin: 0;
+  color: #a3a6ad;
+  font-size: 12px;
+}
+.rs-sub {
+  margin: 8px 0 0;
+  color: #97999f;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.rs-sources {
+  gap: 5px;
+  font-size: 12px;
+}
+.rs-kind {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: #1a1d22;
+  color: #a6c4ed;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.7;
+}
+.rs-kind[data-inside] {
+  color: #b8d9d2;
+}
+.rs-title {
+  margin-right: 6px;
+  color: #c9cbd1;
+}
+.rs-loc {
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+a.rs-loc:hover {
+  color: #c9cbd1;
+}
+/* In brief (research.tsx `ResearchBrief`): its first findings, a small chip of its grade each. */
+.rs-claims {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rs-claims li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.rs-grade-sm b {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  font-size: 10.5px;
+}
+.rs-more {
+  margin: 0;
+  font-size: 12px;
+}
+/* As its agent reports it (its conversation, its Plan tab): a card, its links under it. */
+.rs-list {
+  display: grid;
+  gap: 8px;
+}
+.rs-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #262a31;
+  border-radius: 9px;
+  background: #0d0f12;
+}
+.rs-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 0;
+  font-size: 12px;
+}
+.rs-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-secondary);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.rs-link:hover {
+  color: var(--color-bright);
+}
+/* All of it, on the Plans page. */
+.plans-research {
+  margin-top: 28px;
+}
+@media (max-width: 480px) {
+  .rs-claim-row {
+    flex-direction: column;
+    gap: 6px;
+  }
+}

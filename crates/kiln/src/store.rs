@@ -11,16 +11,122 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::PlannedJob;
 
+pub mod capture;
+pub mod group;
 pub mod migrations;
 
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<Connection>>,
+    inner: Arc<Inner>,
     /// A test build's store whose calls run on the calling task, each after yielding once
     /// ([`Store::in_memory_inline`]): what kiln-sim's models drive under their seeded scheduler, a
     /// crash able to come at each call's wait.
     #[cfg(test)]
     inline: bool,
+}
+
+/// The store's connection, and with the cluster group what its writes go through.
+struct Inner {
+    // Dropped in order: the connection before the watch its hook writes into.
+    conn: Mutex<Connection>,
+    watch: Option<capture::Watch>,
+    group: Option<group::Group>,
+    /// A folder of its own, removed with the store (tests through the group, [`Store::in_memory`]).
+    scratch: Option<std::path::PathBuf>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(dir) = self.scratch.take() {
+            // The group's thread and connections go first: then the folder.
+            self.group.take();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Tables this node keeps for itself: its log search index, built from its own logs. Written with
+/// [`Store::call_local`], past the cluster group; a write through the group must not touch them.
+pub const LOCAL: &[&str] = &["ci_log_indexed", "ci_log_index_data", "ci_log_index_idx", "ci_log_index_content", "ci_log_index_docsize", "ci_log_index_config"];
+
+/// A transaction that nests: a SQLite savepoint. At the top it opens one as `BEGIN DEFERRED`
+/// would; inside another (the one a write runs in while the cluster group takes it, docs/p2p.md
+/// P1) it becomes part of that. [`Tx::commit`] keeps what it did; dropped without, it's undone.
+pub struct Tx<'c> {
+    conn: &'c Connection,
+    open: bool,
+}
+
+/// Opens a [`Tx`] on `conn`: what every write that needs its statements together uses, rather than
+/// rusqlite's transactions, which can't be opened inside another.
+pub fn tx(conn: &Connection) -> rusqlite::Result<Tx<'_>> {
+    conn.execute_batch("SAVEPOINT kiln_tx")?;
+    Ok(Tx { conn, open: true })
+}
+
+impl Tx<'_> {
+    /// Keeps what it did: commits it at the top, makes it part of the one around it inside one.
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.open = false;
+        self.conn.execute_batch("RELEASE kiln_tx")
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.conn.execute_batch("ROLLBACK TO kiln_tx; RELEASE kiln_tx");
+        }
+    }
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+/// Runs a write through the cluster group (see [`Store::call`]).
+fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group::Group, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+    // IMMEDIATE: the write lock now, so what `f` reads is what it writes over (a transaction that
+    // read first would be refused its write had the group's thread committed meanwhile).
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    watch.begin();
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn)));
+    let change = watch.end(conn);
+    let result = match ran {
+        Ok(r) => r,
+        Err(panic) => {
+            conn.execute_batch("ROLLBACK").ok();
+            std::panic::resume_unwind(panic)
+        }
+    };
+    let change = match change {
+        Ok(c) => c,
+        Err(e) => {
+            // What it wrote couldn't be read for the log: it isn't kept.
+            conn.execute_batch("ROLLBACK").ok();
+            return Err(e);
+        }
+    };
+    if change.is_empty() {
+        conn.execute_batch("ROLLBACK")?;
+        return result;
+    }
+    // Kept as without the group (an `f` that failed after writing keeps what it wrote), with its
+    // number; then the change goes to the log.
+    let seq = group.next_seq();
+    let kept = conn
+        .execute(&format!("UPDATE {} SET seq = ?1 WHERE one = 1", group::STATE), [i64::try_from(seq)?])
+        .map_err(anyhow::Error::from)
+        .and_then(|_| conn.execute_batch("COMMIT").map_err(anyhow::Error::from));
+    if let Err(e) = kept {
+        conn.execute_batch("ROLLBACK").ok();
+        return Err(e);
+    }
+    group.append(seq, change);
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +250,10 @@ pub struct Job {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<PlannedJob>,
     pub steps: Vec<Step>,
+    /// A CI matrix leg's values, by axis: where it sits in its job's grid on the run graph
+    /// (docs/ci.md W21-R04).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,39 +343,82 @@ fn from_json<T: for<'de> Deserialize<'de> + Default>(s: &str) -> T {
 }
 
 impl Store {
+    /// The store at `path`, written to directly (no cluster group): tools that run with the server
+    /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let conn = Self::connect(path)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }), #[cfg(test)] inline: false })
+    }
+
+    /// The store at `path` with its writes through the cluster group, its log in `cluster`
+    /// (docs/p2p.md, P1). What the log holds past the database is replayed into it first.
+    pub fn open_grouped(path: &Path, cluster: &Path) -> anyhow::Result<Self> {
+        let conn = Self::connect(path)?;
+        let group = group::Group::open(path, cluster).context("the cluster group")?;
+        let watch = capture::Watch::install(&conn, LOCAL)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), scratch: None }), #[cfg(test)] inline: false })
+    }
+
+    fn connect(path: &Path) -> anyhow::Result<Connection> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
         }
         let mut conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
         migrations::apply(&mut conn).context("apply migrations")?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            #[cfg(test)]
-            inline: false,
-        })
+        Ok(conn)
     }
 
+    /// A store of its own for tests: in memory, or with `KILN_STORE_GROUP=1` a database in a scratch
+    /// folder with its writes through the cluster group, so the whole suite can run that way.
     pub fn in_memory() -> anyhow::Result<Self> {
+        if std::env::var("KILN_STORE_GROUP").is_ok_and(|v| v == "1") {
+            let dir = std::env::temp_dir().join(format!("kiln-store-{}", crate::util::new_id()));
+            let mut store = Self::open_grouped(&dir.join("kiln.db"), &dir.join("cluster"))?;
+            if let Some(inner) = Arc::get_mut(&mut store.inner) {
+                inner.scratch = Some(dir);
+            }
+            return Ok(store);
+        }
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            #[cfg(test)]
-            inline: false,
-        })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }), #[cfg(test)] inline: false })
     }
 
     /// An in-memory store whose calls run on the calling task, each after yielding once: kiln-sim's
     /// models drive it under their seeded scheduler, so a crash can come at each call (CP-T6.1).
+    /// Never the cluster group's, whatever `KILN_STORE_GROUP` says.
     #[cfg(test)]
     pub fn in_memory_inline() -> anyhow::Result<Self> {
-        Ok(Self { inline: true, ..Self::in_memory()? })
+        let mut conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        migrations::apply(&mut conn)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }), inline: true })
     }
 
-    /// Run `f` with the connection on the blocking pool.
+    /// Whether this store's writes go through the cluster group.
+    pub fn grouped(&self) -> bool {
+        self.inner.group.is_some()
+    }
+
+    /// With the cluster group, where it stands: kiln.db's last write and the last entry applied.
+    pub fn group_standing(&self) -> Option<(u64, u64)> {
+        self.inner.group.as_ref().map(group::Group::standing)
+    }
+
+    /// Waits until every write so far is in the cluster group's log (tests; a clean stop).
+    pub fn flush_group(&self) -> anyhow::Result<()> {
+        match &self.inner.group {
+            Some(g) => g.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs `f` with the connection on the blocking pool. With the cluster group, what `f` writes
+    /// goes through it: `f` runs in a transaction while the rows it touches are noted, which
+    /// commits with the write's number and sends the rows' state (its change) to the group's log,
+    /// which a restart replays. A read is only a read.
     pub async fn call<R, F>(&self, f: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
@@ -282,12 +435,29 @@ impl Store {
                 std::task::Poll::Pending
             })
             .await;
-            let mut g = self.conn.lock();
+            let mut g = self.inner.conn.lock();
             return f(&mut g);
         }
-        let conn = self.conn.clone();
+        let inner = self.inner.clone();
         crate::rt::blocking(move || {
-            let mut g = conn.lock();
+            let mut g = inner.conn.lock();
+            match (&inner.watch, &inner.group) {
+                (Some(watch), Some(group)) => through_group(&mut g, watch, group, f),
+                _ => f(&mut g),
+            }
+        })
+        .await?
+    }
+
+    /// Runs `f` with the connection, past the cluster group: for this node's own tables ([`LOCAL`]).
+    pub async fn call_local<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        crate::rt::blocking(move || {
+            let mut g = inner.conn.lock();
             f(&mut g)
         })
         .await?
@@ -323,7 +493,7 @@ impl Store {
     /// before doing any work).
     pub async fn unclaim_job(&self, id: String, note: String) -> anyhow::Result<()> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "UPDATE jobs SET status = 'queued', agent = NULL, executor = NULL, started_at = NULL,
                    error = ?2 WHERE id = ?1 AND status = 'running'",
@@ -379,6 +549,29 @@ impl Store {
             let id: String =
                 c.query_row("SELECT id FROM repos WHERE name = ?1", [&r.name], |row| row.get(0))?;
             Ok(Repo { id, ..r })
+        })
+        .await
+    }
+
+    /// Whether a native repository is public: anyone may read it over git (W14-R01).
+    pub async fn repo_public(&self, id: String) -> anyhow::Result<bool> {
+        self.call(move |c| Ok(c.query_row("SELECT public FROM repos WHERE id = ?1", [&id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))).await
+    }
+
+    /// The public repositories' ids.
+    pub async fn public_repos(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT id FROM repos WHERE public = 1")?;
+            let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+            Ok(ids)
+        })
+        .await
+    }
+
+    pub async fn set_repo_public(&self, id: String, public: bool) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute("UPDATE repos SET public = ?2 WHERE id = ?1", params![id, public])?;
+            Ok(())
         })
         .await
     }
@@ -486,7 +679,7 @@ impl Store {
     /// Insert a run with its planned jobs atomically. Jobs with no `needs` start queued.
     pub async fn create_run(&self, mut run: Run, jobs: Vec<PlannedJob>) -> anyhow::Result<Run> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let number: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE repo_id = ?1",
                 [&run.repo_id],
@@ -568,6 +761,79 @@ impl Store {
         .await
     }
 
+    /// [`Self::runs`], of the repositories named only.
+    pub async fn runs_among(&self, names: Vec<String>, repo: Option<String>, limit: u32, before: Option<i64>) -> anyhow::Result<Vec<Run>> {
+        let names = serde_json::to_string(&names)?;
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                        r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                        r.error, r.concurrency_group
+                 FROM runs r JOIN repos p ON p.id = r.repo_id
+                 WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+                   AND (?3 IS NULL OR r.created_at < ?3)
+                   AND p.name IN (SELECT value FROM json_each(?4))
+                 ORDER BY r.created_at DESC, r.number DESC LIMIT ?2",
+            )?;
+            let rows = st.query_map(params![repo, limit.min(500), before, names], row_run)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Runs in another order than newest first (the runs list's sort, W21-R03): `oldest`, or
+    /// `longest` and `shortest` (a running one's time so far), from `offset` on; `among` the
+    /// repositories a person may read, when narrowed.
+    /// The runners and executors each of `ids`'s legs ran on (W21-R03's facets), by run.
+    pub async fn run_hosts(&self, ids: Vec<String>) -> anyhow::Result<std::collections::HashMap<String, (Vec<String>, Vec<String>)>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT run_id, agent, executor FROM jobs WHERE run_id IN (SELECT value FROM json_each(?1)) AND (agent IS NOT NULL OR executor IS NOT NULL) ORDER BY run_id")?;
+            let rows = st.query_map([serde_json::to_string(&ids)?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
+            let mut out: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = std::collections::HashMap::new();
+            for row in rows {
+                let (run, agent, executor) = row?;
+                let hosts = out.entry(run).or_default();
+                for (list, v) in [(&mut hosts.0, agent), (&mut hosts.1, executor)] {
+                    if let Some(v) = v.filter(|v| !v.is_empty())
+                        && !list.contains(&v)
+                    {
+                        list.push(v);
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn runs_sorted(&self, among: Option<Vec<String>>, repo: Option<String>, order: &str, limit: u32, offset: u32) -> anyhow::Result<Vec<Run>> {
+        const TOOK: &str = "(COALESCE(r.finished_at, CAST(strftime('%s', 'now') AS INTEGER)) - COALESCE(r.started_at, r.created_at))";
+        let by = match order {
+            "oldest" => "r.created_at ASC, r.number ASC".to_owned(),
+            "longest" => format!("{TOOK} DESC, r.created_at DESC"),
+            "shortest" => format!("{TOOK} ASC, r.created_at DESC"),
+            _ => "r.created_at DESC, r.number DESC".to_owned(),
+        };
+        let names = among.map(|n| serde_json::to_string(&n).unwrap_or_default());
+        self.call(move |c| {
+            let mut st = c.prepare(&format!(
+                "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                        r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                        r.error, r.concurrency_group
+                 FROM runs r JOIN repos p ON p.id = r.repo_id
+                 WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+                   AND (?4 IS NULL OR p.name IN (SELECT value FROM json_each(?4)))
+                 ORDER BY {by} LIMIT ?2 OFFSET ?3"
+            ))?;
+            let rows = st.query_map(params![repo, limit.min(500), offset, names], row_run)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
     pub async fn run(&self, id: String) -> anyhow::Result<Option<Run>> {
         self.call(move |c| {
             Ok(c.query_row(
@@ -625,11 +891,16 @@ impl Store {
     }
 
     /// v1 jobs waiting for an agent, oldest first (legs of the CI engine, with a `job_id`, are its
-    /// dispatcher's, docs/ci.md §2.4).
+    /// dispatcher's, docs/ci.md §2.4). A run of a concurrency group waits while an older run of the
+    /// group is active: one of a group runs at a time.
     pub async fn queued_jobs(&self, limit: u32) -> anyhow::Result<Vec<Job>> {
         self.call(move |c| {
             let mut st = c.prepare(&format!(
-                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL ORDER BY queued_at, rowid LIMIT ?1"
+                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL AND NOT EXISTS (
+                   SELECT 1 FROM runs r JOIN runs o ON o.concurrency_group = r.concurrency_group
+                   WHERE r.id = jobs.run_id AND o.id != r.id AND o.status IN ('queued','running','pending')
+                     AND (o.created_at < r.created_at OR (o.created_at = r.created_at AND o.rowid < r.rowid)))
+                 ORDER BY queued_at, rowid LIMIT ?1"
             ))?;
             Ok(st.query_map([limit], row_job)?.collect::<Result<Vec<_>, _>>()?)
         })
@@ -645,10 +916,28 @@ impl Store {
         .await
     }
 
+    /// Which of `ids` are the CI engine's legs (rows of a workflow's job), not v1's jobs.
+    pub async fn ci_legs(&self, ids: Vec<String>) -> anyhow::Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT 1 FROM jobs WHERE id = ?1 AND job_id IS NOT NULL")?;
+            let mut out = std::collections::HashSet::new();
+            for id in ids {
+                if st.exists([&id])? {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Atomically claim a queued job for an agent. Returns false if someone else got it.
     pub async fn claim_job(&self, id: String, agent: String, executor: String) -> anyhow::Result<bool> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let n = tx.execute(
                 "UPDATE jobs SET status = 'running', agent = ?2, executor = ?3, started_at = ?4,
@@ -709,7 +998,7 @@ impl Store {
         cpu_seconds: Option<f64>,
     ) -> anyhow::Result<(String, Option<Status>)> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             tx.execute(
                 "UPDATE jobs SET status = ?2, finished_at = ?3, exit_code = ?4, error = ?5,
@@ -740,7 +1029,7 @@ impl Store {
     /// Put a running job back in the queue (agent lost) or fail it when out of retries.
     pub async fn requeue_job(&self, id: String, reason: String) -> anyhow::Result<bool> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let (attempt, spec): (u32, String) = tx.query_row(
                 "SELECT attempt, spec FROM jobs WHERE id = ?1",
                 [&id],
@@ -779,7 +1068,7 @@ impl Store {
     /// caller can tell their agents to stop.
     pub async fn cancel_run(&self, run_id: String, reason: String) -> anyhow::Result<Vec<(String, Option<String>)>> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let running: Vec<(String, Option<String>)> = {
                 let mut st = tx.prepare(
@@ -812,7 +1101,7 @@ impl Store {
     /// Re-run a finished run's failed (or all) jobs as a fresh attempt.
     pub async fn retry_run(&self, run_id: String, only_failed: bool) -> anyhow::Result<u32> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let filter = if only_failed {
                 "status IN ('failed','cancelled','timed_out','skipped')"
@@ -845,27 +1134,35 @@ impl Store {
         .await
     }
 
-    /// Runs in the same concurrency group that are still active (for cancel-in-progress).
-    pub async fn active_runs_in_group(&self, group: String, except: String) -> anyhow::Result<Vec<String>> {
+    /// The runs of `group` that run `new` supersedes, as GitHub's concurrency groups have it: with
+    /// `cancel-in-progress`, every older run still active; without it, the older ones waiting, as the
+    /// oldest active goes on and `new` waits for it ([`Store::queued_jobs`]).
+    pub async fn superseded_in_group(&self, group: String, new: String, cancel_in_progress: bool) -> anyhow::Result<Vec<String>> {
         self.call(move |c| {
             let mut st = c.prepare(
                 "SELECT id FROM runs WHERE concurrency_group = ?1 AND id != ?2
-                   AND status IN ('queued','running','pending')",
+                   AND status IN ('queued','running','pending') ORDER BY created_at, rowid",
             )?;
-            Ok(st.query_map(params![group, except], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?)
+            let older = st.query_map(params![group, new], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(older.into_iter().skip(usize::from(!cancel_in_progress)).collect())
         })
         .await
     }
 
-    pub async fn stats(&self) -> anyhow::Result<serde_json::Value> {
-        self.call(|c| {
+    /// The last day's runs and jobs (the overview's), every repository's or `among` these (by name:
+    /// a person of some repositories, W10).
+    pub async fn stats(&self, among: Option<Vec<String>>) -> anyhow::Result<serde_json::Value> {
+        let among = among.map(|names| serde_json::to_string(&names).unwrap_or_default());
+        self.call(move |c| {
             let since = crate::util::now_unix() - 86_400;
-            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [since], |r| r.get(0)) };
+            // `?2`: the repositories, or NULL for all of them.
+            const RUNS_IN: &str = "(?2 IS NULL OR repo_id IN (SELECT id FROM repos WHERE name IN (SELECT value FROM json_each(?2))))";
+            const JOBS_IN: &str = "(?2 IS NULL OR run_id IN (SELECT r.id FROM runs r JOIN repos p ON p.id = r.repo_id WHERE p.name IN (SELECT value FROM json_each(?2))))";
+            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(&sql.replace("{RUNS_IN}", RUNS_IN), params![since, among], |r| r.get(0)) };
             let mut by_status = serde_json::Map::new();
             {
-                let mut st =
-                    c.prepare("SELECT status, COUNT(*) FROM jobs WHERE COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running') GROUP BY status")?;
-                let rows = st.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let mut st = c.prepare(&format!("SELECT status, COUNT(*) FROM jobs WHERE (COALESCE(finished_at, queued_at, 0) >= ?1 OR status IN ('queued','running')) AND {JOBS_IN} GROUP BY status"))?;
+                let rows = st.query_map(params![since, among], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
                 for row in rows {
                     let (s, n) = row?;
                     by_status.insert(s, n.into());
@@ -873,13 +1170,13 @@ impl Store {
             }
             let mut hourly = Vec::new();
             {
-                let mut st = c.prepare(
+                let mut st = c.prepare(&format!(
                     "SELECT (finished_at / 3600) * 3600 AS h,
                             SUM(status = 'succeeded'), SUM(status IN ('failed','timed_out')),
                             AVG(finished_at - started_at)
-                     FROM jobs WHERE finished_at >= ?1 GROUP BY h ORDER BY h",
-                )?;
-                let rows = st.query_map([since], |r| {
+                     FROM jobs WHERE finished_at >= ?1 AND {JOBS_IN} GROUP BY h ORDER BY h"
+                ))?;
+                let rows = st.query_map(params![since, among], |r| {
                     Ok(serde_json::json!({
                         "ts": r.get::<_, i64>(0)?,
                         "succeeded": r.get::<_, Option<i64>>(1)?.unwrap_or(0),
@@ -902,16 +1199,32 @@ impl Store {
                 }
             }
             Ok(serde_json::json!({
-                "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1")?,
-                "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out')")?,
-                "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded'")?,
+                "runs_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND {RUNS_IN}")?,
+                "runs_failed_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status IN ('failed','timed_out') AND {RUNS_IN}")?,
+                "runs_succeeded_24h": count("SELECT COUNT(*) FROM runs WHERE created_at >= ?1 AND status = 'succeeded' AND {RUNS_IN}")?,
                 "median_job_seconds": c.query_row(
-                    "SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL
-                     ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL)",
-                    [since], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
+                    &format!("SELECT finished_at - started_at AS d FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN}
+                     ORDER BY d LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM jobs WHERE finished_at >= ?1 AND started_at IS NOT NULL AND {JOBS_IN})"),
+                    params![since, among], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0),
                 "jobs_by_status": by_status,
                 "hourly": hourly,
             }))
+        })
+        .await
+    }
+
+    /// How many jobs of these repositories (by name) wait and run: a person of some repositories'
+    /// queue (W10), where the server's counts are everyone's.
+    pub async fn queue_among(&self, names: Vec<String>) -> anyhow::Result<serde_json::Value> {
+        let names = serde_json::to_string(&names)?;
+        self.call(move |c| {
+            let (queued, running): (i64, i64) = c.query_row(
+                "SELECT COALESCE(SUM(j.status = 'queued'), 0), COALESCE(SUM(j.status = 'running'), 0) FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
+                 WHERE j.status IN ('queued', 'running') AND p.name IN (SELECT value FROM json_each(?1))",
+                [&names],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(serde_json::json!({ "queued": queued, "running": running }))
         })
         .await
     }
@@ -1065,7 +1378,7 @@ impl Store {
     pub async fn prune(&self, days: u32) -> anyhow::Result<Vec<String>> {
         self.call(move |c| {
             let cutoff = crate::util::now_unix() - i64::from(days) * 86_400;
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let ids: Vec<String> = {
                 let mut st = tx.prepare(
                     "SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id
@@ -1085,7 +1398,7 @@ impl Store {
 }
 
 const JOB_SELECT: &str = "SELECT id, run_id, key, display, status, labels, needs, agent, executor,
-    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec FROM jobs";
+    attempt, queued_at, started_at, finished_at, exit_code, error, peak_rss, cpu_seconds, spec, matrix FROM jobs";
 
 fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -1129,6 +1442,10 @@ fn row_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         cpu_seconds: r.get(16)?,
         spec: serde_json::from_str(&r.get::<_, String>(17)?).ok(),
         steps: Vec::new(),
+        matrix: r
+            .get::<_, Option<String>>(18)?
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty())),
     })
 }
 
@@ -1155,7 +1472,7 @@ fn steps_of(c: &Connection, job_id: &str) -> rusqlite::Result<Vec<Step>> {
 /// settle the run when every job is terminal.
 const DEP_FAILED: &str = "dependency failed";
 
-fn advance_run(tx: &rusqlite::Transaction<'_>, run_id: &str, now: i64) -> anyhow::Result<Option<Status>> {
+fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option<Status>> {
     loop {
         let jobs: Vec<(String, String, Vec<String>)> = {
             let mut st = tx.prepare("SELECT id, key, status, needs, COALESCE(error, '') FROM jobs WHERE run_id = ?1")?;
@@ -1399,5 +1716,65 @@ mod tests {
         assert_eq!(s.queued_jobs(10).await?.len(), 1);
         Ok(())
     })
+    }
+
+    /// A concurrency group runs one run at a time: a newer run waits for the one under way, and a
+    /// newer one still drops the one waiting (the image pipeline built seven at once without it).
+    #[test]
+    fn a_group_runs_one_at_a_time() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let repo = s
+                .upsert_repo(Repo {
+                    id: "r1".into(),
+                    name: "hyper-light/x".into(),
+                    clone_url: "https://example/x".into(),
+                    branches: vec![],
+                    poll_seconds: 60,
+                    enabled: true,
+                    created_at: 0,
+                    last_polled_at: None,
+                    last_error: None,
+                    mode: "upstream".into(),
+                    default_branch: None,
+                    mirror: None,
+                })
+                .await?;
+            let p = pipeline::parse("name: image\njobs:\n  image: {steps: [{run: x}]}\n")?;
+            let run = |id: &str, at: i64, group: Option<&str>| Run {
+                id: id.into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 0,
+                pipeline: "image".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: id.into(),
+                message: String::new(),
+                author: String::new(),
+                status: Status::Queued,
+                created_at: at,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: group.map(str::to_owned),
+            };
+            for (id, at, group) in [("a", 1, Some("x:image")), ("b", 2, Some("x:image")), ("c", 2, Some("x:image")), ("free", 3, None)] {
+                s.create_run(run(id, at, group), pipeline::plan(&p, &pipeline::Context::default())?).await?;
+            }
+            let waiting = |s: Store| async move { anyhow::Ok(s.queued_jobs(10).await?.into_iter().map(|j| j.run_id).collect::<Vec<_>>()) };
+            // The oldest of the group goes, and a run of no group; b and c wait.
+            assert_eq!(waiting(s.clone()).await?, ["a", "free"]);
+            // c, the newest, drops b (waiting) and leaves a (under way), or cancels both.
+            assert_eq!(s.superseded_in_group("x:image".into(), "c".into(), false).await?, ["b"]);
+            assert_eq!(s.superseded_in_group("x:image".into(), "c".into(), true).await?, ["a", "b"]);
+            s.cancel_run("b".into(), "superseded by a newer run".into()).await?;
+            let a = s.jobs("a".into(), false).await?.first().map(|j| j.id.clone()).unwrap_or_default();
+            assert!(s.claim_job(a.clone(), "ag".into(), "baremetal".into()).await?);
+            assert_eq!(waiting(s.clone()).await?, ["free"], "c waits while a runs");
+            s.finish_job(a, Status::Succeeded, Some(0), None, None, None).await?;
+            assert_eq!(waiting(s.clone()).await?, ["c", "free"], "c goes once a is done");
+            Ok(())
+        })
     }
 }

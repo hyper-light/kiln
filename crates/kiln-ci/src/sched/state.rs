@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::Serialize;
 
 use super::groups::{GroupAction, GroupConfig, Groups};
+use super::pools::{self, ExecState, Executor, Pool, PoolView};
+use super::reserve::Reservation;
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
 
@@ -43,6 +45,10 @@ pub struct Config {
     pub rules: Vec<Rule>,
     /// Legs in progress at most, per repository (W05-R11).
     pub quotas: HashMap<String, usize>,
+    /// Pools, in order: a leg goes to the first that serves its labels (W13-R09).
+    pub pools: Vec<Pool>,
+    /// Runners and pools kept for matching legs in windows (W05-R12).
+    pub reservations: Vec<Reservation>,
 }
 
 impl Default for Config {
@@ -57,6 +63,8 @@ impl Default for Config {
             overcommit_disk: 1.0,
             rules: vec![routing::native_rule()],
             quotas: HashMap::new(),
+            pools: Vec::new(),
+            reservations: Vec::new(),
         }
     }
 }
@@ -78,6 +86,9 @@ pub struct LegIn {
     /// Expected runner-seconds (history, W19).
     pub cost: Option<f64>,
     pub prefer: Vec<Preference>,
+    /// It has a `container:` or `services:`: on a hosted pool (`k8s`), it runs in an executor
+    /// made for it (a pod of that container, those services beside it, W13-R07).
+    pub own_executor: bool,
 }
 
 /// A runner that can take legs.
@@ -88,6 +99,10 @@ pub struct RunnerIn {
     pub slots: u32,
     /// What it offers in resource mode; slots are used when `None`.
     pub capacity: Option<Resources>,
+    /// The hosted executor it is (a `k8s` pool's pod, W13-R07): it takes its pool's legs and no
+    /// other's; `Some("")` when the server doesn't know whose it is (one left from before a
+    /// restart), which takes none.
+    pub executor: Option<String>,
 }
 
 /// How an attempt ended.
@@ -117,7 +132,16 @@ pub enum Input {
     LegRunning { leg: Box<LegIn>, runner: String, attempt: u32 },
     /// The plan cancelled a leg (fail-fast, the run cancelled).
     LegCancelled { leg: String, reason: String },
-    AttemptFinished { leg: String, attempt: u32, outcome: Outcome },
+    /// A leg gone with its repository: dropped without settling (its records are gone with it),
+    /// its runner told to stop it.
+    LegGone {
+        leg: String,
+    },
+    AttemptFinished {
+        leg: String,
+        attempt: u32,
+        outcome: Outcome,
+    },
     /// The runner refused the assignment (no free slot, draining): the leg goes back to its queue,
     /// the same attempt, and not to that runner.
     Rejected { leg: String },
@@ -126,6 +150,12 @@ pub enum Input {
     RunnerLost { runner: String },
     RunnerDraining { runner: String },
     RulesChanged(Vec<Rule>),
+    /// A pool's executor its host started is ready for a leg (W13-R09).
+    ExecutorReady { executor: String },
+    /// Its host couldn't start it, or it's gone.
+    ExecutorFailed { executor: String, error: String },
+    /// Pools and reservations, read again (the Pools page, W13-R09, W05-R12).
+    PoolsChanged { pools: Vec<Pool>, reservations: Vec<Reservation> },
     /// The time a [`Command::Timer`] asked for.
     Tick,
 }
@@ -142,6 +172,13 @@ pub enum WaitReason {
     Quota { limit: usize },
     Exclusive,
     Retry { at: i64 },
+    /// Its pool is starting executors for it (W13-R09): how many, since when (unix ms).
+    Scaling { pool: String, starting: usize, since: i64 },
+    /// The runners or pool that could take it are kept for other legs until `until` (W05-R12).
+    Reservation { reservation: String, until: i64 },
+    /// Only `avoided` could take it, and it waits for another: as its retry policy asks
+    /// (`runner: different`), or as that one refused it (W05-R16).
+    OtherRunner { avoided: String, refused: bool },
 }
 
 /// What to do.
@@ -150,8 +187,21 @@ pub enum Command {
     StartRun { run: String },
     CancelRun { run: String, reason: String },
     /// `image` is the routing rule's, for container and microVM executors (W13); `docker`, the
-    /// Docker access the rules give the leg (W13-R04).
-    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String> },
+    /// Docker access the rules give the leg (W13-R04); `slot`, the pool's executor it runs in
+    /// (W13-R09).
+    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String>, slot: Option<String> },
+    /// Start one of a pool's executors on `runner`, ready for a leg (W13-R09).
+    /// `leg`: the one it's made for (a `k8s` pod of that leg's containers, W13-R07).
+    StartExecutor {
+        pool: String,
+        executor: String,
+        runner: String,
+        kind: String,
+        image: Option<String>,
+        leg: Option<String>,
+    },
+    /// Stop an idle executor (past its pool's `idle_timeout`, or its pool gone).
+    StopExecutor { executor: String, runner: String },
     /// Stop a leg's attempt on its runner.
     Cancel { leg: String, attempt: u32, reason: String },
     /// A failed attempt will be retried at `at` as `attempt`.
@@ -172,6 +222,17 @@ enum State {
     Done,
 }
 
+/// Why a leg stays off a runner (W05-R16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Off {
+    /// It lost the leg: the retry goes to another runner when one could take it, else to it.
+    Lost,
+    /// Its retry policy asks for a different runner (`runner: different`): it waits for one.
+    Different,
+    /// It refused the leg: the leg waits for another.
+    Refused,
+}
+
 #[derive(Debug, Clone)]
 struct Leg {
     input: LegIn,
@@ -183,11 +244,14 @@ struct Leg {
     queued_at: i64,
     key: Option<(i64, u64, u64)>,
     reason: Option<WaitReason>,
-    avoid: Option<String>,
+    /// A runner it stays off, and why (W05-R16).
+    avoid: Option<(String, Off)>,
     pin: Option<String>,
     last_runner: Option<String>,
     /// Cancelled while it ran, and why: however its attempt ends, it ends cancelled, never retried.
     cancelling: Option<String>,
+    /// Gone with its repository while it ran: its attempt's end frees its runner, nothing else.
+    gone: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +287,15 @@ pub struct Scheduler {
     seq: u64,
     timers: BTreeMap<i64, Vec<String>>,
     in_progress: HashMap<String, usize>,
+    /// Pools' executors, by id.
+    executors: BTreeMap<String, Executor>,
+    /// (pool, runner) left alone until, and the wait after the next failure.
+    backoff: HashMap<(String, String), (i64, i64)>,
+    /// Each pool's last failure to start an executor: (runner, error).
+    pool_errors: HashMap<String, (String, String)>,
+    /// The reservations' windows open now (index, end), and when they're next looked at (W05-R12).
+    windows: Vec<(usize, i64)>,
+    windows_at: Option<i64>,
 }
 
 impl Scheduler {
@@ -237,6 +310,10 @@ impl Scheduler {
     /// Handles one input at `now` (unix milliseconds).
     pub fn handle(&mut self, input: Input, now: i64) -> Vec<Command> {
         let mut out = Vec::new();
+        // Reservations' windows that opened or closed since: what may run where changes.
+        if !self.cfg.reservations.is_empty() && self.windows_at.is_none_or(|at| now >= at) {
+            self.refresh_windows(now, &mut out);
+        }
         match input {
             Input::RunQueued { run, group, supersede } => self.run_queued(run, group, supersede, now, &mut out),
             Input::RunFinished { run } => {
@@ -252,11 +329,13 @@ impl Scheduler {
             Input::LegQueued(leg) => self.leg_queued(*leg, now, &mut out),
             Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt),
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
+            Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
             Input::Rejected { leg } => {
                 if let Some(runner) = self.release(&leg) {
+                    self.discard_used(&leg, &mut out);
                     if let Some(l) = self.legs.get_mut(&leg) {
-                        l.avoid = Some(runner.clone());
+                        l.avoid = Some((runner.clone(), Off::Refused));
                     }
                     self.enqueue(&leg, now, &mut out);
                     self.try_runner(&runner, now, &mut out);
@@ -268,8 +347,26 @@ impl Scheduler {
                 if let Some(r) = self.runners.get_mut(&runner) {
                     r.draining = true;
                 }
+                self.try_avoided(now, &mut out);
             }
             Input::RulesChanged(rules) => self.rules_changed(rules, now, &mut out),
+            Input::ExecutorReady { executor } => self.executor_ready(&executor, now, &mut out),
+            Input::ExecutorFailed { executor, error } => self.executor_failed(&executor, error, now, &mut out),
+            Input::PoolsChanged { pools, reservations } => {
+                self.cfg.pools = pools;
+                self.cfg.reservations = reservations;
+                self.windows_at = None;
+                self.refresh_windows(now, &mut out);
+                // A pool gone: its idle and starting executors stop; busy ones end with their legs.
+                let gone: Vec<Executor> = self.executors.values().filter(|e| !matches!(e.state, ExecState::Busy { .. }) && !self.cfg.pools.iter().any(|p| p.name == e.pool)).cloned().collect();
+                for e in gone {
+                    self.drop_executor(&e.id);
+                    out.push(Command::StopExecutor { executor: e.id, runner: e.runner });
+                }
+                let rules = self.cfg.rules.clone();
+                self.rules_changed(rules, now, &mut out);
+                self.scale_all(now, &mut out);
+            }
             Input::Tick => self.tick(now, &mut out),
         }
         out
@@ -342,24 +439,57 @@ impl Scheduler {
         }
     }
 
+    /// The pool that runs a leg of `route` (W13-R09): the first that serves its labels, and for an
+    /// untrusted leg one whose executors may run untrusted code (W18-R07).
+    pub fn pool_for(&self, route: &LegRoute) -> Option<&Pool> {
+        let untrusted_ok = |p: &Pool| route.untrusted.as_ref().is_none_or(|u| u.executors.contains(&p.executor));
+        self.config().pools.iter().find(|p| p.serves(&route.labels) && untrusted_ok(p))
+    }
+
     fn requirement(&self, input: &LegIn) -> Requirement {
+        // A pool that serves the leg's labels runs it, on the hosts the pool names.
+        if let Some(p) = self.pool_for(&input.route) {
+            let mut constraints = p.hosts.clone();
+            for c in &input.route.requires {
+                match routing::Constraint::parse(c) {
+                    Ok(x) => constraints.push((c.clone(), x)),
+                    Err(e) => constraints.push((e, routing::Constraint::Or(Vec::new()))),
+                }
+            }
+            return Requirement {
+                constraints,
+                caps: input.route.caps | p.caps,
+                executors: vec![p.executor.clone()],
+                image: p.image.clone(),
+                pool: Some(p.name.clone()),
+                rootless_docker: input.route.untrusted.as_ref().is_some_and(|u| !u.rootful_docker),
+                ..Requirement::default()
+            };
+        }
         routing::resolve(&input.route, &self.config().rules).unwrap_or_else(|e| {
             // A constraint that doesn't parse: no runner can satisfy it, and the leg says why.
             Requirement { labels: input.route.labels.clone(), constraints: vec![(e, routing::Constraint::Or(Vec::new()))], caps: input.route.caps, ..Requirement::default() }
         })
     }
 
-    fn leg_queued(&mut self, input: LegIn, now: i64, out: &mut Vec<Command>) {
+    fn leg_queued(&mut self, mut input: LegIn, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
         if self.legs.get(&id).is_some_and(|l| l.state != State::Done) {
             return;
         }
         let mut req = self.requirement(&input);
+        // A pool's leg takes what its executor holds already.
+        if req.pool.is_some() {
+            input.request = Resources::default();
+        }
         req.prefer.extend(input.prefer.iter().cloned());
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
         let group = input.group.clone();
-        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None });
+        self.legs.insert(
+            id.clone(),
+            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false },
+        );
         match group {
             Some((key, name, cfg)) => {
                 let actions = self.groups.arrive(&key, &name, &format!("leg:{id}"), &cfg);
@@ -386,7 +516,24 @@ impl Scheduler {
         }
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
-        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Assigned { runner: runner.clone() }, attempt, queued_at: 0, key: None, reason: None, avoid: None, pin: None, last_runner: Some(runner.clone()), cancelling: None });
+        self.legs.insert(
+            id.clone(),
+            Leg {
+                input,
+                req,
+                sig,
+                state: State::Assigned { runner: runner.clone() },
+                attempt,
+                queued_at: 0,
+                key: None,
+                reason: None,
+                avoid: None,
+                pin: None,
+                last_runner: Some(runner.clone()),
+                cancelling: None,
+                gone: false,
+            },
+        );
         // The runner may not have reconnected yet: keep what it runs until it does.
         let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, exclusive: false });
         r.running.push(id);
@@ -397,7 +544,7 @@ impl Scheduler {
         if self.sigs.contains_key(sig) {
             return;
         }
-        let eligible: BTreeSet<String> = self.runners.iter().filter(|(_, r)| r.connected && routing::eligible(req, &r.input.view)).map(|(k, _)| k.clone()).collect();
+        let eligible: BTreeSet<String> = self.runners.iter().filter(|(_, r)| self.eligible_for(req, r)).map(|(k, _)| k.clone()).collect();
         self.sigs.insert(sig.to_owned(), Sig { req: req.clone(), eligible, queue: BTreeSet::new() });
     }
 
@@ -427,6 +574,9 @@ impl Scheduler {
                 break;
             }
             self.try_runner(&r, now, out);
+        }
+        if let Some(pool) = self.legs.get(id).filter(|l| l.state == State::Queued).and_then(|l| l.req.pool.clone()) {
+            self.scale(&pool, now, out);
         }
         if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
             let reason = self.wait_reason(id);
@@ -482,11 +632,35 @@ impl Scheduler {
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
 
+    /// Whether a runner other than `avoided` could take a leg: one connected, eligible for it and
+    /// not draining, with room now or not.
+    fn another_could(&self, l: &Leg, avoided: &str) -> bool {
+        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && self.runners.get(id).is_some_and(|r| !r.draining)))
+    }
+
+    /// Tries again the runners that queued legs stay off only while another could take them
+    /// (W05-R16's default): after a runner goes, drains or changes, that one may be the only one.
+    fn try_avoided(&mut self, now: i64, out: &mut Vec<Command>) {
+        let avoided: BTreeSet<String> = self.legs.values().filter(|l| l.state == State::Queued).filter_map(|l| l.avoid.as_ref().filter(|(_, off)| *off == Off::Lost).map(|(r, _)| r.clone())).collect();
+        for r in avoided {
+            self.try_runner(&r, now, out);
+        }
+    }
+
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
         if !r.connected || r.draining || r.exclusive {
             return false;
         }
-        if l.avoid.as_deref() == Some(r.input.id.as_str()) || l.pin.as_deref().is_some_and(|p| p != r.input.id) {
+        if self.reserved_against(r, l).is_some() {
+            return false;
+        }
+        if let Some((a, off)) = &l.avoid
+            && *a == r.input.id
+            && (*off != Off::Lost || self.another_could(l, a))
+        {
+            return false;
+        }
+        if l.pin.as_deref().is_some_and(|p| p != r.input.id) {
             return false;
         }
         if l.input.exclusive && !r.running.is_empty() {
@@ -497,6 +671,12 @@ impl Scheduler {
         {
             return false;
         }
+        // A pool's leg runs in one of its idle executors on that host: one made for it when it
+        // needs that (W13-R07).
+        if let Some(pool) = &l.req.pool {
+            let own = self.own_leg(l);
+            return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own);
+        }
         let c = self.config();
         match (c.resources, r.input.capacity) {
             (true, Some(cap)) => {
@@ -506,8 +686,13 @@ impl Scheduler {
                     && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
                     && r.used.gpu + q.gpu <= cap.gpu
             }
-            _ => r.running.len() < r.input.slots.max(1) as usize,
+            _ => self.own_legs(r) < r.input.slots.max(1) as usize,
         }
+    }
+
+    /// The legs a runner runs in its own slots (a pool's run in their executors).
+    fn own_legs(&self, r: &Runner) -> usize {
+        r.running.iter().filter(|x| !self.legs.get(*x).is_some_and(|l| l.req.pool.is_some())).count()
     }
 
     /// Gives a runner the best queued legs that fit it, until none does.
@@ -535,7 +720,6 @@ impl Scheduler {
     }
 
     fn assign(&mut self, id: &str, runner: &str, now: i64, out: &mut Vec<Command>) {
-        let _ = now;
         self.unqueue(id);
         let Some(l) = self.legs.get_mut(id) else { return };
         l.state = State::Assigned { runner: runner.to_owned() };
@@ -553,7 +737,14 @@ impl Scheduler {
             r.exclusive = exclusive;
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
-        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker });
+        // Its pool's idle executor there, which it alone uses.
+        let own = self.legs.get(id).and_then(|l| self.own_leg(l)).map(str::to_owned);
+        let slot = req.pool.as_ref().and_then(|p| self.executors.values_mut().find(|e| e.pool == *p && e.runner == runner && e.state == ExecState::Idle && e.leg == own)).map(|e| {
+            e.state = ExecState::Busy { leg: id.to_owned() };
+            e.since = now;
+            e.id.clone()
+        });
+        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker, slot });
     }
 
     fn release(&mut self, id: &str) -> Option<String> {
@@ -573,12 +764,29 @@ impl Scheduler {
         Some(runner)
     }
 
+    /// The executor a leg ran in took its one leg: it's discarded. Its host removed it as the leg
+    /// ended; one the leg never reached (refused, failed before it started) goes now.
+    fn discard_used(&mut self, id: &str, out: &mut Vec<Command>) {
+        // And one made for it that it never got to (cancelled while its pod started).
+        let used: Vec<(String, String)> =
+            self.executors.values().filter(|e| e.state == ExecState::Busy { leg: id.to_owned() } || e.leg.as_deref() == Some(id)).map(|e| (e.id.clone(), e.runner.clone())).collect();
+        for (e, runner) in used {
+            self.drop_executor(&e);
+            out.push(Command::StopExecutor { executor: e, runner });
+        }
+    }
+
     fn finished(&mut self, id: &str, attempt: u32, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
         let Some(l) = self.legs.get(id) else { return };
         if l.attempt != attempt || l.state == State::Done {
             return;
         }
+        if l.gone {
+            self.drop_gone(id, now, out);
+            return;
+        }
         let runner = self.release(id);
+        self.discard_used(id, out);
         // Cancelled while it ran: a failure now (killed, its runner gone) is the cancel's doing.
         if let Some(why) = self.legs.get(id).and_then(|l| l.cancelling.clone()) {
             let (outcome, reason) = match outcome {
@@ -589,6 +797,7 @@ impl Scheduler {
             if let Some(r) = runner {
                 self.try_runner(&r, now, out);
             }
+            self.scale_all(now, out);
             return;
         }
         let decision = match &outcome {
@@ -604,7 +813,8 @@ impl Scheduler {
                     l.avoid = None;
                     l.pin = None;
                     match d.runner {
-                        RunnerChoice::Different => l.avoid = runner.clone(),
+                        RunnerChoice::Different => l.avoid = runner.clone().map(|r| (r, Off::Different)),
+                        RunnerChoice::Another => l.avoid = runner.clone().map(|r| (r, Off::Lost)),
                         RunnerChoice::Same => l.pin = runner.clone(),
                         RunnerChoice::Any | RunnerChoice::Default => {}
                     }
@@ -623,15 +833,45 @@ impl Scheduler {
         if let Some(r) = runner {
             self.try_runner(&r, now, out);
         }
+        self.scale_all(now, out);
     }
 
     fn settle(&mut self, id: &str, outcome: Outcome, reason: Option<String>, now: i64, out: &mut Vec<Command>) {
+        // An executor made for it goes with it (a pod still starting for a cancelled leg).
+        self.discard_used(id, out);
         let group = self.legs.remove(id).and_then(|l| l.input.group);
         out.push(Command::Settled { leg: id.to_owned(), outcome, reason });
         if let Some((key, _, _)) = group {
             for a in self.groups.leave(&key, &format!("leg:{id}")) {
                 self.group_action(a, now, out);
             }
+        }
+    }
+
+    fn gone(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(l) = self.legs.get_mut(id) else { return };
+        // Running: its runner stops it, and its slot is free once the runner says it ended.
+        if matches!(l.state, State::Assigned { .. }) {
+            l.gone = true;
+            out.push(Command::Cancel { leg: id.to_owned(), attempt: l.attempt, reason: "its repository was deleted".into() });
+            return;
+        }
+        self.unqueue(id);
+        self.drop_gone(id, now, out);
+    }
+
+    /// A leg gone with its repository, off its runner and out of the scheduler: nothing settled.
+    fn drop_gone(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let runner = self.release(id);
+        self.discard_used(id, out);
+        let group = self.legs.remove(id).and_then(|l| l.input.group);
+        if let Some((key, _, _)) = group {
+            for a in self.groups.leave(&key, &format!("leg:{id}")) {
+                self.group_action(a, now, out);
+            }
+        }
+        if let Some(r) = runner {
+            self.try_runner(&r, now, out);
         }
     }
 
@@ -655,22 +895,58 @@ impl Scheduler {
 
     fn runner_up(&mut self, r: RunnerIn, now: i64, out: &mut Vec<Command>) {
         let id = r.id.clone();
+        // A hosted executor's own runner: the executor is ready, there (W13-R07). One the
+        // scheduler doesn't know is told to go.
+        if let Some(e) = r.executor.clone() {
+            match self.executors.get_mut(&e) {
+                Some(x) if x.state == ExecState::Starting => {
+                    x.runner = id.clone();
+                    x.state = ExecState::Idle;
+                    x.since = now;
+                    let pool = x.pool.clone();
+                    self.backoff.remove(&(pool.clone(), String::new()));
+                    self.idle_timer(&pool, now, out);
+                }
+                Some(_) => {}
+                // One from before a restart, or stopped since: it goes. An ephemeral runner that
+                // is no executor's (`""`, a v1 job's pod) is left alone, and takes nothing.
+                None if !e.is_empty() => out.push(Command::StopExecutor { executor: e, runner: id.clone() }),
+                None => {}
+            }
+        }
         let (running, used, exclusive) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.exclusive)).unwrap_or_default();
         self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false, exclusive });
         self.refresh_eligibility(&id);
+        self.try_avoided(now, out);
         self.try_runner(&id, now, out);
+        self.scale_all(now, out);
         self.refresh_reasons(out);
     }
 
     fn refresh_eligibility(&mut self, runner: &str) {
         let Some(r) = self.runners.get(runner) else { return };
-        let (view, connected) = (r.input.view.clone(), r.connected);
-        for s in self.sigs.values_mut() {
-            if connected && routing::eligible(&s.req, &view) {
-                s.eligible.insert(runner.to_owned());
-            } else {
-                s.eligible.remove(runner);
+        let ok: Vec<(String, bool)> = self.sigs.iter().map(|(k, s)| (k.clone(), self.eligible_for(&s.req, r))).collect();
+        for (k, yes) in ok {
+            if let Some(s) = self.sigs.get_mut(&k) {
+                if yes {
+                    s.eligible.insert(runner.to_owned());
+                } else {
+                    s.eligible.remove(runner);
+                }
             }
+        }
+    }
+
+    /// Whether a runner may take legs of `req`: a hosted executor's own runner only its pool's
+    /// (W13-R07), and no other runner those; the rest as routing decides.
+    fn eligible_for(&self, req: &Requirement, r: &Runner) -> bool {
+        if !r.connected {
+            return false;
+        }
+        let hosted = req.pool.as_deref().and_then(|p| self.pool(p)).is_some_and(|p| p.hosted);
+        match r.input.executor.as_deref() {
+            Some(e) => hosted && self.executors.get(e).is_some_and(|x| Some(x.pool.as_str()) == req.pool.as_deref()),
+            None => !hosted && routing::eligible(req, &r.input.view),
         }
     }
 
@@ -683,10 +959,19 @@ impl Scheduler {
             None => return,
         };
         self.refresh_eligibility(runner);
+        // The legs that stayed off another runner only while this one could take them go there
+        // first: they waited longer than the legs this one loses now.
+        self.try_avoided(now, out);
+        // Its pools' executors went with it.
+        let gone: Vec<String> = self.executors.values().filter(|e| e.runner == runner && !matches!(e.state, ExecState::Busy { .. })).map(|e| e.id.clone()).collect();
+        for e in gone {
+            self.drop_executor(&e);
+        }
         for leg in legs {
             let attempt = self.legs.get(&leg).map_or(0, |l| l.attempt);
             self.finished(&leg, attempt, Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }), now, out);
         }
+        self.scale_all(now, out);
         self.refresh_reasons(out);
     }
 
@@ -730,6 +1015,267 @@ impl Scheduler {
                 }
             }
         }
+        self.reap_idle(now, out);
+        self.scale_all(now, out);
+    }
+
+    // ------------------------------------------------------------------ reservations (W05-R12)
+
+    /// Which reservation keeps `r` (or the leg's pool) from `l` now, and until when.
+    fn reserved_against(&self, r: &Runner, l: &Leg) -> Option<(String, i64)> {
+        self.windows.iter().find_map(|(i, end)| {
+            let res = self.cfg.reservations.get(*i)?;
+            let keeps = match &res.pool {
+                Some(p) => l.req.pool.as_deref() == Some(p.as_str()),
+                None => res.holds(&r.input.view),
+            };
+            (keeps && !res.admits(&l.input.route)).then(|| (res.name.clone(), *end))
+        })
+    }
+
+    /// The windows open at `now`, and a timer for the next that opens or closes; then every
+    /// runner looks again at what waits, as what may run where changed.
+    fn refresh_windows(&mut self, now: i64, out: &mut Vec<Command>) {
+        let before = self.windows.clone();
+        self.windows = self.cfg.reservations.iter().enumerate().filter_map(|(i, r)| r.window_end(now).map(|end| (i, end))).collect();
+        let next = self.windows.iter().map(|(_, end)| *end).chain(self.cfg.reservations.iter().filter_map(|r| r.next_start(now))).filter(|t| *t > now).min();
+        // Looked at again within a week at the latest.
+        let at = next.unwrap_or(now + 7 * 86_400_000);
+        self.windows_at = Some(at);
+        self.timers.entry(at).or_default();
+        out.push(Command::Timer { at });
+        if self.windows != before {
+            let runners: Vec<String> = self.runners.keys().cloned().collect();
+            for r in runners {
+                self.try_runner(&r, now, out);
+            }
+            self.refresh_reasons(out);
+        }
+    }
+
+    // ------------------------------------------------------------------ pools (W13-R09)
+
+    fn pool(&self, name: &str) -> Option<&Pool> {
+        self.cfg.pools.iter().find(|p| p.name == name)
+    }
+
+    fn drop_executor(&mut self, id: &str) {
+        if let Some(e) = self.executors.remove(id)
+            && let Some(r) = self.runners.get_mut(&e.runner)
+        {
+            sub(&mut r.used, &e.reserved);
+        }
+    }
+
+    /// Legs queued for `pool`.
+    fn waiting_for(&self, pool: &str) -> usize {
+        self.sigs.values().filter(|s| s.req.pool.as_deref() == Some(pool)).map(|s| s.queue.len()).sum()
+    }
+
+    /// The hosts that may run `pool`'s executors now, with room for another: connected, not
+    /// draining, eligible for its legs, under `per_host_max`, with the resources in resource
+    /// mode, and not backing off; the least loaded with the pool first.
+    fn hosts_for(&self, p: &Pool, now: i64) -> Vec<String> {
+        let req = Requirement { constraints: p.hosts.clone(), caps: p.caps, executors: vec![p.executor.clone()], pool: Some(p.name.clone()), ..Requirement::default() };
+        let mut hosts: Vec<(usize, String)> = self
+            .runners
+            .values()
+            .filter(|r| r.connected && !r.draining && routing::eligible(&req, &r.input.view))
+            .filter(|r| self.backoff.get(&(p.name.clone(), r.input.id.clone())).is_none_or(|(until, _)| *until <= now))
+            .filter_map(|r| {
+                let here = self.executors.values().filter(|e| e.pool == p.name && e.runner == r.input.id).count();
+                if here >= p.per_host_max {
+                    return None;
+                }
+                let c = self.config();
+                if let (true, Some(cap)) = (c.resources, r.input.capacity) {
+                    let q = &p.request;
+                    let fits = r.used.cpu + q.cpu <= cap.cpu * c.overcommit_cpu
+                        && (r.used.mem + q.mem) as f64 <= cap.mem as f64 * c.overcommit_mem
+                        && (r.used.disk + q.disk) as f64 <= cap.disk as f64 * c.overcommit_disk
+                        && r.used.gpu + q.gpu <= cap.gpu;
+                    if !fits {
+                        return None;
+                    }
+                }
+                Some((here, r.input.id.clone()))
+            })
+            .collect();
+        hosts.sort();
+        hosts.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Starts as many of `pool`'s executors as its waiting legs and `min_idle` want.
+    fn scale(&mut self, pool: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(p) = self.pool(pool).cloned() else { return };
+        let count = |s: fn(&ExecState) -> bool| self.executors.values().filter(|e| e.pool == pool && s(&e.state)).count();
+        let (starting, idle, busy) = (count(|s| *s == ExecState::Starting), count(|s| *s == ExecState::Idle), count(|s| matches!(s, ExecState::Busy { .. })));
+        let mut want = pools::wanted(&p, starting, idle, busy, self.waiting_for(pool));
+        // The server's executors (a `k8s` pool's pods): started by it, each its own runner once
+        // it connects; not while a failed start's backoff lasts.
+        if p.hosted {
+            if self.backoff.get(&(p.name.clone(), String::new())).is_some_and(|(until, _)| *until > now) {
+                return;
+            }
+            // Each waiting leg that needs a pod of its own (W13-R07) gets one, within `max`; the
+            // shared ones are for the others.
+            let waiting: Vec<(String, bool)> = self
+                .sigs
+                .values()
+                .filter(|s| s.req.pool.as_deref() == Some(pool))
+                .flat_map(|s| s.queue.iter().map(|(_, _, _, id)| id.clone()))
+                .filter_map(|id| self.legs.get(&id).map(|l| (id, l.input.own_executor)))
+                .collect();
+            let mut room = p.max.saturating_sub(self.executors.values().filter(|e| e.pool == pool).count());
+            for (leg, _) in waiting.iter().filter(|(_, own)| *own) {
+                if room == 0 {
+                    break;
+                }
+                if self.executors.values().any(|e| e.leg.as_deref() == Some(leg.as_str())) {
+                    continue;
+                }
+                room -= 1;
+                self.start_hosted(&p, Some(leg.clone()), now, out);
+            }
+            let shared = |s: fn(&ExecState) -> bool| self.executors.values().filter(|e| e.pool == pool && e.leg.is_none() && s(&e.state)).count();
+            let (starting, idle, busy) = (shared(|s| *s == ExecState::Starting), shared(|s| *s == ExecState::Idle), shared(|s| matches!(s, ExecState::Busy { .. })));
+            let others = waiting.iter().filter(|(_, own)| !*own).count();
+            for _ in 0..pools::wanted(&p, starting, idle, busy, others).min(room) {
+                self.start_hosted(&p, None, now, out);
+            }
+            return;
+        }
+        while want > 0 {
+            let Some(host) = self.hosts_for(&p, now).into_iter().next() else { break };
+            self.seq += 1;
+            let id = format!("pool-{pool}-{now:x}-{:x}", self.seq);
+            self.executors.insert(id.clone(), Executor { id: id.clone(), pool: pool.to_owned(), runner: host.clone(), state: ExecState::Starting, since: now, reserved: p.request, leg: None });
+            if let Some(r) = self.runners.get_mut(&host) {
+                add(&mut r.used, &p.request);
+            }
+            out.push(Command::StartExecutor { pool: pool.to_owned(), executor: id, runner: host, kind: p.executor.clone(), image: p.image.clone(), leg: None });
+            want -= 1;
+        }
+    }
+
+    /// One of a hosted pool's executors started by the server: made for `leg`, or for any.
+    fn start_hosted(&mut self, p: &Pool, leg: Option<String>, now: i64, out: &mut Vec<Command>) {
+        self.seq += 1;
+        let id = format!("pool-{}-{now:x}-{:x}", p.name, self.seq);
+        self.executors
+            .insert(id.clone(), Executor { id: id.clone(), pool: p.name.clone(), runner: String::new(), state: ExecState::Starting, since: now, reserved: Resources::default(), leg: leg.clone() });
+        out.push(Command::StartExecutor { pool: p.name.clone(), executor: id, runner: String::new(), kind: p.executor.clone(), image: p.image.clone(), leg });
+    }
+
+    /// The leg's own id when it needs an executor made for it: it has containers, and its pool's
+    /// executors are the server's (W13-R07).
+    fn own_leg<'l>(&self, l: &'l Leg) -> Option<&'l str> {
+        let hosted = l.req.pool.as_deref().and_then(|p| self.pool(p)).is_some_and(|p| p.hosted);
+        (hosted && l.input.own_executor).then_some(l.input.id.as_str())
+    }
+
+    fn scale_all(&mut self, now: i64, out: &mut Vec<Command>) {
+        let names: Vec<String> = self.cfg.pools.iter().map(|p| p.name.clone()).collect();
+        for n in names {
+            self.scale(&n, now, out);
+        }
+    }
+
+    fn executor_ready(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(e) = self.executors.get_mut(id) else { return };
+        if e.state != ExecState::Starting {
+            return;
+        }
+        e.state = ExecState::Idle;
+        e.since = now;
+        let (pool, runner) = (e.pool.clone(), e.runner.clone());
+        self.backoff.remove(&(pool.clone(), runner.clone()));
+        self.try_runner(&runner, now, out);
+        self.idle_timer(&pool, now, out);
+        self.refresh_reasons(out);
+    }
+
+    fn executor_failed(&mut self, id: &str, error: String, now: i64, out: &mut Vec<Command>) {
+        let Some(e) = self.executors.get(id).cloned() else { return };
+        self.drop_executor(id);
+        // Gone under its leg: the leg's runner reports how the attempt ended.
+        if matches!(e.state, ExecState::Busy { .. }) {
+            return;
+        }
+        // The host is left alone a while, longer each time it fails.
+        let key = (e.pool.clone(), e.runner.clone());
+        let delay = self.backoff.get(&key).map_or(pools::FIRST_BACKOFF_MS, |(_, d)| *d);
+        self.backoff.insert(key, (now + delay, (delay * 2).min(pools::MAX_BACKOFF_MS)));
+        self.pool_errors.insert(e.pool.clone(), (e.runner.clone(), error));
+        self.timers.entry(now + delay).or_default();
+        out.push(Command::Timer { at: now + delay });
+        self.scale(&e.pool, now, out);
+        self.refresh_reasons(out);
+    }
+
+    /// A timer for when `pool`'s oldest idle executor passes its `idle_timeout`.
+    fn idle_timer(&mut self, pool: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(p) = self.pool(pool) else { return };
+        let timeout = p.idle_timeout_ms;
+        if let Some(at) = self.executors.values().filter(|e| e.pool == pool && e.state == ExecState::Idle).map(|e| e.since + timeout).min()
+            && at > now
+        {
+            self.timers.entry(at).or_default();
+            out.push(Command::Timer { at });
+        }
+    }
+
+    /// Stops executors idle past their pool's `idle_timeout`, oldest first, while the pool keeps
+    /// `min_idle` and nothing waits for it.
+    fn reap_idle(&mut self, now: i64, out: &mut Vec<Command>) {
+        let pools: Vec<Pool> = self.cfg.pools.clone();
+        for p in pools {
+            if self.waiting_for(&p.name) > 0 {
+                continue;
+            }
+            let mut idle: Vec<(i64, String, String)> = self.executors.values().filter(|e| e.pool == p.name && e.state == ExecState::Idle).map(|e| (e.since, e.id.clone(), e.runner.clone())).collect();
+            idle.sort();
+            let spare = idle.len() + self.executors.values().filter(|e| e.pool == p.name && e.state == ExecState::Starting).count();
+            let mut over = spare.saturating_sub(p.min_idle);
+            for (since, id, runner) in idle {
+                if over == 0 || now - since < p.idle_timeout_ms {
+                    break;
+                }
+                self.drop_executor(&id);
+                out.push(Command::StopExecutor { executor: id, runner });
+                over -= 1;
+            }
+            self.idle_timer(&p.name, now, out);
+        }
+    }
+
+    /// The pools and their executors now (the Pools page, `GET /api/ci/pools`).
+    pub fn pools(&self) -> Vec<PoolView> {
+        self.cfg
+            .pools
+            .iter()
+            .map(|p| {
+                let mine: Vec<Executor> = self.executors.values().filter(|e| e.pool == p.name).cloned().collect();
+                let count = |f: fn(&ExecState) -> bool| mine.iter().filter(|e| f(&e.state)).count();
+                PoolView {
+                    name: p.name.clone(),
+                    executor: p.executor.clone(),
+                    image: p.image.clone(),
+                    labels: p.labels.clone(),
+                    hosts: p.hosts.first().map(|(s, _)| s.clone()),
+                    min_idle: p.min_idle,
+                    max: p.max,
+                    per_host_max: p.per_host_max,
+                    idle_timeout_ms: p.idle_timeout_ms,
+                    starting: count(|s| *s == ExecState::Starting),
+                    idle: count(|s| *s == ExecState::Idle),
+                    busy: count(|s| matches!(s, ExecState::Busy { .. })),
+                    waiting: self.waiting_for(&p.name),
+                    last_error: self.pool_errors.get(&p.name).cloned(),
+                    executors: mine,
+                }
+            })
+            .collect()
     }
 
     fn set_reason(&mut self, id: &str, reason: WaitReason, out: &mut Vec<Command>) {
@@ -759,6 +1305,30 @@ impl Scheduler {
             return WaitReason::Quota { limit: *q };
         }
         let eligible: Vec<&Runner> = self.sigs.get(&l.sig).map(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).collect()).unwrap_or_default();
+        // Every runner that could take it is kept for other legs: until the first window ends.
+        if !eligible.is_empty()
+            && let Some((name, until)) = eligible.iter().map(|r| self.reserved_against(r, l)).collect::<Option<Vec<_>>>().and_then(|all| all.into_iter().min_by_key(|(_, u)| *u))
+        {
+            return WaitReason::Reservation { reservation: name, until };
+        }
+        if let (Some(pool), false) = (&l.req.pool, eligible.is_empty()) {
+            let mine: Vec<&Executor> = self.executors.values().filter(|e| e.pool == *pool).collect();
+            let starting: Vec<&&Executor> = mine.iter().filter(|e| e.state == ExecState::Starting).collect();
+            if let Some(since) = starting.iter().map(|e| e.since).min() {
+                return WaitReason::Scaling { pool: pool.clone(), starting: starting.len(), since };
+            }
+            // At its `max` (or no host has room): its executors are the capacity.
+            let busy = mine.iter().filter(|e| matches!(e.state, ExecState::Busy { .. })).count();
+            return WaitReason::Capacity { eligible: mine.len(), busy, draining: 0 };
+        }
+        if let Some((a, off)) = &l.avoid
+            && *off != Off::Lost
+            && !eligible.is_empty()
+            && eligible.iter().all(|r| r.input.id == *a)
+        {
+            let avoided = self.runners.get(a).map_or_else(|| a.clone(), |r| r.input.view.name.clone());
+            return WaitReason::OtherRunner { avoided, refused: *off == Off::Refused };
+        }
         if !eligible.is_empty() {
             if l.input.exclusive && eligible.iter().all(|r| !r.running.is_empty() || r.draining) {
                 return WaitReason::Exclusive;

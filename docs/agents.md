@@ -10,8 +10,49 @@ browsers watching it.
 |---|---|---|
 | Claude Code | `claude -p` stream-json + control protocol | `harness/claude.rs` |
 | Codex | `codex app-server` (JSON-RPC v2) | `harness/codex.rs` |
-| Gemini CLI, opencode, Goose, Amp | Agent Client Protocol | `harness/acp.rs` |
+| Devin, Gemini CLI, opencode, Goose, Amp | Agent Client Protocol | `harness/acp.rs` |
 | Antigravity CLI | `agy` headless stream-json, one turn per message on stdin (agy 1.4 or newer) | `harness/antigravity.rs` |
+
+Devin runs as `devin acp`, with its modes, models and effort announced by the harness. Its modes
+include Code (`accept-edits`, its own default), Ask, Plan, Smart and Bypass; a child starts in Ask or Plan
+when its parent's permissions require it. The same session controls, approvals, messages, MCP
+tools and conversation resumption run over ACP. Its own terminal interface is `devin`. Live
+settings, steering, interruption, queueing, resume and native terminal discovery were tested against
+Devin CLI 3000.11.92.
+
+Devin's advertised `cognition.ai/midTurnPrompts` capability enables Steer and queued-message
+steering without cancellation. Concurrent prompts share a turn; kiln records their completion
+and usage once. A runner upgrade refreshes this capability on existing Devin sessions without
+restarting their processes. Other ACP agents keep steering queued.
+
+Before a Devin session starts, each machine loads its model catalog with a bounded ACP handshake
+in a temporary configuration that keeps its native default model, with imports, MCP servers and
+automatic updates off. It sends no prompts. Each model's effort choices are read from the agent
+and kept in the existing model cache for the start dialog. Shared effort choices are offered only
+when every listed model
+supports them. The start dialog uses the native default model's levels before a model is chosen,
+then the chosen model's own levels. Resuming keeps the conversation's model and sends a selected
+effort only if that model supports it. The native permission modes are available before discovery
+finishes.
+
+ACP sessions prefer [config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
+(`configOptions`) over the older `modes` and `models` fields. The first select
+in the `mode`, `model` and `thought_level` categories drives kiln's existing permission, model
+and effort selectors; additional options, including ones with no category or an unknown
+category, are ordinary session controls. Grouped choices keep their group names in the labels.
+Boolean options use the existing toggles, advertised with `session.configOptions.boolean`.
+Unrecognized option types are kept with the adapter's state but have no control. The agent's
+order is retained within each selector and control group.
+
+Every `config_option_update` and `session/set_config_option` reply replaces the full option
+list, including current values and choices that depend on another setting. Requested startup
+settings are applied before the first prompt, mode first and model before effort; a failed
+setting holds the prompt. Later changes also run one at a time, so a model's updated effort
+choices are loaded before applying effort. Agents without config options retain the legacy
+setters. ACP resume
+loads the harness's saved conversation; a replay already in kiln's timeline is not appended
+again. Context occupancy comes from `usage_update`; token totals use the prompt's reported
+usage, and costs are displayed only when denominated in USD.
 
 The Antigravity CLI runs as `agy --input-format stream-json --output-format stream-json`: kiln
 writes `{"event":"user","message":{"content":…}}` for each turn and reads `init` (its conversation,
@@ -49,29 +90,46 @@ Every ten seconds the runner notes what runs under each harness and what else is
 its group, or carrying its mark), and keeps that in its record of its sessions (beside each one's
 harness process). What an agent started that runs on apart from its harness (a server started with
 `&` or `setsid`, a script left going) shows with its background tasks as "left running" (task id
-`left-<pid>`), until it ends; stopping that task stops it and what runs under it.
+`left-<pid>`) while its turn goes on; stopping that task stops it and what runs under it. Nothing
+outlives the turn that left it: once the agent is between turns (idle, nothing waiting on a
+person), what its commands left running apart from its harness is stopped. Its harness's own
+background tasks (a shell or a monitor it runs in the background, which run under it) are its work
+and stay until they end, it stops them, or the agent ends; a server meant to keep going runs as
+one. So does a job of the machine's own: a systemd user unit (`systemd-run --user`, a service or a
+scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
+agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
-the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short.
+the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short;
+it goes when that turn ends, as anything else left running.
 Ending the agent stops what it left running, then ends whatever else is still in its group (what
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
 
 ## Mission control
 
-- **Order.** By default (Needs you first) the agents that wait on you come first, longest waiting
-  first, then those stopped, paused, finished since you last looked, working, ready, offline and
-  ended. The list follows the agents as they change: one that comes to need you rises at once.
-  While you use the list (a finger or button pressed on it, focus on one of its controls, a menu
-  or dialog open, agents selected, or a moment after the pointer last moved over it), its rows
-  hold still, then glide to their places. A sort chosen on purpose (by name, age, activity,
-  runner, harness or cost) is followed as it is.
-- **Requests anywhere.** On any other page (and an agent's page, for the other agents), each
-  agent's oldest request shows as a card at the top: a tool call is allowed or denied there, a
-  question or plan opens the agent. Two at once (one on a phone), then a line for the rest. ×, or
-  a swipe, puts one away until that agent asks for something else.
+Its **Programs** follow multi-stack programs (the critical path first), a row per track: its
+worker and how it stands, the goal under way, goals met, change requests, pass, threshold and
+usage, with the workers, slots and weights the person sets there ([programs.md](programs.md)).
+
+- **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
+  paused for you) come first, longest waiting first, then those stopped, paused, finished since
+  you last looked, working, ready, offline and ended. The list follows the agents as they change:
+  one that comes to need you rises at once. While you use the list (a finger or button pressed on
+  it, focus on one of its controls, a menu or dialog open, agents selected, or a moment after the
+  pointer last moved over it), its rows hold still, then glide to their places. A sort chosen on
+  purpose (by name, age, activity, runner, harness or cost) is followed as it is.
+- **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
+  says what each agent has for you, the most pressing first: its oldest request (a tool call is
+  allowed or denied there, a plan it proposes approved there, **Review** to keep it planning with
+  what to change; a question opens the agent); goals it paused for you
+  (**Review the plan**, when they wait on one, and **Resume**); a stop of its own, its harness
+  ended with an error (**Restart**); a usage limit it reached, only said, with when it goes on.
+  Two at once (one on a phone), then a line for the rest. Where kiln's other notifications are,
+  on every screen: at the bottom, above any passing ones. ×, or a swipe, puts one away until
+  there's something new.
 - **Answers at once.** An answer shows as given wherever its request showed (its row, its card, the
   agent's page) before the agent has it; if it doesn't go, the request is back, saying why.
 - **Selecting by touch.** On a touch screen rows have no checkbox: press and hold a row to select
@@ -80,8 +138,13 @@ counted.
 - **The message box.** It writes to the agents selected (each named in its To line, put back with
   its ×), or with none selected to every agent the list shows; @ and part of a name, machine or
   harness finds more. A prompt goes with files (the paperclip, a paste or a drop) and what you say
-  into the mic, queued, steered or sent now as an agent's own box sends it; or a command from its
-  list. It empties as it sends, and says how it went.
+  into the mic, queued, steered or sent now as an agent's own box sends it. Above it, the agent
+  page's line of settings, permissions · model · effort, each opened in place with the same
+  controls: unset, each agent keeps its own; chosen, only the agents that have it are sent to, and
+  given it first (Reset unsets them all). In the field, / lists kiln's own commands for all of them
+  first (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
+  each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
+  working. It empties as it sends, and says how it went.
 
 ## API
 
@@ -101,7 +164,7 @@ counted.
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear,restore}` | run, pause, skip the goal under way, empty its goal stack, or bring back the goals cleared last |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
-| GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
+| GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Devin, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
 | POST | `/api/ai-sessions/:machine/:pid/fork` | continue a copy of a found session, leaving it running → `Info[]`; see below |
 | GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
@@ -149,7 +212,7 @@ puts the end of what's on screen into the message being written.
 
 ### Taking over a found session
 
-A session found running on a machine (a Claude Code or Codex TUI someone started, in one of
+A session found running on a machine (a Claude Code, Codex or Devin TUI someone started, in one of
 kiln's terminals or any other) can be continued as a kiln agent session. `takeover` on each found
 session says whether:
 
@@ -176,6 +239,13 @@ found: it may have ended), 409 (`stop` without `{"stop": true}`, `outside`, `upg
 that continues a copy of the conversation (Claude Code's `--fork-session`, Codex's
 `thread/fork`), named `<name> (branch)`, leaving the found session running as it is. Errors: 404,
 409 (no conversation yet, or a runner too old to branch), 400 (a harness that can't branch).
+
+Devin's native sessions are read from its local `devin/cli/sessions.db` under `XDG_DATA_HOME`
+(by default `~/.local/share`; `LOCALAPPDATA` on Windows). Only the selected main message chain
+is shown. A held session lock identifies the owning ACP process and its native terminal parent;
+a stale lock or an ambiguous owner does not identify a conversation. Native sessions can be taken over, and ended
+conversations appear in the existing past-session list, excluding hidden and running ones.
+Devin does not offer conversation branching through ACP.
 
 ### Messaging many agents at once
 
@@ -220,6 +290,12 @@ and shows what a sign-in asks for:
   the code that page shows, pasted back (a browser on the same machine may finish without one).
 - Codex (`codex login --device-auth`): a page and a one-time code to enter there; it finishes by
   itself. Or an OpenAI API key (`--with-api-key`), never echoed.
+- Devin (`devin auth login --force-manual-token-flow`): a page to open on any device, then the
+  code that page shows, pasted back. Its account card reads `devin auth status`; signing out runs
+  `devin auth logout`. The CLI may also try to open that page in the machine's default browser;
+  the link in kiln works from another device. After sign-in, existing ACP sessions reload their
+  conversation before queued messages continue, refreshing credentials and model choices while
+  retaining their permission mode.
 
 Not on Windows machines yet. What is typed in goes to the CLI only: never logged, kept once the
 sign-in ends, or shown in its output.
@@ -237,10 +313,11 @@ Each change is also an `account_flow` event (`{type, flow}`) on `/api/events`.
 
 ### Continuing a past session
 
-`GET /api/harness/history?target=local|agent:<name>&kind=claude|codex&limit=50` lists the
+`GET /api/harness/history?target=local|agent:<name>&kind=claude|codex|devin&limit=50` lists the
 conversations a machine keeps that are not running, read on that machine from its own
 transcripts (Claude Code's `projects/` in `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `sessions/`
-in `CODEX_HOME` or `~/.codex`): newest first, `kind` for one harness, `limit` up to 200 (50 by
+in `CODEX_HOME` or `~/.codex`) or Devin's native session database: newest first, `kind` for one
+harness, `limit` up to 200 (50 by
 default). Each: `kind`, `id` (the harness's session or thread id), `title` (Claude Code's
 `/rename` or generated title, Codex's thread name; else the last prompt's first line), `cwd`,
 `branch?`, `model?`, `last_activity` (unix seconds of the transcript's last write),
@@ -254,7 +331,7 @@ changed. Errors: 400 (a bad `target` or `kind`), 404 (an ephemeral runner, which
 (the machine is not connected or did not answer).
 
 Continue one with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` on the same
-target. Leave `model` unset: both harnesses keep the conversation's own. Its history is in the
+target. Leave `model` unset: the harness keeps the conversation's own. Its history is in the
 timeline when the session turns idle (Codex's latest 100 turns, listed with
 `thread/turns/list`; a notice says when earlier ones are not shown). Claude Code writes a
 `/rename` into its transcript with the next exchange: a name given just before the session ends
@@ -269,9 +346,11 @@ for it, or the machine seeing its process), never from what it asked. A child ge
 its parent has, and what it asks a person stays the person's: no operation answers another
 agent's approvals, questions or plans.
 
-Mission Control shows only standalone kiln sessions, in a flat list. Managed children and native
-subagents are excluded from its rows, counts, filters, conversation search and bulk actions.
-Subagent status and output remain available inside the agent chats, including after they finish.
+Mission Control lists every agent kiln runs, in one flat list. An agent started through kiln's API
+is a top-level agent, whoever started it: a row of its own, in the counts, filters, conversation
+search and bulk actions, with no nesting under the agent that started it. A harness's own
+subagents stay subagents: they aren't rows, and their status and output stay inside their agent's
+chat, including after they finish.
 The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
@@ -290,6 +369,17 @@ subagent or a command its harness started in the background): it decides when to
   one message; only a settle after work the server saw is told (not one from before a restart), a
   few seconds on (a wait under way returns first). What the parent saw itself through
   `agents_wait` or `agents_result` isn't told again.
+- **One message of news waits at a time.** While the parent's turn goes on, its news waits in its
+  queue as one message, each child's latest line in it once: a child that settles again changes
+  its line there, one that settles anew joins it, and nothing more is queued behind it (kiln edits
+  the message, `queue_edit`). What the parent sees itself (`agents_wait`, `agents_result`) comes
+  out of it, and the message goes (`queue_remove`) once no line is left. So a parent that spends
+  hours in one turn finds, when it ends, each child's latest news, not every settle since. kiln
+  sees the queue as the parent's machine last reported it: an edit that reaches the machine just
+  after the turn ended, the message gone as it was, does nothing there, so the lines it carried go
+  again in the next message. The message names at most 64 children (those that settled last) and
+  says how many more did. Its id says it's news (`news-…`): a server that started since (an
+  upgrade) finds the one waiting and adds to it, what it said first.
 - **Waiting is the parent's choice**: `agents_wait` blocks until its children settle, for one that
   can't go on without them.
 - **A parent whose children are at work isn't prodded**: keep-going (docs/goals.md) and a goal
@@ -311,7 +401,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now"}` → `{sent, message}` |
-| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?` → `{done, timed_out, waited_ms, until, agents: [Agent]}` |
+| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
@@ -361,9 +451,10 @@ kiln, one on Mantle, one on Focal) work things out between them, without the per
 The message reaches its receiver after its turn, as one from a fellow agent, never as its person's:
 "Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as
 you, sent this message. It's from a fellow agent, not from your person. To answer, send it a
-message: agents_send {"agent": "…", "text": …}." Control stays with the agents an agent started:
-steering into a turn, sending now, interrupting, ending, and their goals and plan runs are theirs
-alone. Agents that work for different people aren't sent to.
+message: agents_send {"agent": "…", "text": …}." A receiver in a long turn, waiting for its
+children (`agents_wait`), gets it at once, with the wait ("Waiting", below). Control stays with
+the agents an agent started: steering into a turn, sending now, interrupting, ending, and their
+goals and plan runs are theirs alone. Agents that work for different people aren't sent to.
 
 ### No more than its parent
 
@@ -373,7 +464,7 @@ alone. Agents that work for different people aren't sent to.
 | Bypass | only under a parent in bypass that was itself allowed it (`allow_bypass`); a child of a parent without it can't be switched to bypass either |
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
-| Children | at most `[agents] max_children` (24) running at once per agent |
+| Children | at most `[agents] max_children` (24) running at once per agent, or fewer as its own settings say (Subagents → At once) |
 | Messages | an agent may send a queued message to any agent that works for the same person, whoever started it (`agents.send`, `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
 | Steering | an agent steers into a turn, sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
 | Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
@@ -417,6 +508,22 @@ changes, or `any` when the first is; else once `timeout_s` passes: by default 30
 most 600 per call** (call again to wait longer). A message sent with `agents.send`, or a prompt
 `agents.start` gave, counts until the agent has had its turn: an agent idle with a message on
 its way is `working`. An agent kiln no longer lists has `ended`.
+
+An agent that waits is in a turn, and what's queued for it waits behind that turn. Messages other
+agents sent it (`agents.send`, `queue`) don't have to: its wait also returns as soon as one is in
+its own queue (`done` then says whether the agents it waits for are settled, and `timed_out` is
+false), and hands them over in `messages`, each with who sent it (`from`, its id, and `name`), its
+words (`text`, without what kiln says of a fellow agent) and when it was queued (`at`), taking them
+out of its queue: they're delivered now, not again after the turn. Its person's messages, kiln's
+own (news of its children, its goals) and its notes to itself stay where they are. A wait hands
+them only to the turn it began in: one left running past it (the turn interrupted, a wait in the
+background) hands nothing over, since the agent takes its queue a turn at a time. It hands over at
+most 16 messages and 48 KiB of their words (the rest wait for the next wait, and one longer than
+that on its own for the turn's end), each once, however many waits run. `hand_over: false` hands
+nothing over; a program's waits in code mode don't unless it passes `hand_over: true`, as what a
+program returns of the answer is its own. `kiln agents wait` prints them after where each agent
+stands. A message an agent sends another says so in its id (`from-agent-<sender>-…`), which is how
+a wait finds it.
 
 ### Who asks
 
@@ -479,7 +586,7 @@ Workspace → Its own volume; `agents.start` with `workspace: "volume"`) (docs/a
 
 ## Change requests from agents
 
-An agent's work goes up for review from its Changes tab (**Open change request**), or by the agent
+An agent's work goes up for review from its Changes tab (**Open PR**), or by the agent
 itself (`agents.change`; an agent may open one for its own work and for the agents it started)
 (docs/agentic.md, C1–C4):
 
@@ -489,6 +596,14 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   edits in the same folder stay theirs, and git's ignore rules apply. Its message is the title,
   the body, and a `Kiln-Agent: <name> (<harness>, <id>)` line; its author is the machine's own
   git identity.
+- **In a worktree:** an agent that goes into a worktree of its folder's repository (`git worktree
+  add`, Claude Code's `EnterWorktree`) works there: each file it changes is placed in the working
+  tree it's in, by its path there, and its work is where its latest change is. Its change request
+  takes that working tree's files, committed on its last commit (the worktree's branch, not the
+  checkout's), its trunk the checkout's branch when the remote names none; so do its facts, a plan
+  step's commits, and the Changes tab, where a file in another working tree than the agent's
+  folder is shown where it is. Claude Code's agent moves into a worktree as it enters it, and back
+  as it leaves.
 - **Where it goes:** the branch `agents/<what it's about>-<the start of its id>`.
   - A repository kiln hosts: pushed to kiln's git as a change request
     (`refs/for/<trunk>/branch/agents/…`), with an agent token minted for that push alone
@@ -499,12 +614,18 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
     the pull or merge request is opened through the provider when kiln has an integration with
     it; otherwise the change's link opens one.
   - A folder whose repository kiln doesn't know: the branch goes to its `origin`.
-- **Each push is a version.** Pushing again (**Push a new version**, or `agents.change` again)
+- **Each push is a version.** Pushing again (**Push update**, or `agents.change` again)
   makes the commit anew from the agent's files as they are then.
+- **Where it stands**, in a word above its files: **Pending** (not up for review yet), **Pushed**
+  (its branch is pushed, its pull request not opened yet), **Checking**, **Failed** or **Fixing**
+  (its checks failed; with **Auto-Fix** on, the agent fixes them), **Changes requested**,
+  **In review**, **Approved**, then **Merged** or **Closed**. While it's open, failing checks come
+  first, then changes asked for, then checks still running. On a card 400px wide or more it's one
+  line, what to do at its end; on a narrower one (a phone), a line each.
 - **What comes back** to the agent, as a message after its turn, while it runs: a comment on
   its change (with the file, the lines, the version and a link), a review asking for changes,
   CI that failed on its newest version (the failed legs and the first one's failure excerpt;
-  only when **Fix failing checks by itself** is on, which it is unless you turn it off when
+  only when **Auto-Fix** is on, which it is unless you turn it off when
   opening it), and the land queue taking it out (with the reason). Approvals and landing only
   update where it stands. An agent that has ended is sent nothing.
 - **A plan run's steps** (`plans.run` with `mode: "agents"`, steps in order; docs/agentic.md P4)
@@ -546,18 +667,23 @@ one; `attachments.*` and `incidents.*` do the same for agents and code mode. An 
   tells instead (`session`).
 - **What wakes it** (`wake`): `failure` (a run of what it looks after failed, or a deployment to its
   environment), `flaky` (a run had flaky tests), `ejected` (the land queue took a change out),
-  `stuck` (a job waited for a runner past `limits.stuck_minutes`), `mention` (`@name` in a comment),
-  `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two minutes), `upgrade`
-  (an upgrade failed) and `check` (kiln's checks of the machine, every half hour, found something
-  failing).
+  `stuck` (a job waited for a runner past `limits.stuck_minutes`), `slow` (a green run's critical
+  path took longer than the median of its workflow's last green runs on its branch by more than
+  `limits.slow_percent`), `unroutable` (a job no runner meets what it asks for, a minute on),
+  `degraded` (an app kiln CD deploys to its environment turned degraded), `mention` (`@name` in a
+  comment), `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two
+  minutes), `upgrade` (an upgrade failed) and `check` (kiln's checks of the machine, every half
+  hour, found something failing).
 - **What it may do** (`can`, W20-R09): it always reads what it looks after; beyond that `rerun`,
   `cancel`, `diagnose`, `fix`, `edit-pipelines`, `quarantine`, `comment`, `experiment`,
   `manage-runners`, `deploy`, `land`. Its agent acts for whoever attached it (who needs
   `agents.attach` there), and its calls to kiln are held to these capabilities on what it looks
   after: kiln refuses it the rest.
-- **Its limits** (`limits`): incidents a day (`sessions_per_day`, 10), reruns per failure
-  (`reruns_per_failure`, 2), when a job is stuck (`stuck_minutes`, 15); **its playbook**, and
-  **who reviews** what it opens.
+- **Its limits** (`limits`): incidents a day (`sessions_per_day`, 10), tokens a day
+  (`tokens_per_day`, 5,000,000, its agents' sessions together), runner minutes a day
+  (`runner_minutes_per_day`, 300, the runs its agents asked for and the attempts they reran),
+  reruns per failure (`reruns_per_failure`, 2), when a job is stuck (`stuck_minutes`, 15), when a
+  run is slow (`slow_percent`, 25); **its playbook**, and **who reviews** what it opens.
 
 What wakes it opens an **incident**, or adds to the open one with the same signature (what failed
 and how, with numbers, paths and hashes taken out), so one cause never starts two agents. Its
@@ -567,7 +693,8 @@ and how to report. It says what it found with `incidents.report`: `class` (flaky
 infrastructure, regression, pipeline, dependency, other), `summary`, `links`, `state` (reported,
 resolved; dismissing is a person's). A failure that keeps coming back from reruns past its limit
 tells the agent to stop rerunning. An incident waits for a person instead (`waiting`, saying why)
-while its attachment is paused, past its limit for the day, or when its agent couldn't start.
+while its attachment is paused, past one of its limits for the day, or when its agent couldn't
+start.
 **Pause** stops one; `attachments.pause` with a repository as `on` stops everything attached to it,
 its workflows' and environments' too. Mission Control lists the agents an attachment woke with
 the other agents; their questions come to Needs you and to notifications as any agent's do. A runner doctor's
@@ -585,7 +712,9 @@ open incident shows in the runner's row in System → Updates.
 | `incidents.report` | `POST /api/incidents/:id/report` | `{class?, summary?, links?, state?}`: its agent, or a person who may attach there |
 
 A run that woke an attached agent shows the incident on its page: who looks after it, where it
-stands, what its agent found and opened, and a link to the agent.
+stands, what its agent found and opened, and a link to the agent. **Attach agent** on a
+repository, a workflow, a run, an environment or a runner pool opens Agents → Attached with the
+form filled in for it.
 
 **In the repository.** A repository can keep its attachments in trunk's `.kiln/agents.yaml`, read
 like the rest of its policy (from trunk, never from a change, within a minute of landing):
@@ -601,7 +730,7 @@ agents:
     attach: { pipelines: [ci], branches: [main] }   # or environments: [production]
     wake: [failure, flaky, stuck, ejected]          # or { schedule: "0 6 * * 1" }
     can: [read, rerun, diagnose, fix, comment, quarantine]
-    limits: { per-day: { sessions: 10 }, reruns-per-failure: 2 }
+    limits: { per-day: { sessions: 10, tokens: 5M, runner-minutes: 300 }, reruns-per-failure: 2 }
     instructions: .kiln/agents/ci-doctor.md         # its playbook: a file on trunk, or the words
     reviewers: [ada]
 ```
@@ -613,7 +742,7 @@ one) is left out, and the server's log says why. `@name` in a comment calls a re
 attachment only on that repository's diffs.
 
 Not yet: a workspace of its own per incident (its agent works in the folder named; workspaces wait
-on Slates), and the file's per-day runner minutes and tokens, which are read but not held to.
+on Slates).
 
 ## Commands
 
@@ -624,7 +753,7 @@ console picks) and are answered with a `reply` update to that client.
 |---|---|---|
 | `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
-| `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex; ACP cannot steer) |
+| `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex, Devin when advertised) |
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
@@ -643,8 +772,9 @@ console picks) and are answered with a `reply` update to that client.
 | `resume` | | ends a pause now (`state.pause`): the turn it cut off goes on, then the queue |
 | `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
+| `max_subagents` | `count` (null: no limit of its own) | the most subagents it runs at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, each. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it |
 | `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
-| `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too |
+| `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too, if its own usage says the limit is its own as well |
 
 ### Questions
 
@@ -785,7 +915,14 @@ turn (`harness/pause.rs`):
   ignored ones aren't. `git diff <commit>` shows what changed since; `git restore --source <commit>
   -- .` brings it back.
 - **The whole account.** The server pauses every other session on the same account, on every
-  machine (`limit_hold`), so they don't each find out by failing.
+  machine (`limit_hold`), so they don't each find out by failing: each one the limit is its own
+  as well. A session whose own usage shows it isn't goes on: that window starts over at another
+  time there (it uses another account; an account id can go stale when a machine signs in to
+  another account under a running harness), or the window is another model's (Weekly · Opus, to
+  a session on Sonnet). One whose usage doesn't say (not used up as last reported, or nothing
+  known of that window) asks its harness first, and pauses only if the answer shows the limit
+  reached. Paused, it keeps to its own settings: it goes on by itself at the reset or not, and
+  goes on elsewhere or not, as set for it.
 - **Going on.** Once the window starts over (`until`, plus 30 s and a spread of up to 90 s across
   the account's sessions), kiln asks the harness for its usage (Claude Code's `get_usage`, Codex's
   `account/rateLimits/read`). A limit no longer reached ends the pause: the turn it cut off goes on
@@ -1003,11 +1140,26 @@ mock-up, a small tool) as a page: see docs/previews.md.
 - kiln never lets a harness CLI it runs open a browser on the machine; sign-in pages are shown in
   the console, wherever the person is.
 
+## Metrics
+
+On the server's `/metrics` (Prometheus; Observe reads it): its goal driver's counts, and its own
+harness host's (the sessions on the server's machine). A runner's host counts its own in its
+process, which serves no `/metrics`. Every series is there from the start, at 0. The table is
+the code's (`metrics::AGENTS`): a test holds the two together.
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `kiln_goals_sent_total` | counter | `kind`: `start`, `reminder` | Goals the goal driver sent an agent: a goal's first send, or afresh once resumed or reworded (start), or again after the agent stopped short of it (reminder). |
+| `kiln_goals_ended_total` | counter | `status`: `met`, `skipped` | Goals that ended: met (as its harness, the agent or you said, or with its plan's steps or run), or skipped (cleared in the agent, skipped through goal control, or taken out while under way). |
+| `kiln_harness_polls_total` | counter | | Looks the harness host's watch took at what its harnesses run (every 10 s). |
+| `kiln_harness_records_written_total` | counter | | Writes of the harness host's record of its sessions. |
+
 ## Capability matrix
 
 Checked end to end against the real CLIs with scripted model APIs and isolated configuration
 homes, on the server and through a runner: Claude Code 2.1.296 and Codex 0.162.1; ACP through
-Zed's Claude agent adapter (claude-agent-acp), the only ACP agent run so far.
+Zed's Claude agent adapter (claude-agent-acp). Devin has separate installed-CLI smoke tests for
+settings, steering, interruption, queueing, resumption, native history and terminal ownership.
 
 ✓ verified end to end · unit: covered by the adapter's tests (fed the harness's real message
 shapes), not end to end · — the protocol has no way · ? not run against a real install.

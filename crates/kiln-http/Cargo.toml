@@ -1,0 +1,25 @@
+[package]
+name = "kiln-http"
+description = "kiln's HTTP: HTTP/1.1 and HTTP/2, server and client, on hyper-rt (no tokio, no hyper)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hyper-rt = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+bytes = "1.12.1"
+futures-channel = "0.3.34"
+futures-core = "0.3.34"
+futures-io = "0.3.34"
+http = "1.5.0"
+http-body = "1.1.0"
+httparse = "1.10.1"
+memchr = "2.8.3"
+tracing = "0.1.44"
+
+[dev-dependencies]
+futures = "0.3.34"
+http-body-util = "0.1.5"
+
+[lints]
+workspace = true

@@ -1,8 +1,10 @@
 import * as React from "react";
+import type { CiPlanJob } from "@/api/ci";
 import type { Job } from "@/api/types";
 import { formatDuration, spanSeconds } from "@/lib/format";
 import { useElementWidth, useNow } from "@/lib/hooks";
 import { StatusDot } from "@/components/ui/status";
+import { cn } from "@/lib/utils";
 
 const NODE_W = 212;
 const NODE_H = 60;
@@ -14,11 +16,12 @@ interface Placed {
   job: Job;
   x: number;
   y: number;
+  height: number;
   depth: number;
 }
 
-/** Columns by dependency depth (longest path from a root). */
-export function layoutDag(jobs: Job[]) {
+/** Columns by dependency depth (longest path from a root), each node `heightOf` tall. */
+export function layoutDag(jobs: Job[], heightOf: (job: Job) => number = () => NODE_H) {
   const byKey = new Map(jobs.map((j) => [j.key, j]));
   const depth = new Map<string, number>();
   const visiting = new Set<string>();
@@ -55,16 +58,18 @@ export function layoutDag(jobs: Job[]) {
     col.forEach((j, i) => rowOf.set(j.key, i));
   });
 
-  const maxRows = Math.max(1, ...cols.map((c) => c?.length ?? 0));
-  const height = PAD * 2 + maxRows * NODE_H + (maxRows - 1) * ROW_GAP;
+  const colHeight = (col: Job[]) => col.reduce((sum, j) => sum + heightOf(j), 0) + (col.length - 1) * ROW_GAP;
+  const tallest = Math.max(NODE_H, ...cols.map((c) => (c ? colHeight(c) : 0)));
+  const height = PAD * 2 + tallest;
   const placed: Placed[] = [];
   cols.forEach((col, ci) => {
     if (!col) return;
-    const colH = col.length * NODE_H + (col.length - 1) * ROW_GAP;
-    const offset = (height - PAD * 2 - colH) / 2;
-    col.forEach((job, ri) => {
-      placed.push({ job, depth: ci, x: PAD + ci * (NODE_W + COL_GAP), y: PAD + offset + ri * (NODE_H + ROW_GAP) });
-    });
+    let y = PAD + (tallest - colHeight(col)) / 2;
+    for (const job of col) {
+      const h = heightOf(job);
+      placed.push({ job, depth: ci, x: PAD + ci * (NODE_W + COL_GAP), y, height: h });
+      y += h + ROW_GAP;
+    }
   });
   const width = PAD * 2 + cols.length * NODE_W + Math.max(0, cols.length - 1) * COL_GAP;
   return { placed, width, height };
@@ -140,27 +145,170 @@ export interface DagNote {
   reused: boolean;
 }
 
-/** The most matrix legs a node shows as cells; more are counted instead. */
+/** The most matrix legs a node shows as cells without their values; more are counted instead. */
 const MAX_CELLS = 18;
+
+/**
+ * A matrix job's legs as a grid inside its node (W21-R04): across, its first axis's values; down,
+ * the other axes' combinations; each leg in its cell by its values, a combination left out an
+ * empty one. One axis of more than `GRID_COLS` values, or legs that don't fall one to a cell,
+ * wrap in order instead.
+ */
+interface Grid {
+  /** What runs across and down, said with the grid. */
+  axes: string;
+  cols: number;
+  cells: (Job | null)[];
+  /** A cell's side and the gap between cells, px. */
+  size: number;
+  gap: number;
+  /** One row: its axes said beside it rather than above. */
+  inline: boolean;
+}
+
+const GRID_COLS = 25;
+/** The room a node has for its grid: its width inside its padding and border. */
+const GRID_W = NODE_W - 26;
+
+function matrixGrid(members: Job[]): Grid | null {
+  const ms = members.map((m) => m.matrix);
+  if (!ms.every((m): m is Record<string, unknown> => !!m)) return null;
+  // Its axes: the keys every leg has (`include` can add keys to some).
+  const axes = Object.keys(ms[0] ?? {}).filter((k) => ms.every((m) => k in m));
+  const [across, ...down] = axes;
+  if (across === undefined) return null;
+  const at = (m: Record<string, unknown>, k: string) => JSON.stringify(m[k]);
+  const rowOf = (m: Record<string, unknown>) => down.map((k) => at(m, k)).join("\u0000");
+  const colIndex = new Map<string, number>();
+  const rowIndex = new Map<string, number>();
+  for (const m of ms) {
+    if (!colIndex.has(at(m, across))) colIndex.set(at(m, across), colIndex.size);
+    if (!rowIndex.has(rowOf(m))) rowIndex.set(rowOf(m), rowIndex.size);
+  }
+  let cols = colIndex.size;
+  let cells: (Job | null)[] = new Array<Job | null>(cols * rowIndex.size).fill(null);
+  let placed = cols <= GRID_COLS;
+  ms.forEach((m, i) => {
+    const cell = (rowIndex.get(rowOf(m)) ?? 0) * cols + (colIndex.get(at(m, across)) ?? 0);
+    if (cells[cell]) placed = false;
+    else cells[cell] = members[i] ?? null;
+  });
+  if (!placed) {
+    cols = Math.min(GRID_COLS, members.length);
+    cells = members;
+  }
+  const gap = cols > 16 ? 1 : 2;
+  const size = Math.max(4, Math.min(9, Math.floor((GRID_W - (cols - 1) * gap) / cols)));
+  const label = !placed ? `${axes.join(" × ")}, in order` : down.length ? `${across} → · ${down.join(" × ")} ↓` : `${across} →`;
+  return { axes: label, cols, cells, size, gap, inline: cells.length <= cols };
+}
+
+function gridHeight(g: Grid) {
+  const rows = Math.ceil(g.cells.length / g.cols);
+  return rows * g.size + (rows - 1) * g.gap;
+}
+
+/** A node's height: a grid adds its own and a line for its axes (beside a one-row grid). */
+const heightWith = (g: Grid | undefined) => (g ? NODE_H + (g.inline ? 16 : 20 + gridHeight(g)) : NODE_H);
+
+const STEP_DONE = new Set(["succeeded", "failed", "skipped", "cancelled", "timed_out"]);
+
+/** Steps done of all, over a node's legs: a leg whose steps aren't written yet counts its plan's. */
+function stepsOf(legs: Job[], planned: number): { done: number; total: number } | null {
+  let done = 0;
+  let total = 0;
+  for (const l of legs) {
+    total += l.steps.length || planned;
+    for (const st of l.steps) if (STEP_DONE.has(st.status)) done++;
+  }
+  return total ? { done, total } : null;
+}
+
+/** What a job whose legs aren't made yet waits for (W21-R04), from the run's plan. */
+function waitingFor(p: CiPlanJob, finished: boolean): string {
+  if (finished) return "didn't run";
+  const names = p.needs.length > 2 ? `${p.needs.slice(0, 2).join(", ")} +${p.needs.length - 2}` : p.needs.join(" and ");
+  if (p.matrix_waits) return `its matrix waits on the outputs of ${names}`;
+  return names ? `waits for ${names}` : "waits to start";
+}
 
 /**
  * The jobs and what each needs, read left to right. Where the graph doesn't fit the width it has (a
  * phone, a long pipeline), its columns stack instead, one under the other: nothing scrolls sideways.
- * A CI run also draws its critical path heavier, shows a matrix job's legs as cells by state, and
- * says why a queued leg waits.
+ * A CI run also draws its critical path heavier, shows a matrix job's legs as a grid of cells by
+ * state, each node's steps done and its time against how long it typically takes, why a queued leg
+ * waits, and (from its plan) the jobs whose legs aren't made yet, with what they wait for.
  */
-export function JobDag({ jobs, selected, onSelect, critical, notes }: { jobs: Job[]; selected: string | null; onSelect: (id: string) => void; critical?: Set<string>; notes?: Map<string, DagNote> }) {
+export function JobDag({
+  jobs,
+  selected,
+  onSelect,
+  critical,
+  notes,
+  plan,
+  finished,
+}: {
+  jobs: Job[];
+  selected: string | null;
+  onSelect: (id: string) => void;
+  critical?: Set<string>;
+  notes?: Map<string, DagNote>;
+  plan?: CiPlanJob[];
+  finished?: boolean;
+}) {
   const now = useNow();
   const [ref, avail] = useElementWidth<HTMLDivElement>();
-  const { nodes, groups } = React.useMemo(() => groupMatrix(jobs), [jobs]);
-  const { placed, width, height } = React.useMemo(() => layoutDag(nodes), [nodes]);
+  const { nodes, groups, grids, waiting, planned } = React.useMemo(() => {
+    const { nodes, groups } = groupMatrix(jobs);
+    const grids = new Map<string, Grid>();
+    if (notes) {
+      for (const [key, g] of groups) {
+        const grid = matrixGrid(g.members);
+        if (grid) grids.set(key, grid);
+      }
+    }
+    // The plan's jobs with no legs yet: a node each, drawn from what it needs. A job calling a
+    // workflow has that workflow's jobs as its legs (`call/test`).
+    const keys = nodes.map((n) => n.key);
+    const made = (job: string) => keys.filter((k) => specId(k) === job || k.startsWith(`${job}/`));
+    const planned = new Map((plan ?? []).map((p) => [p.job, p]));
+    const waiting = new Map((plan ?? []).filter((p) => made(p.job).length === 0).map((p) => [p.job, p]));
+    const stubs: Job[] = [...waiting.values()].map((p) => ({
+      id: `plan:${p.job}`,
+      run_id: "",
+      key: p.job,
+      display: p.name ?? p.job,
+      status: "pending",
+      labels: [],
+      needs: p.needs.flatMap((n) => (waiting.has(n) ? [n] : made(n))),
+      agent: null,
+      executor: null,
+      attempt: 0,
+      queued_at: null,
+      started_at: null,
+      finished_at: null,
+      exit_code: null,
+      error: null,
+      peak_rss: null,
+      cpu_seconds: null,
+      steps: [],
+    }));
+    return { nodes: [...nodes, ...stubs], groups, grids, waiting, planned };
+  }, [jobs, notes, plan]);
+  const { placed, width, height } = React.useMemo(() => layoutDag(nodes, (j) => heightWith(grids.get(j.key))), [nodes, grids]);
   const pos = new Map(placed.map((p) => [p.job.key, p]));
   const gradId = React.useId().replace(/:/g, "");
   const fits = avail === 0 || width <= avail;
 
   const node = (job: Job, style?: React.CSSProperties) => {
+    const waits = job.id.startsWith("plan:") ? waiting.get(job.key) : undefined;
+    if (waits) return stub(job, waits, style);
     const dur = spanSeconds(job.started_at, job.finished_at, now);
     const group = groups.get(job.key);
+    const grid = grids.get(job.key);
+    const p = notes ? planned.get(specId(job.key)) : undefined;
+    const steps = notes && dur !== null ? stepsOf(group ? group.members : [job], p?.steps ?? 0) : null;
+    const typical = p?.typical ?? null;
     const isSelected = group ? group.members.some((m) => m.id === selected) : selected === job.id;
     // A group selects its most interesting leg: failing or running first.
     const target = group ? ([...group.members].sort((a, b) => (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9))[0]?.id ?? job.id) : job.id;
@@ -171,7 +319,7 @@ export function JobDag({ jobs, selected, onSelect, critical, notes }: { jobs: Jo
           .join(" · ")
       : null;
     const note = group ? undefined : notes?.get(job.id);
-    const cells = group && notes && group.members.length <= MAX_CELLS ? group.members : null;
+    const cells = group && notes && !grid && group.members.length <= MAX_CELLS ? group.members : null;
     const kept = group ? group.members.every((m) => notes?.get(m.id)?.reused) : note?.reused;
     return (
       <button
@@ -194,7 +342,14 @@ export function JobDag({ jobs, selected, onSelect, critical, notes }: { jobs: Jo
           {kept && <span className="font-mono text-[9px] text-[#93a1b4]">kept</span>}
         </span>
         <span className="flex min-w-0 items-center gap-2 font-mono text-[10px] text-[#8c8f98]">
-          <span className={job.status === "running" ? "text-[#d8d0f2] tabular-nums" : "tabular-nums"}>{dur === null ? job.status.replace("_", " ") : formatDuration(dur)}</span>
+          <span className={cn("shrink-0 tabular-nums", job.status === "running" && "text-[#d8d0f2]")} title={typical !== null ? `typically ${formatDuration(typical)}` : undefined}>
+            {dur === null ? job.status.replace("_", " ") : job.status === "running" && typical !== null ? `${formatDuration(dur)} of ~${formatDuration(typical)}` : formatDuration(dur)}
+          </span>
+          {steps && (
+            <span className="shrink-0 tabular-nums" title={`${steps.done} of ${steps.total} steps done`}>
+              {steps.done}/{steps.total}
+            </span>
+          )}
           {cells ? (
             <span className="dag-cells" aria-label={summary ?? undefined}>
               {cells.map((m) => (
@@ -216,7 +371,45 @@ export function JobDag({ jobs, selected, onSelect, critical, notes }: { jobs: Jo
             </span>
           )}
         </span>
+        {grid && (
+          <span className={grid.inline ? "flex min-w-0 items-center gap-2" : "grid gap-1"}>
+            <span className="dag-axes">{grid.axes}</span>
+            <span
+              className="dag-grid"
+              role="img"
+              aria-label={summary ?? undefined}
+              style={{ "--cell": `${grid.size}px`, gap: grid.gap, gridTemplateColumns: `repeat(${grid.cols}, var(--cell))` } as React.CSSProperties}
+            >
+              {grid.cells.map((m, i) =>
+                m ? <i key={m.id} className="dag-cell" data-status={m.status} title={`${m.display}: ${m.status.replace("_", " ")}`} /> : <i key={`-${i}`} className="dag-cell" data-empty="" />,
+              )}
+            </span>
+          </span>
+        )}
       </button>
+    );
+  };
+
+  // A job whose legs aren't made yet: not one to open, and said as what it waits for.
+  const stub = (job: Job, p: CiPlanJob, style?: React.CSSProperties) => {
+    const why = waitingFor(p, !!finished);
+    return (
+      <div key={job.id} className="dag-node" data-waiting="" data-flow={style ? undefined : ""} data-status="pending" style={style} role="group" aria-label={`${job.display}: ${why}`}>
+        <span className="flex min-w-0 items-center gap-2">
+          <StatusDot status="pending" />
+          <span className="min-w-0 flex-1 truncate text-[12.5px] text-[#c8cad0]">{job.display}</span>
+        </span>
+        <span className="flex min-w-0 items-center gap-2 font-mono text-[10px] text-[#8c8f98]">
+          <span className="min-w-0 truncate" title={why}>
+            {why}
+          </span>
+          {p.typical !== null && (
+            <span className="ml-auto shrink-0 tabular-nums" title="how long it typically takes">
+              ~{formatDuration(p.typical)}
+            </span>
+          )}
+        </span>
+      </div>
     );
   };
 
@@ -276,7 +469,7 @@ export function JobDag({ jobs, selected, onSelect, critical, notes }: { jobs: Jo
             return m ? <circle key={`${e.key}-end`} cx={Number(m[1]) - 0.5} cy={Number(m[2])} r={2} fill={e.active ? "#bab0e3" : "#3b424e"} /> : null;
           })}
         </svg>
-        {placed.map(({ job, x, y }) => node(job, { left: x, top: y, width: NODE_W, height: NODE_H }))}
+        {placed.map(({ job, x, y, height: h }) => node(job, { left: x, top: y, width: NODE_W, height: h }))}
       </div>
     </div>
   );

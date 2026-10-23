@@ -188,7 +188,7 @@ pub async fn insert_release(store: &Store, r: &Release) -> anyhow::Result<(Relea
     let draft = to_json(&r)?;
     let id: Result<i64, i64> = store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             if let Some(k) = &key {
                 let used: Option<i64> =
                     tx.query_row("SELECT id FROM deploy_releases WHERE app = ?1 AND environment = ?2 AND idempotency_key = ?3", params![app, env, k], |r| r.get(0)).optional()?;
@@ -336,7 +336,7 @@ pub async fn claim(store: &Store, owner: &str, now: i64, lease_secs: i64, max: u
     let max = i64::try_from(max).unwrap_or(16);
     store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let ids: Vec<i64> = {
                 let mut s = tx.prepare("SELECT release FROM deploy_work WHERE due_at <= ?1 AND (lease_until <= ?1 OR lease_owner = ?2) ORDER BY due_at LIMIT ?3")?;
                 s.query_map(params![now, owner, max], |r| r.get(0))?.collect::<Result<Vec<i64>, _>>()?

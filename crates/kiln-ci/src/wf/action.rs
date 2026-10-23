@@ -1,9 +1,12 @@
 //! Action metadata (`action.yml`, docs/ci.md W02-R10), GitHub's keys plus kiln actions' `secrets`,
-//! `requires` and `permissions`. Unknown keys are warnings, as GitHub tolerates them.
+//! `requires` and `permissions`. Unknown keys are warnings, as GitHub tolerates them; so is a
+//! secret the action reads without declaring it (`KCI4041`), which inside it is nothing.
+
+use std::collections::BTreeSet;
 
 use super::diag::{Diag, Severity};
 use super::front::Fe;
-use super::ir::{Action, ActionInput, ActionOutput, ActionRuns};
+use super::ir::{Action, ActionInput, ActionOutput, ActionRuns, Step, Tpl};
 use super::keys;
 use super::yaml::{Node, Scalar};
 use crate::expr::Dialect;
@@ -20,7 +23,41 @@ pub(crate) fn parse(root: &Node, diags: &mut Vec<Diag>) -> Action {
         }
         diags.push(d);
     }
+    undeclared(&a, diags);
     a
+}
+
+/// `KCI4041`, a warning: a secret the action reads without declaring it. Inside an action only
+/// what it declares is there (W09-R07), so the read gets nothing.
+fn undeclared(a: &Action, diags: &mut Vec<Diag>) {
+    let declared: BTreeSet<String> = a.secrets.iter().map(|d| d.name.to_ascii_uppercase()).chain(["GITHUB_TOKEN".to_owned()]).collect();
+    let mut found: Vec<(String, &Tpl)> = Vec::new();
+    a.runs.env.iter().for_each(|(k, t)| found.push((format!("runs.env.{k}"), t)));
+    a.runs.args.iter().for_each(|t| found.push(("runs.args".into(), t)));
+    for (i, s) in a.runs.steps.iter().enumerate() {
+        step_templates(s, &format!("runs.steps[{i}]"), &mut found);
+    }
+    for (path, t) in found {
+        let mut used = crate::secrets::Used::default();
+        used.add(&t.src);
+        for n in used.names.iter().filter(|n| !declared.contains(n.as_str())) {
+            diags.push(Diag::warning("KCI4041", format!("this action reads the secret `{n}` without declaring it: add it under `secrets:`, or it gets nothing"), t.range).at(path.as_str()));
+        }
+    }
+}
+
+/// Every template of a step (its parallel ones too), each with where it is.
+fn step_templates<'a>(s: &'a Step, at: &str, out: &mut Vec<(String, &'a Tpl)>) {
+    for t in s.run.iter().chain(&s.cond).chain(&s.name).chain(&s.working_directory).chain(&s.shell) {
+        out.push((at.to_owned(), t));
+    }
+    s.env.iter().for_each(|(k, t)| out.push((format!("{at}.env.{k}"), t)));
+    for (k, v) in &s.with {
+        v.templates(&format!("{at}.with.{k}"), out);
+    }
+    for (i, p) in s.parallel.iter().enumerate() {
+        step_templates(p, &format!("{at}.parallel[{i}]"), out);
+    }
 }
 
 /// `true`, `false`, or the strings GitHub also accepts for them.

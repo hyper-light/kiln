@@ -24,6 +24,7 @@ fn w13_ac01_facts() -> anyhow::Result<()> {
     let declared = Declared {
         facts: [("location".to_owned(), "rack-2".to_owned())].into(),
         probes: [("answer".to_owned(), "echo the answer is v4.2.0".to_owned()), ("broken".to_owned(), "exit 3".to_owned())].into(),
+        ..Declared::default()
     };
     let (path, wanted) = (dir.path().to_path_buf(), declared.clone());
     let f = kiln::rt::block_on(async move { anyhow::Ok(gather(&path, &wanted).await) })?;

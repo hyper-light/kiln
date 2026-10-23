@@ -545,13 +545,22 @@ pub fn github_label_rules() -> Vec<Rule> {
     };
     vec![
         rule(&["ubuntu-latest"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
+        rule(&["ubuntu-26.04"], "linux", "x86_64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04"], "linux", "x86_64", "kiln/runner-ubuntu-22.04"),
+        rule(&["ubuntu-26.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-22.04"),
+        // GitHub's lightweight Ubuntu 24.04 in a container. Its smaller set of tools still has
+        // Node.js and npm, the Docker CLI, gh and PowerShell, which kiln's own `-slim` (the basics
+        // alone) leaves out: the full image has them.
+        rule(&["ubuntu-slim"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["macos-latest"], "macos", "aarch64", ""),
+        rule(&["macos-26"], "macos", "aarch64", ""),
         rule(&["macos-15"], "macos", "aarch64", ""),
         rule(&["macos-14"], "macos", "aarch64", ""),
+        rule(&["macos-15-intel"], "macos", "x86_64", ""),
+        rule(&["macos-13"], "macos", "x86_64", ""),
         rule(&["windows-latest"], "windows", "x86_64", ""),
         rule(&["windows-2025"], "windows", "x86_64", ""),
         rule(&["windows-2022"], "windows", "x86_64", ""),
@@ -611,6 +620,8 @@ pub struct Requirement {
     pub rules: Vec<usize>,
     /// Docker only when its engine runs rootless (an untrusted leg's, W18-R07).
     pub rootless_docker: bool,
+    /// The pool whose executors run it (W13-R09).
+    pub pool: Option<String>,
 }
 
 impl Requirement {
@@ -621,7 +632,16 @@ impl Requirement {
         labels.dedup();
         let mut cs: Vec<&str> = self.constraints.iter().map(|(s, _)| s.as_str()).collect();
         cs.sort_unstable();
-        format!("labels={};group={};req={};caps={:x};exec={}{}", labels.join(","), self.group.as_deref().unwrap_or(""), cs.join(" && "), self.caps, self.executors.join(","), if self.rootless_docker { ";rootless" } else { "" })
+        format!(
+            "labels={};group={};req={};caps={:x};exec={}{}{}",
+            labels.join(","),
+            self.group.as_deref().unwrap_or(""),
+            cs.join(" && "),
+            self.caps,
+            self.executors.join(","),
+            if self.rootless_docker { ";rootless" } else { "" },
+            self.pool.as_deref().map(|p| format!(";pool={p}")).unwrap_or_default()
+        )
     }
 }
 
@@ -633,19 +653,25 @@ fn rule_applies(r: &Rule, leg: &LegRoute) -> bool {
     if !m.repos.is_empty() && !m.repos.iter().any(|g| Pattern::new(g).is_ok_and(|p| p.matches(&leg.repo))) {
         return false;
     }
-    if let Some(j) = &m.job {
-        let Ok(c) = Condition::parse(j, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
-        let cx = MapContexts::default()
-            .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
-            .with("workflow", Value::str(&leg.workflow))
-            .with("repo", Value::str(&leg.repo))
-            .with("event", Value::str(&leg.event));
-        if !expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false) {
-            return false;
-        }
+    if let Some(j) = &m.job
+        && !job_condition(j, leg)
+    {
+        return false;
     }
     // A rule with nothing to match applies to every leg (a fleet-wide default).
     true
+}
+
+/// Whether a condition over a leg holds (a rule's `match.job`, a reservation's `for`): over `job`
+/// (`id`, `name`), `workflow`, `repo` and `event`. One that doesn't parse holds for none.
+pub fn job_condition(src: &str, leg: &LegRoute) -> bool {
+    let Ok(c) = Condition::parse(src, &ParseOptions::permissive(Dialect::Kiln)) else { return false };
+    let cx = MapContexts::default()
+        .with("job", Value::object([("id".to_owned(), Value::str(&leg.job)), ("name".to_owned(), Value::str(&leg.job_name))]))
+        .with("workflow", Value::str(&leg.workflow))
+        .with("repo", Value::str(&leg.repo))
+        .with("event", Value::str(&leg.event));
+    expr::eval_condition(&c, &cx, &mut Budget::default()).unwrap_or(false)
 }
 
 /// A leg's requirement (W05-R19): rules that match it, in order, add their constraints and
@@ -903,6 +929,11 @@ mod tests {
         assert_eq!((req.rules.clone(), req.executors.clone()), (vec![0], vec!["firecracker".to_owned()]));
         let other = LegRoute { repo: "other/x".into(), ..leg.clone() };
         assert!(resolve(&other, &[rule])?.rules.is_empty());
+        // GitHub's newer labels, each its image.
+        for (label, image) in [("ubuntu-26.04", "kiln/runner-ubuntu-26.04"), ("ubuntu-26.04-arm", "kiln/runner-ubuntu-26.04"), ("ubuntu-slim", "kiln/runner-ubuntu-24.04")] {
+            let req = resolve(&LegRoute { labels: vec![label.into()], ..leg.clone() }, &github_label_rules())?;
+            assert_eq!(req.image.as_deref(), Some(image), "{label}");
+        }
         // The same requirement, the same signature.
         assert_eq!(resolve(&leg, &github_label_rules())?.signature(), resolve(&LegRoute { job: "test".into(), ..leg }, &github_label_rules())?.signature());
         Ok(())
