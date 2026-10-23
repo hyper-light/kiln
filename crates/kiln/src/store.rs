@@ -353,6 +353,29 @@ impl Store {
         .await
     }
 
+    /// Whether a native repository is public: anyone may read it over git (W14-R01).
+    pub async fn repo_public(&self, id: String) -> anyhow::Result<bool> {
+        self.call(move |c| Ok(c.query_row("SELECT public FROM repos WHERE id = ?1", [&id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))).await
+    }
+
+    /// The public repositories' ids.
+    pub async fn public_repos(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT id FROM repos WHERE public = 1")?;
+            let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+            Ok(ids)
+        })
+        .await
+    }
+
+    pub async fn set_repo_public(&self, id: String, public: bool) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute("UPDATE repos SET public = ?2 WHERE id = ?1", params![id, public])?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn delete_repo(&self, id: String) -> anyhow::Result<()> {
         self.call(move |c| {
             c.execute("DELETE FROM repos WHERE id = ?1 OR name = ?1", [id])?;

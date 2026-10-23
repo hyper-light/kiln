@@ -14,6 +14,10 @@
 //! - ACP agents and Antigravity, whose own records kiln doesn't keep: the conversation in words,
 //!   from kiln's timeline, which the harness there is given with the first message it gets
 //!   ([`super::handoff::as_words`]).
+//!
+//! What the harness keeps for it in its own home besides goes too ([`super::homes`]): its
+//! memories, merged into the ones there, and the session's own tasks, plans and checkpoints;
+//! Codex's thread goal is set on the thread it goes on in ([`GOAL`]).
 
 use std::collections::HashSet;
 
@@ -25,9 +29,10 @@ use super::model::{Event, State};
 use super::session::Spec;
 
 /// The package's format, newest: one of a version this runner doesn't know is refused, never
-/// guessed at. 2 added [`Carry::Words`]; a package without it stays 1, so older runners still take
-/// it.
-pub const VERSION: u32 = 2;
+/// guessed at. 2 added [`Carry::Words`]; 3, what the harness keeps in its home
+/// ([`Package::home`]). A package without them stays 1, so older runners still take it; one with
+/// them, an older runner refuses whole rather than take it without them.
+pub const VERSION: u32 = 3;
 
 /// The format a package with `carry` is.
 fn version_of(carry: &Carry) -> u32 {
@@ -85,6 +90,25 @@ pub struct Package {
     /// The git worktree it works in, inside its repository (`super::worktree`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<super::worktree::Worktree>,
+    /// What its harness keeps for it in its own home: its memories, its tasks, plans and
+    /// checkpoints, its goal (`super::homes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<super::homes::Home>,
+}
+
+impl Package {
+    /// What its harness keeps for it in its home goes along: a package with something of it to put
+    /// in place is version 3.
+    #[must_use]
+    pub fn with_home(mut self, home: super::homes::Home) -> Self {
+        if home.installs() {
+            self.version = self.version.max(3);
+        }
+        if home != super::homes::Home::default() {
+            self.home = Some(home);
+        }
+        self
+    }
 }
 
 /// What a moved session's repository waits with until its files are in: written on arrival beside
@@ -175,7 +199,31 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         Carry::ClaudeLines { session, .. } => spec.resume = Some(session.clone()),
         Carry::Seed { .. } | Carry::Words { .. } | Carry::Nothing => spec.resume = None,
     }
-    Package { version: version_of(&carry), id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms(), picks_up: false, synced: None, git: None, ignored: None, worktree: None }
+    Package {
+        version: version_of(&carry),
+        id: id.to_owned(),
+        spec,
+        from: from.to_owned(),
+        from_cwd: from_cwd.to_owned(),
+        carry,
+        events,
+        state,
+        created_at: crate::util::now_ms(),
+        picks_up: false,
+        synced: None,
+        git: None,
+        ignored: None,
+        worktree: None,
+        home: None,
+    }
+}
+
+/// The transcript `carry` holds (Claude Code's), for what it names.
+pub fn transcript_of(carry: &Carry) -> &[String] {
+    match carry {
+        Carry::ClaudeLines { lines, .. } => lines,
+        Carry::Seed { .. } | Carry::Nothing | Carry::Words { .. } => &[],
+    }
 }
 
 /// Every message of transcript `had` is among `lines`: `had` is an earlier copy of the same
@@ -218,15 +266,44 @@ pub fn install(pkg: &Package, cwd: &str) -> Result<Option<Vec<Value>>, String> {
             }
             Ok(None)
         }
-        Carry::Seed { items } => Ok(Some(items.clone())),
+        Carry::Seed { items } => {
+            let mut items = items.clone();
+            // Its goal, set on the new thread once the conversation is in.
+            if let Some(g) = pkg.home.as_ref().and_then(|h| h.goal.as_ref()) {
+                items.push(serde_json::json!({"type": GOAL, "objective": g.objective, "status": g.status, "tokenBudget": g.token_budget}));
+            }
+            Ok(Some(items))
+        }
         // Given to the harness with the first message it gets (`Adapter::seed`).
         Carry::Words { text } => Ok(Some(vec![serde_json::json!({"type": CONTEXT, "text": text})])),
         Carry::Nothing => Ok(None),
     }
 }
 
+/// Put what the harness keeps in its home for the session ([`Package::home`]) where the harness
+/// here looks for it, for folder `cwd`; `folder`: that's the folder it worked in (else it isn't on
+/// this machine). Blocking (writes files); what it did, in words, for its timeline. Once its
+/// record is in ([`install`]): the session's own files take the place of what it left here only
+/// once its record did.
+pub fn install_home(pkg: &Package, cwd: &str, folder: bool) -> Vec<String> {
+    install_home_in(pkg, &super::homes::Dirs::here(&pkg.spec.env), cwd, folder)
+}
+
+/// [`install_home`], into the harnesses' homes `dirs` names.
+fn install_home_in(pkg: &Package, dirs: &super::homes::Dirs, cwd: &str, folder: bool) -> Vec<String> {
+    let Some(home) = &pkg.home else { return Vec::new() };
+    let session = match &pkg.carry {
+        Carry::ClaudeLines { session, .. } => Some(session.as_str()),
+        Carry::Seed { .. } | Carry::Nothing | Carry::Words { .. } => pkg.spec.resume.as_deref(),
+    };
+    super::homes::install(home, &pkg.spec.kind, dirs, session, cwd, &pkg.from, folder)
+}
+
 /// The item a seed carries the conversation in words as ([`Carry::Words`]).
 pub const CONTEXT: &str = "kiln_context";
+
+/// The item a seed carries the thread's goal as (Codex's: `thread/goal/set` on the new thread).
+pub const GOAL: &str = "kiln_goal";
 
 #[cfg(test)]
 mod tests {
@@ -246,7 +323,7 @@ mod tests {
         let pkg = pack("s1", spec, "/home/b/w", "a", "/home/a/w", carry, vec![], State::default());
         // A new conversation there, given the words; a package an older runner can tell it can't take.
         assert_eq!((pkg.spec.resume.as_deref(), pkg.version), (None, 2));
-        assert!(takes(pkg.version) && takes(1) && !takes(3));
+        assert!(takes(pkg.version) && takes(1) && takes(3) && !takes(4));
         let items = install(&pkg, "/home/b/w").map_err(anyhow::Error::msg)?.unwrap_or_default();
         assert_eq!(items.first().and_then(|i| i.get("type")).and_then(Value::as_str), Some(CONTEXT));
         // Claude Code's and Codex's packages stay as older runners read them.
@@ -320,6 +397,315 @@ mod tests {
         let err = put(&now, vec![msg("u1"), msg("u2")]).err().unwrap_or_default();
         assert!(err.contains("never written over"), "{err}");
         assert_eq!(std::fs::read_to_string(&found)?.lines().count(), 4);
+        Ok(())
+    }
+
+    use super::super::homes::{self, Dirs};
+    use std::path::{Path, PathBuf};
+
+    /// What a credential holds, wherever it is: never in a package.
+    const SECRET: &str = "sk-live-never-travels";
+
+    fn write(path: &Path, text: &str) -> anyhow::Result<()> {
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(path, text)?;
+        Ok(())
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| format!("<{}: {e}>", path.display()))
+    }
+
+    fn text(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    /// Two machines, each with a home of its own (`a` and `b`, the harnesses' homes in them).
+    fn machines() -> anyhow::Result<(tempfile::TempDir, PathBuf, PathBuf)> {
+        let t = tempfile::tempdir()?;
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        std::fs::create_dir_all(&a)?;
+        std::fs::create_dir_all(&b)?;
+        Ok((t, a, b))
+    }
+
+    fn claude_env(home: &Path) -> Vec<(String, String)> {
+        vec![("CLAUDE_CONFIG_DIR".to_owned(), text(&home.join(".claude")))]
+    }
+
+    /// A package's way over: as JSON, which never holds a credential.
+    fn over_the_wire(pkg: &Package) -> anyhow::Result<Package> {
+        use base64::Engine as _;
+        let wire = serde_json::to_string(pkg)?;
+        assert!(!wire.contains(SECRET) && !wire.contains(&base64::engine::general_purpose::STANDARD.encode(SECRET)), "a credential travels");
+        Ok(serde_json::from_str(&wire)?)
+    }
+
+    /// Claude Code, from a worktree of a repository on one machine to the same worktree of the
+    /// repository's copy elsewhere on another: its transcript and the session's own files where
+    /// Claude Code looks for the new folder; the project's memory merged into the one there, by the
+    /// repository's main folder on each; neither its credentials nor its instructions.
+    #[test]
+    fn claude_codes_memory_tasks_plans_and_checkpoints_go_where_it_looks_for_the_new_folder() -> anyhow::Result<()> {
+        let (_t, a, b) = machines()?;
+        let (ca, cb) = (a.join(".claude"), b.join(".claude"));
+        // The repository on a, the session in a worktree of it; its copy on b, elsewhere, the
+        // worktree not made there yet.
+        let repo_a = a.join("Projects").join("kiln");
+        write(&repo_a.join(".git").join("worktrees").join("w").join("commondir"), "../..\n")?;
+        let cwd_a = repo_a.join(".claude").join("worktrees").join("w");
+        write(&cwd_a.join(".git"), &format!("gitdir: {}\n", text(&repo_a.join(".git").join("worktrees").join("w"))))?;
+        let repo_b = b.join("src").join("kiln");
+        std::fs::create_dir_all(repo_b.join(".git"))?;
+        let cwd_b = repo_b.join(".claude").join("worktrees").join("w");
+        // On a: the session's transcript and files, the project's memory, a credential, the
+        // person's instructions.
+        let lines: Vec<String> = vec![r#"{"type":"user","uuid":"u1","slug":"happy-plan"}"#.into(), r#"{"type":"assistant","uuid":"u2","slug":"happy-plan"}"#.into()];
+        let project_a = super::super::handoff::claude_project_dir(&ca, &text(&cwd_a));
+        write(&project_a.join("s1.jsonl"), &lines.join("\n"))?;
+        write(&project_a.join("s1").join("subagents").join("agent-x.jsonl"), "{\"sub\":1}")?;
+        write(&project_a.join("s1").join("tool-results").join("t1.txt"), "a long output")?;
+        write(&ca.join("file-history").join("s1").join("abc@v1"), "before the edit")?;
+        write(&ca.join("tasks").join("s1").join("1.json"), r#"{"id":"1","subject":"port the parser","status":"in_progress"}"#)?;
+        write(&ca.join("tasks").join("s1").join(".highwatermark"), "1")?;
+        write(&ca.join("tasks").join("s1").join(".lock"), "")?;
+        write(&ca.join("todos").join("s1-agent-s1.json"), "[]")?;
+        write(&ca.join("todos").join("other-agent-other.json"), "[\"not ours\"]")?;
+        write(&ca.join("plans").join("happy-plan.md"), "# The plan")?;
+        write(&ca.join("plans").join("happy-plan-agent-a1.md"), "# A subagent's plan")?;
+        write(&ca.join("plans").join("someone-else.md"), "not ours")?;
+        let memory_a = super::super::handoff::claude_project_dir(&ca, &text(&repo_a)).join("memory");
+        write(&memory_a.join("MEMORY.md"), "- [Builds](builds.md) — cap them\n- [Deploys](deploys.md) — need approval\n")?;
+        write(&memory_a.join("builds.md"), "a: cap builds at 20G")?;
+        write(&memory_a.join("deploys.md"), "deploys need approval")?;
+        write(&memory_a.join("team").join("shared.md"), "the team's")?;
+        write(&ca.join(".credentials.json"), SECRET)?;
+        write(&ca.join("CLAUDE.md"), "a's instructions")?;
+        // On b: the project's memory of its own, and the person's instructions there.
+        let memory_b = super::super::handoff::claude_project_dir(&cb, &text(&repo_b)).join("memory");
+        write(&memory_b.join("MEMORY.md"), "- [Deploys](deploys.md) — need approval\n- [Own](own.md) — b's\n")?;
+        write(&memory_b.join("builds.md"), "b: builds run on fedora")?;
+        write(&memory_b.join("deploys.md"), "deploys need approval")?;
+        write(&memory_b.join("own.md"), "b's own")?;
+        write(&cb.join("CLAUDE.md"), "b's instructions")?;
+
+        let home = homes::pack("claude", &Dirs::at(&a, &claude_env(&a)), Some("s1"), &text(&cwd_a), &lines, None);
+        let carry = Carry::ClaudeLines { session: "s1".into(), lines };
+        let spec = Spec { kind: "claude".into(), env: claude_env(&a), ..Spec::default() };
+        let pkg = pack("k1", spec, &text(&cwd_b), "lab-a", &text(&cwd_a), carry, Vec::new(), State::default()).with_home(home);
+        // A package an older runner refuses whole.
+        assert_eq!(pkg.version, 3);
+        assert!(takes(pkg.version) && !(1..=2).contains(&pkg.version));
+        let mut pkg = over_the_wire(&pkg)?;
+        // There, Claude Code's home is b's.
+        pkg.spec.env = claude_env(&b);
+        install(&pkg, &text(&cwd_b)).map_err(anyhow::Error::msg)?;
+        let said = install_home_in(&pkg, &Dirs::at(&b, &claude_env(&b)), &text(&cwd_b), true);
+
+        // Its transcript, and its own files beside it, in Claude Code's folder for the new folder.
+        let project_b = super::super::handoff::claude_project_dir(&cb, &text(&cwd_b));
+        assert_eq!(super::super::transcript::find(&cb, "s1"), Some(project_b.join("s1.jsonl")));
+        assert_eq!(read(&project_b.join("s1").join("subagents").join("agent-x.jsonl")), "{\"sub\":1}");
+        assert_eq!(read(&project_b.join("s1").join("tool-results").join("t1.txt")), "a long output");
+        // Its checkpoints, tasks (their counter, not their lock), todos and plans: its own alone.
+        assert_eq!(read(&cb.join("file-history").join("s1").join("abc@v1")), "before the edit");
+        assert!(read(&cb.join("tasks").join("s1").join("1.json")).contains("port the parser"));
+        assert_eq!(read(&cb.join("tasks").join("s1").join(".highwatermark")), "1");
+        assert!(!cb.join("tasks").join("s1").join(".lock").exists());
+        assert_eq!(read(&cb.join("todos").join("s1-agent-s1.json")), "[]");
+        assert!(!cb.join("todos").join("other-agent-other.json").exists());
+        assert_eq!(read(&cb.join("plans").join("happy-plan.md")), "# The plan");
+        assert_eq!(read(&cb.join("plans").join("happy-plan-agent-a1.md")), "# A subagent's plan");
+        assert!(!cb.join("plans").join("someone-else.md").exists());
+        // The project's memory, merged by the repository's main folder: b's stays, its index takes
+        // the lines it lacked, pointing at a's memory that differs, beside b's.
+        assert_eq!(read(&memory_b.join("MEMORY.md")), "- [Deploys](deploys.md) — need approval\n- [Own](own.md) — b's\n- [Builds](builds.from-lab-a.md) — cap them\n");
+        assert_eq!(read(&memory_b.join("builds.md")), "b: builds run on fedora");
+        assert_eq!(read(&memory_b.join("builds.from-lab-a.md")), "a: cap builds at 20G");
+        assert_eq!(read(&memory_b.join("own.md")), "b's own");
+        assert!(!memory_b.join("team").exists(), "a team's memory is Claude Code's to bring");
+        // Never a credential, nor a's instructions over b's: said instead.
+        assert!(!cb.join(".credentials.json").exists());
+        assert_eq!(read(&cb.join("CLAUDE.md")), "b's instructions");
+        let all = said.join(". ");
+        assert!(all.contains("Claude Code's memory of the project came from lab-a: MEMORY.md took the lines it lacked; 1 differs here, so this machine's stays, and the one that came went beside: builds.from-lab-a.md"), "{all}");
+        assert!(all.contains("Its subagents' transcripts and tool results, checkpoints for rewind, tasks, todos and plans came along"), "{all}");
+        assert!(all.contains("The person's own instructions to Claude Code here (~/.claude/CLAUDE.md) aren't the ones it had on lab-a"), "{all}");
+        // Taken again (it comes back the same): nothing new, nothing twice.
+        let again = install_home_in(&pkg, &Dirs::at(&b, &claude_env(&b)), &text(&cwd_b), true);
+        assert!(again.iter().all(|s| !s.contains("came from")), "{again:?}");
+        assert_eq!(read(&memory_b.join("MEMORY.md")).lines().count(), 3);
+        assert!(!memory_b.join("builds.from-lab-a-2.md").exists());
+        Ok(())
+    }
+
+    /// Codex: its memories merged into the ones there (but what it makes again from its
+    /// database), its thread's goal set on the new thread with the conversation; neither its
+    /// rollout nor its credentials.
+    #[test]
+    fn codexs_memories_merge_and_its_goal_goes_on_in_the_new_thread() -> anyhow::Result<()> {
+        let (_t, a, b) = machines()?;
+        let (xa, xb) = (a.join(".codex"), b.join(".codex"));
+        write(&xa.join("memories").join("MEMORY.md"), "# a's handbook")?;
+        write(&xa.join("memories").join("memory_summary.md"), "a's summary")?;
+        write(&xa.join("memories").join("rollout_summaries").join("2026-10-20T10-00-00-port-parser.md"), "ported the parser")?;
+        write(&xa.join("memories").join("raw_memories.md"), "made again from its database")?;
+        write(&xa.join("memories_extensions").join("ad_hoc").join("notes").join("2026-10-21T09-00-00-use-pnpm.md"), "use pnpm")?;
+        write(&xa.join("sessions").join("2026").join("10").join("22").join("rollout-2026-10-22T10-00-00-th1.jsonl"), "a rollout line")?;
+        write(&xa.join("auth.json"), SECRET)?;
+        write(&xa.join("AGENTS.md"), "the same instructions")?;
+        let db = rusqlite::Connection::open(xa.join("goals_1.sqlite"))?;
+        db.execute_batch(
+            "CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY NOT NULL, goal_id TEXT NOT NULL, objective TEXT NOT NULL, status TEXT NOT NULL, token_budget INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0, time_used_seconds INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+             INSERT INTO thread_goals VALUES ('th1', 'g1', 'port the parser', 'active', 200000, 1200, 60, 1, 2);",
+        )?;
+        drop(db);
+        write(&xb.join("memories").join("MEMORY.md"), "# b's handbook")?;
+        write(&xb.join("AGENTS.md"), "the same instructions")?;
+
+        let home = homes::pack("codex", &Dirs::at(&a, &[]), Some("th1"), "/a/work", &[], None);
+        let item = serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "port the parser"}]});
+        let spec = Spec { kind: "codex".into(), ..Spec::default() };
+        let pkg = over_the_wire(&pack("k2", spec, "/b/work", "lab-a", "/a/work", Carry::Seed { items: vec![item.clone()] }, Vec::new(), State::default()).with_home(home))?;
+        assert_eq!(pkg.version, 3);
+        assert!(!serde_json::to_string(&pkg)?.contains("a rollout line"), "the rollout stays: the conversation goes as the new thread's history");
+        // The new thread's history, then its goal.
+        let items = install(&pkg, "/b/work").map_err(anyhow::Error::msg)?.unwrap_or_default();
+        assert_eq!(items.first(), Some(&item));
+        assert_eq!(items.get(1), Some(&serde_json::json!({"type": GOAL, "objective": "port the parser", "status": "active", "tokenBudget": 200000})));
+        let said = install_home_in(&pkg, &Dirs::at(&b, &[]), "/b/work", true);
+        let mem = xb.join("memories");
+        assert_eq!(read(&mem.join("MEMORY.md")), "# b's handbook");
+        assert_eq!(read(&mem.join("MEMORY.from-lab-a.md")), "# a's handbook");
+        assert_eq!(read(&mem.join("memory_summary.md")), "a's summary");
+        assert_eq!(read(&mem.join("rollout_summaries").join("2026-10-20T10-00-00-port-parser.md")), "ported the parser");
+        assert!(!mem.join("raw_memories.md").exists());
+        assert_eq!(read(&xb.join("memories_extensions").join("ad_hoc").join("notes").join("2026-10-21T09-00-00-use-pnpm.md")), "use pnpm");
+        assert!(!xb.join("auth.json").exists() && !xb.join("sessions").exists() && !xb.join("goals_1.sqlite").exists());
+        let all = said.join(". ");
+        assert!(all.contains("Codex's memories came from lab-a: 2 files new here; 1 differs here, so this machine's stays, and the one that came went beside: MEMORY.from-lab-a.md"), "{all}");
+        assert!(all.contains("Codex's memory notes came from lab-a: 1 file new here"), "{all}");
+        assert!(!all.contains("instructions"), "the same instructions on both: {all}");
+        Ok(())
+    }
+
+    /// Gemini CLI: its memory of the project goes to the project's folder there, under the name
+    /// Gemini CLI gives the folder there (another folder has the one it had); not its chats,
+    /// its inbox nor its credentials.
+    #[test]
+    fn gemini_clis_memory_of_the_project_goes_to_the_name_it_has_there() -> anyhow::Result<()> {
+        let (_t, a, b) = machines()?;
+        let (ga, gb) = (a.join(".gemini"), b.join(".gemini"));
+        let (cwd_a, cwd_b) = (a.join("Projects").join("kiln"), b.join("work").join("kiln"));
+        std::fs::create_dir_all(&cwd_a)?;
+        std::fs::create_dir_all(&cwd_b)?;
+        write(&ga.join("projects.json"), &serde_json::json!({"projects": {text(&cwd_a): "kiln"}}).to_string())?;
+        write(&ga.join("tmp").join("kiln").join(".project_root"), &text(&cwd_a))?;
+        write(&ga.join("tmp").join("kiln").join("memory").join("MEMORY.md"), "- [Tests](tests.md) — run them capped\n")?;
+        write(&ga.join("tmp").join("kiln").join("memory").join("tests.md"), "cargo test, capped")?;
+        write(&ga.join("tmp").join("kiln").join("memory").join(".inbox").join("x.patch"), "pending")?;
+        write(&ga.join("tmp").join("kiln").join("chats").join("session-2026-10-22T10-00-abc.jsonl"), "a chat")?;
+        write(&ga.join("oauth_creds.json"), SECRET)?;
+        write(&ga.join("GEMINI.md"), "a's instructions")?;
+        // On b, "kiln" is another folder's.
+        write(&gb.join("projects.json"), r#"{"projects": {"/other/kiln": "kiln"}}"#)?;
+        write(&gb.join("tmp").join("kiln").join(".project_root"), "/other/kiln")?;
+
+        let events = vec![Event { id: "m1".into(), seq: 0, at: 0, parent: None, by: None, body: crate::harness::model::Body::Assistant { text: "tests pass".into(), streaming: false } }];
+        let carry = words(&events, "moved");
+        let home = homes::pack("gemini", &Dirs::at(&a, &[]), None, &text(&cwd_a), &[], None);
+        let spec = Spec { kind: "gemini".into(), ..Spec::default() };
+        let pkg = over_the_wire(&pack("k3", spec, &text(&cwd_b), "lab-a", &text(&cwd_a), carry, events, State::default()).with_home(home))?;
+        assert_eq!(pkg.version, 3);
+        assert!(!serde_json::to_string(&pkg)?.contains("a chat"));
+        let items = install(&pkg, &text(&cwd_b)).map_err(anyhow::Error::msg)?.unwrap_or_default();
+        assert_eq!(items.first().and_then(|i| i.get("type")).and_then(Value::as_str), Some(CONTEXT));
+        let said = install_home_in(&pkg, &Dirs::at(&b, &[]), &text(&cwd_b), true);
+        let mem = gb.join("tmp").join("kiln-1").join("memory");
+        assert_eq!(read(&mem.join("MEMORY.md")), "- [Tests](tests.md) — run them capped\n");
+        assert_eq!(read(&mem.join("tests.md")), "cargo test, capped");
+        assert!(!mem.join(".inbox").exists() && !gb.join("tmp").join("kiln-1").join("chats").exists());
+        // Gemini CLI finds the folder's by its marker.
+        assert_eq!(read(&gb.join("tmp").join("kiln-1").join(".project_root")), text(&cwd_b));
+        assert!(!gb.join("oauth_creds.json").exists());
+        assert!(!gb.join("GEMINI.md").exists(), "instructions are the machine's");
+        let all = said.join(". ");
+        assert!(all.contains("Gemini CLI's memory of the project came from lab-a: 2 files new here"), "{all}");
+        assert!(all.contains("The person's own instructions to Gemini CLI here (~/.gemini/GEMINI.md) aren't the ones it had on lab-a"), "{all}");
+        // Its folder isn't there: it works in the home folder, and the project's memory stays.
+        let elsewhere = install_home_in(&pkg, &Dirs::at(&b, &[]), &text(&b), false);
+        assert!(elsewhere.iter().any(|s| s == "Gemini CLI's memory of the project stays on lab-a, as its folder isn't here"), "{elsewhere:?}");
+        Ok(())
+    }
+
+    /// Antigravity's knowledge and Goose's memories, kept for every project: merged, the
+    /// knowledge that differs beside, Goose's memories entry by entry.
+    #[test]
+    fn antigravitys_knowledge_and_gooses_memories_merge_into_the_ones_there() -> anyhow::Result<()> {
+        let (_t, a, b) = machines()?;
+        let (ka, kb) = (a.join(".gemini").join("antigravity-cli"), b.join(".gemini").join("antigravity-cli"));
+        write(&ka.join("knowledge").join("ki-1").join("metadata.json"), r#"{"title":"kiln deploys","v":2}"#)?;
+        write(&ka.join("knowledge").join("ki-1").join("artifacts").join("overview.md"), "deploys need approval")?;
+        write(&ka.join("knowledge").join("knowledge.lock"), "")?;
+        write(&ka.join("conversations").join("c1.db"), "a conversation")?;
+        write(&ka.join("brain").join("c1").join("plan.md"), "its plan")?;
+        write(&kb.join("knowledge").join("ki-1").join("metadata.json"), r#"{"title":"kiln deploys","v":1}"#)?;
+        let carry = Carry::Words { text: "moved".into() };
+        let home = homes::pack("antigravity", &Dirs::at(&a, &[]), Some("c1"), "/a/w", &[], None);
+        let pkg = over_the_wire(&pack("k4", Spec { kind: "antigravity".into(), ..Spec::default() }, "/b/w", "lab-a", "/a/w", carry.clone(), Vec::new(), State::default()).with_home(home))?;
+        assert!(!serde_json::to_string(&pkg)?.contains("a conversation"));
+        let said = install_home_in(&pkg, &Dirs::at(&b, &[]), "/b/w", true);
+        assert_eq!(read(&kb.join("knowledge").join("ki-1").join("metadata.json")), r#"{"title":"kiln deploys","v":1}"#);
+        assert_eq!(read(&kb.join("knowledge").join("ki-1").join("metadata.from-lab-a.json")), r#"{"title":"kiln deploys","v":2}"#);
+        assert_eq!(read(&kb.join("knowledge").join("ki-1").join("artifacts").join("overview.md")), "deploys need approval");
+        assert!(!kb.join("knowledge").join("knowledge.lock").exists() && !kb.join("brain").exists() && !kb.join("conversations").exists());
+        assert!(said.iter().any(|s| s.starts_with("Antigravity's knowledge came from lab-a: 1 file new here; 1 differs here")), "{said:?}");
+
+        let (ga, gb) = (a.join(".config").join("goose"), b.join(".config").join("goose"));
+        write(&ga.join("memory").join("development.txt"), "# rust\nuse cargo nextest\n\nprefer small commits\n\n")?;
+        write(&ga.join("memory").join("personal.txt"), "the person is Ada\n\n")?;
+        write(&ga.join("secrets.yaml"), SECRET)?;
+        write(&ga.join(".goosehints"), "a's hints")?;
+        write(&gb.join("memory").join("development.txt"), "prefer small commits\n\n")?;
+        write(&gb.join(".goosehints"), "a's hints")?;
+        let home = homes::pack("goose", &Dirs::at(&a, &[]), None, "/a/w", &[], None);
+        let pkg = over_the_wire(&pack("k5", Spec { kind: "goose".into(), ..Spec::default() }, "/b/w", "lab-a", "/a/w", carry, Vec::new(), State::default()).with_home(home))?;
+        let said = install_home_in(&pkg, &Dirs::at(&b, &[]), "/b/w", true);
+        assert_eq!(read(&gb.join("memory").join("development.txt")), "prefer small commits\n\n# rust\nuse cargo nextest\n\n");
+        assert_eq!(read(&gb.join("memory").join("personal.txt")), "the person is Ada\n\n");
+        assert!(!gb.join("secrets.yaml").exists());
+        let all = said.join(". ");
+        assert!(all.contains("Goose's memories came from lab-a: 1 file new here; development.txt took the memories it lacked"), "{all}");
+        assert!(!all.contains("instructions"), "{all}");
+        Ok(())
+    }
+
+    /// opencode, Amp and Devin keep nothing of the kind: their records are the session's own, it
+    /// goes on in a new session there with the conversation in words, and the package stays one
+    /// older runners take.
+    #[test]
+    fn opencode_amp_and_devin_keep_nothing_that_travels() -> anyhow::Result<()> {
+        let (_t, a, _b) = machines()?;
+        let data = a.join(".local").join("share");
+        write(&data.join("opencode").join("storage").join("session").join("p1").join("ses_1.json"), "{}")?;
+        write(&data.join("opencode").join("storage").join("todo").join("ses_1.json"), "[]")?;
+        write(&data.join("opencode").join("auth.json"), SECRET)?;
+        write(&a.join(".config").join("opencode").join("AGENTS.md"), "a's instructions")?;
+        write(&data.join("amp").join("secrets.json"), SECRET)?;
+        write(&data.join("devin").join("cli").join("sessions.db"), "sessions")?;
+        write(&data.join("devin").join("credentials.toml"), SECRET)?;
+        for kind in ["opencode", "amp", "devin"] {
+            let home = homes::pack(kind, &Dirs::at(&a, &[]), Some("ses_1"), "/a/w", &[], None);
+            assert!(home.files.is_empty() && home.goal.is_none() && home.left.is_empty(), "{kind}: {home:?}");
+            // The person's instructions are said, not carried (Devin's aren't known).
+            assert_eq!(home.instructions.is_some(), kind != "devin", "{kind}");
+            let pkg = over_the_wire(
+                &pack("k6", Spec { kind: kind.into(), ..Spec::default() }, "/b/w", "lab-a", "/a/w", Carry::Words { text: "moved".into() }, Vec::new(), State::default()).with_home(home),
+            )?;
+            assert_eq!(pkg.version, 2, "{kind}");
+        }
         Ok(())
     }
 }

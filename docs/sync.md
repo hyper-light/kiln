@@ -282,7 +282,7 @@ Open, it shows two things:
 | `kiln_moves_total` | result | agent sessions moving off this machine: `ok`, `failed` |
 | `kiln_move_barrier_seconds` | | histogram: a session leaving waits for its folder's last changes to be in the log |
 | `kiln_move_files_wait_seconds` | | histogram: a session arriving waits for them in its folder |
-| `kiln_move_carried_bytes_total` | what | what moving sessions' repositories carried besides synced files: `git`, `ignored`, `worktree` |
+| `kiln_move_carried_bytes_total` | what | what moving sessions carried besides synced files: `git`, `ignored`, `worktree` (their repositories'), `home` (what their harness keeps for them, [reach.md](reach.md) §8) |
 
 **Logs and traces** use the target `kiln.sync`, which Observe takes as service `kiln.sync`. An
 event carries an `event` field and is taken whatever else it says. These are the events:

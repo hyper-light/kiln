@@ -642,20 +642,23 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         Source::Machine { .. } => Commits::Folder,
         Source::Url { url } => Commits::Url(url.clone()),
     };
-    // 2. Each machine's clone, all at once.
-    let clones = futures::future::join_all(b.tasks.iter().map(|(id, m, p)| clone_on(hub, b, id, m, p, &source))).await;
+    // 2. Each machine's clone, all at once. A clone alone is over on a machine as soon as that
+    // machine's is: a slow one keeps no other waiting.
     if b.kind == Kind::Clone {
-        for ((id, m, p), r) in b.tasks.iter().zip(clones) {
-            match r {
+        let source = &source;
+        futures::future::join_all(b.tasks.iter().map(|(id, m, p)| async move {
+            match clone_on(hub, b, id, m, p, source).await {
                 Ok((head, _)) => {
                     hub.tasks.update(hub, id, |t| t.head.clone_from(&head));
                     hub.tasks.done(hub, id, format!("cloned into {p} on {m}"));
                 }
                 Err(e) => hub.tasks.fail(hub, id, e),
             }
-        }
+        }))
+        .await;
         return Ok(());
     }
+    let clones = futures::future::join_all(b.tasks.iter().map(|(id, m, p)| clone_on(hub, b, id, m, p, &source))).await;
     // 3. The group each new folder joins.
     let cloned: Vec<(&String, &String, &String, bool)> = b
         .tasks
@@ -967,6 +970,69 @@ mod tests {
         assert_eq!(t.bundle_file("../etc"), None);
         assert!(t.bundle_file("0199aa").is_some());
         Ok(())
+    }
+
+    /// Whether `ok` holds within ten seconds.
+    async fn soon(ok: impl Fn() -> bool) -> bool {
+        let start = Instant::now();
+        while !ok() && start.elapsed() < Duration::from_secs(10) {
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        ok()
+    }
+
+    #[test]
+    fn each_machine_s_clone_is_done_once_that_machine_says_so_however_slow_the_others() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let now = crate::util::now_unix();
+            let from = Source::Url { url: "https://github.com/a/b".into() };
+            let task = |id: &str, machine: &str| Task {
+                id: id.into(),
+                batch: "b1".into(),
+                kind: Kind::Clone,
+                key: "github.com/a/b".into(),
+                name: "a/b".into(),
+                from: from.clone(),
+                branch: None,
+                machine: machine.into(),
+                path: "/src/b".into(),
+                delete: false,
+                state: "queued".into(),
+                detail: String::new(),
+                error: None,
+                notes: Vec::new(),
+                created: now,
+                updated: now,
+                synced: None,
+                head: None,
+            };
+            hub.tasks.inner.lock().tasks.extend([task("quick", "laptop"), task("slow", "busy-box")]);
+            let b = Batch {
+                id: "b1".into(),
+                kind: Kind::Clone,
+                key: "github.com/a/b".into(),
+                name: "a/b".into(),
+                from: from.clone(),
+                branch: None,
+                tasks: vec![("quick".into(), "laptop".into(), "/src/b".into()), ("slow".into(), "busy-box".into(), "/src/b".into())],
+                delete: false,
+                origin: None,
+                source_git: false,
+                source_copy: None,
+                synced: None,
+            };
+            let h = hub.clone();
+            crate::rt::spawn(async move { drive(h, b).await });
+            let state = |id: &str| hub.tasks.get(id).map(|t| t.state).unwrap_or_default();
+            anyhow::ensure!(soon(|| state("quick") == "cloning" && state("slow") == "cloning").await, "both machines were told to clone");
+            // The laptop is done; the busy box says nothing yet.
+            hub.tasks.heard("laptop", TaskNews { head: Some("c0ffee".into()), ..TaskNews::new("quick", "done", "cloned main into /src/b") });
+            anyhow::ensure!(soon(|| state("quick") == "done").await, "the laptop's clone shows done at once");
+            assert_eq!(hub.tasks.get("quick").and_then(|t| t.head).as_deref(), Some("c0ffee"));
+            assert_eq!(state("slow"), "cloning", "the busy box's clone is still under way");
+            Ok(())
+        })
     }
 
     #[test]

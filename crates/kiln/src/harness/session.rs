@@ -2099,11 +2099,19 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
         note.push(' ');
         note.push_str(n);
     }
-    let carry = match mv.kind {
+    let (carry, home) = match mv.kind {
+        // Its record, and what its harness keeps for it in its home besides (`homes`).
         None => {
             let env = spec.env.clone();
             let timeline = events.clone();
-            crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)).await.map_err(|e| format!("{e:#}"))??
+            let (cwd, objective) = (from_cwd.clone(), state.objective.clone());
+            crate::rt::blocking(move || {
+                let carry = super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)?;
+                let home = super::homes::pack(kind.id, &super::homes::Dirs::here(&env), session.as_deref(), &cwd, super::moving::transcript_of(&carry), objective.as_ref());
+                Ok::<_, String>((carry, Some(home)))
+            })
+            .await
+            .map_err(|e| format!("{e:#}"))??
         }
         // The other harness's own record of it, as a switch writes one (`carried`).
         Some(to) => {
@@ -2121,7 +2129,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             // A program of its own was the old harness's.
             spec.program = None;
             for_harness(&mut state, there, &model, c.mode, c.effort);
-            carry
+            // What the old harness keeps in its home is its own: the other one doesn't read it.
+            (carry, None)
         }
     };
     // Its folder's last changes go first, so it goes on there from them; then its repository's
@@ -2174,10 +2183,13 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             return Err(why);
         }
     };
-    let carried = carried_bytes(&out);
+    let carried = carried_bytes(&out, home.as_ref());
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    if let Some(home) = home {
+        pkg = pkg.with_home(home);
+    }
     pkg.picks_up = mv.picks_up || cut;
     pkg.synced = synced.as_ref().map(|x| x.mark.clone());
     pkg.git = out.git;
@@ -2211,9 +2223,10 @@ fn tell_move(news: crate::sync::wire::MoveNews) {
     }
 }
 
-/// What a leaving session's repository carries besides its synced files, in bytes: what the
-/// machine it goes to lacks of its git history, the files git ignores, and its worktree.
-fn carried_bytes(out: &GitOut) -> [(&'static str, u64); 3] {
+/// What a leaving session carries besides its synced files, in bytes: what the machine it goes to
+/// lacks of its git history, the files git ignores, its worktree, and what its harness keeps for
+/// it in its home.
+fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static str, u64); 4] {
     // Base64, as the package carries them: three bytes in four.
     let b64 = |s: &str| u64::try_from(s.len() / 4 * 3).unwrap_or(u64::MAX);
     let files = |c: &super::carry::Carried| c.files.iter().map(|f| b64(&f.data)).sum::<u64>();
@@ -2221,6 +2234,7 @@ fn carried_bytes(out: &GitOut) -> [(&'static str, u64); 3] {
         ("git", out.git.as_ref().and_then(|g| g.bundle.as_deref()).map_or(0, b64)),
         ("ignored", out.ignored.as_ref().map_or(0, files)),
         ("worktree", out.worktree.as_ref().map_or(0, |w| files(&w.changed).saturating_add(files(&w.ignored)))),
+        ("home", home.map_or(0, super::homes::Home::size)),
     ]
 }
 

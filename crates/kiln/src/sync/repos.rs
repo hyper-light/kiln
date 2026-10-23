@@ -44,7 +44,12 @@ pub enum Job {
     /// The folders of this machine's synced copies (looked at wherever they are).
     Paths(Vec<String>),
     Connected(bool),
+    /// What a look found: looks go on beside the orders, never in their way.
+    Looked(git::Looked),
 }
+
+/// How the worker looks at the machine's repositories: [`git::look`], but for tests.
+type Scan = Arc<dyn Fn(PathBuf, Vec<PathBuf>, BTreeSet<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = git::Looked> + Send>> + Send + Sync>;
 
 /// What the worker and the tasks it runs share.
 struct Shared {
@@ -62,6 +67,7 @@ struct Shared {
     kick: async_channel::Sender<Job>,
     /// Folders a task is cloning into or deleting now: never two at once.
     busy: Mutex<BTreeSet<String>>,
+    scan: Scan,
 }
 
 impl Shared {
@@ -99,12 +105,17 @@ impl Shared {
 /// Starts this machine's worker (its state in `dir`, `<state>/sync`); what it says goes out through
 /// `say`. Hand it [`Job`]s.
 pub fn start(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>) -> async_channel::Sender<Job> {
+    let scan: Scan = Arc::new(|home, extra, kiln| Box::pin(git::look(home, extra, kiln)));
+    start_with(dir, me, http, server, say, crate::os::home_dir(), scan)
+}
+
+fn start_with(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>, home: PathBuf, scan: Scan) -> async_channel::Sender<Job> {
     let (tx, rx) = async_channel::unbounded();
     let registry = Registry::load(&dir.join("clones.json"));
     let shared = Arc::new(Shared {
         dir,
         me,
-        home: crate::os::home_dir(),
+        home,
         http,
         server,
         say,
@@ -114,8 +125,9 @@ pub fn start(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: a
         registry: Mutex::new(registry),
         kick: tx.clone(),
         busy: Mutex::new(BTreeSet::new()),
+        scan,
     });
-    crate::rt::spawn(async move { Worker { s: shared, paths: Vec::new(), told: None, told_at: None, looked: None, soon: true }.run(rx).await });
+    crate::rt::spawn(async move { Worker { s: shared, paths: Vec::new(), told: None, told_at: None, looked: None, looking: false, soon: true }.run(rx).await });
     tx
 }
 
@@ -126,6 +138,8 @@ struct Worker {
     told: Option<Repos>,
     told_at: Option<Instant>,
     looked: Option<Instant>,
+    /// A look is under way.
+    looking: bool,
     /// Look at the next chance.
     soon: bool,
 }
@@ -143,9 +157,9 @@ impl Worker {
             }
             self.again();
             let due = self.looked.is_none_or(|t| t.elapsed() >= LOOK_EVERY);
-            if self.s.connected.load(Ordering::SeqCst) && (self.soon || due) {
+            if self.s.connected.load(Ordering::SeqCst) && (self.soon || due) && !self.looking {
                 self.soon = false;
-                self.look().await;
+                self.look();
             }
         }
     }
@@ -172,6 +186,7 @@ impl Worker {
                 }
             }
             Job::Order(Msg::Look) => self.soon = true,
+            Job::Looked(looked) => self.report(looked),
             Job::Order(Msg::Forget { path }) => {
                 let changed = self.s.registry.lock().clones.remove(&path).is_some();
                 if changed {
@@ -221,8 +236,9 @@ impl Worker {
         }
     }
 
-    /// Looks at this machine's repositories, and says what it found if that changed (or it is time).
-    async fn look(&mut self) {
+    /// Starts looking at this machine's repositories. A look runs git in each one, which takes
+    /// minutes on a busy machine with many: the orders that come meanwhile go on at once.
+    fn look(&mut self) {
         let (extra, kiln) = {
             let r = self.s.registry.lock();
             let kiln: BTreeSet<String> = r.clones.keys().cloned().collect();
@@ -230,7 +246,16 @@ impl Worker {
             extra.extend(self.paths.iter().map(|p| git::expand(p, &self.s.home)));
             (extra, kiln)
         };
-        let looked = git::look(self.s.home.clone(), extra, kiln).await;
+        self.looking = true;
+        let (looking, kick) = ((self.s.scan)(self.s.home.clone(), extra, kiln), self.s.kick.clone());
+        crate::rt::spawn(async move {
+            let _ = kick.send(Job::Looked(looking.await)).await;
+        });
+    }
+
+    /// Says what a look found, if that changed (or it is time).
+    fn report(&mut self, looked: git::Looked) {
+        self.looking = false;
         self.looked = Some(Instant::now());
         let report = Repos { home: self.s.home.to_string_lossy().into_owned(), repos: looked.repos, error: looked.error, at: crate::util::now_unix() };
         let same = self.told.as_ref().is_some_and(|t| Repos { at: report.at, ..t.clone() } == report);
@@ -444,6 +469,54 @@ async fn delete(s: &Arc<Shared>, task: &str, path: &str, origin: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_order_goes_on_at_once_while_a_slow_look_is_under_way() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (src, home) = (dir.path().join("src"), dir.path().join("home"));
+        std::fs::create_dir_all(&src)?;
+        std::fs::create_dir_all(&home)?;
+        for args in [&["init", "-q", "-b", "main"][..], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "first"]] {
+            anyhow::ensure!(std::process::Command::new("git").arg("-C").arg(&src).args(args).status()?.success(), "git {}", args.join(" "));
+        }
+        crate::rt::block_on(async move {
+            // A look that starts, then waits until the test lets it end.
+            let (started_tx, started) = async_channel::unbounded::<()>();
+            let (end, ended) = async_channel::bounded::<()>(1);
+            let scan: Scan = Arc::new(move |_, _, _| {
+                let (started_tx, ended) = (started_tx.clone(), ended.clone());
+                Box::pin(async move {
+                    let _ = started_tx.send(()).await;
+                    let _ = ended.recv().await;
+                    git::Looked { repos: Vec::new(), error: None }
+                })
+            });
+            let (say, heard) = async_channel::unbounded();
+            let http = Arc::new(Client::new(crate::http::client::Roots::WebPki, None)?);
+            let jobs = start_with(dir.path().join("state"), "me".into(), http, "http://127.0.0.1:9".into(), say, home.clone(), scan);
+            jobs.send(Job::Connected(true)).await?;
+            crate::rt::timeout(Duration::from_secs(10), started.recv()).await??;
+            let order = CloneOrder { task: "t1".into(), key: "k".into(), path: home.join("b").to_string_lossy().into_owned(), url: Some(src.to_string_lossy().into_owned()), ..CloneOrder::default() };
+            jobs.send(Job::Order(Msg::Clone(order))).await?;
+            let next = || async {
+                loop {
+                    let AgentMsg::Sync { json, .. } = heard.recv().await? else { continue };
+                    match wire::decode(&json) {
+                        Some(Msg::Task(n)) if n.over() => return anyhow::Ok(Some(n)),
+                        Some(Msg::Repos(_)) => return Ok(None),
+                        _ => {}
+                    }
+                }
+            };
+            let done = crate::rt::timeout(Duration::from_secs(30), next()).await??.ok_or_else(|| anyhow::anyhow!("the look ended before the clone"))?;
+            assert_eq!((done.state.as_str(), done.error, done.branch.as_deref()), ("done", None, Some("main")));
+            assert!(home.join("b/.git").exists());
+            // The look ends, and says what it found.
+            end.send(()).await?;
+            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(10), next()).await??.is_none(), "the look said what it found");
+            Ok(())
+        })
+    }
 
     #[test]
     fn sizes_read_as_people_say_them() {
