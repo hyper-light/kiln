@@ -2603,6 +2603,7 @@ impl Claude {
         };
         if status == ToolStatus::Done {
             track_changes(core, structured);
+            follow_worktree(core, &name, structured);
         }
         let (output, truncated) = clip_middle(&text, OUTPUT_MAX);
         if let Some(ev) = core.get_mut(tid)
@@ -3380,6 +3381,23 @@ fn track_changes(core: &mut Core, structured: &Value) {
                 core.want_change(&abs(fp), &rel(fp, &cwd));
             }
         }
+    }
+}
+
+/// Claude Code's worktree tools move the session: into the worktree `EnterWorktree` made
+/// (`worktreePath`), back where `ExitWorktree` left it (`restoredCwd`). Its next turn's `init` says
+/// so too; followed at once, the agent's folder is where it works from that call on.
+fn follow_worktree(core: &mut Core, name: &str, structured: &Value) {
+    let to = match name {
+        "EnterWorktree" => structured.get("worktreePath"),
+        "ExitWorktree" => structured.get("restoredCwd"),
+        _ => None,
+    };
+    if let Some(to) = to.and_then(Value::as_str).filter(|t| !t.is_empty())
+        && core.state.cwd != to
+    {
+        core.state.cwd = to.to_owned();
+        core.touch_state();
     }
 }
 
@@ -4287,6 +4305,25 @@ mod tests {
         let _ = core.take_writes();
         c.command(&mut core, Command::Send { id: "m2".into(), text: "and another thing".into(), mode: Default::default(), attachments: Vec::new(), overrides: None });
         assert!(core.take_writes().iter().any(|w| w.contains("and another thing")), "sent at once");
+    }
+
+    /// Claude Code's worktree tools, as its stream says them (2.1.296, 2026-10-23): its folder is
+    /// the worktree from the call on, and the one it left it for after.
+    #[test]
+    fn a_worktree_it_goes_into_is_its_folder_at_once_and_where_it_leaves_it_for_after() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.cwd = "/w/repo".into();
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tw","name":"EnterWorktree","input":{"name":"feature"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tw","type":"tool_result","content":"Created worktree at /w/repo/.claude/worktrees/feature on branch worktree-feature."}]},"tool_use_result":{"worktreePath":"/w/repo/.claude/worktrees/feature","worktreeBranch":"worktree-feature","message":"Created worktree"}}"#);
+        assert_eq!(core.state.cwd, "/w/repo/.claude/worktrees/feature");
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"tx","name":"ExitWorktree","input":{"action":"keep"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tx","type":"tool_result","content":"Left the worktree."}]},"tool_use_result":{"action":"keep","originalCwd":"/w/repo","worktreePath":"/w/repo/.claude/worktrees/feature","worktreeBranch":"worktree-feature","restoredCwd":"/w/repo"}}"#);
+        assert_eq!(core.state.cwd, "/w/repo");
+        // Another tool's result naming a worktree doesn't move it.
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"tr","name":"Read","input":{"file_path":"/w/repo/a"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tr","type":"tool_result","content":"a"}]},"tool_use_result":{"worktreePath":"/elsewhere"}}"#);
+        assert_eq!(core.state.cwd, "/w/repo");
     }
 
     #[test]

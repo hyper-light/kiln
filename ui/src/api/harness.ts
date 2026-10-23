@@ -289,7 +289,10 @@ function withFiles(was: KeptFile[], added: KeptFile[]): KeptFile[] {
 }
 
 export interface FileChange {
+  /** Relative to its working tree's top (`tree`) when it's in one, else to the agent's folder. */
   path: string;
+  /** The top of the git working tree it's in: its folder's repository's own, or a worktree of it. */
+  tree?: string;
   created?: boolean;
   deleted?: boolean;
   added: number;
@@ -645,6 +648,8 @@ export interface AgentInfo {
   name: string;
   shell?: string;
   cwd: string;
+  /** The working tree its work is in (its latest change's): git's questions about its work go there. */
+  tree?: string;
   created_at: number;
   status: Status;
   title: string;

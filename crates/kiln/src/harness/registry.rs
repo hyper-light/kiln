@@ -1207,6 +1207,7 @@ impl Registry {
                         name: spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| default_name(&spec.kind)),
                         shell: spec.shell.clone(),
                         cwd: spec.cwd.clone().unwrap_or_default(),
+                        tree: None,
                         created_at: now,
                         status: Status::Starting,
                         title: String::new(),

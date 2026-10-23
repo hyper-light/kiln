@@ -232,6 +232,8 @@ export function diffStats(diffs: Pick<FileDiff, "hunks">[] | undefined): { add: 
 
 export interface FileChange {
   path: string;
+  /** Its working tree's top, `path` being relative to it (the server's changeset). */
+  tree?: string;
   created: boolean;
   deleted?: boolean;
   truncated?: boolean;

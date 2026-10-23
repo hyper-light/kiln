@@ -204,6 +204,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     pub cwd: String,
+    /// The working tree its work is in (`State::tree`): what's asked of git about its work is
+    /// asked there ([`Info::work_dir`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     pub created_at: i64,
     pub status: Status,
     #[serde(default)]
@@ -326,6 +330,13 @@ fn is_zero(n: &u32) -> bool {
 }
 
 impl Info {
+    /// Where git is asked about its work: the working tree its latest change is in, else its
+    /// folder (an agent in a worktree commits and pushes from there, not from the checkout it
+    /// started in).
+    pub fn work_dir(&self) -> &str {
+        self.tree.as_deref().filter(|t| !t.is_empty()).unwrap_or(&self.cwd)
+    }
+
     /// Refresh the live fields from the session's state.
     pub fn apply(&mut self, s: &State) {
         if !s.name.is_empty() {
@@ -338,6 +349,7 @@ impl Info {
         if !s.cwd.is_empty() {
             self.cwd.clone_from(&s.cwd);
         }
+        self.tree.clone_from(&s.tree);
         self.harness_session.clone_from(&s.harness_session);
         self.epoch = s.epoch;
         self.approvals = s
@@ -841,6 +853,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         name: spec.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| kind.name.to_owned()),
         shell: spec.shell.clone(),
         cwd,
+        tree: None,
         created_at: now,
         status: Status::Starting,
         title: String::new(),
@@ -2467,10 +2480,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        s.core.lock().start_change(&job.abs);
+                        // Placed among its folder's repository's working trees (a worktree it went into).
+                        let home = {
+                            let mut core = s.core.lock();
+                            core.start_change(&job.abs);
+                            core.state.cwd.clone()
+                        };
                         changes.push(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::file_change(&job)).await.unwrap_or((None, None));
+                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home)).await.unwrap_or((None, None));
                             (abs, change)
                         });
                     }
@@ -3248,6 +3266,7 @@ mod tests {
             name: "x".into(),
             shell: None,
             cwd: "/w".into(),
+            tree: None,
             created_at: 1,
             status: Status::Starting,
             title: String::new(),

@@ -2240,12 +2240,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let up = uplink.0.clone();
                         let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
                             let ws = s.spec.lock().workspace.clone();
-                            (std::path::PathBuf::from(s.info().cwd), ws)
+                            let info = s.info();
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, ws)) => crate::workspace::serve(&cwd, ws.as_ref(), &json).await,
+                                Some((cwd, work, ws)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), &json).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });

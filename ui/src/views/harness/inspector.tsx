@@ -53,6 +53,7 @@ function ToolSection({ title, count, children }: { title: string; count?: number
 function fromServer(files: ServerChange[]): FileChange[] {
   return files.map((f) => ({
     path: f.path,
+    tree: f.tree,
     created: Boolean(f.created),
     add: f.added,
     del: f.removed,
@@ -78,8 +79,11 @@ export const Changes = React.memo(function Changes({
 }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
+  // A file in another working tree than its folder's (a worktree it left, the checkout it went
+  // from) is shown where it is; in its folder's, by its path there.
+  const nameOf = (f: FileChange) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
   const [sel, setSel] = React.useState<string | null>(null);
-  const shown: FileChange[] = sel ? files.filter((f) => f.path === sel) : files;
+  const shown: FileChange[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
   const add = files.reduce((n, f) => n + f.add, 0);
   const del = files.reduce((n, f) => n + f.del, 0);
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
@@ -104,10 +108,10 @@ export const Changes = React.memo(function Changes({
           <DiffStat add={add} del={del} />
         </button>
         {files.map((f) => {
-          const rel = relPath(f.path, cwd);
+          const rel = nameOf(f);
           const slash = rel.lastIndexOf("/");
           return (
-            <button key={f.path} type="button" className="hx-file" aria-pressed={sel === f.path} onClick={() => setSel(sel === f.path ? null : f.path)} title={rel}>
+            <button key={rel} type="button" className="hx-file" aria-pressed={sel === rel} onClick={() => setSel(sel === rel ? null : rel)} title={rel}>
               <span className="hx-file-name">
                 {slash > 0 && <span className="hx-dim">{rel.slice(0, slash + 1)}</span>}
                 {rel.slice(slash + 1)}
@@ -123,14 +127,14 @@ export const Changes = React.memo(function Changes({
       <div className="hx-stack">
         {shown.map((f) =>
           f.edits.map((e, i) => (
-            <div key={`${f.path}-${i}`}>
+            <div key={`${nameOf(f)}-${i}`}>
               {f.edits.length > 1 && (
                 <div className="hx-dim mb-1 text-[11px]">
                   edit {i + 1} of {f.edits.length}
                   {e.call?.status === "error" ? " · failed" : ""}
                 </div>
               )}
-              <FileDiffView diff={e.diff} label={relPath(f.path, cwd)} defaultOpen={shown.length <= 4} />
+              <FileDiffView diff={e.diff} label={nameOf(f)} defaultOpen={shown.length <= 4} />
               {f.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
             </div>
           )),

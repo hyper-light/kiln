@@ -263,7 +263,9 @@ async fn result(cx: Cx, v: Value) -> Out {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|f| json!({"path": f.get("path"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false)}))
+        .map(|f| {
+            json!({"path": f.get("path"), "tree": f.get("tree"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false)})
+        })
         .collect();
     Ok(json!({
         "agent": wait::brief(&info),
@@ -271,6 +273,8 @@ async fn result(cx: Cx, v: Value) -> Out {
         "last_turn": info.last_turn,
         "changes": {"files": files, "files_changed": info.files_changed, "lines_added": info.lines_added, "lines_removed": info.lines_removed},
         "cwd": info.cwd,
+        // The working tree its work is in, when it went into one (a worktree): its files' paths are its.
+        "tree": info.tree,
         "machine": wait::machine(&info.target),
         "cost_usd": info.cost_usd,
         // Its workspace of its own (docs/agentic.md, W): the folder it's laid over, and its volume.
