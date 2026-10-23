@@ -6478,7 +6478,10 @@ and AC02.
   machine of its own to run them on; and test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
   a public repository the user owns, then `compare` run against kiln), and AC05; F-21's last two
   (`azure/login` with a tenant, `attest-build-provenance` with GitHub's Sigstore); an
-  authenticated way for legs to read github.com's API (W18's egress proxy).
+  authenticated way for legs to read github.com's API (W18's egress proxy); scorecard's checks
+  of a push (prometheus's, TypeScript's), which read the repository from an Enterprise Server's
+  API only when `GH_HOST` names one, over HTTPS (the runner sets it only for a step that gives
+  `gh` the job's token), and then sign their results through Sigstore's public instance (W18).
 
 ---
 

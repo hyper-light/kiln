@@ -498,6 +498,10 @@ ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == 
 LEFT = [
     # zizmor's online audits pass GH_TOKEN, the job's, to a container that reads github.com.
     (r"401 Unauthorized\) for url \(https://github\.com/", "a tool sends the job's token to github.com itself (zizmor's online audits), which refuses kiln's: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
+    # scorecard-action checks a push's repository remotely (a pull request's, locally), through
+    # github.com's API unless `GH_HOST` names an Enterprise Server (over HTTPS). Then it signs
+    # what it found through Sigstore's public instance, for scorecard.dev.
+    (r"repo unreachable: GET https://api\.github\.com/repos/\S+: 401 Bad credentials", "scorecard reads a push's repository from github.com's API with the job's token, which github.com refuses: kiln would name its facade an Enterprise Server's host for it (`GH_HOST`, over HTTPS, which the lab's isn't), and its results are then signed through Sigstore's public instance for scorecard.dev, which trusts GitHub's ID tokens (W18, left)"),
 ]
 
 
