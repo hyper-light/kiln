@@ -96,6 +96,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
         ("aws-ecs", Some(n)) => super::aws_ecs::adopt(&tcx, scope.as_deref().unwrap_or_default(), n).await,
         ("cloudflare-workers", None) => super::cloudflare_workers::discover(&tcx).await,
         ("cloudflare-workers", Some(n)) => super::cloudflare_workers::adopt(&tcx, n).await,
+        ("cloudformation", None) => super::cloudformation::discover(&tcx).await,
+        ("cloudformation", Some(n)) => super::cloudformation::adopt(&tcx, n).await,
         ("vercel", None) => super::vercel::discover(&tcx).await,
         ("vercel", Some(n)) => super::vercel::adopt(&tcx, n).await,
         (other, _) => return Err(bad(format!("no discovery for {other} yet"))),

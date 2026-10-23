@@ -24,9 +24,12 @@ pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod aws_s3;
 pub mod cloudflare_workers;
+pub mod cloudformation;
 pub mod vercel;
 #[cfg(test)]
 pub mod fake;
+#[cfg(test)]
+pub mod fake_query;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -546,6 +549,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "aws-lambda" => aws_lambda::list(cx, kind, names).await?,
         "aws-ecs" => aws_ecs::list(cx, kind, names).await?,
         "cloudflare-workers" => cloudflare_workers::list(cx, kind, names).await?,
+        "cloudformation" => cloudformation::list(cx, kind, names).await?,
         "vercel" => vercel::list(cx, kind, names).await?,
         other => bail!("no reading {other} yet"),
     };
@@ -563,6 +567,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "aws-lambda" => aws_lambda::apply(cx, desired).await,
         "aws-ecs" => aws_ecs::apply(cx, desired).await,
         "cloudflare-workers" => cloudflare_workers::apply(cx, desired).await,
+        "cloudformation" => cloudformation::apply(cx, desired).await,
         "vercel" => vercel::apply(cx, desired).await,
         other => bail!("no applying to {other} yet"),
     }
@@ -575,6 +580,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "aws-lambda" => aws_lambda::delete(cx, key).await,
         "aws-ecs" => aws_ecs::delete(cx, key).await,
         "cloudflare-workers" => cloudflare_workers::delete(cx, key).await,
+        "cloudformation" => cloudformation::delete(cx, key).await,
         "vercel" => vercel::delete(cx, key).await,
         other => bail!("no deleting from {other} yet"),
     }

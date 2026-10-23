@@ -17,6 +17,7 @@
 pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod cloudflare_workers;
+pub mod cloudformation;
 pub mod vercel;
 
 use serde::Serialize;
@@ -214,11 +215,17 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "aws",
         place: &["region"],
         scope: None,
-        settings: &[s("stack", true, "the stack"), s("template", true, "the template (SAM and CDK's synthesized output too)"), s("parameters", false, "the stack's parameters")],
+        settings: &[
+            s("stack", true, "the stack's name"),
+            s("template", true, "the template: a file in the source (CloudFormation's or SAM's, or CDK's synthesized output), or an object"),
+            s("parameters", false, "the stack's parameters, by key: {Env: \"${{ env.name }}\"}"),
+            s("capabilities", false, "what the template may do: [CAPABILITY_IAM, CAPABILITY_NAMED_IAM, CAPABILITY_AUTO_EXPAND] (SAM's transform needs the last)"),
+            s("tags", false, "the stack's tags, which CloudFormation gives its resources"),
+        ],
         kinds: &[kind("cloudformation.aws.kiln.dev", "Stack", "Stack"), child(kind("cloudformation.aws.kiln.dev", "StackResource", "Resource"))],
         capabilities: &[Events, Drift, Adopt, Validate],
         reads: &["CloudFormation and SAM templates"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "gcp-run",
@@ -646,6 +653,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "aws-ecs" => aws_ecs::render(input),
         "aws-lambda" => aws_lambda::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
+        "cloudformation" => cloudformation::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
             Some(p) => Err(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", p.title)),
@@ -661,6 +669,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "aws-ecs" => aws_ecs::files(spec),
         "aws-lambda" => aws_lambda::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
+        "cloudformation" => cloudformation::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
     }
@@ -678,6 +687,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "aws-ecs" => aws_ecs::health(obj),
         "aws-lambda" => aws_lambda::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
+        "cloudformation" => cloudformation::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,
     }
