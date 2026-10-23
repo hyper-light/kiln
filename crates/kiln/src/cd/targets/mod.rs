@@ -21,6 +21,7 @@
 
 pub mod api;
 pub mod aws_beanstalk;
+pub mod aws_ec2;
 pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod aws_s3;
@@ -548,6 +549,7 @@ pub fn repo_name(url: &str) -> String {
 async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec<Value>> {
     let objects = match cx.conn.def.name {
         "aws-beanstalk" => aws_beanstalk::list(cx, kind, names).await?,
+        "aws-ec2" => aws_ec2::list(cx, kind, names).await?,
         "aws-lambda" => aws_lambda::list(cx, kind, names).await?,
         "aws-ecs" => aws_ecs::list(cx, kind, names).await?,
         "cloudflare-workers" => cloudflare_workers::list(cx, kind, names).await?,
@@ -567,6 +569,7 @@ pub(super) async fn read(cx: &Cx<'_>, o: &Value) -> Result<Option<Value>> {
 pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let live = match cx.conn.def.name {
         "aws-beanstalk" => aws_beanstalk::apply(cx, desired).await,
+        "aws-ec2" => aws_ec2::apply(cx, desired).await,
         "aws-lambda" => aws_lambda::apply(cx, desired).await,
         "aws-ecs" => aws_ecs::apply(cx, desired).await,
         "cloudflare-workers" => cloudflare_workers::apply(cx, desired).await,
@@ -581,6 +584,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
 async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
     match cx.conn.def.name {
         "aws-beanstalk" => aws_beanstalk::delete(cx, key).await,
+        "aws-ec2" => aws_ec2::delete(cx, key).await,
         "aws-lambda" => aws_lambda::delete(cx, key).await,
         "aws-ecs" => aws_ecs::delete(cx, key).await,
         "cloudflare-workers" => cloudflare_workers::delete(cx, key).await,

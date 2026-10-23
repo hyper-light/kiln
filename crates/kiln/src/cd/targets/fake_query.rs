@@ -62,6 +62,40 @@ pub struct BeanstalkEnv {
     pub events: Vec<String>,
 }
 
+/// A launch template as the fake keeps it: its versions' data (as the form gave it) in order.
+#[derive(Clone, Debug, Default)]
+pub struct Template {
+    pub id: String,
+    pub versions: Vec<BTreeMap<String, String>>,
+    pub default: usize,
+}
+
+/// An instance refresh as the fake keeps it.
+#[derive(Clone, Debug, Default)]
+pub struct Refresh {
+    pub id: String,
+    pub status: String,
+    pub reason: String,
+    pub percent: u32,
+    pub version: String,
+    pub auto_rollback: bool,
+}
+
+/// An Auto Scaling group as the fake keeps it.
+#[derive(Clone, Debug, Default)]
+pub struct Group {
+    pub template: String,
+    pub version: String,
+    pub min: String,
+    pub max: String,
+    pub desired: String,
+    pub zones: String,
+    /// Each instance's id and the template version it was launched from.
+    pub instances: Vec<(String, String)>,
+    /// Newest first.
+    pub refreshes: Vec<Refresh>,
+}
+
 #[derive(Default)]
 pub struct State {
     pub stacks: BTreeMap<String, Stack>,
@@ -71,6 +105,10 @@ pub struct State {
     /// Versions by (application, label): bucket, key, status, describes left.
     pub versions: BTreeMap<(String, String), (String, String, String, u32)>,
     pub envs: BTreeMap<String, BeanstalkEnv>,
+    /// EC2: launch templates by name.
+    pub templates: BTreeMap<String, Template>,
+    /// Auto Scaling: groups by name.
+    pub groups: BTreeMap<String, Group>,
     /// Every operation, in order: `ExecuteChangeSet shop-network`.
     pub calls: Vec<String>,
 }
@@ -142,6 +180,8 @@ impl srv::Handler for FakeQuery {
         match f.get("Version").map(String::as_str) {
             Some("2010-05-15") => cloudformation(&mut st, &action, &f),
             Some("2010-12-01") => beanstalk(&mut st, &action, &f),
+            Some("2016-11-15") => ec2(&mut st, &action, &f),
+            Some("2011-01-01") => autoscaling(&mut st, &action, &f),
             _ => error(400, "InvalidAction", &format!("the fake takes no {action}")),
         }
     }
@@ -513,6 +553,176 @@ fn beanstalk(st: &mut State, action: &str, f: &BTreeMap<String, String>) -> Resp
     }
 }
 
+/// EC2's answers have no `Result` element, and their lists' items are `<item>`.
+fn ec2_answer(action: &str, body: &Value) -> Response {
+    srv::text(http::StatusCode::OK, &format!("<{action}Response xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>fake</requestId>{}</{action}Response>", to_xml(body, "item")))
+}
+
+fn ec2_error(code: &str, message: &str) -> Response {
+    srv::text(http::StatusCode::BAD_REQUEST, &format!("<Response><Errors><Error><Code>{code}</Code><Message>{}</Message></Error></Errors><RequestID>fake</RequestID></Response>", escape(message)))
+}
+
+fn template_json(name: &str, t: &Template) -> Value {
+    json!({ "launchTemplateId": t.id, "launchTemplateName": name, "latestVersionNumber": t.versions.len().to_string(), "defaultVersionNumber": t.default.to_string() })
+}
+
+fn ec2(st: &mut State, action: &str, f: &BTreeMap<String, String>) -> Response {
+    let name = f.get("LaunchTemplateName").or_else(|| f.get("LaunchTemplateName.1")).cloned().unwrap_or_default();
+    let data: BTreeMap<String, String> = f.iter().filter_map(|(k, v)| k.strip_prefix("LaunchTemplateData.").map(|k| (k.to_owned(), v.clone()))).collect();
+    let not_found = || ec2_error("InvalidLaunchTemplateName.NotFoundException", &format!("The specified launch template, with template name {name}, does not exist."));
+    match action {
+        "CreateLaunchTemplate" => {
+            if st.templates.contains_key(&name) {
+                return ec2_error("InvalidLaunchTemplateName.AlreadyExistsException", &format!("Launch template name already in use: {name}"));
+            }
+            let t = Template { id: format!("lt-{:04}", st.templates.len() + 1), versions: vec![data], default: 1 };
+            st.calls.push(format!("CreateLaunchTemplate {name}"));
+            let out = template_json(&name, &t);
+            st.templates.insert(name, t);
+            ec2_answer(action, &json!({ "launchTemplate": out }))
+        }
+        "CreateLaunchTemplateVersion" => {
+            let Some(t) = st.templates.get_mut(&name) else { return not_found() };
+            t.versions.push(data);
+            let n = t.versions.len();
+            st.calls.push(format!("CreateLaunchTemplateVersion {name} {n}"));
+            ec2_answer(action, &json!({ "launchTemplateVersion": { "launchTemplateName": name, "versionNumber": n.to_string() } }))
+        }
+        "ModifyLaunchTemplate" => {
+            let Some(t) = st.templates.get_mut(&name) else { return not_found() };
+            let v = f.get("SetDefaultVersion").and_then(|v| v.parse::<usize>().ok()).unwrap_or(t.default);
+            t.default = v;
+            st.calls.push(format!("ModifyLaunchTemplate {name} default {v}"));
+            ec2_answer(action, &json!({ "launchTemplate": template_json(&name, t) }))
+        }
+        "DescribeLaunchTemplates" => match st.templates.get(&name) {
+            Some(t) => ec2_answer(action, &json!({ "launchTemplates": [template_json(&name, t)] })),
+            None if name.is_empty() => ec2_answer(action, &json!({ "launchTemplates": st.templates.iter().map(|(n, t)| template_json(n, t)).collect::<Vec<_>>() })),
+            None => not_found(),
+        },
+        "DeleteLaunchTemplate" => {
+            if st.templates.remove(&name).is_none() {
+                return not_found();
+            }
+            st.calls.push(format!("DeleteLaunchTemplate {name}"));
+            ec2_answer(action, &json!({}))
+        }
+        other => ec2_error("InvalidAction", &format!("EC2 has no {other} in the fake")),
+    }
+}
+
+fn group_json(name: &str, g: &Group) -> Value {
+    let instances: Vec<Value> = g.instances.iter().map(|(id, v)| json!({ "InstanceId": id, "LifecycleState": "InService", "HealthStatus": "Healthy", "LaunchTemplate": { "LaunchTemplateName": g.template, "Version": v } })).collect();
+    json!({ "AutoScalingGroupName": name, "LaunchTemplate": { "LaunchTemplateName": g.template, "Version": g.version }, "MinSize": g.min, "MaxSize": g.max, "DesiredCapacity": g.desired, "VPCZoneIdentifier": g.zones, "Instances": instances })
+}
+
+/// A group's newest refresh moves on a step each time the group is looked at: onto its version,
+/// or (an image saying `bad`) failing its health checks, rolled back with `AutoRollback`.
+fn step_refresh(st: &mut State, name: &str) {
+    let templates = st.templates.clone();
+    let Some(g) = st.groups.get_mut(name) else { return };
+    let Some(r) = g.refreshes.first_mut() else { return };
+    let image = templates.get(&g.template).and_then(|t| t.versions.get(r.version.parse::<usize>().unwrap_or(1).saturating_sub(1))).and_then(|d| d.get("ImageId").cloned()).unwrap_or_default();
+    let bad = image.contains("bad");
+    match r.status.as_str() {
+        "Pending" => r.status = "InProgress".into(),
+        "InProgress" if r.percent < 50 => r.percent = 50,
+        "InProgress" if bad && r.auto_rollback => {
+            r.status = "RollbackInProgress".into();
+            r.reason = "The instance refresh failed: instances failed their health checks.".into();
+        }
+        "InProgress" if bad => {
+            r.status = "Failed".into();
+            r.reason = "The instance refresh failed: instances failed their health checks.".into();
+        }
+        "InProgress" => {
+            r.status = "Successful".into();
+            r.percent = 100;
+            g.version = r.version.clone();
+            for (_, v) in &mut g.instances {
+                v.clone_from(&r.version);
+            }
+        }
+        "RollbackInProgress" => r.status = "RollbackSuccessful".into(),
+        _ => {}
+    }
+}
+
+fn autoscaling(st: &mut State, action: &str, f: &BTreeMap<String, String>) -> Response {
+    let name = f.get("AutoScalingGroupName").cloned().unwrap_or_default();
+    let invalid = |m: &str| error(400, "ValidationError", m);
+    match action {
+        "CreateAutoScalingGroup" => {
+            if st.groups.contains_key(&name) {
+                return error(400, "AlreadyExists", &format!("AutoScalingGroup by this name already exists - A group with the name {name} already exists"));
+            }
+            let template = f.get("LaunchTemplate.LaunchTemplateName").cloned().unwrap_or_default();
+            if !st.templates.contains_key(&template) {
+                return invalid(&format!("You must use a valid fully-formed launch template. The specified launch template, with template name {template}, does not exist."));
+            }
+            let version = f.get("LaunchTemplate.Version").cloned().unwrap_or_default();
+            let desired = f.get("DesiredCapacity").or_else(|| f.get("MinSize")).cloned().unwrap_or_else(|| "1".into());
+            let n: usize = desired.parse().unwrap_or(1);
+            let g = Group {
+                template,
+                version: version.clone(),
+                min: f.get("MinSize").cloned().unwrap_or_default(),
+                max: f.get("MaxSize").cloned().unwrap_or_default(),
+                desired,
+                zones: f.get("VPCZoneIdentifier").cloned().unwrap_or_default(),
+                instances: (1..=n).map(|i| (format!("i-{name}-{i}"), version.clone())).collect(),
+                refreshes: Vec::new(),
+            };
+            st.calls.push(format!("CreateAutoScalingGroup {name} {version}"));
+            st.groups.insert(name, g);
+            answer(action, &json!({}))
+        }
+        "UpdateAutoScalingGroup" => {
+            let Some(g) = st.groups.get_mut(&name) else { return invalid(&format!("AutoScalingGroup name not found - null {name}")) };
+            for (k, slot) in [("MinSize", &mut g.min), ("MaxSize", &mut g.max), ("DesiredCapacity", &mut g.desired), ("VPCZoneIdentifier", &mut g.zones)] {
+                if let Some(v) = f.get(k) {
+                    *slot = v.clone();
+                }
+            }
+            st.calls.push(format!("UpdateAutoScalingGroup {name}"));
+            answer(action, &json!({}))
+        }
+        "DescribeAutoScalingGroups" => {
+            let names = list(f, "AutoScalingGroupNames");
+            let wanted: Vec<String> = st.groups.keys().filter(|n| names.is_empty() || names.contains(n)).cloned().collect();
+            for n in &wanted {
+                step_refresh(st, n);
+            }
+            let groups: Vec<Value> = st.groups.iter().filter(|(n, _)| wanted.contains(n)).map(|(n, g)| group_json(n, g)).collect();
+            answer(action, &json!({ "AutoScalingGroups": groups }))
+        }
+        "StartInstanceRefresh" => {
+            let Some(g) = st.groups.get_mut(&name) else { return invalid(&format!("AutoScalingGroup name not found - {name}")) };
+            if g.refreshes.first().is_some_and(|r| matches!(r.status.as_str(), "Pending" | "InProgress" | "RollbackInProgress")) {
+                return error(400, "InstanceRefreshInProgress", "An Instance Refresh is already in progress and blocks the execution of this Instance Refresh.");
+            }
+            let version = f.get("DesiredConfiguration.LaunchTemplate.Version").cloned().unwrap_or_else(|| g.version.clone());
+            let id = format!("r-{}", g.refreshes.len() + 1);
+            g.refreshes.insert(0, Refresh { id: id.clone(), status: "Pending".into(), reason: String::new(), percent: 0, version: version.clone(), auto_rollback: f.get("Preferences.AutoRollback").map(String::as_str) == Some("true") });
+            st.calls.push(format!("StartInstanceRefresh {name} {version}"));
+            answer(action, &json!({ "InstanceRefreshId": id }))
+        }
+        "DescribeInstanceRefreshes" => {
+            let Some(g) = st.groups.get(&name) else { return invalid(&format!("AutoScalingGroup name not found - {name}")) };
+            let rs: Vec<Value> = g.refreshes.iter().map(|r| json!({ "InstanceRefreshId": r.id, "AutoScalingGroupName": name, "Status": r.status, "StatusReason": r.reason, "PercentageComplete": r.percent.to_string(), "DesiredConfiguration": { "LaunchTemplate": { "LaunchTemplateName": g.template, "Version": r.version } } })).collect();
+            answer(action, &json!({ "InstanceRefreshes": rs }))
+        }
+        "DeleteAutoScalingGroup" => {
+            if st.groups.remove(&name).is_none() {
+                return invalid(&format!("AutoScalingGroup name not found - {name}"));
+            }
+            st.calls.push(format!("DeleteAutoScalingGroup {name}"));
+            answer(action, &json!({}))
+        }
+        other => error(400, "InvalidAction", &format!("Auto Scaling has no {other} in the fake")),
+    }
+}
+
 pub async fn start(fake: Arc<FakeQuery>) -> anyhow::Result<String> {
     let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 64).map_err(|e| anyhow::anyhow!("{e}"))?;
     let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -562,7 +772,8 @@ pub fn released(provider: &str, spec: Value, version: &str, files: &[(&str, &str
         enabled: true,
         version: Some(version.to_owned()),
         package,
-        artifacts: artifacts.iter().map(|(n, d)| ((*n).to_owned(), Artifact { repository: String::new(), tag: String::new(), digest: (*d).to_owned() })).collect(),
+        // An artifact's digest; and its tag, which an AMI's id is.
+        artifacts: artifacts.iter().map(|(n, d)| ((*n).to_owned(), Artifact { repository: String::new(), tag: (*d).to_owned(), digest: (*d).to_owned() })).collect(),
         requested_by: "ada".into(),
         at: String::new(),
         rollback_of: None,

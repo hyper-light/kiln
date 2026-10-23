@@ -15,6 +15,7 @@
 //! (the platform's API, credentials, polling) is the server's (`kiln::cd::targets`).
 
 pub mod aws_beanstalk;
+pub mod aws_ec2;
 pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod cloudflare_workers;
@@ -200,11 +201,19 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "aws",
         place: &["region"],
         scope: None,
-        settings: &[s("group", true, "the Auto Scaling group"), s("launch-template", true, "the launch template"), s("image", false, "the AMI (${{ artifacts.* }})")],
+        settings: &[
+            s("group", true, "the Auto Scaling group"),
+            s("launch-template", true, "the launch template"),
+            s("image", false, "the AMI (ami-…, ${{ artifacts.* }}): the template's ImageId"),
+            s("template", false, "the launch template's data: a JSON file in the source or an object (LaunchTemplateData: InstanceType, UserData, SecurityGroupIds, …)"),
+            s("set", false, "values to set in the template's data by path: {\"InstanceType\": \"t3.large\"}"),
+            s("group-spec", false, "for a group kiln makes, and the settings it keeps: MinSize, MaxSize, DesiredCapacity, VPCZoneIdentifier, TargetGroupARNs, …"),
+            s("refresh", false, "the instance refresh's preferences: {MinHealthyPercentage: 90, InstanceWarmup: 60, CheckpointPercentages: [50], AutoRollback: true}"),
+        ],
         kinds: &[kind("ec2.aws.kiln.dev", "LaunchTemplate", "Launch template"), kind("autoscaling.aws.kiln.dev", "AutoScalingGroup", "Auto Scaling group"), child(kind("ec2.aws.kiln.dev", "Instance", "Instance"))],
-        capabilities: &[Events, Drift, Adopt],
+        capabilities: &[Drift, Adopt],
         reads: &[],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "aws-static",
@@ -660,6 +669,7 @@ pub struct RenderInput<'a> {
 pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, String> {
     match provider {
         "aws-beanstalk" => aws_beanstalk::render(input),
+        "aws-ec2" => aws_ec2::render(input),
         "aws-ecs" => aws_ecs::render(input),
         "aws-lambda" => aws_lambda::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
@@ -677,6 +687,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
 pub fn files(provider: &str, spec: &Value) -> Vec<String> {
     match provider {
         "aws-beanstalk" => aws_beanstalk::files(spec),
+        "aws-ec2" => aws_ec2::files(spec),
         "aws-ecs" => aws_ecs::files(spec),
         "aws-lambda" => aws_lambda::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
@@ -696,6 +707,7 @@ pub fn health(obj: &Value) -> Option<Status> {
     let group = crate::obj::group(obj);
     match for_group(group)?.name {
         "aws-beanstalk" => aws_beanstalk::health(obj),
+        "aws-ec2" => aws_ec2::health(obj),
         "aws-ecs" => aws_ecs::health(obj),
         "aws-lambda" => aws_lambda::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),

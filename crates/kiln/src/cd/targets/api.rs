@@ -92,6 +92,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
     let r = match (conn.def.name, s(&v, "name")) {
         ("aws-beanstalk", None) => super::aws_beanstalk::discover(&tcx).await,
         ("aws-beanstalk", Some(n)) => super::aws_beanstalk::adopt(&tcx, n).await,
+        ("aws-ec2", None) => super::aws_ec2::discover(&tcx).await,
+        ("aws-ec2", Some(n)) => super::aws_ec2::adopt(&tcx, n).await,
         ("aws-lambda", None) => super::aws_lambda::discover(&tcx).await,
         ("aws-lambda", Some(n)) => super::aws_lambda::adopt(&tcx, n).await,
         ("aws-ecs", None) => super::aws_ecs::discover(&tcx, scope.as_deref()).await,
