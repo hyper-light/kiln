@@ -15,9 +15,13 @@ rollback, and what's still open.
   gate's evidence.
 - **Deployed:** not yet. Deploys go through Ada.
 - **Gated** on fedora before the push, on the commit that carries this file.
+- **Merged with main's P1** (7c8774c, kiln.db's writes through the cluster group) at 8e8dcd6. This
+  train's own transactions became P1's nesting `crate::store::tx`, as main's had: kiln's Records,
+  owners as groups, and the registry's.
 - **Checked before the gate,** on adacachy at idle priority:
   - clippy, clean;
-  - the deploy and records unit tests;
+  - the deploy, records, authz and registry unit tests, in memory and again with their stores
+    through the cluster group (`KILN_STORE_GROUP=1`);
   - every deploy integration test, through real servers on the new store, and the CI job that
     releases through deploy. Two CI compose tests failed once under adacachy's load, then passed
     on a re-run.
@@ -131,6 +135,12 @@ Each item's row in docs/deploy-api.md's Status table has the detail and how it w
   - The flip side: one row the copy can't read (a release or registration whose JSON doesn't
     parse) keeps it down until that row is mended or removed. Kiln's other services run on.
   - Production has nothing to copy.
+- **Under the cluster group, memory can run a revision ahead.** Since main's P1 (7c8774c), kiln.db's
+  writes go through the cluster group, and so do kiln's Records'. Their commit moves its head in
+  memory inside the write. If the group then can't keep the write (its change unreadable, or its
+  commit failing), memory runs one revision ahead of the database until the next start. The next
+  commit's revision skips a number, and a wait can wake for nothing. Conditions are checked
+  against the database, so no commit is wrong.
 - **Several servers are tested in one process.** The two-server test runs two hubs in one process
   over one Records. Two processes need Amphora as its own process (CP-T1.2) or replicated groups.
 - **P7's platforms are tested against fakes of their APIs**, not against real accounts. Each
