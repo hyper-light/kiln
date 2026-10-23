@@ -471,6 +471,7 @@ impl Cd {
             let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
             let pin = self.store.read(|d| d.pins.get(&id).cloned());
             let mut seen = pin.clone();
+            let facts = (kube_version.clone(), api_versions.clone());
             let result = crate::rt::blocking(move || -> Result<(Resolved, Option<Resolved>)> {
                 let head = this.inputs_of(&def, kube_version.as_deref(), &api_versions, None)?;
                 // A rolled-back app holds its deployment's commits until git changes what it
@@ -486,7 +487,18 @@ impl Cd {
             // Artifacts resolve for each revision: the head's, and a rolled-back app's own.
             let result = match result {
                 Ok((mut head, mut held)) => async {
-                    let (a, p) = self.resolve_artifacts(&def_for_artifacts, &head.revision).await?;
+                    let (a, p) = match self.resolve_artifacts(&def_for_artifacts, &head.revision).await {
+                        Ok(r) => r,
+                        // The head's artifacts aren't built yet (pushes come faster than its image
+                        // builds): the newest commit since what runs whose are takes its place.
+                        Err(e) => match self.newest_built(&def_for_artifacts, &id, &head.revision, facts).await {
+                            Some((built, a, p)) => {
+                                head = built;
+                                (a, p)
+                            }
+                            None => return Err(e),
+                        },
+                    };
                     head.add_artifacts(a, p);
                     // Its secrets are the ones its definition pins, whichever commits it holds.
                     let secrets = self.app_secrets(&def_for_artifacts).await?;
@@ -521,6 +533,32 @@ impl Cd {
                 Err(e) => self.set_source_error(&id, Some(format!("{e:#}"))),
             }
         }
+    }
+
+    /// The newest commit from `head` back to the one the app runs whose artifacts are built (the
+    /// head's aren't): its inputs and artifacts, in the head's place until the head's are. `None`:
+    /// none of them is, or the head doesn't lead from what runs (then it waits for the head's).
+    async fn newest_built(self: &Arc<Self>, def: &AppDef, id: &str, head: &str, (kube_version, api_versions): (Option<String>, Vec<String>)) -> Option<(Resolved, Vec<ArtifactRef>, Vec<PullSecret>)> {
+        let runs = self.statuses.read().get(id).and_then(|s| s.revision.as_deref().map(str::to_owned))?;
+        // The source whose commit is the app's revision.
+        let i = def.sources.iter().position(|s| s.chart.is_none() && s.as_ref.is_none())?;
+        let source = def.sources.get(i)?;
+        let (dir, url, auth, from, to) = (self.mirror_dir(&source.repo), source.repo.clone(), self.git_auth(&source.repo), runs.clone(), head.to_owned());
+        let stack = crate::rt::blocking(move || Mirror::open(&dir, &url, auth)?.stack(Some(&from), &to, NEWEST_BUILT)).await.ok()?.ok()?;
+        for commit in in_place_of_head(stack, &runs) {
+            if self.resolve_artifacts(def, &commit).await.is_err() {
+                continue;
+            }
+            let at: Vec<Option<String>> = (0..def.sources.len()).map(|j| (j == i).then(|| commit.clone())).collect();
+            let (this, d, (kv, av)) = (Arc::clone(self), def.clone(), (kube_version.clone(), api_versions.clone()));
+            let built = crate::rt::blocking(move || this.inputs_of(&d, kv.as_deref(), &av, Some(&at))).await.ok()?.ok()?;
+            let (a, p) = self.resolve_artifacts(def, &built.revision).await.ok()?;
+            if commit != runs {
+                tracing::info!(app = %id, head = %head.get(..7).unwrap_or(head), commit = %commit.get(..7).unwrap_or(&commit), "deployments: the head's artifacts aren't built yet; the newest commit whose are takes its place");
+            }
+            return Some((built, a, p));
+        }
+        None
     }
 
     fn set_source_error(&self, id: &str, e: Option<String>) {
@@ -1403,6 +1441,19 @@ pub fn is_shadow(def: &AppDef) -> bool {
     matches!(def.origin, Origin::Argo { .. }) && def.labels.get("kiln.dev/take-over").map(String::as_str) != Some("true")
 }
 
+/// How many commits back from the head an app looks for the newest whose artifacts are built.
+const NEWEST_BUILT: usize = 64;
+
+/// The commits to try in place of a head whose artifacts aren't built, newest first: those after
+/// `runs` (the commit the app runs) and before the head, then `runs` itself, never older. `stack`:
+/// the commits from `runs` (left out) up to the head, oldest first.
+fn in_place_of_head(mut stack: Vec<String>, runs: &str) -> Vec<String> {
+    stack.pop();
+    stack.reverse();
+    stack.push(runs.to_owned());
+    stack
+}
+
 /// An app's status as the API and events show it.
 pub fn summary_json(s: &Summary) -> Value {
     json!({
@@ -1633,6 +1684,13 @@ mod tests {
         assert!(forgotten(&before, &ids(&["default/kiln-namespaces"]), &kept).is_empty());
         assert_eq!(forgotten(&before, &BTreeSet::new(), &kept), ["default/kiln-namespaces"], "one it no longer renders is forgotten");
         Ok(())
+    }
+
+    #[test]
+    fn a_head_not_built_yet_gives_way_to_the_newest_commit_since_what_runs() {
+        let stack: Vec<String> = ["c3", "c4", "c5", "head"].iter().map(|c| (*c).to_owned()).collect();
+        assert_eq!(in_place_of_head(stack, "c2"), ["c5", "c4", "c3", "c2"], "newest first, down to what runs and never past it");
+        assert_eq!(in_place_of_head(vec!["head".to_owned()], "c2"), ["c2"], "nothing between: what runs stays");
     }
 
     #[test]
