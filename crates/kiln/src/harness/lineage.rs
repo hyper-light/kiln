@@ -373,8 +373,9 @@ fn candidates(hub: &Hub, want: &crate::reach::directory::Want) -> (Vec<String>, 
             passed.push(format!("{}: {why}", r.name));
             continue;
         }
-        let free_gb = r.mem_free() as f32 / (1024.0 * 1024.0 * 1024.0);
-        let score = r.idle_cpus() * 4.0 + free_gb.min(64.0);
+        // Its room as reach measures it (an overloaded machine only when none other suits); CI
+        // slots aside, which agents don't take.
+        let score = crate::reach::directory::room(r.strain(), 0, 0);
         ok.push((score, r.name.clone()));
     }
     ok.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));

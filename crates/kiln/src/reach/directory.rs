@@ -51,11 +51,51 @@ pub struct RunnerInfo {
     pub via: String,
 }
 
+/// How hard a machine is pressed, by its last sample.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Strain {
+    /// Cores it isn't using: by its busy share or by its load average, whichever leaves fewer
+    /// (work waiting on disk or memory counts in its load, not in its busy share).
+    pub idle: f32,
+    /// Memory it has free.
+    pub free: u64,
+    /// Nearly out of memory (under [`LOW_MEMORY`] or a twentieth of it free) or loaded past twice
+    /// its cores: work goes to it only when no other machine will do.
+    pub overloaded: bool,
+}
+
+/// Free memory under which a machine is overloaded, whatever its size.
+pub const LOW_MEMORY: u64 = 2 << 30;
+/// What being overloaded costs a machine's score: more than any idle cores and memory make up.
+pub const OVERLOADED: f32 = 1.0e4;
+
+/// A machine's [`Strain`] from its sample (zeros: one that hasn't said, never overloaded).
+pub fn strain(cpus: u32, cpu_pct: f32, load1: f32, mem_total: u64, mem_used: u64) -> Strain {
+    let c = cpus as f32;
+    let by_busy = (c * (1.0 - (cpu_pct / 100.0).clamp(0.0, 1.0))).max(0.0);
+    let by_load = (c - load1.max(0.0)).max(0.0);
+    let free = mem_total.saturating_sub(mem_used);
+    let low_memory = mem_total > 0 && (free < LOW_MEMORY || free < mem_total / 20);
+    Strain { idle: by_busy.min(by_load), free, overloaded: low_memory || (cpus > 0 && load1 > 2.0 * c) }
+}
+
+/// How much room a machine has for more work: its idle cores count most, free memory next, the
+/// share of its CI slots taken against it, and being overloaded most of all. Higher is better.
+pub fn room(s: Strain, busy: u32, slots: u32) -> f32 {
+    let ci = if slots > 0 { busy as f32 / slots as f32 } else { 0.0 };
+    let free_gb = s.free as f32 / (1024.0 * 1024.0 * 1024.0);
+    s.idle * 4.0 + free_gb.min(64.0) - ci * 8.0 - if s.overloaded { OVERLOADED } else { 0.0 }
+}
+
 impl RunnerInfo {
-    /// Cores it is not using, by its last sample.
+    /// How hard it is pressed, by its last sample.
+    pub fn strain(&self) -> Strain {
+        strain(self.cpus, self.cpu_pct, self.load1, self.mem_total, self.mem_used)
+    }
+
+    /// Cores it is not using, by its last sample (its busy share or its load, whichever leaves fewer).
     pub fn idle_cpus(&self) -> f32 {
-        let cpus = self.cpus as f32;
-        (cpus * (1.0 - (self.cpu_pct / 100.0).clamp(0.0, 1.0))).max(0.0)
+        self.strain().idle
     }
 
     pub fn mem_free(&self) -> u64 {
@@ -278,26 +318,27 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
             passed.push((r.name.clone(), w));
             continue;
         }
-        let idle = r.idle_cpus();
-        let free_gb = r.mem_free() as f32 / (1024.0 * 1024.0 * 1024.0);
-        let ci = if r.slots > 0 { r.busy as f32 / r.slots as f32 } else { 0.0 };
+        let s = r.strain();
         // Idle cores count most, free memory next; CI work on it and a tunnelled path count against
-        // it. This machine itself comes first while it has room (nothing crosses the network, and
-        // another machine's resources stay its own), and wins a tie when it hasn't.
-        let mut score = idle * 4.0 + free_gb.min(64.0) - ci * 8.0;
+        // it, and being overloaded (nearly out of memory, or loaded past twice its cores) most of
+        // all: such a machine gets work only when no other suits. This machine itself comes first
+        // while it has room (nothing crosses the network, and another machine's resources stay its
+        // own), and wins a tie when it hasn't; overloaded, it gets no such turn.
+        let mut score = room(s, r.busy, r.slots);
         if r.via == "tunnel" {
             score -= 2.0;
         }
-        if r.name == me {
+        if r.name == me && !s.overloaded {
             score += if r.mem_total == 0 || r.mem_free() >= ROOM { HOME } else { 0.5 };
         }
         let why = format!(
-            "{} · {:.0} of {} cores idle · {} free{}{}",
+            "{} · {:.0} of {} cores idle · {} free{}{}{}",
             r.platform(),
-            idle,
+            s.idle,
             r.cpus,
             human_bytes(r.mem_free()),
             if r.busy > 0 { format!(" · {} CI jobs", r.busy) } else { String::new() },
+            if s.overloaded { format!(" · overloaded (load {:.0})", r.load1) } else { String::new() },
             if r.name == me { " · this machine" } else { "" }
         );
         ok.push(Choice { runner: r.clone(), score, why });
@@ -340,6 +381,32 @@ mod tests {
             via: "direct".into(),
             ..RunnerInfo::default()
         }
+    }
+
+    /// A machine nearly out of memory, or loaded past twice its cores, gets work only when none
+    /// other suits, however many cores its busy share leaves idle; overloaded, the asking machine
+    /// gives way too. Its load counts against its idle cores.
+    #[test]
+    fn an_overloaded_machine_gets_work_only_when_none_other_suits() -> anyhow::Result<()> {
+        let want = Want::parse("linux")?;
+        // A machine as fedora was: a third of its cores busy by its share, load 126, 1 GB free.
+        let mut thrashing = runner("fedora", "linux", "x86_64", 32, 36.0, 1);
+        thrashing.load1 = 126.0;
+        // Every core busy, but room.
+        let busy = runner("adacachy", "linux", "x86_64", 32, 100.0, 60);
+        let (ok, _) = rank(&[thrashing.clone(), busy.clone()], &want, "mac");
+        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("adacachy"), "{ok:?}");
+        assert!(ok.iter().any(|c| c.runner.name == "fedora" && c.why.contains("overloaded")), "{ok:?}");
+        // The only one that suits: it still runs there, saying so.
+        assert_eq!(pick(std::slice::from_ref(&thrashing), &want, "mac")?.runner.name, "fedora");
+        // The asking machine overloaded: it gives way.
+        let (ok, _) = rank(&[thrashing, busy], &want, "fedora");
+        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("adacachy"), "{ok:?}");
+        // A load past its cores leaves none idle, whatever its busy share says.
+        let mut loaded = runner("b", "linux", "x86_64", 8, 10.0, 32);
+        loaded.load1 = 12.0;
+        assert!(loaded.idle_cpus().abs() < f32::EPSILON, "{}", loaded.idle_cpus());
+        Ok(())
     }
 
     #[test]

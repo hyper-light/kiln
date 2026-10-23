@@ -246,6 +246,14 @@ keys), `changed(glob, …)` (whether the trigger changed any matching file).
 | any runner with `docker` ✦ | `container` | A container per job; steps run in it; caches as volumes; `services` on a private network. Docker or Podman. |
 | any runner with `microvm` ✦ | `microvm` | A Firecracker microVM per job, booted from `image` (or a warm snapshot of it). kiln runs as the guest's PID 1 and talks to the host runner over vsock; the network goes through a policy proxy on the host. Shards will be a second backend. |
 
+A job goes to a runner that carries every label of its `runs-on`, in any case: one of the runner's
+own, its name, or what its platform is (`linux`, `macos`, `windows`; `x86_64`, `amd64`, `x64`;
+`aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled
+so. Of those with a slot free, the one with the most room: its idle cores (by its busy share or its
+load average, whichever leaves fewer), then its free memory, the share of its slots in use counting
+against it. A runner that's overloaded (under 2 GiB or a twentieth of its memory free, or a load
+past twice its cores) takes no job: the job goes to another, or waits for room.
+
 If `isolation` is absent, a job runs as it does in v1: in a pod on `[k8s]`, and on the host
 everywhere else (where `image` is ignored, as before). Containers and microVMs are always asked
 for explicitly. Runners advertise `docker` / `microvm` themselves when they can run them.
