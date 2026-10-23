@@ -1,11 +1,14 @@
 /**
- * One plan: written or changed in place (each saved change a version), its steps as they will run,
- * run on an agent (one that runs, or a new one; as one message, step by step, or as goals), shared
- * by a link, exported, its versions and runs. Everything in the page's flow. A plan that isn't
- * there (deleted, or a wrong link) says so.
+ * One plan: written or changed in place (each saved change a version), its steps as they will run
+ * (as their graph: side by side where they don't wait for each other), its research (what its steps
+ * rest on, each finding graded), run on an agent (one that runs, or a new one; as one message, step
+ * by step, as goals, or an agent per step), shared by a link, exported, its versions and runs. A
+ * plan made from a goal is planned first: its agent researches it and writes its steps, and it runs
+ * once it's ready. Everything in the page's flow. A plan that isn't there (deleted, or a wrong link)
+ * says so.
  */
 import * as React from "react";
-import { Link, useNavigate, useParams } from "@/lib/router";
+import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { harnessApi, type KindInfo } from "@/api/harness";
 import { planHref, plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
@@ -19,8 +22,12 @@ import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Prose } from "@/views/harness/parts";
+import { Shimmer } from "@/views/harness/signals";
+import { ResearchPanel } from "@/views/research/research";
+import { effectiveNeeds, PlanGraph } from "./graph";
 import { PlanItemsEditor } from "./items";
-import { itemsMarkdown, planMarkdown, planSteps } from "./steps";
+import { itemsMarkdown, planMarkdown, planSteps, withoutTitle } from "./steps";
+import { PlanSteps, stepsWords } from "./steps-view";
 import "./plans.css";
 
 const tagList = (s: string) =>
@@ -124,6 +131,17 @@ function PlanEditor({ id }: { id: string }) {
   const [items, setItems] = React.useState<PlanItem[]>(plan?.items ?? []);
   const [tags, setTags] = React.useState(base?.tags ?? "");
   const [preview, setPreview] = React.useState(true);
+  // A plan is read first; its words and steps are changed on asking (a new one is written at once).
+  const [editing, setEditing] = React.useState(isNew);
+  // Steps picked to run just those (`?pick=2,3`: picked elsewhere, an agent's Plan tab, to run here).
+  const [search] = useSearchParams();
+  const [picked, setPicked] = React.useState<number[]>(() =>
+    (search.get("pick") ?? "")
+      .split(",")
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n > 0),
+  );
+  const [cameToRun] = React.useState(() => search.has("pick"));
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -142,6 +160,8 @@ function PlanEditor({ id }: { id: string }) {
   if (plan && keyOf(plan) !== base?.key && !dirty) take(plan);
 
   const steps = items.length ? items.map((it) => it.title || "Untitled step") : planSteps(body);
+  // What each step waits for, as it'll run: as they say, or each the one before.
+  const waits = effectiveNeeds(items.map((x) => x.needs));
 
   const save = async () => {
     setBusy(true);
@@ -156,6 +176,8 @@ function PlanEditor({ id }: { id: string }) {
         res.setData(() => p);
         take(p);
         invalidate("plans");
+        setEditing(false);
+        setPicked([]);
       }
     } catch (e) {
       setError(errorMessage(e));
@@ -173,68 +195,139 @@ function PlanEditor({ id }: { id: string }) {
       <PlanCrumbs />
       {plan && (
         <p className="plan-dim plan-meta">
+          {plan.phase === "planning" && (
+            <>
+              <Shimmer on>Being planned</Shimmer> ·{" "}
+            </>
+          )}
           v{plan.version} · changed {relativeTime(plan.updated_at)}
           {plan.runs ? ` · run ${plan.runs}×` : ""}
           {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
+          {plan.source?.goal && (
+            <>
+              {" · made from the goal "}
+              <Link to={`/agents/${encodeURIComponent(plan.source.goal.agent)}`}>
+                &ldquo;{plan.source.goal.text.length > 80 ? `${plan.source.goal.text.slice(0, 80)}…` : plan.source.goal.text}&rdquo;
+              </Link>
+              {", met once every step is"}
+            </>
+          )}
         </p>
       )}
-      <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="From its text, or its first step, when left empty" />
-      <div className="plan-edit" data-preview={preview}>
-        <div className="plan-text">
-          <label htmlFor="plan-body" className="field-label">
-            {items.length ? "Overview" : "Plan"}
-          </label>
-          <textarea
-            id="plan-body"
-            className="plan-body"
-            data-short={items.length ? "" : undefined}
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            placeholder={
-              items.length
-                ? "Why, and anything every step should know (optional)"
-                : "Markdown. Each item of a top-level list is a step:\n\n1. Read the failing test\n2. Fix the parser\n3. Run the suite\n\nOr add steps below: each with its description, examples, acceptance criteria and testing."
-            }
-            spellCheck
+      {plan && !editing ? (
+        <>
+          <h1 className="run-title">{plan.title}</h1>
+          <div className="plan-actions">
+            <Button size="sm" variant="secondary" onClick={() => setEditing(true)}>
+              Edit
+            </Button>
+          </div>
+          {withoutTitle(plan.body, plan.title).trim() && (
+            <div className="plan-overview">
+              <Prose text={withoutTitle(plan.body, plan.title)} />
+            </div>
+          )}
+          <PlanSteps
+            plan={plan}
+            picked={picked}
+            onPick={setPicked}
+            onRun={(n) => {
+              setPicked([n]);
+              document.getElementById("plan-run")?.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
           />
-          <div className="field-label plan-items-label">Steps</div>
-          <PlanItemsEditor items={items} onChange={setItems} idPrefix="plan-item" />
-        </div>
-        {preview && (
-          <div className="plan-preview">
-            <div className="field-label">Preview</div>
-            {body.trim() || items.length ? <Prose text={[body.trim(), itemsMarkdown(items)].filter(Boolean).join("\n\n")} /> : <p className="plan-dim">Nothing yet.</p>}
-            <div className="field-label plan-steps-label">{steps.length ? `${steps.length} step${steps.length === 1 ? "" : "s"}, as they run one by one` : "No steps: it runs as one message"}</div>
-            {steps.length > 0 && (
-              <ol className="plan-steps">
-                {steps.map((s, i) => (
-                  <li key={i}>{s}</li>
-                ))}
-              </ol>
+        </>
+      ) : (
+        <>
+          <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="From its text, or its first step, when left empty" />
+          <div className="plan-edit" data-preview={preview}>
+            <div className="plan-text">
+              <label htmlFor="plan-body" className="field-label">
+                {items.length ? "Overview" : "Plan"}
+              </label>
+              <textarea
+                id="plan-body"
+                className="plan-body"
+                data-short={items.length ? "" : undefined}
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder={
+                  items.length
+                    ? "Why, and anything every step should know (optional)"
+                    : "Markdown. Each item of a top-level list is a step:\n\n1. Read the failing test\n2. Fix the parser\n3. Run the suite\n\nOr add steps below: each with its description, examples, acceptance criteria and testing."
+                }
+                spellCheck
+              />
+              <div className="field-label plan-items-label">Steps</div>
+              <PlanItemsEditor items={items} onChange={setItems} idPrefix="plan-item" />
+            </div>
+            {preview && (
+              <div className="plan-preview">
+                <div className="field-label">Preview</div>
+                {body.trim() || items.length ? <Prose text={[body.trim(), itemsMarkdown(items)].filter(Boolean).join("\n\n")} /> : <p className="plan-dim">Nothing yet.</p>}
+                <div className="field-label plan-steps-label">
+                  {!steps.length
+                    ? "No steps: it runs as one message"
+                    : items.some((it) => it.needs?.length)
+                      ? `${steps.length} steps, side by side where they don't wait for each other`
+                      : `${steps.length} step${steps.length === 1 ? "" : "s"}, as they run one by one`}
+                </div>
+                {items.length > 1 ? (
+                  <PlanGraph label="Its steps, as they'll run" steps={items.map((it, i) => ({ n: i + 1, title: it.title, needs: waits[i] ?? [] }))} />
+                ) : (
+                  steps.length > 0 && (
+                    <ol className="plan-steps">
+                      {steps.map((s, i) => (
+                        <li key={i}>{s}</li>
+                      ))}
+                    </ol>
+                  )
+                )}
+              </div>
             )}
           </div>
-        )}
-      </div>
-      <label className="plan-check">
-        <input type="checkbox" className="check" checked={preview} onChange={(e) => setPreview(e.target.checked)} /> Show the preview and steps
-      </label>
-      <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="release, parser" hint="Separated by commas." />
-      <div className="plan-actions">
-        <Button size="sm" disabled={!dirty || busy || (!body.trim() && items.length === 0)} onClick={() => void save()}>
-          {busy ? "Saving…" : isNew ? "Save plan" : "Save changes"}
-        </Button>
-        {!isNew && dirty && (
-          <Button size="sm" variant="ghost" onClick={discard}>
-            Discard changes
-          </Button>
-        )}
-        {error && <span className="plan-error">{error}</span>}
-      </div>
+          <label className="plan-check">
+            <input type="checkbox" className="check" checked={preview} onChange={(e) => setPreview(e.target.checked)} /> Show the preview and steps
+          </label>
+          <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="release, parser" hint="Separated by commas." />
+          <div className="plan-actions">
+            <Button size="sm" disabled={!dirty || busy || (!body.trim() && items.length === 0)} onClick={() => void save()}>
+              {busy ? "Saving…" : isNew ? "Save plan" : "Save changes"}
+            </Button>
+            {!isNew && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  discard();
+                  setEditing(false);
+                }}
+              >
+                {dirty ? "Discard changes" : "Done"}
+              </Button>
+            )}
+            {error && <span className="plan-error">{error}</span>}
+          </div>
+        </>
+      )}
+      {plan?.research && (
+        <section className="plan-section" aria-label="Research">
+          <h2 className="plan-h">Research</h2>
+          <ResearchPanel id={plan.research} live={plan.phase === "planning"} />
+        </section>
+      )}
       {plan && (
         <>
-          <Loadable label="where it can run" fallback={<RunHold />}>
-            <RunPlan plan={plan} dirty={dirty} onRan={() => invalidate(`plans/${plan.id}`)} />
-          </Loadable>
+          {plan.phase === "planning" ? (
+            <section className="plan-section" aria-label="Run the plan">
+              <h2 className="plan-h">Run it</h2>
+              <p className="plan-dim">Being planned: its agent is researching it and writing its steps. It runs once the agent says it&rsquo;s ready.</p>
+            </section>
+          ) : (
+            <Loadable label="where it can run" fallback={<RunHold />}>
+              <RunPlan plan={plan} dirty={dirty} picked={picked} onPicked={setPicked} onRan={() => invalidate(`plans/${plan.id}`)} focus={cameToRun} />
+            </Loadable>
+          )}
           <SharePlan plan={plan} onChange={(p) => res.setData(() => p)} />
           <Loadable label="its versions and runs" fallback={<RowsHold rows={2} rowHeight={44} />}>
             <Versions
@@ -278,15 +371,21 @@ function RunHold() {
 }
 
 /** Run the plan on an agent. */
-function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: () => void }) {
+function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; dirty: boolean; picked: number[]; onPicked: (n: number[]) => void; onRan: () => void; focus?: boolean }) {
   warm(harnessSessionsRes, kindsRes);
   const agents = useRes(harnessSessionsRes).data;
   const kinds = useRes(kindsRes).data;
-  const [where, setWhere] = React.useState("new");
+  // On the agent it came from, while that agent runs; else a new one.
+  const [where, setWhere] = React.useState(() => {
+    const from = plan.source?.session;
+    return from && agents.some((a) => a.id === from && a.status !== "exited") ? from : "new";
+  });
   const [target, setTarget] = React.useState("local");
   const [kindChoice, setKind] = React.useState("");
   const [cwd, setCwd] = React.useState("");
   const [modeChoice, setMode] = React.useState<PlanMode>("message");
+  // As goals, each step a goal stack of its own: its acceptance criteria and tests, a goal each.
+  const [split, setSplit] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [started, setStarted] = React.useState<PlanStarted | null>(null);
@@ -297,7 +396,11 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
   const offered = (kinds[target] ?? []).filter((k) => k.available);
   // A harness the machine doesn't offer gives way to the first it does; a plan without steps runs as one message.
   const kind = offered.some((k) => k.id === kindChoice) ? kindChoice : (offered[0]?.id ?? "");
-  const mode: PlanMode = plan.steps.length === 0 ? "message" : modeChoice;
+  // Steps picked: just those run, never as one message (an agent each, unless asked otherwise).
+  const some = picked.length > 0;
+  const mode: PlanMode = plan.steps.length === 0 ? "message" : some && modeChoice === "message" ? "agents" : modeChoice;
+  const count = some ? picked.length : plan.steps.length;
+  const checks = plan.items.some((it) => it.acceptance.length || it.testing.length);
   // Steps that say what they run after run as that says, side by side where they don't wait for each other.
   const graph = plan.items.some((it) => it.needs?.length);
   // One agent per step starts agents of its own.
@@ -310,8 +413,10 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
     setStarted(null);
     try {
       const to = { target, kind, cwd: cwd.trim() || undefined };
-      if (mode === "agents") setStarted(await plansApi.runAgents(plan.id, to));
-      else setRan(await plansApi.run(plan.id, where === "new" ? { new: to } : { session: where }, mode));
+      const only = some ? picked : undefined;
+      if (mode === "agents") setStarted(await plansApi.runAgents(plan.id, to, { only }));
+      else setRan(await plansApi.run(plan.id, where === "new" ? { new: to } : { session: where }, mode, { only, split: mode === "goals" && checks && split }));
+      onPicked([]);
       onRan();
     } catch (e) {
       setError(errorMessage(e));
@@ -321,8 +426,17 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
   };
 
   return (
-    <section className="plan-section" aria-label="Run the plan">
-      <h2 className="plan-h">Run it</h2>
+    <section className="plan-section" id="plan-run" aria-label="Run the plan" ref={focus ? (el) => el?.scrollIntoView({ block: "start" }) : undefined}>
+      <h2 className="plan-h">{some ? `Run ${stepsWords(picked)}` : "Run it"}</h2>
+      {some && (
+        <p className="plan-dim plan-meta-line">
+          Just {picked.length === 1 ? "that step" : "those steps"}, each keeping its number; the steps {picked.length === 1 ? "it waits" : "they wait"} for outside{" "}
+          {picked.length === 1 ? "it" : "them"} are taken as done.{" "}
+          <button type="button" className="sv-link" onClick={() => onPicked([])}>
+            Run the whole plan instead
+          </button>
+        </p>
+      )}
       <div className="plan-run-fields">
         {mode !== "agents" && (
           <SelectField
@@ -349,17 +463,23 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
           value={mode}
           onChange={(v) => setMode(v as PlanMode)}
           options={[
-            { value: "message", label: "One message" },
+            ...(some ? [] : [{ value: "message", label: "One message" }]),
             ...(plan.steps.length
               ? [
-                  { value: "steps", label: `Step by step (${plan.steps.length} messages, each after the last turn ends)` },
-                  { value: "goals", label: `Goals (${plan.steps.length}, each a /goal once the one before is met)` },
-                  { value: "agents", label: `One agent per step (${plan.steps.length}, each once ${graph ? "the steps it runs after are" : "the one before is"} met)` },
+                  { value: "steps", label: `Step by step (${count} message${count === 1 ? "" : "s"}, each after the last turn ends)` },
+                  { value: "goals", label: `Goals on that agent's goal stack (${count}, each once the one before is met)` },
+                  { value: "agents", label: `An agent each (${count}, each once ${graph ? "the steps it runs after are" : "the one before is"} met)` },
                 ]
               : []),
           ]}
         />
       </div>
+      {mode === "goals" && checks && (
+        <label className="plan-check">
+          <input type="checkbox" className="check" checked={split} onChange={(e) => setSplit(e.target.checked)} /> Each step as a goal stack of its own: its acceptance criteria and tests, a goal each,
+          before it
+        </label>
+      )}
       {mode === "agents" && (
         <p className="plan-dim plan-meta-line">
           {graph
@@ -369,19 +489,22 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
       )}
       <div className="plan-actions">
         <Button size="sm" variant="secondary" disabled={busy || dirty || (fresh && !kind)} onClick={() => void run()}>
-          {busy ? (mode === "agents" ? "Starting…" : "Sending…") : "Run plan"}
+          {busy ? (mode === "agents" ? "Starting…" : "Sending…") : some ? `Run ${picked.length === 1 ? `step ${picked[0]}` : `${picked.length} steps`}` : "Run plan"}
         </Button>
         {dirty && <span className="plan-dim">Save your changes first: a run sends the saved version.</span>}
         {error && <span className="plan-error">{error}</span>}
         {ran && (
           <span className="plan-ok">
-            {mode === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`} ·{" "}
-            <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
+            {mode === "goals"
+              ? `${ran.sent} goal${ran.sent === 1 ? "" : "s"} lined up${ran.split ? `, ${ran.split} as goal stacks of their criteria and tests` : ""}`
+              : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}{" "}
+            · <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
           </span>
         )}
         {started && (
           <span className="plan-ok">
-            {started.steps} steps, an agent each · <Link to={runHref(started.run)}>follow the run</Link>
+            {started.steps} step{started.steps === 1 ? "" : "s"}, an agent each · <Link to={runHref(started.run)}>follow the run</Link>
+            {started.note ? ` · ${started.note}` : ""}
           </span>
         )}
       </div>

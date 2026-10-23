@@ -6,6 +6,12 @@
 //!   digest one of its manifests there, the platforms read from that manifest (an index's
 //!   members, else its config's `os` and `architecture`), never taken from the report.
 //! - `GET /api/ci/images?repo=&name=`: the images, newest first.
+//! - `POST /api/ci/images?repo=` `{ name, kind?, content }`: a definition made in the UI ("Save
+//!   to repo"), checked, then proposed as a diff adding `.kiln/images/<name>/Dockerfile` (or
+//!   `Agentfile`): never written directly.
+//! - `POST /api/ci/images/validate` `{ path?, kind?, content }`: an image's definition checked
+//!   as the editor checks it: a Dockerfile by kiln's own parser and lints
+//!   (`kiln_ci::dockerfile`); an Agentfile is shards' to check, on the runner that builds it.
 
 use std::collections::HashMap;
 
@@ -16,6 +22,53 @@ use serde_json::{Value, json};
 use super::Fail;
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
+
+/// `POST /api/ci/images/validate`: a definition's diagnostics (W13-R11).
+pub async fn validate(body: kiln_http::Incoming) -> Result<Response, Fail> {
+    let v: Value = srv::body_json(body, 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    validate_value(&v).await
+}
+
+/// `POST /api/ci/images?repo=`: a definition proposed as a diff, once it checks out.
+pub async fn propose(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    let repo = q.get("repo").or_else(|| q.get("repository")).filter(|r| !r.is_empty()).cloned().ok_or_else(|| (StatusCode::BAD_REQUEST, "say which repository: ?repo=owner/name".to_owned()))?;
+    let name = body.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_owned();
+    if name.is_empty() || name.starts_with('.') || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+        return Err((StatusCode::BAD_REQUEST, "an image's name is letters, digits, `-`, `_` and `.`".into()));
+    }
+    let agentfile = body.get("kind").and_then(Value::as_str).is_some_and(|k| k.eq_ignore_ascii_case("agentfile"));
+    let content = body.get("content").and_then(Value::as_str).unwrap_or_default().to_owned();
+    if !agentfile {
+        let c = content.clone();
+        let found = crate::rt::blocking(move || kiln_ci::dockerfile::check(&c)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        let errors: Vec<String> = found.iter().filter(|d| d.is_error()).map(|d| d.render("Dockerfile")).collect();
+        if !errors.is_empty() {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("the Dockerfile has errors, so it isn't proposed:\n{}", errors.join("\n"))));
+        }
+    }
+    let file = format!(".kiln/images/{name}/{}", if agentfile { "Agentfile" } else { "Dockerfile" });
+    let out = super::diffs::propose_file(hub, &repo, caller, &file, &format!("The {name} runner image"), body, move |_| Ok(content)).await?;
+    Ok(srv::json(StatusCode::CREATED, &out))
+}
+
+/// What `validate` answers, for its route and its operation.
+pub async fn validate_value(v: &Value) -> Result<Response, Fail> {
+    let content = v.get("content").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let path = v.get("path").and_then(Value::as_str).unwrap_or_default();
+    let kind = match v.get("kind").and_then(Value::as_str) {
+        Some(k) => k.to_ascii_lowercase(),
+        None if path.ends_with("Agentfile") => "agentfile".to_owned(),
+        None => "dockerfile".to_owned(),
+    };
+    match kind.as_str() {
+        "dockerfile" => {
+            let diagnostics = crate::rt::blocking(move || kiln_ci::dockerfile::check(&content)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "kind": "dockerfile", "checked": true, "diagnostics": diagnostics })))
+        }
+        "agentfile" => Ok(srv::json(StatusCode::OK, &json!({ "kind": "agentfile", "checked": false, "diagnostics": [], "note": "an Agentfile is checked by shards' own parser, on the runner that builds it" }))),
+        other => Err((StatusCode::BAD_REQUEST, format!("`{other}`: an image is a dockerfile or an agentfile"))),
+    }
+}
 
 /// A config blob past this isn't read for its platform.
 const MAX_CONFIG: u64 = 1 << 20;

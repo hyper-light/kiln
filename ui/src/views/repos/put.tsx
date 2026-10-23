@@ -6,11 +6,12 @@
  */
 import * as React from "react";
 import { api } from "@/api/client";
-import type { Place, PlaceMachine, PlaceTask, TaskSource } from "@/api/types";
+import type { Place, PlaceMachine, PlaceTask, SyncMode, TaskSource } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SelectField, TextField } from "@/components/ui/misc";
 import { cn } from "@/lib/utils";
 import { errorMessage } from "@/lib/hooks";
+import { MODES } from "../sync";
 import { type Entry, defaultPath, osLabel, resolvedOn, tildeOf } from "./model";
 
 export type PutMode = "clone" | "sync";
@@ -67,6 +68,9 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
   const [sourceId, setSourceId] = React.useState<string>("");
   const source = sources.find((s) => s.id === sourceId) ?? sources[0];
   const [branch, setBranch] = React.useState("");
+  // A new sync of a git repository: what its copies keep the same.
+  const [keeps, setKeeps] = React.useState<SyncMode>("files_and_git");
+  const choosesKeeps = mode === "sync" && !entry.synced && Boolean(source?.git);
   const [picks, setPicks] = React.useState<Record<string, Pick>>({});
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -127,6 +131,7 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
         from: source.from,
         branch: fromBranchable && branch.trim() ? branch.trim() : undefined,
         to: chosen.map((m) => ({ machine: m.name, path: pathOf(m.name).trim() })),
+        mode: choosesKeeps ? keeps : undefined,
       });
       onStarted(tasks);
     } catch (err) {
@@ -152,7 +157,11 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
           ? "Each machine gets a clone of its own: the commits and branches, from where you choose. Work not committed stays where it is."
           : entry.synced
             ? "Each new folder is cloned, then kept the same as the copies it syncs with already: uncommitted work too, both ways, within seconds."
-            : "The first folder starts a sync; each new one is cloned, then kept the same as it: uncommitted work too, both ways, within seconds."}
+            : choosesKeeps && keeps === "git"
+              ? "The first folder starts a sync; each new one is cloned, then its branches and commits are kept the same as its, both ways, within seconds. Each machine's working tree stays its own."
+              : choosesKeeps && keeps === "files_and_git"
+                ? "The first folder starts a sync; each new one is cloned, then kept the same as it: its files, uncommitted work too, and its branches and commits, both ways, within seconds."
+                : "The first folder starts a sync; each new one is cloned, then kept the same as it: uncommitted work too, both ways, within seconds."}
       </p>
       {sources.length === 0 ? (
         <p className="repo-error">
@@ -171,6 +180,7 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
               </datalist>
             </div>
           )}
+          {choosesKeeps && <SelectField label="Keeps the same" value={keeps} onChange={(v) => setKeeps(v as SyncMode)} options={MODES} />}
         </div>
       )}
       <fieldset className="repo-put-machines">

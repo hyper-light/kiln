@@ -21,6 +21,7 @@ import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, 
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
 import { handleGoals } from "./goals.ts";
+import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
@@ -1389,6 +1390,7 @@ const server = http.createServer(async (req, res) => {
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
     // ---- goal stacks ----
     if (await handleGoals(req, res, url)) return;
+    if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

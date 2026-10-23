@@ -139,13 +139,8 @@ mod tests {
     fn a_group_on_the_disk_log_keeps_what_it_committed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("sync.log");
-        let step = Step {
-            by: "m".into(),
-            member: 2,
-            seq: 1,
-            at: 1,
-            changes: vec![Change { path: "a.txt".into(), to: Some(Version::File { hash: "ab".repeat(32), exec: false }), base: None }],
-        };
+        let step =
+            Step { by: "m".into(), member: 2, seq: 1, at: 1, changes: vec![Change { path: "a.txt".into(), to: Some(Version::File { hash: "ab".repeat(32), exec: false }), base: None, bundle: None }] };
         {
             let log = open(&path)?;
             let store = claim(&log, 7)?;

@@ -5,7 +5,7 @@
 //! * [`core`] — a session's state plus what came out of the last step (updates, stdin lines).
 //! * [`claude`] — Claude Code over stream-json and the control protocol.
 //! * [`codex`] — Codex over its app-server (JSON-RPC v2).
-//! * [`acp`] — any Agent Client Protocol agent (Gemini CLI, opencode, Goose, Amp's adapter).
+//! * [`acp`] — any Agent Client Protocol agent (Devin, Gemini CLI, opencode, Goose, Amp's adapter).
 //! * [`diff`] — line diffs for edit previews.
 //! * [`handoff`] — a conversation carried from one harness to another (switching models across them).
 //! * [`kinds`] — the registry of harnesses and their adapters.
@@ -15,6 +15,7 @@
 //! * [`lineage`] — agents an agent starts: its children, held to no more than it has.
 //! * [`ops`] — the `agents.*` operations (HTTP, MCP, code mode, the CLI).
 //! * [`wait`] — where agents stand, and waiting for them to settle.
+//! * [`queued`] — what waits in an agent's queue, and the messages kiln keeps there itself.
 //! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 
 pub mod acp;
@@ -32,6 +33,7 @@ pub mod elsewhere;
 pub mod files;
 pub mod gitstate;
 pub mod handoff;
+pub mod homes;
 pub mod host;
 pub mod kept;
 pub mod kinds;
@@ -43,6 +45,7 @@ pub mod opened;
 pub mod ops;
 pub mod pause;
 pub mod port;
+pub mod queued;
 pub mod registry;
 pub mod relocate;
 pub mod screen;

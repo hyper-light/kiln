@@ -18,6 +18,14 @@ pub const GITHUB_HOST: &str = "github";
 /// A GitLab `[[ci.gitlab]]` names, with its token (docs/deploy-api.md §7).
 pub const GITLAB_HOST: &str = "gitlab";
 
+/// Bitbucket Cloud, with `[ci.bitbucket]`'s credentials (docs/deploy-api.md §7).
+pub const BITBUCKET_HOST: &str = "bitbucket";
+
+/// Whether a release repository is on another git host (GitHub, a GitLab, Bitbucket), not kiln's own.
+pub fn remote_host(host: &str) -> bool {
+    matches!(host, GITHUB_HOST | GITLAB_HOST | BITBUCKET_HOST)
+}
+
 /// A stage apps are released to (docs/deploy-api.md §4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

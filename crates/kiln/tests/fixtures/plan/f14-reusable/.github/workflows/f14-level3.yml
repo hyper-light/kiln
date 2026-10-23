@@ -1,0 +1,23 @@
+# F-14's third level: the work, the repository's secret inherited from the caller two levels up.
+name: level3
+on:
+  workflow_call:
+    inputs:
+      prefix:
+        type: string
+        required: true
+    outputs:
+      answer:
+        value: ${{ jobs.work.outputs.answer }}
+jobs:
+  work:
+    runs-on: self-hosted
+    outputs:
+      answer: ${{ steps.a.outputs.answer }}
+    steps:
+      - id: a
+        env:
+          INHERITED: ${{ secrets.F14_SECRET }}
+        run: |
+          test -n "$INHERITED"
+          echo "answer=${{ inputs.prefix }}-deep" >> "$GITHUB_OUTPUT"

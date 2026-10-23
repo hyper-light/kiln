@@ -122,3 +122,25 @@ fn w18_ac02_kilns_own() {
         assert!(in_spdx.contains(purl) && in_cdx.contains(purl), "{purl} is missing");
     }
 }
+
+/// W18-R03's review: what a change does to the dependencies, package by package.
+#[test]
+fn w18_r03_dependency_changes() {
+    let lock = |pkgs: &[(&str, &str)]| -> String { pkgs.iter().map(|(n, v)| format!("[[package]]\nname = \"{n}\"\nversion = \"{v}\"\n\n")).collect() };
+    let old = parse(Lock::Cargo, &lock(&[("serde", "1.0.200"), ("rand", "0.8.5"), ("rand", "0.9.0"), ("left", "1.0.0")])).unwrap_or_default();
+    let new = parse(Lock::Cargo, &lock(&[("serde", "1.0.210"), ("rand", "0.9.0"), ("tokio", "1.40.0")])).unwrap_or_default();
+    let c = changes(&old, &new);
+    let said: Vec<(String, Vec<String>, Vec<String>)> = c.iter().map(|x| (x.name.clone(), x.from.clone(), x.to.clone())).collect();
+    assert_eq!(
+        said,
+        [
+            ("left".to_owned(), vec!["1.0.0".to_owned()], vec![]),
+            ("rand".to_owned(), vec!["0.8.5".to_owned()], vec![]),
+            ("serde".to_owned(), vec!["1.0.200".to_owned()], vec!["1.0.210".to_owned()]),
+            ("tokio".to_owned(), vec![], vec!["1.40.0".to_owned()]),
+        ],
+        "removed, a version dropped, upgraded, added"
+    );
+    assert!(c.iter().all(|x| x.ecosystem == "cargo"));
+    assert!(changes(&new, &new).is_empty(), "nothing changed");
+}

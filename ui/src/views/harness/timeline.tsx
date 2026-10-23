@@ -1155,7 +1155,7 @@ export const Timeline = React.memo(function Timeline({
           {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (
-                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} />
+                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} />
               ))}
             </div>
           )}

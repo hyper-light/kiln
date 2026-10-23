@@ -64,6 +64,9 @@ impl Level {
 
 /// The mode a harness starts in when none is given.
 fn default_mode(k: &Kind) -> &'static str {
+    if k.id == "devin" {
+        return "accept-edits";
+    }
     match k.protocol {
         Protocol::Acp(_) => super::acp::KILN_ASK,
         _ => k.modes().1,
@@ -72,7 +75,7 @@ fn default_mode(k: &Kind) -> &'static str {
 
 /// An ACP agent's own mode, placed by its words (each agent names its own: Gemini CLI's
 /// `autoEdit` and `yolo`, opencode's `plan` and `build`, Goose's `approve` and `auto`).
-fn acp_level(mode: &str) -> Option<Level> {
+pub(super) fn acp_level(mode: &str) -> Option<Level> {
     let m: String = mode.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
     let has = |w: &str| m.contains(w);
     Some(if has("yolo") || has("bypass") || has("danger") || has("fullaccess") || has("skip") {
@@ -123,6 +126,14 @@ pub fn level(kind: &str, mode: &str) -> Option<Level> {
             super::antigravity::BYPASS => Some(Level::Bypass),
             _ => None,
         },
+        Protocol::Acp(_) if k.id == "devin" => match mode {
+            "plan" => Some(Level::Plan),
+            "ask" => Some(Level::Ask),
+            "accept-edits" => Some(Level::AcceptEdits),
+            "smart" => Some(Level::Auto),
+            "bypass" => Some(Level::Bypass),
+            _ => None,
+        },
         Protocol::Acp(_) => match mode {
             super::acp::KILN_ASK => Some(Level::Ask),
             super::acp::KILN_BYPASS => Some(Level::Bypass),
@@ -145,6 +156,7 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
         Protocol::ClaudeStreamJson => super::claude::modes(true).into_iter().map(|m| m.id).collect(),
         Protocol::CodexAppServer => super::codex::modes(true).into_iter().map(|m| m.id).collect(),
         Protocol::AgyStreamJson => super::antigravity::modes().into_iter().map(|m| m.id).collect(),
+        Protocol::Acp(_) if k.id == "devin" => ["plan", "ask", "accept-edits", "smart", "bypass"].map(str::to_owned).to_vec(),
         Protocol::Acp(_) => vec![super::acp::KILN_ASK.to_owned(), super::acp::KILN_BYPASS.to_owned()],
         Protocol::Terminal => Vec::new(),
     };
@@ -154,8 +166,8 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
 /// The mode a child in harness `kind` starts in under a parent at `ceiling`: the one `asked` for,
 /// when it's within it; with none asked, its harness's default when that's within it, else the
 /// most its harness offers that is. Always one, so the harness's own settings (Claude Code's
-/// `defaultMode`) can't start it higher. `bypass_ok`: the parent may use bypass itself. An ACP
-/// agent asked for nothing starts in its own default mode (kiln knows its modes only once it runs).
+/// `defaultMode`) can't start it higher. `bypass_ok`: the parent may use bypass itself. Other ACP
+/// agents asked for nothing start in their own default mode (kiln learns their modes as they run).
 pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bool) -> Result<Option<String>, String> {
     let k = Kind::get(kind).ok_or_else(|| format!("unknown harness {kind:?}"))?;
     let known = modes_of(k);
@@ -184,7 +196,7 @@ pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bo
             }
             Ok(Some(mode.to_owned()))
         }
-        None if matches!(k.protocol, Protocol::Acp(_)) && ceiling >= Level::Ask => Ok(None),
+        None if matches!(k.protocol, Protocol::Acp(_)) && k.id != "devin" && ceiling >= Level::Ask => Ok(None),
         None => {
             let default = default_mode(k);
             if within.iter().any(|(id, _)| id == default) {
@@ -443,13 +455,16 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
     }
     let all = hub.harness.list();
     let running = all.iter().filter(|i| i.parent.as_deref() == Some(parent.id.as_str()) && i.status != Status::Exited).count();
-    let max = usize::try_from(limits.max_children).unwrap_or(usize::MAX);
+    let kiln_max = usize::try_from(limits.max_children).unwrap_or(usize::MAX);
+    // Its own, when lower: the most subagents it runs at once (its Agent settings).
+    let own = parent.max_subagents.and_then(|m| usize::try_from(m).ok()).filter(|m| *m < kiln_max);
+    let max = own.unwrap_or(kiln_max);
     if running.saturating_add(count) > max {
-        return Err(refuse(format!(
-            "{} runs {running} agent{} it started, and one agent runs at most {max} at once ([agents] max_children): end some first",
-            parent.name,
-            if running == 1 { "" } else { "s" }
-        )));
+        let s = if running == 1 { "" } else { "s" };
+        return Err(refuse(match own {
+            Some(_) => format!("{} runs {running} agent{s} it started, and its settings let it run at most {max} at once: end some first, or raise that in its Agent settings", parent.name),
+            None => format!("{} runs {running} agent{s} it started, and one agent runs at most {max} at once ([agents] max_children): end some first", parent.name),
+        }));
     }
     let mode = child_mode(&ask.kind, ask.mode.as_deref(), ceiling(parent), !parent.no_bypass).map_err(refuse)?;
     // Its commands run only on its own machine: so do its children's, there.
@@ -463,7 +478,7 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
-    let kind = Kind::get(&ask.kind).ok_or_else(|| bad(format!("unknown harness {:?}: claude, codex, gemini, opencode, goose, amp or antigravity", ask.kind)))?;
+    let kind = Kind::get(&ask.kind).ok_or_else(|| bad(format!("unknown harness {:?}: claude, codex, devin, gemini, opencode, goose, amp or antigravity", ask.kind)))?;
     if !kind.structured() {
         return Err(bad(format!("{} has no structured mode", kind.name)));
     }
@@ -592,6 +607,27 @@ mod tests {
         // Unknown modes and modes a harness doesn't have are refused, never let through.
         assert!(child_mode("claude", Some("turbo"), Level::Bypass, true).is_err());
         assert!(child_mode("codex", Some("acceptEdits"), Level::Bypass, true).is_err(), "Codex has no acceptEdits");
+    }
+
+    #[test]
+    fn devin_children_keep_native_modes_within_their_parents_permissions() {
+        assert_eq!(level("devin", ""), Some(Level::AcceptEdits));
+        for (mode, l) in [("plan", Level::Plan), ("ask", Level::Ask), ("accept-edits", Level::AcceptEdits), ("smart", Level::Auto), ("bypass", Level::Bypass)] {
+            assert_eq!(level("devin", mode), Some(l));
+            assert_eq!(child_mode("devin", Some(mode), l, true), Ok(Some(mode.to_owned())));
+        }
+        assert_eq!(child_mode("devin", None, Level::Plan, false), Ok(Some("plan".into())));
+        assert_eq!(child_mode("devin", None, Level::Ask, false), Ok(Some("ask".into())));
+        assert_eq!(child_mode("devin", None, Level::AcceptEdits, false), Ok(Some("accept-edits".into())));
+        assert_eq!(child_mode("devin", None, Level::Bypass, true), Ok(Some("accept-edits".into())));
+        assert!(child_mode("devin", Some("accept-edits"), Level::Ask, true).is_err());
+        assert!(child_mode("devin", Some("smart"), Level::AcceptEdits, true).is_err());
+        assert!(child_mode("devin", Some("bypass"), Level::Auto, true).is_err());
+        assert!(child_mode("devin", Some("bypass"), Level::Bypass, false).is_err());
+        for unknown in ["kiln-ask", "kiln-bypass", "auto", "code", "readonly"] {
+            assert_eq!(level("devin", unknown), None);
+            assert!(child_mode("devin", Some(unknown), Level::Bypass, true).is_err());
+        }
     }
 
     fn info(id: &str, parent: Option<&str>, status: Status) -> Info {

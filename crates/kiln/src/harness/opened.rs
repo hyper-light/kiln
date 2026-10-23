@@ -28,13 +28,12 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use http_body_util::BodyExt as _;
-use hyper::client::conn::http1::SendRequest;
+use kiln_http::client::http1::SendRequest;
 use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::browser::ports::{CHUNK, WINDOW};
 use crate::http::server::{self as srv, Request, Response};
-use crate::http::ws::FuturesIo;
 use crate::hub::Hub;
 use crate::proto::{CAP_PORTS, LANE_PORTS, ServerMsg};
 
@@ -183,7 +182,7 @@ impl Tunnels {
     }
 }
 
-/// A connection to a port, as hyper's client speaks over it.
+/// A connection to a port, as kiln-http's client speaks over it.
 pub struct Conn {
     from: futures::channel::mpsc::UnboundedReceiver<Bytes>,
     pending: Bytes,
@@ -191,26 +190,28 @@ pub struct Conn {
     taken: futures::channel::mpsc::UnboundedSender<u64>,
 }
 
-impl hyper::rt::Read for Conn {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<io::Result<()>> {
+impl futures::io::AsyncRead for Conn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if this.pending.is_empty() {
             match this.from.poll_next_unpin(cx) {
                 Poll::Ready(Some(b)) => this.pending = b,
                 // Its port ended it.
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(None) => return Poll::Ready(Ok(0)),
                 Poll::Pending => return Poll::Pending,
             }
         }
-        let n = this.pending.len().min(buf.remaining());
+        let n = this.pending.len().min(buf.len());
         let piece = this.pending.split_to(n);
-        buf.put_slice(&piece);
+        if let Some(to) = buf.get_mut(..n) {
+            to.copy_from_slice(&piece);
+        }
         let _ = this.taken.unbounded_send(u64::try_from(n).unwrap_or(u64::MAX));
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(n))
     }
 }
 
-impl hyper::rt::Write for Conn {
+impl futures::io::AsyncWrite for Conn {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         match this.out.poll_ready(cx) {
@@ -227,7 +228,7 @@ impl hyper::rt::Write for Conn {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.get_mut().out.close_channel();
         Poll::Ready(Ok(()))
     }
@@ -398,7 +399,7 @@ async fn sender(hub: &Arc<Hub>, o: &Opening, machine: &str) -> anyhow::Result<Se
         }
     }
     let conn = hub.harness.ports.open(hub, machine, &o.session, o.port).await?;
-    let (sender, connection) = hyper::client::conn::http1::handshake::<_, srv::Body>(conn).await?;
+    let (sender, connection) = kiln_http::client::http1::handshake::<_, srv::Body>(conn).await?;
     crate::rt::spawn_local(async move {
         let _ = connection.with_upgrades().await;
     })
@@ -426,7 +427,7 @@ async fn forward_http(hub: &Arc<Hub>, o: &Opening, machine: &str, site: &str, re
 /// An upgrade (a WebSocket): asked of the app first, its answer the device's; then both
 /// connections piped until either ends.
 async fn forward_upgrade(hub: &Arc<Hub>, o: &Opening, machine: &str, site: &str, mut req: Request) -> anyhow::Result<Response> {
-    let device = hyper::upgrade::on(&mut req);
+    let device = kiln_http::upgrade::on(&mut req);
     let (parts, _) = req.into_parts();
     let mut up = http::Request::builder().method(Method::GET).uri(target(&parts.uri)).body(srv::empty())?;
     let mut headers = upstream_headers(&parts.headers, o.port, site);
@@ -436,7 +437,7 @@ async fn forward_upgrade(hub: &Arc<Hub>, o: &Opening, machine: &str, site: &str,
     }
     *up.headers_mut() = headers;
     let conn = hub.harness.ports.open(hub, machine, &o.session, o.port).await?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake::<_, srv::Body>(conn).await?;
+    let (mut sender, connection) = kiln_http::client::http1::handshake::<_, srv::Body>(conn).await?;
     crate::rt::spawn_local(async move {
         let _ = connection.with_upgrades().await;
     })
@@ -447,7 +448,7 @@ async fn forward_upgrade(hub: &Arc<Hub>, o: &Opening, machine: &str, site: &str,
         downstream_headers(&mut head.headers, o.port, site);
         return Ok(http::Response::from_parts(head, body.map_err(io::Error::other).boxed()));
     }
-    let app = hyper::upgrade::on(&mut resp);
+    let app = kiln_http::upgrade::on(&mut resp);
     let mut out = http::Response::new(srv::empty());
     *out.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     for k in [header::UPGRADE, header::CONNECTION, header::SEC_WEBSOCKET_ACCEPT, header::SEC_WEBSOCKET_PROTOCOL, header::SEC_WEBSOCKET_EXTENSIONS] {
@@ -459,7 +460,7 @@ async fn forward_upgrade(hub: &Arc<Hub>, o: &Opening, machine: &str, site: &str,
     crate::rt::spawn_local(async move {
         match (device.await, app.await) {
             (Ok(d), Ok(a)) => {
-                if let Err(e) = crate::frontdoor::proxy::pipe(FuturesIo(d), FuturesIo(a)).await {
+                if let Err(e) = crate::frontdoor::proxy::pipe(d, a).await {
                     tracing::debug!(port, error = %e, "an opened app's upgraded connection ended");
                 }
             }

@@ -454,9 +454,12 @@ fn now_ms() -> i64 {
 
 /// The contents a step carries.
 fn hashes(step: &Step) -> impl Iterator<Item = &String> {
-    step.changes.iter().filter_map(|c| match &c.to {
-        Some(Version::File { hash, .. }) => Some(hash),
-        _ => None,
+    step.changes.iter().flat_map(|c| {
+        let file = match &c.to {
+            Some(Version::File { hash, .. }) => Some(hash),
+            _ => None,
+        };
+        file.into_iter().chain(c.bundle.as_ref())
     })
 }
 
@@ -742,7 +745,7 @@ impl Owner {
         };
         let store = disk::claim(log, u128::from(group))?;
         let depth = store.depth();
-        let limits = Limits { exclude: spec.exclude.clone(), ..spec.max_size.map_or_else(Limits::default, |max_size| Limits { max_size, ..Limits::default() }) };
+        let limits = Limits { exclude: spec.exclude.clone(), mode: spec.mode, ..spec.max_size.map_or_else(Limits::default, |max_size| Limits { max_size, ..Limits::default() }) };
         let file = self.state_file(spec);
         let fresh = !file.exists();
         let mut feed = Feed::open(&root, &self.me, spec.member, limits, file)?;

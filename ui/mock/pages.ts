@@ -630,7 +630,74 @@ function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
 
 /* ------------------------------------------------------------------ plans */
 
+/** A goal turned into a plan here (Make a plan): a plan being planned, its words the goal's. */
+export function planning(goal: { agent: string; id: string; text: string }): string {
+  const id = `pl_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Math.floor(Date.now() / 1000);
+  const title = goal.text.split(/[.:—]/)[0]!.trim().slice(0, 80);
+  PLANS.unshift({ ...PLANS[0]!, id, title, body: goal.text, items: [], steps: [], tags: [], version: 1, runs: 0, updated_at: now, share: undefined, phase: "planning", research: undefined, source: { goal } } as unknown as (typeof PLANS)[number]);
+  return id;
+}
+
+/** The plan Release prep proposed (plan mode), as its conversation has it and as kiln keeps it (`pl_proposed`). */
+export const PROPOSED = `# Fix: a mount taken over by a restarted daemon dropped a store
+
+The successor's handle store starts fresh, so a page re-fetched after the takeover was never tracked, and its write-back was judged fresh.
+
+1. Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.
+2. Track handles the successor never saw opened: \`WritableOpens\` keyed by handle and inode (coherence.rs).
+3. Adopt an unseen handle on a restored mount before serving its write (channel.rs).
+4. Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.
+5. Verify: workspace clippy, the doc gate, and CI.`;
+
 const PLANS = [
+  {
+    id: "pl_search",
+    title: "Search across agents' conversations",
+    body: "Agents can search every conversation they may read.",
+    items: [
+      { title: "Store: search by agent and time", description: "", examples: "", acceptance: [], testing: [], needs: [] },
+      { title: "Op: conversations.search", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "Agents use it in code mode", description: "", examples: "", acceptance: [], testing: [], needs: [1] },
+      { title: "UI: search in Mission Control", description: "", examples: "", acceptance: [], testing: [], needs: [2, 3] },
+      { title: "Docs and the kiln-agents skill", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "Bench: a million events under 50 ms", description: "", examples: "", acceptance: [], testing: [], needs: [2] },
+      { title: "WebKit and phone check", description: "", examples: "", acceptance: [], testing: [], needs: [4] },
+      { title: "Ship it", description: "", examples: "", acceptance: [], testing: [], needs: [4, 5, 6, 7] },
+    ],
+    tags: [],
+    source: null,
+    share: null,
+    version: 1,
+    created_at: T0 - 7_200,
+    updated_at: T0 - 3_600,
+    steps: ["Store: search by agent and time", "Op: conversations.search", "Agents use it in code mode", "UI: search in Mission Control", "Docs and the kiln-agents skill", "Bench: a million events under 50 ms", "WebKit and phone check", "Ship it"],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
+  {
+    id: "pl_proposed",
+    title: "Fix: a mount taken over by a restarted daemon dropped a store",
+    body: PROPOSED,
+    items: [],
+    tags: [],
+    source: { session: "fam-orch", agent: "Release prep", harness: "claude", proposed: true },
+    share: null,
+    version: 2,
+    created_at: T0 - 40 * 60,
+    updated_at: T0 - 20 * 60,
+    steps: [
+      "Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.",
+      "Track handles the successor never saw opened: `WritableOpens` keyed by handle and inode (coherence.rs).",
+      "Adopt an unseen handle on a restored mount before serving its write (channel.rs).",
+      "Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.",
+      "Verify: workspace clippy, the doc gate, and CI.",
+    ],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
   {
     id: "pl_release",
     title: "Cut the 0.2 release",
@@ -661,6 +728,36 @@ const PLANS = [
     updated_at: T0 - 3_600 * 5,
     steps: ["Freeze main", "Run the full bench", "Tag and publish"],
     runs: 2,
+    phase: "ready",
+    research: null,
+  },
+  {
+    id: "pl_quic",
+    title: "QUIC replication",
+    body: "Goal: Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    items: [
+      { title: "Replicate over QUIC", description: "Carry the metadata store's raft log over hyper-quic.", examples: "", acceptance: [{ kind: "qualitative", text: "The replication suite passes on three nodes." }], testing: [], basis: ["f1", "f2"] },
+      {
+        title: "Bench with replication on",
+        description: "",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "Fills stay at least 4x ahead of RocksDB." }, { kind: "qualitative", text: "Gets and seeks stay at least 4x ahead of Splinter." }],
+        testing: [],
+        needs: [1],
+        basis: ["f3"],
+      },
+      { title: "Document the replication protocol", description: "", examples: "", acceptance: [], testing: [], needs: [1], basis: ["f1"] },
+    ],
+    tags: ["from a goal"],
+    source: { session: "fam-orch", agent: "Release prep", goal: { agent: "fam-orch", id: "g-quic", text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB" } },
+    share: null,
+    version: 1,
+    created_at: T0 - 3 * 3600,
+    updated_at: T0 - 2 * 3600,
+    steps: ["Replicate over QUIC", "Bench with replication on", "Document the replication protocol"],
+    runs: 1,
+    phase: "planning",
+    research: "rs_quic",
   },
   {
     id: "pl_parser",
@@ -675,6 +772,8 @@ const PLANS = [
     updated_at: T0 - 86_400 * 2,
     steps: ["Read the failing test", "Fix the parser", "Run the suite"],
     runs: 0,
+    phase: "ready",
+    research: null,
   },
   {
     id: "pl_docs",
@@ -689,8 +788,72 @@ const PLANS = [
     updated_at: T0 - 86_400 * 3,
     steps: [],
     runs: 1,
+    phase: "ready",
+    research: null,
   },
 ];
+
+const conf = (score: number, why: string, extra: Record<string, number> = {}) => {
+  const grade = score >= 85 ? "A" : score >= 70 ? "B" : score >= 50 ? "C" : score >= 30 ? "D" : "F";
+  const words = { A: "high", B: "good", C: "moderate", D: "low", F: "very low" }[grade];
+  return { score, grade, words, support: score / 100, against: 0, reliability: 0.9, citation: 1, independent: 2, cites: 2, found: 2, failed: 0, why, ...extra };
+};
+
+/** Research (docs/research.md), as the server answers it: a plan's planning, its findings graded. */
+const RESEARCH = {
+  rs_quic: {
+    id: "rs_quic",
+    question: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
+    agent: "fam-orch",
+    by: "agent:Release prep",
+    plan: "pl_quic",
+    sources: [
+      { id: "s1", type: "code", title: "hyper-raft's log transport", locator: "crates/hyper-raft/src/transport.rs:88-140", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s2", type: "measurement", title: "the replication suite", locator: "cargo test -p meta-store --test replication", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s3", type: "standard", title: "RFC 9000: QUIC", locator: "https://www.rfc-editor.org/rfc/rfc9000#section-2.2", published: "2021-05", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s4", type: "blog", title: "QUIC under load", locator: "https://example.dev/quic-under-load", published: "2023", retrieved_at: Date.now() - 3 * 3600_000 },
+      { id: "s5", type: "forum", title: "a thread on QUIC and head-of-line blocking", locator: "https://forum.example.org/t/4812", published: "2022", retrieved_at: Date.now() - 3 * 3600_000 },
+    ],
+    findings: [
+      {
+        id: "f1",
+        claim: "hyper-raft's log transport takes any stream with ordered delivery, so a QUIC stream carries it as it is.",
+        cites: [
+          { source: "s1", quote: "pub trait LogStream: AsyncRead + AsyncWrite + Unpin + Send", at: "line 88", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+          { source: "s3", quote: "Streams in QUIC provide a lightweight, ordered byte-stream abstraction", check: { state: "found", at: Date.now() - 3 * 3600_000 } },
+        ],
+        against: [],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(98, "2 independent sources (code, a standard); 2 of 2 quotes found where cited"),
+        against_weights: [],
+      },
+      {
+        id: "f2",
+        claim: "The replication suite passes over QUIC on three nodes today.",
+        cites: [{ source: "s2", quote: "test result: ok. 48 passed; 0 failed", check: { state: "found", at: Date.now() - 2 * 3600_000, said: "in the agent's own tool output" } }],
+        against: [],
+        at: Date.now() - 2 * 3600_000,
+        confidence: conf(95, "1 independent source (a measurement); 1 of 1 quotes found where cited", { independent: 1, cites: 1, found: 1, reliability: 0.95 }),
+        against_weights: [],
+      },
+      {
+        id: "f3",
+        claim: "QUIC's per-stream ordering keeps tail latency within 10% of TCP under load.",
+        cites: [
+          { source: "s4", quote: "p99 stayed within 8% of TCP at 40k req/s", check: { state: "not_found", at: Date.now() - 3 * 3600_000, said: "the page doesn't hold those words" } },
+        ],
+        against: [{ claim: "Head-of-line blocking returns when one stream carries everything.", cites: [{ source: "s5", check: { state: "found", at: Date.now() - 3 * 3600_000 } }] }],
+        at: Date.now() - 3 * 3600_000,
+        confidence: conf(13, "1 independent source (a blog); 0 of 1 quotes found where cited, 1 not; 1 counterclaim, the strongest moderate", { independent: 1, cites: 1, found: 0, failed: 1, reliability: 0.5, citation: 0.3, against: 0.2, support: 0.15 }),
+        against_weights: [0.2],
+      },
+    ],
+    skipped: {},
+    summary: { findings: 3, grades: { A: 2, F: 1 }, sources: 5, internal: 2, external: 3, checking: 0 },
+    created_at: Date.now() - 3 * 3600_000,
+    updated_at: Date.now() - 2 * 3600_000,
+  },
+} as Record<string, unknown>;
 
 /* ------------------------------------------------------------------ the rest */
 
@@ -1256,8 +1419,20 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     return (err(res, 404, `no route for ${p}`), true);
   }
 
+  // Research
+  if (p === "/api/research" && m === "GET") return (void json(res, 200, { research: Object.values(RESEARCH) }), true);
+  if ((mm = p.match(/^\/api\/research\/([^/]+)$/)) && m === "GET") {
+    const r = RESEARCH[decodeURIComponent(mm[1]!)];
+    return (r ? json(res, 200, r) : err(res, 404, "no such research"), true);
+  }
   // Plans
-  if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
+  if (p === "/api/plans" && m === "GET") {
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    const session = url.searchParams.get("session");
+    const proposed = url.searchParams.get("proposed") === "1";
+    const of = (pl: (typeof PLANS)[number]) => (pl as { source?: { session?: string; proposed?: boolean } | null }).source;
+    return (void json(res, 200, PLANS.filter((pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed))), true);
+  }
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
     const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
     if (!pl) return (err(res, 404, "no such plan"), true);
@@ -1280,6 +1455,17 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
         true
       );
     return (void json(res, 200, pl), true);
+  }
+  // A plan run (`plans.run`): some of its steps (`only`), as goals split into their criteria and tests (`split`), or an agent each.
+  if ((mm = p.match(/^\/api\/plans\/([^/]+)\/run$/)) && m === "POST") {
+    const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
+    if (!pl) return (err(res, 404, "no such plan"), true);
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { mode?: string; only?: number[]; split?: boolean; session?: string };
+    const n = b.only?.length ?? (pl.items?.length || pl.steps?.length || 0);
+    if (b.mode === "agents") return (void json(res, 200, { run: "pr_agents1", steps: n, note: b.only?.length ? `Not in this run, taken as done: the steps step ${b.only[0]} waits for.` : null }), true);
+    return (void json(res, 200, { session: b.session ?? "fam-orch", sent: n, run: "pr_goals1", split: b.mode === "goals" && b.split ? n : 0 }), true);
   }
   if ((mm = p.match(/^\/api\/shared\/plans\/([^/]+)$/))) {
     const pl = PLANS.find((x) => x.share === decodeURIComponent(mm![1]!));

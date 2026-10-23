@@ -138,6 +138,25 @@ impl Caller {
         capability == SIGNED_IN || [&self.rights, &self.limit].into_iter().all(|r| r.as_ref().is_none_or(|r| r.somewhere(capability)))
     }
 
+    /// What a run it starts records of it (W10-R02's `secrets.use`), so its legs are given only
+    /// the secrets it may use: whom it acts for (their grants read again as each leg starts), or
+    /// the grants it has without a user (a peered cluster's), and a token's own grant as it was
+    /// then (an agent's token is rotated while its run waits). `None` when it may use any (the
+    /// owner, an owner's token without a grant of its own) or is a job, whose run's trust its
+    /// runs share.
+    pub fn started_by(&self) -> Option<serde_json::Value> {
+        if self.kind == Kind::Job || self.is_owner() {
+            return None;
+        }
+        let texts = |r: &Rights| r.grants.iter().map(Grant::text).collect::<Vec<_>>();
+        Some(serde_json::json!({
+            "name": self.name,
+            "user": self.user,
+            "rights": if self.user.is_none() { self.rights.as_ref().map(texts) } else { None },
+            "limit": self.limit.as_ref().map(texts),
+        }))
+    }
+
     /// The grants it holds (a token's: its own), for `/api/me`.
     pub fn grants(&self) -> Option<Vec<String>> {
         let g = |r: &Rights| r.grants.iter().map(Grant::text).collect::<Vec<_>>();
@@ -150,6 +169,16 @@ impl Caller {
 }
 
 // ------------------------------------------------------------------ who
+
+/// The repositories `caller` may `capability` in, by name: what a list narrowed row by row keeps
+/// (W10). `None` when it may anywhere, the server's scope.
+pub async fn readable(hub: &Hub, caller: &Caller, capability: &str) -> Option<Vec<String>> {
+    if caller.can(capability, &Scope::Server) {
+        return None;
+    }
+    let repos = hub.store.repos().await.unwrap_or_default();
+    Some(repos.into_iter().filter(|r| caller.can(capability, &Scope::Repo { repo: r.name.clone() })).map(|r| r.name).collect())
+}
 
 /// The caller of a request the owner didn't make: a token, or a user's session. `None`: nobody
 /// kiln knows (or a token that is revoked or expired).
@@ -191,6 +220,117 @@ pub async fn agent_for(hub: &Hub, name: &str, opener: &str) -> Option<Caller> {
         })
         .await
         .unwrap_or_else(store_err)
+}
+
+/// Of `names`, the secrets the principal a run recorded ([`Caller::started_by`]) may not have
+/// given to its legs in `target` (`secrets.use:<NAME>`): judged by the user it acts for as they
+/// are now (gone or disabled: none), within the grants it started with.
+pub async fn withheld_secrets(hub: &Hub, by: &serde_json::Value, names: Vec<String>, target: &Scope) -> Vec<String> {
+    // Several principals (a land queue batch's landers): what any of them may not have.
+    let each: Vec<&serde_json::Value> = match by.get("all").and_then(serde_json::Value::as_array) {
+        Some(all) => all.iter().collect(),
+        None => vec![by],
+    };
+    let mut out: Vec<String> = Vec::new();
+    for one in each {
+        for n in withheld_from(hub, one, names.clone(), target).await {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// [`withheld_secrets`] for one principal.
+async fn withheld_from(hub: &Hub, by: &serde_json::Value, names: Vec<String>, target: &Scope) -> Vec<String> {
+    let grants = |k: &str| by.get(k).and_then(serde_json::Value::as_array).map(|l| l.iter().filter_map(|g| g.as_str().and_then(|t| Grant::parse(t).ok())).collect::<Vec<_>>());
+    let (user, rights, limit) = (by.get("user").and_then(serde_json::Value::as_str).map(str::to_owned), grants("rights"), grants("limit"));
+    let target = target.clone();
+    let all = names.clone();
+    hub.store
+        .call(move |c| {
+            let custom = custom_roles(c)?;
+            let live = match &user {
+                Some(uid) => match user_rights(c, uid)? {
+                    Some((_, r)) => Some(r),
+                    None => return Ok(names),
+                },
+                None => rights.map(|grants| Rights { grants, custom: custom.clone() }),
+            };
+            let limit = limit.map(|grants| Rights { grants, custom });
+            Ok(names.into_iter().filter(|n| ![&live, &limit].into_iter().flatten().all(|r| r.allows(&format!("secrets.use:{n}"), &target))).collect())
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "whose secrets these are could not be read; the leg gets none");
+            all
+        })
+}
+
+/// Whether the principal a run recorded ([`Caller::started_by`]) may `capability` at `target`, as
+/// [`withheld_secrets`] judges a secret: by the user it acts for as they are now (gone or
+/// disabled: no), within the grants it started with; every one of a batch's (`all`).
+pub async fn starter_may(hub: &Hub, by: &serde_json::Value, capability: &str, target: &Scope) -> bool {
+    let each: Vec<&serde_json::Value> = match by.get("all").and_then(serde_json::Value::as_array) {
+        Some(all) => all.iter().collect(),
+        None => vec![by],
+    };
+    for one in each {
+        let grants = |k: &str| one.get(k).and_then(serde_json::Value::as_array).map(|l| l.iter().filter_map(|g| g.as_str().and_then(|t| Grant::parse(t).ok())).collect::<Vec<_>>());
+        let (user, rights, limit) = (one.get("user").and_then(serde_json::Value::as_str).map(str::to_owned), grants("rights"), grants("limit"));
+        let (what, target) = (capability.to_owned(), target.clone());
+        let may = hub
+            .store
+            .call(move |c| {
+                let custom = custom_roles(c)?;
+                let live = match &user {
+                    Some(uid) => match user_rights(c, uid)? {
+                        Some((_, r)) => Some(r),
+                        None => return Ok(false),
+                    },
+                    None => rights.map(|grants| Rights { grants, custom: custom.clone() }),
+                };
+                let limit = limit.map(|grants| Rights { grants, custom });
+                Ok([&live, &limit].into_iter().flatten().all(|r| r.allows(&what, &target)))
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %format!("{e:#}"), "what a run's starter may do could not be read; taken as nothing");
+                false
+            });
+        if !may {
+            return false;
+        }
+    }
+    true
+}
+
+/// User `id` as a caller, as they are now (disabled or gone: none): who something they said
+/// elsewhere acts as (a reply to kiln's review email, or in a chat's thread: docs/ci.md W14-R05).
+pub async fn user_caller(hub: &Hub, id: &str) -> Option<Caller> {
+    let id = id.to_owned();
+    hub.store
+        .call(move |c| {
+            Ok(user_rights(c, &id)?.map(|(name, rights)| Caller {
+                kind: Kind::User,
+                name: format!("user:{name}"),
+                user: Some(id.clone()),
+                token: None,
+                agent: None,
+                rights: Some(rights),
+                limit: None,
+            }))
+        })
+        .await
+        .unwrap_or_else(store_err)
+}
+
+/// Whether user `id`, as they are now, may `capability` in `target` (disabled or gone: no): what a
+/// person's own notification rules are held to (W19-R06).
+pub async fn user_may(hub: &Hub, id: &str, capability: &str, target: &Scope) -> bool {
+    let (id, capability, target) = (id.to_owned(), capability.to_owned(), target.clone());
+    hub.store.call(move |c| Ok(user_rights(c, &id)?.is_some_and(|(_, r)| r.allows(&capability, &target)))).await.unwrap_or(false)
 }
 
 /// Whether anyone but the owner can sign in here.

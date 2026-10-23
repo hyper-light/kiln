@@ -305,10 +305,10 @@ mod tests {
             seq: 7,
             at: 1_000,
             changes: vec![
-                StepChange { path: "new.rs".into(), to: file_v("a"), base: None },
-                StepChange { path: "old.rs".into(), to: file_v("b"), base: file_v("c") },
-                StepChange { path: "gone.rs".into(), to: None, base: file_v("d") },
-                StepChange { path: "link".into(), to: Some(Version::Link { target: "x".into() }), base: None },
+                StepChange { path: "new.rs".into(), to: file_v("a"), base: None, bundle: None },
+                StepChange { path: "old.rs".into(), to: file_v("b"), base: file_v("c"), bundle: None },
+                StepChange { path: "gone.rs".into(), to: None, base: file_v("d"), bundle: None },
+                StepChange { path: "link".into(), to: Some(Version::Link { target: "x".into() }), base: None, bundle: None },
             ],
         };
         let decisions = vec![Decision::Take, Decision::Beside(Some("old.conflict-mac-20261019-120000.rs".into())), Decision::Same, Decision::Refuse];
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn a_big_step_lists_some_files_and_counts_them_all() {
-        let changes: Vec<StepChange> = (0..FILES + 5).map(|i| StepChange { path: format!("f{i}"), to: file_v("h"), base: None }).collect();
+        let changes: Vec<StepChange> = (0..FILES + 5).map(|i| StepChange { path: format!("f{i}"), to: file_v("h"), base: None, bundle: None }).collect();
         let decisions = vec![Decision::Take; changes.len()];
         let e = step_event(1, &Step { by: "mac".into(), member: 2, seq: 1, at: 0, changes }, &decisions, None, |_| Some(1));
         assert_eq!(e.files.len(), FILES);

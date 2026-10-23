@@ -1,0 +1,16 @@
+name: Storage clients (W08-AC01)
+description: The published @actions/cache and @actions/artifact against kiln's runtime services, one operation a step.
+inputs:
+  op: { description: "save, restore, upload, list, download or delete", required: true }
+  key: { description: The cache key, required: false }
+  paths: { description: The cache's paths, one a line, required: false }
+  restore-keys: { description: Prefixes to restore by, one a line, required: false }
+  name: { description: The artifact's name, required: false }
+  root: { description: The directory whose files an upload takes, required: false }
+  id: { description: An artifact's id, to download it by, required: false }
+  to: { description: Where a download goes, required: false }
+outputs:
+  id: { description: The uploaded artifact's id }
+runs:
+  using: node24
+  main: dist/main.mjs

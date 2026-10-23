@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 # Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md;
 # so are Quiver, Focal's bus and hyper-raft (vendor/MANIFEST.toml), each a workspace of its own.
-exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "bench/kilndb"]
+exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"
@@ -25,6 +25,12 @@ unreachable = "deny"
 indexing_slicing = "deny"
 exit = "deny"
 type_complexity = "allow"
+
+# Debug builds hash with optimized SHA-256. A server hashes its own (debug: over a GiB) binary as
+# it starts, on one of its shards, and the content store hashes every chunk: unoptimized, that alone
+# kept test servers from answering within a minute on a loaded machine.
+[profile.dev.package.sha2]
+opt-level = 3
 
 # SQLite (the store's engine, built from C by rusqlite's libsqlite3-sys) optimized in dev and test
 # builds too: unoptimized, a store's migrations alone took a scratch hub 75 ms; optimized, about 20

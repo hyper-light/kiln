@@ -1,6 +1,7 @@
 import * as React from "react";
-import { ArrowRight, KeyRound, LockKeyhole } from "lucide-react";
+import { ArrowRight, Fingerprint, KeyRound, LockKeyhole, UserRound } from "lucide-react";
 import { ApiError, api } from "@/api/client";
+import { passkeysHere, signin, type SsoProvider } from "@/api/signin";
 import { Brand } from "@/components/shell/brand";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
@@ -26,10 +27,13 @@ function clearLinkProblem() {
   window.history.replaceState(null, "", url.pathname + url.search + url.hash);
 }
 
-type Methods = { password: boolean; token: boolean };
+type Methods = { password: boolean; token: boolean; passkey: boolean; people: boolean; sso: SsoProvider[] };
 
 /** How this server signs people in. An older server, or one out of reach: the token always works. */
-const readMethods = (signal: AbortSignal): Promise<Methods> => api.authMethods(signal).catch(() => ({ password: false, token: true }));
+const readMethods = async (signal: AbortSignal): Promise<Methods> => {
+  const [m, sso] = await Promise.all([api.authMethods(signal).catch(() => ({ password: false, token: true })), signin.sso(signal).catch(() => [])]);
+  return { passkey: false, people: false, ...m, sso };
+};
 
 export function Login({ error, onRetry }: { error?: string; onRetry: () => void }) {
   const retry = () => {
@@ -75,12 +79,19 @@ function SignInLoaded({ error, onRetry }: { error?: string; onRetry: () => void 
 function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: string; onRetry: () => void }) {
   const loading = methods === null;
   const hasPassword = methods?.password ?? null;
-  const [mode, setMode] = React.useState<Mode>(methods?.password === false ? "token" : "password");
+  // A password signs in when the owner keeps one or any person does (with their name).
+  const anyPassword = Boolean(methods?.password || methods?.people);
+  const [mode, setMode] = React.useState<Mode>(methods && !anyPassword ? "token" : "password");
   const [secret, setSecret] = React.useState("");
+  const [name, setName] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   const [notice] = React.useState(linkProblem);
   const inputRef = React.useRef<HTMLInputElement>(null);
+  // People with passwords of their own sign in with their name (W10); passkeys and hosts beside.
+  const people = mode === "password" && (methods?.people ?? false);
+  const byPasskey = (methods?.passkey ?? false) && passkeysHere();
+  const sso = methods?.sso ?? [];
 
   const switchMode = (m: Mode) => {
     setMode(m);
@@ -96,13 +107,27 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
     setBusy(true);
     setErr(null);
     try {
-      if (mode === "password") await api.loginPassword(value);
+      if (people && name.trim()) await signin.withName(name.trim(), value);
+      else if (mode === "password") await api.loginPassword(value);
       else await api.login(value);
       clearLinkProblem();
     } catch (e2) {
       const status = e2 instanceof ApiError ? e2.status : (e2 as { status?: number }).status;
-      if (status === 401) setErr(mode === "password" ? "Wrong password." : "That token was not accepted.");
+      if (status === 401) setErr(mode === "password" ? (people && name.trim() ? "Wrong name or password." : "Wrong password.") : "That token was not accepted.");
       else setErr(errorMessage(e2));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const withPasskey = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await signin.withPasskey();
+      clearLinkProblem();
+    } catch (e2) {
+      setErr(e2 instanceof DOMException && e2.name === "NotAllowedError" ? "No passkey was used: it was cancelled, or this device has none of this server's." : errorMessage(e2));
     } finally {
       setBusy(false);
     }
@@ -135,8 +160,31 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
       )}
 
       <form onSubmit={submit} className="mt-9 max-w-[440px]" autoComplete="on">
-        {/* Lets password managers file the password under a username. */}
-        <input type="text" name="username" autoComplete="username" value="admin" readOnly tabIndex={-1} aria-hidden="true" className="sr-only" />
+        {people ? (
+          <div className="mb-4">
+            <label htmlFor="who" className="field-label">
+              Name
+            </label>
+            <div className="field">
+              <UserRound size={15} aria-hidden="true" />
+              <input
+                id="who"
+                name="username"
+                type="text"
+                autoComplete="username"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                placeholder={hasPassword ? "Yours in kiln; empty for the owner" : "Yours in kiln"}
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
+          </div>
+        ) : (
+          /* Lets password managers file the password under a username. */
+          <input type="text" name="username" autoComplete="username" value="admin" readOnly tabIndex={-1} aria-hidden="true" className="sr-only" />
+        )}
         <label htmlFor="secret" className="field-label">
           {mode === "password" ? "Password" : "Admin token"}
         </label>
@@ -159,10 +207,10 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
           />
         </div>
         <div className="mt-5 flex flex-wrap items-center gap-3">
-          <Button type="submit" disabled={busy || loading || !secret.trim()}>
+          <Button type="submit" disabled={busy || loading || !secret.trim() || (people && !hasPassword && !name.trim())}>
             {busy ? "Signing in…" : "Sign in"} <ArrowRight size={16} />
           </Button>
-          {hasPassword && (
+          {anyPassword && (
             <Button type="button" variant="ghost" onClick={() => switchMode(mode === "password" ? "token" : "password")}>
               {mode === "password" ? "Use the admin token" : "Use your password"}
             </Button>
@@ -179,6 +227,24 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
           </div>
         )}
       </form>
+
+      {!loading && (byPasskey || sso.length > 0) && (
+        <div className="mt-8 max-w-[440px]">
+          <div className="font-mono text-[10px] tracking-[0.14em] text-[#858891] uppercase">Or</div>
+          <div className="mt-3 flex flex-wrap gap-3">
+            {byPasskey && (
+              <Button type="button" variant="secondary" disabled={busy} onClick={() => void withPasskey()}>
+                <Fingerprint size={16} aria-hidden="true" /> Sign in with a passkey
+              </Button>
+            )}
+            {sso.map((p) => (
+              <Button key={p.provider} asChild variant="secondary">
+                <a href={p.start}>Continue with {p.name}</a>
+              </Button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {mode === "token" && !loading && (
         <details className="mt-8 max-w-[440px] text-[13px] leading-[1.75] text-[#a1a4ad]">

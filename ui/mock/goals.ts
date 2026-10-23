@@ -11,6 +11,7 @@
  */
 import type http from "node:http";
 import type { GoalItem, GoalStack } from "../src/api/harness.ts";
+import { planning } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -55,30 +56,73 @@ const stacks = new Map<string, Kept>([
           started_at: t0,
           ended_at: t0 + 3600_000,
         },
-        // Split by the agent (`goals_split`): its parts first, then it comes back for its own check.
+        // Planned (`goals_plan`): its planning, then its plan's steps as its parts (the second split into
+        // its acceptance criteria and tests); met once they all are.
+        {
+          id: "g-quic-plan",
+          text: 'Plan "QUIC replication" (plan pl_quic, research rs_quic) is ready: researched inside and outside, its steps written, and said ready',
+          status: "met",
+          reason: "the agent said so: the plan is ready",
+          how: "goal",
+          part_of: "g-quic",
+          part_kind: "planning",
+          started_at: t0 + 3600_000,
+          ended_at: t0 + 3600_000 + 40 * 60_000,
+        },
         {
           id: "g-quic-1",
-          text: "The QUIC transport passes the replication suite on three nodes",
+          text: 'Step 1 of 3 of the plan "QUIC replication": The QUIC transport passes the replication suite on three nodes',
           status: "met",
           reason: "the agent said so: replication suite 48/48 on three nodes",
           how: "goal",
           part_of: "g-quic",
-          started_at: t0 + 3600_000,
+          part_kind: "plan",
+          step: { plan: "pl_quic", version: 1, n: 1 },
+          started_at: t0 + 3600_000 + 40 * 60_000,
           ended_at: t0 + 2 * 3600_000,
         },
         {
-          id: "g-quic-2",
-          text: "Fills, gets and seeks stay at least 4x ahead of Splinter and RocksDB with replication on",
+          id: "g-quic-2a",
+          text: '"Bench with replication" (step 2 of the plan "QUIC replication"), acceptance criterion 1 of 2: fills stay at least 4x ahead of RocksDB',
+          status: "met",
+          reason: "the agent said so: 4.6x on fills (bench run 212)",
+          how: "goal",
+          part_of: "g-quic-2",
+          part_kind: "checks",
+          started_at: t0 + 2 * 3600_000,
+          ended_at: t0 + 2 * 3600_000 + 20 * 60_000,
+        },
+        {
+          id: "g-quic-2b",
+          text: '"Bench with replication" (step 2 of the plan "QUIC replication"), acceptance criterion 2 of 2: gets and seeks stay at least 4x ahead of Splinter',
           status: "active",
           how: "goal",
-          part_of: "g-quic",
-          started_at: t0 + 2 * 3600_000,
+          part_of: "g-quic-2",
+          part_kind: "checks",
+          started_at: t0 + 2 * 3600_000 + 20 * 60_000,
           reminded_at: Date.now() - 4 * 60_000,
+        },
+        {
+          id: "g-quic-2",
+          text: 'Step 2 of 3 of the plan "QUIC replication": Bench with replication on — Done when: fills stay at least 4x ahead of RocksDB; gets and seeks stay at least 4x ahead of Splinter',
+          status: "pending",
+          part_of: "g-quic",
+          part_kind: "plan",
+          step: { plan: "pl_quic", version: 1, n: 2 },
+        },
+        {
+          id: "g-quic-3",
+          text: 'Step 3 of 3 of the plan "QUIC replication": Document the replication protocol',
+          status: "pending",
+          part_of: "g-quic",
+          part_kind: "plan",
+          step: { plan: "pl_quic", version: 1, n: 3 },
         },
         {
           id: "g-quic",
           text: "Add full hyperaraft dual UDP/QUIC stack replication to our metadata store without impacting the 4-5x lead on Splinter and RocksDB",
           status: "pending",
+          planned_as: "pl_quic",
         },
         {
           id: "g-store",
@@ -232,6 +276,25 @@ export async function handleGoals(req: http.IncomingMessage, res: http.ServerRes
   } else if (!action && method === "PUT") {
     const b = await body<{ goals?: { id?: string; text: string }[] }>(req);
     if (set(s, b.goals ?? [])) push(s);
+  } else if (action === "plan" && method === "POST") {
+    // Turned into a plan: planning it goes first, a part of it, and the goal waits after it.
+    const b = await body<{ id?: string }>(req);
+    const goal = s.items.find((i) => i.id === b.id) ?? s.items.find((i) => i.status === "active");
+    if (!goal) return (json(res, 400, { error: "no goal to plan" }), true);
+    const plan = planning({ agent, id: goal.id, text: goal.text });
+    const part: GoalItem = {
+      id: `g_${Math.random().toString(36).slice(2, 8)}`,
+      text: `Plan "${goal.text.slice(0, 60)}": research it inside and outside, write its steps, say it's ready`,
+      status: goal.status === "active" ? "active" : "pending",
+      part_of: goal.id,
+      part_kind: "planning",
+    };
+    if (goal.status === "active") goal.status = "pending";
+    goal.planned_as = plan;
+    s.items.splice(s.items.indexOf(goal), 0, part);
+    s.updated_at = Date.now();
+    json(res, 200, { plan, research: "", goal: goal.id, part: part.id });
+    return true;
   } else if (action && method === "POST") {
     const why = control(s, action);
     if (why) {

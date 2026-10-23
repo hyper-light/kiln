@@ -1,0 +1,18 @@
+# The kubesec starter's manifest (it scans `file.yaml`).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fixture
+spec:
+  containers:
+    - name: fixture
+      image: alpine:3.20
+      command: ["sleep", "3600"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        readOnlyRootFilesystem: true
+      resources:
+        limits:
+          cpu: 100m
+          memory: 64Mi

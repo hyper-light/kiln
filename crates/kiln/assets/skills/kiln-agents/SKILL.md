@@ -5,7 +5,7 @@ description: Hand parts of your work to other coding agents through kiln (any ha
 
 # Agents that run agents
 
-kiln runs coding agents (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, Antigravity) on
+kiln runs coding agents (Claude Code, Codex, Devin, Gemini CLI, opencode, Goose, Amp, Antigravity) on
 every machine it has. You can start some yourself: each is your **child**, works on its own,
 and reports back. The tools are `agents_start`, `agents_wait`, `agents_result`, `agents_send`,
 `agents_list`, `agents_get`, `agents_children`, `agents_interrupt`, `agents_stop`,
@@ -60,13 +60,20 @@ return { waited: done.agents.map(x => ({ id: x.id, stand: x.stand })),
 **You don't have to wait.** Once your children are started, carry on with other work, or end your
 turn: kiln tells you, in a message after your turn, when each one ends its turn (with its last
 words), needs a person, stops or ends, and starts your next turn with it if you're idle. Children
-that settle together come in one message. Then read what one concluded with `agents_result`.
+that settle together come in one message, and while your turn goes on that message is all that
+waits for you: a child that settles again changes its line in it, so a long turn ends with each
+child's latest news, once. What you saw yourself (`agents_wait`, `agents_result`) comes out of it.
+Then read what one concluded with `agents_result`.
 
 Wait only when you can't go on without a result: `agents_wait` returns when each agent has
 **settled** (idle, needs a person, paused for a usage
 limit, stopped, or ended), or when its time is up (`timeout_s`, at most 600: call it again to
 wait longer). `until: "change"` returns on any change; `any: true` when the first is done. A
-message you just sent counts: an agent isn't settled until it has had its turn.
+message you just sent counts: an agent isn't settled until it has had its turn. A wait also
+returns as soon as another agent's message is in your queue: it comes back in `messages` (who sent
+it, `from` and `name`, and its `text`) and is out of your queue, so answer it now if it needs an
+answer, then wait again. A program's wait in code mode leaves them queued unless it passes
+`hand_over: true`; then return `messages` from the program, or they're lost.
 
 Each agent comes back with its `stand`:
 

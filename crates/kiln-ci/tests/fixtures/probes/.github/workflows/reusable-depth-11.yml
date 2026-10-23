@@ -1,0 +1,6 @@
+# F-22 (docs/ci.md W22-AC03, A.8): 11 levels of workflows, this caller among them (make_reusable.py).
+name: probe reusable depth 11
+on: [push, workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/r01.yml

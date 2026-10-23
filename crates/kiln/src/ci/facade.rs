@@ -69,7 +69,7 @@ pub(crate) struct Cgi<'a> {
 
 /// What `git http-backend` answers, its request body `prefix` and then, when given, the rest of
 /// the request as it arrives (a push's pack, never held whole).
-pub(crate) async fn backend(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<hyper::body::Incoming>) -> Result<Response, Fail> {
+pub(crate) async fn backend(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<kiln_http::Incoming>) -> Result<Response, Fail> {
     let a = run(cgi, prefix, rest).await?;
     let mut r = srv::response(a.status, &a.content_type, srv::channel_body(a.body));
     for (k, v) in a.extra {
@@ -103,7 +103,7 @@ impl Answer {
 }
 
 /// Runs `git http-backend` for `cgi`: [`backend`]'s, its answer not yet a response.
-pub(crate) async fn run(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<hyper::body::Incoming>) -> Result<Answer, Fail> {
+pub(crate) async fn run(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<kiln_http::Incoming>) -> Result<Answer, Fail> {
     let header = |h: &str| cgi.headers.get(h).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let mut cmd = Command::new("git");
     for c in cgi.configs {

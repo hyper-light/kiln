@@ -109,7 +109,7 @@ async fn control(cx: Cx, v: Value) -> Out {
         return Err((StatusCode::BAD_REQUEST, "`why`, `resume_in_s` and `resume_at` go with pause".into()));
     }
     let by = By::of(&cx.hub, &cx.caller, &agent);
-    let s = super::control_as(&cx.hub, &agent, action, &by, Pausing { why: opt(&v, "why"), until }).await.map_err(fail)?;
+    let s = super::control_as(&cx.hub, &agent, action, &by, Pausing { why: opt(&v, "why"), until, review: None }).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.control".into(), format!("{agent}: {action:?}")).await;
     json_of(&s)
 }
@@ -132,6 +132,17 @@ async fn update(cx: Cx, v: Value) -> Out {
     let s = super::update(&cx.hub, &agent, &id, change, &by).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.update".into(), format!("{agent}: {id}")).await;
     json_of(&s)
+}
+
+/// What an agent does once its goal has become a plan.
+const PLANNING: &str = "Plan it now, in this order. 1. Research it, inside and outside, and record what you find as you go (research_add, with this research's id): inside, the files on your machine and on others (code, docs, data, pictures, frames of video) and kiln's own records (conversations_search, plans, CI runs, deployments); outside, the web, official docs and standards, papers (arXiv, Semantic Scholar, Crossref, PubMed), blogs and forums. Each finding is a claim with its citations (the source, the exact words you quote, where they are) and any counterclaims you found. kiln looks for each quote where you say it is and grades each finding: describe the evidence, never the grade. 2. Write the plan's steps (plans_update with the plan's id: `items`, each with what to do, its acceptance criteria, its tests, the steps it waits for in `needs`, and the findings it rests on in `basis`). 3. Say it's ready (plans_ready, with `then`: `goals` to carry on here with its steps as this goal's parts, `agents` to run it with an agent per step, `review` to pause for the person to look first). It answers with the research, graded: show it to the person in your reply, as it is, every claim with its sources and grade. Once every step is met, so is the goal.";
+
+async fn plan(cx: Cx, v: Value) -> Out {
+    let agent = agent_of(&v)?;
+    crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
+    let p = super::plan(&cx.hub, &agent, opt(&v, "id").as_deref(), opt(&v, "title").as_deref(), &cx.caller.name).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.plan".into(), format!("{agent}: {} as plan {}", p.goal, p.plan)).await;
+    Ok(json!({"plan": p.plan, "research": p.research, "goal": p.goal, "part": p.part, "next": PLANNING}))
 }
 
 async fn split(cx: Cx, v: Value) -> Out {
@@ -252,6 +263,24 @@ pub fn list_ops() -> Vec<Op> {
             },
             route: |v| Ok((Method::PATCH, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", &opt(v, "id").unwrap_or_default()]))),
             run: |cx, v| Box::pin(update(cx, v)),
+        },
+        Op {
+            name: "goals.plan",
+            summary: "Turn a goal (the one under way, or the one `id` names) into a plan kiln keeps: a plan in its planning phase (the goal's words its brief) and its research. The goal gets one part first, planning it: research it inside and outside (research_add: each claim with its sources and the words quoted; kiln grades each), write its steps (plans_update: acceptance criteria, tests, `needs`, and the findings each rests on in `basis`), present the research with its sources and grades (research_get's markdown), then say it's ready (plans_ready). Its steps then become the goal's parts (or run with an agent each), and once every one is met, so is the goal.",
+            read_only: false,
+            destructive: false,
+            input: || {
+                schema(
+                    json!({
+                        "agent": {"type": "string", "description": AGENT},
+                        "id": {"type": "string", "description": "The goal to plan; left out, the goal under way."},
+                        "title": {"type": "string", "description": "The plan's title (left out: from the goal's words)."}
+                    }),
+                    &[],
+                )
+            },
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "plan"]))),
+            run: |cx, v| Box::pin(plan(cx, v)),
         },
         Op {
             name: "goals.split",

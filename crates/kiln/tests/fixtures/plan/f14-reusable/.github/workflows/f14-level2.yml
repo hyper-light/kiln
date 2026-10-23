@@ -1,0 +1,17 @@
+# F-14's second level.
+name: level2
+on:
+  workflow_call:
+    inputs:
+      prefix:
+        type: string
+        required: true
+    outputs:
+      answer:
+        value: ${{ jobs.leaf.outputs.answer }}
+jobs:
+  leaf:
+    uses: ./.github/workflows/f14-level3.yml
+    with:
+      prefix: ${{ inputs.prefix }}
+    secrets: inherit

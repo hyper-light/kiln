@@ -157,6 +157,12 @@ fn github(req: &Req, port: u16) -> Answer {
             None,
         ),
         ("GET", "/repos/acme/gh/pulls/5/reviews") if token => (200, json!([{ "user": { "login": "bob" }, "state": "APPROVED", "body": "", "submitted_at": "2026-10-18T12:03:00Z" }]), None),
+        // Its review threads' state, which only GraphQL says.
+        ("POST", "/graphql") if token => (
+            200,
+            json!({ "data": { "repository": { "pullRequest": { "reviewThreads": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [{ "isResolved": true, "comments": { "nodes": [{ "databaseId": 21 }] } }] } } } } }),
+            None,
+        ),
         ("GET", "/repos/acme/gh") if token => (200, json!({ "allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": false }), None),
         ("POST", "/repos/acme/gh/pulls/5/comments") if token => (201, json!({ "id": 23 }), None),
         ("POST", "/repos/acme/gh/pulls/5/reviews") if token => (200, json!({ "id": 31 }), None),
@@ -522,6 +528,8 @@ fn w23_r06_pulls() -> anyhow::Result<()> {
         assert!(v.pointer("/files/0/patch").and_then(Value::as_str).is_some_and(|p| p.contains("@@")) && v.get("checks").is_some(), "{repo}: {v}");
     }
     assert!(call("GET", "/api/ci/repos/acme%2Fgh/pulls/5", None)?.1.pointer("/conversation/0/body") == Some(&json!("looks good")));
+    // GitHub's threads' resolved state, from its GraphQL; GitLab's from its discussions.
+    assert_eq!(call("GET", "/api/ci/repos/acme%2Fgh/pulls/5", None)?.1.pointer("/threads/0/resolved"), Some(&json!(true)));
     assert!(call("GET", "/api/ci/repos/acme%2Fgl/pulls/3", None)?.1.pointer("/conversation/0/body") == Some(&json!("thanks")));
 
     // A comment on a line, a review, a merge: on each host, by its own calls.

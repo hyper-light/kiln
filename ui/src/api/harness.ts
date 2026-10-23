@@ -350,6 +350,8 @@ export interface State {
   pause?: Pause;
   /** It pauses once a limit is this full (percent): between turns, or at the next step of one under way; absent: only when one is reached. */
   pause_at?: number;
+  /** The most subagents it runs at once: its harness's own, and the agents it starts through kiln (absent: no limit of its own). */
+  max_subagents?: number;
   /** How its last turn ended (what kiln's keep-going reads). */
   last_turn?: TurnEnd;
   /** Turns in a row kiln started to keep it going, since a person last said something. */
@@ -416,6 +418,7 @@ export interface ModelOption {
   id: string;
   label: string;
   description?: string;
+  default?: boolean;
   /** The effort levels it takes, lowest first (when the harness says). */
   efforts?: string[];
 }
@@ -457,6 +460,14 @@ export interface GoalItem {
   part_of?: string;
   /** The plan step it was made from (`n` from 1). */
   step?: { plan: string; version: number; n: number; run?: string };
+  /** The agent it's under way on, handed to it (a program's coordinator's goal, its track's worker's: docs/programs.md). */
+  on?: string;
+  /** Who made it a part: the agent (`own`: its goal comes back for its own check), or kiln (`checks`, `plan`, `planning`, `run`: its goal is met once they all are). */
+  part_kind?: "own" | "checks" | "plan" | "planning" | "run";
+  /** The plan it became. */
+  planned_as?: string;
+  /** The plan run it waits for. */
+  waits_on?: string;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */
@@ -613,6 +624,16 @@ export interface TurnEnd {
   kept?: number;
 }
 
+/** Goals an agent paused for you, until you resume them (`AgentInfo.held`). */
+export interface Held {
+  /** Why, as its goal stack says it ("Paused by the agent: …"). */
+  why: string;
+  /** The plan it waits for you to look at first, when that's why. */
+  plan?: string;
+  /** Unix ms it paused. */
+  since: number;
+}
+
 export interface AgentInfo {
   id: string;
   kind: string;
@@ -641,12 +662,16 @@ export interface AgentInfo {
   pause?: Pause;
   /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
   keep_off?: boolean;
+  /** Its goals wait on you: it paused them for you, until you resume them (set on the server). */
+  held?: Held;
   /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
   move_on_limit?: boolean;
   /** Where it goes on then (as `State.move_plan`). */
   move_plan?: MovePlan;
   /** Where it pauses as its limits fill (as `State.pause_at`). */
   pause_at?: number;
+  /** The most subagents it runs at once (as `State.max_subagents`). */
+  max_subagents?: number;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -797,6 +822,8 @@ export type Command =
   | { type: "auto_resume"; on: boolean }
   /** Pause once a limit is this full (null: only when one is reached). */
   | { type: "pause_at"; percent: number | null }
+  /** The most subagents it runs at once (null: no limit of its own). */
+  | { type: "max_subagents"; count: number | null }
   /** Whether at a limit it goes on on another machine with room, and where (`MovePlan`). */
   | ({ type: "move_on_limit"; on: boolean } & MovePlan);
 
@@ -955,6 +982,8 @@ export const harnessApi = {
   addGoals: (id: string, goals: string[], start = false) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start }),
   /** Start (or resume), pause, skip the goal under way, clear, or bring back the goals cleared last. */
   goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
+  /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
+  planGoal: (id: string, goal: string) => call<{ plan: string; research: string; goal: string; part: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/plan`, { id: goal }),
   /** The terminals beside an agent (its shell, its harness's own screen), live ones first. */
   terminals: (id: string) => call<BesideTerminal[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`),
   /** Open one beside it: its shell (the one already open, with `command` run in it), or its harness's own screen on `command`. */

@@ -358,7 +358,8 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     let program = stand_in(dir.path())?;
-    let s = common::start_with_agents(dir.path(), &Options::default())?;
+    // Terminals on, and so agent sessions: the server's own.
+    let s = common::start(dir.path(), &Options { extra: "[terminal]\nenabled = true\n", ..Options::default() })?;
     let (port, admin) = (s.port, s.admin.clone());
     let (target, _runner) = match runner {
         None => ("local".to_owned(), None),

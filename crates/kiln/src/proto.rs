@@ -171,9 +171,16 @@ pub enum AgentMsg {
     PortData { conn: u64, data: Vec<u8> },
     /// The runner took `bytes` more of what the server sent connection `conn`.
     PortAck { conn: u64, bytes: u64 },
-    /// Connection `conn`'s port ended it (or it failed: `error`). Appended last: postcard encodes
-    /// variants by index.
+    /// Connection `conn`'s port ended it (or it failed: `error`).
     PortClose { conn: u64, error: Option<String> },
+    /// CI: one of a pool's executors this runner was asked to start is ready, or failed (JSON
+    /// `crate::runner::pool::Said`, docs/ci.md W13-R09). Only from runners announcing
+    /// [`CAP_POOLS`]. Appended last: postcard encodes variants by index.
+    Executor { json: String },
+    /// CI: a deployment it was asked to take down ([`ServerMsg::Undeploy`]) is gone, or why it
+    /// couldn't be (JSON `kiln_ci::wire::Undeployed`). Appended last: postcard encodes variants
+    /// by index.
+    Undeployed { json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -260,6 +267,17 @@ pub const CAP_ENGINES: u32 = 1 << 26;
 /// [`AgentMsg::Build`] capability: the runner answers questions about its agents' folders and
 /// pushes their work for review ([`ServerMsg::Workspace`], `crate::workspace`).
 pub const CAP_WORKSPACE: u32 = 1 << 27;
+/// The runner starts a pool's executors when asked ([`ServerMsg::Executor`], docs/ci.md W13-R09).
+/// Clear of every bit above (1 << 21 is `CAP_DOCTOR`, 1 << 22 `CAP_FILES`, 1 << 23 `CAP_STREAM`,
+/// 1 << 24 `CAP_PREVIEW`, 1 << 25 `CAP_PORTS`, 1 << 26 `CAP_ENGINES`, 1 << 27 `CAP_WORKSPACE`).
+pub const CAP_POOLS: u32 = 1 << 28;
+/// [`AgentMsg::Build`] capability: the runner keeps a job's result and its events (each with its
+/// `seq`) until the server says it has the result ([`ServerMsg::Received`]), and sends them again
+/// after a reconnect, so what was in flight as the connection dropped isn't lost.
+pub const CAP_RECEIVED: u32 = 1 << 29;
+/// The runner takes down a deployment it made when its environment goes ([`ServerMsg::Undeploy`],
+/// docs/ci.md W15-R07), and says so ([`AgentMsg::Undeployed`]).
+pub const CAP_UNDEPLOY: u32 = 1 << 30;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -461,13 +479,27 @@ pub enum ServerMsg {
     /// The server took `bytes` more of what connection `conn`'s runner sent: it may send that many
     /// more (`crate::browser::ports::WINDOW`).
     PortAck { conn: u64, session: String, bytes: u64 },
-    /// Connection `conn` is done with. Appended last: postcard encodes variants by index.
+    /// Connection `conn` is done with.
     PortClose { conn: u64, session: String },
     /// A question about agent session `session`'s folder (`json` a [`crate::workspace::Ask`]: its
     /// repository, or a commit of the agent's work pushed for review), answered by
     /// [`AgentMsg::Answer`]. Only to runners announcing [`CAP_WORKSPACE`]. Appended last: postcard
     /// encodes variants by index.
     Workspace { req: u64, session: String, json: String },
+    /// CI: start or stop one of a pool's executors (JSON `crate::runner::pool::Ask`, docs/ci.md
+    /// W13-R09). Only to runners announcing [`CAP_POOLS`]. Appended last: postcard encodes
+    /// variants by index.
+    Executor { json: String },
+    /// The server has job `job`'s result ([`AgentMsg::JobFinished`]): the runner forgets it and
+    /// the job's events. With no `job`, said as the server hears the runner's capabilities: it
+    /// takes each event once (by its `seq`), so the runner may send them again after a reconnect.
+    /// Only to runners announcing [`CAP_RECEIVED`]. Appended last: postcard encodes variants by
+    /// index.
+    Received { job: String },
+    /// CI: take down a deployment this runner made (JSON `kiln_ci::wire::Undeploy`, docs/ci.md
+    /// W15-R07): its environment, a preview, went. Only to runners announcing [`CAP_UNDEPLOY`].
+    /// Appended last: postcard encodes variants by index.
+    Undeploy { json: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -765,6 +797,50 @@ mod tests {
         }
         assert!(CAP_STREAM.is_power_of_two() && CAP_STREAM > CAP_FILES && CAP_STREAM < 1 << 24);
         assert!(LANE_STREAM == 8 && LANE_STREAM < crate::net::limits(true).lanes_per_peer, "a lane past the first eight, within what a peer allows");
+        Ok(())
+    }
+
+    #[test]
+    fn pool_executors_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Workspace { req: 1, session: "s".into(), json: "{}".into() })?;
+        let start = ServerMsg::Executor { json: "{}".into() };
+        let b = encode(&start)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Executor comes right after Workspace");
+        assert_eq!(decode::<ServerMsg>(&b)?, start);
+        let last_agent = encode(&AgentMsg::PortClose { conn: 1, error: None })?;
+        let said = AgentMsg::Executor { json: "{}".into() };
+        let b = encode(&said)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Executor comes right after PortClose");
+        assert_eq!(decode::<AgentMsg>(&b)?, said);
+        let others = CAP_WORKSPACE | CAP_ENGINES | CAP_PORTS | CAP_PREVIEW | CAP_STREAM | CAP_FILES | CAP_DOCTOR | CAP_CONVO | CAP_DOCKER_ROOTLESS | CAP_REACH | CAP_REPOS | CAP_JOB_TTY | CAP_FACTS | CAP_SHARDS | CAP_FIRECRACKER | CAP_DOCKER | CAP_ACTIONS | CAP_CI2;
+        assert!(CAP_POOLS.is_power_of_two() && CAP_POOLS & others == 0, "CAP_POOLS is a bit of its own");
+        Ok(())
+    }
+
+    #[test]
+    fn receipts_are_appended_after_pool_executors() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::Executor { json: "{}".into() })?;
+        let got = ServerMsg::Received { job: "j".into() };
+        let b = encode(&got)?;
+        assert_eq!(b.first().copied(), last.first().map(|n| n + 1), "ServerMsg::Received comes right after Executor");
+        assert_eq!(decode::<ServerMsg>(&b)?, got);
+        assert!(CAP_RECEIVED.is_power_of_two() && CAP_RECEIVED > CAP_POOLS);
+        Ok(())
+    }
+
+    #[test]
+    fn undeploys_are_appended_after_receipts_and_executors() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::Received { job: "j".into() })?;
+        let ask = ServerMsg::Undeploy { json: "{}".into() };
+        let b = encode(&ask)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Undeploy comes right after Received");
+        assert_eq!(decode::<ServerMsg>(&b)?, ask);
+        let last_agent = encode(&AgentMsg::Executor { json: "{}".into() })?;
+        let said = AgentMsg::Undeployed { json: "{}".into() };
+        let b = encode(&said)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Undeployed comes right after Executor");
+        assert_eq!(decode::<AgentMsg>(&b)?, said);
+        assert!(CAP_UNDEPLOY.is_power_of_two() && CAP_UNDEPLOY > CAP_RECEIVED);
         Ok(())
     }
 

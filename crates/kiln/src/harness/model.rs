@@ -1057,6 +1057,11 @@ pub struct State {
     /// limit cuts a turn off. None: only when a limit is reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The most subagents it runs at once (Agent settings): its harness's own, and the agents it
+    /// starts through kiln, each. None: as many as its harness and kiln's `[agents] max_children`
+    /// let it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// A pause ends only when a person resumes it, not by itself at the reset.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manual_resume: bool,
@@ -1468,6 +1473,11 @@ pub enum Command {
         #[serde(default)]
         percent: Option<u8>,
     },
+    /// The most subagents it runs at once (`State::max_subagents`). None: no limit of its own.
+    MaxSubagents {
+        #[serde(default)]
+        count: Option<u32>,
+    },
     /// Whether at a usage limit it goes on on another machine with room (`State::move_on_limit`),
     /// and where (`State::move_plan`): a machine (`agent:<name>`), a harness and a model there.
     MoveOnLimit {
@@ -1479,8 +1489,8 @@ pub enum Command {
         #[serde(default)]
         model: Option<String>,
     },
-    /// Another session on the same account reached a usage limit: wait for its reset too (the
-    /// server sends it).
+    /// Another session on the same account reached a usage limit: wait for its reset too, if its
+    /// own usage says the limit is its own as well (the server sends it; `pause::account_hold`).
     LimitHold {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window: Option<String>,

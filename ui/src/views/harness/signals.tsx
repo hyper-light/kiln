@@ -42,8 +42,68 @@ export function PrismLabel({ live = false, sweep = false, className, children }:
 }
 
 /** What says a subagent is running, the prism sweeping through its words (`on`: else as it is; signals.css). */
-export function Shimmer({ on, className, children }: { on: boolean; className?: string; children: React.ReactNode }) {
-  return <span className={cn(className, on && "sg-shimmer")}>{children}</span>;
+/**
+ * The prism through a word while its work goes on. `flow`: whose work (an agent's or a task's id):
+ * the sweep goes its own way for it ([`flowOf`]), so many at once move as one field, none in step.
+ */
+export function Shimmer({ on, className, children, flow }: { on: boolean; className?: string; children: React.ReactNode; flow?: string }) {
+  return (
+    <span className={cn(className, on && "sg-shimmer")} style={on && flow ? flowOf(flow) : undefined}>
+      {children}
+    </span>
+  );
+}
+
+const flows = new Map<string, React.CSSProperties>();
+
+/**
+ * One working thing's own way through the shimmer, from its id (the same every time), so that
+ * side by side each is plainly its own: its lead colour of the prism; a wash of three of them or
+ * one bright glint passing over its colour; sweeping back and forth or drifting steadily one way
+ * or the other; its pace, where in it it is, the light's angle and how deep its colours. Paces are
+ * steps of one beat (1.5 s) and colours all the prism's, so together they read as one field.
+ */
+export function flowOf(seed: string): React.CSSProperties {
+  const kept = flows.get(seed);
+  if (kept) return kept;
+  // FNV-1a of the id, then mulberry32 from it: a few even draws, the same for the same id.
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i += 1) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  let t = h >>> 0;
+  const draw = () => {
+    t = (t + 0x6d2b79f5) >>> 0;
+    let x = Math.imul(t ^ (t >>> 15), 1 | t);
+    x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = (n: number) => Math.min(n - 1, Math.floor(draw() * n));
+  const lead = pick(PRISM.length);
+  const c = (k: number) => PRISM[(lead + k) % PRISM.length] ?? "#b8a6d5";
+  const angle = Math.round(60 + draw() * 80);
+  // A wash of three of the prism's colours, or one bright glint over its own.
+  const glint = draw() < 0.4;
+  const image = glint
+    ? `linear-gradient(${angle}deg, ${c(0)} 0%, ${c(0)} 36%, ${c(2)} 50%, ${c(0)} 64%, ${c(0)} 100%)`
+    : `linear-gradient(${angle}deg, ${c(0)} 0%, ${c(1)} 25%, ${c(2)} 50%, ${c(1)} 75%, ${c(0)} 100%)`;
+  // Sweeping back and forth, or drifting one way or the other without end.
+  const motion = pick(3);
+  const dur = 1.5 * (2 + pick(5));
+  const flow = {
+    "--sg-image": image,
+    "--sg-motion": motion === 0 ? "sg-shimmer-sweep" : "sg-shimmer-drift",
+    "--sg-dir": motion === 0 ? (draw() < 0.5 ? "alternate" : "alternate-reverse") : motion === 1 ? "normal" : "reverse",
+    "--sg-ease": motion === 0 ? "ease-in-out" : "linear",
+    "--sg-size": motion === 0 ? `${Math.round(220 + draw() * 180)}%` : "200%",
+    "--sg-dur": `${dur}s`,
+    "--sg-delay": `${(-draw() * dur * 2).toFixed(2)}s`,
+    "--sg-depth": (0.9 + draw() * 0.45).toFixed(2),
+  } as React.CSSProperties;
+  if (flows.size > 2000) flows.clear();
+  flows.set(seed, flow);
+  return flow;
 }
 
 /** "<1s", "12s", "1m 05s", "1h 02m". */

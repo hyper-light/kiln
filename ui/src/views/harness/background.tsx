@@ -318,7 +318,7 @@ function ActivityItem({ t, store, mixed, shown, onShow, onOpenTask }: { t: Task;
       <div className="al-head">
         <button type="button" className="al-row" aria-expanded={thread ? undefined : shown} onClick={() => (thread ? onOpenTask(thread) : onShow())}>
           {sub ? (
-            <Shimmer on={t.status === "running"} className="al-glyph">
+            <Shimmer on={t.status === "running"} flow={t.id} className="al-glyph">
               <KindGlyph kind="agent" pending={t.status === "pending"} />
             </Shimmer>
           ) : (

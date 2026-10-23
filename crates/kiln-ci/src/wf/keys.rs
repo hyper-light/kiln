@@ -337,7 +337,8 @@ pub const JOB: &[Key] = &[
     kiln("attest", Ty::Any, "kiln: provenance and SBOMs (W18-R01)."),
     kiln("quarantine", Ty::Str, "kiln: `enforce` (W16-R05)."),
     kiln("bench-gate", Ty::Any, "kiln: fail on benchmark regressions (W16-R09)."),
-    kiln_only("deploy", Ty::Any, "kiln: `{ app, environment }` (W15-R05)."),
+    kiln_only("deploy", Ty::Any, "kiln: `{ app, environment, revision, wait, timeout }`: deploy after the job's steps (W15-R05)."),
+    kiln("test-results", Ty::Any, "kiln: `discover`: after its steps, the test reports it wrote where tools usually write them (W16-R01)."),
     kiln("agents", Ty::Any, "kiln: what attached agents may do with this job (W20-R09)."),
     kiln_only("artifacts", Ty::StrList, "kiln v1: files to keep after the job."),
     kiln_only("checkout", Ty::Bool, "kiln: `false` skips the implicit checkout."),
@@ -357,7 +358,7 @@ pub const WORKFLOW: &[Key] = &[
     kiln("supersede", Ty::Any, "kiln: cancel or deprioritize older runs (W05-R08)."),
     kiln("routing", Ty::Any, "kiln: `{ infer: true }` (W05-R19)."),
     kiln_only("run-env", Ty::Bool, "kiln: collect `$KILN_RUN_ENV` into `run.env` (W04-R21)."),
-    kiln("kiln", Ty::Any, "kiln: `{ honour-skip-ci }` (W03-R06)."),
+    kiln("kiln", Ty::Any, "kiln: `{ honour-skip-ci, chain-depth }` (W03-R06, R13)."),
     kiln_only("checkout", Ty::Bool, "kiln: `false` turns the implicit checkout off."),
 ];
 

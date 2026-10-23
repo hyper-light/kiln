@@ -25,7 +25,7 @@ use crate::proto::{self, AgentMsg, Assignment, Hello, JobResult, LANE_CONTROL, L
 use crate::store::{AgentRow, Job, Status, Store};
 
 /// How long a persistent agent may be gone before its jobs are requeued.
-const AGENT_GRACE: Duration = Duration::from_secs(45);
+pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
 const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 /// Host samples kept per agent for the UI charts (1 h at 5 s).
@@ -171,6 +171,11 @@ pub struct Hub {
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
     pub ephemeral_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    /// One-time enrollment tokens for a `k8s` pool's executor pods (docs/ci.md W13-R07): token →
+    /// (executor, the pod's name, which the runner must take, expiry).
+    pub executor_tokens: Mutex<HashMap<String, (String, String, Instant)>>,
+    /// The executor each executor pod's runner is, by the name it enrolled with.
+    pub pod_executors: Mutex<HashMap<String, String>>,
     /// One-time outpost invites (`POST /api/outposts/invite`).
     pub outpost_invites: OutpostInvites,
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
@@ -285,6 +290,8 @@ impl Hub {
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
+            executor_tokens: Mutex::new(HashMap::new()),
+            pod_executors: Mutex::new(HashMap::new()),
             outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
@@ -909,6 +916,12 @@ impl Hub {
         self.peers.lock().get(&peer).cloned()
     }
 
+    /// Whether `job` is one of the CI engine's legs: one it knows, or, while it rebuilds its runs
+    /// after a restart (knowing none yet), one the store has (its message waits for it then).
+    async fn ci_leg(&self, job: &str) -> bool {
+        self.ci.is_leg(job) || (self.ci.enabled() && self.ci.restored().is_none() && self.store.ci_legs(vec![job.to_owned()]).await.is_ok_and(|l| l.contains(job)))
+    }
+
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
         // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
@@ -1044,12 +1057,17 @@ impl Hub {
             }
             AgentMsg::JobSample { .. } => {}
             AgentMsg::JobFinished(r) => {
+                let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
-                    if self.ci.is_leg(&r.job) {
+                    if self.ci_leg(&r.job).await {
                         self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
                     } else {
                         self.job_done(&agent, r).await?;
                     }
+                }
+                // Heard (taken, or not this runner's to give any more): it needn't send it again.
+                if self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_RECEIVED != 0) {
+                    self.send_peer(peer, &ServerMsg::Received { job }).await;
                 }
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
@@ -1135,6 +1153,11 @@ impl Hub {
             AgentMsg::PortClose { conn, error } => self.harness.ports.ended(&agent, conn, error),
             AgentMsg::Build { build, caps } => {
                 self.instances.lock().set_build(peer, build.clone(), caps);
+                // It may send its legs' events and results again after a reconnect: they're taken
+                // once (a receipt without a job says so).
+                if caps & proto::CAP_RECEIVED != 0 {
+                    self.send_peer(peer, &ServerMsg::Received { job: String::new() }).await;
+                }
                 self.updates.on_build(self, &agent, &build);
                 self.updates.fleet.wake();
                 self.emit(&serde_json::json!({ "type": "updates" }));
@@ -1148,6 +1171,11 @@ impl Hub {
                 }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
+                // Previews' deployments it's left to take down (docs/ci.md W15-R07).
+                if caps & proto::CAP_UNDEPLOY != 0 {
+                    let (hub, agent) = (Arc::clone(self), agent.clone());
+                    crate::rt::spawn(async move { crate::ci::previews::runner_up(&hub, &agent).await });
+                }
             }
             AgentMsg::UpdatePrefs { accept } => {
                 self.updates.fleet.set_accept(&agent, accept);
@@ -1186,6 +1214,10 @@ impl Hub {
                     self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json });
                 }
             }
+            // A pool's executor it was asked to start (docs/ci.md W13-R09).
+            AgentMsg::Executor { json } => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.clone(), json }),
+            // A preview's deployment it was asked to take down (docs/ci.md W15-R07).
+            AgentMsg::Undeployed { json } => crate::ci::previews::undeployed(self, &agent, &json).await,
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {
@@ -1395,8 +1427,23 @@ impl Hub {
                 self.emit_job(&j.id).await;
             }
         }
+        // Until the CI engine has rebuilt its runs after a restart it knows none of its legs: those
+        // the runner says it has are its own still, for the dispatcher to re-adopt or stop once it
+        // has (`dispatch::spawn`), never taken back as v1's jobs (which would cancel them).
+        let rebuilding = if self.ci.enabled() && self.ci.restored().is_none() {
+            let said: Vec<String> = h.running.iter().filter(|j| !keep.contains(j)).cloned().collect();
+            self.store.ci_legs(said).await.unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
         for j in &h.running {
             if keep.contains(j) {
+                continue;
+            }
+            // CI's legs are the dispatcher's to re-adopt, or to stop if they were given up while
+            // the runner was away (`Msg::RunnerUp` below, W05-R05).
+            if self.ci.is_leg(j) || rebuilding.contains(j) {
+                keep.push(j.clone());
                 continue;
             }
             // The server requeued this job while the agent was away, but the agent kept working:
@@ -1748,6 +1795,9 @@ impl Hub {
                 slow = Instant::now();
                 self.check_timeouts().await?;
                 self.check_lost_agents().await;
+                crate::ci::notify::runners_gone(&self);
+                crate::ci::notify::secrets_unused(&self);
+                crate::ci::notify::quarantined(&self);
             }
         }
     }
@@ -2092,6 +2142,7 @@ impl Hub {
             }
         // Expire unused pod enrollment tokens.
         self.ephemeral_tokens.lock().retain(|_, (_, exp)| *exp > Instant::now());
+        self.executor_tokens.lock().retain(|_, (_, _, exp)| *exp > Instant::now());
     }
 
     /// Sample the server host itself for the UI ("server" series).

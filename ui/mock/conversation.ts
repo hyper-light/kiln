@@ -472,6 +472,8 @@ const limits = (): State["limits"] =>
 let offlineUntil = Date.now() + Number(process.env.MOCK_OFFLINE_MS ?? 0);
 const offline = () => Date.now() < offlineUntil;
 let pauseAt: number | undefined;
+/** The most subagents it runs at once (`max_subagents`). */
+let maxSubagents: number | undefined;
 let moveOn = false;
 /** Where it goes on at a limit (`State.move_plan`). */
 let movePlan: { to?: string; kind?: string; model?: string } = {};
@@ -533,6 +535,7 @@ let lastTurn: State["last_turn"];
 const state = (): State => ({
   status: offline() ? "disconnected" : running ? "running" : "idle",
   pause_at: pauseAt,
+  max_subagents: maxSubagents,
   ...(OLD_RUNNER ? {} : { move_on_limit: moveOn, move_plan: { ...movePlan } }),
   doing: running ? doing : undefined,
   turn_started: running ? turnStarted : undefined,
@@ -733,7 +736,7 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
   };
   go(0);
   ws.on("message", (raw) => {
-    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; on?: boolean; to?: string; kind?: string };
+    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; count?: number | null; on?: boolean; to?: string; kind?: string };
     try {
       c = JSON.parse(raw.toString()) as typeof c;
     } catch {
@@ -747,6 +750,9 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
     if (c.type === "pause_at") {
       pauseAt = c.percent ?? undefined;
       if (c.percent === null) stopOff = true;
+    } else if (c.type === "max_subagents") {
+      maxSubagents = c.count ?? undefined;
+      broadcast({ t: "state", state: state() });
     } else if (c.type === "resume" && PAUSED) {
       // A runner from before a stop point could be resumed past: it stops again at once, unless
       // the stop point is off. A newer one goes on.

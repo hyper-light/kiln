@@ -21,6 +21,10 @@ use crate::store::Repo;
 /// also by their path).
 pub async fn files(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> HashMap<String, Arc<Workflow>> {
     let mut out: HashMap<String, Arc<Workflow>> = HashMap::new();
+    // A workflow that calls none (most do) needs nothing read: no git for its run to start.
+    if calls(wf).is_empty() {
+        return out;
+    }
     match load::load(hub, repo, sha).await {
         Ok(commit) => {
             for l in commit.workflows {
@@ -60,7 +64,7 @@ fn calls(wf: &Workflow) -> Vec<String> {
 /// A remote reusable workflow at its pinned commit.
 async fn remote(hub: &Hub, r: &Remote) -> anyhow::Result<Workflow> {
     let sha = actions::pin(hub, r).await?;
-    let mirror = actions::mirror(hub, &r.owner, &r.repo).to_string_lossy().to_string();
+    let mirror = r.mirror(hub).to_string_lossy().to_string();
     let src = gitops::run_git(hub, &["-C", &mirror, "show", &format!("{sha}:{}", r.path)], std::time::Duration::from_secs(60)).await?;
     let text = String::from_utf8_lossy(&src).into_owned();
     let (w, diags) = kiln_ci::wf::parse_workflow(&r.path, &text, Dialect::Gha);

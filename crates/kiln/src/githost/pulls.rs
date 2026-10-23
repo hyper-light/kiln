@@ -88,6 +88,41 @@ fn at(v: &Value, p: &str) -> Option<i64> {
     crate::ci::providers::unix(v.pointer(p))
 }
 
+/// Whether each of a GitHub pull request's review threads is resolved, by its first comment's id:
+/// only GitHub's GraphQL says (docs/ci.md W23-R06). Empty when it won't (an older Enterprise
+/// Server, a token without it), and the threads are said to be of unknown state.
+async fn gh_resolved(app: &github::App, token: &str, name: &str, number: u64) -> HashMap<String, bool> {
+    let mut out = HashMap::new();
+    let Some((owner, repo)) = name.split_once('/') else { return out };
+    let query = "query($owner: String!, $name: String!, $n: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $n) { reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { isResolved comments(first: 1) { nodes { databaseId } } } } } } }";
+    let mut after = Value::Null;
+    for _ in 0..10 {
+        let body = json!({ "query": query, "variables": { "owner": owner, "name": repo, "n": number, "after": after } });
+        let page = match app.call(Method::Post, &app.graphql_url(), github::Auth::Token(token), Some(&body)).await {
+            Ok((200, v)) if v.get("errors").is_none() => v,
+            Ok((code, v)) => {
+                tracing::debug!(repo = name, code, said = %github::said(&v), "GitHub's review threads' state isn't known");
+                return out;
+            }
+            Err(e) => {
+                tracing::debug!(repo = name, error = %format!("{e:#}"), "GitHub's review threads' state isn't known");
+                return out;
+            }
+        };
+        let threads = page.pointer("/data/repository/pullRequest/reviewThreads").cloned().unwrap_or_default();
+        for t in threads.get("nodes").and_then(Value::as_array).into_iter().flatten() {
+            if let (Some(first), Some(resolved)) = (t.pointer("/comments/nodes/0/databaseId"), t.get("isResolved").and_then(Value::as_bool)) {
+                out.insert(first.to_string(), resolved);
+            }
+        }
+        if threads.pointer("/pageInfo/hasNextPage") != Some(&json!(true)) {
+            break;
+        }
+        after = threads.pointer("/pageInfo/endCursor").cloned().unwrap_or_default();
+    }
+    out
+}
+
 /// Every page of a GitHub list (100 at a time), up to 1,000 items.
 async fn gh_all(app: &github::App, token: &str, path: &str) -> anyhow::Result<Vec<Value>> {
     let mut out = Vec::new();
@@ -293,13 +328,20 @@ pub async fn get(hub: &Hub, repo: &Repo, number: u64) -> anyhow::Result<Value> {
                 .map(|c| comment_json(&c.get("id").map(Value::to_string).unwrap_or_default(), &st(c, "/user/login"), &st(c, "/body"), at(c, "/created_at")))
                 .collect();
             let inline = gh_all(&app, &t, &format!("/repos/{name}/pulls/{number}/comments")).await?;
+            let resolved = if inline.is_empty() { HashMap::new() } else { gh_resolved(&app, &t, &name, number).await };
             let threads = threads(
                 inline
                     .iter()
                     .map(|c| {
                         let id = c.get("id").map(Value::to_string).unwrap_or_default();
                         let place = c.get("line").or_else(|| c.get("original_line")).and_then(Value::as_u64).map(|line| Line { path: st(c, "/path"), line, left: st(c, "/side") == "LEFT" });
-                        (id.clone(), c.get("in_reply_to_id").filter(|r| !r.is_null()).map(Value::to_string), place, None, comment_json(&id, &st(c, "/user/login"), &st(c, "/body"), at(c, "/created_at")))
+                        (
+                            id.clone(),
+                            c.get("in_reply_to_id").filter(|r| !r.is_null()).map(Value::to_string),
+                            place,
+                            resolved.get(&id).copied(),
+                            comment_json(&id, &st(c, "/user/login"), &st(c, "/body"), at(c, "/created_at")),
+                        )
                     })
                     .collect(),
             );

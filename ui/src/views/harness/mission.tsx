@@ -20,6 +20,7 @@ import { useAgentsLive } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { heldWords } from "./cards";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
@@ -38,7 +39,7 @@ import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
 import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
-import { subagentRunning, subagentsAtWork, throughSubagents } from "./tasks";
+import { subagentsAtWork, throughSubagents } from "./tasks";
 
 /** A phone: the page's head is one line, and the message box folds. */
 const PHONE = "(max-width: 640px)";
@@ -59,6 +60,7 @@ function lineOf(a: AgentInfo, stand: Stand): string {
   switch (stand) {
     case "needs": {
       const ap = a.approvals[0];
+      if (!ap && a.held) return heldWords(a.held.why) ? `Paused its goals for you: ${heldWords(a.held.why)}` : "Paused its goals for you";
       if (!ap) return "Waiting for you";
       const more = a.approvals.length > 1 ? ` (+${a.approvals.length - 1} more)` : "";
       return ap.tool === "question" ? `Asks: ${ap.title}${more}` : ap.tool === "plan" ? `Proposes a plan${more}` : `${ap.tool_name || ap.tool}: ${ap.title}${more}`;
@@ -87,23 +89,47 @@ function lineOf(a: AgentInfo, stand: Stand): string {
 /** Answered at once (answered.ts): the row moves on now; if the answer doesn't go, it's back. */
 function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
   const decide = (decision: "allow" | "deny") => void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => toast.error("Couldn't answer", errorMessage(e)));
-  if (ap.tool === "question" || ap.tool === "plan")
+  if (ap.tool === "question")
     return (
       <Button size="xs" asChild>
-        <Link to={`/agents/${a.id}`}>{ap.tool === "plan" ? "Review the plan" : "Answer"}</Link>
+        <Link to={`/agents/${a.id}`}>Answer</Link>
+      </Button>
+    );
+  // A plan it proposes is approved here; to keep it planning (with what to change), review it on its page.
+  return (
+    <>
+      <Button size="xs" onClick={() => decide("allow")}>
+        {ap.tool === "plan" ? "Approve" : "Allow"}
+      </Button>
+      {ap.tool !== "plan" && (
+        <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
+          Deny
+        </Button>
+      )}
+      <Link to={`/agents/${a.id}`} className="ms-link">
+        Review
+      </Link>
+    </>
+  );
+}
+
+/** Goals it paused for you: the plan they wait on to look at, and Resume. */
+function HeldDecide({ a }: { a: AgentInfo }) {
+  const resume = () => void harnessApi.goalAction(a.id, "start").catch((e: unknown) => toast.error("Couldn't resume its goals", errorMessage(e)));
+  if (!a.held?.plan)
+    return (
+      <Button size="xs" onClick={resume}>
+        Resume
       </Button>
     );
   return (
     <>
-      <Button size="xs" onClick={() => decide("allow")}>
-        Allow
+      <Button size="xs" asChild>
+        <Link to={`/agents/plans/${a.held.plan}`}>Review the plan</Link>
       </Button>
-      <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
-        Deny
+      <Button size="xs" variant="secondary" onClick={resume}>
+        Resume
       </Button>
-      <Link to={`/agents/${a.id}`} className="ms-link">
-        Review
-      </Link>
     </>
   );
 }
@@ -122,8 +148,8 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
   const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
   const line = (
     <span className="ms-line">
-      {/* A subagent of its own running: the prism sweeps through its word. */}
-      <Shimmer on={stand === "working" && subagentRunning(a.subagents)} className="ms-word">
+      {/* Working: the prism flows through its word, each agent's its own way, so the list moves as one field. */}
+      <Shimmer on={stand === "working"} flow={a.id} className="ms-word">
         <i aria-hidden="true" />
         {WORD[stand]}
       </Shimmer>
@@ -168,6 +194,7 @@ const Row = React.memo(function Row({ a, stand, selected, picking, onSelect }: {
         {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
         <span className="ms-decide">
           {stand === "needs" && ap && <Decide a={a} ap={ap} />}
+          {stand === "needs" && !ap && a.held && <HeldDecide a={a} />}
           {stand === "paused" && (
             <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>
               Resume
@@ -281,7 +308,13 @@ export default function Mission() {
                 <Link to="/agents/plans">Plans</Link>
               </Button>
               <Button asChild variant="ghost" size="xs">
+                <Link to="/agents/programs">Programs</Link>
+              </Button>
+              <Button asChild variant="ghost" size="xs">
                 <Link to="/agents/attached">Attached</Link>
+              </Button>
+              <Button asChild variant="ghost" size="xs">
+                <Link to="/agents/experiments">Experiments</Link>
               </Button>
               <Button size="icon" aria-label="New agents" title="New agents" onClick={() => setSpawn(true)}>
                 <Plus />
@@ -293,7 +326,13 @@ export default function Mission() {
                 <Link to="/agents/plans">Plans</Link>
               </Button>
               <Button asChild variant="secondary">
+                <Link to="/agents/programs">Programs</Link>
+              </Button>
+              <Button asChild variant="secondary">
                 <Link to="/agents/attached">Attached</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link to="/agents/experiments">Experiments</Link>
               </Button>
               <Button onClick={() => setSpawn(true)}>
                 New agents <Plus />

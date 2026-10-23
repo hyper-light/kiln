@@ -97,18 +97,19 @@ export function testSentence(t: PlanTest): string {
   return scenario && pass ? `${scenario} — passes when ${pass}` : scenario || pass;
 }
 
+/** What a step is, as markdown under no heading: what to do, examples, acceptance criteria, tests. */
+export function itemDetail(it: PlanItem): string {
+  const parts: string[] = [];
+  if (it.description.trim()) parts.push(it.description.trim());
+  if (it.examples.trim()) parts.push(`**Examples**\n\n${it.examples.trim()}`);
+  if (it.acceptance.length) parts.push(`**Acceptance criteria**\n\n${it.acceptance.map((c) => `- ${criterionSentence(c)}`).join("\n")}`);
+  if (it.testing.length) parts.push(`**Tests**\n\n${it.testing.map((t) => `- ${testSentence(t)}`).join("\n")}`);
+  return parts.join("\n\n");
+}
+
 /** A plan's steps as markdown, each under its own heading (crates/kiln/src/plans `markdown`). */
 export function itemsMarkdown(items: readonly PlanItem[]): string {
-  return items
-    .map((it, i) => {
-      const parts = [`## ${i + 1}. ${it.title.trim()}`];
-      if (it.description.trim()) parts.push(it.description.trim());
-      if (it.examples.trim()) parts.push(`**Examples**\n\n${it.examples.trim()}`);
-      if (it.acceptance.length) parts.push(`**Acceptance criteria**\n\n${it.acceptance.map((c) => `- ${criterionSentence(c)}`).join("\n")}`);
-      if (it.testing.length) parts.push(`**Tests**\n\n${it.testing.map((t) => `- ${testSentence(t)}`).join("\n")}`);
-      return parts.join("\n\n");
-    })
-    .join("\n\n");
+  return items.map((it, i) => [`## ${i + 1}. ${it.title.trim()}`, itemDetail(it)].filter(Boolean).join("\n\n")).join("\n\n");
 }
 
 /** A plan as one markdown file: its title as the heading, its text, then its items. */

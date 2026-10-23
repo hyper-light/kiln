@@ -24,6 +24,8 @@ import { discoveryRes, joinRequestsRes } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
 import { BatteryLine, LowBattery } from "./battery";
+import { ImagesPanel, PoolsPanel } from "./runners-pools";
+import { useAuth } from "@/lib/auth";
 
 /** The facets runners are filtered by, with each runner's values. */
 function facetValues(a: Agent): Record<string, string[]> {
@@ -67,6 +69,8 @@ function Intro({ lead }: { lead: React.ReactNode }) {
 export default function Runners() {
   const [params] = useSearchParams();
   // Old links (`?join=1`) opened a dialog; adding machines has its own page now.
+  // Pools for those who read the whole fleet; edited by those who manage them (W13-R09).
+  const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
   if (params.get("join") === "1") return <Navigate to="/runners/add" replace />;
   return (
     <div className="container-console page">
@@ -74,6 +78,18 @@ export default function Runners() {
       <Loadable label="the runners" fallback={<RunnersHold />}>
         <RunnersBody />
       </Loadable>
+      {(!can || can["runners.read"] === "server") && (
+        <>
+          <Loadable label="the pools" fallback={<Hold height={120} />}>
+            <PoolsPanel manage={!can || can["pools.manage"] === "server"} />
+          </Loadable>
+          {(!can || can["runs.read"] === "server") && (
+            <Loadable label="the images" fallback={<Hold height={120} />}>
+              <ImagesPanel />
+            </Loadable>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -239,6 +255,8 @@ function RunnersBody() {
                       <td className="hidden md:table-cell">
                         <Chips labels={a.labels} max={4} />
                       </td>
+                      {/* What it can run legs in, as it last probed (W21-R08). */}
+                      <td className="cell-mono hidden lg:table-cell">{a.facts ? Object.keys(a.facts.executors).join(", ") || "—" : "—"}</td>
                       <td className="min-w-[90px]">
                         {a.outpost ? (
                           // Kiln run there without installing it: its terminals and agents, no jobs.
@@ -281,7 +299,7 @@ function RunnersBody() {
                     </tr>
                     {open && (
                       <tr className="runner-detail-row">
-                        <td colSpan={10}>{details(a)}</td>
+                        <td colSpan={11}>{details(a)}</td>
                       </tr>
                     )}
                   </React.Fragment>
@@ -339,6 +357,7 @@ function RunnersHead() {
         <th className="w-6" aria-label="State" />
         <th>Runner</th>
         <th className="hidden md:table-cell">Labels</th>
+        <th className="hidden lg:table-cell">Executors</th>
         <th>Slots</th>
         <th className="num hidden sm:table-cell">CPU</th>
         <th className="num hidden lg:table-cell">Mem</th>

@@ -1,0 +1,8 @@
+{"server":"kiln-http","user_s":16.82,"sys_s":4.75,"mode":"h2","conns":64,"threads":8,"depth":1,"streams":100,"secs":5,"requests":65946800,"rps":13189360,"errors":0,"p50_us":475.1,"p90_us":573.4,"p99_us":639.0,"p999_us":1310.7,"max_us":2315.0}
+{"server":"hyper-tokio","user_s":14.33,"sys_s":5.49,"mode":"h2","conns":64,"threads":8,"depth":1,"streams":100,"secs":5,"requests":6565729,"rps":1313146,"errors":0,"p50_us":933.9,"p90_us":15990.8,"p99_us":26738.7,"p999_us":35651.6,"max_us":52907.1}
+{"server":"kiln-http","user_s":16.45,"sys_s":4.73,"mode":"h2","conns":64,"threads":8,"depth":1,"streams":100,"secs":5,"requests":66246000,"rps":13249200,"errors":0,"p50_us":466.9,"p90_us":639.0,"p99_us":802.8,"p999_us":1835.0,"max_us":4596.1}
+{"server":"hyper-tokio","user_s":14.06,"sys_s":5.64,"mode":"h2","conns":64,"threads":8,"depth":1,"streams":100,"secs":5,"requests":6595661,"rps":1319132,"errors":0,"p50_us":950.3,"p90_us":15990.8,"p99_us":26738.7,"p999_us":34603.0,"max_us":50241.1}
+{"server":"kiln-http","user_s":16.91,"sys_s":4.74,"mode":"h2","conns":64,"threads":8,"depth":1,"streams":100,"secs":5,"requests":62227800,"rps":12445560,"errors":0,"p50_us":557.1,"p90_us":589.8,"p99_us":639.0,"p999_us":1146.9,"max_us":2305.4}
+{"server":"hyper-tokio","user_s":14.24,"sys_s":5.90,"mode":"h2","conns":64,"threads":8,"depth":1,"streams":100,"secs":5,"requests":6728703,"rps":1345741,"errors":0,"p50_us":933.9,"p90_us":15466.5,"p99_us":26214.4,"p999_us":33554.4,"max_us":44757.0}
+{"server":"kiln-http","user_s":0.12,"sys_s":0.63,"mode":"idle-h2","conns":20000,"rss_before_kib":45052,"rss_after_kib":93616,"bytes_per_conn":2486}
+{"server":"hyper-tokio","user_s":0.29,"sys_s":0.94,"mode":"idle-h2","conns":20000,"rss_before_kib":3716,"rss_after_kib":394028,"bytes_per_conn":19984}

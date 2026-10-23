@@ -1,6 +1,8 @@
 //! Scheduler tests (docs/ci.md W05-AC01 to AC06, AC10, W05-S01 to S04), on the simulator.
 
 use super::groups::GroupConfig;
+use super::pools::PoolSpec;
+use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
@@ -15,6 +17,7 @@ fn linux(name: &str, slots: u32) -> RunnerIn {
         view: RunnerView { name: name.into(), labels: vec!["k8s".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, caps: 1 << 10, pool: None },
         slots,
         capacity: None,
+        executor: None,
     }
 }
 
@@ -309,4 +312,307 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
+}
+
+// ------------------------------------------------------------------ pools (W13-R09, W05-R27)
+
+fn docker_host(name: &str) -> RunnerIn {
+    let mut r = linux(name, 2);
+    r.view.labels = vec!["linux".into()];
+    r.view.facts.executors.insert("docker".into(), crate::facts::Executor::default());
+    r
+}
+
+fn pool(min_idle: usize, max: usize, per_host_max: usize, idle: &str) -> Result<super::pools::Pool, String> {
+    PoolSpec {
+        name: "burst".into(),
+        executor: "docker".into(),
+        hosts: Some("executors contains docker".into()),
+        image: Some("kiln/runner-ubuntu-24.04".into()),
+        labels: vec!["burst".into(), "linux".into()],
+        min_idle,
+        max: Some(max),
+        per_host_max: Some(per_host_max),
+        idle_timeout: Some(idle.into()),
+        ..PoolSpec::default()
+    }
+    .pool()
+}
+
+fn pool_leg(id: &str) -> LegIn {
+    LegIn { id: id.into(), run: "run-burst".into(), repo: "acme/x".into(), route: LegRoute { labels: vec!["burst".into()], ..LegRoute::default() }, priority: 50, ..LegIn::default() }
+}
+
+fn counts(sim: &Sim) -> (usize, usize, usize) {
+    sim.sched.pools().first().map_or((0, 0, 0), |p| (p.starting, p.idle, p.busy))
+}
+
+/// A pool keeps `min_idle` executors ready, a leg of its labels runs in one (which is then
+/// discarded), on the hosts its `hosts` names only, and the host's own slots stay its own.
+#[test]
+fn w13_r09_pool_runs_legs_in_its_executors() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pool(2, 4, 4, "10m")?], ..Config::default() });
+    sim.runner(0, docker_host("d1"));
+    sim.runner(0, linux("plain", 2));
+    sim.run(MIN);
+    assert_eq!(counts(&sim), (0, 2, 0), "min_idle ready");
+    assert!(sim.executors_started.iter().all(|(_, _, host)| host == "d1"), "only hosts with Docker: {:?}", sim.executors_started);
+    sim.leg(MIN, pool_leg("p1"), 30_000);
+    sim.leg(MIN, leg("own", "acme/x", 50), 30_000);
+    sim.run(MIN + 1);
+    let p1 = sim.assigned.iter().find(|a| a.leg == "p1").ok_or("p1 never ran")?;
+    assert_eq!(p1.runner, "d1");
+    let slot = sim.runs.is_empty() && sim.started("own").is_some();
+    assert!(slot, "the host's own leg ran in its slots beside the pool's");
+    // Its executor was busy, then discarded; min_idle is kept.
+    sim.run(2 * MIN);
+    assert_eq!(counts(&sim).2, 0, "nothing busy");
+    assert_eq!(counts(&sim).1, 2, "min_idle kept after the leg's executor was discarded");
+    Ok(())
+}
+
+/// W13-AC04, on the simulator (the E2E runs it with Docker): a burst of 200 legs on a pool with
+/// `min_idle = 2` and `max = 32` scales its executors to 32, drains the queue, and is back to
+/// 2 within `idle_timeout`.
+#[test]
+fn w13_ac04_pool_burst_on_the_simulator() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pool(2, 32, 16, "2m")?], ..Config::default() });
+    sim.runner(0, docker_host("h1"));
+    sim.runner(0, docker_host("h2"));
+    sim.run(MIN);
+    assert_eq!(counts(&sim), (0, 2, 0));
+    for i in 0..200 {
+        sim.leg(MIN, pool_leg(&format!("b{i}")), 20_000);
+    }
+    let (mut peak, mut t) = (0, MIN);
+    while sim.settled.len() < 200 && t < 60 * MIN {
+        t += 250;
+        sim.run(t);
+        let (s, i, b) = counts(&sim);
+        peak = peak.max(s + i + b);
+        assert!(s + i + b <= 32, "never more than max: {}", s + i + b);
+    }
+    assert_eq!(sim.settled.len(), 200, "the queue drained");
+    assert!(sim.settled.iter().all(|(_, _, o)| *o == Outcome::Success));
+    assert_eq!(peak, 32, "scaled to max");
+    // Each host held at most per_host_max at once.
+    for host in ["h1", "h2"] {
+        let on: usize = sim.sched.pools().first().map_or(0, |p| p.executors.iter().filter(|e| e.runner == host).count());
+        assert!(on <= 16, "{host}: {on}");
+    }
+    let drained = t;
+    sim.run(drained + 2 * MIN + 1_000);
+    assert_eq!(counts(&sim), (0, 2, 0), "back to min_idle within idle_timeout");
+    Ok(())
+}
+
+/// A host that can't start the pool's executors is left alone, longer each time, and the legs
+/// say why they wait; another host takes them.
+#[test]
+fn w13_r09_failing_host_backs_off() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pool(0, 4, 4, "10m")?], ..Config::default() });
+    sim.failing_hosts.insert("bad".into());
+    sim.runner(0, docker_host("bad"));
+    sim.leg(1, pool_leg("w1"), 10_000);
+    sim.run(20_000);
+    let tries = sim.executors_started.iter().filter(|(_, _, h)| h == "bad").count();
+    assert!((2..=6).contains(&tries), "backing off: {tries} tries in 20 s");
+    assert!(sim.waits.iter().any(|(_, l, r)| l == "w1" && matches!(r, WaitReason::Scaling { pool, starting: 1, .. } if pool == "burst")), "{:?}", sim.waits);
+    let view = sim.sched.pools();
+    assert!(view.first().and_then(|p| p.last_error.clone()).is_some_and(|(h, _)| h == "bad"));
+    sim.runner(20_000, docker_host("good"));
+    sim.run(40_000);
+    assert_eq!(sim.assigned.iter().find(|a| a.leg == "w1").map(|a| a.runner.as_str()), Some("good"));
+    Ok(())
+}
+
+fn pod_pool(min_idle: usize, max: usize) -> Result<super::pools::Pool, String> {
+    PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], min_idle, max: Some(max), idle_timeout: Some("1m".into()), ..PoolSpec::default() }.pool()
+}
+
+fn pod_leg(id: &str) -> LegIn {
+    LegIn { id: id.into(), run: "run-pods".into(), repo: "acme/x".into(), route: LegRoute { labels: vec!["pod".into()], ..LegRoute::default() }, priority: 50, ..LegIn::default() }
+}
+
+/// W13-R07: a `k8s` pool's executors are the server's, each a pod whose own runner, bound to it
+/// as it connects, takes one of the pool's legs and nothing else, `max` of them at once. A runner
+/// with the pool's labels takes none of its legs; a pod the scheduler doesn't know is told to go.
+#[test]
+fn w13_r07_k8s_pool_pods_are_their_own_runners() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pod_pool(0, 3)?], ..Config::default() });
+    let mut lookalike = linux("lookalike", 4);
+    lookalike.view.labels = vec!["pod".into()];
+    sim.runner(0, lookalike);
+    for i in 0..5 {
+        sim.leg(1, pod_leg(&format!("p{i}")), 10_000);
+    }
+    let mut anywhere = leg("anywhere", "acme/x", 50);
+    anywhere.route.labels = vec!["self-hosted".into()];
+    sim.leg(1, anywhere, 10_000);
+    let (mut t, mut peak) = (1, 0);
+    while sim.settled.len() < 6 && t < 5 * MIN {
+        t += 250;
+        sim.run(t);
+        let (s, i, b) = counts(&sim);
+        peak = peak.max(s + i + b);
+    }
+    assert_eq!(sim.settled.len(), 6, "every leg ran: {:?}", sim.settled);
+    assert!(sim.executors_started.iter().all(|(_, _, host)| host.is_empty()), "the server starts them: {:?}", sim.executors_started);
+    assert_eq!(peak, 3, "max at once");
+    let pods: Vec<&str> = sim.assigned.iter().filter(|a| a.leg.starts_with('p')).map(|a| a.runner.as_str()).collect();
+    assert_eq!(pods.len(), 5);
+    assert!(pods.iter().all(|r| r.starts_with("pod-pool-pods-")), "each in a pod: {pods:?}");
+    let mut once = pods.clone();
+    once.sort_unstable();
+    once.dedup();
+    assert_eq!(once.len(), 5, "a pod takes one leg");
+    assert_eq!(sim.assigned.iter().find(|a| a.leg == "anywhere").map(|a| a.runner.as_str()), Some("lookalike"), "no pod takes another leg");
+    sim.run(t + 2 * MIN);
+    assert_eq!(counts(&sim), (0, 0, 0), "each pod went with its leg");
+    // A pod from before a restart: told to go, and given nothing.
+    sim.runner(t + 3 * MIN, RunnerIn { id: "pod-old".into(), slots: 1, executor: Some("pool-pods-old".into()), ..RunnerIn::default() });
+    sim.leg(t + 3 * MIN, pod_leg("late"), 10_000);
+    sim.run(t + 4 * MIN);
+    assert!(sim.executors_stopped.iter().any(|(_, e)| e == "pool-pods-old"), "{:?}", sim.executors_stopped);
+    assert_ne!(sim.assigned.iter().find(|a| a.leg == "late").map(|a| a.runner.as_str()), Some("pod-old"));
+    Ok(())
+}
+
+/// W13-R07: a leg with containers gets a pod made for it on a `k8s` pool (its job container and
+/// services in it), and only that one; the pool's other legs share pods made for none.
+#[test]
+fn w13_r07_a_leg_with_containers_gets_a_pod_of_its_own() -> Result<(), String> {
+    let mut sim = Sim::new(Config { pools: vec![pod_pool(0, 4)?], ..Config::default() });
+    let mut db = pod_leg("with-db");
+    db.own_executor = true;
+    sim.leg(1, db, 10_000);
+    sim.leg(1, pod_leg("plain"), 10_000);
+    sim.run(2 * MIN);
+    assert_eq!(sim.settled.len(), 2, "{:?}", sim.settled);
+    let made: Vec<Option<String>> = sim.sched.pools().first().map(|p| p.executors.iter().map(|e| e.leg.clone()).collect()).unwrap_or_default();
+    assert!(made.is_empty(), "each pod went with its leg: {made:?}");
+    // The leg with containers ran on the pod started for it, the other on one started for none.
+    let pod_of = |leg: &str| sim.assigned.iter().find(|a| a.leg == leg).map(|a| a.runner.clone()).unwrap_or_default();
+    assert_ne!(pod_of("with-db"), pod_of("plain"));
+    assert_eq!(sim.executors_started.len(), 2, "{:?}", sim.executors_started);
+    // Cancelled while its pod starts, the pod made for it goes too.
+    let mut late = pod_leg("late");
+    late.own_executor = true;
+    sim.leg(3 * MIN, late, 10_000);
+    sim.input(3 * MIN + 1, Input::LegCancelled { leg: "late".into(), reason: "cancelled".into() });
+    sim.run(4 * MIN);
+    assert_eq!(counts(&sim), (0, 0, 0), "{:?}", sim.sched.pools());
+    Ok(())
+}
+
+/// W13-R07: a `k8s` pool may have a Docker sidecar in its pods (Podman's by default), which
+/// `pool_for` says of the pool a leg goes to; no other kind of pool has one, nor another engine.
+#[test]
+fn w13_r07_a_pools_docker_sidecar() -> Result<(), String> {
+    let mut spec = PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], docker: Some(super::pools::PodDocker::default()), ..PoolSpec::default() };
+    let docker = spec.docker.clone().unwrap_or_default();
+    assert_eq!((docker.engine(), docker.image(), docker.cli_image()), ("podman", "quay.io/podman/stable".to_owned(), "docker:cli".to_owned()));
+    let sched = Scheduler::new(Config { pools: vec![spec.pool()?, pod_pool(0, 1).map(|p| super::pools::Pool { name: "plain".into(), labels: vec!["plain".into()], ..p })?], ..Config::default() });
+    let route = |label: &str| LegRoute { labels: vec![label.into()], ..LegRoute::default() };
+    assert_eq!(sched.pool_for(&route("pod")).map(|p| (p.name.as_str(), p.docker)), Some(("pods", true)));
+    assert_eq!(sched.pool_for(&route("plain")).map(|p| (p.name.as_str(), p.docker)), Some(("plain", false)));
+    spec.docker = Some(super::pools::PodDocker { engine: Some("containerd".into()), ..super::pools::PodDocker::default() });
+    assert!(spec.pool().is_err_and(|e| e.contains("`podman` or `docker`")));
+    let on_docker = PoolSpec { executor: "docker".into(), image: Some("ubuntu".into()), docker: Some(super::pools::PodDocker::default()), ..spec };
+    assert!(on_docker.pool().is_err_and(|e| e.contains("`k8s` pool's pods")));
+    Ok(())
+}
+
+// ------------------------------------------------------------------ reservations (W05-R12)
+
+const H: i64 = 60 * MIN;
+
+fn wf_leg(id: &str, workflow: &str) -> LegIn {
+    let mut l = leg(id, "acme/x", 50);
+    l.route.workflow = workflow.into();
+    l
+}
+
+/// W05-R12: a runner kept for `bench` legs from 02:00 for two hours takes only those in the
+/// window; another waits with reason `reservation` until it ends; one already running finishes.
+#[test]
+fn w05_r12_reservation_keeps_a_runner() -> Result<(), String> {
+    let res = ReservationSpec { name: "nightly".into(), runners: Some("custom.rack == bench".into()), matches: "workflow == 'bench'".into(), cron: "0 2 * * *".into(), duration: "2h".into(), ..ReservationSpec::default() }.reservation()?;
+    let mut sim = Sim::new(Config { reservations: vec![res], ..Config::default() });
+    let mut bench = linux("bench", 1);
+    bench.view.facts.custom.insert("rack".into(), "bench".into());
+    sim.runner(0, bench);
+    sim.leg(H + 50 * MIN, wf_leg("early", "build"), 20 * MIN);
+    sim.leg(2 * H + 30 * MIN, wf_leg("late", "build"), MIN);
+    sim.leg(2 * H + 35 * MIN, wf_leg("kept", "bench"), MIN);
+    sim.run(5 * H);
+    assert_eq!(sim.started("early"), Some(H + 50 * MIN), "before the window, anything");
+    assert!(sim.settled.iter().any(|(t, l, o)| l == "early" && *o == Outcome::Success && *t == 2 * H + 10 * MIN), "running into the window, it finishes: {:?}", sim.settled);
+    assert_eq!(sim.started("kept"), Some(2 * H + 35 * MIN), "the leg it's kept for");
+    assert!(sim.waits.iter().any(|(_, l, r)| l == "late" && matches!(r, WaitReason::Reservation { reservation, until } if reservation == "nightly" && *until == 4 * H)), "{:?}", sim.waits);
+    assert_eq!(sim.started("late"), Some(4 * H), "once the window ends");
+    // A runner it doesn't keep takes anything.
+    let res = ReservationSpec { runners: Some("custom.rack == bench".into()), matches: "workflow == 'bench'".into(), cron: "0 2 * * *".into(), duration: "2h".into(), ..ReservationSpec::default() }.reservation()?;
+    let mut sim = Sim::new(Config { reservations: vec![res], ..Config::default() });
+    sim.runner(0, linux("other", 1));
+    sim.leg(2 * H + 30 * MIN, wf_leg("late", "build"), MIN);
+    sim.run(3 * H);
+    assert_eq!(sim.started("late"), Some(2 * H + 30 * MIN));
+    Ok(())
+}
+
+/// A pool's `reserve`: its executors take only the legs it's kept for in the window.
+#[test]
+fn w05_r12_reserved_pool() -> Result<(), String> {
+    let mut spec = PoolSpec {
+        name: "burst".into(),
+        executor: "docker".into(),
+        image: Some("kiln/runner-ubuntu-24.04".into()),
+        labels: vec!["burst".into()],
+        min_idle: 1,
+        max: Some(2),
+        ..PoolSpec::default()
+    };
+    spec.reserve = Some(ReservationSpec { matches: "workflow == 'bench'".into(), cron: "0 2 * * *".into(), duration: "1h".into(), ..ReservationSpec::default() });
+    let res = spec.reservation().ok_or("no reservation")??;
+    assert_eq!((res.name.as_str(), res.pool.as_deref()), ("pool burst", Some("burst")));
+    let mut sim = Sim::new(Config { pools: vec![spec.pool()?], reservations: vec![res], ..Config::default() });
+    sim.runner(0, docker_host("d1"));
+    let mut other = pool_leg("other");
+    other.route.workflow = "build".into();
+    let mut kept = pool_leg("kept");
+    kept.route.workflow = "bench".into();
+    sim.leg(2 * H + 10 * MIN, other, MIN);
+    sim.leg(2 * H + 20 * MIN, kept, MIN);
+    sim.run(4 * H);
+    assert_eq!(sim.started("kept"), Some(2 * H + 20 * MIN));
+    assert_eq!(sim.started("other"), Some(3 * H), "after the window");
+    Ok(())
+}
+
+/// W05-R03: a request as written. CPUs as Kubernetes writes them (`500m` is half of one, not 500
+/// minutes), memory and disk in bytes with their units, GPUs; a pool's the same way.
+#[test]
+fn w05_r03_requests_as_written() -> Result<(), String> {
+    use super::pools::{ResourceSpec, cpus};
+    assert_eq!(cpus("2"), Some(2.0));
+    assert_eq!(cpus("500m"), Some(0.5));
+    assert_eq!(cpus("0.25"), Some(0.25));
+    assert_eq!(cpus("-1"), None);
+    assert_eq!(cpus("lots"), None);
+    let r = ResourceSpec { cpu: Some("1500m".into()), memory: Some("2Gi".into()), disk: Some("10G".into()), gpu: Some(1) }.resources()?;
+    assert_eq!(r, Resources { cpu: 1.5, mem: 2 << 30, disk: 10_000_000_000, gpu: 1 });
+    assert_eq!(ResourceSpec::default().resources()?, Resources::default(), "nothing asked");
+    assert!(ResourceSpec { memory: Some("much".into()), ..ResourceSpec::default() }.resources().is_err());
+    let pool = PoolSpec {
+        name: "p".into(),
+        executor: "docker".into(),
+        image: Some("alpine:3.20".into()),
+        labels: vec!["p".into()],
+        resources: Some(ResourceSpec { cpu: Some("100m".into()), memory: Some("64Mi".into()), ..ResourceSpec::default() }),
+        ..PoolSpec::default()
+    }
+    .pool()?;
+    assert_eq!((pool.request.cpu, pool.request.mem), (0.1, 64 << 20), "a pool's executor asks a tenth of a CPU");
+    Ok(())
 }

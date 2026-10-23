@@ -13,16 +13,114 @@
  * when it resumes by itself.
  */
 import * as React from "react";
+import { ListTree } from "lucide-react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
+import { harnessSessionsRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
+import { ApiError } from "@/api/client";
+import { planHref, plansApi, runHref, type Plan } from "@/api/plans";
+import { PlanGraph } from "@/views/plans/graph";
+import { effectiveNeeds } from "@/views/plans/graph-layout";
+import { StandTitle, StepGlyph, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
-import { fromLines, stackReads, startWords, stoppedBy, toGo } from "./goal-stack";
+import { Link } from "@/lib/router";
+import { canPlan, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "./goal-stack";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
+
+/** Longer than this, a goal's words fold to their first lines. */
+const LONG_GOAL = 220;
+
+/** A goal's words, in the prism's shimmer while it's worked on: a long one folds to its first lines, opened on asking. */
+function GoalWords({ text, stand }: { text: string; stand: Stand }) {
+  const [open, setOpen] = React.useState(false);
+  const long = text.length > LONG_GOAL;
+  return (
+    <>
+      <span className="gs-words" data-folded={long && !open ? "" : undefined}>
+        <StandTitle stand={stand}>{text}</StandTitle>
+      </span>
+      {long && (
+        <button type="button" className="gs-fold" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? "Less" : "More"}
+        </button>
+      )}
+    </>
+  );
+}
+
+/** "gone" for a plan or run that isn't there any more. */
+const unlessGone = (e: unknown): "gone" => {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return "gone";
+  throw e;
+};
+
+/** A goal that became a plan: its steps as they run (each as the goal's parts, or its run, say), and the plan to open. */
+function PlannedGoal({ goal, items, paused }: { goal: GoalItem; items: GoalItem[]; paused: boolean }) {
+  const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
+  return (
+    <Loadable label="its plan" fallback={null}>
+      {run ? <PlannedRun plan={goal.planned_as ?? ""} run={run} /> : <PlannedParts plan={goal.planned_as ?? ""} goal={goal} items={items} paused={paused} />}
+    </Loadable>
+  );
+}
+
+const usePlan = (plan: string) => useSuspenseResource(`plans/${plan}`, (s) => plansApi.get(plan, s).catch(unlessGone)).data;
+
+/** Its steps are the goal's parts: each stands as its part does. */
+function PlannedParts({ plan, goal, items, paused }: { plan: string; goal: GoalItem; items: GoalItem[]; paused: boolean }) {
+  const p = usePlan(plan);
+  if (!p || p === "gone") return null;
+  return <PlannedView p={p} stand={(n) => stepStand(goal, items, n, paused)} />;
+}
+
+/** Its steps run with an agent each: each stands as its run says. */
+function PlannedRun({ plan, run }: { plan: string; run: string }) {
+  const p = usePlan(plan);
+  const v = useSuspenseResource(`plans/runs/${run}`, (s) => plansApi.runView(run, s).catch(unlessGone), { on: ["harness", "harness_closed", "plan_stack"], pollMs: 4000 }).data;
+  if (!p || p === "gone") return null;
+  const steps = v && v !== "gone" ? v.steps : [];
+  return <PlannedView p={p} stand={(n) => steps.find((s) => s.n === n)?.stand} run={run} />;
+}
+
+function PlannedView({ p, stand, run }: { p: Plan; stand: (n: number) => Stand | undefined; run?: string }) {
+  const titles = p.items?.length ? p.items.map((it) => it.title || "Untitled step") : p.steps;
+  const waits = effectiveNeeds(titles.map((_, i) => p.items?.[i]?.needs));
+  const steps = titles.map((title, i) => ({ n: i + 1, title, needs: waits[i] ?? [], stand: stand(i + 1) }));
+  const met = steps.filter((s) => s.stand === "met").length;
+  return (
+    <div className="gs-plan">
+      {steps.length > 0 && <PlanGraph label={`Its plan, “${p.title}”`} steps={steps} />}
+      <p className="gs-plan-line">
+        <Link to={planHref(p.id)}>{p.phase === "planning" ? "Being planned: researching it and writing its steps" : `${met} of ${steps.length} step${steps.length === 1 ? "" : "s"} met`}</Link>
+        {run && (
+          <>
+            {" · "}
+            <Link to={runHref(run)}>its run</Link>
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
+/** An agent's name, from the agents kiln knows (its id's start until they're in). */
+function AgentLabel({ id }: { id: string }) {
+  return (
+    <React.Suspense fallback={<>agent {id.slice(0, 8)}</>}>
+      <AgentName id={id} />
+    </React.Suspense>
+  );
+}
+
+function AgentName({ id }: { id: string }) {
+  const name = useRes(harnessSessionsRes).data.find((a) => a.id === id)?.name;
+  return <>{name || `agent ${id.slice(0, 8)}`}</>;
+}
 
 /** When the goal under way last went to the agent: sent, or sent again (how many times in a row). */
 function sentWords(g: GoalItem): string {
@@ -45,24 +143,25 @@ function readGoals(agent: string): Promise<{ stack: GoalStack | null; error: unk
   );
 }
 
-export function Goals({ agent, harness }: { agent: string; harness?: string }) {
+export function Goals({ agent, harness, working }: { agent: string; harness?: string; working?: boolean }) {
   // Another agent's: these stay until its goals are in.
   const shown = React.useDeferredValue(agent);
   return (
     <Loadable label="Loading the goal stack" fallback={<GoalPanel agent={agent} harness={harness} stack={null} />}>
       {/* Its own: an edit or a goal half typed for one agent never goes to another. */}
-      <AgentGoals key={shown} agent={shown} harness={harness} />
+      <AgentGoals key={shown} agent={shown} harness={harness} working={working} />
     </Loadable>
   );
 }
 
 /** The agent's goal stack, read again every few seconds while it shows. */
-function AgentGoals({ agent, harness }: { agent: string; harness?: string }) {
+function AgentGoals({ agent, harness, working }: { agent: string; harness?: string; working?: boolean }) {
   const res = useSuspenseResource(`harness/goals/${agent}`, () => readGoals(agent), { pollMs: 2500 });
   return (
     <GoalPanel
       agent={agent}
       harness={harness}
+      working={working}
       stack={res.data.stack}
       error={res.data.error}
       onStack={(s) => {
@@ -73,15 +172,40 @@ function AgentGoals({ agent, harness }: { agent: string; harness?: string }) {
   );
 }
 
+/** Where a goal stands, as its node shows it: under way and the agent at work, working; under way while it's
+ * idle, or to come, only sketched. */
+function standOf(g: GoalItem, paused: boolean, working: boolean): Stand {
+  if (g.status === "met") return "met";
+  if (g.status === "unmet") return "unmet";
+  if (g.status === "skipped") return "skipped";
+  if (g.status === "active") return paused ? "paused" : working ? "working" : "waiting";
+  return "waiting";
+}
+
+/** How deep a goal is among parts: 0 a goal, 1 a part, 2 a part's part. */
+function depthOf(g: GoalItem, items: GoalItem[]): number {
+  let d = 0;
+  let at: GoalItem | undefined = g;
+  while (at?.part_of && d < 3) {
+    const up: string = at.part_of;
+    at = items.find((i) => i.id === up);
+    d += 1;
+  }
+  return d;
+}
+
 function GoalPanel({
   agent,
   harness,
+  working = false,
   stack,
   error: readError,
   onStack,
 }: {
   agent: string;
   harness?: string;
+  /** The agent is at work now. */
+  working?: boolean;
   /** None until it's read. */
   stack: GoalStack | null;
   /** Why it couldn't be read. */
@@ -218,21 +342,64 @@ function GoalPanel({
               {shown.map((g) => {
                 // The goal under way while you've paused the stack: paused, not under way.
                 const held = g.status === "active" && stack?.state === "paused";
+                // One handed to another agent (a program's track's worker): under way there.
+                const away = g.status === "pending" ? g.on : undefined;
                 return (
-                  <li key={g.id} className="gs-link" data-status={held ? "paused" : g.status} data-part={g.part_of ? "" : undefined}>
-                    <span className="gs-node" aria-hidden="true">
-                      {g.status === "met" ? "✓" : g.status === "unmet" ? "✕" : g.status === "skipped" ? "–" : items.indexOf(g) + 1}
+                  <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : g.status} data-part={g.part_of ? "" : undefined} data-depth={g.part_of ? depthOf(g, items) : undefined}>
+                    {/* Where it stands, drawn as the console draws work (plans/status.tsx). */}
+                    <span className="gs-node" title={WORD[g.status]}>
+                      <StepGlyph stand={standOf(g, held, working && !g.waits_on)} />
                     </span>
                     <span className="gs-text">
                       {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                      {g.text.split(" — ")[0]}
+                      <GoalWords text={g.text.split(" — ")[0] ?? g.text} stand={standOf(g, held, working && !g.waits_on)} />
                       {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
                       <span className="gs-word">
-                        {held ? "paused" : WORD[g.status]}
-                        {g.status === "active" && !held ? sentWords(g) : ""}
+                        {held ? "paused" : away ? (
+                          <>
+                            under way on{" "}
+                            <Link to={`/agents/${encodeURIComponent(away)}`}>
+                              <AgentLabel id={away} />
+                            </Link>
+                          </>
+                        ) : (
+                          WORD[g.status]
+                        )}
+                        {g.status === "active" && !held && !g.waits_on ? sentWords(g) : ""}
                         {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
+                        {g.planned_as && (
+                          <>
+                            {" · "}
+                            <Link to={planHref(g.planned_as)}>planned</Link>: met once every step of its plan is
+                          </>
+                        )}
+                        {g.waits_on && (
+                          <>
+                            {" · waits for "}
+                            <Link to={runHref(g.waits_on)}>its run</Link>
+                          </>
+                        )}
                       </span>
                     </span>
+                    {/* What can be done with it: a goal of its own still to go becomes a plan. */}
+                    {canPlan(g) && (
+                      <div className="gs-acts">
+                        <Button
+                          size="xs"
+                          variant="secondary"
+                          disabled={busy}
+                          onClick={() =>
+                            void act(async () => {
+                              await harnessApi.planGoal(agent, g.id);
+                              return harnessApi.goals(agent);
+                            })
+                          }
+                        >
+                          <ListTree aria-hidden="true" /> Make a plan
+                        </Button>
+                      </div>
+                    )}
+                    {g.planned_as && <PlannedGoal goal={g} items={items} paused={stack?.state === "paused"} />}
                   </li>
                 );
               })}

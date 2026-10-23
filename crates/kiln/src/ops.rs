@@ -68,15 +68,34 @@ pub fn path(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// kiln's own operations: agents', plans', goal stacks', runners' and attachments', in the order they're listed.
+/// kiln's own operations: agents', plans', goal stacks', runners', attachments', and access and
+/// the audit trail's, in the order they're listed.
 pub fn own() -> &'static [Op] {
     static OPS: std::sync::OnceLock<Vec<Op>> = std::sync::OnceLock::new();
-    OPS.get_or_init(|| crate::harness::ops::list_ops().into_iter().chain(crate::plans::ops::list_ops()).chain(crate::goals::ops::list_ops()).chain(crate::doctor::list_ops()).chain(crate::ci::attach::list_ops()).collect())
+    OPS.get_or_init(|| {
+        crate::harness::ops::list_ops()
+            .into_iter()
+            .chain(crate::plans::ops::list_ops())
+            .chain(crate::goals::ops::list_ops())
+            .chain(crate::programs::ops::list_ops())
+            .chain(crate::research::ops::list_ops())
+            .chain(crate::doctor::list_ops())
+            .chain(crate::ci::attach::list_ops())
+            .chain(crate::authz::ops::list_ops())
+            .collect()
+    })
 }
 
 /// Every operation this server has: CI's, deployments' when they're on, and kiln's own.
 pub fn all(hub: &Hub) -> Vec<Info> {
     listed(hub.cfg.cd.enabled)
+}
+
+/// The operations as `GET /api/ops` lists them (W20-R01): each one's name, summary, whether it
+/// changes anything, and its input's JSON Schema.
+pub fn catalog(hub: &Hub) -> Value {
+    let ops: Vec<Value> = all(hub).iter().map(|o| json!({ "name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": (o.input)() })).collect();
+    json!({ "operations": ops })
 }
 
 /// CI's operations, deployments' and releases' with `cd`, and kiln's own.
@@ -93,7 +112,7 @@ pub fn listed(cd: bool) -> Vec<Info> {
 
 /// Operations on one agent that an agent calling them without `agent` means for itself: its own
 /// goal stack, and putting its own work up for review.
-const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "goals.done", "goals.update", "goals.split", "agents.change"];
+const YOURS: &[&str] = &["goals.get", "goals.add", "goals.set", "goals.control", "goals.done", "goals.update", "goals.split", "goals.plan", "agents.change"];
 
 /// `input` to operation `name` as `caller` means it: an agent's own id where it left out `agent`
 /// on one of [`YOURS`].
@@ -110,7 +129,8 @@ fn yours(caller: &Caller, name: &str, mut input: Value) -> Value {
 /// Runs operation `name` for `cx`'s caller, when the route table lets it.
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
-    if name.starts_with("ci.") {
+    // CI's, and the hosts' pull requests (W23-R06) and experiments (W20-R11) beside them.
+    if name.starts_with("ci.") || name.starts_with("host.") || name.starts_with("experiments.") {
         return crate::ci::ops::call(cx, name, input).await;
     }
     if name.starts_with("deploy.") {
@@ -170,7 +190,7 @@ mod tests {
     /// runners' `runners.read` or `runners.manage`), and reads exactly when its route is a GET.
     #[test]
     fn kiln_s_own_operations_are_routes_of_the_table() {
-        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1"});
+        let probe = json!({"agent": "a1", "id": "p1", "run": "r1", "step": 1, "action": "start", "text": "x", "goals": ["g"], "runner": "mac", "policy": "auto", "attachment": "ci-doctor", "incident": "i1", "user": "ada", "grant": "g1", "name": "auditor", "token": "t1", "program": "p1", "track": "T1"});
         assert!(own().iter().any(|o| o.name == "agents.start") && own().iter().any(|o| o.name == "plans.run") && own().iter().any(|o| o.name == "goals.add"));
         for op in own() {
             let route = (op.route)(&probe);
@@ -187,6 +207,12 @@ mod tests {
                 "attachments.list" | "attachments.get" | "incidents.list" | "incidents.get" => "runs.read",
                 "attachments.save" | "attachments.remove" | "attachments.pause" => "agents.attach",
                 "incidents.report" => crate::authz::SIGNED_IN,
+                // Access: people, grants and custom roles are `users.manage`'s; tokens are each
+                // caller's own (anyone's with `tokens.manage`); the audit trail is `audit.read`'s.
+                "roles.list" => crate::authz::SIGNED_IN,
+                n if n.starts_with("users.") || n.starts_with("grants.") || n.starts_with("roles.") => "users.manage",
+                n if n.starts_with("tokens.") => "tokens.manage",
+                "audit.list" => "audit.read",
                 _ => "agents.run",
             };
             assert_eq!(rule.capability, needs, "{}", op.name);

@@ -1,0 +1,17 @@
+# F-14 (docs/ci.md Appendix F; W04-AC04, AC07): reusable workflows three levels deep, with typed
+# inputs and their defaults, `secrets: inherit` all the way down, and an output handed back up
+# through each level.
+name: reusable
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/f14-level1.yml
+    with:
+      count: 3
+      flag: true
+    secrets: inherit
+  after:
+    needs: call
+    runs-on: self-hosted
+    steps:
+      - run: test "${{ needs.call.outputs.answer }}" = "3-true-plain-deep"

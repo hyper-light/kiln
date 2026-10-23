@@ -54,6 +54,10 @@ pub struct Spec {
     /// The effort / reasoning level to start with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The most subagents it runs at once (as `State::max_subagents`): Codex takes it as its own
+    /// limit when it starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// With `resume`: continue only up to this point of that session (a message or turn id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<String>,
@@ -109,6 +113,7 @@ impl Default for Spec {
             allow_bypass: true,
             program: None,
             effort: None,
+            max_subagents: None,
             resume_at: None,
             fork: false,
             takeover_pid: None,
@@ -174,6 +179,18 @@ impl SubagentBrief {
     }
 }
 
+/// Goals an agent paused for a person, until someone resumes them (`Info::held`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Held {
+    /// Why, as the stack says it ("Paused by the agent: …").
+    pub why: String,
+    /// The plan it waits for you to look at first, when that's why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Unix ms it paused.
+    pub since: i64,
+}
+
 /// A session as lists show it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Info {
@@ -201,6 +218,11 @@ pub struct Info {
     pub approvals: Vec<ApprovalBrief>,
     #[serde(default)]
     pub queued: usize,
+    /// What waits in its queue, each message by its id and a digest of its words (as
+    /// `State::queue`): the server's, for the messages kiln keeps there itself
+    /// (`super::queued`). Lists don't show it.
+    #[serde(skip)]
+    pub queue: Vec<super::queued::Queued>,
     #[serde(default)]
     pub tasks_running: usize,
     /// Native harness subagents, including finished work, for the list's child disclosure.
@@ -268,6 +290,10 @@ pub struct Info {
     /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_off: bool,
+    /// Its goals wait on a person: it paused them for you, until you resume them (`goals::held_stacks`;
+    /// set on the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Held>,
     /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub move_on_limit: bool,
@@ -277,6 +303,9 @@ pub struct Info {
     /// Where it pauses as its limits fill (as `State::pause_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_at: Option<u8>,
+    /// The most subagents it runs at once (as `State::max_subagents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subagents: Option<u32>,
     /// The agent that started it (as `Spec::parent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -317,6 +346,7 @@ impl Info {
             .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at })
             .collect();
         self.queued = s.queue.len();
+        self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
         self.tasks_running = s.tasks.iter().filter(|t| t.status == "running").count();
         self.subagents = SubagentBrief::of(&s.tasks);
         self.cost_usd = s.usage.cost_usd;
@@ -347,11 +377,13 @@ impl Info {
         self.move_on_limit = s.move_on_limit;
         self.move_plan.clone_from(&s.move_plan);
         self.pause_at = s.pause_at;
+        self.max_subagents = s.max_subagents;
     }
 
-    /// The parts lists care about changed (activity timestamps aside).
+    /// The parts lists care about changed (activity timestamps aside, and the words of what's queued:
+    /// a message edited while it waits changes nothing they show).
     pub fn differs(&self, o: &Self) -> bool {
-        let strip = |i: &Self| Self { last_activity: 0, ..i.clone() };
+        let strip = |i: &Self| Self { last_activity: 0, queue: Vec::new(), ..i.clone() };
         strip(self) != strip(o)
     }
 }
@@ -655,6 +687,7 @@ impl Session {
         if !core.state.model.is_empty() {
             s.model = Some(core.state.model.clone());
         }
+        s.max_subagents = core.state.max_subagents;
         s
     }
 }
@@ -796,8 +829,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
 /// previous image of this process handed over).
 #[allow(clippy::too_many_arguments)]
-fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
+    core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
     let cwd = core.state.cwd.clone();
     let info = Info {
         id: id.clone(),
@@ -815,6 +849,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         harness_session: spec.resume.clone(),
         approvals: Vec::new(),
         queued: 0,
+        queue: Vec::new(),
         tasks_running: 0,
         subagents: Vec::new(),
         cost_usd: 0.0,
@@ -841,9 +876,11 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         pause: None,
         last_turn: None,
         keep_off: false,
+        held: None,
         move_on_limit: false,
         move_plan: Default::default(),
         pause_at: None,
+        max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
         no_bypass: !spec.allow_bypass,
@@ -1399,7 +1436,8 @@ struct Switch {
 }
 
 /// Nothing is under way: no turn, nothing waiting for a person.
-fn settled(s: &Session) -> bool {
+/// Between turns: idle, nothing waiting on a person, no turn under way.
+pub(super) fn settled(s: &Session) -> bool {
     settled_core(&s.core.lock())
 }
 
@@ -2061,11 +2099,19 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
         note.push(' ');
         note.push_str(n);
     }
-    let carry = match mv.kind {
+    let (carry, home) = match mv.kind {
+        // Its record, and what its harness keeps for it in its home besides (`homes`).
         None => {
             let env = spec.env.clone();
             let timeline = events.clone();
-            crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)).await.map_err(|e| format!("{e:#}"))??
+            let (cwd, objective) = (from_cwd.clone(), state.objective.clone());
+            crate::rt::blocking(move || {
+                let carry = super::moving::record(&kind.protocol, &env, session.as_deref(), &timeline, &note)?;
+                let home = super::homes::pack(kind.id, &super::homes::Dirs::here(&env), session.as_deref(), &cwd, super::moving::transcript_of(&carry), objective.as_ref());
+                Ok::<_, String>((carry, Some(home)))
+            })
+            .await
+            .map_err(|e| format!("{e:#}"))??
         }
         // The other harness's own record of it, as a switch writes one (`carried`).
         Some(to) => {
@@ -2083,7 +2129,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             // A program of its own was the old harness's.
             spec.program = None;
             for_harness(&mut state, there, &model, c.mode, c.effort);
-            carry
+            // What the old harness keeps in its home is its own: the other one doesn't read it.
+            (carry, None)
         }
     };
     // Its folder's last changes go first, so it goes on there from them; then its repository's
@@ -2136,10 +2183,13 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
             return Err(why);
         }
     };
-    let carried = carried_bytes(&out);
+    let carried = carried_bytes(&out, home.as_ref());
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    if let Some(home) = home {
+        pkg = pkg.with_home(home);
+    }
     pkg.picks_up = mv.picks_up || cut;
     pkg.synced = synced.as_ref().map(|x| x.mark.clone());
     pkg.git = out.git;
@@ -2173,9 +2223,10 @@ fn tell_move(news: crate::sync::wire::MoveNews) {
     }
 }
 
-/// What a leaving session's repository carries besides its synced files, in bytes: what the
-/// machine it goes to lacks of its git history, the files git ignores, and its worktree.
-fn carried_bytes(out: &GitOut) -> [(&'static str, u64); 3] {
+/// What a leaving session carries besides its synced files, in bytes: what the machine it goes to
+/// lacks of its git history, the files git ignores, its worktree, and what its harness keeps for
+/// it in its home.
+fn carried_bytes(out: &GitOut, home: Option<&super::homes::Home>) -> [(&'static str, u64); 4] {
     // Base64, as the package carries them: three bytes in four.
     let b64 = |s: &str| u64::try_from(s.len() / 4 * 3).unwrap_or(u64::MAX);
     let files = |c: &super::carry::Carried| c.files.iter().map(|f| b64(&f.data)).sum::<u64>();
@@ -2183,6 +2234,7 @@ fn carried_bytes(out: &GitOut) -> [(&'static str, u64); 3] {
         ("git", out.git.as_ref().and_then(|g| g.bundle.as_deref()).map_or(0, b64)),
         ("ignored", out.ignored.as_ref().map_or(0, files)),
         ("worktree", out.worktree.as_ref().map_or(0, |w| files(&w.changed).saturating_add(files(&w.ignored)))),
+        ("home", home.map_or(0, super::homes::Home::size)),
     ]
 }
 
@@ -2557,6 +2609,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 drop(core);
                                 on_change();
                             }
+                            Command::MaxSubagents { count } => {
+                                let mut core = s.core.lock();
+                                core.state.max_subagents = count.filter(|n| *n >= 1);
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
                             Command::MoveOnLimit { on, to, kind, model } => {
                                 let mut core = s.core.lock();
                                 core.state.move_on_limit = on;
@@ -2567,7 +2626,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             Command::LimitHold { window, until, said, .. } => {
                                 let mut core = s.core.lock();
-                                super::pause::hold(&mut core, super::pause::LIMIT, "account", super::pause::Hit { window, until, said }, None);
+                                super::pause::account_hold(&mut core, super::pause::Hit { window, until, said });
                                 drop(core);
                                 on_change();
                             }
@@ -2870,6 +2929,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         if let Some(c) = name_session(&s, value.as_ref()) {
                             carry.push(c);
                         }
+                        on_change();
+                    }
+                    // Its threshold, set while it isn't running (a person's, or kiln's for a
+                    // program's worker): kept, and it holds from its next start.
+                    Command::PauseAt { percent } => {
+                        let mut core = s.core.lock();
+                        core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
+                        core.touch_state();
+                        drop(core);
                         on_change();
                     }
                     c => adapter.command(&mut s.core.lock(), c),
@@ -3188,6 +3256,7 @@ mod tests {
             harness_session: None,
             approvals: vec![],
             queued: 0,
+            queue: Vec::new(),
             tasks_running: 0,
             subagents: Vec::new(),
             cost_usd: 0.0,
@@ -3214,9 +3283,11 @@ mod tests {
             pause: None,
             last_turn: None,
             keep_off: false,
+            held: None,
             move_on_limit: false,
             move_plan: Default::default(),
             pause_at: None,
+            max_subagents: None,
             parent: None,
             plan_run: None,
             no_bypass: false,

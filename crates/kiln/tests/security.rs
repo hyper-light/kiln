@@ -2,8 +2,9 @@
 //! - every route refuses a token that may do nothing;
 //! - every YAML kiln reads from a repository refuses a bomb, at once;
 //! - webhooks and channels never reach this machine or a private network unless allowed;
-//! - a secret a run uses appears nowhere: not in its logs, the API, the events or the database's
-//!   files.
+//! - a secret a run uses appears nowhere: not in its logs, the API (every read of the route
+//!   table, and every read-only operation the MCP tools are made of: W09-AC02), the events or
+//!   the database's files.
 //!
 //! Fork isolation is W18-AC03's, signed URLs W08-AC04's, and archives the runner's own test
 //! (`w22_ac07_tarball_stays_in_the_workspace`).
@@ -271,6 +272,110 @@ jobs:
     // The secret was used: the logs show it masked.
     assert!(logs.contains("plain: ***") && logs.contains("next step ***"), "{logs}");
     seen.push(("logs".into(), logs));
+
+    // W09-AC02: every read of the route table, its parameters the run's ids (and its `**` the
+    // tails reads have), and every read-only operation, as an MCP tool calls it.
+    let leg = legs.first().cloned().unwrap_or_default();
+    let ids = [id.as_str(), leg.as_str(), "acme%2Fleak", "acme", "LEAKY", "leak", "0", "1"];
+    let tails = [
+        "annotations",
+        "summary",
+        "graph",
+        "tests",
+        "artifacts",
+        "attempts",
+        "outputs",
+        "jobs",
+        "logs",
+        "names",
+        "workflows",
+        "secrets",
+        "variables",
+        "environments",
+        "metrics",
+        "LEAKY",
+        "kinds",
+        "policy",
+        "subject",
+        "jwks-export",
+        "nobody",
+        "viewer",
+        "0",
+    ];
+    // Each path bare, and with what reads of a scope, a repository or words take.
+    let queries = ["", "?scope=repo%3Aacme%2Fleak", "?repo=acme%2Fleak", "?q=plain"];
+    let (mut walked, mut answered, mut silent) = (0usize, 0usize, Vec::new());
+    for rule in kiln::authz::ROUTES {
+        // Streams and sockets aren't reads that end; updates ask the internet.
+        if rule.method.is_some_and(|m| m != "GET") || rule.pattern.ends_with("/ws") || rule.pattern.ends_with("/terminal") || rule.pattern == "/api/events" || rule.pattern.starts_with("/api/updates")
+        {
+            continue;
+        }
+        walked += 1;
+        let mut paths = vec![String::new()];
+        for seg in rule.pattern.split('/').filter(|s| !s.is_empty()) {
+            let options: Vec<&str> = match seg {
+                "*" => ids.to_vec(),
+                "**" => tails.to_vec(),
+                s => vec![s],
+            };
+            paths = paths.iter().flat_map(|p| options.iter().map(move |o| format!("{p}/{o}"))).take(48).collect();
+        }
+        let mut any = false;
+        for path in paths {
+            for q in queries {
+                let (status, body) = http(s.port, "GET", &format!("{path}{q}"), &s.admin, None)?;
+                if (200..300).contains(&status) {
+                    any = true;
+                    seen.push((format!("GET {path}{q}"), body));
+                }
+            }
+        }
+        if any {
+            answered += 1;
+        } else {
+            silent.push(rule.pattern);
+        }
+    }
+    // Where a value could be: each of these answered (a secret's own routes only write).
+    for pattern in ["/api/ci/secrets", "/api/ci/variables", "/api/ci/runs/*", "/api/ci/runs/*/**", "/api/ci/legs/*", "/api/ci/legs/*/logs"] {
+        assert!(!silent.contains(&pattern), "{pattern} answered nothing");
+    }
+    // (66 of 108 when written: the rest have nothing to show on this server.)
+    assert!(walked > 90 && answered >= 55, "{answered} of {walked} reads answered; none did for {silent:?}");
+    let (st, body) = http(s.port, "GET", "/api/ops", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "the operations: {st} {body}");
+    let (mut tools, mut told) = (0usize, 0usize);
+    for op in serde_json::from_str::<Value>(&body)?.get("operations").and_then(Value::as_array).into_iter().flatten().filter(|o| o.get("read_only") == Some(&json!(true))) {
+        let name = op.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut input = serde_json::Map::new();
+        for (k, spec) in op.pointer("/input/properties").and_then(Value::as_object).into_iter().flatten() {
+            let v = match (k.as_str(), spec.get("type").and_then(Value::as_str)) {
+                ("run", _) => json!(id),
+                ("leg", _) => json!(leg),
+                ("repo", _) => json!("acme/leak"),
+                ("scope", _) => json!("repo:acme/leak"),
+                ("name", _) => json!("LEAKY"),
+                ("workflow", _) => json!("leak.yml"),
+                ("job", _) => json!("leak"),
+                (_, Some("integer" | "number")) => json!(5),
+                (_, Some("boolean")) => json!(false),
+                (_, Some("array")) => json!([]),
+                (_, Some("object")) => json!({}),
+                _ => json!("leak"),
+            };
+            input.insert(k.clone(), v);
+        }
+        tools += 1;
+        let (status, body) = http(s.port, "POST", &format!("/api/ops/{name}"), &s.admin, Some(&Value::Object(input)))?;
+        if (200..300).contains(&status) {
+            told += 1;
+        }
+        seen.push((format!("the {name} tool"), body));
+    }
+    // (39 of 58 when written.)
+    assert!(tools > 40 && told >= 30, "{told} of {tools} read-only tools answered");
+    eprintln!("W09-AC02: {answered} of {walked} reads answered, {told} of {tools} read-only tools; none had the value");
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let streamed = stream.join().unwrap_or_default();
     assert!(streamed.starts_with("HTTP/1.1 101") && streamed.contains("\"type\""), "no events came: {}", streamed.chars().take(200).collect::<String>());
@@ -285,5 +390,171 @@ jobs:
     for (path, bytes) in &all {
         assert!(!bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes()), "the secret is in {path}");
     }
+    Ok(())
+}
+
+/// W10: lists narrowed row by row. A person who may read one repository lists runs without
+/// saying which, and gets that repository's alone; asking for another gets nothing; the owner
+/// gets both.
+#[test]
+fn w10_run_lists_narrowed_to_what_the_caller_reads() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: false, ci: "kiln_workflows = true", ..Options::default() })?;
+    for name in ["acme/a", "acme/b"] {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
+        anyhow::ensure!(st == 200, "{name}: {st} {body}");
+        let work = dir.path().join(name.replace('/', "-"));
+        std::fs::create_dir_all(&work)?;
+        git(&work, &["init", "-q", "-b", "main"])?;
+        std::fs::write(work.join("README.md"), "x\n")?;
+        git(&work, &["add", "."])?;
+        git(&work, &["commit", "-qm", "first"])?;
+        let url = format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port);
+        git(&work, &["push", "-q", &url, "main"])?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while http(s.port, "GET", "/api/repos", &s.admin, None)?.1.contains("\"last_polled_at\":null") {
+            anyhow::ensure!(Instant::now() < deadline, "never polled");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        std::fs::create_dir_all(work.join(".kiln"))?;
+        std::fs::write(work.join(".kiln/ci.yaml"), "on: push\njobs:\n  a:\n    runs-on: nowhere\n    steps:\n      - run: echo waits\n")?;
+        git(&work, &["add", "."])?;
+        git(&work, &["commit", "-qm", "ci"])?;
+        git(&work, &["push", "-q", &url, "main"])?;
+    }
+    let repos_of = |token: &str, path: &str| -> anyhow::Result<Vec<String>> {
+        let (st, body) = http(s.port, "GET", path, token, None)?;
+        anyhow::ensure!(st == 200, "{path}: {st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let list = v.get("runs").cloned().unwrap_or(v);
+        let mut names: Vec<String> = list.as_array().into_iter().flatten().filter_map(|r| r.get("repo").or_else(|| r.get("repo_name")).and_then(Value::as_str)).map(str::to_owned).collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while repos_of(&s.admin, "/api/ci/runs")? != ["acme/a", "acme/b"] {
+        anyhow::ensure!(Instant::now() < deadline, "both repositories' runs: {:?}", repos_of(&s.admin, "/api/ci/runs"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": "dev", "grants": ["developer@repo:acme/a"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "user: {st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&json!({ "kind": "pat", "user": "dev", "grants": ["owner"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "token: {st} {body}");
+    let dev = serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).map(str::to_owned).unwrap_or_default();
+    assert_eq!(repos_of(&dev, "/api/ci/runs")?, ["acme/a"]);
+    assert_eq!(repos_of(&dev, "/api/ci/runs?repo=acme/b")?, Vec::<String>::new());
+    assert_eq!(repos_of(&dev, "/api/runs")?, ["acme/a"]);
+    assert_eq!(repos_of(&s.admin, "/api/runs")?, ["acme/a", "acme/b"]);
+    // The overview: dev's is acme/a's alone, with none of the server's (runners, its host).
+    let (st, body) = http(s.port, "GET", "/api/overview", &dev, None)?;
+    anyhow::ensure!(st == 200, "dev's overview: {st} {body}");
+    let mine: Value = serde_json::from_str(&body)?;
+    assert_eq!(mine.get("narrowed"), Some(&json!(["acme/a"])), "{mine}");
+    assert_eq!(mine.pointer("/stats/runs_24h"), Some(&json!(1)), "{mine}");
+    assert!(mine.get("agents").is_some_and(Value::is_null) && mine.pointer("/system/hostname").is_some_and(Value::is_null), "{mine}");
+    let all: Value = serde_json::from_str(&http(s.port, "GET", "/api/overview", &s.admin, None)?.1)?;
+    assert!(all.get("narrowed").is_none() && all.get("agents").is_some_and(Value::is_object), "{all}");
+    assert_eq!(all.pointer("/stats/runs_24h"), Some(&json!(2)), "{all}");
+    // The event stream: dev hears acme/a's new run, and nothing of acme/b's.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let heard = events(s.port, &dev, Instant::now() + Duration::from_secs(60), std::sync::Arc::clone(&stop));
+    std::thread::sleep(Duration::from_millis(500));
+    for name in ["acme/a", "acme/b"] {
+        let work = dir.path().join(name.replace('/', "-"));
+        std::fs::write(work.join("README.md"), "again\n")?;
+        git(&work, &["commit", "-qam", "again"])?;
+        git(&work, &["push", "-q", &format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port), "main"])?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while repos_of(&s.admin, "/api/ci/runs?limit=10")?.len() < 2 || http(s.port, "GET", "/api/ci/runs?limit=4", &s.admin, None)?.1.matches("\"again\"").count() < 2 {
+        anyhow::ensure!(Instant::now() < deadline, "the new runs");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let heard = heard.join().unwrap_or_default();
+    assert!(heard.contains("acme/a") && !heard.contains("acme/b"), "{heard}");
+    Ok(())
+}
+
+/// W10-R02's `secrets.use`: a run's legs are given only the secrets whoever started it may use.
+/// Two people push branches of a kiln-hosted repository: a developer, whose role uses any secret,
+/// and one whose grants deny `DEPLOY_KEY` there. The first's run has both of the repository's
+/// secrets; the second's has `OTHER` alone, and its leg says `DEPLOY_KEY` was withheld and why.
+#[test]
+fn w10_secrets_use_holds_a_run_to_whoever_started_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/held", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    for (name, value) in [("DEPLOY_KEY", "deploy-value-1"), ("OTHER", "other-value-2")] {
+        let (st, body) = http(s.port, "PUT", &format!("/api/ci/secrets/{name}?scope=repo:acme/held"), &s.admin, Some(&json!({ "value": value })))?;
+        anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+    }
+    let person = |name: &str, grants: &[&str]| -> anyhow::Result<String> {
+        let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&json!({ "name": name, "grants": grants })))?;
+        anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+        let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&json!({ "kind": "pat", "user": name, "grants": ["owner"] })))?;
+        anyhow::ensure!((200..300).contains(&st), "{name}'s token: {st} {body}");
+        Ok(serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).map(str::to_owned).unwrap_or_default())
+    };
+    let dev = person("dev", &["developer@repo:acme/held"])?;
+    let held = person("held", &["developer@repo:acme/held", "!secrets.use:DEPLOY_KEY@repo:acme/held"])?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/held.git", s.port);
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    git(&work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "held\n")?;
+    git(&work, &["add", "."])?;
+    git(&work, &["commit", "-qm", "first"])?;
+    git(&work, &["push", "-q", &url(&s.admin), "main"])?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while http(s.port, "GET", "/api/repos", &s.admin, None)?.1.contains("\"last_polled_at\":null") {
+        anyhow::ensure!(Instant::now() < deadline, "never polled");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(
+        work.join(".kiln/ci.yaml"),
+        "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - env:\n          D: ${{ secrets.DEPLOY_KEY }}\n          O: ${{ secrets.OTHER }}\n        run: echo \"deploy=${D:+given} other=${O:+given}\"\n",
+    )?;
+    git(&work, &["add", "."])?;
+    git(&work, &["commit", "-qm", "ci"])?;
+    git(&work, &["push", "-q", &url(&s.admin), "main"])?;
+    // Each person's branch: its run, its log and its annotations.
+    let ran = |branch: &str, token: &str| -> anyhow::Result<(String, String)> {
+        git(&work, &["checkout", "-q", "-B", branch, "main"])?;
+        std::fs::write(work.join("README.md"), format!("{branch}\n"))?;
+        git(&work, &["commit", "-qam", branch])?;
+        git(&work, &["push", "-q", &url(token), &format!("HEAD:refs/heads/{branch}")])?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let run = loop {
+            let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/held&limit=20", &s.admin, None)?;
+            let v: Value = serde_json::from_str(&body).unwrap_or_default();
+            let found = v.get("runs").and_then(Value::as_array).into_iter().flatten().find(|r| r.get("branch").and_then(Value::as_str) == Some(branch) && r.get("finished_at").is_some_and(|f| !f.is_null())).cloned();
+            if let Some(r) = found {
+                break r;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "{branch}'s run didn't finish: {body}\n{}", s.log());
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        let id = run.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+        let mut logs = String::new();
+        for leg in serde_json::from_str::<Value>(&detail)?.get("legs").and_then(Value::as_array).into_iter().flatten().filter_map(|l| l.get("id").and_then(Value::as_str)) {
+            for step in 0..4 {
+                logs.push_str(&http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?.1);
+            }
+        }
+        let (_, notes) = http(s.port, "GET", &format!("/api/ci/runs/{id}/annotations"), &s.admin, None)?;
+        Ok((logs, notes))
+    };
+    let (logs, notes) = ran("dev-branch", &dev)?;
+    assert!(logs.contains("deploy=given other=given"), "a developer's run has both: {logs}");
+    assert!(!notes.contains("withheld"), "{notes}");
+    let (logs, notes) = ran("held-branch", &held)?;
+    assert!(logs.contains("deploy= other=given"), "DEPLOY_KEY is withheld from the run held pushed: {logs}");
+    assert!(notes.contains("secret DEPLOY_KEY withheld") && notes.contains("user:held") && notes.contains("secrets.use:DEPLOY_KEY"), "and the leg says so: {notes}");
     Ok(())
 }

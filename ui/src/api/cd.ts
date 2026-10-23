@@ -43,6 +43,8 @@ export interface CdFilters {
   cluster?: string[];
   project?: string[];
   namespace?: string[];
+  /** The environments its deploy file names it for. */
+  environment?: string[];
   /** A part of the app's id, any case. */
   q?: string;
 }
@@ -70,6 +72,7 @@ const selector = (f: CdFilters) => ({
   cluster: f.cluster?.join(","),
   project: f.project?.join(","),
   namespace: f.namespace?.join(","),
+  environment: f.environment?.join(","),
   q: f.q,
 });
 

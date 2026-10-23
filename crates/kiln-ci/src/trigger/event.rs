@@ -65,6 +65,12 @@ pub struct Event {
     /// The ref was created or deleted by this push.
     pub created: bool,
     pub deleted: bool,
+    /// Who in kiln caused it, when someone did (a push to a kiln-hosted repository, a diff, a
+    /// dispatch through the API, an agent): the principal whose `secrets.use` its legs' secrets
+    /// are held to (docs/ci.md W10-R02). `None` for what the repository itself started
+    /// (schedules, another run, a host's webhook), whose secrets its configuration decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<serde_json::Value>,
 }
 
 /// The zero SHA, `before` of a new ref and `after` of a deleted one.
