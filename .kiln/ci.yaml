@@ -28,6 +28,10 @@ jobs:
         run: rustup component add clippy && cargo --version
       - name: clippy (no-panic lint wall)
         run: cargo clippy --locked --all-targets -- -D warnings
+      # Built apart, the libraries as their tests first, then the rest: kiln's crate compiled twice
+      # at once (the library, and the library as its tests) still ran out of 16Gi now and then.
+      - name: build the libraries' tests
+        run: cargo test --locked --lib --no-run
       - name: test
         run: cargo test --locked
 

@@ -78,6 +78,7 @@ pub struct InstallArgs {
     /// Agent: join token (consumed during install; never stored in the boot command).
     #[arg(long, env = "KILN_JOIN_TOKEN", allow_hyphen_values = true)]
     pub token: Option<String>,
+    /// Agent: its name (this machine's host name when not given). Docker: the container's (kiln).
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long, value_delimiter = ',')]
