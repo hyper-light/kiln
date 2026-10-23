@@ -316,6 +316,44 @@ mod tests {
         Ok(())
     }
 
+    /// As an upgrade does it: a running binary's path given a new file, the process names the new
+    /// one (its own `/proc/self/exe` reads `<path> (deleted)`). The running binary is this test's,
+    /// linked into a folder of its own (a copy would be gigabytes).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_binary_replaced_on_disk_names_the_one_in_its_place() -> anyhow::Result<()> {
+        const GO: &str = "KILN_TEST_REPLACED_GO";
+        // The run in the replaced binary: once told, what it names.
+        if let Some(go) = std::env::var_os(GO) {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !Path::new(&go).exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("exe={}", std::env::current_exe()?.display());
+            println!("this_kiln={}", this_kiln()?.display());
+            return Ok(());
+        }
+        let me = std::env::current_exe()?;
+        let dir = tempfile::tempdir_in(me.parent().unwrap_or(Path::new(".")))?;
+        let bin = dir.path().join("kiln");
+        std::fs::hard_link(&me, &bin)?;
+        let go = dir.path().join("go");
+        let child = std::process::Command::new(&bin)
+            .args(["--exact", "os::tests::a_running_binary_replaced_on_disk_names_the_one_in_its_place", "--nocapture", "--test-threads=1"])
+            .env(GO, &go)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let new = dir.path().join("kiln.new");
+        std::fs::write(&new, b"the next kiln")?;
+        std::fs::rename(&new, &bin)?;
+        std::fs::write(&go, b"")?;
+        let said = String::from_utf8_lossy(&child.wait_with_output()?.stdout).into_owned();
+        println!("{said}");
+        assert!(said.contains(&format!("exe={} (deleted)\n", bin.display())), "the replaced binary's own path: {said}");
+        assert!(said.contains(&format!("this_kiln={}\n", bin.display())), "{said}");
+        Ok(())
+    }
+
     #[test]
     fn a_folder_goes_on_a_windows_path_once() {
         let var = |name: &str| (name == "LOCALAPPDATA").then(|| r"C:\Users\me\AppData\Local".to_owned());

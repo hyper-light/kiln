@@ -540,14 +540,16 @@ mod tests {
     #[test]
     fn what_a_harness_s_helper_runs_is_the_harness_s_and_never_left_running() -> anyhow::Result<()> {
         // An MCP server (as its command names it) under this process, running a command that runs
-        // another (as a browser's processes do), all marked as session "helped"'s.
-        let mut helper = std::process::Command::new("sh").arg("-c").arg("sh -c 'sleep 33; true' & wait").arg("mcp-server-lab").env(MARK, "helped").spawn()?;
+        // another (as a browser's processes do), all marked as a session of this test's own (another
+        // run of it at the same time has its own).
+        let id = format!("helped-{}", std::process::id());
+        let mut helper = std::process::Command::new("sh").arg("-c").arg("sh -c 'sleep 33; true' & wait").arg("mcp-server-lab").env(MARK, &id).spawn()?;
         let until = std::time::Instant::now() + Duration::from_secs(5);
         while under(helper.id()).len() < 2 && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
         let theirs = under(helper.id());
-        let seen = scan(&[("helped".to_owned(), Some(std::process::id()))]).remove("helped").unwrap_or_default();
+        let seen = scan(&[(id.clone(), Some(std::process::id()))]).remove(&id).unwrap_or_default();
         stop(&[vec![helper.id()], theirs.clone()].concat());
         let _ = helper.wait();
         assert!(theirs.len() >= 2, "the helper's command and what it runs: {theirs:?}");
