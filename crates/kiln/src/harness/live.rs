@@ -191,10 +191,13 @@ impl Feed {
                 self.shared.deleted.store(false, Ordering::Release);
             }
             Err(e) => {
+                // Said once as the feed breaks; asked again at each frame, each refusal counted.
+                if !self.broken {
+                    tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %self.shared.topic, error = %e, "a session's live feed couldn't be made: its viewers get snapshots until it is");
+                }
                 self.broken = true;
                 self.shared.refusals.fetch_add(1, Ordering::AcqRel);
                 crate::metrics::bus().refused.inc(&["create"]);
-                tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %self.shared.topic, error = %e, "a session's live feed couldn't be made: its viewers get snapshots until it is");
             }
         }
         self.made

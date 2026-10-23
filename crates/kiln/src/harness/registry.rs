@@ -119,12 +119,6 @@ impl Mirror {
         }
     }
 
-    /// The frames that bring a new viewer to the current state; `files`, what's kept of the files
-    /// its messages mention (`Keeper::frame`), goes ahead of the events.
-    fn snapshot(&self, files: Option<String>) -> Vec<String> {
-        self.parts().frames(files)
-    }
-
     /// What a snapshot is made of, taken under the mirrors' lock: the events as references, the
     /// rest as copies. Its frames are made after the lock is let go ([`Parts::frames`]).
     fn parts(&self) -> Parts {
@@ -1714,7 +1708,7 @@ mod tests {
         assert!(m.state_frame().is_none());
         assert!(m.sent.is_null());
         let (_viewer, _) = m.feed.attach();
-        let snapshot = m.snapshot(None);
+        let snapshot = m.parts().frames(None);
         assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": m.state}))));
         m.state = json!({"status": "idle"});
         let frame = m.state_frame().ok_or_else(|| anyhow::anyhow!("no viewer frame"))?;

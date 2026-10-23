@@ -47,7 +47,7 @@ on any device (`crate::harness::live`):
 
 | Setting | Default | What it is |
 |---|---|---|
-| `memory` | `memory = 268435456` (256 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go. Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed. |
+| `memory` | `memory = 268435456` (256 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. |
 | `topic_bytes` | `topic_bytes = 16777216` (16 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. |
 
 The bus holds 65,536 topics and 65,536 subscriptions at once; a session's feed keeps 2048 frames.

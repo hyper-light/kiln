@@ -5,21 +5,36 @@ delivers, what deploying it does and how to watch it, its risks and its rollback
 open: the metric names Kiln Metrics hasn't answered and the decisions that are Ada's.
 
 **Where it stands (2026-10-23):**
-- **Not merged.** Branch `cp/t2-quiver`, local, has merged main at 719c954 (76b6baf). Main's new
-  kiln-http took hyper-rt from git at 767627f; it now takes the vendored copy, so kiln holds one
-  hyper-raft.
-- **Not gated.** Its two gates, Quiver's and kiln's, wait for slots from the coordinator. What
-  has run on fedora on the merged tree, as development checks:
+- **Not merged.** Branch `cp/t2-quiver`, local, has merged main at 243c2aa (948ea91). Main's
+  kiln-http took hyper-rt from git at 767627f; it takes the vendored copy, so kiln holds one
+  hyper-raft. Main's kiln.db Raft group (`store/group.rs`) builds and passes on 25cf889 too.
+- **Reviewed.** An adversarial review found, and this branch fixed:
+  - a viewer could wait on silently once a full bus refused its feed's frames and the resync marker
+    after them: each viewer now counts its feed's refusals and starts over when there were more;
+  - a session nobody watched kept its frames on the bus until it ended: its topic now goes at its
+    first frame with no viewer, and is made again for the next;
+  - an ended session's topic went at once, from under a viewer still a frame or two behind: it now
+    goes with its last viewer, each ending with the session's last frame (`closed`);
+  - a viewer's snapshot was made under the registry-wide lock, holding up every session's frames:
+    its parts are taken under it (the events by reference) and it's made after;
+  - vendored names were pinned by caret, and crates.io has unrelated crates under some
+    (`quiver`, `hyper-rt`): every one is pinned exactly, and bench/kilndb patches them too;
+  - the labs passed even if viewers only ever caught up by starting over: they now require one
+    snapshot each, and no lag notice or refusal on the server.
+- **Not gated.** kiln's gate waits for a slot from the coordinator. What has run on fedora on the
+  merged tree, as development checks:
   - clippy on kiln, kiln-cd, kiln-seams and kiln-http, every target;
-  - kiln's unit tests: 1,323 passed, none failed;
-  - the live-feed labs (2) and the vendored test (8);
+  - kiln's unit tests: 1,383 passed, none failed;
+  - the live-feed labs (2) and the vendored test (9);
   - kiln-http's tests (39) and kiln-cd's (153).
-  The blob labs passed before the merge.
-- **Not measured.** AC-T2.1.2 to AC-T2.1.4 (Quiver's fan-out bench and its hour's soak) and the
-  comparison with NATS, Redis and Kafka wait for a quiet window on fedora.
-- **Quiver** is at df068e4. Its gate passed in kiln CI (run 5: fmt, clippy on Linux, macOS and
-  Windows, the production check, the tests, the vendor check), and hyper-light/quiver's main is
-  df068e4 (fast-forwarded on Ada's word, 2026-10-23), the commit kiln vendors.
+- **Measuring.** The comparison with NATS, Redis and Kafka is running on adacachy, on Ada's word,
+  beside production (load 33 to 92, so no record of AC-T2.1.2's bar), its systems interleaved
+  load by load; the hour's soak follows it. AC-T2.1.2 to AC-T2.1.4's records want a quiet machine.
+- **Quiver** is at d8e5d54. Its gate passed in kiln CI at df068e4 (run 5: fmt, clippy on Linux,
+  macOS and Windows, the production check, the tests, the vendor check), and hyper-light/quiver's
+  main is df068e4 (fast-forwarded on Ada's word, 2026-10-23). Since then: the bench interleaves its
+  systems and raises its file limit, vendored names are pinned exactly, docs say no more than the
+  code. kiln vendors d8e5d54.
 
 ## What it delivers
 
@@ -109,7 +124,7 @@ A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.rs, docs/b
   changed both the log format and the wire format, but only for groups that state fates:
   - the log's new record kind (11, a hard state with a promise) and a persist row's flag 128;
   - the wire's new flags (`HELD`, `TOLD`).
-  kiln's groups state none: they take `Config::new`'s `fates: None`. So kiln's logs and messages
+  kiln's groups state none: sync's, CD's and kiln.db's alike take `Config::new`'s `fates: None`. So kiln's logs and messages
   are written as before, and the wire format's version (1) and fixed layout are unchanged
   (crates/hyper-raft/src/wire.rs and crates/hyper-log/src/format.rs at both revisions).
 - **A fleet upgrade's minutes:** a new server with old runners, or an old server with new
