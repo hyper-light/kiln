@@ -227,7 +227,8 @@ def upload(name, files):
         if zipped:
             headers.update({"Content-Encoding": "gzip", "x-tfs-filelength": str(len(data))})
         step = len(body) if zipped else 4
-        for at in range(0, len(body), step):
+        # An empty file's one chunk says `bytes 0--1/0`.
+        for at in range(0, max(len(body), 1), max(step, 1)):
             chunk = body[at:at + step]
             ranged = dict(headers, **{"Content-Range": "bytes %d-%d/%d" % (at, at + len(chunk) - 1, len(body))})
             call("PUT", made["fileContainerResourceUrl"] + "?itemPath=" + urllib.parse.quote(name + "/" + path), chunk, ranged)
@@ -236,7 +237,7 @@ def upload(name, files):
     print("uploaded", name, "from", part)
 upload("shared", [("from-" + part + ".txt", ("made by " + part + "\n").encode(), part == "a"), ("dir/" + part + ".txt", (part * 300 + "\n").encode(), True)])
 if part == "a":
-    upload("solo", [("only.txt", b"only a\n", False)])
+    upload("solo", [("only.txt", b"only a\n", False), ("empty.txt", b"", False)])
 "#;
 
 /// What v1 to v3 of `download-artifact` do: the run's artifacts listed, each one's files, then
@@ -254,7 +255,7 @@ for a in sorted(listed["value"], key=lambda a: a["name"]):
     items = json.loads(get(a["fileContainerResourceUrl"] + "?itemPath=" + urllib.parse.quote(a["name"]), runtime))
     for item in sorted(items["value"], key=lambda i: i["path"]):
         data = get(item["contentLocation"], runtime, "application/octet-stream;api-version=6.0-preview").decode()
-        print("file", item["path"], item["fileLength"], len(data), data.splitlines()[0][:12])
+        print("file", item["path"], item["fileLength"], len(data), (data.splitlines() or ["-"])[0][:12])
 api = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"]
 runs = json.loads(get(api + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/artifacts", os.environ["TOKEN"], "application/json"))
 for a in sorted(runs["artifacts"], key=lambda a: a["name"]):
@@ -310,9 +311,10 @@ fn w08_r08_artifacts_as_v3_keeps_them() -> anyhow::Result<()> {
         "file shared/dir/b.txt 301 301 bbbbbbbbbbbb",
         "file shared/from-a.txt 10 10 made by a",
         "file shared/from-b.txt 10 10 made by b",
+        "file solo/empty.txt 0 0 -",
         "file solo/only.txt 7 7 only a",
         "zip shared dir/a.txt,dir/b.txt,from-a.txt,from-b.txt made by b",
-        "zip solo only.txt only a",
+        "zip solo empty.txt,only.txt only a",
     ] {
         assert!(said(line), "{line}: {down}");
     }

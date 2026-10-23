@@ -151,14 +151,18 @@ fn inside(name: &str, item: &str) -> Option<String> {
     ok.then(|| rest.to_owned())
 }
 
-/// `Content-Range: bytes <start>-<end>/<total>` → (start, end, total).
-fn content_range(req: &Request) -> Option<(u64, u64, u64)> {
-    let v = req.headers().get(header::CONTENT_RANGE)?.to_str().ok()?;
+/// `Content-Range: bytes <start>-<end>/<total>` → (start, length, total). An empty file's is
+/// `bytes 0--1/0`, as the toolkit says it.
+fn content_range(v: &str) -> Option<(u64, u64, u64)> {
     let spec = v.trim().strip_prefix("bytes")?.trim();
     let (range, total) = spec.split_once('/')?;
+    let total: u64 = total.trim().parse().ok()?;
+    if total == 0 {
+        return Some((0, 0, 0));
+    }
     let (a, b) = range.split_once('-')?;
-    let (start, end, total): (u64, u64, u64) = (a.trim().parse().ok()?, b.trim().parse().ok()?, total.trim().parse().ok()?);
-    (end >= start && end < total).then_some((start, end, total))
+    let (start, end): (u64, u64) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+    (end >= start && end < total).then(|| (start, end - start + 1, total))
 }
 
 /// An artifact of the leg's run, by its container.
@@ -208,9 +212,10 @@ pub async fn container(hub: &Arc<Hub>, id: &str, req: Request) -> Result<Respons
 
 async fn upload(hub: &Hub, id: i64, name: &str, item: &str, req: Request) -> Result<Response, Fail> {
     let Some(path) = inside(name, item) else { return Ok(message(StatusCode::BAD_REQUEST, &format!("itemPath must name a file inside the artifact ({name}/<path>): {item}"))) };
-    let Some((start, end, total)) = content_range(&req) else { return Ok(message(StatusCode::BAD_REQUEST, "Content-Range: bytes <start>-<end>/<total> is required")) };
+    let Some((start, len, total)) = req.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(content_range) else {
+        return Ok(message(StatusCode::BAD_REQUEST, "Content-Range: bytes <start>-<end>/<total> is required"));
+    };
     let max = hub.cfg.ci.artifacts.max_size_gb.saturating_mul(1 << 30);
-    let len = end - start + 1;
     if len > MAX_PART || total > max {
         return Ok(message(StatusCode::PAYLOAD_TOO_LARGE, &format!("the file is over the artifact's {max} bytes, or the chunk over {MAX_PART}")));
     }
@@ -497,6 +502,17 @@ mod tests {
         assert_eq!(inside("dist", "dist\\win\\f.exe").as_deref(), Some("win/f.exe"), "a Windows client's separators");
         for bad in ["dist", "dist/", "other/f", "distx/f", "dist/../f", "dist/a//b", "dist/./f", "dist/a/.."] {
             assert_eq!(inside("dist", bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn w08_r08_v3_chunks_say_their_range() {
+        assert_eq!(content_range("bytes 0-9/10"), Some((0, 10, 10)));
+        assert_eq!(content_range("bytes 8388608-8388611/8388612"), Some((8_388_608, 4, 8_388_612)));
+        // An empty file, as the toolkit says it.
+        assert_eq!(content_range("bytes 0--1/0"), Some((0, 0, 0)));
+        for bad in ["bytes 5-4/10", "bytes 0-10/10", "bytes 0-9/*", "0-9/10", "bytes x-9/10"] {
+            assert_eq!(content_range(bad), None, "{bad}");
         }
     }
 
