@@ -26,6 +26,7 @@ pub mod azure_web;
 pub mod cloudflare_pages;
 pub mod cloudflare_workers;
 pub mod cloudformation;
+pub mod compose;
 pub mod digitalocean;
 pub mod fly;
 pub mod gcp_appengine;
@@ -33,9 +34,15 @@ pub mod gcp_compute;
 pub mod gcp_functions;
 pub mod gcp_run;
 pub mod heroku;
+pub mod host;
+pub mod job;
+pub mod microvm;
 pub mod netlify;
 pub mod nomad;
+pub mod pulumi;
 pub mod render;
+pub mod runner;
+pub mod terraform;
 pub mod vercel;
 
 use serde::Serialize;
@@ -602,11 +609,19 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "runner",
         place: &["selector"],
         scope: None,
-        settings: &[s("service", true, "the service (systemd, launchd or a Windows service)"), s("files", true, "what it installs (${{ artifacts.* }})"), s("check", false, "a check each host runs once it restarts")],
+        settings: &[
+            s("service", true, "the service (a systemd user unit on Linux, a launch agent on macOS, a Windows service)"),
+            s("files", true, "what it runs: a .tar.gz or .zip CI built (${{ release.artifacts.<name>.digest }})"),
+            s("start", true, "the command it runs, from the release's directory"),
+            s("env", false, "its environment: {MODE: prod}"),
+            s("check", false, "a URL each host's service answers once it restarted, or a command"),
+            s("batch", false, "hosts at a time (1)"),
+            s("keep", false, "releases kept on each host to go back to (3)"),
+        ],
         kinds: &[kind("host.kiln.dev", "Service", "Service"), child(kind("host.kiln.dev", "Host", "Host"))],
-        capabilities: &[Logs, Drift],
+        capabilities: &[Versions],
         reads: &[],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "compose",
@@ -614,11 +629,16 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "runner",
         place: &["selector"],
         scope: None,
-        settings: &[s("project", true, "the Compose project"), s("file", false, "compose.yaml in the source (found by default)")],
+        settings: &[
+            s("project", true, "the Compose project"),
+            s("file", false, "compose.yaml in the source (found by default), or the file as an object"),
+            s("env", false, "the environment the file is read with: {IMAGE: …}"),
+            s("batch", false, "hosts at a time (1)"),
+        ],
         kinds: &[kind("compose.kiln.dev", "Project", "Project"), child(kind("compose.kiln.dev", "Container", "Container"))],
-        capabilities: &[Logs, Drift],
+        capabilities: &[],
         reads: &["compose.yaml"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "microvm",
@@ -626,11 +646,21 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "runner",
         place: &["selector"],
         scope: None,
-        settings: &[s("vm", true, "the microVM"), s("image", true, "its image or Agentfile (${{ artifacts.* }})")],
+        settings: &[
+            s("vm", true, "the microVM"),
+            s("image", true, "the image it boots (${{ release.artifacts.<name>.digest }})"),
+            s("command", false, "what it runs in place of the image's command"),
+            s("env", false, "its service's environment: {MODE: prod}"),
+            s("ports", false, "the host's ports that reach its own: [\"8080:80\"]"),
+            s("health", false, "a URL it answers once healthy, or a command run in there"),
+            s("vcpus", false, "its vCPUs (1)"),
+            s("memory", false, "its memory (512M)"),
+            s("batch", false, "hosts at a time (1)"),
+        ],
         kinds: &[kind("microvm.kiln.dev", "VM", "microVM")],
-        capabilities: &[Logs, Drift],
-        reads: &["Agentfile"],
-        built: false,
+        capabilities: &[],
+        reads: &[],
+        built: true,
     },
     ProviderDef {
         name: "terraform",
@@ -638,11 +668,18 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "runner",
         place: &[],
         scope: None,
-        settings: &[s("workspace", true, "the workspace"), s("dir", false, "the configuration's directory in the source"), s("binary", false, "terraform or tofu"), s("vars", false, "input variables")],
+        settings: &[
+            s("workspace", true, "the workspace each release applies"),
+            s("dir", false, "the configuration's directory in the source (.)"),
+            s("binary", false, "terraform (the default) or tofu"),
+            s("vars", false, "input variables: {image: \"${{ release.artifacts.image.digest }}\"}"),
+            s("backend-config", false, "the backend's settings, for init"),
+            s("runs-on", false, "the runners with the tool: a label or a list of them (linux)"),
+        ],
         kinds: &[kind("terraform.kiln.dev", "Workspace", "Workspace"), child(kind("terraform.kiln.dev", "Resource", "Resource"))],
-        capabilities: &[Drift, Validate],
+        capabilities: &[],
         reads: &["*.tf"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "pulumi",
@@ -650,11 +687,16 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "runner",
         place: &[],
         scope: None,
-        settings: &[s("stack", true, "the stack"), s("dir", false, "the project's directory in the source")],
+        settings: &[
+            s("stack", true, "the stack each release brings up (org/project/stack)"),
+            s("dir", false, "the project's directory in the source (.)"),
+            s("config", false, "config it sets: {image: \"${{ release.artifacts.image.digest }}\"}"),
+            s("runs-on", false, "the runners with the tool: a label or a list of them (linux)"),
+        ],
         kinds: &[kind("pulumi.kiln.dev", "Stack", "Stack"), child(kind("pulumi.kiln.dev", "Resource", "Resource"))],
-        capabilities: &[Drift, Validate],
+        capabilities: &[],
         reads: &["Pulumi.yaml"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "job",
@@ -662,11 +704,15 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "runner",
         place: &[],
         scope: None,
-        settings: &[s("workflow", true, "the workflow"), s("job", false, "the job in it"), s("check", false, "a check after it")],
+        settings: &[
+            s("workflow", true, "a workflow of the source's repository, run at the release's commit"),
+            s("job", false, "one of its jobs, and those it needs (all, by default)"),
+            s("inputs", false, "its inputs: {version: \"${{ release.version }}\"}"),
+        ],
         kinds: &[kind("job.kiln.dev", "Run", "Run")],
-        capabilities: &[Logs],
+        capabilities: &[],
         reads: &["a workflow"],
-        built: false,
+        built: true,
     },
 ];
 
@@ -791,6 +837,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "cloudflare-pages" => cloudflare_pages::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
         "cloudformation" => cloudformation::render(input),
+        "compose" => compose::render(input),
         "digitalocean" => digitalocean::render(input),
         "fly" => fly::render(input),
         "gcp-appengine" => gcp_appengine::render(input),
@@ -798,9 +845,14 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "gcp-functions" => gcp_functions::render(input),
         "gcp-run" => gcp_run::render(input),
         "heroku" => heroku::render(input),
+        "host" => host::render(input),
+        "job" => job::render(input),
+        "microvm" => microvm::render(input),
         "netlify" => netlify::render(input),
         "nomad" => nomad::render(input),
+        "pulumi" => pulumi::render(input),
         "render" => render::render(input),
+        "terraform" => terraform::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
             Some(p) => Err(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", p.title)),
@@ -825,6 +877,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "cloudflare-pages" => cloudflare_pages::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
         "cloudformation" => cloudformation::files(spec),
+        "compose" => compose::files(spec),
         "digitalocean" => digitalocean::files(spec),
         "fly" => fly::files(spec),
         "gcp-appengine" => gcp_appengine::files(spec),
@@ -832,9 +885,14 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "gcp-functions" => gcp_functions::files(spec),
         "gcp-run" => gcp_run::files(spec),
         "heroku" => heroku::files(spec),
+        "host" => host::files(spec),
+        "job" => job::files(spec),
+        "microvm" => microvm::files(spec),
         "netlify" => netlify::files(spec),
         "nomad" => nomad::files(spec),
+        "pulumi" => pulumi::files(spec),
         "render" => render::files(spec),
+        "terraform" => terraform::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
     }
@@ -861,6 +919,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "cloudflare-pages" => cloudflare_pages::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
         "cloudformation" => cloudformation::health(obj),
+        "compose" => compose::health(obj),
         "digitalocean" => digitalocean::health(obj),
         "fly" => fly::health(obj),
         "gcp-appengine" => gcp_appengine::health(obj),
@@ -868,9 +927,14 @@ pub fn health(obj: &Value) -> Option<Status> {
         "gcp-functions" => gcp_functions::health(obj),
         "gcp-run" => gcp_run::health(obj),
         "heroku" => heroku::health(obj),
+        "host" => host::health(obj),
+        "job" => job::health(obj),
+        "microvm" => microvm::health(obj),
         "netlify" => netlify::health(obj),
         "nomad" => nomad::health(obj),
+        "pulumi" => pulumi::health(obj),
         "render" => render::health(obj),
+        "terraform" => terraform::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,
     }

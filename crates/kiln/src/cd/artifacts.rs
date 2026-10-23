@@ -15,17 +15,26 @@ use crate::hub::Hub;
 /// The most an artifact may hold to be read whole.
 pub const LIMIT: u64 = 512 << 20;
 
-/// Where a provider reads what kiln holds for it: artifacts' content, and the values of an app's
-/// secrets as it applies the objects that reference them (docs/deploy-api.md §3.5).
+/// Where a provider reads what kiln holds for it: artifacts' content, the values of an app's
+/// secrets as it applies the objects that reference them (docs/deploy-api.md §3.5), and kiln's
+/// runners, for the providers that act through them (docs/cd-targets.md §2.2).
 pub trait Files: Send + Sync {
     /// The content of the artifact whose SHA-256 is `hex`, streamed, with its size.
     fn open<'a>(&'a self, hex: &'a str) -> Pin<Box<dyn std::future::Future<Output = Result<(async_channel::Receiver<Bytes>, u64)>> + Send + 'a>>;
     /// The value `reference` ([`kiln_cd::apps::SECRET_REF`]) stands for, which must be one of
     /// `app`'s secrets: read now, and the read kept in the secret's log.
     fn secret<'a>(&'a self, app: &'a str, reference: &'a str) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+    /// kiln's runners: none where the providers' calls go only to platforms' APIs.
+    fn runners(&self) -> Option<&dyn crate::cd::targets::runner::Runners> {
+        None
+    }
 }
 
 impl Files for Hub {
+    fn runners(&self) -> Option<&dyn crate::cd::targets::runner::Runners> {
+        Some(self)
+    }
+
     fn open<'a>(&'a self, hex: &'a str) -> Pin<Box<dyn std::future::Future<Output = Result<(async_channel::Receiver<Bytes>, u64)>> + Send + 'a>> {
         Box::pin(async move {
             let obj = crate::ci::services::cas::object(self, hex).await?.with_context(|| format!("no artifact sha256:{hex} in kiln's store (expired?)"))?;

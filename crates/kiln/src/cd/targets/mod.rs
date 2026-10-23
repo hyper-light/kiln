@@ -45,6 +45,7 @@ pub mod heroku;
 pub mod netlify;
 pub mod nomad;
 pub mod render;
+pub mod runner;
 pub mod vercel;
 #[cfg(test)]
 pub mod fake;
@@ -58,6 +59,8 @@ pub mod fake_hosting;
 pub mod fake_nomad;
 #[cfg(test)]
 pub mod fake_query;
+#[cfg(test)]
+pub mod fake_runners;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -157,6 +160,8 @@ pub enum Creds {
     Bearer(String),
     /// A token platform's stored token, with its integration's configuration (an account id).
     Token { token: String, config: Value },
+    /// kiln's runners, which act as kiln (`runner` targets).
+    Runners,
 }
 
 /// Where what kiln applied is kept, and the rollouts of what it applied (§5): the CD store
@@ -376,6 +381,10 @@ impl Cd {
     /// Credentials for calls on `conn`, as the workload of `app` (or of the target's apps), for
     /// `trigger` (`watch`, `sync`, `delete`).
     pub(super) async fn creds(&self, conn: &Conn, app: Option<&str>, trigger: &str) -> Result<Creds> {
+        // kiln's runners act as kiln: no integration, no credentials.
+        if conn.def.integration == "runner" {
+            return Ok(Creds::Runners);
+        }
         let i = self.account(conn).await?;
         let (repository, environment, app) = self.identity(&conn.target.name(), app);
         let w = kiln_ci::oidc::Workload { repository: &repository, environment: environment.as_deref(), actor: "kiln", source: "cd", app: app.as_deref(), trigger: Some(trigger), ..Default::default() };
@@ -617,6 +626,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "netlify" => netlify::list(cx, kind, names).await?,
         "nomad" => nomad::list(cx, kind, names).await?,
         "render" => render::list(cx, kind, names).await?,
+        "terraform" | "pulumi" | "job" | "host" | "compose" | "microvm" => runner::list(cx, kind, names).await?,
         "vercel" => vercel::list(cx, kind, names).await?,
         other => bail!("no reading {other} yet"),
     };
@@ -653,6 +663,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "netlify" => netlify::apply(cx, desired).await,
         "nomad" => nomad::apply(cx, desired).await,
         "render" => render::apply(cx, desired).await,
+        "terraform" | "pulumi" | "job" | "host" | "compose" | "microvm" => runner::apply(cx, desired).await,
         "vercel" => vercel::apply(cx, desired).await,
         other => bail!("no applying to {other} yet"),
     }
@@ -684,6 +695,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "netlify" => netlify::delete(cx, key).await,
         "nomad" => nomad::delete(cx, key).await,
         "render" => render::delete(cx, key).await,
+        "terraform" | "pulumi" | "job" | "host" | "compose" | "microvm" => runner::delete(cx, key).await,
         "vercel" => vercel::delete(cx, key).await,
         other => bail!("no deleting from {other} yet"),
     }

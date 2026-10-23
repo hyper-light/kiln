@@ -491,6 +491,31 @@ struct EnvBody {
     targets: Option<Targets>,
 }
 
+/// Defines `name` in `repo` as kiln's own environment of `kind` on the runners `selector` picks,
+/// for a CD provider whose deployments the deploy action makes on its runners
+/// (docs/cd-targets.md §2.2, `microvm`), keeping the protection it has. One the repository's file
+/// defines is the file's: it must say that kind already.
+pub async fn define(hub: &Hub, repo: &Repo, name: &str, kind: &str, selector: &str) -> anyhow::Result<()> {
+    let targets = Targets { runners: Some(selector.trim().to_owned()), ..Targets::default() };
+    check_kind(Some(kind), &targets).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    let existing = defs(hub, repo).await?.remove(&name.to_ascii_lowercase());
+    if let Some(d) = &existing {
+        if d.source == "file" {
+            if d.kind.as_deref() == Some(kind) {
+                return Ok(());
+            }
+            anyhow::bail!("{name} is defined by {}'s .kiln/environments.yaml, as no {kind} environment", repo.name);
+        }
+        if d.kind.as_deref() == Some(kind) && d.targets == targets {
+            return Ok(());
+        }
+    }
+    let mut d = existing.unwrap_or(EnvDef { name: name.to_owned(), protection: Protection::default(), url: None, kind: None, targets: Targets::default(), source: "kiln".into(), agents_approve: false, concurrency: None, preview: None });
+    d.kind = Some(kind.to_owned());
+    d.targets = targets;
+    save(hub, repo, &d, "kilncd").await
+}
+
 /// Makes `d` in kiln (or changes the one made here): what saving an environment does.
 async fn save(hub: &Hub, repo: &Repo, d: &EnvDef, by: &str) -> anyhow::Result<()> {
     let (id, n, p, u, who, limit, kind, targets) =

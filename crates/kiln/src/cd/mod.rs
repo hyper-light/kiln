@@ -21,6 +21,7 @@ pub mod live;
 pub mod ops;
 pub mod plans;
 pub mod rollouts;
+pub mod runners;
 pub mod targets;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
