@@ -7,7 +7,9 @@
 //!
 //! kiln's store runs one call at a time, so commits are linearizable as they are. Beside the
 //! tables, what a wait needs is kept in memory too (the head, the feed's horizon, each family's
-//! newest change), so a wait for a change already made answers at once.
+//! newest change), so a wait for a change already made answers at once. The head moves there only
+//! once a commit is kept (with the cluster group, once the group's commit is), so no read sees a
+//! revision the tables don't hold.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -120,6 +122,8 @@ impl StoreRecords {
         self.store
             .call(move |c| {
                 let t = crate::store::tx(c)?;
+                // The horizons move in memory before the write is kept, unlike a commit's head: ahead
+                // of the tables, they only refuse reads the tables could still answer.
                 let mut m = inner.mem.lock();
                 let before = sql(before.min(m.head));
                 t.execute(
@@ -222,7 +226,6 @@ impl Records for StoreRecords {
                     return Err(Refusal::TooLarge { what: "a value", size: value.len(), limit: VALUE_MAX });
                 }
             }
-            let inner = Arc::clone(&self.inner);
             let out = self
                 .store
                 .call(move |c| {
@@ -241,11 +244,13 @@ impl Records for StoreRecords {
                             return Ok(Err(Refusal::Conflict { family: family.clone(), key: key.clone(), at: live }));
                         }
                     }
-                    let mut m = inner.mem.lock();
+                    // The head as kept: memory moves only once a commit is (below), so it may be
+                    // behind here, never ahead.
+                    let head: i64 = t.query_row("SELECT head FROM records_meta WHERE id = 1", [], |r| r.get(0))?;
                     if tx.writes.is_empty() {
-                        return Ok(Ok(m.head));
+                        return Ok(Ok((rev(head), BTreeSet::new())));
                     }
-                    let at = m.head.saturating_add(1);
+                    let at = rev(head).saturating_add(1);
                     let mut families = BTreeSet::new();
                     for (seq, w) in tx.writes.iter().enumerate() {
                         let (family, key, value) = match w {
@@ -264,18 +269,23 @@ impl Records for StoreRecords {
                     }
                     t.execute("UPDATE records_meta SET head = ?1 WHERE id = 1", [sql(at)])?;
                     t.commit()?;
-                    m.head = at;
-                    for f in families {
-                        m.newest.insert(f, at);
-                    }
-                    Ok(Ok(at))
+                    Ok(Ok((at, families)))
                 })
                 .await
                 .map_err(unavailable)?;
-            if out.is_ok() {
-                self.inner.changed.notify(usize::MAX);
+            // Kept (with the cluster group, its commit too), so what's in memory moves now; commits
+            // that finish out of order each leave the newer.
+            let (at, families) = out?;
+            {
+                let mut m = self.inner.mem.lock();
+                m.head = m.head.max(at);
+                for f in families {
+                    let newest = m.newest.entry(f).or_default();
+                    *newest = (*newest).max(at);
+                }
             }
-            out
+            self.inner.changed.notify(usize::MAX);
+            Ok(at)
         })
     }
 
@@ -293,9 +303,10 @@ impl Records for StoreRecords {
                         }
                         m.head
                     };
-                    let mut s = c.prepare_cached("SELECT rev, key, value FROM records_versions WHERE family = ?1 AND rev > ?2 ORDER BY rev, seq LIMIT ?3")?;
+                    // Up to the head it answers with: a commit kept, and not yet in memory, comes next.
+                    let mut s = c.prepare_cached("SELECT rev, key, value FROM records_versions WHERE family = ?1 AND rev > ?2 AND rev <= ?4 ORDER BY rev, seq LIMIT ?3")?;
                     let changes = s
-                        .query_map(params![family, sql(after), i64::try_from(limit).unwrap_or(i64::MAX)], |r| Ok(Change { rev: rev(r.get(0)?), key: r.get(1)?, value: r.get(2)? }))?
+                        .query_map(params![family, sql(after), i64::try_from(limit).unwrap_or(i64::MAX), sql(head)], |r| Ok(Change { rev: rev(r.get(0)?), key: r.get(1)?, value: r.get(2)? }))?
                         .collect::<Result<Vec<Change>, _>>()?;
                     Ok(Ok(Changes { changes, head }))
                 })
