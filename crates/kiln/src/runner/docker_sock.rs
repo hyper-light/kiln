@@ -350,6 +350,49 @@ fn with_label(filters: Option<&str>, label: &str) -> String {
     v.to_string()
 }
 
+/// A list's or an event stream's `filters` with the leg's names the daemon's, each of `keys` as
+/// its kind is named: exactly, or (`true`) a pattern anchored at its end (`^/db$`, as a script
+/// checks a name), which the suffix would otherwise leave matching nothing. `None` when none
+/// changed.
+fn named_filters(filters: &str, names: &Names, keys: &[(&str, Kind, bool)]) -> Option<String> {
+    let mut v: Value = serde_json::from_str(filters).ok()?;
+    let o = v.as_object_mut()?;
+    let mut changed = false;
+    for (key, k, anchored) in keys {
+        let named = |s: &str| -> Option<String> {
+            if *anchored {
+                let core = s.strip_suffix('$')?;
+                let bare = core.trim_start_matches('^').trim_start_matches('/');
+                (names.own(*k, bare) != bare).then(|| format!("{core}{}$", names.suffix))
+            } else {
+                Some(names.own(*k, s)).filter(|now| now != s)
+            }
+        };
+        match o.get_mut(*key) {
+            Some(Value::Array(a)) => {
+                for x in a.iter_mut() {
+                    if let Some(now) = x.as_str().and_then(named) {
+                        *x = Value::String(now);
+                        changed = true;
+                    }
+                }
+            }
+            // An older client's `{"name": {"db": true}}`.
+            Some(Value::Object(m)) => {
+                let old: Vec<String> = m.keys().filter(|x| named(x).is_some()).cloned().collect();
+                for x in old {
+                    if let (Some(now), Some(value)) = (named(&x), m.remove(&x)) {
+                        m.insert(now, value);
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    changed.then(|| v.to_string())
+}
+
 /// The route of a request to `target` with `method`, the leg's names taken to the daemon's.
 fn route(method: &str, target: &str, names: &mut Names) -> Route {
     let (path, query) = target.split_once('?').map_or((target, None), |(p, q)| (p, Some(q)));
@@ -360,6 +403,12 @@ fn route(method: &str, target: &str, names: &mut Names) -> Route {
     let plain = if method == "HEAD" { Answer::Bodiless } else { Answer::Plain };
     let to = |segments: &[&str], q: Option<&str>| format!("{version}{}{}", segments.join("/"), q.map(|q| format!("?{q}")).unwrap_or_default());
     let made = |names: &mut Names, k: Kind, v: Option<&str>| v.filter(|v| !v.is_empty()).map(|v| names.made(k, v)).filter(|now| Some(now.as_str()) != v);
+    // A list or an event stream, its filters' names the daemon's.
+    let filtered = |names: &Names, keys: &[(&str, Kind, bool)], answer: Answer| Route {
+        target: requery(query, "filters", |v| v.and_then(|f| named_filters(f, names, keys))).map(|q| to(&parts, Some(&q))),
+        gather: None,
+        answer,
+    };
     match parts.as_slice() {
         ["", "containers", "create"] if post => {
             let mut name = None;
@@ -377,8 +426,13 @@ fn route(method: &str, target: &str, names: &mut Names) -> Route {
             let q = requery(query, "filters", |v| Some(with_label(v, &label)));
             Route { target: q.map(|q| to(&parts, Some(&q))), gather: None, answer: Answer::One }
         }
-        ["", "containers", "json"] | ["", "networks" | "volumes"] | ["", "networks" | "volumes", ""] if get && leg => Route { target: None, gather: None, answer: Answer::List },
-        ["", "events"] if get && leg => Route { target: None, gather: None, answer: Answer::Events },
+        ["", "containers", "json"] if get && leg => {
+            let keys = [("name", Kind::Container, true), ("before", Kind::Container, false), ("since", Kind::Container, false), ("network", Kind::Network, false), ("volume", Kind::Volume, false)];
+            filtered(names, &keys, Answer::List)
+        }
+        ["", "networks"] | ["", "networks", ""] if get && leg => filtered(names, &[("name", Kind::Network, true)], Answer::List),
+        ["", "volumes"] | ["", "volumes", ""] if get && leg => filtered(names, &[("name", Kind::Volume, true)], Answer::List),
+        ["", "events"] if get && leg => filtered(names, &[("container", Kind::Container, false), ("network", Kind::Network, false), ("volume", Kind::Volume, false)], Answer::Events),
         ["", "commit"] if post => {
             let q = requery(query, "container", |v| v.map(|c| names.own(Kind::Container, c)).filter(|now| Some(now.as_str()) != v));
             Route { target: q.map(|q| to(&parts, Some(&q))), gather: None, answer: plain }
@@ -1446,6 +1500,13 @@ mod tests {
         assert_eq!(route("GET", "/v1.51/volumes?filters=x", &mut names).answer, Answer::List);
         assert_eq!(route("GET", "/events?since=1", &mut names).answer, Answer::Events);
         assert_eq!(route("HEAD", "/_ping", &mut names).answer, Answer::Bodiless);
+        // A list's filters by name, anchored as a script checks one, and an event stream's.
+        let decoded = |target: Option<String>| percent_decode(&target.unwrap_or_default());
+        let listed = route("GET", &format!("/v1.51/containers/json?all=1&filters={}", percent_encode(r#"{"name":["^/renamed$"],"network":["net"],"before":["renamed"]}"#)), &mut names);
+        assert_eq!(decoded(listed.target), format!(r#"/v1.51/containers/json?all=1&filters={{"name":["^/renamed{k}$"],"network":["net"],"before":["renamed{k}"]}}"#));
+        assert_eq!(route("GET", &format!("/containers/json?filters={}", percent_encode(r#"{"name":["renamed"]}"#)), &mut names).target, None, "a name unanchored matches with the suffix");
+        let watched = route("GET", &format!("/events?filters={}", percent_encode(r#"{"container":{"renamed":true},"type":["container"]}"#)), &mut names);
+        assert_eq!(decoded(watched.target), format!(r#"/events?filters={{"container":{{"renamed{k}":true}},"type":["container"]}}"#));
         // A prune takes what the leg made, and only that.
         let prune = route("POST", "/v1.51/containers/prune?filters=%7B%22until%22%3A%5B%2224h%22%5D%7D", &mut names).target.unwrap_or_default();
         let filters = percent_decode(prune.split_once("filters=").map(|(_, f)| f).unwrap_or_default());
