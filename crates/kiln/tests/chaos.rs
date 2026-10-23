@@ -274,8 +274,8 @@ fn newest(s: &Server, workflow: &str) -> anyhow::Result<String> {
 /// W05-R05 with the CI engine's rebuild after a restart late (`rebuild=10s`), so both runners say
 /// hello before it knows their legs. A runner apart from the server ran on through the restart:
 /// its leg is re-adopted, not cancelled as a job nobody knows, and finishes on its first attempt.
-/// The server's own runner went with it: its leg was lost (`runner-lost`, the next attempt
-/// waiting for another runner, W05-R16) and holds none of its slots, so its next leg runs.
+/// The server's own runner went with it: its leg was lost (`runner-lost`), and its next attempt
+/// ran there, the only runner that could take it (W05-R16's default), so its next leg runs.
 #[test]
 fn w05_r05_hellos_before_the_rebuild() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -314,7 +314,7 @@ fn w05_r05_hellos_before_the_rebuild() -> anyhow::Result<()> {
     })?;
     std::fs::write(
         repo.join(".kiln/both.yaml"),
-        "on: push\njobs:\n  kept:\n    runs-on: keep\n    steps:\n      - run: sleep 30; echo \"kept to its end\"\n  lost:\n    runs-on: local\n    steps:\n      - run: sleep 300\n",
+        "on: push\njobs:\n  kept:\n    runs-on: keep\n    steps:\n      - run: sleep 30; echo \"kept to its end\"\n  lost:\n    runs-on: local\n    steps:\n      - run: if [ \"$KILN_ATTEMPT\" = 1 ]; then sleep 300; fi\n",
     )?;
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "both"])?;
@@ -346,10 +346,11 @@ fn w05_r05_hellos_before_the_rebuild() -> anyhow::Result<()> {
     assert_eq!(kept.2, 1, "re-adopted, not retried: {all:?}");
     let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{}/logs?step=0", kept.3), &s.admin, None)?;
     assert!(text.contains("kept to its end"), "it ran to its end: {text}");
-    // The lost one: its first attempt `runner-lost`, its next not on the runner that lost it.
-    until(&s, 60, "the lost leg's next attempt", || {
+    // The lost one: its first attempt `runner-lost`, its next on the runner that lost it, the
+    // only one that can take it.
+    until(&s, 120, "the lost leg's next attempt", || {
         let lost = legs_of(&s, &run)?.into_iter().find(|l| l.0 == "lost").unwrap_or_default();
-        Ok((lost.2 < 2 || lost.1 == "running").then(|| format!("{lost:?}")))
+        Ok((lost.2 < 2 || lost.1 != "succeeded").then(|| format!("{lost:?}")))
     })?;
     let lost = legs_of(&s, &run)?.into_iter().find(|l| l.0 == "lost").unwrap_or_default();
     let (_, about) = http(s.port, "GET", &format!("/api/ci/legs/{}", lost.3), &s.admin, None)?;

@@ -203,7 +203,7 @@ async fn add_user(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fai
     let texts: Vec<(String, String, bool)> = grants.iter().map(|g| (g.what.clone(), g.scope.text(), g.deny)).collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE name = ?1 COLLATE NOCASE)", [&n], |r| r.get(0))?;
             if taken {

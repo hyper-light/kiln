@@ -122,7 +122,7 @@ pub async fn sample_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
         let kept = hub
             .store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 for (pool, [starting, idle, busy, waiting]) in rows {
                     tx.execute("INSERT OR REPLACE INTO ci_pool_samples (pool, ts, starting, idle, busy, waiting) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![pool, now, starting, idle, busy, waiting])?;
                 }

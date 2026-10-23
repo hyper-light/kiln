@@ -407,7 +407,7 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
     let (outcomes, fresh, asked) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             // Reviewers asked for the first time, by diff: they hear of it (W19-R06).
             let mut asked: Vec<(u32, String, String)> = Vec::new();
@@ -704,7 +704,7 @@ pub(crate) async fn add_version(hub: &Arc<Hub>, repo: &Repo, path: &str, d: &Dif
     let (n, by): (u32, Option<String>) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let n: u32 = tx.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM diff_versions WHERE diff_id = ?1", [&id], |r| r.get(0))?;
             // The same commits, rebased: whom the version before came from (W10-R02's `secrets.use`).
             let by: Option<String> = tx.query_row("SELECT started_by FROM diff_versions WHERE diff_id = ?1 ORDER BY n DESC LIMIT 1", [&id], |r| r.get(0)).optional()?.flatten();
@@ -1358,7 +1358,7 @@ async fn relabel(hub: &Hub, d: &Diff, caller: &Caller, add: Vec<String>, remove:
     let (added, removed) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut added = Vec::new();
             for n in &add {

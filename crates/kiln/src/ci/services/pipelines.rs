@@ -115,7 +115,7 @@ async fn create(hub: &Hub, c: &Claims, origin: &str, req: Request) -> Result<Res
     let made = hub
         .store
         .call(move |db| {
-            let tx = db.transaction()?;
+            let tx = crate::store::tx(db)?;
             let existing: Option<(i64, bool, Option<i64>)> =
                 tx.query_row("SELECT id, v3 = 1, expires_at FROM ci_artifacts WHERE run_id = ?1 AND name = ?2", params![run, n], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
             let made = match existing {

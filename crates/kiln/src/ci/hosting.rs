@@ -683,7 +683,7 @@ async fn keep_pushers(hub: &Hub, repo: &Repo, updates: &[Update], started_by: Op
     hub.store
         .call(move |c| {
             let now = crate::util::now_unix();
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             for (r, sha) in moved {
                 tx.execute("DELETE FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2", rusqlite::params![id, r])?;
                 // Whoever may use every secret leaves nothing to hold its runs to.

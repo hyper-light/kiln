@@ -1662,8 +1662,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   connected; lists the ones offline), `unroutable` (no runner known to kiln could ever run it; lists
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
-  `max-parallel`, `capability` (eligible runners' builds lack a capability; which). It is stored
-  (`jobs.wait_reason`), sent as an event, and shown on the leg.
+  `max-parallel`, `capability` (eligible runners' builds lack a capability; which),
+  `other-runner` (only the runner its retry avoids could take it: R16's `runner: different`, or a
+  runner that refused it; which). It is stored (`jobs.wait_reason`), sent as an event, and shown
+  on the leg.
 
 **Requirements: retries** (G-16)
 
@@ -1686,7 +1688,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `oom_kill` count rose, or exit 137 with memory at its limit), `disk-full` (ENOSPC seen, or the
   work volume full), `timeout`, `failure` (anything else).
 - **W05-R16 Defaults.** Without a policy: `runner-lost` is retried once on a different runner
-  (today's requeue, kept, and shown as "retried: runner X was lost"); nothing else is retried.
+  when one can take it, else on the same one (today's requeue, kept, and shown as "retried:
+  runner X was lost"); nothing else is retried. A policy's `runner: different` waits for another
+  runner, and says so (`other-runner`).
 - **W05-R17 Reruns**, GitHub-exact: re-run all jobs, re-run failed jobs (and the jobs that need
   them), re-run one job (and its dependents), optionally with debug logging. A rerun is a new run
   attempt (`github.run_attempt`); automatic leg retries are attempts of the leg
@@ -1959,12 +1963,18 @@ W20.
     machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
     ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
 - *Left.* AC11 on the live cluster.
-- *Open, for the user to decide:* R16's retry after `runner-lost` avoids the runner that lost the
-  leg, so where only one runner can take it, the retry waits for good. The options: wait (today);
-  prefer another runner and take the same one when none other can (at once, or after a few
-  minutes); don't retry when no other runner can; or the default prefers another while an
-  explicit `runner: different` stays strict and says it waits for a runner other than the one
-  lost. The last is recommended.
+- *Done* (2026-10-23), R16's retry where only the runner that lost the leg could take it, which
+  waited for good. Of the options put to the user (wait; prefer another runner and take the same
+  one when none other can, at once or after a few minutes; don't retry; or the default prefers
+  another while an explicit `runner: different` stays strict), the last, recommended, is taken
+  while their decision is open; another is a small change:
+  - The default retry goes to another runner when one could take it (connected, eligible and not
+    draining, busy or not), else to the one that lost it, at once. A leg that stayed off it goes
+    there first when the others go or drain.
+  - `runner: different` waits for another, and its wait reason says which runner it avoids
+    (`other-runner`), as a leg a runner refused does.
+  - Unit-tested (`w05_r16_a_lost_runners_retry`); a server's own runner, the only one, takes its
+    lost legs' retries across a restart (`tests/chaos.rs`, `tests/restart.rs`).
 
 ### W06 Step runtime on the runner
 
@@ -4327,6 +4337,11 @@ adapts [review.md](review.md), which it replaces.
   for the queries the top actions make. Anything else answers 501 with
   `{"message": "not implemented by kiln: <method> <path>", "documentation_url": …}`, and the
   step gets a warning annotation naming the route, so gaps are visible and get filled.
+- *Note.* `gh` without `--repo` takes the repository from the checkout's remotes, and matches them
+  to `GH_HOST` by host name alone: with a facade on a port other than 443 (`GH_HOST` names the
+  port) it matches none ("none of the git remotes … correspond to the GH_HOST environment
+  variable", the corpus lab's, on 42511). A GitHub Enterprise Server is always on 443; so is a
+  facade that `gh`'s inference is to work with. `--repo` or `GH_REPO` works on any port.
 - **W14-R12 Per repository** (`ci.github_api`): `facade` (default; everything through kiln, fast
   and independent of GitHub) or `github` (upstream repositories with the App: `GITHUB_SERVER_URL`
   is github.com and `GITHUB_TOKEN` an installation token, for workflows that must act on GitHub
@@ -5644,7 +5659,11 @@ with W11-AC03's tenants).
     - `GET /api/ci/legs/:id/logs/search?q=`: one leg's lines, read from its files, so a running
       leg's too;
     - `GET /api/ci/legs/:id/logs/failure`: the failed step's log from just before its first line
-      that reads like an error (else its end), with its exit code;
+      that reads like an error (else its end), with its exit code. A line that starts as one
+      (`error:`, `error[`, `--- FAIL`, a traceback) or says it panicked comes before one that only
+      has an error's words, and a log record at a lower level (`level=info msg="fetch failed"`,
+      `[INFO]`, `warning:`) or a test runner's progress (`=== RUN`, `--- PASS`) is neither: an
+      info line 3,000 lines before buildx's failed test had been the excerpt;
     - operations `ci.logs.search`, `ci.legs.search`, `ci.legs.failure_excerpt` and
       `ci.runs.compare` (W20), which the `kiln-ci-diagnose` skill now uses.
   - **The page** (`/logs`, from Runs) takes the text, repository, branch, conclusion and window.
@@ -6743,6 +6762,9 @@ and AC02.
     - it waits for macOS or Windows, which the lab hasn't;
     - a reason not kiln's: the repository's secrets, GitHub Pages, a check of the pull
       request's description or base, the lab's host network, a timed wait in the slow lab;
+    - a gate's (one job that says how the ones it needs did, a stable name for branch
+      protection, as prometheus's `test_go_oldest_status`), which follows their misses: it is
+      explained only as they are;
     - or kiln's to fix.
   - Found and fixed on the way, each with its test:
     - `cross`'s mounts, and GitHub's paths, in a `docker` leg (W13-R04);
@@ -6752,10 +6774,14 @@ and AC02.
     - a leg's fetch of another public repository (W14-R11), and `GH_HOST` in a container;
     - an owner's `.github` repository, and a remote reusable workflow's `./` calls (W07-R02);
     - v1 to v3 artifacts (W08-R08);
-    - live logs the masker held back (W06-R08).
+    - live logs the masker held back (W06-R08);
+    - `USER` and `LOGNAME`, the runner's, in a hosted leg's steps (W13-R04);
+    - Go on the runner image's `PATH`, as on GitHub's (prometheus's setup asks `go env` without
+      setting Go up).
   - Pass 1022g (six repositories, on builds before most of these): 10 of 25 workflows that ran
     passed, 7 more missed only for reasons not kiln's, and 8 for kiln's, each fixed since.
-    Pass 1023b runs every repository again on a build with all of it.
+    Pass 1023b ran ripgrep, bat, cargo and tokio again on a build with all of it; pass 1023c,
+    from 2026-10-23, runs the other twenty, each on the newest build when it starts.
 - *AC02, fourth batch* (2026-10-19), in the lab, the facade over HTTPS:
   - `github/codeql-action/upload-sarif`: the code-scanning starters above.
   - `peter-evans/create-pull-request@v7`: a branch pushed, a pull request opened, then updated
@@ -6949,13 +6975,16 @@ and AC02.
     `12345678901234567000`, `1000`, `0.1` and `16`.
   - Found on the way, and fixed: a cancelled step in a job container was never signalled (W05's
     AC07 note), and the probes' own matrix one didn't test an empty value written last.
-- *Left.* AC01: the rest of pass 1023b; the corpus's macOS and Windows legs, which need such
+- *Left.* AC01: the rest of pass 1023c; the corpus's macOS and Windows legs, which need such
   runners in the lab (user-assisted: joining a Mac and a Windows machine runs third-party CI code
   on them); the host executor's run of the repositories' workflows (W06-AC07), which needs a
   machine of its own to run them on; and test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
   a public repository the user owns, then `compare` run against kiln), and AC05; F-21's last two
   (`azure/login` with a tenant, `attest-build-provenance` with GitHub's Sigstore); an
-  authenticated way for legs to read github.com's API (W18's egress proxy).
+  authenticated way for legs to read github.com's API (W18's egress proxy); scorecard's checks
+  of a push (prometheus's, TypeScript's), which read the repository from an Enterprise Server's
+  API only when `GH_HOST` names one, over HTTPS (the runner sets it only for a step that gives
+  `gh` the job's token), and then sign their results through Sigstore's public instance (W18).
 
 ---
 

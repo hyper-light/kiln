@@ -4,4 +4,6 @@
 # threads wait on each other: two in-memory stores built side by side took three to four times one
 # (fedora, 2026-10-20). SQLite's own recommended options turn it off (sqlite.org/compile.html,
 # SQLITE_DEFAULT_MEMSTATUS); nothing in kiln reads them.
-LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
+# With SQLite's pre-update hook: the store notes the rows a write touches, for the cluster group's
+# entries (crates/kiln/src/store/capture.rs, docs/p2p.md P1).
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_PREUPDATE_HOOK"

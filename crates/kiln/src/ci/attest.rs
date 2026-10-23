@@ -198,7 +198,7 @@ async fn keep(hub: &Hub, run: String, leg: String, idx: u32, nonce: String, orig
     let digests: Vec<String> = subjects.iter().flat_map(|s| s.digest.iter().map(|(alg, hex)| format!("{}:{}", alg.to_ascii_lowercase(), hex.to_ascii_lowercase()))).collect();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let mut ids = Vec::new();
             for (kind, bundle) in made {

@@ -271,6 +271,17 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              && curl -fsSL -o \"/tmp/$f\" \"$u/$f\" && echo \"$(curl -fsSL \"$u/gh_2.102.0_checksums.txt\" | grep \"  $f$\" | cut -d' ' -f1)  /tmp/$f\" | sha256sum -c - \\\n    \
              && tar -xzf \"/tmp/$f\" -C /tmp && install -m 0755 \"/tmp/gh_2.102.0_linux_$g/bin/gh\" /usr/local/bin/gh && rm -rf \"/tmp/$f\" \"/tmp/gh_2.102.0_linux_$g\"\n"
         ));
+        // Go, as GitHub's images have it on `PATH` (prometheus's `promci-setup` asks `go env` for its
+        // caches' paths without setting Go up): the newest release, checked against the sums
+        // go.dev lists. Its own `PATH` here, so the layers before stay as they were.
+        d.push_str(
+            "RUN case \"$(dpkg --print-architecture)\" in amd64) a=amd64 ;; arm64) a=arm64 ;; esac \\\n    \
+             && curl -fsSL -o /tmp/go.json 'https://go.dev/dl/?mode=json' && v=$(jq -r '.[0].version' /tmp/go.json) && f=\"$v.linux-$a.tar.gz\" \\\n    \
+             && s=$(jq -r --arg f \"$f\" '.[0].files[] | select(.filename == $f) | .sha256' /tmp/go.json) \\\n    \
+             && curl -fsSL -o \"/tmp/$f\" \"https://go.dev/dl/$f\" && echo \"$s  /tmp/$f\" | sha256sum -c - \\\n    \
+             && tar -xzf \"/tmp/$f\" -C /usr/local && rm -f \"/tmp/$f\" /tmp/go.json\n\
+             ENV PATH=/usr/local/go/bin:$PATH\n",
+        );
         if os != "ubuntu22" {
             // pip installs as it does on GitHub's Ubuntu 24.04 and 26.04 machines, whose
             // `/etc/pip.conf` says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
@@ -679,6 +690,10 @@ pub struct JobContainer {
     pub user: Option<String>,
     /// `HOME` for its steps.
     pub home: String,
+    /// The name its steps' user goes by (`USER`, `LOGNAME`): kiln's runner image's `runner`, as a
+    /// hosted runner's steps have it (scripts lean on it: ORT's action makes its container's paths
+    /// with `${PROJECT_PATH/$USER/ort}`). None in another image, where GitHub gives steps none.
+    pub login: Option<String>,
     /// The image's `PATH`, to which `GITHUB_PATH` entries are prepended.
     pub path: String,
     /// It has `sh`, which a step's cancel reaches the step through ([`Cli::signal_in`]).
@@ -895,11 +910,11 @@ impl Containers {
                     Err(_) => (false, false),
                 };
                 let musl = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s(MUSL_PROBE)], &none, CALL).await.is_ok_and(|o| o.trim() == "musl");
-                let (user, home) = match user {
-                    Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
-                    None => (as_runner, "/github/home".to_owned()),
+                let (user, home, login) = match user {
+                    Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned(), Some(if uid == 0 { "root" } else { "runner" }.to_owned())),
+                    None => (as_runner, "/github/home".to_owned(), None),
                 };
-                c.job = Some(JobContainer { id, user, home, path, has_sh, has_bash, musl, map });
+                c.job = Some(JobContainer { id, user, home, login, path, has_sh, has_bash, musl, map });
             }
             // Health checks, then the ports the host got.
             let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();
@@ -1235,6 +1250,8 @@ mod tests {
             "/usr/bin/pwsh",
             "libicu74",
             "cli/cli/releases",
+            "https://go.dev/dl/$f",
+            "PATH=/usr/local/go/bin:",
             "break-system-packages",
         ] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");

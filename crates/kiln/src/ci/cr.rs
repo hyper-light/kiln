@@ -99,7 +99,7 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     let made: (String, u32, u32, &'static str, bool, Vec<String>) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let (id, number, n, kind, rebase_only) = match found {
                 Some((id, number)) => {

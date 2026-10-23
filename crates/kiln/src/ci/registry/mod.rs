@@ -705,7 +705,7 @@ async fn put_manifest(hub: &Hub, who: &Who, name: &str, reference: &str, req: Re
     let fresh_tag = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             tx.execute("INSERT INTO registry_repos (name, created_at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING", params![n, now])?;
             tx.execute(
@@ -773,7 +773,7 @@ async fn delete_manifest(hub: &Hub, name: &str, reference: &str) -> Answer {
     let gone = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             // A release path's tags never go, nor the manifests they name.
             if immutable_in(&tx, &n)? {
                 let tagged: bool = if by_digest { tx.query_row("SELECT EXISTS(SELECT 1 FROM registry_tags WHERE repo = ?1 AND digest = ?2)", params![n, r], |x| x.get(0))? } else { true };
@@ -1003,7 +1003,7 @@ pub async fn put_chart(hub: &Hub, name: &str, version: &str, tgz: &[u8], meta: &
     let (n, d, t, len) = (name.to_owned(), digest.clone(), version.to_owned(), i64::try_from(body.len()).unwrap_or(i64::MAX));
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             tx.execute("INSERT INTO registry_repos (name, created_at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING", params![n, now])?;
             tx.execute(
@@ -1079,7 +1079,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
     let (stale, blobs, tags): (Vec<String>, usize, usize) = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let stale: Vec<String> = {
                 let mut q = tx.prepare("SELECT id FROM registry_uploads WHERE updated_at < ?1")?;
                 let rows = q.query_map([now - UPLOAD_TTL], |r| r.get::<_, String>(0))?;

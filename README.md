@@ -29,7 +29,7 @@ UI. It runs the same way on bare metal and on Kubernetes.
 
 ```sh
 cargo build --release              # after building the UI: npm --prefix ui ci && npm --prefix ui run build
-./target/release/kiln install      # the cluster of your kubeconfig's current context (the default)
+./target/release/kiln install      # the cluster of your kubeconfig's current context (the default; without one, this machine)
 ./target/release/kiln install --on docker    # a container on this machine
 ./target/release/kiln install --on machine   # this machine: ~/.local/bin, ~/.config/kiln/kiln.toml, start on boot, start now
 kiln login                         # opens the UI with a one-time link; no password to type
@@ -40,10 +40,12 @@ answers, its UI loads and its runner is connected, saying where to open it; a fa
 failed and takes back what the install made. In Kubernetes it goes in namespace `kiln`
 (`--namespace`, `--context`), reached at a node's address and a NodePort (or, when no node can be
 reached, through `kubectl port-forward`); Docker's is on port 7070 (`--port`), QUIC on the next.
-Both run an image built from the binary that installs them, which must be a Linux kiln
-(`--image` to run another). minikube, kind and k3d clusters are loaded with it, and Docker Desktop's
-single node shares it; any other cluster, Docker Desktop's multi-node one too, pulls it from
-`--registry`.
+Both run an image built for the cluster's (or Docker's) CPU: from the binary that installs them
+when it's a Linux kiln for it, else (a Mac's, Windows', or another CPU) from the static Linux build
+of the kiln server this machine's runner is enrolled with (`--server` names another; `--image` runs
+an image of your own). minikube, kind and k3d clusters are loaded with it, and Docker Desktop's
+cluster (one node or more) and OrbStack's share it; any other cluster pulls it from a registry:
+`--registry`, else the one the cluster names (kube-public's `local-registry-hosting`).
 
 `kiln install --unattended` never prompts. `kiln install --system` installs system-wide on this
 machine (asks for sudo; add `--unattended` to use `sudo -n` only). The server runs a local agent by

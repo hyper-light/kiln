@@ -11,11 +11,117 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::PlannedJob;
 
+pub mod capture;
+pub mod group;
 pub mod migrations;
 
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<Connection>>,
+    inner: Arc<Inner>,
+}
+
+/// The store's connection, and with the cluster group what its writes go through.
+struct Inner {
+    // Dropped in order: the connection before the watch its hook writes into.
+    conn: Mutex<Connection>,
+    watch: Option<capture::Watch>,
+    group: Option<group::Group>,
+    /// A folder of its own, removed with the store (tests through the group, [`Store::in_memory`]).
+    scratch: Option<std::path::PathBuf>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(dir) = self.scratch.take() {
+            // The group's thread and connections go first: then the folder.
+            self.group.take();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Tables this node keeps for itself: its log search index, built from its own logs. Written with
+/// [`Store::call_local`], past the cluster group; a write through the group must not touch them.
+pub const LOCAL: &[&str] = &["ci_log_indexed", "ci_log_index_data", "ci_log_index_idx", "ci_log_index_content", "ci_log_index_docsize", "ci_log_index_config"];
+
+/// A transaction that nests: a SQLite savepoint. At the top it opens one as `BEGIN DEFERRED`
+/// would; inside another (the one a write runs in while the cluster group takes it, docs/p2p.md
+/// P1) it becomes part of that. [`Tx::commit`] keeps what it did; dropped without, it's undone.
+pub struct Tx<'c> {
+    conn: &'c Connection,
+    open: bool,
+}
+
+/// Opens a [`Tx`] on `conn`: what every write that needs its statements together uses, rather than
+/// rusqlite's transactions, which can't be opened inside another.
+pub fn tx(conn: &Connection) -> rusqlite::Result<Tx<'_>> {
+    conn.execute_batch("SAVEPOINT kiln_tx")?;
+    Ok(Tx { conn, open: true })
+}
+
+impl Tx<'_> {
+    /// Keeps what it did: commits it at the top, makes it part of the one around it inside one.
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.open = false;
+        self.conn.execute_batch("RELEASE kiln_tx")
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.conn.execute_batch("ROLLBACK TO kiln_tx; RELEASE kiln_tx");
+        }
+    }
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+/// Runs a write through the cluster group (see [`Store::call`]).
+fn through_group<R>(conn: &mut Connection, watch: &capture::Watch, group: &group::Group, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+    // IMMEDIATE: the write lock now, so what `f` reads is what it writes over (a transaction that
+    // read first would be refused its write had the group's thread committed meanwhile).
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    watch.begin();
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn)));
+    let change = watch.end(conn);
+    let result = match ran {
+        Ok(r) => r,
+        Err(panic) => {
+            conn.execute_batch("ROLLBACK").ok();
+            std::panic::resume_unwind(panic)
+        }
+    };
+    let change = match change {
+        Ok(c) => c,
+        Err(e) => {
+            // What it wrote couldn't be read for the log: it isn't kept.
+            conn.execute_batch("ROLLBACK").ok();
+            return Err(e);
+        }
+    };
+    if change.is_empty() {
+        conn.execute_batch("ROLLBACK")?;
+        return result;
+    }
+    // Kept as without the group (an `f` that failed after writing keeps what it wrote), with its
+    // number; then the change goes to the log.
+    let seq = group.next_seq();
+    let kept = conn
+        .execute(&format!("UPDATE {} SET seq = ?1 WHERE one = 1", group::STATE), [i64::try_from(seq)?])
+        .map_err(anyhow::Error::from)
+        .and_then(|_| conn.execute_batch("COMMIT").map_err(anyhow::Error::from));
+    if let Err(e) = kept {
+        conn.execute_batch("ROLLBACK").ok();
+        return Err(e);
+    }
+    group.append(seq, change);
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,38 +338,103 @@ fn from_json<T: for<'de> Deserialize<'de> + Default>(s: &str) -> T {
 }
 
 impl Store {
+    /// The store at `path`, written to directly (no cluster group): tools that run with the server
+    /// stopped, and setups that turn the group off (`[cluster] group = false`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let conn = Self::connect(path)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }) })
+    }
+
+    /// The store at `path` with its writes through the cluster group, its log in `cluster`
+    /// (docs/p2p.md, P1). What the log holds past the database is replayed into it first.
+    pub fn open_grouped(path: &Path, cluster: &Path) -> anyhow::Result<Self> {
+        let conn = Self::connect(path)?;
+        let group = group::Group::open(path, cluster).context("the cluster group")?;
+        let watch = capture::Watch::install(&conn, LOCAL)?;
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: Some(watch), group: Some(group), scratch: None }) })
+    }
+
+    fn connect(path: &Path) -> anyhow::Result<Connection> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
         }
         let mut conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
         migrations::apply(&mut conn).context("apply migrations")?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(conn)
     }
 
+    /// A store of its own for tests: in memory, or with `KILN_STORE_GROUP=1` a database in a scratch
+    /// folder with its writes through the cluster group, so the whole suite can run that way.
     pub fn in_memory() -> anyhow::Result<Self> {
+        if std::env::var("KILN_STORE_GROUP").is_ok_and(|v| v == "1") {
+            let dir = std::env::temp_dir().join(format!("kiln-store-{}", crate::util::new_id()));
+            let mut store = Self::open_grouped(&dir.join("kiln.db"), &dir.join("cluster"))?;
+            if let Some(inner) = Arc::get_mut(&mut store.inner) {
+                inner.scratch = Some(dir);
+            }
+            return Ok(store);
+        }
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrations::apply(&mut conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self { inner: Arc::new(Inner { conn: Mutex::new(conn), watch: None, group: None, scratch: None }) })
     }
 
     /// Run `f` with the connection on this thread: for what's read once as the server starts,
-    /// before anything else runs (a constructor that can't wait).
+    /// before anything else runs (a constructor that can't wait). Only reads: a write here would
+    /// go past the cluster group.
     pub fn now<R>(&self, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
-        f(&mut self.conn.lock())
+        f(&mut self.inner.conn.lock())
     }
 
-    /// Run `f` with the connection on the blocking pool.
+    /// Whether this store's writes go through the cluster group.
+    pub fn grouped(&self) -> bool {
+        self.inner.group.is_some()
+    }
+
+    /// With the cluster group, where it stands: kiln.db's last write and the last entry applied.
+    pub fn group_standing(&self) -> Option<(u64, u64)> {
+        self.inner.group.as_ref().map(group::Group::standing)
+    }
+
+    /// Waits until every write so far is in the cluster group's log (tests; a clean stop).
+    pub fn flush_group(&self) -> anyhow::Result<()> {
+        match &self.inner.group {
+            Some(g) => g.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs `f` with the connection on the blocking pool. With the cluster group, what `f` writes
+    /// goes through it: `f` runs in a transaction while the rows it touches are noted, which
+    /// commits with the write's number and sends the rows' state (its change) to the group's log,
+    /// which a restart replays. A read is only a read.
     pub async fn call<R, F>(&self, f: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        let conn = self.conn.clone();
+        let inner = self.inner.clone();
         crate::rt::blocking(move || {
-            let mut g = conn.lock();
+            let mut g = inner.conn.lock();
+            match (&inner.watch, &inner.group) {
+                (Some(watch), Some(group)) => through_group(&mut g, watch, group, f),
+                _ => f(&mut g),
+            }
+        })
+        .await?
+    }
+
+    /// Runs `f` with the connection, past the cluster group: for this node's own tables ([`LOCAL`]).
+    pub async fn call_local<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        crate::rt::blocking(move || {
+            let mut g = inner.conn.lock();
             f(&mut g)
         })
         .await?
@@ -299,7 +470,7 @@ impl Store {
     /// before doing any work).
     pub async fn unclaim_job(&self, id: String, note: String) -> anyhow::Result<()> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "UPDATE jobs SET status = 'queued', agent = NULL, executor = NULL, started_at = NULL,
                    error = ?2 WHERE id = ?1 AND status = 'running'",
@@ -485,7 +656,7 @@ impl Store {
     /// Insert a run with its planned jobs atomically. Jobs with no `needs` start queued.
     pub async fn create_run(&self, mut run: Run, jobs: Vec<PlannedJob>) -> anyhow::Result<Run> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let number: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE repo_id = ?1",
                 [&run.repo_id],
@@ -738,7 +909,7 @@ impl Store {
     /// Atomically claim a queued job for an agent. Returns false if someone else got it.
     pub async fn claim_job(&self, id: String, agent: String, executor: String) -> anyhow::Result<bool> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let n = tx.execute(
                 "UPDATE jobs SET status = 'running', agent = ?2, executor = ?3, started_at = ?4,
@@ -799,7 +970,7 @@ impl Store {
         cpu_seconds: Option<f64>,
     ) -> anyhow::Result<(String, Option<Status>)> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             tx.execute(
                 "UPDATE jobs SET status = ?2, finished_at = ?3, exit_code = ?4, error = ?5,
@@ -830,7 +1001,7 @@ impl Store {
     /// Put a running job back in the queue (agent lost) or fail it when out of retries.
     pub async fn requeue_job(&self, id: String, reason: String) -> anyhow::Result<bool> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let (attempt, spec): (u32, String) = tx.query_row(
                 "SELECT attempt, spec FROM jobs WHERE id = ?1",
                 [&id],
@@ -869,7 +1040,7 @@ impl Store {
     /// caller can tell their agents to stop.
     pub async fn cancel_run(&self, run_id: String, reason: String) -> anyhow::Result<Vec<(String, Option<String>)>> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let running: Vec<(String, Option<String>)> = {
                 let mut st = tx.prepare(
@@ -902,7 +1073,7 @@ impl Store {
     /// Re-run a finished run's failed (or all) jobs as a fresh attempt.
     pub async fn retry_run(&self, run_id: String, only_failed: bool) -> anyhow::Result<u32> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let filter = if only_failed {
                 "status IN ('failed','cancelled','timed_out','skipped')"
@@ -1176,7 +1347,7 @@ impl Store {
     pub async fn prune(&self, days: u32) -> anyhow::Result<Vec<String>> {
         self.call(move |c| {
             let cutoff = crate::util::now_unix() - i64::from(days) * 86_400;
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let ids: Vec<String> = {
                 let mut st = tx.prepare(
                     "SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id
@@ -1270,7 +1441,7 @@ fn steps_of(c: &Connection, job_id: &str) -> rusqlite::Result<Vec<Step>> {
 /// settle the run when every job is terminal.
 const DEP_FAILED: &str = "dependency failed";
 
-fn advance_run(tx: &rusqlite::Transaction<'_>, run_id: &str, now: i64) -> anyhow::Result<Option<Status>> {
+fn advance_run(tx: &Connection, run_id: &str, now: i64) -> anyhow::Result<Option<Status>> {
     loop {
         let jobs: Vec<(String, String, Vec<String>)> = {
             let mut st = tx.prepare("SELECT id, key, status, needs, COALESCE(error, '') FROM jobs WHERE run_id = ?1")?;

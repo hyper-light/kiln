@@ -161,7 +161,7 @@ async fn give_up(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Resul
     let given: Vec<String> = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let given: Vec<String> = {
                 let mut q = tx.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND closed_ms < ?1 LIMIT ?2")?;
                 q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
@@ -214,7 +214,7 @@ async fn let_go(hub: &Hub) -> anyhow::Result<()> {
         let s = session.clone();
         hub.store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 tx.execute("DELETE FROM transcript_segments WHERE session = ?1", [&s])?;
                 tx.execute("DELETE FROM transcript_archives WHERE session = ?1", [&s])?;
                 tx.commit()?;
@@ -252,7 +252,7 @@ async fn backfill(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Resu
         noted = noted.saturating_add(
             hub.store
                 .call(move |c| {
-                    let tx = c.transaction()?;
+                    let tx = crate::store::tx(c)?;
                     let mut n = 0usize;
                     for (session, closed) in &page {
                         n = n.saturating_add(tx.execute("INSERT OR IGNORE INTO transcript_archives (session, closed_ms, due_ms, done_ms) VALUES (?1, ?2, ?2, NULL)", params![session, closed])?);

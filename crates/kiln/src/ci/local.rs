@@ -490,6 +490,8 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
         "unroutable" => (format!("no runner meets its requirements ({})", list("failing")), true),
         "capability" => (format!("{} can't run what it uses (Docker, or actions)", list("runners")), true),
         "no-runner" => ("no runner that can take it is connected".to_owned(), false),
+        "other-runner" if o.get("refused").and_then(Value::as_bool) == Some(true) => (format!("a runner other than {}, which refused it", text("avoided")), true),
+        "other-runner" => (format!("a runner other than {}, as its retry asks (`runner: different`)", text("avoided")), true),
         "approval" => (format!("a reviewer's approval to deploy to {} ({})", text("environment"), list("reviewers")), true),
         "wait-timer" => (format!("the wait timer of {}", text("environment")), false),
         "window" => (format!("a deploy window of {}: {}", text("environment"), text("window")), false),

@@ -176,6 +176,9 @@ pub enum WaitReason {
     Scaling { pool: String, starting: usize, since: i64 },
     /// The runners or pool that could take it are kept for other legs until `until` (W05-R12).
     Reservation { reservation: String, until: i64 },
+    /// Only `avoided` could take it, and it waits for another: as its retry policy asks
+    /// (`runner: different`), or as that one refused it (W05-R16).
+    OtherRunner { avoided: String, refused: bool },
 }
 
 /// What to do.
@@ -219,6 +222,17 @@ enum State {
     Done,
 }
 
+/// Why a leg stays off a runner (W05-R16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Off {
+    /// It lost the leg: the retry goes to another runner when one could take it, else to it.
+    Lost,
+    /// Its retry policy asks for a different runner (`runner: different`): it waits for one.
+    Different,
+    /// It refused the leg: the leg waits for another.
+    Refused,
+}
+
 #[derive(Debug, Clone)]
 struct Leg {
     input: LegIn,
@@ -230,7 +244,8 @@ struct Leg {
     queued_at: i64,
     key: Option<(i64, u64, u64)>,
     reason: Option<WaitReason>,
-    avoid: Option<String>,
+    /// A runner it stays off, and why (W05-R16).
+    avoid: Option<(String, Off)>,
     pin: Option<String>,
     last_runner: Option<String>,
     /// Cancelled while it ran, and why: however its attempt ends, it ends cancelled, never retried.
@@ -320,7 +335,7 @@ impl Scheduler {
                 if let Some(runner) = self.release(&leg) {
                     self.discard_used(&leg, &mut out);
                     if let Some(l) = self.legs.get_mut(&leg) {
-                        l.avoid = Some(runner.clone());
+                        l.avoid = Some((runner.clone(), Off::Refused));
                     }
                     self.enqueue(&leg, now, &mut out);
                     self.try_runner(&runner, now, &mut out);
@@ -332,6 +347,7 @@ impl Scheduler {
                 if let Some(r) = self.runners.get_mut(&runner) {
                     r.draining = true;
                 }
+                self.try_avoided(now, &mut out);
             }
             Input::RulesChanged(rules) => self.rules_changed(rules, now, &mut out),
             Input::ExecutorReady { executor } => self.executor_ready(&executor, now, &mut out),
@@ -616,6 +632,21 @@ impl Scheduler {
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
 
+    /// Whether a runner other than `avoided` could take a leg: one connected, eligible for it and
+    /// not draining, with room now or not.
+    fn another_could(&self, l: &Leg, avoided: &str) -> bool {
+        self.sigs.get(&l.sig).is_some_and(|s| s.eligible.iter().any(|id| id != avoided && self.runners.get(id).is_some_and(|r| !r.draining)))
+    }
+
+    /// Tries again the runners that queued legs stay off only while another could take them
+    /// (W05-R16's default): after a runner goes, drains or changes, that one may be the only one.
+    fn try_avoided(&mut self, now: i64, out: &mut Vec<Command>) {
+        let avoided: BTreeSet<String> = self.legs.values().filter(|l| l.state == State::Queued).filter_map(|l| l.avoid.as_ref().filter(|(_, off)| *off == Off::Lost).map(|(r, _)| r.clone())).collect();
+        for r in avoided {
+            self.try_runner(&r, now, out);
+        }
+    }
+
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
         if !r.connected || r.draining || r.exclusive {
             return false;
@@ -623,7 +654,13 @@ impl Scheduler {
         if self.reserved_against(r, l).is_some() {
             return false;
         }
-        if l.avoid.as_deref() == Some(r.input.id.as_str()) || l.pin.as_deref().is_some_and(|p| p != r.input.id) {
+        if let Some((a, off)) = &l.avoid
+            && *a == r.input.id
+            && (*off != Off::Lost || self.another_could(l, a))
+        {
+            return false;
+        }
+        if l.pin.as_deref().is_some_and(|p| p != r.input.id) {
             return false;
         }
         if l.input.exclusive && !r.running.is_empty() {
@@ -776,7 +813,8 @@ impl Scheduler {
                     l.avoid = None;
                     l.pin = None;
                     match d.runner {
-                        RunnerChoice::Different => l.avoid = runner.clone(),
+                        RunnerChoice::Different => l.avoid = runner.clone().map(|r| (r, Off::Different)),
+                        RunnerChoice::Another => l.avoid = runner.clone().map(|r| (r, Off::Lost)),
                         RunnerChoice::Same => l.pin = runner.clone(),
                         RunnerChoice::Any | RunnerChoice::Default => {}
                     }
@@ -879,6 +917,7 @@ impl Scheduler {
         let (running, used, exclusive) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.exclusive)).unwrap_or_default();
         self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining: false, exclusive });
         self.refresh_eligibility(&id);
+        self.try_avoided(now, out);
         self.try_runner(&id, now, out);
         self.scale_all(now, out);
         self.refresh_reasons(out);
@@ -920,6 +959,9 @@ impl Scheduler {
             None => return,
         };
         self.refresh_eligibility(runner);
+        // The legs that stayed off another runner only while this one could take them go there
+        // first: they waited longer than the legs this one loses now.
+        self.try_avoided(now, out);
         // Its pools' executors went with it.
         let gone: Vec<String> = self.executors.values().filter(|e| e.runner == runner && !matches!(e.state, ExecState::Busy { .. })).map(|e| e.id.clone()).collect();
         for e in gone {
@@ -1278,6 +1320,14 @@ impl Scheduler {
             // At its `max` (or no host has room): its executors are the capacity.
             let busy = mine.iter().filter(|e| matches!(e.state, ExecState::Busy { .. })).count();
             return WaitReason::Capacity { eligible: mine.len(), busy, draining: 0 };
+        }
+        if let Some((a, off)) = &l.avoid
+            && *off != Off::Lost
+            && !eligible.is_empty()
+            && eligible.iter().all(|r| r.input.id == *a)
+        {
+            let avoided = self.runners.get(a).map_or_else(|| a.clone(), |r| r.input.view.name.clone());
+            return WaitReason::OtherRunner { avoided, refused: *off == Off::Refused };
         }
         if !eligible.is_empty() {
             if l.input.exclusive && eligible.iter().all(|r| !r.running.is_empty() || r.draining) {

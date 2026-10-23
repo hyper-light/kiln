@@ -119,7 +119,7 @@ impl StoreRecords {
         let inner = Arc::clone(&self.inner);
         self.store
             .call(move |c| {
-                let t = c.transaction()?;
+                let t = crate::store::tx(c)?;
                 let mut m = inner.mem.lock();
                 let before = sql(before.min(m.head));
                 t.execute(
@@ -226,7 +226,7 @@ impl Records for StoreRecords {
             let out = self
                 .store
                 .call(move |c| {
-                    let t = c.transaction()?;
+                    let t = crate::store::tx(c)?;
                     for cond in &tx.conds {
                         let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = cond;
                         let newest: Option<(i64, bool)> = t

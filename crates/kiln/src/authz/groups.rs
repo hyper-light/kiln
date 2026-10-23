@@ -165,7 +165,7 @@ async fn create(hub: &Hub, caller: &Caller, req: Request) -> Result<Response, Fa
     let made: bool = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             if tx.execute("INSERT OR IGNORE INTO user_groups (name, description, created_at, created_by) VALUES (?1, ?2, ?3, ?4)", params![n, description, now, by])? == 0 {
                 return Ok(false);
@@ -215,7 +215,7 @@ async fn delete(hub: &Hub, caller: &Caller, name: &str) -> Result<Response, Fail
     let gone = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let gone = tx.execute("DELETE FROM user_groups WHERE name = ?1", [&n])?;
             tx.execute("DELETE FROM user_group_members WHERE group_name = ?1", [&n])?;
             tx.commit()?;

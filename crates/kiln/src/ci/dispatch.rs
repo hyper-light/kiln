@@ -2812,7 +2812,7 @@ async fn seal_secret_outputs(hub: &Hub, run: &str, leg: &str, values: &std::coll
     let (run, leg) = (run.to_owned(), leg.to_owned());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             for (name, sealed, nonce) in rows {
                 tx.execute(
                     "INSERT INTO ci_secret_outputs (run_id, leg_id, name, sealed, nonce) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(leg_id, name) DO UPDATE SET sealed = excluded.sealed, nonce = excluded.nonce",

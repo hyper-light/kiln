@@ -941,6 +941,8 @@ export function waitSentence(w: unknown): string | null {
     starting?: number;
     since?: number;
     reservation?: string;
+    avoided?: string;
+    refused?: boolean;
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   switch (o.reason) {
@@ -952,6 +954,10 @@ export function waitSentence(w: unknown): string | null {
       return `No runner meets its requirements${list(o.failing)}.`;
     case "capability":
       return `The runners that match need a newer kiln${list(o.runners)}.`;
+    case "other-runner":
+      return o.refused
+        ? `Waiting for a runner other than ${o.avoided ?? "the one"} that refused it.`
+        : `Its retry waits for a runner other than ${o.avoided ?? "the one it ran on"}, as its policy asks (runner: different).`;
     case "concurrency":
       if (o.environment) return `Waiting for ${o.environment}'s other deployments (at most ${o.limit ?? 1} at once).`;
       return `Waiting for concurrency group ${o.group ?? ""}${o.holders?.length ? `, held by ${o.holders.join(", ")}` : ""}.`;

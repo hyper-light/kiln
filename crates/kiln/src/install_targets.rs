@@ -2,13 +2,17 @@
 //! its own) in a cluster or a container, from this binary or an image given (docs/p2p.md,
 //! "Installing"); and, for every target, the check an install ends with.
 //!
-//! - **The image.** `--image` names one; else one is built from this binary with this machine's
-//!   Docker, as kiln's own image is (`Dockerfile`): on Alpine for a static kiln (the released ones
-//!   are), else on this machine's own system, whose C library the binary was linked against.
+//! - **The image.** `--image` names one; else one is built with this machine's Docker, as kiln's
+//!   own image is (`Dockerfile`), for the CPU of the nodes (or Docker) it runs on: from this binary
+//!   when it's a Linux kiln for that CPU, on Alpine for a static kiln (the released ones are), else
+//!   on this machine's own system, whose C library the binary was linked against; from any other
+//!   kiln (a Mac's, Windows') or for another CPU, from the static Linux build a kiln server has
+//!   for it (`--server`'s, else the one this machine's runner is enrolled with).
 //! - **Into a cluster.** minikube, kind and k3d take the image from this machine's Docker (an image
-//!   `--image` names too, when that Docker has it); Docker Desktop's single node and OrbStack's
-//!   share it; any other cluster (Docker Desktop's multi-node one too) pulls it from `--registry`,
-//!   pushed there first.
+//!   `--image` names too, when that Docker has it); Docker Desktop's cluster (its kind nodes pull
+//!   from its image store through its mirror) and OrbStack's share it; any other cluster pulls it
+//!   from a registry, pushed there first: `--registry`, else the one the cluster names
+//!   (`local-registry-hosting` in kube-public, as kind, minikube and k3d document theirs).
 //! - **Kubernetes.** In `--namespace` (`kiln`): a service account with the role kiln's updates use
 //!   (its own Deployment, its pods), the admin token as a secret, a NodePort service, the config, a
 //!   volume and one Deployment (three nodes come with docs/p2p.md's P3). It's opened at a node's
@@ -72,7 +76,8 @@ impl Via<'_> {
                 let status = r.status();
                 Ok((status, r.bytes(8 << 20).await?))
             }
-            Via::Proxy(cluster, base) => cluster.request(Method::GET, &format!("{base}{path}"), None, None).await,
+            // As a browser asks: kiln serves its page to no one who takes JSON alone.
+            Via::Proxy(cluster, base) => cluster.request_as(Method::GET, &format!("{base}{path}"), None, None, "*/*").await,
         }
     }
 }
@@ -236,24 +241,118 @@ fn own_tag() -> Option<String> {
     (id != "unknown").then(|| format!("{APP}:{id}"))
 }
 
-/// Builds the image `tag` from this binary with this machine's Docker, unless it's built already:
-/// whether it built it.
-fn build_image(tag: &str) -> anyhow::Result<bool> {
-    anyhow::ensure!(cfg!(target_os = "linux"), "an image is built from a Linux kiln, and this one isn't: give one with --image");
+/// Docker's and Kubernetes' word for a CPU Rust names (`x86_64` is `amd64`, `aarch64` `arm64`).
+fn docker_arch(cpu: &str) -> &str {
+    match cpu {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Whether a kubeconfig names a cluster here: its current context (where `kiln install` goes by
+/// default).
+pub fn has_cluster() -> bool {
+    context_name(None).is_ok()
+}
+
+/// An image of kiln for Linux on `arch` CPUs (`amd64`, `arm64`), built with this machine's Docker
+/// unless it's built already: from this binary when it's a Linux kiln for them, else from the
+/// static build a kiln server has ([`fetch_linux_kiln`]). Its tag, and whether it was built now.
+async fn kiln_image(a: &InstallArgs, arch: &str) -> anyhow::Result<(String, bool)> {
+    if cfg!(target_os = "linux") && arch == docker_arch(std::env::consts::ARCH) {
+        let tag = own_tag().context("this binary's build can't be read to tag an image of it: give one with --image")?;
+        let built = build_image(&tag, &std::env::current_exe()?, None)?;
+        return Ok((tag, built));
+    }
+    let dir = std::env::temp_dir().join(format!("kiln-linux-{}", crate::util::new_id()));
+    std::fs::create_dir_all(&dir)?;
+    let made = async {
+        let exe = fetch_linux_kiln(a, arch, &dir).await?;
+        let (hash, _) = crate::updates::hash_file(&exe)?;
+        let tag = format!("{APP}:{}", crate::updates::build_id(&hash));
+        let built = build_image(&tag, &exe, Some(&format!("linux/{arch}")))?;
+        anyhow::Ok((tag, built))
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    made
+}
+
+/// The static Linux kiln for `arch` CPUs (`amd64`, `arm64`), fetched into `dir` from a kiln server
+/// (its `/dl/kiln/<target>`, where every machine's kiln comes from): `--server`'s, else the one this
+/// machine's runner is enrolled with. Its path.
+async fn fetch_linux_kiln(a: &InstallArgs, arch: &str, dir: &Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let cpu = match arch {
+        "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        other => bail!("kiln has no Linux build for {other} CPUs: give --image"),
+    };
+    let target = format!("{cpu}-unknown-linux-musl");
+    let server =
+        a.server.clone().filter(|s| !s.trim().is_empty()).or_else(|| crate::upgrade::find_existing(&a.service).and_then(|e| crate::upgrade::arg_value(&e.args, "--server"))).with_context(|| {
+            format!(
+                "its image needs a Linux kiln for {arch} CPUs, which this one isn't, and no kiln server is known here to fetch one from: give --server (a kiln that has its {target} build), or --image"
+            )
+        })?;
+    let mut url = format!("{}/dl/kiln/{target}", server.trim_end_matches('/'));
+    say(format!("binary      kiln for {target}, from {url}"));
+    let http = client()?;
+    for _ in 0..5 {
+        let mut resp = http.get(&url).timeout(Duration::from_secs(900)).send().await.with_context(|| format!("fetching {url}"))?;
+        if (300..400).contains(&resp.status()) {
+            let to = resp.header("location").with_context(|| format!("{url} answered {} going nowhere", resp.status()))?;
+            url = if to.starts_with('/') { format!("{}{to}", origin_of(&url)) } else { to.to_owned() };
+            continue;
+        }
+        anyhow::ensure!(resp.is_success(), "{url} answered {}: give --image, or --server (a kiln that has its {target} build)", resp.status());
+        let path = dir.join("kiln");
+        let mut file = std::fs::File::create(&path)?;
+        let mut got = 0usize;
+        while let Some(chunk) = resp.chunk().await? {
+            got += chunk.len();
+            anyhow::ensure!(got <= crate::updates::MAX_BINARY, "{url} sent more than a kiln binary's {} MiB", crate::updates::MAX_BINARY >> 20);
+            file.write_all(&chunk)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        anyhow::ensure!(!dynamic(&path).with_context(|| format!("{url} sent something else than kiln's {target} build"))?, "{url} sent a kiln linked dynamically, not the static {target} build");
+        crate::os::make_executable(&path)?;
+        return Ok(path);
+    }
+    bail!("fetching kiln's {target} build: too many redirects")
+}
+
+/// `scheme://host[:port]` of `url`.
+fn origin_of(url: &str) -> &str {
+    let after = url.find("://").map_or(0, |i| i + 3);
+    url.get(after..).and_then(|rest| rest.find('/')).map_or(url, |slash| url.get(..after + slash).unwrap_or(url))
+}
+
+/// Builds the image `tag` from the Linux kiln `exe` with this machine's Docker (for `platform`,
+/// `linux/<arch>`, when that's not Docker's own), unless it's built already: whether it built it.
+fn build_image(tag: &str, exe: &Path, platform: Option<&str>) -> anyhow::Result<bool> {
     if !docker(&["image", "ls", "-q", tag])?.is_empty() {
-        say(format!("image       {tag} (built from this binary before)"));
+        say(format!("image       {tag} (built from this kiln before)"));
         return Ok(false);
     }
-    let exe = std::env::current_exe()?;
-    let base = base(dynamic(&exe).context("reading this binary")?, &std::fs::read_to_string("/etc/os-release").unwrap_or_default())?;
+    // A dynamic kiln is this machine's own (the fetched ones are static): its system is the base.
+    let base = base(dynamic(exe).context("reading the kiln to build the image from")?, &std::fs::read_to_string("/etc/os-release").unwrap_or_default())?;
     let dir = std::env::temp_dir().join(format!("kiln-image-{}", crate::util::new_id()));
     std::fs::create_dir_all(&dir)?;
     let built = (|| {
-        std::fs::copy(&exe, dir.join("kiln"))?;
+        std::fs::copy(exe, dir.join("kiln"))?;
         std::fs::write(dir.join("Dockerfile"), dockerfile(&base))?;
         std::fs::write(dir.join("kiln.toml"), config(""))?;
-        say(format!("image       building {tag} from this binary ({})", base.lines().next().unwrap_or("").trim_start_matches("FROM ")));
-        docker(&["build", "-q", "--label", "kiln.installed=1", "-t", tag, &dir.to_string_lossy()])
+        say(format!("image       building {tag} ({}{})", base.lines().next().unwrap_or("").trim_start_matches("FROM "), platform.map(|p| format!(", {p}")).unwrap_or_default()));
+        let context = dir.to_string_lossy();
+        let mut args = vec!["build", "-q", "--label", "kiln.installed=1", "-t", tag];
+        if let Some(p) = platform {
+            args.extend(["--platform", p]);
+        }
+        args.push(context.as_ref());
+        docker(&args)
     })();
     let _ = std::fs::remove_dir_all(&dir);
     built.map(|_| true)
@@ -284,11 +383,7 @@ pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
     }
     let (image, built) = match &a.image {
         Some(image) => (image.clone(), false),
-        None => {
-            let tag = own_tag().context("this binary's build can't be read to tag an image of it: give one with --image")?;
-            let built = build_image(&tag)?;
-            (tag, built)
-        }
+        None => kiln_image(a, &docker(&["version", "--format", "{{.Server.Arch}}"])?).await?,
     };
     let made_volume = docker(&["volume", "ls", "-q", "--filter", &format!("name=^{volume}$")])?.is_empty();
     let (http, quic) = (a.port, a.port.checked_add(1).context("--port can't be the last port: QUIC takes the next one")?);
@@ -357,26 +452,23 @@ fn context_name(context: Option<&str>) -> anyhow::Result<String> {
 }
 
 /// How the cluster of context `ctx` (`nodes`, its nodes) takes an image from this machine's
-/// Docker: a minikube profile's, kind's or k3d's loader, or nothing (an empty command) for Docker
-/// Desktop's and OrbStack's single node, which runs on that Docker; else why it can't. Docker
-/// Desktop's multi-node cluster runs kind out of Docker's sight, so its images are pulled.
+/// Docker: a minikube profile's, kind's or k3d's loader; or nothing (an empty command) for Docker
+/// Desktop's and OrbStack's, which share that Docker's images: Docker Desktop's kind nodes (its
+/// cluster, one node or more, since 4.65) pull them through its registry mirror; else why it can't.
 fn loader(ctx: &str, nodes: &[Value]) -> Result<Vec<String>, String> {
     let words = |w: &[&str]| Ok(w.iter().map(|w| (*w).to_owned()).collect());
+    if ["docker-desktop", "orbstack"].contains(&ctx) {
+        return Ok(Vec::new());
+    }
     if let Some(p) = nodes.iter().find_map(|n| n.pointer("/metadata/labels/minikube.k8s.io~1name")?.as_str()) {
         return words(&["minikube", "-p", p, "image", "load"]);
     }
     // kind's nodes say their cluster: `kind://docker/<cluster>/<node>`.
     if let Some(cluster) = nodes.iter().find_map(|n| n.pointer("/spec/providerID")?.as_str()?.strip_prefix("kind://")?.split('/').nth(1)) {
-        if ctx == "docker-desktop" {
-            return Err("Docker Desktop's multi-node cluster pulls its images from a registry".to_owned());
-        }
         return words(&["kind", "load", "docker-image", "--name", cluster]);
     }
     if let Some(name) = ctx.strip_prefix("k3d-") {
         return words(&["k3d", "image", "import", "-c", name]);
-    }
-    if ["docker-desktop", "orbstack"].contains(&ctx) {
-        return Ok(Vec::new());
     }
     Err(format!("the cluster of context {ctx} takes no image from this machine"))
 }
@@ -427,10 +519,43 @@ fn url_of(host: &str, port: u64) -> String {
     if host.contains(':') { format!("http://[{host}]:{port}") } else { format!("http://{host}:{port}") }
 }
 
+/// The CPU of the cluster's nodes, as Kubernetes says it (`amd64`, `arm64`): the image is built for
+/// it.
+fn nodes_arch(nodes: &[Value]) -> anyhow::Result<String> {
+    let mut archs: Vec<&str> = nodes.iter().filter_map(|n| n.pointer("/status/nodeInfo/architecture")?.as_str()).collect();
+    archs.sort_unstable();
+    archs.dedup();
+    match archs.as_slice() {
+        [one] => Ok((*one).to_owned()),
+        [] => bail!("the cluster's nodes don't say their CPU: give --image"),
+        many => bail!("the cluster's nodes have more than one kind of CPU ({}): give --image of an image built for each", many.join(", ")),
+    }
+}
+
+/// The registry a cluster names for images pushed from this machine (`localRegistryHosting.v1` of
+/// kube-public's `local-registry-hosting`, KEP-1755's word, in YAML): where to push (`host`), and
+/// the name the cluster's nodes pull by (`hostFromContainerRuntime`, else `host`).
+fn hosting(text: &str) -> Option<(String, String)> {
+    let v: Value = serde_yaml::from_str(text).ok()?;
+    let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|h| !h.is_empty());
+    let host = field("host")?;
+    Some((host.to_owned(), field("hostFromContainerRuntime").unwrap_or(host).to_owned()))
+}
+
+/// The registry the cluster names for images pushed from this machine ([`hosting`]): where to
+/// push, and the name its nodes pull by.
+async fn named_registry(cluster: &Cluster) -> Option<(String, String)> {
+    let cm = cluster.get(&ResKey::new("", "ConfigMap", "kube-public", "local-registry-hosting")).await.ok().flatten()?;
+    hosting(cm.pointer("/data/localRegistryHosting.v1")?.as_str()?)
+}
+
 /// The image the cluster runs, and its pull policy: `--image` (loaded into a cluster that takes
-/// images from this machine, when this machine's Docker has it); else one built from this binary,
-/// pushed to `--registry`, or loaded into the cluster.
-fn cluster_image(a: &InstallArgs, ctx: &str, nodes: &[Value]) -> anyhow::Result<(String, &'static str)> {
+/// images from this machine, when this machine's Docker has it); else one built for the nodes'
+/// CPU ([`kiln_image`]): loaded into the cluster (never pulled), shared with it (pulled when its
+/// node hasn't it, as Docker Desktop's kind nodes pull through its mirror), or pushed to a registry
+/// it pulls from: `--registry`, else the one it names ([`named_registry`]) when it takes no image
+/// from this machine.
+async fn cluster_image(a: &InstallArgs, cluster: &Cluster, ctx: &str, nodes: &[Value]) -> anyhow::Result<(String, &'static str)> {
     let load = loader(ctx, nodes);
     if let Some(image) = &a.image {
         if let Ok(load) = &load
@@ -441,19 +566,31 @@ fn cluster_image(a: &InstallArgs, ctx: &str, nodes: &[Value]) -> anyhow::Result<
         }
         return Ok((image.clone(), "IfNotPresent"));
     }
-    if let (Err(why), None) = (&load, &a.registry) {
-        bail!("{why}: give --registry to push the image built from this binary to, or --image of one it can pull");
-    }
-    let tag = own_tag().context("this binary's build can't be read to tag an image of it: give one with --image")?;
-    build_image(&tag)?;
-    if let Some(registry) = &a.registry {
-        let pushed = format!("{}/{tag}", registry.trim_end_matches('/'));
+    let registry = match (&load, &a.registry) {
+        (_, Some(r)) => Some((r.trim_end_matches('/').to_owned(), r.trim_end_matches('/').to_owned())),
+        (Ok(_), None) => None,
+        (Err(why), None) => {
+            let Some((push, pull)) = named_registry(cluster).await else {
+                bail!("{why}, and it names no registry (kube-public's local-registry-hosting): give --registry to push the image to, or --image of one it can pull");
+            };
+            say(format!("registry    {push}{}", if pull == push { String::new() } else { format!(" (the cluster pulls from {pull})") }));
+            Some((push, pull))
+        }
+    };
+    let (tag, _) = kiln_image(a, &nodes_arch(nodes)?).await?;
+    if let Some((push, pull)) = registry {
+        let pushed = format!("{push}/{tag}");
         docker(&["tag", &tag, &pushed])?;
         docker(&["push", "-q", &pushed])?;
         say(format!("image       pushed to {pushed}"));
-        return Ok((pushed, "IfNotPresent"));
+        return Ok((format!("{pull}/{tag}"), "IfNotPresent"));
     }
-    load_image(&load.unwrap_or_default(), &tag)?;
+    let load = load.unwrap_or_default();
+    if load.is_empty() {
+        say(format!("image       {tag}, shared with the cluster"));
+        return Ok((tag, "IfNotPresent"));
+    }
+    load_image(&load, &tag)?;
     Ok((tag, "Never"))
 }
 
@@ -472,13 +609,18 @@ pub async fn kubernetes_install(a: &InstallArgs) -> anyhow::Result<()> {
     let nodes = cluster.list_in(&GroupKind::new("", "Node"), None, None, false).await.context("listing the cluster's nodes")?;
     let hosts = addresses(&ctx, &nodes);
     anyhow::ensure!(!hosts.is_empty(), "the cluster's nodes have no address");
-    let (image, pull) = cluster_image(a, &ctx, &nodes)?;
+    let (image, pull) = cluster_image(a, &cluster, &ctx, &nodes).await?;
     let token = crate::util::random_token();
     let mut made = Vec::new();
     let Err(e) = install_in(&cluster, &ctx, ns, (&image, pull), &token, &hosts, &mut made).await else { return Ok(()) };
     let logs = pod_logs(&cluster, ns).await;
     let gone = undo(&cluster, ns, &made).await;
-    let logs = logs.map(|l| format!("\n\nkiln's last log lines:\n{l}")).unwrap_or_default();
+    let mut logs = logs.map(|l| format!("\n\nkiln's last log lines:\n{l}")).unwrap_or_default();
+    if format!("{e:#}").contains("ImagePullBackOff") && image.contains('/') {
+        logs.push_str(&format!(
+            "\n\nThe cluster's nodes couldn't pull {image}: they reach a registry this machine pushes to as its own setup says (kind's: https://kind.sigs.k8s.io/docs/user/local-registry/)."
+        ));
+    }
     let left = if made.is_empty() {
         "Nothing was made.".to_owned()
     } else if gone {
@@ -716,8 +858,9 @@ mod tests {
         assert_eq!(cmd("anything", &[node(json!({}), "kind://docker/dev/dev-control-plane")]).as_deref(), Ok("kind load docker-image --name dev"));
         assert_eq!(cmd("k3d-ci", &[node(json!({}), "k3s://k3d-ci-server-0")]).as_deref(), Ok("k3d image import -c ci"));
         assert_eq!(cmd("docker-desktop", &[node(json!({}), "")]).as_deref(), Ok(""), "Docker Desktop's single node runs on its Docker");
-        let desktop_kind = cmd("docker-desktop", &[node(json!({}), "kind://docker/desktop/desktop-control-plane")]);
-        assert!(desktop_kind.is_err_and(|why| why.contains("registry")), "Docker Desktop's multi-node cluster pulls");
+        // Its kind nodes (Docker Desktop's default since 4.65, one node or more) pull its images
+        // through its mirror: an image of this machine's Docker is theirs.
+        assert_eq!(cmd("docker-desktop", &[node(json!({}), "kind://docker/desktop/desktop-control-plane")]).as_deref(), Ok(""));
         assert!(cmd("gke_prod_us-east1_main", &[node(json!({}), "gce://prod/us-east1-b/n1")]).is_err(), "a cluster elsewhere needs a registry");
     }
 
@@ -774,7 +917,8 @@ mod tests {
     /// A kiln stand-in on a port of its own: `/healthz`, its page (naming its script, when `ui`),
     /// the script, and `/healthz/server` with `runners` connected; at those paths, and through an
     /// API server's proxy to kiln's service in namespace `kiln`, which rewrites the page's links to
-    /// go through it, as Kubernetes' does.
+    /// go through it, as Kubernetes' does. Its page, as kiln's, isn't for a request that takes JSON
+    /// alone (406).
     fn stand_in(ui: bool, runners: u64) -> anyhow::Result<String> {
         use std::io::Write as _;
         let l = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -795,8 +939,11 @@ mod tests {
                     Some(_) => page.replace("src=\"/", &format!("src=\"https://10.0.0.1:6443{}/", proxy_base("kiln"))),
                     None => page.to_owned(),
                 };
+                let accept = req.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("accept:").map(|v| v.trim().to_owned()));
+                let html = accept.is_none_or(|a| a.contains("text/html") || a.contains("*/*"));
                 let (status, body) = match proxied.unwrap_or(path) {
                     "/healthz" => ("200 OK", "ok".to_owned()),
+                    "/" if !html => ("406 Not Acceptable", String::new()),
                     "/" => ("200 OK", page),
                     "/assets/index-x1.js" => ("200 OK", "export {}".to_owned()),
                     "/healthz/server" => ("200 OK", format!(r#"{{"runners":{{"connected":{runners},"before":0,"back":1.0}}}}"#)),
@@ -820,6 +967,93 @@ mod tests {
             assert!(format!("{e:#}").contains("not ready after 0 s") && format!("{e:#}").contains("runner isn't connected"), "{e:#}");
             Ok(())
         })
+    }
+
+    /// A 64-bit ELF file's first bytes: with a program interpreter (a dynamic binary), or none.
+    fn elf(interp: bool) -> Vec<u8> {
+        // Its header (64-bit, little-endian; one program header, 56 bytes, at 64), then that header,
+        // the program interpreter's (3) or a loadable segment's (1).
+        let mut b = b"\x7fELF\x02\x01".to_vec();
+        b.resize(32, 0);
+        b.extend_from_slice(&64u64.to_le_bytes());
+        b.resize(54, 0);
+        b.extend_from_slice(&56u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.resize(64, 0);
+        b.extend_from_slice(&(if interp { 3u32 } else { 1u32 }).to_le_bytes());
+        b.resize(64 + 56, 0);
+        b
+    }
+
+    /// A kiln server stand-in for `/dl/kiln/<target>`: the aarch64 build sent on from where it
+    /// was asked for (a redirect, as a server's for a build it hasn't), the x86_64 one linked
+    /// dynamically, any other target a page that isn't a binary.
+    fn builds() -> anyhow::Result<String> {
+        use std::io::Write as _;
+        let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}", l.local_addr()?);
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                let (head, body): (String, Vec<u8>) = match req.split_whitespace().nth(1).unwrap_or("/") {
+                    "/dl/kiln/aarch64-unknown-linux-musl" => ("302 Found\r\nlocation: /releases/kiln-aarch64".into(), Vec::new()),
+                    "/releases/kiln-aarch64" => ("200 OK".into(), elf(false)),
+                    "/dl/kiln/x86_64-unknown-linux-musl" => ("200 OK".into(), elf(true)),
+                    _ => ("200 OK".into(), b"<!doctype html><p>no such page</p>".to_vec()),
+                };
+                let _ = write!(s, "HTTP/1.1 {head}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            }
+        });
+        Ok(url)
+    }
+
+    #[test]
+    fn a_linux_kiln_for_the_clusters_cpu_comes_from_a_kiln_server() -> anyhow::Result<()> {
+        #[derive(clap::Parser)]
+        struct Install {
+            #[command(flatten)]
+            a: InstallArgs,
+        }
+        use clap::Parser as _;
+        let server = builds()?;
+        let a = Install::try_parse_from(["install", "--server", server.as_str()])?.a;
+        let dir = tempfile::tempdir()?;
+        crate::rt::block_on(async move {
+            let got = fetch_linux_kiln(&a, "arm64", dir.path()).await?;
+            assert_eq!(std::fs::read(&got)?, elf(false), "the static build, where the server sent it on to");
+            let Err(e) = fetch_linux_kiln(&a, "amd64", dir.path()).await else { bail!("a dynamic kiln was taken for an image of its own") };
+            assert!(format!("{e:#}").contains("linked dynamically"), "{e:#}");
+            let Err(e) = fetch_linux_kiln(&a, "riscv64", dir.path()).await else { bail!("a CPU kiln has no build for was fetched") };
+            assert!(format!("{e:#}").contains("--image"), "{e:#}");
+            Ok(())
+        })?;
+        assert_eq!(origin_of("http://10.0.0.2:7070/dl/kiln/x"), "http://10.0.0.2:7070");
+        assert_eq!(origin_of("https://kiln.example"), "https://kiln.example");
+        Ok(())
+    }
+
+    #[test]
+    fn a_registry_is_the_one_the_cluster_names() {
+        let named = "host: \"localhost:5001\"\nhostFromContainerRuntime: \"kind-registry:5000\"\nhelp: \"https://kind.sigs.k8s.io/docs/user/local-registry/\"\n";
+        assert_eq!(hosting(named), Some(("localhost:5001".to_owned(), "kind-registry:5000".to_owned())));
+        assert_eq!(
+            hosting("host: \"localhost:5002\"\nhostFromClusterNetwork: \"r:5000\"\n"),
+            Some(("localhost:5002".to_owned(), "localhost:5002".to_owned())),
+            "the nodes pull by `host` when it names no other"
+        );
+        assert_eq!(hosting("help: x\n"), None);
+    }
+
+    #[test]
+    fn an_image_is_built_for_the_cpu_of_the_clusters_nodes() {
+        let node = |arch: &str| json!({ "status": { "nodeInfo": { "architecture": arch, "operatingSystem": "linux" } } });
+        assert_eq!(nodes_arch(&[node("arm64"), node("arm64")]).ok().as_deref(), Some("arm64"));
+        assert!(nodes_arch(&[node("arm64"), node("amd64")]).is_err_and(|e| e.to_string().contains("--image")));
+        assert!(nodes_arch(&[json!({})]).is_err());
+        assert_eq!((docker_arch("x86_64"), docker_arch("aarch64")), ("amd64", "arm64"));
     }
 
     #[test]

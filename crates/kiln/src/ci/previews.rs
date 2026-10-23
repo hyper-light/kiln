@@ -276,7 +276,7 @@ pub async fn end(hub: &Hub, repo: &Repo, name: &str, why: &str) -> anyhow::Resul
     let gone: Option<Gone> = hub
         .store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let row: Option<(String, Option<String>)> =
                 tx.query_row("SELECT name, kind FROM ci_previews WHERE repo_id = ?1 AND name = ?2 AND closed_at IS NULL", params![id, n], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             let Some((name, kind)) = row else { return Ok(None) };

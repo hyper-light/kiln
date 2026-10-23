@@ -651,7 +651,7 @@ async fn set_unsent(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
     let running = hub
         .store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             for (pos, row) in rows.iter().enumerate() {
                 let pos = i64::try_from(pos).unwrap_or(i64::MAX);
                 match row {
@@ -836,7 +836,7 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
     let running = hub
         .store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             let mut met = tx.execute("UPDATE goal_items SET status = 'met', reason = ?2, ended_at = ?3 WHERE id = ?1", params![target_id, reason, now])?;
             for id in &ended_parts {
                 met += tx.execute("UPDATE goal_items SET status = 'met', reason = 'Met with the goal it is a part of.', ended_at = ?2 WHERE id = ?1", params![id, now])?;
@@ -905,7 +905,7 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
         let running = hub
             .store
             .call(move |c| {
-                let tx = c.unchecked_transaction()?;
+                let tx = crate::store::tx(c)?;
                 if active {
                     tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1", params![gone, now, format!("Taken out by {who}.")])?;
                     tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
@@ -1074,7 +1074,7 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
     let (running, skipped) = hub
         .store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             let mut skipped = 0;
             match action {
                 Action::Start => run_from_here(&tx, &agent_s, said_at, now)?,
@@ -1447,7 +1447,7 @@ where
             if !due {
                 return Ok(false);
             }
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             run_from_here(&tx, &a, said_at, now)?;
             let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0))?;
             tx.commit()?;
@@ -1490,7 +1490,7 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
             {
                 return Ok(());
             }
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             let active: Option<(String, String)> =
                 tx.query_row("SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active'", params![agent], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             if active.as_ref().is_some_and(|(_, t)| same(t, &text)) {
@@ -1908,7 +1908,7 @@ where
                 if !still {
                     return Ok(false);
                 }
-                let tx = c.unchecked_transaction()?;
+                let tx = crate::store::tx(c)?;
                 run_from_here(&tx, &a, said_at, now)?;
                 let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0))?;
                 tx.commit()?;
@@ -1941,7 +1941,7 @@ pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, ite
     let like = format!("{}%", track.replace(['%', '_'], ""));
     let done = store
         .call(move |c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute("UPDATE goal_items SET delegated_to = NULL WHERE agent = ?1 AND delegated_to IS NOT NULL AND text LIKE ?2", params![agent, like])?;
             if let Some(item) = &item {
                 let n = if met {

@@ -340,6 +340,70 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
     let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
+    // With no other runner, it waits for one, and says so.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    assert_eq!(s.reason("x"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: true }));
+}
+
+/// W05-R16: the default retry after `runner-lost` goes to another runner when one could take it,
+/// else to the same one; a policy's `runner: different` waits for another, and says so.
+#[test]
+fn w05_r16_a_lost_runners_retry() {
+    let assigned = |c: &[Command], l: &str, r: &str, n: u32| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt, .. } if leg == l && runner == r && *attempt == n));
+    // The only runner: lost, then back, it takes the retry.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    assert!(assigned(&c, "x", "a", 1), "{c:?}");
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 1);
+    assert!(c.iter().any(|x| matches!(x, Command::Retry { leg, attempt: 2, .. } if leg == "x")) && !c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 2);
+    assert!(assigned(&c, "x", "a", 2), "no other could take it: {c:?}");
+    // Two runners: the retry waits for the other while it's busy, and takes the lost one once
+    // the other goes too, before the other's own leg.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let first = if assigned(&c, "x", "a", 1) { "a" } else { "b" };
+    let other = if first == "a" { "b" } else { "a" };
+    let c = s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 0);
+    assert!(assigned(&c, "y", other, 1), "{c:?}");
+    s.handle(Input::RunnerLost { runner: first.into() }, 1);
+    let c = s.handle(Input::RunnerUp(Box::new(linux(first, 1))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "x")), "another could take it: {c:?}");
+    assert!(matches!(s.reason("x"), Some(WaitReason::Capacity { .. })), "{:?}", s.reason("x"));
+    let c = s.handle(Input::RunnerLost { runner: other.into() }, 3);
+    assert!(assigned(&c, "x", first, 2), "{c:?}");
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "y")), "the runner is x's: {c:?}");
+    // A draining other is no other.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let first = if assigned(&c, "x", "a", 1) { "a" } else { "b" };
+    let other = if first == "a" { "b" } else { "a" };
+    s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 0);
+    s.handle(Input::RunnerLost { runner: first.into() }, 1);
+    s.handle(Input::RunnerUp(Box::new(linux(first, 1))), 2);
+    let c = s.handle(Input::RunnerDraining { runner: other.into() }, 3);
+    assert!(assigned(&c, "x", first, 2), "{c:?}");
+    // `runner: different`: the only runner back, the retry waits for another.
+    let strict = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::RunnerLost)], initial_ms: 0, factor: 1.0, max_ms: 0, runner: super::retry::RunnerChoice::Different };
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(LegIn { retry: Some(strict), ..leg("z", "acme/x", 60) })), 0);
+    assert!(assigned(&c, "z", "a", 1), "{c:?}");
+    s.handle(Input::RunnerLost { runner: "a".into() }, 1);
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    assert_eq!(s.reason("z"), Some(&WaitReason::OtherRunner { avoided: "a".into(), refused: false }));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 3);
+    assert!(assigned(&c, "z", "b", 2), "{c:?}");
 }
 
 // ------------------------------------------------------------------ pools (W13-R09, W05-R27)

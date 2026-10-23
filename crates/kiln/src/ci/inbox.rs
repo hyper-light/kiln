@@ -36,7 +36,7 @@ pub async fn put(hub: &Hub, people: &[String], event: &str, title: &str, line: &
     let told = people.clone();
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             for p in &people {
                 tx.execute(

@@ -4756,6 +4756,8 @@ fn server_health(hub: &Hub) -> Response {
             "restarts": hub.generation.saturating_sub(1),
             "memory": memory,
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
+            // The cluster group (docs/p2p.md P1): kiln.db's last write, and the log's last entry.
+            "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({ "group": true, "seq": seq, "applied": applied })),
         }),
     )
 }

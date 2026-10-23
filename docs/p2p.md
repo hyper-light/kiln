@@ -198,7 +198,7 @@ each other relay through any node both can (the steadiest first), not a fixed se
 `kiln install` installs a whole node, on the target the person picks, and leaves it running:
 
 ```
-kiln install                                 # Kubernetes, the current context (the default)
+kiln install                                 # Kubernetes, the current context (the default; without one, this machine)
 kiln install --on kubernetes --context lab   # another context
 kiln install --on docker                     # a container on this machine
 kiln install --on machine                    # this machine itself, as a service
@@ -219,9 +219,11 @@ kiln install --join <code>                   # join a kiln, rather than start on
   says what failed and leaves nothing running.
 
 **Built ahead of the phases** (`crates/kiln/src/install_targets.rs`, today's server as the node):
-`--on kubernetes` (the default; one Deployment until P3 makes it three, a NodePort service, its
-admin token a secret, an image built from the installing binary and loaded into minikube, kind or
-k3d, or pushed to `--registry`), `--on docker` and `--on machine`. Each ends once the kiln answers,
+`--on kubernetes` (the default where a kubeconfig names a cluster, else `--on machine`; one
+Deployment until P3 makes it three, a NodePort service, its admin token a secret, an image built
+for the nodes' CPU, from the installing binary or the static Linux build its kiln server has, and
+loaded into minikube, kind or k3d, shared with Docker Desktop's and OrbStack's, or pushed to
+`--registry` or the registry the cluster names), `--on docker` and `--on machine`. Each ends once the kiln answers,
 its UI's page and script load and its runner is connected (`/healthz/server`), and otherwise takes
 back what it made. `--join` comes with P5.
 
@@ -241,3 +243,45 @@ their own tracks land.
 | P6 | `kiln install` on Kubernetes (default), Docker and a machine, as whole nodes | each target installs a working node from nothing, in one command, checked on each |
 | P7 | Amphora under the nodes (its root group takes the cluster group's records; session, repository and environment groups; kiln plan T1) and Mantle for bytes (T10) | conversations, runs and bytes no longer go through one machine |
 | P8 | The server role retired: production runs as nodes | no code path names a server; production's minikube runs three nodes |
+
+### P1, as built
+
+kiln.db's writes go through the cluster group: one hyper-raft group, its log at
+`<data>/cluster/cluster.log`, with the store as its state machine (`crates/kiln/src/store/group.rs`).
+On the server alone the group has one voter, which commits alone.
+
+- **A write** (`Store::call`):
+  - It runs as it always has, in a transaction of the store's connection (`BEGIN IMMEDIATE`, so what
+    it reads is what it writes over), while SQLite's pre-update hook notes the rows it touches
+    (`store/capture.rs`).
+  - When it's done, those rows are read as it left them: what it commits, with the parts it took
+    back, or that failed half way, left out.
+  - It commits with its number (`seq`, in `cluster_state`), and its net change goes to the group as
+    an entry. The log writes the entries that came meanwhile together, one flush for all of them.
+  - The caller's answer comes once kiln.db holds the write, as before the group, and is as durable:
+    kiln.db commits without waiting for the disk. Measured on adacachy's NVMe, a small write took
+    104 µs at the median and 305 µs at p95 through the group, against 48 µs and 120 µs without it;
+    the log caught up 18 ms after the last write. A read is only a read.
+- **A restart replays** the log's writes kiln.db doesn't hold: those whose commit the disk lost while
+  the log's flush kept them. An entry applies when its `seq` is past kiln.db's, and is skipped
+  otherwise. Its rows are written whole by key, so applying one twice leaves what once does.
+  - The group starts with a barrier, an entry of its own, so the store serves only once that's done.
+  - The other way, kiln.db holds writes the log didn't take (a stop before they reached it). kiln.db
+    is whole and the log goes on from it; a learner takes a copy of the database (P2).
+  - On first start, today's database is the group's state at index 0, write 0.
+- **Rows keep their rowids.** A change carries each row whole with its rowid, so a replica is the same
+  database, not just an equal one. kiln uses rowids as identifiers: a run's is its GitHub run id, and
+  a job's orders its legs. SQLite's sessions were the other way, and they renumber rows.
+- **The machine applies** on a connection of its own, foreign keys off, since a write's cascades are
+  among its rows already.
+- **Transactions nest.** A write that needs its statements together opens a `store::tx` (a savepoint)
+  rather than rusqlite's transactions, which can't open inside the write's own.
+- **This node's own tables** (its log search index, built from its own logs) are written past the
+  group with `Store::call_local`; a write through the group that touches them is refused.
+- **Images:** on one node the image is kiln.db itself, so the log compacts behind what's applied and
+  durable, every 8,192 writes or 128 MiB. A learner's first copy of the database is P2's. Writes
+  forwarded by learners (P2), and a group with voters (P3), answer once committed.
+- **Seen live:** `/healthz/server`'s `store` says whether writes go through the group, kiln.db's last
+  write, and the log's last entry.
+- **Off:** `[cluster] group = false` (or `KILN_CLUSTER_GROUP=0`) writes straight to kiln.db as before.
+  The database is whole either way. `KILN_STORE_GROUP=1` runs the tests' stores through the group.

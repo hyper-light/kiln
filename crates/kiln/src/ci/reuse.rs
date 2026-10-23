@@ -145,7 +145,7 @@ pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str)
     let (run, source, id, hash) = (run.to_owned(), source.to_owned(), id.to_owned(), hash.to_owned());
     hub.store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             tx.execute(
                 "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, executor, attempt, queued_at, started_at, finished_at, exit_code, error,
                                    job_id, matrix, leg_index, outputs, conclusion, requirements, routing, concurrency_group, priority, input_hash, reused_from, environment, leg, run_attempt)

@@ -57,6 +57,9 @@ HOSTED = {
         "depot-ubuntu-24.04", "depot-ubuntu-24.04-4", "depot-ubuntu-24.04-8", "depot-ubuntu-24.04-16", "depot-ubuntu-latest-4",
         "github-ubuntu-24.04-x86_64-2", "github-ubuntu-24.04-x86_64-4", "github-ubuntu-24.04-x86_64-8", "github-ubuntu-24.04-x86_64-32",
         "ubuntu-24.04-xl", "ubuntu-latest-4-core-oss", "ubuntu-latest-16-core-oss",
+        # The repositories' own Linux pools, as a team moving to kiln routes its pools' labels to
+        # its runners: TypeScript's 1ES pool, CodSpeed's benchmark machines (Ubuntu 24.04).
+        "TypeScript-1ES-GitHub-TypeScript-1", "codspeed-macro", "codspeed-macro-x64-ryzen-9950x-ubuntu-24-04",
     ],
     ("linux", "x86_64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-8", "depot-ubuntu-22.04-16"],
     ("linux", "aarch64", "kiln/runner-ubuntu-24.04"): ["depot-ubuntu-24.04-arm-8", "depot-ubuntu-24.04-arm-16", "github-ubuntu-24.04-aarch64-4", "ubuntu-24.04-arm64-xl"],
@@ -85,12 +88,20 @@ KNOWN = [
     (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
     # buildx's debug adapter tests wait 5 s for a build to end (`require.Fail(t, "timeout reached")`).
     (r"Error:\s+timeout reached", "a test's timed wait (buildx's debug adapter waits 5 s for a build to end), in the lab, which runs at nice 19 and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    # buildx's own buildkitd (its `remote` worker, on the host's network) asking Docker Hub for a
+    # token itself, kiln nowhere on the way; the same test passed in the other legs.
+    (r"failed to fetch anonymous token: Get \"https://auth\.docker\.io/token[^\"]*\": net/http: TLS handshake timeout", "Docker Hub's token service didn't finish a TLS handshake in 10 s, asked by the test's own buildkitd (kiln isn't on the way): the network, a flake to run again"),
+    # CodeMirror parses to a time budget; with no editor view, a test's tree stays as far as it got.
+    (r"computeStartCompletePosition test", "CodeMirror's parser works to a time budget, which prometheus's completion test ran out of in the slow lab (its suite took 19 s, 2 s quiet): timing, to be run again when quiet"),
     (r"Condition never satisfied", "a test's timed wait (testify's `Eventually`: prometheus's waits seconds for its server), in the slow lab: timing, to be run again when quiet"),
     (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
     # The lab's firewall keeps containers on networks of their own from its server, so its legs
     # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
     # answers. Prometheus's Triton test expects nothing at 127.0.0.1:443.
     (r"an error occurred unmarshaling the discovery response json: invalid character '<'", "the lab's legs share the host's network, where a server listens on 443; a hosted runner's own machine has nothing there"),
+    # gh matches a checkout's remotes to GH_HOST by host name alone, without its port: the lab's
+    # facade is on port 42511 (a GitHub Enterprise Server is always on 443).
+    (r"none of the git remotes configured for this repository correspond to the GH_HOST", "gh matches the checkout's remote to GH_HOST by host name alone, and the lab's facade is on port 42511, not 443 as a GitHub Enterprise Server is; a facade on 443 matches"),
     # Two legs at once on that network share one EPMD (Erlang's port mapper), and name their
     # nodes alike: elixir's `primary@<host>`.
     (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),
@@ -431,7 +442,19 @@ def results(api, repo, event, corpus, runs, blocked):
         passed = sum(1 for leg in legs if leg.get("conclusion") == "success")
         if r.get("status") not in FINISHED:
             api.call("POST", f"/api/ci/runs/{r['id']}/cancel", {})
-            out[n] = {"result": "blocked" if n in blocked else "unfinished", "legs": f"{passed} of {len(legs)} legs passed", "notes": notes}
+            # What never ran for it: the jobs that need a leg that waited (tokio's whole CI needs
+            # its `docs` job, one of whose legs is Windows's), skipped once the run is cancelled.
+            after, deadline = legs, time.time() + 60
+            while time.time() < deadline:
+                time.sleep(5)
+                got = api.call("GET", "/api/ci/runs/" + r["id"])
+                after = got.get("legs") or after
+                if (got.get("run") or {}).get("finished_at") is not None:
+                    break
+            never = sum(1 for leg in after if leg.get("status") == "skipped") - sum(1 for leg in legs if leg.get("status") == "skipped")
+            if never > 0:
+                notes.append(f"{never} more legs never ran: they need one that waits" if n in blocked else f"{never} more legs never ran: the run was stopped unfinished")
+            out[n] = {"result": "blocked" if n in blocked else "unfinished", "legs": f"{passed} of {len(after)} legs passed", "notes": notes}
             continue
         if not notes and r.get("error"):
             notes.append(r["error"])
@@ -473,21 +496,127 @@ def run_repo(api, args, repo, commit):
     return out
 
 
-# A leg that waits for a machine the lab hasn't: macOS's or Windows's.
-ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == (macos|windows)|runs-on \[[^\]]*(macos|windows))")
+# A leg that waits for a machine the lab hasn't: macOS's, Windows's, Linux's on arm64.
+ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == (macos|windows)|arch == (aarch64|arm64|arm)\b|runs-on \[[^\]]*(macos|windows|-arm))")
+
+
+# Failures that are kiln's, of work docs/ci.md has left: what each is, and where it's tracked.
+LEFT = [
+    # zizmor's online audits pass GH_TOKEN, the job's, to a container that reads github.com.
+    (r"401 Unauthorized\) for url \(https://github\.com/", "a tool sends the job's token to github.com itself (zizmor's online audits), which refuses kiln's: legs' authenticated reads of github.com wait for W18's egress proxy and a GitHub credential (W22, left)"),
+    # scorecard-action checks a push's repository remotely (a pull request's, locally), through
+    # github.com's API unless `GH_HOST` names an Enterprise Server (over HTTPS). Then it signs
+    # what it found through Sigstore's public instance, for scorecard.dev.
+    (r"repo unreachable: GET https://api\.github\.com/repos/\S+: 401 Bad credentials", "scorecard reads a push's repository from github.com's API with the job's token, which github.com refuses: kiln would name its facade an Enterprise Server's host for it (`GH_HOST`, over HTTPS, which the lab's isn't), and its results are then signed through Sigstore's public instance for scorecard.dev, which trusts GitHub's ID tokens (W18, left)"),
+]
+
+
+def left(note):
+    """What kiln's work left a leg's miss is, by its note, or None."""
+    return next((r for pat, r in LEFT if re.search(pat, note)), None)
 
 
 def not_kilns(note):
     """Why a leg's miss (its note) isn't kiln's to fix, or None when it is."""
     if ELSEWHERE.search(note):
-        return "it waits for macOS or Windows, which the lab hasn't (its runner is Linux's)"
+        return "it waits for macOS, Windows or Linux on arm64, which the lab hasn't (its runner is Linux's, x86-64)"
+    if re.match(r"^\d+ more legs never ran: they need one that waits$", note):
+        return "they need a leg that waits for a machine the lab hasn't"
     return next((r for pat, r in KNOWN if re.search(pat, note)), None)
 
 
-def miss(w):
+def jobs_of(repo, name):
+    """The jobs of `repo`'s corpus workflow `name`: each job's id → (the jobs it needs, whether it
+    runs whatever they did, whether it reads how they did). Read by indentation, as `triggers`
+    reads `on`: enough for a workflow's own `jobs:` block."""
+    try:
+        with open(os.path.join(CORPUS, repo.replace("/", "_"), name)) as f:
+            lines = [x for x in f.read().splitlines() if x.strip() and not x.lstrip().startswith("#")]
+    except OSError:
+        return {}
+    at = next((i for i, x in enumerate(lines) if re.match(r"^jobs:\s*(#.*)?$", x)), None)
+    if at is None:
+        return {}
+    blocks, indent = {}, None
+    for x in lines[at + 1 :]:
+        if not x[0].isspace():
+            break
+        width = len(x) - len(x.lstrip())
+        m = re.match(r"^\s+([A-Za-z_][\w-]*|\"[^\"]+\"|'[^']+')\s*:\s*(#.*)?$", x)
+        if m and width <= (indent if indent is not None else width):
+            indent = width
+            blocks[m.group(1).strip("'\"")] = []
+        elif blocks:
+            blocks[next(reversed(blocks))].append(x)
+    out = {}
+    for job, block in blocks.items():
+        own = min((len(x) - len(x.lstrip()) for x in block), default=0)
+        needs, runs_anyway = set(), False
+        for i, x in enumerate(block):
+            if len(x) - len(x.lstrip()) != own:
+                continue
+            if m := re.match(r"^\s*needs:\s*(.*?)\s*(#.*)?$", x):
+                if m.group(1):
+                    needs = {e.strip().strip("'\"") for e in m.group(1).strip("[]").split(",") if e.strip()}
+                else:
+                    for y in block[i + 1 :]:
+                        # A list's items may sit at the key's own indent.
+                        if len(y) - len(y.lstrip()) < own or (len(y) - len(y.lstrip()) == own and not y.lstrip().startswith("-")):
+                            break
+                        if k := re.match(r"^\s*-\s*['\"]?([\w-]+)", y):
+                            needs.add(k.group(1))
+            if re.match(r"^\s*if:.*(\b(always|failure)\(\)|!\s*cancelled\(\))", x):
+                runs_anyway = True
+        # It reads how they did (an expression's names are any case: cargo's `toJson(needs)`), and
+        # does nothing else: no secret, no action but alls-green's (a notice of a failure, an
+        # issue opened for one, a run cancelled for one miss for their own reasons).
+        text = "\n".join(block)
+        reads = bool(re.search(r"(?i)\bneeds\.(\*|[\w-]+)\.result|\btojson\(\s*needs\s*\)", text))
+        alone = not re.search(r"(?i)\bsecrets\.", text) and all(re.match(r"re-actors/alls-green@", u) for u in re.findall(r"^\s*(?:-\s*)?uses:\s*['\"]?(\S+?)['\"]?\s*(?:#.*)?$", text, re.M))
+        out[job] = (needs, runs_anyway, reads and alone)
+    return out
+
+
+def job_of(note):
+    """The job of a leg's note (`` `key`: … `` or `` `key` waits: … ``): its key's id, without a
+    matrix's values or a called workflow's job."""
+    m = re.match(r"^`([^`]+)`", note)
+    return m.group(1).split(" / ")[0].split(" (")[0] if m else None
+
+
+GATE = "a gate (one stable name for branch protection): it fails when a job it needs missed, as it should, so it misses for theirs, said here"
+
+
+def gates(repo, name, notes):
+    """The notes, of one run of `repo`'s workflow `name`, of gate jobs: a job that runs whatever
+    the jobs it needs did, reads how they did and fails when one missed (prometheus's
+    `test_go_oldest_status`, a matrix's one name for branch protection), when another note is of
+    a job it needs, directly or through others. Its miss is theirs: the run's result says why
+    they missed."""
+    jobs = jobs_of(repo, name) if repo and name else {}
+    out = set()
+    for note in notes:
+        job = job_of(note)
+        if job not in jobs or not (jobs[job][1] and jobs[job][2]):
+            continue
+        under, todo = set(), list(jobs[job][0])
+        while todo:
+            j = todo.pop()
+            if j not in under:
+                under.add(j)
+                todo += list(jobs.get(j, (set(),))[0])
+        if any(job_of(other) in under for other in notes if other != note):
+            out.add(note)
+    return out
+
+
+def miss(w, repo=None, name=None):
     """A workflow's result for an event, a miss: the reasons it's not kiln's, every leg's that
-    missed, or None when one of them is kiln's (or none says why)."""
-    reasons = [not_kilns(x) for x in w.get("notes", [])]
+    missed, or None when one of them is kiln's (or none says why). A gate's (`gates`) is the
+    jobs' it needs."""
+    notes = w.get("notes", [])
+    gated = gates(repo, name, notes)
+    reasons = [GATE if x in gated else not_kilns(x) for x in notes]
     return sorted(set(reasons)) if reasons and all(reasons) else None
 
 
@@ -505,7 +634,7 @@ def write(out_dir):
     ran = [(d, n) for d, n in rows if any(e.get(n, {}).get("result") != "no run" for e in d["events"].values())]
     passed = [(d, n) for d, n in ran if all(e.get(n, {}).get("result") in ("pass", "no run", None) for e in d["events"].values())]
     missed = [(d, n) for d, n in ran if (d, n) not in passed]
-    explained = [(d, n) for d, n in missed if all(e.get(n, {}).get("result") in ("pass", "no run", None) or miss(e[n]) for e in d["events"].values())]
+    explained = [(d, n) for d, n in missed if all(e.get(n, {}).get("result") in ("pass", "no run", None) or miss(e[n], d["repo"], n) for e in d["events"].values())]
     lines = [
         "# CI conformance: F-03's popular repositories",
         "",
@@ -518,7 +647,7 @@ def write(out_dir):
         f"**{len(passed)} of {len(ran)} workflows that ran passed.** {len(explained)} more missed only for reasons not kiln's, each leg's named below,"
         f" and {len(missed) - len(explained)} for one that is kiln's to fix ({len(rows)} in all) in {len(done)} of {len(ORDER)} repositories run so far.",
         "",
-        "A cell says why each of its legs that missed did, when none is kiln's; `kiln's` when one is, or says nothing.",
+        "A cell says why each of its legs that missed did, when none is kiln's; `kiln's` when one is, or says nothing (with what of kiln's work it is, when docs/ci.md has it left).",
         "",
     ]
     for d in done:
@@ -533,8 +662,10 @@ def write(out_dir):
                     said = [no_run(d["repo"], n, e)]
                 result = w["result"]
                 if result not in ("pass", "no run"):
-                    why = miss(w)
-                    result += f": {'; '.join(why)}" if why else ": kiln's"
+                    why = miss(w, d["repo"], n)
+                    gated = gates(d["repo"], n, w.get("notes", []))
+                    known = sorted({x for x in (left(y) for y in w.get("notes", []) if y not in gated and not not_kilns(y)) if x})
+                    result += f": {'; '.join(why)}" if why else (f": kiln's, left: {'; '.join(known)}" if known else ": kiln's")
                 cells.append(result)
                 said = ([w["legs"]] if w.get("legs") else []) + said
                 if said:
@@ -546,17 +677,63 @@ def write(out_dir):
         f.write("\n".join(lines))
 
 
+def renote(api, out_dir, only=None):
+    """Reads each failed leg's note in `out_dir`'s results again from the server, from its runs
+    there (the repository's at the result's commit, by event and workflow), as after a fix to
+    how kiln picks a failure's excerpt; the rest of each result stays as it was (a run since
+    cancelled says no more why its legs waited). Then the report."""
+    for repo in ORDER:
+        p = os.path.join(out_dir, repo.replace("/", "_") + ".json")
+        if (only and repo not in only) or not os.path.exists(p):
+            continue
+        with open(p) as f:
+            d = json.load(f)
+        listing = api.call("GET", "/api/ci/runs?" + urllib.parse.urlencode({"repo": repo, "limit": 200}))["runs"]
+        changed = 0
+        for event, by_name in d.get("events", {}).items():
+            for n, w in by_name.items():
+                notes = w.get("notes") or []
+                if not any(re.match(r"^`[^`]+`: ", x) for x in notes):
+                    continue
+                runs = [r for r in listing if r.get("event") == event and r.get("sha") == d.get("sha") and os.path.basename(r.get("workflow", "")) == n]
+                if not runs:
+                    continue
+                r = max(runs, key=lambda r: int(r.get("created_at") or 0))
+                fresh = {}
+                for leg in api.call("GET", "/api/ci/runs/" + r["id"]).get("legs") or []:
+                    if leg.get("conclusion") in ("failure", "timed_out", "startup_failure"):
+                        step, msg = leg_detail(api, leg)
+                        fresh[leg.get("key")] = f"`{leg.get('key')}`: {step}" + (f": {msg}" if msg else "")
+                new = [fresh.get(m.group(1), x) if (m := re.match(r"^`([^`]+)`: ", x)) else x for x in notes]
+                changed += sum(1 for a, b in zip(notes, new) if a != b)
+                w["notes"] = new
+        if changed:
+            # Whole or not at all: a pass under way reads every result after each repository.
+            with open(p + ".new", "w") as f:
+                json.dump(d, f, indent=1)
+            os.replace(p + ".new", p)
+        print(f"{repo}: {changed} notes read again", flush=True)
+    write(out_dir)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", required=True)
     ap.add_argument("--token-file", required=True)
-    ap.add_argument("--work", required=True, help="where the repositories are made")
+    ap.add_argument("--work", help="where the repositories are made")
     ap.add_argument("--out", required=True, help="where each repository's results go")
     ap.add_argument("--only", nargs="*", help="these repositories (owner/name)")
     ap.add_argument("--timeout", type=int, default=7200, help="seconds to wait for one repository's runs")
     ap.add_argument("--pass", dest="pass_name", help="a pass of its own (new commits, so new runs, as after a change to kiln); the same name and --out go on with it")
+    ap.add_argument("--renote", action="store_true", help="read the failed legs' notes of the results in --out again from the server (`renote`), and nothing else")
     args = ap.parse_args()
     api = Api(args.server, open(args.token_file).read().strip())
+    if args.renote:
+        renote(api, args.out, args.only)
+        print(f"wrote {OUT}")
+        return
+    if not args.work:
+        ap.error("--work is needed for a pass")
     os.makedirs(args.work, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
     srcs = sources()
@@ -567,6 +744,11 @@ def main():
         p = os.path.join(args.out, repo.replace("/", "_") + ".json")
         if os.path.exists(p):
             continue
+        # A restart of the lab asks the pass to stop between repositories, before it starts the
+        # next one's runs, which the restart would cancel.
+        if os.path.exists(os.path.join(args.out, "STOP")):
+            print(f"stopping before {repo}, as {args.out}/STOP asks", flush=True)
+            break
         try:
             res = run_repo(api, args, repo, srcs[repo])
         except Exception as e:  # noqa: BLE001 — one repository's failure is its result

@@ -315,7 +315,7 @@ async fn commit(hub: &Arc<Hub>, claims: &Claims, req: Request) -> Result<Respons
     let made = hub
         .store
         .call(move |db| {
-            let tx = db.transaction()?;
+            let tx = crate::store::tx(db)?;
             let now = crate::util::now_unix();
             let n = tx.execute(
                 "INSERT OR IGNORE INTO ci_caches (repo_id, scope, key, version, object, size, created_at, last_used_at, created_by_leg) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",

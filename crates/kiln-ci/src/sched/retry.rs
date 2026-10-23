@@ -65,12 +65,16 @@ pub enum RetryOn {
 /// Where a retry runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RunnerChoice {
-    /// Another runner after `runner-lost`, any otherwise.
+    /// [`RunnerChoice::Another`] after `runner-lost`, any otherwise.
     #[default]
     Default,
     Any,
     Same,
+    /// Another runner, waiting for one when none other can take it (`runner: different`).
     Different,
+    /// Another runner when one can take it, else the same one (W05-R16's default after
+    /// `runner-lost`): where only that runner could, the retry doesn't wait for good.
+    Another,
 }
 
 /// A `retry:` policy.
@@ -167,13 +171,13 @@ pub struct Decision {
 /// Whether attempt `attempt` (1 for the first) of a leg that failed as `f` is retried.
 pub fn decide(policy: Option<&RetryPolicy>, attempt: u32, f: &Failed) -> Option<Decision> {
     let resolve = |c: RunnerChoice| match c {
-        RunnerChoice::Default if f.class == FailureClass::RunnerLost => RunnerChoice::Different,
+        RunnerChoice::Default if f.class == FailureClass::RunnerLost => RunnerChoice::Another,
         RunnerChoice::Default => RunnerChoice::Any,
         other => other,
     };
     match policy {
-        // The default: a lost runner is retried once, elsewhere (W05-R16).
-        None => (f.class == FailureClass::RunnerLost && attempt < 2).then_some(Decision { delay_ms: 0, runner: RunnerChoice::Different }),
+        // The default: a lost runner is retried once, elsewhere when it can be (W05-R16).
+        None => (f.class == FailureClass::RunnerLost && attempt < 2).then_some(Decision { delay_ms: 0, runner: RunnerChoice::Another }),
         Some(p) => (attempt <= p.max && p.covers(f)).then(|| Decision { delay_ms: p.backoff_ms(attempt), runner: resolve(p.runner) }),
     }
 }
@@ -193,7 +197,7 @@ mod tests {
 
     #[test]
     fn the_default() {
-        assert_eq!(decide(None, 1, &failed(FailureClass::RunnerLost)), Some(Decision { delay_ms: 0, runner: RunnerChoice::Different }));
+        assert_eq!(decide(None, 1, &failed(FailureClass::RunnerLost)), Some(Decision { delay_ms: 0, runner: RunnerChoice::Another }));
         assert_eq!(decide(None, 2, &failed(FailureClass::RunnerLost)), None, "once");
         assert_eq!(decide(None, 1, &failed(FailureClass::Failure)), None, "nothing else");
     }
@@ -218,6 +222,10 @@ mod tests {
         // v1's retries: n.
         let v1 = YVal::Map(vec![("max".into(), YVal::Num(2.0)), ("on".into(), YVal::Seq(vec![s("runner-lost")]))]);
         let p = RetryPolicy::from_yval(&v1);
-        assert!(p.as_ref().is_some_and(|p| decide(Some(p), 2, &failed(FailureClass::RunnerLost)).is_some_and(|d| d.runner == RunnerChoice::Different)));
+        assert!(p.as_ref().is_some_and(|p| decide(Some(p), 2, &failed(FailureClass::RunnerLost)).is_some_and(|d| d.runner == RunnerChoice::Another)));
+        // An explicit `runner: different` stays strict.
+        let strict = YVal::Map(vec![("max".into(), YVal::Num(1.0)), ("on".into(), YVal::Seq(vec![s("runner-lost")])), ("runner".into(), s("different"))]);
+        let p = RetryPolicy::from_yval(&strict);
+        assert!(p.as_ref().is_some_and(|p| decide(Some(p), 1, &failed(FailureClass::RunnerLost)).is_some_and(|d| d.runner == RunnerChoice::Different)));
     }
 }

@@ -211,7 +211,7 @@ pub async fn mine(hub: &Hub, caller: &crate::authz::Caller, put: Option<Value>) 
         let (id, text) = (uid.clone(), serde_json::to_string(&rules).unwrap_or_else(|_| "[]".into()));
         hub.store
             .call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 if rules.is_empty() {
                     tx.execute("DELETE FROM notify_subscriptions WHERE user_id = ?1", [&id])?;
                 } else {

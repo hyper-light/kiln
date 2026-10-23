@@ -35,7 +35,33 @@ pub fn add_to_user_path(dir: &Path) -> io::Result<Option<super::PathAdded>> {
     let shell = std::env::var("SHELL").unwrap_or_default();
     let zdotdir = std::env::var_os("ZDOTDIR").map(PathBuf::from);
     let line = shell_path_line(&shell, cfg!(target_os = "macos"), &home_dir(), zdotdir.as_deref(), dir, Path::exists);
-    Ok(add_marked_line(&line.file, &line.line)?.then_some(super::PathAdded { file: Some(line.file), now: Some(line.now) }))
+    let created = !line.file.exists();
+    Ok(add_marked_line(&line.file, &line.line)?.then_some(super::PathAdded { file: Some(line.file), now: Some(line.now), created }))
+}
+
+/// Take back what [`add_to_user_path`] added: its marked line (and the blank line set before it)
+/// out of the startup file, and the file itself when it was made for it and holds nothing else.
+pub fn remove_from_user_path(_dir: &Path, added: &super::PathAdded) -> io::Result<()> {
+    let Some(file) = &added.file else { return Ok(()) };
+    let text = std::fs::read_to_string(file)?;
+    let kept = without_marked_line(&text);
+    if added.created && kept.trim().is_empty() {
+        return std::fs::remove_file(file);
+    }
+    if kept != text {
+        std::fs::write(file, kept)?;
+    }
+    Ok(())
+}
+
+/// `text` without [`add_marked_line`]'s block: the mark, the line after it, and a blank line
+/// just before the mark.
+fn without_marked_line(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(at) = lines.iter().position(|l| l.trim() == PATH_MARK) else { return text.to_owned() };
+    let from = if at > 0 && lines.get(at - 1).is_some_and(|l| l.trim().is_empty()) { at - 1 } else { at };
+    let rest: Vec<&str> = lines.iter().take(from).chain(lines.iter().skip(at + 2)).copied().collect();
+    if rest.is_empty() { String::new() } else { format!("{}\n", rest.join("\n")) }
 }
 
 /// What marks the line [`add_to_user_path`] adds to a shell's startup file.
@@ -445,6 +471,8 @@ mod path_tests {
         std::fs::write(&theirs, "alias ll='ls -l'")?;
         assert!(add_marked_line(&theirs, "the line")?);
         assert_eq!(std::fs::read_to_string(&theirs)?, format!("alias ll='ls -l'\n\n{PATH_MARK}\nthe line\n"));
+        assert_eq!(without_marked_line(&std::fs::read_to_string(&theirs)?), "alias ll='ls -l'\n", "taken back, the file is as it was");
+        assert_eq!(without_marked_line(&std::fs::read_to_string(&fresh)?), "");
         Ok(())
     }
 
