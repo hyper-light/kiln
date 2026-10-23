@@ -6729,6 +6729,33 @@ and AC02.
     through Sigstore's public instance, which trusts GitHub's ID tokens, not kiln's. The
     dependency graph's compare those 5 starters need is now served (W14-R11); they're to be run
     again.
+- *AC01, the repositories' own workflows* (`ci/conformance/corpus.py`, results in
+  `docs/ci-conformance-corpus.md`), from 2026-10-22:
+  - Each of F-03's 24 repositories, at the commit F-03 took its workflows at, is kiln's own
+    repository (native and public, as on GitHub). Its whole tree is a pull request against an
+    empty trunk, then pushed to it. The trunk has the upstream's version tags, as a checkout of
+    the whole history has them.
+  - They run in the conformance lab: a throwaway server and a Linux runner of two slots. Its
+    `docker` executor runs kiln's runner image, given the host's Docker through each leg's own
+    socket. A pacer freezes the lab while the machine's disks are busy, for production's sake.
+  - Every leg that misses is classified, and a workflow's miss is explained only if each of its
+    legs' is:
+    - it waits for macOS or Windows, which the lab hasn't;
+    - a reason not kiln's: the repository's secrets, GitHub Pages, a check of the pull
+      request's description or base, the lab's host network, a timed wait in the slow lab;
+    - or kiln's to fix.
+  - Found and fixed on the way, each with its test:
+    - `cross`'s mounts, and GitHub's paths, in a `docker` leg (W13-R04);
+    - two legs at once on one runner's Docker: their names are their own now (W13-R04);
+    - a public repository read with no permission for it, over git and the REST API
+      (W10-R04, W14-R01);
+    - a leg's fetch of another public repository (W14-R11), and `GH_HOST` in a container;
+    - an owner's `.github` repository, and a remote reusable workflow's `./` calls (W07-R02);
+    - v1 to v3 artifacts (W08-R08);
+    - live logs the masker held back (W06-R08).
+  - Pass 1022g (six repositories, on builds before most of these): 10 of 25 workflows that ran
+    passed, 7 more missed only for reasons not kiln's, and 8 for kiln's, each fixed since.
+    Pass 1023b runs every repository again on a build with all of it.
 - *AC02, fourth batch* (2026-10-19), in the lab, the facade over HTTPS:
   - `github/codeql-action/upload-sarif`: the code-scanning starters above.
   - `peter-evans/create-pull-request@v7`: a branch pushed, a pull request opened, then updated
@@ -6922,8 +6949,10 @@ and AC02.
     `12345678901234567000`, `1000`, `0.1` and `16`.
   - Found on the way, and fixed: a cancelled step in a job container was never signalled (W05's
     AC07 note), and the probes' own matrix one didn't test an empty value written last.
-- *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
+- *Left.* AC01: the rest of pass 1023b; the corpus's macOS and Windows legs, which need such
+  runners in the lab (user-assisted: joining a Mac and a Windows machine runs third-party CI code
+  on them); the host executor's run of the repositories' workflows (W06-AC07), which needs a
+  machine of its own to run them on; and test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
   a public repository the user owns, then `compare` run against kiln), and AC05; F-21's last two
   (`azure/login` with a tenant, `attest-build-provenance` with GitHub's Sigstore); an
   authenticated way for legs to read github.com's API (W18's egress proxy).
