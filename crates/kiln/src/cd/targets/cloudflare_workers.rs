@@ -418,6 +418,7 @@ mod tests {
     /// change; a version deployed outside kiln read as drift; then deleted.
     #[test]
     fn workers_upload_route_and_migrate() -> anyhow::Result<()> {
+        let _one = fake::CLOUDFLARE.lock();
         crate::rt::block_on(async {
             let cf = Arc::new(fake::FakeCf::default());
             let base = fake::start_cf(cf.clone()).await?;

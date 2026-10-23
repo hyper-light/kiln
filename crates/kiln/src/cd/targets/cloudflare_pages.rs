@@ -413,7 +413,7 @@ mod tests {
     /// degraded, production on the deployment before; then the project goes.
     #[test]
     fn projects_deploy_each_releases_site() -> anyhow::Result<()> {
-        let _one = fake::LAMBDA.lock();
+        let _one = fake::CLOUDFLARE.lock();
         crate::rt::block_on(async {
             let cf = Arc::new(FakeCf::default());
             let base = fake::start_cf(cf.clone()).await?;

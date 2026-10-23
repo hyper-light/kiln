@@ -56,6 +56,9 @@ pub struct Fake {
 /// process's.
 pub static LAMBDA: Mutex<()> = Mutex::new(());
 
+/// Tests on a fake Cloudflare (Workers, Pages) run one at a time, for the same reason.
+pub static CLOUDFLARE: Mutex<()> = Mutex::new(());
+
 fn err(status: u16, code: &str, message: &str) -> Response {
     let r = srv::json(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST), &json!({ "message": message, "__type": code }));
     srv::with_header(r, http::header::HeaderName::from_static("x-amzn-errortype"), code)
