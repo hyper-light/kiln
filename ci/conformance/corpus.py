@@ -599,6 +599,11 @@ def main():
         p = os.path.join(args.out, repo.replace("/", "_") + ".json")
         if os.path.exists(p):
             continue
+        # A restart of the lab asks the pass to stop between repositories, before it starts the
+        # next one's runs, which the restart would cancel.
+        if os.path.exists(os.path.join(args.out, "STOP")):
+            print(f"stopping before {repo}, as {args.out}/STOP asks", flush=True)
+            break
         try:
             res = run_repo(api, args, repo, srcs[repo])
         except Exception as e:  # noqa: BLE001 — one repository's failure is its result
