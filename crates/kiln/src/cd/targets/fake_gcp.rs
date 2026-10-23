@@ -378,8 +378,8 @@ fn run_answer(p: &str, l: &str, s: &str, svc: &RunService) -> Value {
 
 /// Sets what a create or an update asks of a service: a revision for a new template (unless it's
 /// the template the service has), and the traffic.
-fn set_service(st: &mut GcpState, s: &str, body: &Value, svc: &mut RunService) -> Result<(), Response> {
-    let t = body.get("template").ok_or_else(|| err(400, "INVALID_ARGUMENT", "a service needs a template"))?;
+fn set_service(st: &mut GcpState, s: &str, body: &Value, svc: &mut RunService) -> Result<(), Box<Response>> {
+    let t = body.get("template").ok_or_else(|| Box::new(err(400, "INVALID_ARGUMENT", "a service needs a template")))?;
     let template = defaulted(t);
     let current = svc.body.get("template").cloned().unwrap_or(Value::Null);
     let asked = template.get("revision").and_then(Value::as_str).map(str::to_owned);
@@ -391,23 +391,23 @@ fn set_service(st: &mut GcpState, s: &str, body: &Value, svc: &mut RunService) -
             None => format!("{s}-{:05}-x{}", svc.generation + 1, next(st)),
         };
         if !name.starts_with(&format!("{s}-")) || name.len() > 63 {
-            return Err(err(400, "INVALID_ARGUMENT", &format!("revision name {name} must start with {s}- and hold at most 63 characters")));
+            return Err(Box::new(err(400, "INVALID_ARGUMENT", &format!("revision name {name} must start with {s}- and hold at most 63 characters"))));
         }
         if svc.revisions.contains_key(&name) {
-            return Err(err(409, "ALREADY_EXISTS", &format!("Revision named '{name}' with different configuration already exists.")));
+            return Err(Box::new(err(409, "ALREADY_EXISTS", &format!("Revision named '{name}' with different configuration already exists."))));
         }
         made = Some(name);
     }
     let traffic = body.get("traffic").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![json!({ "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", "percent": 100 })]);
     if traffic.iter().map(pct).sum::<u64>() != 100 {
-        return Err(err(400, "INVALID_ARGUMENT", "the traffic's percents must add up to 100"));
+        return Err(Box::new(err(400, "INVALID_ARGUMENT", "the traffic's percents must add up to 100")));
     }
     for t in &traffic {
         if let Some(r) = t.get("revision").and_then(Value::as_str).filter(|r| !r.is_empty())
             && !svc.revisions.contains_key(r)
             && made.as_deref() != Some(r)
         {
-            return Err(err(400, "INVALID_ARGUMENT", &format!("Revision '{r}' does not exist.")));
+            return Err(Box::new(err(400, "INVALID_ARGUMENT", &format!("Revision '{r}' does not exist."))));
         }
     }
     let mut stored = body.as_object().cloned().unwrap_or_default();
@@ -447,7 +447,7 @@ fn run(st: &mut GcpState, method: &http::Method, p: &str, l: &str, rest: &[&str]
             }
             let mut svc = RunService::default();
             if let Err(e) = set_service(st, &s, body, &mut svc) {
-                return e;
+                return *e;
             }
             st.run.insert(s.clone(), svc);
             ok(new_op(st, &prefix, format!("run/{s}"), false))
@@ -467,7 +467,7 @@ fn run(st: &mut GcpState, method: &http::Method, p: &str, l: &str, rest: &[&str]
                 return err(409, "ABORTED", "the service changed since its etag was read");
             }
             if let Err(e) = set_service(st, s, body, &mut svc) {
-                return e;
+                return *e;
             }
             st.run.insert((*s).to_owned(), svc);
             ok(new_op(st, &prefix, format!("run/{s}"), false))
@@ -560,12 +560,12 @@ fn function_answer(p: &str, l: &str, name: &str, f: &Function) -> Value {
 
 fn functions(st: &mut GcpState, method: &http::Method, p: &str, l: &str, rest: &[&str], query: &BTreeMap<String, String>, body: &Value) -> Response {
     let prefix = format!("projects/{p}/locations/{l}");
-    let deploy = |st: &mut GcpState, name: &str, f: &mut Function| -> Result<(), Response> {
-        let b = body.as_object().ok_or_else(|| err(400, "INVALID_ARGUMENT", "a function"))?;
+    let deploy = |st: &mut GcpState, name: &str, f: &mut Function| -> Result<(), Box<Response>> {
+        let b = body.as_object().ok_or_else(|| Box::new(err(400, "INVALID_ARGUMENT", "a function")))?;
         if b.get("buildConfig").and_then(|c| c.get("runtime")).and_then(Value::as_str).is_none_or(str::is_empty) {
-            return Err(err(400, "INVALID_ARGUMENT", "buildConfig.runtime is required"));
+            return Err(Box::new(err(400, "INVALID_ARGUMENT", "buildConfig.runtime is required")));
         }
-        let src = b.get("buildConfig").and_then(|c| c.pointer("/source/storageSource")).ok_or_else(|| err(400, "INVALID_ARGUMENT", "buildConfig.source.storageSource is required"))?;
+        let src = b.get("buildConfig").and_then(|c| c.pointer("/source/storageSource")).ok_or_else(|| Box::new(err(400, "INVALID_ARGUMENT", "buildConfig.source.storageSource is required")))?;
         let mut stored = b.clone();
         for k in ["state", "updateTime", "createTime", "url", "stateMessages", "name"] {
             stored.remove(k);
@@ -595,7 +595,7 @@ fn functions(st: &mut GcpState, method: &http::Method, p: &str, l: &str, rest: &
             }
             let mut f = Function::default();
             if let Err(e) = deploy(st, &name, &mut f) {
-                return e;
+                return *e;
             }
             st.functions.insert(name.clone(), f);
             ok(new_op(st, &prefix, format!("fn/{name}"), false))
@@ -618,7 +618,7 @@ fn functions(st: &mut GcpState, method: &http::Method, p: &str, l: &str, rest: &
                 return err(409, "FAILED_PRECONDITION", "An operation on function {name} is already in progress");
             }
             if let Err(e) = deploy(st, name, &mut f) {
-                return e;
+                return *e;
             }
             st.functions.insert((*name).to_owned(), f);
             ok(new_op(st, &prefix, format!("fn/{name}"), false))
@@ -644,10 +644,10 @@ fn appengine(st: &mut GcpState, method: &http::Method, p: &str, rest: &[&str], q
     let prefix = format!("apps/{p}");
     let ae_op = |st: &mut GcpState, about: String, error: Option<String>| {
         let v = new_op(st, &prefix, about, false);
-        if let (Some(e), Some(name)) = (error, v.get("name").and_then(Value::as_str)) {
-            if let Some(o) = st.ops.get_mut(name) {
-                o.error = Some(e);
-            }
+        if let (Some(e), Some(name)) = (error, v.get("name").and_then(Value::as_str))
+            && let Some(o) = st.ops.get_mut(name)
+        {
+            o.error = Some(e);
         }
         ok(v)
     };

@@ -41,7 +41,7 @@ async fn wait(cx: &Cx<'_>, op: Value, what: &str) -> Result<()> {
     } else {
         let link = op.get("selfLink").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("{what}: Compute Engine answered no operation"))?;
         let path = format!("/compute/v1/{}", link.split_once("/compute/v1/").map_or(link, |(_, rest)| rest));
-        until(cx.conn, SETTLE, what, || async { Ok(cx.gcp()?.call(API, Method::Get, &path, &[], None).await.map(|o| done(&o).then_some(o))?) }).await?
+        until(cx.conn, SETTLE, what, || async { cx.gcp()?.call(API, Method::Get, &path, &[], None).await.map(|o| done(&o).then_some(o)) }).await?
     };
     let errors: Vec<String> = op.pointer("/error/errors").and_then(Value::as_array).into_iter().flatten().filter_map(|e| e.get("message").and_then(Value::as_str).map(str::to_owned)).collect();
     if !errors.is_empty() {

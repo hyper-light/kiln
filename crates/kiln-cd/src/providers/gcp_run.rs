@@ -71,7 +71,7 @@ pub fn files(spec: &Value) -> Vec<String> {
 /// starting with a letter and not ending with `-`, at most `max` long.
 pub fn valid_name(s: &str, max: usize) -> bool {
     let b = s.as_bytes();
-    !b.is_empty() && b.len() <= max && b[0].is_ascii_lowercase() && b[b.len() - 1] != b'-' && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+    b.len() <= max && b.first().is_some_and(u8::is_ascii_lowercase) && b.last().is_some_and(|c| *c != b'-') && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 /// A resource name's last part: `projects/p/locations/l/services/s/revisions/r` → `r`.

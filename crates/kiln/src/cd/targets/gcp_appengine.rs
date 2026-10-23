@@ -32,7 +32,7 @@ async fn service(cx: &Cx<'_>, name: &str) -> Result<Option<Value>> {
     get(cx, API, &format!("/v1/{}/services/{name}", app(cx)?)).await
 }
 
-fn split<'a>(name: &'a str) -> Result<(&'a str, &'a str)> {
+fn split(name: &str) -> Result<(&str, &str)> {
     p::split_name(name).ok_or_else(|| anyhow::anyhow!("`{name}` isn't service:version"))
 }
 

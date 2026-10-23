@@ -43,7 +43,7 @@ pub async fn wait(cx: &Cx<'_>, api: &str, version: &str, op: Value, what: &str) 
     } else {
         let name = op.get("name").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("{what}: Google answered no operation"))?.to_owned();
         let path = format!("/{version}/{name}");
-        until(cx.conn, SETTLE, what, || async { Ok(cx.gcp()?.call(api, Method::Get, &path, &[], None).await.map(|o| done(&o).then_some(o))?) }).await?
+        until(cx.conn, SETTLE, what, || async { cx.gcp()?.call(api, Method::Get, &path, &[], None).await.map(|o| done(&o).then_some(o)) }).await?
     };
     if let Some(e) = op.get("error") {
         bail!("{what}: {}", e.get("message").and_then(Value::as_str).unwrap_or("it failed"));
