@@ -545,13 +545,20 @@ pub fn github_label_rules() -> Vec<Rule> {
     };
     vec![
         rule(&["ubuntu-latest"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
+        rule(&["ubuntu-26.04"], "linux", "x86_64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04"], "linux", "x86_64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04"], "linux", "x86_64", "kiln/runner-ubuntu-22.04"),
+        rule(&["ubuntu-26.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-26.04"),
         rule(&["ubuntu-24.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-24.04"),
         rule(&["ubuntu-22.04-arm"], "linux", "aarch64", "kiln/runner-ubuntu-22.04"),
+        // GitHub's lightweight Ubuntu 24.04 in a container, with a smaller set of tools.
+        rule(&["ubuntu-slim"], "linux", "x86_64", "kiln/runner-ubuntu-24.04-slim"),
         rule(&["macos-latest"], "macos", "aarch64", ""),
+        rule(&["macos-26"], "macos", "aarch64", ""),
         rule(&["macos-15"], "macos", "aarch64", ""),
         rule(&["macos-14"], "macos", "aarch64", ""),
+        rule(&["macos-15-intel"], "macos", "x86_64", ""),
+        rule(&["macos-13"], "macos", "x86_64", ""),
         rule(&["windows-latest"], "windows", "x86_64", ""),
         rule(&["windows-2025"], "windows", "x86_64", ""),
         rule(&["windows-2022"], "windows", "x86_64", ""),
@@ -920,6 +927,11 @@ mod tests {
         assert_eq!((req.rules.clone(), req.executors.clone()), (vec![0], vec!["firecracker".to_owned()]));
         let other = LegRoute { repo: "other/x".into(), ..leg.clone() };
         assert!(resolve(&other, &[rule])?.rules.is_empty());
+        // GitHub's newer labels, each its image.
+        for (label, image) in [("ubuntu-26.04", "kiln/runner-ubuntu-26.04"), ("ubuntu-26.04-arm", "kiln/runner-ubuntu-26.04"), ("ubuntu-slim", "kiln/runner-ubuntu-24.04-slim")] {
+            let req = resolve(&LegRoute { labels: vec![label.into()], ..leg.clone() }, &github_label_rules())?;
+            assert_eq!(req.image.as_deref(), Some(image), "{label}");
+        }
         // The same requirement, the same signature.
         assert_eq!(resolve(&leg, &github_label_rules())?.signature(), resolve(&LegRoute { job: "test".into(), ..leg }, &github_label_rules())?.signature());
         Ok(())

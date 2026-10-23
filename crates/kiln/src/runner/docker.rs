@@ -179,6 +179,7 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
     // prebuilt tools by it.
     // And the release's ICU, which PowerShell needs.
     let (base, os, icu) = match name {
+        "ubuntu-26.04" => ("ubuntu:26.04", "ubuntu26", "libicu78"),
         "ubuntu-24.04" => ("ubuntu:24.04", "ubuntu24", "libicu74"),
         "ubuntu-22.04" => ("ubuntu:22.04", "ubuntu22", "libicu70"),
         _ => return None,
@@ -228,9 +229,9 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              && curl -fsSL -o \"/tmp/$f\" \"$u/$f\" && echo \"$(curl -fsSL \"$u/gh_2.102.0_checksums.txt\" | grep \"  $f$\" | cut -d' ' -f1)  /tmp/$f\" | sha256sum -c - \\\n    \
              && tar -xzf \"/tmp/$f\" -C /tmp && install -m 0755 \"/tmp/gh_2.102.0_linux_$g/bin/gh\" /usr/local/bin/gh && rm -rf \"/tmp/$f\" \"/tmp/gh_2.102.0_linux_$g\"\n"
         ));
-        if os == "ubuntu24" {
-            // pip installs as it does on GitHub's Ubuntu 24.04 machines, whose `/etc/pip.conf`
-            // says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
+        if os != "ubuntu22" {
+            // pip installs as it does on GitHub's Ubuntu 24.04 and 26.04 machines, whose
+            // `/etc/pip.conf` says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
             d.push_str("RUN printf '[global]\\nbreak-system-packages = true\\n' > /etc/pip.conf\n");
         }
         // Git as GitHub's images have it, the git-core PPA's (2.55 when added) rather than the
@@ -1160,6 +1161,8 @@ mod tests {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
         assert!(full.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {full}");
+        let resolute = runner_dockerfile("kiln/runner-ubuntu-26.04", None).unwrap_or_default();
+        assert!(resolute.starts_with("FROM ubuntu:26.04\n") && resolute.contains(" ImageOS=ubuntu26\n") && resolute.contains("libicu78") && resolute.contains("break-system-packages"), "{resolute}");
         let jammy = runner_dockerfile("kiln/runner-ubuntu-22.04", None).unwrap_or_default();
         assert!(jammy.contains(" ImageOS=ubuntu22\n") && jammy.contains("libicu70") && !jammy.contains("break-system-packages"), "{jammy}");
         assert!(runner_dockerfile("ubuntu:24.04", None).is_none());
