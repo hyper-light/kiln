@@ -96,7 +96,7 @@ fn registration_path(v: &Value, tail: &[&str]) -> Result<Vec<String>, Fail> {
 
 /// The running service.
 fn service() -> Result<Arc<Deploy>, Fail> {
-    super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))
+    super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, super::not_running()))
 }
 
 fn answer(v: impl serde::Serialize) -> Out {

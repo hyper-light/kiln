@@ -1085,6 +1085,7 @@ Servers keep these in kiln's own Records, durable in its store (`crates/kiln/src
 passing RECORDS-1 to 14). Amphora's records (CP-T1.5) take its place later, copying every family
 through the seam. Tests keep them in `SimRecords`. A server from before the seam copies what kiln's
 tables held, once, at its first start, and leaves the tables as they were for the release before.
+Deploying by API doesn't start until the copy is made, so no release is made before it (§16).
 
 ### 14.2 Work and events: Focal's bus
 
@@ -1151,6 +1152,7 @@ kiln's existing capabilities (authz, W10) cover these, as they do KilnCD's route
 | The provider refuses the release (its chart doesn't render, its spec is invalid) | after `watch.refused` the release fails, its commit is reverted and the provider handed what ran before |
 | A version that isn't in its registry | refused before it is recorded (`422`), with the newest versions there |
 | The server restarts mid-release, or dies | its release's lease (`deploy.work`) lapses and a server takes it again: itself once restarted, or another server sharing its records |
+| What kiln's tables held for deploy can't be copied onto the seam, at a server's first start on it (§14.1) | deploying by API doesn't start: its calls are answered 503 with why, and its supervisor starts it again, backing off, until the copy is made. A copy cut short is made again, whole (its counter row is written last), and the tables are left as they were |
 | The release repository can't be reached | `committing` retries until the timeout, then the release fails, nothing changed |
 | A provider deploys a commit kiln didn't make | it is recorded as a release of origin `git` |
 

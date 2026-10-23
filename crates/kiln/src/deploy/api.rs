@@ -112,7 +112,7 @@ pub fn route<'a>(hub: &'a Arc<Hub>, rest: &'a [&'a str], q: &'a HashMap<String, 
 }
 
 async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
-    let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))?;
+    let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, super::not_running()))?;
     let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who::kiln("admin"), Who::of);
     let actor = who.name.clone();
     // A template that makes repositories is put by someone who may add them.

@@ -82,9 +82,20 @@ pub struct Deploy {
 
 static DEPLOY: RwLock<Option<Arc<Deploy>>> = RwLock::new(None);
 
+/// Why the service couldn't start, the last time it tried.
+static UNSTARTED: RwLock<Option<String>> = RwLock::new(None);
+
 /// The service, once it has started.
 pub fn get() -> Option<Arc<Deploy>> {
     DEPLOY.read().clone()
+}
+
+/// What a call is answered while the service isn't running: why it couldn't start, when it tried.
+pub fn not_running() -> String {
+    match &*UNSTARTED.read() {
+        Some(why) => format!("deploying by API hasn't started here yet: {why}. It starts once that's done"),
+        None => "deploying by API isn't running here (it runs with [cd] enabled)".to_owned(),
+    }
 }
 
 /// Runs the service until the server shuts down: the worker that follows releases.
@@ -94,11 +105,20 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     for repo in hosted.adopt(&hub.cfg.server.data_dir.join("deploy").join("repos")) {
         tracing::info!(%repo, "deploy: a release repository moved into kiln's hosted root");
     }
-    // What kiln's store held for deploy before its records moved onto the seam, copied once.
-    match store::adopt(&*hub.records, &hub.store).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(rows = n, "deploy: its records moved from kiln's tables onto the Records seam"),
-        Err(e) => tracing::warn!(error = %format!("{e:#}"), "deploy: its records couldn't be moved onto the Records seam"),
+    // What kiln's store held for deploy before its records moved onto the seam, copied once. Deploy
+    // doesn't start without it: a release made first would write the counter row, and the copy
+    // would never be made. Its supervisor starts it again, backing off, until the copy is made.
+    let copied = match store::adopt(&*hub.records, &hub.store).await {
+        Ok(n) => n,
+        Err(e) => {
+            let e = e.context("its records couldn't be copied from kiln's tables onto the Records seam");
+            *UNSTARTED.write() = Some(format!("{e:#}"));
+            return Err(e);
+        }
+    };
+    *UNSTARTED.write() = None;
+    if copied > 0 {
+        tracing::info!(rows = copied, "deploy: its records copied from kiln's tables onto the Records seam, the tables left as they were");
     }
     let d = Arc::new(Deploy {
         records: Arc::clone(&hub.records),
@@ -129,4 +149,41 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     let result = flow::work(&d).await;
     *DEPLOY.write() = None;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deploy doesn't start while what kiln's tables held can't be copied onto the seam, so no
+    /// release can write the counter row before the copy; its supervisor starts it again, and the
+    /// start after the copy can be made makes it.
+    #[test]
+    fn deploy_doesn_t_start_until_kiln_s_tables_are_copied() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // A release the copy can't read.
+            hub.store
+                .call(|c| {
+                    c.execute("INSERT INTO deploy_releases (id, app, environment, state, spec, created_at) VALUES (3, 'web', 'staging', 'succeeded', 'not a release', 0)", [])?;
+                    Ok(())
+                })
+                .await?;
+            let Err(e) = Box::pin(run(Arc::clone(&hub))).await else { anyhow::bail!("deploy started without its copy") };
+            anyhow::ensure!(format!("{e:#}").contains("couldn't be copied"), "{e:#}");
+            anyhow::ensure!(not_running().contains("couldn't be copied"), "calls aren't told why: {}", not_running());
+            anyhow::ensure!(store::release(&*hub.records, 3).await?.is_none(), "a copy cut short left a release");
+            // Readable again, it's copied at the next start.
+            hub.store
+                .call(|c| {
+                    c.execute(r#"UPDATE deploy_releases SET spec = '{"id":3,"app":"web","environment":"staging","kind":"deploy","state":"succeeded","requested_by":"ada","created_at":0}' WHERE id = 3"#, [])?;
+                    Ok(())
+                })
+                .await?;
+            anyhow::ensure!(store::adopt(&*hub.records, &hub.store).await? > 0, "the copy wasn't made");
+            anyhow::ensure!(store::release(&*hub.records, 3).await?.is_some_and(|r| r.app == "web"), "release 3 wasn't copied");
+            anyhow::ensure!(store::adopt(&*hub.records, &hub.store).await? == 0, "the copy was made twice");
+            Ok(())
+        })
+    }
 }
