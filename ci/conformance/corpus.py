@@ -475,14 +475,14 @@ def run_repo(api, args, repo, commit):
     return out
 
 
-# A leg that waits for a machine the lab hasn't: macOS's or Windows's.
-ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == (macos|windows)|runs-on \[[^\]]*(macos|windows))")
+# A leg that waits for a machine the lab hasn't: macOS's, Windows's, Linux's on arm64.
+ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == (macos|windows)|arch == (aarch64|arm64|arm)\b|runs-on \[[^\]]*(macos|windows|-arm))")
 
 
 def not_kilns(note):
     """Why a leg's miss (its note) isn't kiln's to fix, or None when it is."""
     if ELSEWHERE.search(note):
-        return "it waits for macOS or Windows, which the lab hasn't (its runner is Linux's)"
+        return "it waits for macOS, Windows or Linux on arm64, which the lab hasn't (its runner is Linux's, x86-64)"
     return next((r for pat, r in KNOWN if re.search(pat, note)), None)
 
 
