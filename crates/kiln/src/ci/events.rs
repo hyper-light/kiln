@@ -398,10 +398,11 @@ pub async fn dispatch_run(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, of
 }
 
 /// [`dispatch_run`] at commit `sha` (a release's, docs/cd-targets.md §2.2): the workflow as that
-/// commit has it, run with the default branch as its ref.
-pub async fn dispatch_at(hub: &Hub, repo: &Repo, sha: &str, which: &str, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
+/// commit has it, run with the default branch as its ref; with `job`, that job of it and the jobs
+/// it needs.
+pub async fn dispatch_at(hub: &Hub, repo: &Repo, sha: &str, which: &str, job: Option<&str>, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
     let full_ref = format!("refs/heads/{}", facts(hub, repo).await.default_branch);
-    dispatch_with(hub, repo, (full_ref, sha.to_owned()), which, offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
+    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, job), offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
 }
 
 /// A workflow kiln wrote itself (a CD provider's jobs on its runners, docs/cd-targets.md §2.2),
@@ -446,16 +447,17 @@ async fn dispatch(
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
     let at = named_ref(hub, repo, git_ref).await?;
-    dispatch_with(hub, repo, at, which, given, actor, started_by, offered).await
+    dispatch_with(hub, repo, at, (which, None), given, actor, started_by, offered).await
 }
 
-/// [`dispatch`] at a ref and commit resolved already.
+/// [`dispatch`] at a ref and commit resolved already: workflow `which`, or one job of it and the
+/// jobs that job needs.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_with(
     hub: &Hub,
     repo: &Repo,
     (full_ref, sha): (String, String),
-    which: &str,
+    (which, job): (&str, Option<&str>),
     given: &serde_json::Map<String, serde_json::Value>,
     actor: &str,
     started_by: Option<serde_json::Value>,
@@ -467,6 +469,15 @@ async fn dispatch_with(
     let commit = load::load(hub, repo, &sha).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let Some(l) = commit.workflows.iter().find(|l| l.path == which || l.path.rsplit('/').next() == Some(which)) else {
         return Err(refused(http::StatusCode::NOT_FOUND, format!("Workflow {which} not found at {full_ref}")));
+    };
+    let only;
+    let l = match job {
+        None => l,
+        Some(job) => {
+            let w = l.workflow.as_ref().and_then(|w| super::uploads::only_job(w, job)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job `{job}`", l.path)))?;
+            only = load::Loaded { workflow: Some(w), ..l.clone() };
+            &only
+        }
     };
     let declared = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "workflow_dispatch")).map(|t| t.inputs.clone());
     let Some(declared) = declared else {

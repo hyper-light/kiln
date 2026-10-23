@@ -4,7 +4,7 @@
 //! picked by CI's routing constraints over what each connected runner reports. Artifacts reach the
 //! runners through links CI's blob service signs.
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use kiln_cd::providers::host::Host;
 
 use super::targets::runner::{BoxFut, RunState, Runners, Work};
@@ -50,12 +50,7 @@ impl Runners for Hub {
                     let path = format!(".kiln/cd/{}.yaml", name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect::<String>().trim_matches('-'));
                     crate::ci::events::start_written(self, &repo, &sha, &path, yaml, "kiln").await.map_err(|e| anyhow::anyhow!("{}", e.message))
                 }
-                Work::Own { workflow, job, inputs } => {
-                    if job.is_some() {
-                        bail!("one job of a workflow isn't started for a release yet: leave job out, and the workflow runs whole");
-                    }
-                    crate::ci::events::dispatch_run(self, &repo, &sha, workflow, inputs, "kiln").await.map_err(|e| anyhow::anyhow!("{}", e.message))
-                }
+                Work::Own { workflow, job, inputs } => crate::ci::events::dispatch_at(self, &repo, &sha, workflow, job, inputs, "kiln").await.map_err(|e| anyhow::anyhow!("{}", e.message)),
             }
         })
     }

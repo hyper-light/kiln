@@ -206,7 +206,7 @@ pub struct Ask {
 }
 
 /// `job` and the jobs it needs, transitively; `None` when the workflow has no such job.
-fn only_job(w: &kiln_ci::wf::Workflow, job: &str) -> Option<kiln_ci::wf::Workflow> {
+pub(super) fn only_job(w: &kiln_ci::wf::Workflow, job: &str) -> Option<kiln_ci::wf::Workflow> {
     if !w.jobs.iter().any(|j| j.id == job) {
         return None;
     }
