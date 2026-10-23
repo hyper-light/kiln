@@ -39,6 +39,8 @@ interface Device {
 
 const devices = new Map<string, Device>();
 const muted = new Set<string>();
+/** Your marks (`/api/push/notices`): what you put away, acted on or saw, by key. */
+const marks = new Map<string, { key: string; how: "away" | "done" | "seen"; at: number }>();
 interface Sent {
   at: number;
   to: string[];
@@ -54,7 +56,7 @@ interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   err: (res: http.ServerResponse, status: number, message: string) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
-  emit: (ev: { type: "push" } | { type: "harness"; info: AgentInfo }) => void;
+  emit: (ev: { type: "push" } | { type: "harness"; info: AgentInfo } | { type: "notices"; principal: string; keys: string[]; how: "away" | "done" | "seen"; at: number; tags: string[] }) => void;
   noContent: (res: http.ServerResponse) => void;
 }
 let emitPush: () => void = () => {};
@@ -289,6 +291,17 @@ export async function handlePush(req: http.IncomingMessage, res: http.ServerResp
     if (to.length === 0) return (ctx.err(res, 404, "no device of yours gets notifications yet: turn them on in Settings first"), true);
     wouldSend("test", { title: "kiln", body: "Notifications reach this device.", tag: "kiln-test", url: "/settings" }, (d) => to.includes(d));
     return (ctx.json(res, 200, { sent: to.length, results: to.map((d) => ({ id: d.id, device: d.device, ok: true })) }), true);
+  }
+  if (p === "/api/push/notices" && m === "GET") return (ctx.json(res, 200, { you: "owner", marks: [...marks.values()].sort((a, b) => b.at - a.at) }), true);
+  if (p === "/api/push/notices" && m === "POST") {
+    const b = await ctx.body<{ keys?: string[]; how?: string; tags?: string[] }>(req);
+    const keys = (b.keys ?? []).map((k) => k.trim()).filter(Boolean);
+    if (b.how !== "away" && b.how !== "done" && b.how !== "seen") return (ctx.err(res, 400, "`how` is one of away, done, seen"), true);
+    if (keys.length === 0) return (ctx.err(res, 400, "`keys`: one to 200 notices"), true);
+    const at = Date.now();
+    for (const key of keys) marks.set(key, { key, how: b.how, at: Math.max(at, marks.get(key)?.at ?? 0) });
+    ctx.emit({ type: "notices", principal: "owner", keys, how: b.how, at, tags: b.tags ?? [] });
+    return (ctx.json(res, 200, { marked: keys.length, at }), true);
   }
   if ((mm = p.match(/^\/api\/push\/mutes\/([^/]+)$/)) && (m === "PUT" || m === "DELETE")) {
     const agent = decodeURIComponent(mm[1]!);

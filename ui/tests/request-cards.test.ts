@@ -82,3 +82,12 @@ test("a held stack's why, without who paused it", () => {
   assert.equal(heldWords("Paused by Release prep: waiting on the staging password"), "waiting on the staging password");
   assert.equal(heldWords("Paused by the agent."), "");
 });
+
+test("a stop is known by when it ended: put away, it stays away as the agent's activity moves on; a later stop is new", () => {
+  const stopped = (last: number, at: number) => agent("crash", { status: "exited", exit: { code: 1, error: "boom", at }, last_activity: last });
+  const [card] = cardsOf([stopped(40, 35)], "/runs", none, none);
+  assert.equal(card?.key, "stopped:crash:35");
+  const away = new Set([card?.key ?? ""]);
+  assert.deepEqual(kinds([stopped(90, 35)], "/runs", away), [], "a refresh, a restart, its activity since: the same stop");
+  assert.deepEqual(kinds([stopped(120, 110)], "/runs", away), ["stopped:crash"], "it stopped again later");
+});

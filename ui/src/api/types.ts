@@ -596,6 +596,8 @@ export type ServerEvent =
   | { type: "places" }
   /** Your notifications changed (a device, a mute, a delivery): refetch GET /api/push and its devices. */
   | { type: "push" }
+  /** Someone marked notices (`principal`: whose; `tags`: agents whose shown notifications go): notices.ts. */
+  | { type: "notices"; principal: string; keys: string[]; how: "away" | "done" | "seen"; at: number; tags?: string[] }
   /** An agent's change request opened or moved on (`agents.change`, review, CI): refetch GET /api/harness/changes. */
   | { type: "agent_change"; agent: string };
 

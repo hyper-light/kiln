@@ -255,6 +255,8 @@ export interface StatusItem {
 export interface ExitInfo {
   code: number | null;
   error?: string;
+  /** Unix ms it ended: what a stop is known by (its card's key). */
+  at?: number;
 }
 
 /** One file's change since the agent first touched it (the server keeps it cumulative). */

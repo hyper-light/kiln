@@ -182,7 +182,7 @@ impl Agy {
             // Older versions have no multi-turn mode: say what it needs.
             if e.contains("input-format") { format!("{e}\nkiln needs agy 1.4 or newer (`agy update`).") } else { e }
         });
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.doing = None;
         core.state.turn_started = None;
         core.set_status(Status::Exited);

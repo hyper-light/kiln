@@ -623,7 +623,7 @@ impl Claude {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }
-        core.state.exit = Some(ExitInfo { code, error });
+        core.state.exit = Some(ExitInfo::now(code, error));
         core.state.activity = None;
         core.state.turn_started = None;
         core.state.doing = None;

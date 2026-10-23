@@ -921,7 +921,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
     let spec: Spec = serde_json::from_str(spec_json).unwrap_or_default();
     let now = crate::util::now_ms();
     let kind = Kind::get(&spec.kind);
-    let exit = super::model::ExitInfo { code: None, error: Some(error.to_owned()) };
+    let exit = super::model::ExitInfo::now(None, Some(error.to_owned()));
     let info = Info {
         id: id.to_owned(),
         kind: spec.kind.clone(),
