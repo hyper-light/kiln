@@ -947,10 +947,10 @@ fn view_now(release: &Value, url: &str) -> super::chat::posts::View {
 /// [`release_moved`]'s work: what `events` send, then each message the release has made to say
 /// what it is now.
 async fn release_up_to_date(hub: &Arc<Hub>, id: i64, events: &[&'static str]) {
-    let Ok(Some(r)) = crate::deploy::store::release(&hub.store, id).await else { return };
+    let Ok(Some(r)) = crate::deploy::store::release(&*hub.records, id).await else { return };
     let release = crate::deploy::flow::release_value(&r);
     let url = format!("{}/deployments/releases/{id}", hub.cfg.server.public_url.trim_end_matches('/'));
-    let channels = crate::deploy::store::app(&hub.store, &r.app).await.ok().flatten().map(|a| a.contacts.channels).unwrap_or_default();
+    let channels = crate::deploy::store::app(&*hub.records, &r.app).await.ok().flatten().map(|a| a.contacts.channels).unwrap_or_default();
     let mut posted: std::collections::HashSet<String> = posts_of(hub, id).await.into_iter().map(|p| p.spec).collect();
     for &event in events {
         let m = Msg::of_release(event, &release, &url);

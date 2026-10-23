@@ -88,9 +88,9 @@ struct MergeAsk {
 
 /// An app and an environment it's registered in.
 async fn registered(d: &Deploy, app: &str, env: &str) -> Result<(App, Environment), Fail> {
-    let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-    store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let a = store::app(&*d.records, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let environment = store::environment(&*d.records, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::registration(&*d.records, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
     Ok((a, environment))
 }
 
@@ -119,7 +119,7 @@ async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req
     let adds_repos = req.extensions().get::<crate::authz::Caller>().is_none_or(|c| c.can("settings.manage", &crate::authz::Scope::Server));
     let key = req.headers().get("idempotency-key").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let method = req.method().clone();
-    let store = &d.hub.store;
+    let store = &*d.records;
     match (&method, rest) {
         (&Method::GET, ["environments"]) => ok(&json!({ "environments": store::environments(store).await.map_err(internal)? })),
         (&Method::POST, ["environments"]) => {
@@ -364,7 +364,7 @@ pub(super) async fn git_hosts(hub: &Hub) -> Vec<Value> {
 /// Every registration with what runs and what's in flight, and what waits for people: the
 /// environments board, in one answer.
 pub(super) async fn board(d: &Deploy) -> Result<Value, Fail> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let environments = store::environments(st).await.map_err(internal)?;
     let apps = store::apps(st).await.map_err(internal)?;
     let mut cells = Vec::new();
@@ -383,7 +383,7 @@ pub(super) async fn board(d: &Deploy) -> Result<Value, Fail> {
 /// The versions a registration has run, newest first: when each first and last landed, how often,
 /// and whether it runs now.
 pub(super) async fn versions(d: &Deploy, app: &str, env: &str) -> Result<Vec<Value>, Fail> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let reg = store::registration(st, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
     let list = store::releases(st, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), limit: 1000, ..store::ReleaseQuery::default() }).await.map_err(internal)?;
     let running = reg.running.and_then(|id| list.iter().find(|r| r.id == id)).and_then(|r| r.version.clone());
@@ -413,12 +413,12 @@ pub(super) async fn versions(d: &Deploy, app: &str, env: &str) -> Result<Vec<Val
 
 /// An app, with each environment it's registered in and what runs there.
 pub(super) async fn app_json(d: &Deploy, name: &str) -> Result<Value, Fail> {
-    let a = store::app(&d.hub.store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
-    let regs = store::registrations(&d.hub.store, Some(name), None).await.map_err(internal)?;
+    let a = store::app(&*d.records, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
+    let regs = store::registrations(&*d.records, Some(name), None).await.map_err(internal)?;
     let mut envs = Vec::new();
     for reg in regs {
         let running = match reg.running {
-            Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+            Some(id) => store::release(&*d.records, id).await.map_err(internal)?,
             None => None,
         };
         envs.push(json!({ "registration": reg, "running": running }));
@@ -428,10 +428,10 @@ pub(super) async fn app_json(d: &Deploy, name: &str) -> Result<Value, Fail> {
 
 /// A registration: what runs, what's in flight, the latest releases, and what its provider says now.
 pub(super) async fn registration_json(d: &Deploy, app: &str, env: &str) -> Result<Value, Fail> {
-    let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    let environment = store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-    let reg = store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
-    let recent = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, version: None, limit: 20 }).await.map_err(internal)?;
+    let a = store::app(&*d.records, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let environment = store::environment(&*d.records, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    let reg = store::registration(&*d.records, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let recent = store::releases(&*d.records, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, version: None, limit: 20 }).await.map_err(internal)?;
     let in_flight = recent.iter().find(|r| r.state.in_flight()).cloned();
     let running = recent.iter().find(|r| Some(r.id) == reg.running).cloned();
     let provider = match environment.provider.strip_prefix("argocd/") {
@@ -458,8 +458,8 @@ pub(super) async fn registration_json(d: &Deploy, app: &str, env: &str) -> Resul
 
 /// An app's secrets in an environment (§3.5) belong to an app and an environment that are there.
 async fn secret_scope(d: &Deploy, app: &str, env: &str) -> Result<Scope, Fail> {
-    store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    store::environment(&d.hub.store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::app(&*d.records, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    store::environment(&*d.records, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
     Ok(Scope::of(app, env))
 }
 
@@ -555,7 +555,7 @@ impl Change {
 }
 
 async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how: Change) -> (Option<Release>, String) {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let later = format!("release it with `kiln deploy {app} --to {env} --secrets`");
     if !how.release {
         return (None, format!("not released: {later}"));
@@ -639,8 +639,8 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let root = tempfile::tempdir()?;
-            let d = Deploy { hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub: Arc::clone(&hub) };
-            let st = &hub.store;
+            let d = Deploy { records: Arc::clone(&hub.records), stand_in: None, hosted: super::super::host::Hosted::new(root.path()), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub: Arc::clone(&hub) };
+            let st = &*d.records;
             store::put_environment(st, &env("staging", KILNCD)).await?;
             store::put_environment(st, &env("argo", "argocd/prod")).await?;
             let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;

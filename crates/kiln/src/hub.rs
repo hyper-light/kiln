@@ -164,6 +164,9 @@ pub enum TermOut {
 pub struct Hub {
     pub cfg: Arc<Config>,
     pub store: Store,
+    /// The records kiln keeps through the Records seam (docs/seams.md): kiln's own, in its store,
+    /// until Amphora's (CP-T1.5) take their place. Deploying by API's are there.
+    pub records: Arc<dyn kiln_seams::Records>,
     pub logs: Logs,
     pub net: NetHandle,
     pub pki: Arc<crate::pki::Pki>,
@@ -287,9 +290,11 @@ impl Hub {
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
         Ok(Arc::new(Self {
             cfg,
             store,
+            records,
             logs,
             net,
             pki,

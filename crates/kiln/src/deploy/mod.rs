@@ -59,6 +59,12 @@ use crate::hub::Hub;
 /// The running service.
 pub struct Deploy {
     pub hub: Arc<Hub>,
+    /// Its records (§14.1), through the Records seam: the hub's, or in a test another's, so two
+    /// servers can share them.
+    pub records: Arc<dyn kiln_seams::Records>,
+    /// In a test, what stands in for its providers (KilnCD, Argo CD).
+    #[cfg(test)]
+    pub stand_in: Option<Arc<dyn provider::StandIn>>,
     /// kiln's own git server.
     pub hosted: host::Hosted,
     /// This server's name on the leases it takes.
@@ -88,7 +94,16 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     for repo in hosted.adopt(&hub.cfg.server.data_dir.join("deploy").join("repos")) {
         tracing::info!(%repo, "deploy: a release repository moved into kiln's hosted root");
     }
+    // What kiln's store held for deploy before its records moved onto the seam, copied once.
+    match store::adopt(&*hub.records, &hub.store).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(rows = n, "deploy: its records moved from kiln's tables onto the Records seam"),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "deploy: its records couldn't be moved onto the Records seam"),
+    }
     let d = Arc::new(Deploy {
+        records: Arc::clone(&hub.records),
+        #[cfg(test)]
+        stand_in: None,
         hosted,
         owner: format!("server-{}", crate::util::new_id()),
         wake: crate::rt::Notify::new(),
@@ -99,7 +114,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     });
     *DEPLOY.write() = Some(Arc::clone(&d));
     // Each environment's release repository is a native repository, with its row.
-    match store::environments(&hub.store).await {
+    match store::environments(&*d.records).await {
         Ok(envs) => {
             for e in envs.iter().filter(|e| e.release_repo.host == model::KILN_HOST) {
                 if let Err(why) = flow::ensure_release_repo(&d, &e.release_repo).await {

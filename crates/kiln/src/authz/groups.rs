@@ -207,7 +207,7 @@ async fn describe(hub: &Hub, caller: &Caller, name: &str, req: Request) -> Resul
 
 async fn delete(hub: &Hub, caller: &Caller, name: &str) -> Result<Response, Fail> {
     // An app is never left with an owner team that isn't there.
-    let owned: Vec<String> = crate::deploy::store::apps(&hub.store).await.map_err(internal)?.into_iter().filter(|a| a.owners.iter().any(|o| o.eq_ignore_ascii_case(name))).map(|a| a.name).collect();
+    let owned: Vec<String> = crate::deploy::store::apps(&*hub.records).await.map_err(internal)?.into_iter().filter(|a| a.owners.iter().any(|o| o.eq_ignore_ascii_case(name))).map(|a| a.name).collect();
     if !owned.is_empty() {
         return Err((StatusCode::CONFLICT, format!("`{name}` owns {}: give them another owner team first", owned.join(", "))));
     }

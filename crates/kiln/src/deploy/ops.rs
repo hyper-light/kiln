@@ -121,13 +121,13 @@ pub fn ops() -> &'static [Op] {
             op!("deploy.environments.list", "The environments apps are released to: each one's CD provider (KilnCD, or an Argo CD), release repository, targets, sync and watch settings, and what agents may do there.", ro: true, destructive: false,
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["environments"]), HashMap::new())),
-                run: |_cx: Cx, _v: Value| async move { answer(json!({ "environments": store::environments(&service()?.hub.store).await.map_err(internal)? })) }),
+                run: |_cx: Cx, _v: Value| async move { answer(json!({ "environments": store::environments(&*service()?.records).await.map_err(internal)? })) }),
             op!("deploy.environments.get", "One environment.", ro: true, destructive: false,
                 input: || schema(json!({"environment": {"type": "string", "description": ENV}}), &["environment"]),
                 route: |v| Ok((Method::GET, path(&["environments", &text(v, "environment")?]), HashMap::new())),
                 run: |_cx: Cx, v: Value| async move {
                     let name = text(&v, "environment")?;
-                    answer(store::environment(&service()?.hub.store, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {name}")))?)
+                    answer(store::environment(&*service()?.records, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {name}")))?)
                 }),
             op!("deploy.environments.put", "Create or replace an environment: its provider (`kilncd`, or `argocd/<integration>`), release repository, targets, sync and watch settings, and its gates (`after` upstream environments, `staging@eu` being one of a linked kiln server; `soak`; `approvals`; `windows`; `checks`, built in by name or external: `{name, http: {url}}` or `{name, workflow: {repository, workflow, ref}}`, `report_only` to only record them; `require_provenance: {workflows, branches}`; `freeze`). What agents may do there (`agents`) only a person changes.", ro: false, destructive: false,
                 input: || schema(json!({"environment": {"type": "object", "description": "The environment, as deploy.environments.get shows one."}}), &["environment"]),
@@ -158,7 +158,7 @@ pub fn ops() -> &'static [Op] {
             op!("deploy.templates.list", "The templates apps are made from (txst's app types): each one's package, namespace pattern, checks, properties and environments.", ro: true, destructive: false,
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["templates"]), HashMap::new())),
-                run: |_cx: Cx, _v: Value| async move { answer(json!({ "templates": store::templates(&service()?.hub.store).await.map_err(internal)? })) }),
+                run: |_cx: Cx, _v: Value| async move { answer(json!({ "templates": store::templates(&*service()?.records).await.map_err(internal)? })) }),
             op!("deploy.templates.put", "Create or replace a template: the package its apps start with (`{app}` is the app's name), their namespace pattern (`apps-{app}`), the checks their releases pass, the properties they may have, the environments they may go to, and the source repository kiln makes for each (`repository: {name: \"acme/{app}\", starter: <git URL>, starter_ref?, branch?}`: its first commit the starter's files, `{{kiln.app}}` filled in). A template that makes repositories is put by someone who may add them (settings.manage).", ro: false, destructive: false,
                 input: || schema(json!({"template": {"type": "object", "description": "The template, as deploy.templates.list shows one."}}), &["template"]),
                 route: |v| {
@@ -174,7 +174,7 @@ pub fn ops() -> &'static [Op] {
                 route: |v| Ok((Method::GET, path(&["templates", &text(v, "template")?]), HashMap::new())),
                 run: |_cx: Cx, v: Value| async move {
                     let name = text(&v, "template")?;
-                    answer(store::template(&service()?.hub.store, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no template {name}")))?)
+                    answer(store::template(&*service()?.records, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no template {name}")))?)
                 }),
             op!("deploy.templates.delete", "Delete a template: refused while apps are made from it.", ro: false, destructive: true,
                 input: || schema(json!({"template": {"type": "string", "description": TEMPLATE}}), &["template"]),
@@ -219,13 +219,13 @@ pub fn ops() -> &'static [Op] {
                 route: |v| Ok((Method::GET, path(&["apps", &text(v, "app")?, "catalog-info.yaml"]), HashMap::new())),
                 run: |_cx: Cx, v: Value| async move {
                     let name = text(&v, "app")?;
-                    let a = store::app(&service()?.hub.store, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {name}")))?;
+                    let a = store::app(&*service()?.records, &name).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {name}")))?;
                     Ok(json!({ "catalog_info": flow::catalog_info(&a) }))
                 }),
             op!("deploy.apps.list", "Every app kiln releases: its project, owner teams and package.", ro: true, destructive: false,
                 input: || schema(json!({}), &[]),
                 route: |_| Ok((Method::GET, path(&["apps"]), HashMap::new())),
-                run: |_cx: Cx, _v: Value| async move { answer(json!({ "apps": store::apps(&service()?.hub.store).await.map_err(internal)? })) }),
+                run: |_cx: Cx, _v: Value| async move { answer(json!({ "apps": store::apps(&*service()?.records).await.map_err(internal)? })) }),
             op!("deploy.apps.get", "An app, and each environment it's registered in with the release that runs there.", ro: true, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}}), &["app"]),
                 route: |v| Ok((Method::GET, path(&["apps", &text(v, "app")?]), HashMap::new())),
@@ -375,7 +375,7 @@ pub fn ops() -> &'static [Op] {
                     };
                     let limit = v.get("limit").and_then(Value::as_u64).and_then(|l| usize::try_from(l).ok()).unwrap_or(50);
                     let q = store::ReleaseQuery { app: opt_text(&v, "app"), environment: opt_text(&v, "environment"), state, version: opt_text(&v, "version"), limit };
-                    answer(json!({ "releases": store::releases(&service()?.hub.store, q).await.map_err(internal)? }))
+                    answer(json!({ "releases": store::releases(&*service()?.records, q).await.map_err(internal)? }))
                 }),
             op!("deploy.metrics", "Delivery metrics from the releases (DORA's four keys): how often changes land, lead time from asked to landed, change failure rate (failed or rolled back), time to restore; for an app, an environment, or all, over `days` (30).", ro: true, destructive: false,
                 input: || schema(json!({"app": {"type": "string", "description": APP}, "environment": {"type": "string", "description": ENV}, "days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]),
@@ -390,7 +390,7 @@ pub fn ops() -> &'static [Op] {
                 },
                 run: |_cx: Cx, v: Value| async move {
                     let days = v.get("days").and_then(Value::as_i64).unwrap_or(30).clamp(1, 365);
-                    let list = store::releases(&service()?.hub.store, store::ReleaseQuery { app: opt_text(&v, "app"), environment: opt_text(&v, "environment"), limit: 1000, ..store::ReleaseQuery::default() })
+                    let list = store::releases(&*service()?.records, store::ReleaseQuery { app: opt_text(&v, "app"), environment: opt_text(&v, "environment"), limit: 1000, ..store::ReleaseQuery::default() })
                         .await
                         .map_err(internal)?;
                     Ok(super::metrics::compute(&list, crate::util::now_unix(), days))
@@ -450,7 +450,7 @@ pub fn ops() -> &'static [Op] {
                 route: |v| Ok((Method::GET, path(&["releases", &id(v)?.to_string()]), HashMap::new())),
                 run: |_cx: Cx, v: Value| async move {
                     let n = id(&v)?;
-                    answer(store::release(&service()?.hub.store, n).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no release {n}")))?)
+                    answer(store::release(&*service()?.records, n).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no release {n}")))?)
                 }),
             op!("deploy.releases.create", "Release an app in an environment: a new `version` (with its `artifacts`), new `values` (a config release: the environment's values.yaml), `enabled` true or false, or `promote_from` another environment. Exactly one of them. The environment's gates come first (upstream environments, here or on a linked server, soak, windows, checks, provenance, approvals): one it can't pass is refused (409), one that holds it leaves it `waiting`, or `waiting_approval` for people (deploy.releases.approve). It answers at once, the release `committing` or `waiting`: follow it with deploy.releases.wait. A version that isn't in its registry is refused (422), and agents release only where the environment lets them (403).", ro: false, destructive: true,
                 input: || schema(json!({
@@ -488,7 +488,7 @@ pub fn ops() -> &'static [Op] {
                     let (app, environment) = match v.get("id").filter(|x| !x.is_null()) {
                         Some(_) => {
                             let n = id(&v)?;
-                            let of = store::release(&d.hub.store, n).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no release {n}")))?;
+                            let of = store::release(&*d.records, n).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no release {n}")))?;
                             (of.app, of.environment)
                         }
                         None => (text(&v, "app")?, text(&v, "environment")?),
@@ -555,9 +555,9 @@ pub fn ops() -> &'static [Op] {
 async fn registration_read(v: &Value, what: impl FnOnce(&Value) -> Result<reads::Read, Fail>) -> Out {
     let d = service()?;
     let (app, env) = (text(v, "app")?, text(v, "environment")?);
-    let a = store::app(&d.hub.store, &app).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    let e = store::environment(&d.hub.store, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-    store::registration(&d.hub.store, &app, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let a = store::app(&*d.records, &app).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let e = store::environment(&*d.records, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::registration(&*d.records, &app, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
     let mut read = what(v)?;
     if let reads::Read::Logs { namespace: ns @ None, .. } = &mut read {
         *ns = Some(a.namespace().to_owned());
@@ -568,9 +568,9 @@ async fn registration_read(v: &Value, what: impl FnOnce(&Value) -> Result<reads:
 /// An app and an environment it's registered in, from an operation's input.
 async fn registered(d: &Deploy, v: &Value) -> Result<(App, Environment), Fail> {
     let (app, env) = (text(v, "app")?, text(v, "environment")?);
-    let a = store::app(&d.hub.store, &app).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    let e = store::environment(&d.hub.store, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-    store::registration(&d.hub.store, &app, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let a = store::app(&*d.records, &app).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let e = store::environment(&*d.records, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no environment {env}")))?;
+    store::registration(&*d.records, &app, &env).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
     Ok((a, e))
 }
 
@@ -583,7 +583,7 @@ fn target(v: &Value) -> Result<actions::Target, Fail> {
 /// up. Woken as it moves on this server; looked at every few seconds besides, since another server
 /// may move it.
 async fn wait(d: &Deploy, id: i64, done: bool, secs: u64) -> Out {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let mut changes = d.changes.subscribe();
     let first = store::release(st, id).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no release {id}")))?;
     let seen = (first.state, first.message.clone());

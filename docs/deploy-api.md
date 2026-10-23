@@ -1061,9 +1061,30 @@ each provider per page view.
 | `releases` | number, registration, kind, version, artifacts, values digest, state, origin, commit, requested by, gate results, approvals, provider status, times, `rollback_of`, `rolled_back_by` |
 | `approvals` | release, person or agent, decision, when |
 
-kiln reaches these through one interface. KilnDB is being built by its own session; until its
-interface is settled, the same interface runs on kiln's current store, so nothing above it changes
-when KilnDB takes over.
+Deploy keeps them as rows of kiln's Records seam (docs/seams.md, "Records"), the layout agreed
+with Amphora's owner (T1) on 2026-10-23. Everything else reaches them through
+`crates/kiln/src/deploy/store.rs`.
+
+- Documents: one family each, the row being the record's JSON: `deploy.env`, `deploy.app`,
+  `deploy.template`, `deploy.registration` (by app and environment), `deploy.proposal` (by fleet
+  and repository). Approvals stay inside their release.
+- Releases:
+  - each release is a row of `deploy.release`, its key the number inverted so the newest sort
+    first;
+  - numbers come from a counter row (`deploy.counter`), taken under compare-and-set in the
+    release's own commit;
+  - the indexes (`deploy.release-by-reg`, `-by-app`, `-by-env`, `-by-state`,
+    `deploy.release-in-flight`) are written in that same commit;
+  - an idempotency key is a `deploy.release-key` row, written only where none is (RECORDS-3);
+  - every change to a release is made under compare-and-set on its row (RECORDS-4), so two
+    servers following one never both move it.
+- The rest: deploy's other state is `deploy.state`: a move's, how far each environment has read its
+  release repository, what a mirror reported.
+
+Servers keep these in kiln's own Records, durable in its store (`crates/kiln/src/records.rs`,
+passing RECORDS-1 to 14). Amphora's records (CP-T1.5) take its place later, copying every family
+through the seam. Tests keep them in `SimRecords`. A server from before the seam copies what kiln's
+tables held, once, at its first start, and leaves the tables as they were for the release before.
 
 ### 14.2 Work and events: Focal's bus
 
@@ -1075,9 +1096,23 @@ when KilnDB takes over.
 | `deploy.timers` | persisted | what must happen later: a soak ends, a window opens, a timeout passes |
 | `deploy.progress` | ephemeral | progress for the UI, `kiln`, chat and MCP |
 
-Delivery is at least once, so every handler is idempotent by release. Focal's bus is being built
-by its own session; until it is embeddable, kiln's event hub and a work table in the store stand in,
-behind the same interface.
+Delivery is at least once, so every handler is idempotent by release. The work queue and the
+timers are records, not topics, as agreed with Quiver's owner (T2) on 2026-10-23, so there is one
+coordination mechanism, not two:
+
+- Each release being followed is a `deploy.work` row: when it's next due, and the lease of the
+  server following it (`due_at`, `owner`, `lease_until`).
+- A server takes a lease under compare-and-set and renews it on its next look. Once it lapses, the
+  lease is another server's to take (§16).
+
+The streams wait on Quiver's classes:
+
+- `deploy.releases` and `deploy.git` move onto persisted topics with CP-T2.2. Until then, a
+  release's own row and `deploy.state` hold what they'd carry.
+- `deploy.progress` moves onto the ephemeral class, through kiln-seams' Bus, once the UI's feed
+  rides it: within one server with CP-T2.1, then across servers with CP-T2.12. Until then each
+  server's event hub carries it.
+- `deploy.watch` may move to a share group (CP-T2.7) if the bus is to own leases.
 
 ## 15. Security, permissions and audit
 
@@ -1115,7 +1150,7 @@ kiln's existing capabilities (authz, W10) cover these, as they do KilnCD's route
 | A release's sync fails, or it doesn't land within `watch.timeout` (Degraded, pods that never start) | it fails, and a revert release puts back what ran before, followed until it runs again; a rollback, a revert, or one asked `no_revert` is held instead and its registration marked degraded (§8.1) |
 | The provider refuses the release (its chart doesn't render, its spec is invalid) | after `watch.refused` the release fails, its commit is reverted and the provider handed what ran before |
 | A version that isn't in its registry | refused before it is recorded (`422`), with the newest versions there |
-| The server restarts mid-release | the watch item's lease lapses and a server takes it again |
+| The server restarts mid-release, or dies | its release's lease (`deploy.work`) lapses and a server takes it again: itself once restarted, or another server sharing its records |
 | The release repository can't be reached | `committing` retries until the timeout, then the release fails, nothing changed |
 | A provider deploys a commit kiln didn't make | it is recorded as a release of origin `git` |
 
@@ -1226,4 +1261,4 @@ deployments, and aren't carried over.
 | P3, GitLab: release repositories on a GitLab (`release_repo.host: gitlab`, `group/…/name`) through the `[[ci.gitlab]]` whose token covers the group, as GitHub's are: made in the group when they aren't there, read through kiln's mirror and written by a push with a lease, releases as merge requests (`via: pull-request`), each release a GitLab deployment to `<environment>/<app>`, GitLab's `Push Hook` and `Merge Request Hook` moving it at once; Argo CD reads with a deploy token of the project kiln makes (`read_repository`); `GET /api/deploy/git-hosts`, and GitLab in the New environment form; CI sources on GitLab: KilnCI's runs of a project there reported as commit statuses (`kiln/<workflow>`) | built. Against a fake GitLab (`tests/deploy_gitlab.rs`: its v4 API, and git that lets into a private project only kiln's token): KilnCI read a private project with the token, ran its workflow on a push hook, and reported `running` then `success` on the commit; the release repository was made once in its group; registrations and releases were pushed; a release delivering was a deployment `running`, `canceled` once cancelled and reverted; a merge request merged was delivered as its merge, its merger the approval, one closed was cancelled, one cancelled in kiln was closed with a note; a push hook brought a commit kiln didn't make in as a release of origin `git`. Through both providers on the test clusters, with that fake GitLab in the deploy-argo cluster (a NodePort both reach): release 8 (podinfo 6.10.2) landed on KilnCD (kilncd-e2e) from kiln's mirror; release 9 was merge request !1, merged, and Argo CD (deploy-argo) read the fake GitLab with kiln's deploy token, Synced and Healthy at the merge commit; !2 closed cancelled release 10, release 11 cancelled in kiln closed !3; the fake GitLab held a `success` deployment for each landed release |
 | P3, Bitbucket: release repositories on Bitbucket Cloud (`release_repo.host: bitbucket`, `workspace/name`) through `[ci.bitbucket]`'s access token (or user and app password) where it covers the workspace, as GitLab's are: made in the workspace when they aren't there (private, empty), read through kiln's mirror and written by a push with a lease; releases as pull requests (`via: pull-request`: merged, the merge delivered and its merger the approval; declined, cancelled; cancelled in kiln, declined there with a comment, its branch deleted); each release a build status of its commit (`deploy/<environment>/<app>`: `INPROGRESS`, `SUCCESSFUL`, `FAILED`, `STOPPED`) linking to it on kiln; Bitbucket's `repo:push` and `pullrequest:*` webhooks moving it at once, polling once a minute without them; Argo CD reads over SSH (`[ci.bitbucket] ssh_url`) with a deploy key kiln makes for that one repository, made again, the one before revoked, when Argo CD can't read with it (kiln asks Argo CD to try the repository again, not for its cached answer, which can say a revoked credential still reads); Bitbucket in `GET /api/deploy/git-hosts`, the New environment form and `kiln deploy env add --host bitbucket`; CI sources on Bitbucket: KilnCI's runs of a repository there reported as build statuses (`kiln/<workflow>`) | built. Against a fake Bitbucket (`tests/deploy_bitbucket.rs`: its 2.0 API, and git that lets into a private repository only kiln's access token): KilnCI read a private repository with the token, ran its workflow on a signed push webhook, and reported `SUCCESSFUL` on the commit; the release repository was made once in its workspace (another workspace, or a deeper name, refused); registrations and releases were pushed; a release delivering was a build status `INPROGRESS`, `STOPPED` once cancelled and reverted; a pull request merged was delivered as its merge, its merger the approval, its branch deleted; one declined was cancelled; one cancelled in kiln was declined with a comment; a push webhook brought a commit kiln didn't make in as a release of origin `git`. Through both providers on the test clusters, with a fake Bitbucket in the deploy-argo cluster (its API and git over HTTP, and an sshd whose deploy keys only read their own repository): release 13 (podinfo 6.10.2) landed on KilnCD (kilncd-e2e) from kiln's mirror; release 14 was pull request #1, merged there, its signed `pullrequest:fulfilled` webhook moving it at once, and Argo CD (deploy-argo) read `ssh://…/acme/releases.git` with kiln's deploy key, Synced and Healthy at the merge commit; #2 declined there cancelled release 15 (seen by polling, within a minute); release 16, cancelled in kiln, declined #3 with a comment; Bitbucket held a `SUCCESSFUL` build status for each landed release and `STOPPED` for the one cancelled. With its deploy key gone (the fake Bitbucket made again), kiln gave Argo CD a new one within seconds; with Argo CD's credential removed, it made another at its next look (every five minutes) and revoked the one before |
 | P3, the rest: `via: pull-request` on kiln's own git server (its diffs), and Bitbucket Data Center | not yet |
-| P6 | not yet |
+| P6: deploying by API on KilnDB's seam, and on several servers. Its records are rows of kiln's Records seam (§14.1, as agreed with Amphora), and so are its work queue and timers (§14.2, as agreed with Quiver): each release's lease is taken under compare-and-set and is another server's once it lapses. Its key-value state is there with them. Servers keep them in kiln's own Records, in its store, until Amphora's (CP-T1.5) take its place. A server from before copies what kiln's tables held, once | built (2026-10-23). `a_server_killed_mid_release_has_its_release_finished_by_another` runs two servers, each a hub of its own, sharing their records and release repository. Server A takes a release's lease, commits it, hands it to its provider, and dies. Server B can't take the release while A's lease holds; it takes it once the lease lapses and follows it until it lands, with A's commit, handed over once. Also: `a_lease_is_one_server_s_until_it_lapses`, `what_kiln_s_tables_held_is_copied_onto_the_seam_once`, and kiln's Records pass RECORDS-1 to 14 (`kiln_s_store_passes_the_records_suite`) and outlive their process. Not yet: the two servers share one process, and two processes need Amphora as its own process (CP-T1.2) or replicated groups; the streams wait for Quiver's persisted class (CP-T2.2) and the UI's feed on the bus (CP-T2.1) |

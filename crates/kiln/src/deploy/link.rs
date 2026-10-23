@@ -39,7 +39,7 @@ fn subject(app: &str, env: &str) -> String {
 /// when) and what's on its way there, signed for `audience` (the asking server's issuer). `None`
 /// when the app isn't registered there.
 pub async fn statement(d: &Deploy, app: &str, env: &str, audience: &str) -> anyhow::Result<Option<String>> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let Some(reg) = store::registration(st, app, env).await? else { return Ok(None) };
     let running = match reg.running {
         Some(id) => store::release(st, id).await?,

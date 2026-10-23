@@ -249,6 +249,12 @@ impl Store {
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
+    /// Run `f` with the connection on this thread: for what's read once as the server starts,
+    /// before anything else runs (a constructor that can't wait).
+    pub fn now<R>(&self, f: impl FnOnce(&mut Connection) -> anyhow::Result<R>) -> anyhow::Result<R> {
+        f(&mut self.conn.lock())
+    }
+
     /// Run `f` with the connection on the blocking pool.
     pub async fn call<R, F>(&self, f: F) -> anyhow::Result<R>
     where

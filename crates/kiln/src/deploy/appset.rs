@@ -86,7 +86,7 @@ async fn register_repo(d: &Deploy, argo: &Argo, env: &Environment, url: &str) ->
 /// What an environment's AppProject allows: each registration's package repository and namespace,
 /// its template's cluster-scoped kinds, and the release repository.
 async fn allowed(d: &Deploy, env: &Environment, url: &str) -> Result<Allowed, String> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let e = |e: anyhow::Error| format!("{e:#}");
     let mut out = Allowed::default();
     out.sources.insert(url.to_owned());

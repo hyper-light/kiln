@@ -181,7 +181,7 @@ pub async fn propose(d: &Deploy, who: &Who, f: &FleetAsk, s: &SourceChange) -> R
     }
     may_maintain(who)?;
     let id = fleet_id(f)?;
-    if !store::proposals(&d.hub.store, &id).await.map_err(internal)?.is_empty() {
+    if !store::proposals(&*d.records, &id).await.map_err(internal)?.is_empty() {
         return status(d, &id).await?.ok_or_else(|| missing(format!("no fleet change {id}")));
     }
     let apps = super::flow::selected(d, f).await?;
@@ -200,7 +200,7 @@ pub async fn propose(d: &Deploy, who: &Who, f: &FleetAsk, s: &SourceChange) -> R
     for (repo, apps) in &by_repo {
         let row = rows.iter().find(|r| r.name.eq_ignore_ascii_case(repo));
         let p = propose_in(d, who, &id, repo, row, apps, s).await;
-        store::put_proposal(&d.hub.store, &p).await.map_err(internal)?;
+        store::put_proposal(&*d.records, &p).await.map_err(internal)?;
     }
     audit(d, &who.name, "deploy.fleet", format!("{id}: {} in the sources of {}", s.what(), by_repo.values().flatten().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "))).await;
     let mut v = status(d, &id).await?.ok_or_else(|| missing(format!("no fleet change {id}")))?;
@@ -324,7 +324,7 @@ async fn make(d: &Deploy, who: &Who, p: &mut Proposal, row: Option<&crate::store
 /// looked at again while open (a pull request merged or closed on its host; kiln's own branch
 /// merged into its branch, or gone), with the diff of kiln's own still open.
 pub async fn status(d: &Deploy, id: &str) -> Result<Option<Value>, Fail> {
-    let mut list = store::proposals(&d.hub.store, id).await.map_err(internal)?;
+    let mut list = store::proposals(&*d.records, id).await.map_err(internal)?;
     if list.is_empty() {
         return Ok(None);
     }
@@ -335,7 +335,7 @@ pub async fn status(d: &Deploy, id: &str) -> Result<Option<Value>, Fail> {
             && state != p.state
         {
             p.state = state;
-            store::put_proposal(&d.hub.store, p).await.map_err(internal)?;
+            store::put_proposal(&*d.records, p).await.map_err(internal)?;
         }
         let mut v = serde_json::to_value(&*p).map_err(|e| internal(e.into()))?;
         if p.open()
@@ -409,7 +409,7 @@ async fn look(d: &Deploy, p: &Proposal) -> Option<String> {
 /// Another host's are merged there.
 pub async fn merge(d: &Deploy, who: &Who, id: &str, repo: Option<&str>) -> Result<Value, Fail> {
     may_maintain(who)?;
-    let list = store::proposals(&d.hub.store, id).await.map_err(internal)?;
+    let list = store::proposals(&*d.records, id).await.map_err(internal)?;
     if list.is_empty() {
         return Err(missing(format!("no fleet change {id} in apps' sources")));
     }
@@ -440,7 +440,7 @@ pub async fn merge(d: &Deploy, who: &Who, id: &str, repo: Option<&str>) -> Resul
         let (h, r, b) = (d.hosted.clone(), p.name.clone(), p.branch.clone());
         crate::rt::blocking(move || h.delete_branch(&r, &b)).await.map_err(internal)?.map_err(internal)?;
         p.state = "merged".to_owned();
-        store::put_proposal(&d.hub.store, &p).await.map_err(internal)?;
+        store::put_proposal(&*d.records, &p).await.map_err(internal)?;
         audit(d, &who.name, "deploy.fleet.merge", format!("{id} into {}'s {}", p.repo, p.into)).await;
     }
     // What a push of it starts (its CI) starts.
@@ -452,7 +452,7 @@ pub async fn merge(d: &Deploy, who: &Who, id: &str, repo: Option<&str>) -> Resul
 /// branch of kiln's own deleted.
 pub async fn withdraw(d: &Deploy, who: &Who, id: &str) -> Result<Value, Fail> {
     may_maintain(who)?;
-    let list = store::proposals(&d.hub.store, id).await.map_err(internal)?;
+    let list = store::proposals(&*d.records, id).await.map_err(internal)?;
     if list.is_empty() {
         return Err(missing(format!("no fleet change {id} in apps' sources")));
     }
@@ -465,7 +465,7 @@ pub async fn withdraw(d: &Deploy, who: &Who, id: &str) -> Result<Value, Fail> {
             g.withdraw(n, &p.branch, &format!("kiln's fleet change {id} was withdrawn by {}: this {} goes with it.", who.name, remote::change_name(&p.host, n))).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
         }
         p.state = "closed".to_owned();
-        store::put_proposal(&d.hub.store, &p).await.map_err(internal)?;
+        store::put_proposal(&*d.records, &p).await.map_err(internal)?;
     }
     audit(d, &who.name, "deploy.fleet.withdraw", id.to_owned()).await;
     status(d, id).await?.ok_or_else(|| missing(format!("no fleet change {id}")))

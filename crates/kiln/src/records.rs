@@ -98,16 +98,16 @@ fn reads_at(m: &Mem, at: Consistency) -> Result<i64, Refusal> {
 }
 
 impl StoreRecords {
-    /// Records in `store` (its migrations make their tables), with what's in memory read from them.
-    pub async fn open(store: Store) -> anyhow::Result<Self> {
+    /// Records in `store` (its migrations make their tables), with what's in memory read from them:
+    /// at once, as a server starts.
+    pub fn open(store: Store) -> anyhow::Result<Self> {
         let mem = store
-            .call(|c| {
+            .now(|c| {
                 let (head, horizon, log_horizon): (i64, i64, i64) = c.query_row("SELECT head, horizon, log_horizon FROM records_meta WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
                 let mut s = c.prepare("SELECT family, newest FROM records_families")?;
                 let newest = s.query_map([], |r| Ok((r.get::<_, String>(0)?, rev(r.get::<_, i64>(1)?))))?.collect::<Result<HashMap<_, _>, _>>()?;
                 Ok(Mem { head: rev(head), horizon: rev(horizon), log_horizon: rev(log_horizon), newest })
-            })
-            .await?;
+            })?;
         Ok(Self { store, inner: Arc::new(Inner { mem: Mutex::new(mem), changed: event_listener::Event::new() }) })
     }
 
@@ -363,7 +363,7 @@ mod tests {
             // A store of its own for each case, opened first.
             let mut stores = VecDeque::new();
             for _ in 0..cases.len() {
-                stores.push_back(StoreRecords::open(Store::in_memory()?).await?);
+                stores.push_back(StoreRecords::open(Store::in_memory()?)?);
             }
             let last = stores.back().cloned().ok_or_else(|| anyhow::anyhow!("no cases"))?;
             let make = || {
@@ -386,13 +386,13 @@ mod tests {
             let path = dir.path().join("kiln.db");
             let put = |k: &str, v: &str| Write::Put { family: "deploy.app".into(), key: k.as_bytes().to_vec(), value: v.as_bytes().to_vec() };
             let (r1, r2) = {
-                let r = StoreRecords::open(Store::open(&path)?).await?;
+                let r = StoreRecords::open(Store::open(&path)?)?;
                 let r1 = r.commit(Tx { conds: vec![], writes: vec![put("web", "1")] }).await?;
                 let r2 = r.commit(Tx { conds: vec![], writes: vec![put("web", "2"), put("api", "1")] }).await?;
                 r.compact(r2).await?;
                 (r1, r2)
             };
-            let r = StoreRecords::open(Store::open(&path)?).await?;
+            let r = StoreRecords::open(Store::open(&path)?)?;
             anyhow::ensure!(r.head().await? == r2, "the head as it was");
             let web = r.get("deploy.app", b"web", Consistency::Linearizable).await?;
             anyhow::ensure!(web == Some(Row { key: b"web".to_vec(), value: b"2".to_vec(), rev: r2 }), "web as it was: {web:?}");
