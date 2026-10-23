@@ -29,8 +29,9 @@ pub struct Pipeline {
     pub on: Triggers,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Only one run of the same concurrency group executes at a time; newer runs cancel older
-    /// queued ones when `cancel-in-progress` is set.
+    /// Only one run of the same concurrency group executes at a time: a newer run cancels the older
+    /// ones when `cancel-in-progress` is set, and otherwise waits for the one under way, dropping
+    /// an older one that waits too (GitHub's single queue).
     #[serde(default)]
     pub concurrency: Option<Concurrency>,
     pub jobs: BTreeMap<String, JobSpec>,
