@@ -23,7 +23,7 @@ futures-io = "0.3"
 futures-core = "0.3"
 http-body = "1"
 kiln-http = { path = "../../crates/kiln-http" }
-hyper-rt = "0.1.0"
+hyper-rt = "=0.1.0"
 
 # hyper-rt at kiln's one copy of hyper-raft (vendor/MANIFEST.toml), as kiln's root manifest points it
 # (docs/vendoring.md): kiln-http names it by version.

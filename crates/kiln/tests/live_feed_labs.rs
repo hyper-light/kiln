@@ -176,6 +176,8 @@ struct Shown {
     frames: usize,
     /// Frames after its first snapshot: what came live.
     live: usize,
+    /// Snapshots it was sent (each begins with `open`): more than one means it started over.
+    opens: usize,
 }
 
 impl Shown {
@@ -187,6 +189,7 @@ impl Shown {
         }
         match v.get("t").and_then(Value::as_str).unwrap_or_default() {
             "open" => {
+                self.opens += 1;
                 self.meta = Value::Null;
                 self.state = Value::Null;
                 self.changes = Value::Null;
@@ -312,6 +315,16 @@ fn metric(port: u16, token: &str, name: &str) -> anyhow::Result<f64> {
     Ok(body.lines().find_map(|l| l.strip_prefix(name).and_then(|rest| rest.trim().parse::<f64>().ok())).unwrap_or(0.0))
 }
 
+/// The sum of a family's series, its labels whatever they are (`kiln_bus_refused_total{op="…"}`).
+fn total(port: u16, token: &str, name: &str) -> anyhow::Result<f64> {
+    let (_, body) = common::http(port, "GET", "/metrics", token, None)?;
+    let series = |l: &str| l.strip_prefix(name).is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'));
+    body.lines()
+        .filter(|l| series(l))
+        .map(|l| l.rsplit_once(' ').map(|(_, v)| v).unwrap_or_default().parse::<f64>().map_err(|e| anyhow::anyhow!("{l}: {e}")))
+        .sum()
+}
+
 // ----------------------------------------------------------------------------------------- a lab
 
 /// A runner of the lab's own, joined to its server, hosting agent sessions; stopped as it's dropped.
@@ -426,12 +439,19 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("{e:#}\nwhole: {:?}\npatched: {:?}\nfresh: {:?}", whole.shown().map(|s| s.texts()), patched.shown().map(|s| s.texts()), last.texts()))?;
     for (who, v) in [("whole", whole.shown()?), ("patched", patched.shown()?)] {
         anyhow::ensure!(v.synced && v.live > MESSAGES && !v.closed, "the {who} viewer took {} frames, {} of them live", v.frames, v.live);
+        // Live all the way: the one snapshot it attached with, never another, so what it shows
+        // came over the feed, not from starting over.
+        anyhow::ensure!(v.opens == 1, "the {who} viewer started over: {} snapshots", v.opens);
         let texts = v.texts();
         anyhow::ensure!(want.iter().all(|w| texts.contains(w)), "the {who} viewer misses messages: {texts:?}");
     }
-    // The frames went over the bus.
+    // The frames went over the bus, which refused none and told no viewer it fell behind.
     let published = metric(port, &admin, "kiln_bus_published_total")? - published_before;
     anyhow::ensure!(published >= MESSAGES as f64, "{published} frames published on the bus");
+    for name in ["kiln_bus_lag_notices_total", "kiln_bus_refused_total"] {
+        let n = total(port, &admin, name)?;
+        anyhow::ensure!(n == 0.0, "{name} is {n}");
+    }
 
     // The session ends: both viewers are told.
     let (st, body) = common::http(port, "DELETE", &format!("/api/harness/sessions/{id}"), &admin, None)?;

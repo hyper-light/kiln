@@ -21,7 +21,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   subscriptions that share what they read, a typed lag notice for a subscriber that falls behind,
   and no publish that waits on a reader (`docs/design/focal-bus.md`). It passes the suite; a stalled
   subscriber among 100 delays no other (`crates/quiver/tests/stalled.rs`). Kiln's live feed of
-  every session rides it.
+  every session rides it on kiln's branch `cp/t2-quiver`, not yet on kiln's main.
 - **GroupStore mandated** (CP-T2.1, T-T2.1.2): hyper-durable's `RamStore` is for tests alone, and a
   build that names it outside one fails (`crates/quiver/tests/ram_store.rs`).
 - **The `quiver` binary** says what it is (`quiver --version`, `quiver --help`), and nothing more yet.

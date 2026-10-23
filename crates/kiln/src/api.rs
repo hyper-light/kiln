@@ -4647,6 +4647,9 @@ enum Live {
     Refused(kiln_seams::bus::Refusal),
     /// The session has no feed on the bus: time for another snapshot.
     Feedless,
+    /// A while with nothing: time to see whether the feed broke since (a full bus may refuse its
+    /// resync marker as well as its frames).
+    Quiet,
 }
 
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
@@ -4669,19 +4672,29 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     };
     send_snapshot(&mut tx, att.frames, takes.packed).await?;
     // Its place among the session's viewers, given back as it goes.
-    let _viewer = att.viewer;
+    let viewer = att.viewer;
     let topic = att.topic;
     let mut at = att.at;
+    // The feed's refusals as of the snapshot it has.
+    let mut refusals = att.refusals;
     let closed = || ws::text(json!({"t": "closed"}).to_string());
     loop {
         let live = {
             let (bus, topic, from) = (&hub.bus, &topic, at);
             async move {
                 match from {
-                    Some(from) => match bus.wait(topic, from).await {
-                        Ok(()) => Live::Ready,
-                        Err(e) => Live::Refused(e),
-                    },
+                    Some(from) => {
+                        let wait = bus.wait(topic, from).fuse();
+                        let quiet = crate::rt::sleep(FEEDLESS).fuse();
+                        futures::pin_mut!(wait, quiet);
+                        futures::select_biased! {
+                            w = wait => match w {
+                                Ok(()) => Live::Ready,
+                                Err(e) => Live::Refused(e),
+                            },
+                            () = quiet => Live::Quiet,
+                        }
+                    }
                     None => {
                         crate::rt::sleep(FEEDLESS).await;
                         Live::Feedless
@@ -4703,6 +4716,12 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                                 Some(frame) if frame.text.as_ref() == crate::harness::live::RESYNC => {
                                     start_over = true;
                                     break;
+                                }
+                                // The session's last frame: the viewer ends with it, and its
+                                // place, given back, lets the topic go.
+                                Some(frame) if frame.text.as_ref() == crate::harness::live::CLOSED => {
+                                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+                                    return Ok(());
                                 }
                                 Some(frame) => {
                                     if let Some(at) = crate::harness::live::published_us(&m.payload) {
@@ -4741,6 +4760,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     start_over = true;
                 }
                 Live::Feedless => start_over = true,
+                Live::Quiet => start_over = viewer.refusals() != refusals,
             },
             m = rx.next().fuse() => match m {
                 Some(Ok(Message::Text(t))) => match serde_json::from_str::<crate::harness::model::Command>(t.as_str()) {
@@ -4759,12 +4779,13 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         }
         if start_over {
             // From the current state (it begins with "open"), and the feed from where that is.
-            let Some((frames, from)) = hub.harness.frames(&id) else {
+            let Some((frames, from, now)) = hub.harness.frames(&id) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
             send_snapshot(&mut tx, frames, takes.packed).await?;
             at = from;
+            refusals = now;
         }
     }
 }

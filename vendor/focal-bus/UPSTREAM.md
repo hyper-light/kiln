@@ -25,8 +25,9 @@ The bus Quiver is built on (docs/design/focal-bus.md, kiln's CP-T2.1).
 ## Changes from upstream
 
 Each change is recorded in `vendor/patches/focal-bus/`, applied in this order on upstream's tree
-(`vendor/MANIFEST.toml` names the commit and the paths taken; kiln's docs/vendoring.md). Each is offered
-to Focal as a branch, and Focal's agent is told of it.
+(`vendor/MANIFEST.toml` names the commit and the paths taken; kiln's docs/vendoring.md). Each change to
+the bus's code is offered to Focal as a branch, and Focal's agent is told of it; a vendoring change
+alone (as the one below) isn't.
 
 | File | Change | Why | Recorded as |
 |---|---|---|---|

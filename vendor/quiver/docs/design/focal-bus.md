@@ -14,9 +14,11 @@ sources, its evidence and what would falsify it.
   `vendor/focal-bus/UPSTREAM.md` lists Quiver's one change: the shared crates named by version, so
   whoever builds the bus points them at one copy.
 - **hyper-raft** at `25cf889`, its `main` and the revision this commit of the bus takes (Focal's
-  `vendor/README.md` names all fifteen shared crates there), into `vendor/hyper-raft`, unchanged: the
-  runtime, the transport over QUIC and TLS, the consensus core, the durable shell over the log and the
-  block layer, the liveness stream, sealing at rest, and their measurement and simulation crates.
+  `vendor/README.md` names its sixteen shared crates there; the bus builds on fifteen, all but
+  `hyper-heap`), into `vendor/hyper-raft`, with one recorded change (`RamStore` for tests alone,
+  below): the runtime, the transport over QUIC and TLS, the consensus core, the durable shell over the
+  log and the block layer, the liveness stream, sealing at rest, and their measurement and
+  simulation crates.
 - **One revision in kiln.** Kiln holds one copy of each hyper-light product (kiln's
   docs/vendoring.md): it vendors Focal's bus and hyper-raft at these same commits, beside Quiver,
   and moves its own hyper-raft from `767627f` to `25cf889`.

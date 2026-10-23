@@ -18,7 +18,7 @@ harness = false
 [dev-dependencies]
 futures = { version = "0.3.31", default-features = false, features = ["std", "async-await", "executor"] }
 # The open loop, the process's CPU and the load average, as Focal's benches report through it.
-hyper-measure = "0.1.0"
+hyper-measure = "=0.1.0"
 quiver = { version = "0.1.0", path = "../quiver" }
 quiver-api = { version = "0.1.0", path = "../quiver-api" }
 

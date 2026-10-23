@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Quiver's ephemeral class against NATS core, Redis Pub/Sub and Kafka, class for class, on one
 # machine (CLAUDE.md §7; bench/README.md, "The comparison"), beside the kernel's own wake-up (the
-# floor under a subscriber that waits). For each system: its broker up in Docker on CPUs of its own
-# (Quiver and the floor have none: they run in the generator's process), each load run on the
-# generator's CPUs, every run added to OUT/runs.tsv and printed to OUT/<system>.md, the
-# broker down. Then OUT/report.md: each system's best run beside Quiver's, load by load.
+# floor under a subscriber that waits). Every broker up in Docker on CPUs of their own (Quiver and
+# the floor have none: they run in the generator's process); then RUNS rounds of every load, each
+# load's systems back to back on the generator's CPUs, their order turned each round, so on a
+# machine whose load moves every system's runs of a load come from the same minutes. Every run is
+# added to OUT/runs.tsv and printed to OUT/<system>.md; then OUT/report.md: each system's best run
+# beside Quiver's, load by load.
 #
 #   bench/compare.sh OUT
 #
@@ -18,6 +20,9 @@
 # librdkafka's build needs a C and a C++ compiler and make (bench/README.md).
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+# A thousand subscribers' connections, and Kafka's consumers' sockets, need more files than a
+# session's soft limit (often 1,024): it's raised to the hard one.
+ulimit -n "$(ulimit -Hn)"
 out=${1:?usage: bench/compare.sh OUT}
 mkdir -p "$out"
 systems=${SYSTEMS:-wake quiver nats redis kafka}
@@ -50,24 +55,28 @@ export QUIVER_COMMIT
 # Built before the first run, so no build runs beside one.
 cargo bench --locked -q -p quiver-bench --bench fanout --no-run
 
-container=""
+# The brokers' containers, by system.
+declare -A containers=()
 stop() {
-  if [ -n "$container" ]; then
-    docker stop -t 10 "$container" >/dev/null 2>&1 || true
-    container=""
-  fi
+  for system in "${!containers[@]}"; do
+    docker stop -t 10 "${containers[$system]}" >/dev/null 2>&1 || true
+  done
+  containers=()
 }
 trap stop EXIT
+# Stopped (a watchdog, systemctl stop), it exits, so the brokers it started stop with it.
+trap 'exit 143' TERM INT
 
-# Each broker as shipped, on loopback alone, its CPUs its own, 8 GiB of memory.
+# Each broker as shipped, on loopback alone, on the brokers' CPUs, 8 GiB of memory; its container
+# into `containers`.
 start() {
   local limits=(--rm --detach --network host --cpuset-cpus "$broker_cpus" --memory 8g --name "quiver-compare-$1-$$")
   case $1 in
-    nats) container=$(docker run "${limits[@]}" "$nats_image" --addr 127.0.0.1 --port 14222) ;;
-    redis) container=$(docker run "${limits[@]}" "$redis_image" redis-server --bind 127.0.0.1 --port 16380) ;;
+    nats) containers[nats]=$(docker run "${limits[@]}" "$nats_image" --addr 127.0.0.1 --port 14222) ;;
+    redis) containers[redis]=$(docker run "${limits[@]}" "$redis_image" redis-server --bind 127.0.0.1 --port 16380) ;;
     kafka)
       # One KRaft broker, as Focal's comparison sets one (its pubsub.yaml), on loopback.
-      container=$(docker run "${limits[@]}" \
+      containers[kafka]=$(docker run "${limits[@]}" \
         -e KAFKA_NODE_ID=1 \
         -e KAFKA_PROCESS_ROLES=broker,controller \
         -e KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:19092,CONTROLLER://127.0.0.1:19093 \
@@ -88,42 +97,53 @@ start() {
 
 # The broker is ready when it says so; at most a minute.
 ready() {
+  local c=${containers[$1]}
   case $1 in
-    nats) docker logs "$container" 2>&1 | grep -q 'Server is ready' ;;
-    redis) docker exec "$container" redis-cli -p 16380 ping 2>/dev/null | grep -q PONG ;;
-    kafka) docker logs "$container" 2>&1 | grep -q 'Kafka Server started' ;;
+    nats) docker logs "$c" 2>&1 | grep -q 'Server is ready' ;;
+    redis) docker exec "$c" redis-cli -p 16380 ping 2>/dev/null | grep -q PONG ;;
+    kafka) docker logs "$c" 2>&1 | grep -q 'Kafka Server started' ;;
   esac
 }
 
+# Every broker up before the first run, side by side on the brokers' CPUs (one idles while another
+# is measured), so the runs interleave: on a machine whose load moves, each load's runs of every
+# system come from the same minutes, not one system's hour against another's.
 for system in $systems; do
-  cgroup=""
-  if [ "$system" != quiver ] && [ "$system" != wake ]; then
-    start "$system"
-    n=0
-    until ready "$system"; do
-      n=$((n + 1))
-      if [ "$n" -ge 60 ]; then
-        docker logs --tail 40 "$container" >&2 || true
-        exit 1
-      fi
-      sleep 1
-    done
-    cgroup=/sys/fs/cgroup/system.slice/docker-$container.scope
-    docker inspect --format '- broker: {{.Config.Image}}, CPUs {{.HostConfig.CpusetCpus}}' "$container" >> "$out/$system.md"
-  fi
+  case $system in quiver | wake) continue ;; esac
+  start "$system"
+  n=0
+  until ready "$system"; do
+    n=$((n + 1))
+    if [ "$n" -ge 60 ]; then
+      docker logs --tail 40 "${containers[$system]}" >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+  docker inspect --format '- broker: {{.Config.Image}}, CPUs {{.HostConfig.CpusetCpus}}' "${containers[$system]}" >> "$out/$system.md"
+done
+
+# Run r of every load, each load's systems back to back, their order turned by one each run (no
+# system always first or last).
+read -r -a order <<< "$systems"
+for r in $(seq 1 "$runs"); do
   for wait in $waits; do
     for rate in $rates; do
       for subscribers in $fanouts; do
-        flags=(--system "$system" --rate "$rate" --subscribers "$subscribers" --runs "$runs"
-          --seconds "$duration" --warmup "$warmup" --payload "$payload" --max-load 1000
-          --out "$out/runs.tsv")
-        if [ "$wait" = busy ]; then flags+=(--busy); fi
-        if [ -d "$cgroup" ]; then flags+=(--broker-cgroup "$cgroup"); fi
-        taskset -c "$client_cpus" cargo bench --locked -q -p quiver-bench --bench fanout -- \
-          fanout "${flags[@]}" | tee -a "$out/$system.md"
+        for system in "${order[@]}"; do
+          flags=(--system "$system" --rate "$rate" --subscribers "$subscribers" --runs 1
+            --seed $((0x5eed + r - 1)) --seconds "$duration" --warmup "$warmup" --payload "$payload"
+            --max-load 1000 --out "$out/runs.tsv")
+          if [ "$wait" = busy ]; then flags+=(--busy); fi
+          if [ -n "${containers[$system]:-}" ]; then
+            flags+=(--broker-cgroup "/sys/fs/cgroup/system.slice/docker-${containers[$system]}.scope")
+          fi
+          taskset -c "$client_cpus" cargo bench --locked -q -p quiver-bench --bench fanout -- \
+            fanout "${flags[@]}" | tee -a "$out/$system.md"
+        done
       done
     done
   done
-  stop
+  order=("${order[@]:1}" "${order[0]}")
 done
 cargo bench --locked -q -p quiver-bench --bench fanout -- report "$out/runs.tsv" | tee "$out/report.md"

@@ -6,10 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-hyper-raft = "0.1.0"
-hyper-durable = "0.1.0"
-hyper-log = "0.1.0"
-hyper-block = "0.1.0"
+hyper-raft = "=0.1.0"
+hyper-durable = "=0.1.0"
+hyper-log = "=0.1.0"
+hyper-block = "=0.1.0"
 parking_lot = "0.12.5"
 anyhow = "1.0.104"
 base64 = "0.23.1"

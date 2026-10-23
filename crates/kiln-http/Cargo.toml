@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 # hyper-raft's runtime, by name: kiln's one copy of hyper-raft is vendored (vendor/MANIFEST.toml), and
 # the root manifest's [patch.crates-io] points the name there (docs/vendoring.md).
-hyper-rt = "0.1.0"
+hyper-rt = "=0.1.0"
 bytes = "1.12.1"
 futures-channel = "0.3.34"
 futures-core = "0.3.34"

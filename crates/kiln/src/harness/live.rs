@@ -12,7 +12,7 @@
 //! viewer back to a snapshot. A mirror let go (the session ended) drops its feed, and the feed's
 //! topic goes with it.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -27,6 +27,10 @@ pub const RETAIN: usize = 2048;
 
 /// The marker a feed publishes after a frame the bus refused: its viewers start over.
 pub const RESYNC: &str = r#"{"t":"resync"}"#;
+
+/// A session's last frame: its viewers end with it.
+pub const CLOSED: &str = r#"{"t":"closed"}"#;
+
 
 /// Feeds made in this process: each takes the next, so a session's mirror made again (a restart
 /// of its machine's link) has a topic of its own and never shares one it could delete.
@@ -86,13 +90,45 @@ pub enum Published {
     Refused,
 }
 
-/// One session's live feed, as its mirror holds it. Dropped (its mirror let go: the session
-/// ended or went away), its topic goes, and a viewer reading on finds it gone.
-pub struct Feed {
+/// What a feed shares with its viewers.
+struct Shared {
     bus: Arc<dyn Bus>,
     topic: String,
     /// Viewers attached now, each counted by its [`Viewer`].
-    viewers: Arc<AtomicUsize>,
+    viewers: AtomicUsize,
+    /// Frames and topics the bus refused the feed: a viewer whose feed was refused since it last
+    /// started over starts over again, whether or not a resync marker ever reaches it (a full bus
+    /// may refuse that too).
+    refusals: AtomicU64,
+    /// The session ended (its feed dropped): the last of its viewers to go deletes the topic.
+    ended: AtomicBool,
+    /// The topic, made, was deleted: by whichever of the ended feed and its last viewer came first.
+    deleted: AtomicBool,
+}
+
+impl Shared {
+    /// Deletes the topic, once.
+    fn delete(&self) {
+        if !self.deleted.swap(true, Ordering::AcqRel) {
+            delete(self.bus.as_ref(), &self.topic);
+        }
+    }
+}
+
+fn delete(bus: &dyn Bus, topic: &str) {
+    if let Err(e) = at_once(bus.delete(topic)) {
+        crate::metrics::bus().refused.inc(&["delete"]);
+        // No viewer loses anything (none watches, or the session ended): info, where a viewer
+        // sent back to a snapshot warns.
+        tracing::info!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a session's live feed couldn't be let go");
+    }
+}
+
+/// One session's live feed, as its mirror holds it. Dropped (its mirror let go: the session
+/// ended or went away), its topic goes once its viewers have: each reads on to the session's last
+/// frame ([`CLOSED`]) and ends with it, so none misses the frames it hadn't read yet.
+pub struct Feed {
+    shared: Arc<Shared>,
     /// A frame was refused: the next publish goes after [`RESYNC`]. Set too while the topic
     /// couldn't be made (it's asked again at the next publish).
     broken: bool,
@@ -100,22 +136,31 @@ pub struct Feed {
 }
 
 /// One viewer's place in a feed's count (and in `kiln_bus_viewers`); dropping it gives the place
-/// back.
-pub struct Viewer(Arc<AtomicUsize>);
+/// back, and the last viewer of an ended session takes its topic with it. It reads the feed's
+/// refusals, so it can tell its feed broke without a frame saying so.
+pub struct Viewer(Arc<Shared>);
 
 impl Viewer {
-    fn new(count: &Arc<AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::AcqRel);
+    fn new(shared: &Arc<Shared>) -> Self {
+        shared.viewers.fetch_add(1, Ordering::AcqRel);
         crate::metrics::bus_gauges().viewers.add(1);
-        Self(Arc::clone(count))
+        Self(Arc::clone(shared))
+    }
+
+    /// The feed's refusals so far: more than when the viewer last started over means the feed
+    /// broke since.
+    pub fn refusals(&self) -> u64 {
+        self.0.refusals.load(Ordering::Acquire)
     }
 }
 
 impl Drop for Viewer {
     fn drop(&mut self) {
         // Its place, taken once as it was made, given back once.
-        self.0.fetch_sub(1, Ordering::AcqRel);
         crate::metrics::bus_gauges().viewers.add(-1);
+        if self.0.viewers.fetch_sub(1, Ordering::SeqCst) == 1 && self.0.ended.load(Ordering::SeqCst) {
+            self.0.delete();
+        }
     }
 }
 
@@ -130,7 +175,8 @@ impl Feed {
     /// A feed for session `id`, its topic made on `bus`.
     pub fn open(bus: Arc<dyn Bus>, id: &str) -> Self {
         let topic = topic(id, FEEDS.fetch_add(1, Ordering::Relaxed));
-        let mut feed = Self { bus, topic, viewers: Arc::new(AtomicUsize::new(0)), broken: false, made: false };
+        let shared = Shared { bus, topic, viewers: AtomicUsize::new(0), refusals: AtomicU64::new(0), ended: AtomicBool::new(false), deleted: AtomicBool::new(false) };
+        let mut feed = Self { shared: Arc::new(shared), broken: false, made: false };
         feed.make();
         feed
     }
@@ -139,31 +185,40 @@ impl Feed {
         if self.made {
             return true;
         }
-        match at_once(self.bus.create(&self.topic, Topic { class: Class::Ephemeral, retain: RETAIN })) {
-            Ok(()) => self.made = true,
+        match at_once(self.shared.bus.create(&self.shared.topic, Topic { class: Class::Ephemeral, retain: RETAIN })) {
+            Ok(()) => {
+                self.made = true;
+                self.shared.deleted.store(false, Ordering::Release);
+            }
             Err(e) => {
                 self.broken = true;
+                self.shared.refusals.fetch_add(1, Ordering::AcqRel);
                 crate::metrics::bus().refused.inc(&["create"]);
-                tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %self.topic, error = %e, "a session's live feed couldn't be made: its viewers get snapshots until it is");
+                tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %self.shared.topic, error = %e, "a session's live feed couldn't be made: its viewers get snapshots until it is");
             }
         }
         self.made
     }
 
     pub fn topic(&self) -> &str {
-        &self.topic
+        &self.shared.topic
     }
 
     /// Viewers watching now.
     pub fn viewers(&self) -> usize {
-        self.viewers.load(Ordering::Acquire)
+        self.shared.viewers.load(Ordering::Acquire)
+    }
+
+    /// The feed's refusals so far (what a viewer starting over now compares against later).
+    pub fn refusals(&self) -> u64 {
+        self.shared.refusals.load(Ordering::Acquire)
     }
 
     /// A viewer's place, and the offset its snapshot is taken at: where it reads on from (none
     /// while the bus can't hold the feed). Taken under the mirrors' lock, as every publish is, so
     /// no frame comes between the snapshot and the offset.
     pub fn attach(&mut self) -> (Viewer, Option<Offset>) {
-        (Viewer::new(&self.viewers), self.position())
+        (Viewer::new(&self.shared), self.position())
     }
 
     /// Where a viewer that starts over reads on from: the offset a snapshot taken now is at.
@@ -171,12 +226,19 @@ impl Feed {
         if !self.make() {
             return None;
         }
-        at_once(self.bus.bounds(&self.topic)).ok().map(|(_, end)| end)
+        at_once(self.shared.bus.bounds(&self.shared.topic)).ok().map(|(_, end)| end)
     }
 
-    /// Publishes `frame` to the feed's viewers: none watching, nothing goes.
+    /// Publishes `frame` to the feed's viewers: none watching, nothing goes, and what the topic
+    /// kept goes too (the next viewer starts from a snapshot, on the topic made again), so a
+    /// session nobody watches holds none of the bus's memory.
     pub fn publish(&mut self, frame: &Frame) -> Published {
         if self.viewers() == 0 {
+            if self.made {
+                self.made = false;
+                self.broken = false;
+                self.shared.delete();
+            }
             return Published::Unwatched;
         }
         if !self.make() {
@@ -184,7 +246,7 @@ impl Feed {
         }
         let m = crate::metrics::bus();
         if self.broken {
-            match at_once(self.bus.publish(&self.topic, None, encode(&Frame::of(RESYNC.to_owned())))) {
+            match at_once(self.shared.bus.publish(&self.shared.topic, None, encode(&Frame::of(RESYNC.to_owned())))) {
                 Ok(_) => {
                     self.broken = false;
                     m.published.inc();
@@ -192,7 +254,7 @@ impl Feed {
                 Err(e) => return self.refused(&e),
             }
         }
-        match at_once(self.bus.publish(&self.topic, None, encode(frame))) {
+        match at_once(self.shared.bus.publish(&self.shared.topic, None, encode(frame))) {
             Ok(_) => {
                 m.published.inc();
                 Published::Sent
@@ -203,21 +265,22 @@ impl Feed {
 
     fn refused(&mut self, e: &Refusal) -> Published {
         self.broken = true;
+        self.shared.refusals.fetch_add(1, Ordering::AcqRel);
         crate::metrics::bus().refused.inc(&["publish"]);
-        tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %self.topic, error = %e, "a frame the bus refused: the session's viewers start over at its next one");
+        tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %self.shared.topic, error = %e, "a frame the bus refused: the session's viewers start over at its next one");
         Published::Refused
     }
 }
 
 impl Drop for Feed {
+    /// The session ended: its topic goes now if no viewer reads it, else with its last viewer.
     fn drop(&mut self) {
-        if self.made
-            && let Err(e) = at_once(self.bus.delete(&self.topic))
-        {
-            crate::metrics::bus().refused.inc(&["delete"]);
-            // No viewer loses anything (the session ended): info, where a viewer sent back to a
-            // snapshot warns.
-            tracing::info!(target: "kiln.bus", event = "feed.refused", topic = %self.topic, error = %e, "a session's live feed couldn't be let go");
+        if !self.made {
+            return;
+        }
+        self.shared.ended.store(true, Ordering::SeqCst);
+        if self.shared.viewers.load(Ordering::SeqCst) == 0 {
+            self.shared.delete();
         }
     }
 }
@@ -295,6 +358,66 @@ mod tests {
         assert_eq!(futures::executor::block_on(b.bounds(&topic)), Err(Refusal::NoTopic(topic)));
         Ok(())
     }
+    /// A feed nobody watches keeps none of the bus's memory: its next frame lets the topic go,
+    /// and the next viewer finds it made again, from its start.
+    #[test]
+    fn a_feed_nobody_watches_lets_its_topic_go_and_a_viewer_makes_it_again() -> anyhow::Result<()> {
+        let b = bus()?;
+        let mut feed = Feed::open(Arc::clone(&b), "s1");
+        let (viewer, _) = feed.attach();
+        assert_eq!(feed.publish(&Frame::of("seen".to_owned())), Published::Sent);
+        drop(viewer);
+        assert_eq!(feed.publish(&Frame::of("unseen".to_owned())), Published::Unwatched);
+        let topic = feed.topic().to_owned();
+        assert_eq!(futures::executor::block_on(b.bounds(&topic)), Err(Refusal::NoTopic(topic.clone())));
+        let (_viewer, at) = feed.attach();
+        assert_eq!(at, Some(0));
+        assert_eq!(feed.publish(&Frame::of("again".to_owned())), Published::Sent);
+        let read = futures::executor::block_on(b.read(&topic, 0, 10))?;
+        let texts: Vec<String> = read.messages.iter().filter_map(|m| decode(&m.payload)).map(|f| f.text.to_string()).collect();
+        assert_eq!(texts, ["again"]);
+        Ok(())
+    }
+
+    /// A viewer learns its feed broke from the feed's refusals, without a frame saying so: a full
+    /// bus may refuse the resync marker as well as the frame, and the viewer must not wait on.
+    #[test]
+    fn a_viewer_learns_its_feed_broke_without_a_frame_saying_so() -> anyhow::Result<()> {
+        let b = bus()?;
+        let mut feed = Feed::open(Arc::clone(&b), "s1");
+        let (viewer, _) = feed.attach();
+        let before = viewer.refusals();
+        assert_eq!(feed.refusals(), before);
+        let huge = Frame::of("x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
+        assert_eq!(feed.publish(&huge), Published::Refused);
+        assert_eq!(feed.publish(&huge), Published::Refused);
+        assert!(viewer.refusals() > before, "the viewer sees the refusals");
+        Ok(())
+    }
+
+    /// An ended session's topic stays while a viewer reads it, so the frames it hadn't read yet,
+    /// the session's last ([`CLOSED`]) among them, still reach it; it goes with the last viewer.
+    #[test]
+    fn an_ended_sessions_topic_stays_until_its_last_viewer_goes() -> anyhow::Result<()> {
+        let b = bus()?;
+        let mut feed = Feed::open(Arc::clone(&b), "s1");
+        let (first, at) = feed.attach();
+        let (second, _) = feed.attach();
+        let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
+        assert_eq!(feed.publish(&Frame::of("last words".to_owned())), Published::Sent);
+        assert_eq!(feed.publish(&Frame::of(CLOSED.to_owned())), Published::Sent);
+        let topic = feed.topic().to_owned();
+        drop(feed);
+        let read = futures::executor::block_on(b.read(&topic, at, 10))?;
+        let texts: Vec<String> = read.messages.iter().filter_map(|m| decode(&m.payload)).map(|f| f.text.to_string()).collect();
+        assert_eq!(texts, ["last words", CLOSED]);
+        drop(first);
+        assert!(futures::executor::block_on(b.bounds(&topic)).is_ok(), "one viewer still reads");
+        drop(second);
+        assert_eq!(futures::executor::block_on(b.bounds(&topic)), Err(Refusal::NoTopic(topic)));
+        Ok(())
+    }
+
     /// CP-T2.1, AC-T2.1.5 in kiln: a session's feed with 100 viewers, one stalled. Every frame is
     /// published at once; the 99 that read as frames come take all 3000 (more than the feed keeps)
     /// in order; the stalled one, reading at last from where it attached, is refused `Behind` (the

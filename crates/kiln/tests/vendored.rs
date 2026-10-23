@@ -237,6 +237,21 @@ fn ac_m1_4_no_manifest_of_kiln_takes_a_path_dependency_from_outside_the_reposito
     Ok(())
 }
 
+/// crates.io has unrelated crates under some vendored names (`quiver` 0.1 to 0.6, `hyper-rt`):
+/// one resolved there in the vendored crate's place, as a newer compatible version would be,
+/// fails the check.
+#[test]
+fn ac_m1_4_an_unrelated_crates_io_crate_under_a_vendored_name_fails_the_check() -> anyhow::Result<()> {
+    let v = vendored(&root())?;
+    let mut lock = kiln_lock()?;
+    let ours = "[[package]]\nname = \"quiver\"\nversion = \"0.1.0\"\n";
+    ensure!(lock.contains(ours), "quiver isn't in the lock as kiln's");
+    lock = lock.replacen(ours, "[[package]]\nname = \"quiver\"\nversion = \"0.1.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n", 1);
+    let found = problems(&lock, &v)?;
+    ensure!(found.iter().any(|p| p.starts_with("quiver (vendored as quiver) is linked as 0.1.1 from registry+")), "{found:?}");
+    Ok(())
+}
+
 #[test]
 fn ac_m1_4_a_second_revision_of_a_vendored_crate_fails_the_check() -> anyhow::Result<()> {
     let v = vendored(&root())?;

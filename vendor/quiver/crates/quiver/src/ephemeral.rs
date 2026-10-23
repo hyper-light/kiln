@@ -3,12 +3,13 @@
 //!
 //! A topic is a log of segments, each a run of up to [`SEGMENT_SLOTS`] messages filled in order and
 //! never changed after. A publish frames its message, takes the topic's lock, gives it the next
-//! offset and fills the next slot; readers take no lock. A subscription holds the one segment it
-//! reads (an `Arc`) and reaches the next by a weak link, so what it reads is shared, never copied,
-//! and one that stalls keeps alive its own segment and none after it. Each message is kept as a
-//! Focal batch of one record (`focal_bus::batch`: the bytes Focal's bus appends, replicates and
-//! delivers), its CRC computed once as it's published, and its bytes are charged to the node's
-//! memory budget (`focal_memory`) until the last reader lets its segment go.
+//! offset and fills the next slot. A subscription reads without it; a read from an offset and a
+//! look at a topic's bounds take it only to find their segment. A subscription holds the one
+//! segment it reads (an `Arc`) and reaches the next by a weak link, so what it reads is shared,
+//! never copied, and one that stalls keeps alive its own segment and none after it. Each message
+//! is kept as a Focal batch of one record (`focal_bus::batch`: the bytes Focal's bus appends,
+//! replicates and delivers), its CRC computed once as it's published, and its bytes are charged to
+//! the node's memory budget (`focal_memory`) until the last reader lets its segment go.
 //!
 //! The topic keeps its newest messages, up to its retention in messages and in bytes; past it the
 //! oldest are let go, and a segment whose messages are all let go leaves the log. A reader behind

@@ -16,24 +16,30 @@ on any device (`crate::harness::live`):
 - **A topic for each session's mirror.** The server's view of a session (`crate::harness::registry`)
   has a feed: a topic of its own, `sessions/<id>/<n>` (`<n>` the feed's number in this process, so a
   mirror made again never shares a topic it could delete; an id outside a topic name's alphabet is
-  its SHA-256 in its place), keeping its last 2048 frames. It's made with the mirror and deleted
-  when the mirror goes.
+  its SHA-256 in its place), keeping its last 2048 frames. It's made with the mirror, and let go
+  whenever nobody watches: the first frame after its last viewer leaves deletes it, and the next
+  viewer makes it again, so a session nobody watches holds none of the bus's memory.
 - **Frames go out only while someone watches,** as before: the JSON a viewer's page reads (`open`,
   `meta`, `state`, `state_patch`, `events`, `stream`, `changes`, `files`, `closed`). A state goes
   whole and as what changed in it, and each viewer takes the form it asked for (`?patch=state`).
 - **No frame missed or seen twice.** A viewer (`GET /api/harness/sessions/:id/ws`) is sent a
   snapshot and reads the feed from the offset the snapshot was taken at: both are taken under the
-  mirrors' lock, which every publish takes too.
+  mirrors' lock, which every publish takes too. The lock holds only while the snapshot's parts are
+  taken (its events by reference); the snapshot is made after it's let go, so a viewer starting
+  over never holds up another session's frames.
 - **A viewer that falls behind starts over, alone.** One further behind than the feed keeps is
   refused `Behind` by the bus (its typed lag notice), and it starts over from a fresh snapshot (with
   `{"t":"synced"}` after it), as a viewer that fell behind always did. A publish never waits for a
   viewer, so a stalled one holds up neither the session nor any other viewer.
 - **Nothing dropped silently.** A frame the bus refuses (over 1 MiB, or the bus's memory full)
   marks the feed broken: its next frame goes after a resync marker, which sends every viewer reading
-  it back to a snapshot, and the refusal is counted (`kiln_bus_refused_total`). While the bus can't
-  make a session's feed at all, its viewers are sent a snapshot every 5 seconds.
-- **The end.** When the session ends its viewers are told (`closed`), and its topic goes; a viewer
-  reading on finds it gone, which says the same.
+  it back to a snapshot, and the refusal is counted (`kiln_bus_refused_total`). A full bus may
+  refuse the marker too, so no viewer relies on it: each counts its feed's refusals and, with
+  nothing to read for 5 seconds, starts over if there were more since its snapshot. While the bus
+  can't make a session's feed at all, its viewers are sent a snapshot every 5 seconds.
+- **The end.** When the session ends its last frame is `closed`, and each viewer ends with it,
+  having read whatever it hadn't yet. The topic goes with the last of them (at once if none
+  watches); a viewer that finds it gone is told `closed` too.
 
 ## Settings
 

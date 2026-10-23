@@ -52,7 +52,9 @@ struct Mirror {
     /// The state as its viewers last had it sent (what a state patch is made against).
     sent: Value,
     changes: Value,
-    events: Vec<Value>,
+    /// Shared, so a snapshot takes them under the mirrors' lock as references and is made after
+    /// it's let go: a viewer starting over never holds up another session's publish.
+    events: Vec<Arc<Value>>,
     index: HashMap<String, usize>,
     /// Its live frames, on a topic of its own on the bus.
     feed: Feed,
@@ -95,11 +97,11 @@ impl Mirror {
     fn upsert(&mut self, e: Value) {
         let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_owned) else { return };
         if let Some(slot) = self.index.get(&id).and_then(|i| self.events.get_mut(*i)) {
-            *slot = e;
+            *slot = Arc::new(e);
             return;
         }
         self.index.insert(id, self.events.len());
-        self.events.push(e);
+        self.events.push(Arc::new(e));
         if self.events.len() > MAX_EVENTS + MAX_EVENTS / 4 {
             let drop = self.events.len() - MAX_EVENTS;
             self.events.drain(..drop);
@@ -108,8 +110,10 @@ impl Mirror {
     }
 
     fn append(&mut self, id: &str, text: &str) {
+        // An event a snapshot still holds is copied first (that one alone), so the snapshot keeps
+        // what it took.
         if let Some(e) = self.index.get(id).and_then(|i| self.events.get_mut(*i))
-            && let Some(Value::String(s)) = e.get_mut("text")
+            && let Some(Value::String(s)) = Arc::make_mut(e).get_mut("text")
         {
             s.push_str(text);
         }
@@ -118,6 +122,35 @@ impl Mirror {
     /// The frames that bring a new viewer to the current state; `files`, what's kept of the files
     /// its messages mention (`Keeper::frame`), goes ahead of the events.
     fn snapshot(&self, files: Option<String>) -> Vec<String> {
+        self.parts().frames(files)
+    }
+
+    /// What a snapshot is made of, taken under the mirrors' lock: the events as references, the
+    /// rest as copies. Its frames are made after the lock is let go ([`Parts::frames`]).
+    fn parts(&self) -> Parts {
+        Parts {
+            info: json!(self.info),
+            meta: self.meta.clone(),
+            state: self.state.clone(),
+            changes: self.changes.clone(),
+            events: self.events.clone(),
+        }
+    }
+}
+
+/// A snapshot of a mirror, not yet made into frames ([`Mirror::parts`]).
+struct Parts {
+    info: Value,
+    meta: Value,
+    state: Value,
+    changes: Value,
+    events: Vec<Arc<Value>>,
+}
+
+impl Parts {
+    /// The frames that bring a new viewer to the state the parts were taken at; `files`, what's
+    /// kept of the files its messages mention (`Keeper::frame`), goes ahead of the events.
+    fn frames(self, files: Option<String>) -> Vec<String> {
         let mut out = vec![json!({"t": "open", "info": self.info}).to_string()];
         if !self.meta.is_null() {
             out.push(json!({"t": "meta", "meta": self.meta}).to_string());
@@ -165,6 +198,8 @@ pub struct Attachment {
     pub at: Option<kiln_seams::bus::Offset>,
     /// Its place among the session's viewers, while it watches.
     pub viewer: Viewer,
+    /// The feed's refusals when the snapshot was taken: more later means the feed broke since.
+    pub refusals: u64,
 }
 
 /// A live frame for a session's viewers. A state comes as well as only what changed since the
@@ -1065,7 +1100,7 @@ impl Registry {
             for id in &gone {
                 if let Some(mut m) = g.remove(id) {
                     // Its feed's topic goes with it once its viewers are told.
-                    m.feed.publish(&Frame::of(json!({"t": "closed"}).to_string()));
+                    m.feed.publish(&Frame::of(super::live::CLOSED.to_owned()));
                 }
             }
             gone
@@ -1128,18 +1163,23 @@ impl Registry {
     pub fn attach(&self, id: &str) -> Option<Attachment> {
         // What's kept is read before the mirrors are locked: the first time, off disk.
         let files = self.keeper.frame(id);
-        let mut g = self.mirrors.lock();
-        let m = g.get_mut(id)?;
-        // The offset under the same lock as the snapshot: every publish takes it too.
-        let (viewer, at) = m.feed.attach();
-        Some(Attachment { frames: m.snapshot(files), topic: m.feed.topic().to_owned(), at, viewer })
+        let (parts, topic, at, viewer, refusals) = {
+            let mut g = self.mirrors.lock();
+            let m = g.get_mut(id)?;
+            // The offset under the same lock as the snapshot's parts: every publish takes it too.
+            let (viewer, at) = m.feed.attach();
+            (m.parts(), m.feed.topic().to_owned(), at, viewer, m.feed.refusals())
+        };
+        // Made into frames with the lock let go: no other session's publish waits on this one.
+        Some(Attachment { frames: parts.frames(files), topic, at, viewer, refusals })
     }
 
-    /// Catch-up frames for a viewer that fell behind, and where on the session's topic it reads
-    /// on from: none when the session is gone.
-    pub fn frames(&self, id: &str) -> Option<(Vec<String>, Option<kiln_seams::bus::Offset>)> {
+    /// Catch-up frames for a viewer that fell behind, where on the session's topic it reads on
+    /// from, and the feed's refusals then: none when the session is gone.
+    pub fn frames(&self, id: &str) -> Option<(Vec<String>, Option<kiln_seams::bus::Offset>, u64)> {
         let files = self.keeper.frame(id);
-        self.mirrors.lock().get_mut(id).map(|m| (m.snapshot(files), m.feed.position()))
+        let (parts, at, refusals) = self.mirrors.lock().get_mut(id).map(|m| (m.parts(), m.feed.position(), m.feed.refusals()))?;
+        Some((parts.frames(files), at, refusals))
     }
 
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
@@ -1506,7 +1546,7 @@ impl Registry {
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(mut m) = self.mirrors.lock().remove(id) {
                 // Its feed's topic goes with it once its viewers are told.
-                m.feed.publish(&Frame::of(json!({"t": "closed"}).to_string()));
+                m.feed.publish(&Frame::of(super::live::CLOSED.to_owned()));
             }
             self.keeper.forget(id);
             self.visuals.forget(id);
@@ -1542,7 +1582,7 @@ impl Registry {
     pub fn conclusion(&self, id: &str) -> Option<(Value, Option<Value>, Value)> {
         let g = self.mirrors.lock();
         let m = g.get(id)?;
-        let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
+        let reply = m.events.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).map(|e| e.as_ref().clone());
         Some((m.state.clone(), reply, m.changes.clone()))
     }
 
