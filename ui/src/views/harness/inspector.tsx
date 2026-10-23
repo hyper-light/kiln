@@ -376,7 +376,7 @@ export function Inspector({
                 {/* The plan it proposed (plan mode), in its words, kept by kiln. */}
                 {agentId ? (
                   <Loadable label="its plan" fallback={null}>
-                    <ProposedPlan session={agentId} words={proposed} />
+                    <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
                   </Loadable>
                 ) : (
                   proposed && (

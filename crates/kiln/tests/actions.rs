@@ -229,6 +229,42 @@ fn w07_ac03_mirror_offline() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What an owner's repositories share, in its `.github` repository (as `crazy-max/.github` and
+/// `docker/.github` keep theirs): a reusable workflow calling another of its own by `./`, and an
+/// action the job that calls uses.
+const SHARED: &[(&str, &str)] = &[
+    (".github/workflows/outer.yml", "on:\n  workflow_call:\njobs:\n  inner:\n    uses: ./.github/workflows/inner.yml\n"),
+    (".github/workflows/inner.yml", "on:\n  workflow_call:\njobs:\n  say:\n    runs-on: local\n    steps:\n      - uses: kinds/.github/.github/actions/hello@v1\n"),
+    (".github/actions/hello/action.yml", "name: hello\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from the shared repository\"\n"),
+];
+
+/// W07-R02: an owner's `.github` repository is a repository like any other, its workflows and
+/// actions used by their names. Its workflow's call by `./` is its own repository's at that
+/// commit, as on GitHub, not the caller's, which has a workflow of that name too.
+#[test]
+fn w07_r02_an_owners_shared_repository() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src = dir.path().join("src");
+    commit(&src.join("kinds").join(".github"), SHARED, Some("v1"))?;
+    let repo = dir.path().join("repo");
+    let s = server_for(dir.path(), &src, &repo)?;
+    let caller = "on: push\njobs:\n  call:\n    uses: kinds/.github/.github/workflows/outer.yml@v1\n";
+    let decoy = "on:\n  workflow_call:\njobs:\n  wrong:\n    runs-on: local\n    steps:\n      - run: echo \"the caller's own\"\n";
+    commit(&repo, &[(".github/workflows/shared.yml", caller), (".github/workflows/inner.yml", decoy)], None)?;
+    let (run, legs) = finished(&s, 0)?;
+    let keys: Vec<&str> = legs.iter().filter_map(|l| l.pointer("/leg/key").and_then(Value::as_str)).collect();
+    assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("success"), "{run}\n{keys:?}\n{}", s.log());
+    assert!(!keys.iter().any(|k| k.ends_with("wrong")), "the caller's own `inner.yml` isn't the one called: {keys:?}");
+    let say = legs.iter().find(|l| l.pointer("/leg/key").and_then(Value::as_str).is_some_and(|k| k.ends_with("say"))).and_then(|l| l.pointer("/leg/id")).and_then(Value::as_str).unwrap_or_default();
+    let mut log = String::new();
+    for step in 0..3 {
+        let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{say}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&text);
+    }
+    assert!(log.contains("hello from the shared repository"), "{keys:?}: {log}");
+    Ok(())
+}
+
 /// The legs of the run's attempt `attempt` (a rerun is the run's next attempt, its legs new),
 /// once every one has finished: (job, log of its steps).
 fn attempt_logs(s: &common::Server, run: &str, attempt: i64) -> anyhow::Result<Vec<(String, String)>> {

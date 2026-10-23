@@ -51,7 +51,9 @@ rather than as far as the agent says:
   output; a record of kiln's in kiln (a plan's words, an agent's conversation).
 
 A quote is found when its words are there in order, however they're spaced, in any case, with curly
-quotes and dashes as plain ones (`…` or `...` stands for words left out). What can't be read (a PDF,
+quotes and dashes as plain ones (`…` or `...` stands for words left out, a line break for lines left
+out: an agent quoting a command's output picks the lines that matter), the full stops, commas, colons
+and quote marks it starts or ends with not counting. What can't be read (a PDF,
 a page its scripts draw, one behind a sign-in, a file on another machine, a machine whose kiln is
 older) is left unchecked and says why. Checks run in the background: research shows its quotes
 being checked, then how each came out.

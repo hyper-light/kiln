@@ -36,15 +36,18 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
     if !matches!(tail, ["info", "refs"] | ["git-upload-pack"]) {
         return Err((StatusCode::FORBIDDEN, "this code host serves fetches only".into()));
     }
-    // A leg's GITHUB_TOKEN, with `contents: read` (W10-R04).
+    // A leg's GITHUB_TOKEN.
     let Some(job) = token::job_of_request(hub, req.headers()).await else { return Ok(unauthorized()) };
-    if !job.may("contents", kiln_ci::plan::perms::Level::Read) {
-        return Err((StatusCode::FORBIDDEN, "this job's token lacks `contents: read`".into()));
-    }
-    let leg = job.leg;
-    let run = runs::run_of(hub, &leg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.ok_or((StatusCode::UNAUTHORIZED, "the leg is gone".to_owned()))?;
+    let run = runs::run_of(hub, &job.leg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.ok_or((StatusCode::UNAUTHORIZED, "the leg is gone".to_owned()))?;
     if !run.repo_name.eq_ignore_ascii_case(&full) {
-        return Err((StatusCode::FORBIDDEN, format!("this leg's token reads {} only", run.repo_name)));
+        if repos.iter().any(|r| r.name.eq_ignore_ascii_case(&full)) {
+            return Err((StatusCode::FORBIDDEN, format!("this leg's token reads {} only", run.repo_name)));
+        }
+        return pass_through(owner, name, tail, hub, req).await;
+    }
+    // Its own repository, with `contents: read` (W10-R04), unless it's public: anyone reads that.
+    if !job.may("contents", kiln_ci::plan::perms::Level::Read) && !hub.store.repo_public(run.repo_id.clone()).await.unwrap_or(false) {
+        return Err((StatusCode::FORBIDDEN, "this job's token lacks `contents: read`".into()));
     }
     let repo = repos.into_iter().find(|r| r.id == run.repo_id).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
     let mirror = crate::gitops::ensure_commit(hub, &repo, &run.sha).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the mirror: {e:#}")))?;
@@ -53,6 +56,50 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
     let cgi = Cgi { root, path_info: &path_info, configs: &["uploadpack.allowAnySHA1InWant=true", "uploadpack.allowFilter=true"], user: "kiln", method: req.method().as_str().to_owned(), query: req.uri().query().unwrap_or_default().to_owned(), headers: req.headers().clone() };
     let body = srv::body_bytes(req.into_body(), 64 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     backend(&cgi, body.to_vec(), None).await
+}
+
+/// A fetch of a repository kiln doesn't have (`actions/checkout`'s `repository:`, ORT's
+/// configuration): passed on to where kiln takes its owner's actions (`[[ci.actions.sources]]`,
+/// else GitHub) without the leg's token, as anyone fetches a public repository there, its answer
+/// streamed back. Nothing is kept, so a shallow fetch stays shallow. One that needs credentials
+/// there isn't found.
+async fn pass_through(owner: &str, name: &str, tail: &[&str], hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
+    let not_found = |why: String| (StatusCode::NOT_FOUND, why);
+    if !super::actions::plain_name(owner) || !super::actions::plain_name(name) {
+        return Err(not_found("no such repository".into()));
+    }
+    let base = super::actions::source(hub, owner, name).map_err(|e| not_found(format!("{e:#}")))?;
+    if !base.starts_with("https://") && !base.starts_with("http://") {
+        return Err(not_found(format!("{owner}/{name} is no repository kiln has")));
+    }
+    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let url = format!("{}/{}{query}", base.trim_end_matches('/'), tail.join("/"));
+    let post = req.method() == http::Method::POST;
+    let client = crate::http::client::github().map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    let mut up = client.request(if post { crate::http::client::Method::Post } else { crate::http::client::Method::Get }, &url).timeout(std::time::Duration::from_secs(600));
+    for h in ["content-type", "accept", "git-protocol", "content-encoding"] {
+        if let Some(v) = req.headers().get(h).and_then(|v| v.to_str().ok()) {
+            up = up.header(h, v);
+        }
+    }
+    if post {
+        up = up.body(srv::body_bytes(req.into_body(), 64 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?);
+    }
+    let mut resp = up.send().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{owner}/{name}: {e:#}")))?;
+    let status = resp.status();
+    if matches!(status, 401 | 403 | 404) {
+        return Err(not_found(format!("{owner}/{name} is no repository kiln has, nor a public one at {base} ({status})")));
+    }
+    let content_type = resp.header("content-type").unwrap_or("application/octet-stream").to_owned();
+    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    crate::rt::spawn(async move {
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            if tx.send(chunk).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(srv::response(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), &content_type, srv::channel_body(rx)))
 }
 
 /// A request for `git http-backend`: the repositories' root, the path below it, `-c` settings and

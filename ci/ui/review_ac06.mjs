@@ -7,7 +7,7 @@
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/review-shots:/shots \
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/review_ac06.mjs
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs"; // playwright-core 1.64.1
-import { checkLayout } from "./layout.mjs";
+import { checkLayout, pageErrors } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.AC06);
 const shots = "/shots";
@@ -40,8 +40,7 @@ for (const [name, type, phoneDevice] of [
   try {
     const ctx = await signedIn(browser, { viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();
-    const errors = [];
-    page.on("pageerror", (e) => errors.push(String(e)));
+    const errors = pageErrors(page, cfg.base);
     const bad = [];
     page.on("response", (r) => {
       if (r.status() >= 400) bad.push(`${r.status()} ${r.url().replace(cfg.base, "")}`);

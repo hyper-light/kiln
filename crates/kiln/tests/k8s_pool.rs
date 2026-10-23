@@ -343,6 +343,69 @@ fn w13_r07_k8s_pool_runs_each_leg_in_a_pod() -> anyhow::Result<()> {
     Ok(())
 }
 
+const LONG_WORKFLOW: &str = r#"on: push
+jobs:
+  long:
+    runs-on: pod
+    steps:
+      - run: for i in 1 2 3; do echo "tick $i"; sleep 5; done; echo "long enough"
+"#;
+
+/// A leg in a pod for longer than the server's reapers take to come round (15 s): its pod is left
+/// alone while it runs (the reaper of v1 jobs' pods took every pod without a job for a finished
+/// job's, so an executor's pod went at its next turn, mid-leg, and the leg was lost with it), and
+/// the leg runs once, to its end, its output all there.
+#[test]
+fn w13_r07_a_long_leg_in_a_pod_runs_to_its_end() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let kube = Kube::start(dir.path())?;
+    let kubeconfig = kube.kubeconfig(dir.path())?;
+    let pool = "\n[[ci.pools]]\nname = \"pods\"\nexecutor = \"k8s\"\nlabels = [\"pod\"]\nmax = 1\n";
+    let extra = "[kubernetes]\nenabled = true\nnamespace = \"ci\"\nagent_image = \"kiln-agent:test\"\n";
+    let s = start_env(dir.path(), &Options { agent: false, ci: pool, extra }, false, &[("KUBECONFIG", &kubeconfig.to_string_lossy())])?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::write(work.join(".github/workflows/long.yml"), LONG_WORKFLOW)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "long"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let mut run = Value::Null;
+    until(&s, 240, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0").cloned().unwrap_or_default();
+        Ok(run.get("finished_at").is_none_or(Value::is_null).then(|| body.clone()))
+    })?;
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut log = String::new();
+    for step in 0..3 {
+        let (_, text) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/logs?step={step}"), &s.admin, None)?;
+        log.push_str(&text);
+    }
+    let pods_log = std::fs::read_dir(dir.path().join("pods"))
+        .map(|d| d.flatten().map(|e| std::fs::read_to_string(e.path().join("log")).unwrap_or_default()).collect::<Vec<_>>().join("\n---\n"))
+        .unwrap_or_default();
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{detail}\n{log}\n{pods_log}\n{}", s.log());
+    assert!(["tick 1", "tick 2", "tick 3", "long enough"].iter().all(|l| log.contains(l)), "{log}");
+    let seen = kube.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+    assert_eq!(seen.created.len(), 1, "one pod, the leg never lost with its runner: {:?}", seen.created.iter().filter_map(|p| p.pointer("/metadata/name")).collect::<Vec<_>>());
+    Ok(())
+}
+
 /// A leg with `container:` and `services:` on a `k8s` pool (W13-R07): a pod made for it, its job
 /// container the pod's main one (its image evaluated with the leg's matrix), its service a native
 /// sidecar `hostAliases` names, and its steps run where the pod's runner is, with no container of
@@ -378,8 +441,11 @@ fn w13_r07_a_leg_with_containers_runs_in_a_pod_made_for_it() -> anyhow::Result<(
         let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
         Ok(body.contains("\"last_polled_at\":null").then_some(body))
     })?;
+    // Not in a container kiln made: where the test itself runs in one (a CI pod a Docker runtime
+    // made), the pod's `/.dockerenv` is the host's, so it says nothing there.
+    let dockerenv = if Path::new("/.dockerenv").exists() { "" } else { "          test ! -e /.dockerenv\n" };
     let workflow = format!(
-        "on: push\njobs:\n  db:\n    runs-on: pod\n    strategy:\n      matrix:\n        v: [\"3.20\"]\n    container:\n      image: alpine:${{{{ matrix.v }}}}\n      env:\n        FROM_CONTAINER: yes\n    services:\n      cache:\n        image: redis:7\n        ports: [{port}]\n    steps:\n      - run: |\n          test ! -e /.dockerenv\n          echo \"port=${{{{ job.services.cache.ports['{port}'] }}}} env=$FROM_CONTAINER\"\n"
+        "on: push\njobs:\n  db:\n    runs-on: pod\n    strategy:\n      matrix:\n        v: [\"3.20\"]\n    container:\n      image: alpine:${{{{ matrix.v }}}}\n      env:\n        FROM_CONTAINER: yes\n    services:\n      cache:\n        image: redis:7\n        ports: [{port}]\n    steps:\n      - run: |\n{dockerenv}          echo \"port=${{{{ job.services.cache.ports['{port}'] }}}} env=$FROM_CONTAINER\"\n"
     );
     std::fs::write(work.join(".github/workflows/db.yml"), workflow)?;
     git(&home, &work, &["add", "."])?;
@@ -509,6 +575,10 @@ fn w17_r01_a_terminal_into_a_leg_in_a_pod() -> anyhow::Result<()> {
 /// pool with a Docker sidecar (`docker` in its `[[ci.pools]]`), each pod has the Docker CLI copied
 /// in, the engine as a privileged native sidecar its job container shares a socket and the work
 /// directory with, and the step runs there.
+fn docker_works() -> bool {
+    Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]).output().is_ok_and(|o| o.status.success())
+}
+
 #[test]
 fn w13_r07_docker_actions_in_pods_need_the_pools_sidecar() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -566,8 +636,14 @@ fn w13_r07_docker_actions_in_pods_need_the_pools_sidecar() -> anyhow::Result<()>
     let pods_log = std::fs::read_dir(dir.path().join("pods"))
         .map(|d| d.flatten().map(|e| std::fs::read_to_string(e.path().join("log")).unwrap_or_default()).collect::<Vec<_>>().join("\n---\n"))
         .unwrap_or_default();
-    assert_eq!(with, "success", "{notes}\n{log}\n{detail}\n{pods_log}\n{}", s.log());
-    assert!(log.contains("from-the-sidecar"), "{log}");
+    // The sidecar's engine is this machine's (the stand-in runs only a pod's job container): where
+    // no Docker answers (a CI pod), the job can't run its action, and only its pod is checked.
+    if docker_works() {
+        assert_eq!(with, "success", "{notes}\n{log}\n{detail}\n{pods_log}\n{}", s.log());
+        assert!(log.contains("from-the-sidecar"), "{log}");
+    } else {
+        eprintln!("no Docker here: the job with the sidecar isn't run to its end, only its pod checked");
+    }
     let seen = kube.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
     assert_eq!(seen.created.len(), 1, "a pod for the job with the sidecar only: {:?}", seen.created);
     let pod = seen.created.first().cloned().unwrap_or_default();

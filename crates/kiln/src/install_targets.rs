@@ -5,14 +5,16 @@
 //! - **The image.** `--image` names one; else one is built from this binary with this machine's
 //!   Docker, as kiln's own image is (`Dockerfile`): on Alpine for a static kiln (the released ones
 //!   are), else on this machine's own system, whose C library the binary was linked against.
-//! - **Into a cluster.** minikube, kind and k3d take the image from this machine's Docker; Docker
-//!   Desktop's cluster shares it; any other cluster pulls it from `--registry`, pushed there first.
+//! - **Into a cluster.** minikube, kind and k3d take the image from this machine's Docker (an image
+//!   `--image` names too, when that Docker has it); Docker Desktop's single node and OrbStack's
+//!   share it; any other cluster (Docker Desktop's multi-node one too) pulls it from `--registry`,
+//!   pushed there first.
 //! - **Kubernetes.** In `--namespace` (`kiln`): a service account with the role kiln's updates use
 //!   (its own Deployment, its pods), the admin token as a secret, a NodePort service, the config, a
 //!   volume and one Deployment (three nodes come with docs/p2p.md's P3). It's opened at a node's
 //!   address and the service's port, or through a port forward when no node can be reached.
-//! - **Docker.** A container (`kiln`), started again by Docker, its data in a volume, on `--port`
-//!   and the next port for QUIC.
+//! - **Docker.** A container (`kiln`, or `--name`), started again by Docker, its data in a volume
+//!   (`kiln-data`), on `--port` and the next port for QUIC.
 //! - **Done means it works.** An install ends once the kiln answers, its UI's page and script load
 //!   and its runner is connected, and says where to open it; else it says what failed and takes
 //!   back what it made.
@@ -83,11 +85,13 @@ async fn check(via: &Via<'_>) -> anyhow::Result<u64> {
     let (status, page) = via.get("/").await.context("its UI doesn't answer")?;
     anyhow::ensure!(status == 200, "its UI's page answers with {status}");
     let page = String::from_utf8_lossy(&page);
+    // The path from `/assets/` on: an API server's proxy rewrites a page's links to go through it.
     let script = page
         .split("src=\"")
         .skip(1)
         .filter_map(|s| s.split('"').next())
-        .find(|s| s.starts_with("/assets/") && s.ends_with(".js"))
+        .filter(|s| s.ends_with(".js"))
+        .find_map(|s| s.find("/assets/").and_then(|at| s.get(at..)))
         .context("its UI's page names no script: this kiln was built without its UI")?;
     let (status, _) = via.get(script).await.context("its UI's script doesn't load")?;
     anyhow::ensure!(status == 200, "its UI's script {script} answers with {status}");
@@ -124,13 +128,35 @@ fn client() -> anyhow::Result<crate::http::client::Client> {
     crate::http::client::Client::new(crate::http::client::Roots::WebPki, None)
 }
 
-/// Says an installed kiln is ready, where to open it, and its login link.
-pub fn opened(url: &str, token: &str, runners: u64) {
+/// Says an installed kiln is ready, where to open it, its login link, and `later`: the command
+/// that makes a new link.
+pub fn opened(url: &str, token: &str, runners: u64, later: &str) {
     let more = if runners > 1 { format!(" ({runners} runners)") } else { String::new() };
     say(format!("ready       it answers, its UI loads and its runner is connected{more}"));
     say("");
     say(format!("UI          {url}"));
-    say(format!("login link  {} (valid 5 min; `kiln login` makes a new one)", crate::api::otp_url(token, url)));
+    say(format!("login link  {} (valid 5 min)", crate::api::otp_url(token, url)));
+    say(format!("            a new one: {later}"));
+}
+
+/// Keeps a kiln installed elsewhere (a container, a cluster) where `kiln login` and `kiln token`
+/// look for one (`access::cluster_credentials_path`), unless that names another kiln already:
+/// whether it's kept there.
+fn remember(url: &str, token: &str) -> bool {
+    let path = crate::access::cluster_credentials_path();
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && !text.lines().any(|l| l.trim().strip_prefix("KILN_URL=").is_some_and(|u| u.trim_matches('"') == url))
+    {
+        return false;
+    }
+    let body = format!("# The kiln `kiln install` set up last; `kiln login` and `kiln token` reach it with these.\nKILN_URL={url}\nKILN_ADMIN_TOKEN={token}\n");
+    crate::util::write_secret(&path, body.as_bytes(), 0o600).is_ok()
+}
+
+/// The command that makes a new login link for the kiln at `url`: `kiln login` once it's
+/// remembered, else one given `token_from`, a shell command printing its admin token.
+fn later(url: &str, token: &str, token_from: &str) -> String {
+    if remember(url, token) { "kiln login".to_owned() } else { format!("kiln login --url {url} --token \"$({token_from})\"") }
 }
 
 // ------------------------------------------------------------------------------ the image
@@ -247,8 +273,14 @@ fn docker(args: &[&str]) -> anyhow::Result<String> {
 /// A whole kiln in a container on this machine's Docker.
 pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
     docker(&["version", "--format", "{{.Server.Version}}"]).context("Docker isn't running here, or this user can't use it")?;
-    if !docker(&["ps", "-aq", "--filter", &format!("name=^{APP}$")])?.is_empty() {
-        bail!("a container named {APP} is here already: remove it (docker rm -f {APP}) to install again");
+    let name = a.name.as_deref().unwrap_or(APP);
+    let volume = format!("{name}-data");
+    if !docker(&["ps", "-aq", "--filter", &format!("name=^{name}$")])?.is_empty() {
+        // Another tool's container may have the name (minikube names its node after its profile).
+        if docker(&["inspect", "--format", "{{index .Config.Labels \"kiln.installed\"}}", name]).is_ok_and(|l| l == "1") {
+            bail!("kiln is installed in Docker here already (container {name}): `docker rm -f {name}` and `docker volume rm {volume}` remove it, or name another one with --name");
+        }
+        bail!("a container named {name} is here already, and kiln didn't install it: name kiln's another with --name");
     }
     let (image, built) = match &a.image {
         Some(image) => (image.clone(), false),
@@ -258,31 +290,30 @@ pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
             (tag, built)
         }
     };
-    let volume = "kiln-data";
     let made_volume = docker(&["volume", "ls", "-q", "--filter", &format!("name=^{volume}$")])?.is_empty();
     let (http, quic) = (a.port, a.port.checked_add(1).context("--port can't be the last port: QUIC takes the next one")?);
     let url = format!("http://localhost:{http}");
     let undo = || {
-        let _ = docker(&["rm", "-f", APP]);
+        let _ = docker(&["rm", "-f", name]);
         if made_volume {
-            let _ = docker(&["volume", "rm", volume]);
+            let _ = docker(&["volume", "rm", &volume]);
         }
         if built {
             let _ = docker(&["image", "rm", &image]);
         }
     };
     let (ports, quic_ports, data, public) = (format!("{http}:7070"), format!("{quic}:7071/udp"), format!("{volume}:/var/lib/kiln"), format!("KILN_PUBLIC_URL={url}"));
-    let run = ["run", "-d", "--name", APP, "--hostname", APP, "--restart", "unless-stopped", "-p", &ports, "-p", &quic_ports, "-v", &data, "-e", &public];
+    let run = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped", "-p", &ports, "-p", &quic_ports, "-v", &data, "-e", &public];
     if let Err(e) = docker(&[&run[..], &["--label", "kiln.installed=1", &image]].concat()) {
         undo();
         return Err(e.context("starting its container (nothing was left)"));
     }
-    say(format!("container   {APP} ({image}), its data in volume {volume}{}", if made_volume { "" } else { " (kept from before)" }));
+    say(format!("container   {name} ({image}), its data in volume {volume}{}", if made_volume { "" } else { " (kept from before)" }));
     // Its admin token, as its server made it in its data.
     let mut token = String::new();
     let start = Instant::now();
     while token.is_empty() && start.elapsed() < Duration::from_secs(60) {
-        token = docker(&["exec", APP, "cat", "/var/lib/kiln/admin.token"]).unwrap_or_default();
+        token = docker(&["exec", name, "cat", "/var/lib/kiln/admin.token"]).unwrap_or_default();
         if token.is_empty() {
             crate::rt::sleep(Duration::from_secs(1)).await;
         }
@@ -293,12 +324,12 @@ pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
     };
     match ready {
         Ok(runners) => {
-            opened(&url, &token, runners);
-            say(format!("container   docker logs {APP}"));
+            opened(&url, &token, runners, &later(&url, &token, &format!("docker exec {name} cat /var/lib/kiln/admin.token")));
+            say(format!("container   docker logs {name}"));
             Ok(())
         }
         Err(e) => {
-            let logs = docker(&["logs", "--tail", "30", APP]).unwrap_or_default();
+            let logs = docker(&["logs", "--tail", "30", name]).unwrap_or_default();
             undo();
             let what = match (made_volume, built) {
                 (true, true) => "container, volume and image were",
@@ -325,20 +356,38 @@ fn context_name(context: Option<&str>) -> anyhow::Result<String> {
     doc.get("current-context").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_owned).context("the kubeconfig has no current context: give one with --context")
 }
 
-/// How the cluster of context `ctx` takes an image built on this machine (an empty command: it
-/// shares this machine's Docker), if it can: a minikube profile's, kind's or k3d's loader.
-fn loader(ctx: &str, minikube_profile: Option<&str>) -> Option<Vec<String>> {
-    let words = |w: &[&str]| Some(w.iter().map(|w| (*w).to_owned()).collect());
-    if let Some(p) = minikube_profile {
+/// How the cluster of context `ctx` (`nodes`, its nodes) takes an image from this machine's
+/// Docker: a minikube profile's, kind's or k3d's loader, or nothing (an empty command) for Docker
+/// Desktop's and OrbStack's single node, which runs on that Docker; else why it can't. Docker
+/// Desktop's multi-node cluster runs kind out of Docker's sight, so its images are pulled.
+fn loader(ctx: &str, nodes: &[Value]) -> Result<Vec<String>, String> {
+    let words = |w: &[&str]| Ok(w.iter().map(|w| (*w).to_owned()).collect());
+    if let Some(p) = nodes.iter().find_map(|n| n.pointer("/metadata/labels/minikube.k8s.io~1name")?.as_str()) {
         return words(&["minikube", "-p", p, "image", "load"]);
     }
-    if let Some(name) = ctx.strip_prefix("kind-") {
-        return words(&["kind", "load", "docker-image", "--name", name]);
+    // kind's nodes say their cluster: `kind://docker/<cluster>/<node>`.
+    if let Some(cluster) = nodes.iter().find_map(|n| n.pointer("/spec/providerID")?.as_str()?.strip_prefix("kind://")?.split('/').nth(1)) {
+        if ctx == "docker-desktop" {
+            return Err("Docker Desktop's multi-node cluster pulls its images from a registry".to_owned());
+        }
+        return words(&["kind", "load", "docker-image", "--name", cluster]);
     }
     if let Some(name) = ctx.strip_prefix("k3d-") {
         return words(&["k3d", "image", "import", "-c", name]);
     }
-    (ctx == "docker-desktop").then(Vec::new)
+    if ["docker-desktop", "orbstack"].contains(&ctx) {
+        return Ok(Vec::new());
+    }
+    Err(format!("the cluster of context {ctx} takes no image from this machine"))
+}
+
+/// Runs `load` (a [`loader`]'s command) for `image`.
+fn load_image(load: &[String], image: &str) -> anyhow::Result<()> {
+    let Some((bin, args)) = load.split_first() else { return Ok(()) };
+    let out = Command::new(bin).args(args).arg(image).stdin(Stdio::null()).output().with_context(|| format!("running {bin} (is it installed?)"))?;
+    anyhow::ensure!(out.status.success(), "{bin} couldn't load {image} into the cluster: {}", String::from_utf8_lossy(&out.stderr).trim());
+    say(format!("image       {image}, loaded into the cluster ({bin})"));
+    Ok(())
 }
 
 /// The hosts a NodePort service may be reached at from here, best first: this machine for a
@@ -362,20 +411,38 @@ fn addresses(ctx: &str, nodes: &[Value]) -> Vec<String> {
     out
 }
 
+/// The first port from `from` nothing listens on here, for a port forward (another kiln may have
+/// `from`). Nothing answers on it, and it can be had: on macOS a bind can share a port another
+/// server holds on every address.
+fn free_port(from: u16) -> u16 {
+    let free = |p: u16| {
+        let at = std::net::SocketAddr::from(([127, 0, 0, 1], p));
+        std::net::TcpStream::connect_timeout(&at, Duration::from_millis(200)).is_err() && std::net::TcpListener::bind(at).is_ok()
+    };
+    (from..from.saturating_add(100)).find(|p| free(*p)).unwrap_or(from)
+}
+
 /// `http://host:port`, an IPv6 address in brackets.
 fn url_of(host: &str, port: u64) -> String {
     if host.contains(':') { format!("http://[{host}]:{port}") } else { format!("http://{host}:{port}") }
 }
 
-/// The image the cluster runs, and its pull policy: `--image`; else one built from this binary,
-/// pushed to `--registry`, or loaded into a cluster that takes images from this machine.
-fn cluster_image(a: &InstallArgs, ctx: &str, minikube_profile: Option<&str>) -> anyhow::Result<(String, &'static str)> {
+/// The image the cluster runs, and its pull policy: `--image` (loaded into a cluster that takes
+/// images from this machine, when this machine's Docker has it); else one built from this binary,
+/// pushed to `--registry`, or loaded into the cluster.
+fn cluster_image(a: &InstallArgs, ctx: &str, nodes: &[Value]) -> anyhow::Result<(String, &'static str)> {
+    let load = loader(ctx, nodes);
     if let Some(image) = &a.image {
+        if let Ok(load) = &load
+            && !load.is_empty()
+            && docker(&["image", "inspect", "--format", "{{.Id}}", image]).is_ok()
+        {
+            load_image(load, image)?;
+        }
         return Ok((image.clone(), "IfNotPresent"));
     }
-    let load = loader(ctx, minikube_profile);
-    if load.is_none() && a.registry.is_none() {
-        bail!("the cluster of context {ctx} can't take an image built here: give --registry to push one to, or --image");
+    if let (Err(why), None) = (&load, &a.registry) {
+        bail!("{why}: give --registry to push the image built from this binary to, or --image of one it can pull");
     }
     let tag = own_tag().context("this binary's build can't be read to tag an image of it: give one with --image")?;
     build_image(&tag)?;
@@ -386,11 +453,7 @@ fn cluster_image(a: &InstallArgs, ctx: &str, minikube_profile: Option<&str>) -> 
         say(format!("image       pushed to {pushed}"));
         return Ok((pushed, "IfNotPresent"));
     }
-    if let Some((bin, args)) = load.as_deref().and_then(<[String]>::split_first) {
-        let out = Command::new(bin).args(args).arg(&tag).stdin(Stdio::null()).output().with_context(|| format!("running {bin} (is it installed?)"))?;
-        anyhow::ensure!(out.status.success(), "{bin} couldn't load the image into the cluster: {}", String::from_utf8_lossy(&out.stderr).trim());
-        say(format!("image       loaded into the cluster ({bin})"));
-    }
+    load_image(&load.unwrap_or_default(), &tag)?;
     Ok((tag, "Never"))
 }
 
@@ -407,10 +470,9 @@ pub async fn kubernetes_install(a: &InstallArgs) -> anyhow::Result<()> {
         }
     }
     let nodes = cluster.list_in(&GroupKind::new("", "Node"), None, None, false).await.context("listing the cluster's nodes")?;
-    let profile = nodes.iter().find_map(|n| n.pointer("/metadata/labels/minikube.k8s.io~1name")?.as_str()).map(str::to_owned);
     let hosts = addresses(&ctx, &nodes);
     anyhow::ensure!(!hosts.is_empty(), "the cluster's nodes have no address");
-    let (image, pull) = cluster_image(a, &ctx, profile.as_deref())?;
+    let (image, pull) = cluster_image(a, &ctx, &nodes)?;
     let token = crate::util::random_token();
     let mut made = Vec::new();
     let Err(e) = install_in(&cluster, &ctx, ns, (&image, pull), &token, &hosts, &mut made).await else { return Ok(()) };
@@ -442,20 +504,28 @@ async fn install_in(cluster: &Cluster, ctx: &str, ns: &str, image: (&str, &str),
             break;
         }
     }
+    let token_from = format!("kubectl --context {ctx} -n {ns} get secret kiln-admin -o jsonpath='{{.data.token}}' | base64 -d");
     match reached {
         Some(url) => {
             let runners = verify(&Via::Url(&http, url.clone()), READY_TIME).await?;
-            opened(&url, token, runners);
+            opened(&url, token, runners, &later(&url, token, &token_from));
         }
         None => {
-            let runners = verify(&Via::Proxy(cluster, format!("/api/v1/namespaces/{ns}/services/{APP}:http/proxy")), READY_TIME).await?;
+            let runners = verify(&Via::Proxy(cluster, proxy_base(ns)), READY_TIME).await?;
+            let local = free_port(7070);
             say("address     no node of the cluster can be reached from here: it was checked through the cluster's API server");
-            say(format!("            open it from here with: kubectl --context {ctx} -n {ns} port-forward svc/{APP} 7070:7070"));
-            opened("http://localhost:7070", token, runners);
+            say(format!("            open it from here with: kubectl --context {ctx} -n {ns} port-forward svc/{APP} {local}:7070"));
+            let url = format!("http://localhost:{local}");
+            opened(&url, token, runners, &later(&url, token, &token_from));
         }
     }
     say(format!("in cluster  kubectl --context {ctx} -n {ns} get pods"));
     Ok(())
+}
+
+/// Where kiln's service in `ns` is reached through the API server (its proxy).
+fn proxy_base(ns: &str) -> String {
+    format!("/api/v1/namespaces/{ns}/services/{APP}:http/proxy")
 }
 
 /// Makes `o`, a new object, and records it in `made`: the object as the cluster stored it.
@@ -486,7 +556,7 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": APP },
         "subjects": [{ "kind": "ServiceAccount", "name": APP, "namespace": ns }] });
     make(cluster, made, binding).await?;
-    make(cluster, made, json!({ "apiVersion": "v1", "kind": "Secret", "metadata": meta("kiln-admin"), "type": "Opaque", "stringData": { "admin.token": token } })).await?;
+    make(cluster, made, json!({ "apiVersion": "v1", "kind": "Secret", "metadata": meta("kiln-admin"), "type": "Opaque", "stringData": { "token": token } })).await?;
     let ports = json!([
         { "name": "http", "port": 7070, "targetPort": 7070, "protocol": "TCP" },
         { "name": "quic", "port": 7071, "targetPort": 7071, "protocol": "UDP" },
@@ -497,7 +567,7 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
     let node_port = |name: &str| service.pointer("/spec/ports")?.as_array()?.iter().find(|p| p.get("name").and_then(Value::as_str) == Some(name))?.get("nodePort")?.as_u64();
     let (http, quic) = (node_port("http").context("its service has no node port for HTTP")?, node_port("quic").context("its service has no node port for QUIC")?);
     let quic_host = if host.contains(':') { format!("[{host}]") } else { host.to_owned() };
-    let server = format!("public_url = \"{}\"\nquic_advertise = \"{quic_host}:{quic}\"\nadmin_token_file = \"/etc/kiln-admin/admin.token\"\n", url_of(host, http));
+    let server = format!("public_url = \"{}\"\nquic_advertise = \"{quic_host}:{quic}\"\nadmin_token_file = \"/etc/kiln-admin/token\"\n", url_of(host, http));
     make(cluster, made, json!({ "apiVersion": "v1", "kind": "ConfigMap", "metadata": meta("kiln-config"), "data": { "kiln.toml": config(&server) } })).await?;
     let claim = json!({ "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "10Gi" } } });
     make(cluster, made, json!({ "apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": meta("kiln-data"), "spec": claim })).await?;
@@ -640,13 +710,15 @@ mod tests {
 
     #[test]
     fn a_cluster_takes_an_image_built_here_the_way_its_kind_does() {
-        let cmd = |ctx: &str, p: Option<&str>| loader(ctx, p).map(|c| c.join(" "));
-        assert_eq!(cmd("minikube", Some("minikube")).as_deref(), Some("minikube -p minikube image load"));
-        assert_eq!(cmd("lab", Some("kiln-install-check")).as_deref(), Some("minikube -p kiln-install-check image load"));
-        assert_eq!(cmd("kind-dev", None).as_deref(), Some("kind load docker-image --name dev"));
-        assert_eq!(cmd("k3d-ci", None).as_deref(), Some("k3d image import -c ci"));
-        assert_eq!(cmd("docker-desktop", None).as_deref(), Some(""), "Docker Desktop's cluster shares its Docker");
-        assert_eq!(cmd("gke_prod_us-east1_main", None), None, "a cluster elsewhere needs a registry");
+        let node = |labels: Value, provider: &str| json!({ "metadata": { "labels": labels }, "spec": { "providerID": provider } });
+        let cmd = |ctx: &str, nodes: &[Value]| loader(ctx, nodes).map(|c| c.join(" "));
+        assert_eq!(cmd("lab", &[node(json!({ "minikube.k8s.io/name": "kiln-install-check" }), "")]).as_deref(), Ok("minikube -p kiln-install-check image load"));
+        assert_eq!(cmd("anything", &[node(json!({}), "kind://docker/dev/dev-control-plane")]).as_deref(), Ok("kind load docker-image --name dev"));
+        assert_eq!(cmd("k3d-ci", &[node(json!({}), "k3s://k3d-ci-server-0")]).as_deref(), Ok("k3d image import -c ci"));
+        assert_eq!(cmd("docker-desktop", &[node(json!({}), "")]).as_deref(), Ok(""), "Docker Desktop's single node runs on its Docker");
+        let desktop_kind = cmd("docker-desktop", &[node(json!({}), "kind://docker/desktop/desktop-control-plane")]);
+        assert!(desktop_kind.is_err_and(|why| why.contains("registry")), "Docker Desktop's multi-node cluster pulls");
+        assert!(cmd("gke_prod_us-east1_main", &[node(json!({}), "gce://prod/us-east1-b/n1")]).is_err(), "a cluster elsewhere needs a registry");
     }
 
     #[test]
@@ -656,6 +728,14 @@ mod tests {
         assert_eq!(addresses("gke", &nodes), ["34.1.2.3", "10.0.0.2", "10.0.0.3"]);
         assert_eq!(addresses("docker-desktop", &nodes[..1]), ["localhost", "10.0.0.2"]);
         assert_eq!(url_of("fd00::2", 30070), "http://[fd00::2]:30070");
+    }
+
+    #[test]
+    fn a_port_forward_takes_a_port_nothing_listens_on() -> anyhow::Result<()> {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = taken.local_addr()?.port();
+        assert_ne!(free_port(port), port);
+        Ok(())
     }
 
     #[test]
@@ -684,15 +764,17 @@ mod tests {
 
     #[test]
     fn an_installed_kiln_has_its_own_runner_and_the_address_it_was_given() -> anyhow::Result<()> {
-        let c: crate::config::Config = toml::from_str(&config("public_url = \"http://10.0.0.2:30070\"\nadmin_token_file = \"/etc/kiln-admin/admin.token\"\n"))?;
+        let c: crate::config::Config = toml::from_str(&config("public_url = \"http://10.0.0.2:30070\"\nadmin_token_file = \"/etc/kiln-admin/token\"\n"))?;
         assert_eq!((c.server.http_addr.as_str(), c.server.public_url.as_str()), ("0.0.0.0:7070", "http://10.0.0.2:30070"));
         assert_eq!((c.local_agent.enabled, c.local_agent.name.as_deref(), c.kubernetes.enabled), (true, Some("kiln"), false));
-        assert_eq!(c.server.admin_token_file.as_deref(), Some(Path::new("/etc/kiln-admin/admin.token")));
+        assert_eq!(c.server.admin_token_file.as_deref(), Some(Path::new("/etc/kiln-admin/token")));
         Ok(())
     }
 
     /// A kiln stand-in on a port of its own: `/healthz`, its page (naming its script, when `ui`),
-    /// the script, and `/healthz/server` with `runners` connected.
+    /// the script, and `/healthz/server` with `runners` connected; at those paths, and through an
+    /// API server's proxy to kiln's service in namespace `kiln`, which rewrites the page's links to
+    /// go through it, as Kubernetes' does.
     fn stand_in(ui: bool, runners: u64) -> anyhow::Result<String> {
         use std::io::Write as _;
         let l = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -707,9 +789,15 @@ mod tests {
                 } else {
                     "<!doctype html><html><p>The UI was not built into this binary.</p></html>"
                 };
-                let (status, body) = match req.split_whitespace().nth(1).unwrap_or("/") {
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                let proxied = path.strip_prefix(proxy_base("kiln").as_str());
+                let page = match proxied {
+                    Some(_) => page.replace("src=\"/", &format!("src=\"https://10.0.0.1:6443{}/", proxy_base("kiln"))),
+                    None => page.to_owned(),
+                };
+                let (status, body) = match proxied.unwrap_or(path) {
                     "/healthz" => ("200 OK", "ok".to_owned()),
-                    "/" => ("200 OK", page.to_owned()),
+                    "/" => ("200 OK", page),
                     "/assets/index-x1.js" => ("200 OK", "export {}".to_owned()),
                     "/healthz/server" => ("200 OK", format!(r#"{{"runners":{{"connected":{runners},"before":0,"back":1.0}}}}"#)),
                     _ => ("404 Not Found", String::new()),
@@ -730,6 +818,17 @@ mod tests {
             assert!(format!("{e:#}").contains("built without its UI"), "{e:#}");
             let Err(e) = verify(&Via::Url(&http, alone), Duration::from_millis(10)).await else { bail!("a kiln without its runner was taken as whole") };
             assert!(format!("{e:#}").contains("not ready after 0 s") && format!("{e:#}").contains("runner isn't connected"), "{e:#}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_kiln_no_node_can_be_reached_at_is_checked_through_the_api_servers_proxy() -> anyhow::Result<()> {
+        let server = stand_in(true, 1)?;
+        crate::rt::block_on(async move {
+            let endpoint = kiln_cd::kube::Endpoint { server, ca: None, insecure: false, tls_server_name: None, auth: kiln_cd::kube::Auth::None, namespace: None };
+            let cluster = Cluster::new("stand-in", endpoint)?;
+            assert_eq!(check(&Via::Proxy(&cluster, proxy_base("kiln"))).await?, 1);
             Ok(())
         })
     }

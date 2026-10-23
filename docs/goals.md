@@ -167,8 +167,8 @@ hundred goals and more fits, its met goals kept for the record.
 ## Big goals, planned first
 
 Agents are told to plan a goal that takes several steps before starting on it, and left to that,
-they often don't. So a stack plans its big goals itself, unless you turn it off (its `plan_big`
-setting: `goals/settings`, below). When a big goal of the agent's own is
+they often don't. So a stack plans its big goals itself, unless you turn it off (**Plan big goals
+first** on its agent's Plan tab; `goals/settings`, below). When a big goal of the agent's own is
 next to start, kiln turns it into a plan first, as **Make a plan** does: its planning (research
 inside and outside, its steps written, said ready) goes to the agent in its place, then its steps,
 and once they're all met, so is the goal.

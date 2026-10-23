@@ -61,7 +61,9 @@ fn calls(wf: &Workflow) -> Vec<String> {
     wf.jobs.iter().filter_map(|j| j.uses.clone()).collect()
 }
 
-/// A remote reusable workflow at its pinned commit.
+/// A remote reusable workflow at its pinned commit. The workflows it calls by `./` are its own
+/// repository's at that commit, as on GitHub, not the caller's: they're named so. (A step's `./`
+/// action is the job's workspace's, wherever its workflow came from.)
 async fn remote(hub: &Hub, r: &Remote) -> anyhow::Result<Workflow> {
     let sha = actions::pin(hub, r).await?;
     let mirror = r.mirror(hub).to_string_lossy().to_string();
@@ -71,5 +73,18 @@ async fn remote(hub: &Hub, r: &Remote) -> anyhow::Result<Workflow> {
     if let Some(d) = diags.iter().find(|d| d.is_error()) {
         anyhow::bail!("{}@{}: {} {}", r.path, r.git_ref, d.code, d.message);
     }
-    w.ok_or_else(|| anyhow::anyhow!("{} is not a workflow", r.path))
+    let mut w = w.ok_or_else(|| anyhow::anyhow!("{} is not a workflow", r.path))?;
+    own_calls(&mut w, r, &sha);
+    Ok(w)
+}
+
+/// `w`'s calls by `./`, named as `r`'s repository's at `sha`.
+fn own_calls(w: &mut Workflow, r: &Remote, sha: &str) {
+    for j in &mut w.jobs {
+        if let Some(u) = j.uses.as_mut()
+            && let Some(path) = u.strip_prefix("./")
+        {
+            *u = r.at(path, sha);
+        }
+    }
 }

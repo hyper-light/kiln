@@ -16,7 +16,10 @@ written from all of them, with the reason for each run that didn't pass.
         [--pass NAME]
 
 The server's runners must route `ubuntu-latest` (`[ci] github_labels = true`) and give legs
-Docker, as for the starter workflows (ci/conformance/starters.py).
+Docker, as for the starter workflows (ci/conformance/starters.py). The labels some of the
+repositories use for other hosted runners (Depot's, Namespace's, their own names for GitHub's
+larger runners) this script routes as GitHub's equivalents, with the server's routing rules
+(`PUT /api/ci/routing/rules`, which it replaces), as a user moving to kiln would.
 """
 
 import argparse
@@ -47,12 +50,50 @@ ORDER = [
 ]
 FINISHED = {"succeeded", "failed", "cancelled", "timed_out", "skipped"}
 
+# Other hosted runners' labels in the corpus, by the platform and image of GitHub's equivalent
+# (kiln's own rules for GitHub's labels, `github_label_rules`).
+HOSTED = {
+    ("linux", "x86_64", "kiln/runner-ubuntu-24.04"): [
+        "depot-ubuntu-24.04", "depot-ubuntu-24.04-4", "depot-ubuntu-24.04-8", "depot-ubuntu-24.04-16", "depot-ubuntu-latest-4",
+        "github-ubuntu-24.04-x86_64-2", "github-ubuntu-24.04-x86_64-4", "github-ubuntu-24.04-x86_64-8", "github-ubuntu-24.04-x86_64-32",
+        "ubuntu-24.04-xl", "ubuntu-latest-4-core-oss", "ubuntu-latest-16-core-oss",
+    ],
+    ("linux", "x86_64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-8", "depot-ubuntu-22.04-16"],
+    ("linux", "aarch64", "kiln/runner-ubuntu-24.04"): ["depot-ubuntu-24.04-arm-8", "depot-ubuntu-24.04-arm-16", "github-ubuntu-24.04-aarch64-4", "ubuntu-24.04-arm64-xl"],
+    ("linux", "aarch64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-arm-4"],
+    ("macos", "aarch64", None): ["namespace-profile-macos-15"],
+    ("windows", "x86_64", None): ["namespace-profile-windows-2022-x86-64-4", "namespace-profile-windows-2022-x86-64-16x32", "windows-2022-xl", "windows-latest-8-core-oss"],
+    ("windows", "aarch64", None): ["github-windows-11-aarch64-8"],
+}
+
 # Failures that aren't kiln's, by what their notes say: the reason the table gives.
 KNOWN = [
     (r"deploy-pages|Failed to create deployment \(status: 501\)", "GitHub Pages is outside kiln (docs/ci.md §1.3)"),
-    # `persist-credentials: false`, then a fetch of the repository: GitHub's public repositories
-    # answer anyone, kiln's only those signed in.
-    (r"could not read Username for", "the job drops its credentials and fetches again: kiln's repositories aren't read anonymously, as a public one on GitHub is"),
+    # The corpus submits the whole tree against an empty trunk: a check that compares a pull
+    # request with its base finds nothing there to compare.
+    (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
+    # What publishes with the repository's own secrets, which the corpus's copy hasn't.
+    (r"you are not authenticated for buf\.build", "it publishes to the Buf registry with the repository's secret (BUF_TOKEN), which the corpus's copy hasn't"),
+    (r"Docker config file not found|could not find api key for server quay\.io", "it pushes to Docker Hub and quay.io with the repository's secrets, which the corpus's copy hasn't"),
+    # prometheus's: the pull request's description, which the corpus's pull request (the whole
+    # tree) hasn't.
+    (r"release-notes block empty or not found", "it reads the pull request's description, which the corpus's pull request (the whole tree) hasn't"),
+    # bat's: the pull request's own changelog line, by its number and its author on GitHub.
+    (r"Search for added line in changelog", "it looks for the pull request's own changelog line (its number, its author from GitHub's API); the corpus's pull request is the whole tree"),
+    # A test that waits a few seconds for a message, or a minute for a release to boot, run while
+    # the lab's pacer froze its work (the machine's disks busy): to be run again quietly.
+    (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
+    # buildx's debug adapter tests wait 5 s for a build to end (`require.Fail(t, "timeout reached")`).
+    (r"Error:\s+timeout reached", "a test's timed wait (buildx's debug adapter waits 5 s for a build to end), in the lab, which runs at nice 19 and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    (r"Condition never satisfied", "a test's timed wait (testify's `Eventually`: prometheus's waits seconds for its server), in the slow lab: timing, to be run again when quiet"),
+    (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    # The lab's firewall keeps containers on networks of their own from its server, so its legs
+    # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
+    # answers. Prometheus's Triton test expects nothing at 127.0.0.1:443.
+    (r"an error occurred unmarshaling the discovery response json: invalid character '<'", "the lab's legs share the host's network, where a server listens on 443; a hosted runner's own machine has nothing there"),
+    # Two legs at once on that network share one EPMD (Erlang's port mapper), and name their
+    # nodes alike: elixir's `primary@<host>`.
+    (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),
 ]
 
 
@@ -117,6 +158,19 @@ class Api:
         return None
 
 
+def route_hosted(api):
+    """The server's routing rules: [`HOSTED`]'s labels each routed as its GitHub equivalent."""
+    rules = []
+    for (os_, arch, image), labels in HOSTED.items():
+        for label in labels:
+            rule = {"match": {"labels": [label]}, "require": [f"os == {os_}", f"arch == {arch}"]}
+            if image:
+                rule.update(executor=["docker", "host"], image=image)
+            rules.append(rule)
+    api.call("PUT", "/api/ci/routing/rules?scope=server", {"rules": rules})
+    print(f"routed {len(rules)} other hosted runners' labels as GitHub's", flush=True)
+
+
 def git(cwd, *args, check=True, env=None):
     env = dict(os.environ, GIT_AUTHOR_NAME="kiln", GIT_AUTHOR_EMAIL="kiln@example.com", GIT_COMMITTER_NAME="kiln", GIT_COMMITTER_EMAIL="kiln@example.com", GIT_TERMINAL_PROMPT="0", **(env or {}))
     r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env)
@@ -170,6 +224,46 @@ def snapshot(work, repo, commit):
     return dest, branch
 
 
+# A version's tag (`v1.2.3`, `1.2`, `release-1.2.3` aside): those a checkout of the whole history
+# fetches that a build reads (elixir's docs list them for their version chooser).
+VERSION_TAG = re.compile(r"^v?\d+(\.\d+)+([-.+][0-9A-Za-z.-]+)?$")
+
+
+def upstream_tags(work, repo, commit):
+    """The upstream's tag nearest `commit`, as `git describe --tags --abbrev=0` finds it in a
+    checkout of the whole history there (`fetch-depth: 0`), and its version tags (a thousand at
+    most, the newest first): `(None, [])` without them. Only the commits are fetched, none of
+    their files."""
+    d = os.path.join(work, "describe", repo.replace("/", "_") + ".git")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    try:
+        git(work, "clone", "-q", "--bare", "--filter=tree:0", f"https://github.com/{repo}.git", d)
+        if not git(d, "rev-parse", "-q", "--verify", commit + "^{commit}", check=False):
+            git(d, "fetch", "-q", "--filter=tree:0", "origin", commit)
+        nearest = git(d, "describe", "--tags", "--abbrev=0", commit, check=False) or None
+        tags = [t for t in git(d, "tag", "--sort=-v:refname").splitlines() if VERSION_TAG.match(t)][:1000]
+        return nearest, tags
+    except RuntimeError as e:
+        print(f"{repo}: no tags of the upstream's found ({e})", flush=True)
+        return None, []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def version_tags(work, repo, commit, dest):
+    """`upstream_tags`, kept with the snapshot at `dest`."""
+    mark = os.path.join(dest, ".git", "kiln-snapshot-tags.json")
+    if os.path.exists(mark):
+        with open(mark) as f:
+            kept = json.load(f)
+        return kept.get("nearest"), kept.get("tags", [])
+    nearest, tags = upstream_tags(work, repo, commit)
+    with open(mark, "w") as f:
+        json.dump({"nearest": nearest, "tags": tags}, f)
+    return nearest, tags
+
+
 def only_corpus(dest, repo):
     """A commit keeping only the workflows F-03 took of `repo` (the one made before, when there
     is one: its runs are the ones to read); its sha."""
@@ -207,9 +301,16 @@ def wait_reason(w):
 ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|exception)\b")
 
 
+# A test runner's own words for a failed test, before the generic last line (make's, an exit code):
+# ExUnit's numbered failures (and the line after, what failed), libtest's, pytest's, Go's.
+FAILED_TEST = re.compile(r"^\d+\) test .+ \(.+\)$|^test \S+ \.\.\. FAILED$|^FAILED \S+::\S+|^--- FAIL: \S+|^---- \S+ stdout ----$")
+GENERIC = re.compile(r"^make(\[\d+\])?: \*\*\*|exit(ed with)? code|exit status \d+|^error: test failed, to rerun pass")
+
+
 def leg_detail(api, leg):
     """The failing step's name and its last useful line: the last that reads as an error, else
-    the last."""
+    the last. A generic one (make's, an exit code) is preceded by the first test the log says
+    failed, and what failed in it."""
     try:
         f = api.call("GET", f"/api/ci/legs/{leg['id']}/logs/failure")
     except RuntimeError:
@@ -217,6 +318,22 @@ def leg_detail(api, leg):
     lines = [re.sub(r"\x1b\[[0-9;]*m", "", x.get("text", "")).strip() for x in (f or {}).get("lines") or []]
     lines = [x for x in lines if x and not x.startswith("[command]")]
     said = next((x for x in reversed(lines) if ERRORISH.search(x) and not x.startswith("+ ")), lines[-1] if lines else "")
+    if GENERIC.search(said):
+        at = next((i for i, x in enumerate(lines) if FAILED_TEST.search(x)), None)
+        if at is not None:
+            test = lines[at]
+            # ExUnit says what failed on the next line.
+            if re.match(r"^\d+\) test ", test) and at + 2 < len(lines):
+                test = f"{test}: {lines[at + 2]}" if lines[at + 1].startswith(("test/", "lib/", "/")) else f"{test}: {lines[at + 1]}"
+            # libtest, after where the test panicked.
+            if m := re.match(r"^---- (\S+) stdout ----$", test):
+                panicked = next((i for i in range(at + 1, min(at + 8, len(lines))) if "panicked at" in lines[i]), None)
+                test = f"{m.group(1)}: {lines[panicked + 1]}" if panicked is not None and panicked + 1 < len(lines) else m.group(1)
+            said = f"{test} ({said})"
+    # A line the known failures name, wherever it is in the step's log, goes with it.
+    known = next((x for x in lines if any(re.search(pat, x) for pat, _ in KNOWN) and x not in said), None)
+    if known and not any(re.search(pat, said) for pat, _ in KNOWN):
+        said = f"{said[:180]} — {known[:110]}"
     return (f or {}).get("step_name") or "", said[:300]
 
 
@@ -257,13 +374,13 @@ def native(api, repo, branch):
         api.call("POST", "/api/repos", {"name": repo, "mode": "native", "default_branch": branch, "public": True})
 
 
-def push(api, dest, repo, refspec):
+def push(api, dest, repo, *refspecs):
     """Pushes to kiln's repository `repo`, the token in a header (not in the URL)."""
     import base64
 
     basic = base64.b64encode(f"x:{api.token}".encode()).decode()
     env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": "Authorization: Basic " + basic}
-    git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", refspec, env=env)
+    git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", *refspecs, env=env)
 
 
 def settle(api, repo, event, sha, timeout):
@@ -331,6 +448,21 @@ def run_repo(api, args, repo, commit):
     trunk, top = commits(dest, repo, args.pass_name or "")
     native(api, repo, branch)
     push(api, dest, repo, f"{trunk}:refs/heads/{branch}")
+    # The upstream's tags, on the trunk, as a checkout of the whole history (`fetch-depth: 0`) has
+    # them on GitHub: a build that says its version by `git describe` (buildx's, which compose
+    # checks) says `<nearest>-1-g<sha>` there, not a bare sha, and one that lists the versions
+    # (elixir's docs) finds them. The nearest is annotated, which `describe` takes over the others
+    # on the same commit (and without `--tags`, alone). The trunk has no workflows: these pushes
+    # run nothing.
+    nearest, tags = version_tags(args.work, repo, commit, dest)
+    for t in tags:
+        if t != nearest:
+            git(dest, "tag", "-f", t, trunk)
+    if nearest:
+        git(dest, "tag", "-f", "-a", "-m", f"F-03: {repo}'s nearest tag upstream", nearest, trunk)
+    names = [t for t in tags if t != nearest] + ([nearest] if nearest else [])
+    for i in range(0, len(names), 200):
+        push(api, dest, repo, *[f"refs/tags/{t}:refs/tags/{t}" for t in names[i : i + 200]])
     corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
     out = {"repo": repo, "commit": commit, "branch": branch, "sha": top, "events": {}}
     for event in EVENTS:
@@ -339,6 +471,24 @@ def run_repo(api, args, repo, commit):
         runs, blocked = settle(api, repo, event, top, args.timeout)
         out["events"][event] = results(api, repo, event, corpus, runs, blocked)
     return out
+
+
+# A leg that waits for a machine the lab hasn't: macOS's or Windows's.
+ELSEWHERE = re.compile(r"` waits: no runner meets its requirements \(.*\b(os == (macos|windows)|runs-on \[[^\]]*(macos|windows))")
+
+
+def not_kilns(note):
+    """Why a leg's miss (its note) isn't kiln's to fix, or None when it is."""
+    if ELSEWHERE.search(note):
+        return "it waits for macOS or Windows, which the lab hasn't (its runner is Linux's)"
+    return next((r for pat, r in KNOWN if re.search(pat, note)), None)
+
+
+def miss(w):
+    """A workflow's result for an event, a miss: the reasons it's not kiln's, every leg's that
+    missed, or None when one of them is kiln's (or none says why)."""
+    reasons = [not_kilns(x) for x in w.get("notes", [])]
+    return sorted(set(reasons)) if reasons and all(reasons) else None
 
 
 def write(out_dir):
@@ -354,6 +504,8 @@ def write(out_dir):
     rows = [(d, n) for d in done for n in sorted({n for e in d["events"].values() for n in e})]
     ran = [(d, n) for d, n in rows if any(e.get(n, {}).get("result") != "no run" for e in d["events"].values())]
     passed = [(d, n) for d, n in ran if all(e.get(n, {}).get("result") in ("pass", "no run", None) for e in d["events"].values())]
+    missed = [(d, n) for d, n in ran if (d, n) not in passed]
+    explained = [(d, n) for d, n in missed if all(e.get(n, {}).get("result") in ("pass", "no run", None) or miss(e[n]) for e in d["events"].values())]
     lines = [
         "# CI conformance: F-03's popular repositories",
         "",
@@ -363,7 +515,10 @@ def write(out_dir):
         "(`pull_request`, every file changed), then pushed to the trunk (`push`). The starter workflows",
         "are in `docs/ci-conformance.md`.",
         "",
-        f"**{len(passed)} of {len(ran)} workflows that ran passed** ({len(rows)} in all) in {len(done)} of {len(ORDER)} repositories run so far.",
+        f"**{len(passed)} of {len(ran)} workflows that ran passed.** {len(explained)} more missed only for reasons not kiln's, each leg's named below,"
+        f" and {len(missed) - len(explained)} for one that is kiln's to fix ({len(rows)} in all) in {len(done)} of {len(ORDER)} repositories run so far.",
+        "",
+        "A cell says why each of its legs that missed did, when none is kiln's; `kiln's` when one is, or says nothing.",
         "",
     ]
     for d in done:
@@ -377,9 +532,9 @@ def write(out_dir):
                 if w["result"] == "no run":
                     said = [no_run(d["repo"], n, e)]
                 result = w["result"]
-                why = next((r for pat, r in KNOWN if any(re.search(pat, x) for x in said)), None)
-                if why and result != "pass":
-                    result += f": {why}"
+                if result not in ("pass", "no run"):
+                    why = miss(w)
+                    result += f": {'; '.join(why)}" if why else ": kiln's"
                 cells.append(result)
                 said = ([w["legs"]] if w.get("legs") else []) + said
                 if said:
@@ -405,6 +560,7 @@ def main():
     os.makedirs(args.work, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
     srcs = sources()
+    route_hosted(api)
     for repo in ORDER:
         if args.only and repo not in args.only:
             continue

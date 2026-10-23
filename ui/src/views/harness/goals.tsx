@@ -365,6 +365,14 @@ function GoalPanel({
           : `Goals run one after another on this agent: each goes to ${who} as its own /goal, and the next starts once it's met.`}{" "}
         Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
       </p>
+      {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
+      <label className="gs-option">
+        <input type="checkbox" className="check" checked={stack?.plan_big ?? true} disabled={busy} onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))} />
+        <span>
+          Plan big goals first
+          <span className="gs-option-hint">A goal longer than a couple of sentences is researched and planned before it&rsquo;s worked on, its steps run under it.</span>
+        </span>
+      </label>
       {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
       {stack?.state === "paused" && stack.reason && (
         <p className="gs-reason">

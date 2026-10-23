@@ -7,7 +7,7 @@
 //       -v $PWD/ci/ui:/check:ro -v <dir with node_modules/playwright-core>:/pw:ro -v /tmp/runs-shots:/shots \
 //       mcr.microsoft.com/playwright:v1.64.1-noble node /check/runs_window_check.mjs
 import { chromium, webkit, devices } from "/pw/node_modules/playwright-core/index.mjs";
-import { checkLayout } from "./layout.mjs";
+import { checkLayout, pageErrors } from "./layout.mjs";
 
 const cfg = JSON.parse(process.env.SIGNIN);
 const shots = "/shots";
@@ -53,8 +53,7 @@ for (const [name, type, phone] of [
       await signIn.goto((await r.json()).url);
       await signIn.close();
       const page = await ctx.newPage();
-      const errors = [];
-      page.on("pageerror", (e) => errors.push(String(e)));
+      const errors = pageErrors(page, cfg.base);
       let served = 0;
       await page.route(/\/api\/runs(\?|$)/, async (route) => {
         const u = new URL(route.request().url());

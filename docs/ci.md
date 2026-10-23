@@ -1440,7 +1440,8 @@ for GHA semantics; kiln's matrix and data-flow additions on top. Pure code in
 - **W04-R24** `jobs.<id>.uses` names `./.github/workflows/<file>` or `$/.github/workflows/<file>`
   (both the same commit; `$/` reads it without a checkout, GitHub-exact) or
   `owner/repo/.github/workflows/<file>@ref` (fetched through W07's mirror, pinned to the SHA the
-  ref resolved to when the run started). Inputs are typed (`boolean`, `number`, `string`) with
+  ref resolved to when the run started). A called workflow's own `./` calls are its repository's,
+  at that commit, not the caller's. Inputs are typed (`boolean`, `number`, `string`) with
   defaults and `required`; `secrets` are mapped explicitly or `inherit`ed; outputs map
   `jobs.<id>.outputs` of the called workflow. Called jobs appear as `<caller> / <called>`. The
   `github` context is the caller's; the OIDC `job_workflow_ref` is the called workflow's.
@@ -2040,7 +2041,8 @@ It replaces `exec.rs` for `AssignV2`.
 - **W06-R08 Masking.** Secrets the leg receives, values from `::add-mask::`, and every line of a
   multi-line secret are replaced by `***` in logs, annotations, summaries, step names and outputs
   before anything leaves the runner. Masking works across chunk boundaries (a streaming matcher
-  keeps the longest mask's length minus one byte of look-behind). kiln also masks each secret's
+  holds back what could be the start of a mask still arriving, and lets the rest go at once, so a
+  step's live log keeps up with whole lines). kiln also masks each secret's
   base64, percent-encoded and JSON-escaped forms (secrets of 8 or more characters). Values shorter
   than 4 characters are not masked (that would destroy logs); the secret's settings page warns.
 - **W06-R09 Logs.** Raw bytes per step as today (ANSI kept), plus `JobEvent`s for groups and
@@ -2397,6 +2399,13 @@ Gives step execution for `uses:`.
     to that repository's legs only. No checkout is needed.
   - R02 through reusable workflows: their calls are followed when the run starts, and the
     actions of the workflows they call are pinned with the rest.
+  - An owner's `.github` repository, where `crazy-max/.github` and `docker/.github` keep the
+    actions and workflows their repositories share, is a repository like any other. A name may
+    start with a dot, but is never dots alone. A workflow there that calls another by `./` calls
+    its own repository's, at that commit (W04-R24), not the caller's
+    (`w07_r02_an_owners_shared_repository`). The corpus's docker/buildx found both. Its
+    annotations step failed with "was not resolved when the run started", and its `binaries`
+    call (`docker/github-builder`'s `bake.yml`) with "no such workflow".
   - R02 through the repository's own composite actions (`./path`): each is read from the
     repository at the running commit, where a checkout of it puts it, and its remote actions are
     pinned with the rest (`w07_ac04_kinds`'s local action uses one nothing else does). The
@@ -2596,6 +2605,18 @@ reusing the results of jobs whose inputs have not changed.
       links to kiln.
   - **Unzipped files.** A file uploaded with `archive: false` downloads raw, under its own name
     (`Content-Disposition`).
+  - **v1 to v3.** GitHub still takes their protocol, file containers, from an action its version
+    check doesn't refuse. bat's `upload-artifact@master` (2.0.1, July 2020) uploads there and its
+    run passes, its artifacts kept as v4's are. kiln serves it at `ACTIONS_RUNTIME_URL`
+    (`_apis/pipelines/workflows/<run>/artifacts`, `_apis/resources/Containers/<id>`,
+    `services/pipelines.rs`):
+    - a file at a time, in `Content-Range` chunks, gzipped when that's smaller;
+    - another upload by the artifact's name adds to it, as v3 had it (a matrix's legs, one
+      artifact); one still uploading waits for the next finish;
+    - its size, set, zips what came.
+
+    Such an artifact is one of the run's like any other, read by v4's actions and the REST API,
+    and the run's v4 artifacts are read this way too (`w08_r08_artifacts_as_v3_keeps_them`).
 
 **Requirements: kiln's improvements** (G-10, G-19)
 
@@ -3352,7 +3373,9 @@ enforcement points to W18, agent isolation to W20.
     `job.services` context;
   - teardown;
   - Docker actions (W07-R06);
-  - `CAP_DOCKER` announced when a CLI answers.
+  - `CAP_DOCKER` announced when a CLI answers. One probe runs at a time, waited for 10 s from
+    its start. A daemon too busy to answer by then (a loaded machine) is asked again at the
+    runner's next connection, rather than taken for absent until a restart.
 - *Done.* R04's `docker` executor:
   - a leg runs in a fresh container of its routing rule's image, without the host's Docker
     socket;
@@ -3391,7 +3414,10 @@ enforcement points to W18, agent isolation to W20.
     `snap install NAME` installs Ubuntu's package of each name, as `taiki-e/install-action`'s
     Valgrind asks for (tokio's stress tests), and anything else says why it can't.
 
-  On Ubuntu 24.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's image's
+  It comes for Ubuntu 26.04 too (`kiln/runner-ubuntu-26.04`, `ImageOS=ubuntu26`, from
+  `ubuntu-26.04` and `ubuntu-26.04-arm`; four of the corpus's repositories ask for it), and
+  `ubuntu-slim`, GitHub's lightweight runner, gets `kiln/runner-ubuntu-24.04-slim`. On Ubuntu
+  24.04 and 26.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's images'
   does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.
 
   apt assumes yes, as GitHub's images set it. Cargo's and npm's global directories are the
@@ -3419,6 +3445,27 @@ enforcement points to W18, agent isolation to W20.
   these legs' containers have no seccomp filter, as a hosted runner's machine has none: with the
   host's Docker they could start any container they like, and the filter kept debuggers from
   turning ASLR off (`personality`, which lldb needs to launch a program: cargo's `lldb` tests).
+
+  The daemon is still the host's, one for every leg on that runner, so the socket gives each leg
+  names of its own. A hosted runner gives each job a machine and a daemon of its own.
+  - What a step makes through the socket gets a suffix of the leg's own on the daemon (`-k` and
+    8 hex digits from the leg's id): a container (`--name`), a network, or a volume (made, or
+    named by a container's mount, which makes it on a machine of its own).
+  - The leg's later requests by that name are taken to it: paths, `rename`, `commit`, a create's
+    network, links, `--volumes-from`, `--pid` and `--ipc container:`, a network's connect.
+  - A container is found on its networks by the name it was given (an alias).
+  - The daemon's answers say the names as the leg gave them. Its lists and events leave out what
+    other legs made, and a prune takes only the leg's own.
+  - Ids, and names the leg didn't make (kiln's for its services, what was there before), go on
+    as they came.
+
+  So two legs at once can both make cargo's `cargo_test_0`, or the same compose project, as two
+  hosted jobs can (`w13_r04_two_legs_make_the_same_names`). Before, they collided. What a leg
+  made carries the labels `kiln.socket.leg.<tag>` and `kiln.socket.runner.<hash>`, keys of their
+  own (a leg's socket within another's, kiln's tests in a kiln leg, keeps both). It goes when the leg ends,
+  as the end of its machine would take it, and in the sweep when a runner that stopped short
+  starts again. The leg's containers' anonymous volumes go with them (kiln's own services' left
+  theirs before). Images and the build cache stay the daemon's, every leg's cache.
 - *Done.* In kiln's runner image, a `docker` leg has GitHub's hosted runners' paths:
   `/home/runner/work/<repo>/<repo>` for the workspace, `/home/runner/work/_temp` and
   `/home/runner/work/_actions` beside it, the event file and the file commands under `_temp`, and
@@ -3558,10 +3605,14 @@ enforcement points to W18, agent isolation to W20.
       comes).
   - A terminal into a pod's leg (W17-R01) is the pod's own shell: the leg is recorded as `k8s`,
     so it needs `runs.debug`, not `runners.terminal`.
+  - An executor's pod is the pool's to reap alone: the reaper of v1 jobs' pods leaves a pod that
+    carries no job. (It took one for a finished job's, so a leg that ran past the reaper's next
+    turn, within 15 s, lost its pod mid-leg, was tried again in another and lost again.)
   - Checked against a stand-in for Kubernetes's API that runs each pod's job container on the
     machine, as a kubelet would, with no container engine but a Docker sidecar's
     (`w13_r07_k8s_pool_runs_each_leg_in_a_pod`: three legs on a pool of at most two pods, each
     leg on a pod's runner of its own, the pods gone after;
+    `w13_r07_a_long_leg_in_a_pod_runs_to_its_end`: a 15-second leg runs once, in its one pod;
     `w13_r07_a_leg_with_containers_runs_in_a_pod_made_for_it`: the pod's job container from the
     leg's matrix, its service a sidecar, its steps run in place with the service's ports;
     `w13_r07_docker_actions_in_pods_need_the_pools_sidecar`: KCI4032 on a pool without one, and
@@ -3862,9 +3913,20 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     public repository (`POST /api/repos` with `public: true`, shown as `public` in its listing),
     which anyone reads without a token, as anyone reads a public GitHub repository. A step's
     `git fetch` after `actions/checkout`'s `persist-credentials: false` relies on it (the
-    corpus's elixir; its repositories are public, as on GitHub). A token that isn't kiln's is
-    refused, public or not, and a push always needs one
-    (`w14_r01_public_repositories_read_without_a_token`);
+    corpus's elixir; its repositories are public, as on GitHub), and so does a token of kiln's
+    that may not read it (a job's whose `permissions` leave `contents` out, as elixir's CodeQL
+    jobs' do). A token that isn't kiln's is refused, public or not, and a push always needs one
+    that may (`w14_r01_public_repositories_read_without_a_token`). A mirrored repository that's
+    public reads so too, and so does the REST facade (R11): a job's read of its public
+    repository needs none of its `permissions`, as on GitHub, where CodeQL's `actions: read` is
+    "only required for workflows in private repositories". Code scanning alerts aren't public,
+    and need `security-events: read` (`w10_r04_a_public_repositorys_reads_need_no_permission`;
+    the corpus's prometheus, whose CodeQL job reads its run);
+  - a leg's fetch of a repository kiln doesn't have (`actions/checkout`'s `repository:`, ORT's
+    configuration) goes on to where kiln takes that owner's actions (`[[ci.actions.sources]]`,
+    else GitHub), without the leg's token, so a public repository there is fetched as anyone
+    fetches it, and one that needs credentials isn't found. It's passed through, nothing kept,
+    so a shallow fetch stays shallow (`w14_r11_a_leg_fetches_another_public_repository`);
   - a push's ref updates are read before git sees the pack, and the push is refused whole, in
     git's own report and as `remote: kiln: …` lines, when one of them breaks policy:
     - only the owner, or a principal `.kiln/review.yaml` `direct-push` names (read from trunk),
@@ -3873,7 +3935,12 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     - an empty repository takes its first trunk from anyone who may push;
     - other branches need `diffs.submit`, tags `diffs.land`; a leg needs `contents: write`;
     - `refs/kiln/*` and `refs/pull/*` are kiln's;
-  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once.
+  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once;
+  - a repository deleted takes its runs with it, as a deleted GitHub repository does: the CI
+    engine drops their legs, a running one stopped on its runner and its slot free once the
+    runner says it ended, and nothing of them settles or retries
+    (`a_deleted_repository_takes_its_legs_with_it`). They used to stay in the engine, a queued
+    leg still assigned and run with its records gone.
   - Checked end to end with real git (`crates/kiln/tests/hosting.rs`): clone and push by
     developer, viewer, owner and powerless tokens, trunk refusals, whole-push refusal, and the
     push's run.
@@ -4686,6 +4753,9 @@ Firecracker microVMs, R01 in `k8s` pods, and R06. R03 is W06-R13's debug reruns.
   - Output is masked with the leg's secrets. What could start a secret is held back until output
     pauses for 25 ms.
   - Sessions are audited, and a terminal closes when its leg ends or is let go.
+  - A leg is running once it's assigned, and has its shell once its workspace and environment are
+    set up: a terminal asked for in between waits for it, 60 s at most, and opens with what was
+    typed meanwhile (`w17_r01_kiln_debug_terminal` asks as soon as the leg runs).
   - Runners announce it with `CAP_JOB_TTY` and offer it when `[terminal]` is enabled.
 - *R02, keep on failure*:
   - `debug: { keep-on-failure: 30m }`, or "Keep failed legs" when rerunning
@@ -6170,6 +6240,33 @@ and AC02.
     through Sigstore's public instance, which trusts GitHub's ID tokens, not kiln's. The
     dependency graph's compare those 5 starters need is now served (W14-R11); they're to be run
     again.
+- *AC01, the repositories' own workflows* (`ci/conformance/corpus.py`, results in
+  `docs/ci-conformance-corpus.md`), from 2026-10-22:
+  - Each of F-03's 24 repositories, at the commit F-03 took its workflows at, is kiln's own
+    repository (native and public, as on GitHub). Its whole tree is a pull request against an
+    empty trunk, then pushed to it. The trunk has the upstream's version tags, as a checkout of
+    the whole history has them.
+  - They run in the conformance lab: a throwaway server and a Linux runner of two slots. Its
+    `docker` executor runs kiln's runner image, given the host's Docker through each leg's own
+    socket. A pacer freezes the lab while the machine's disks are busy, for production's sake.
+  - Every leg that misses is classified, and a workflow's miss is explained only if each of its
+    legs' is:
+    - it waits for macOS or Windows, which the lab hasn't;
+    - a reason not kiln's: the repository's secrets, GitHub Pages, a check of the pull
+      request's description or base, the lab's host network, a timed wait in the slow lab;
+    - or kiln's to fix.
+  - Found and fixed on the way, each with its test:
+    - `cross`'s mounts, and GitHub's paths, in a `docker` leg (W13-R04);
+    - two legs at once on one runner's Docker: their names are their own now (W13-R04);
+    - a public repository read with no permission for it, over git and the REST API
+      (W10-R04, W14-R01);
+    - a leg's fetch of another public repository (W14-R11), and `GH_HOST` in a container;
+    - an owner's `.github` repository, and a remote reusable workflow's `./` calls (W07-R02);
+    - v1 to v3 artifacts (W08-R08);
+    - live logs the masker held back (W06-R08).
+  - Pass 1022g (six repositories, on builds before most of these): 10 of 25 workflows that ran
+    passed, 7 more missed only for reasons not kiln's, and 8 for kiln's, each fixed since.
+    Pass 1023b runs every repository again on a build with all of it.
 - *AC02, fourth batch* (2026-10-19), in the lab, the facade over HTTPS:
   - `github/codeql-action/upload-sarif`: the code-scanning starters above.
   - `peter-evans/create-pull-request@v7`: a branch pushed, a pull request opened, then updated
@@ -6363,8 +6460,10 @@ and AC02.
     `12345678901234567000`, `1000`, `0.1` and `16`.
   - Found on the way, and fixed: a cancelled step in a job container was never signalled (W05's
     AC07 note), and the probes' own matrix one didn't test an empty value written last.
-- *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
+- *Left.* AC01: the rest of pass 1023b; the corpus's macOS and Windows legs, which need such
+  runners in the lab (user-assisted: joining a Mac and a Windows machine runs third-party CI code
+  on them); the host executor's run of the repositories' workflows (W06-AC07), which needs a
+  machine of its own to run them on; and test tenants (W11-AC03); AC03's GitHub half (user-assisted: the probes recorded once on
   a public repository the user owns, then `compare` run against kiln), and AC05; F-21's last two
   (`azure/login` with a tenant, `attest-build-provenance` with GitHub's Sigstore); an
   authenticated way for legs to read github.com's API (W18's egress proxy).

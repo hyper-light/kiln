@@ -422,7 +422,10 @@ impl K8s {
         }
     }
 
-    /// Delete finished pods; fail jobs whose pods are stuck unable to start.
+    /// Delete finished jobs' pods; fail jobs whose pods are stuck unable to start. A pod that carries
+    /// no job isn't this loop's: a CI pool's executor (`ci::pools::reap_pods` keeps those), an image
+    /// check. Taken for a finished job's, an executor's pod went within 15 s of starting, its leg
+    /// lost with it.
     pub async fn reap_loop(self: Arc<Self>, hub: Arc<Hub>) -> anyhow::Result<()> {
         let mut pending_since: std::collections::HashMap<String, Instant> = Default::default();
         loop {
@@ -434,7 +437,7 @@ impl K8s {
             for pod in list {
                 let Some(name) = pod.metadata.name.clone() else { continue };
                 seen.insert(name.clone());
-                let job_id = pod.metadata.labels.as_ref().and_then(|l| l.get(JOB_LABEL)).cloned().unwrap_or_default();
+                let Some(job_id) = pod.metadata.labels.as_ref().and_then(|l| l.get(JOB_LABEL)).cloned() else { continue };
                 let status = pod.status.clone().unwrap_or_default();
                 let phase = status.phase.clone().unwrap_or_default();
                 let job_terminal = match hub.store.job(job_id.clone()).await? {

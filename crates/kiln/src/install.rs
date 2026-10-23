@@ -78,6 +78,7 @@ pub struct InstallArgs {
     /// Agent: join token (consumed during install; never stored in the boot command).
     #[arg(long, env = "KILN_JOIN_TOKEN", allow_hyphen_values = true)]
     pub token: Option<String>,
+    /// Agent: its name (this machine's host name when not given). Docker: the container's (kiln).
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long, value_delimiter = ',')]
@@ -351,7 +352,7 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
         let url = local_url(&cfg);
         if running {
             let runners = crate::install_targets::verify_url(&url, crate::install_targets::READY_TIME).await?;
-            crate::install_targets::opened(&url, &token, runners);
+            crate::install_targets::opened(&url, &token, runners, "kiln login");
         } else {
             say("");
             say(format!("UI          {url}"));
@@ -553,13 +554,23 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
             let line = format!("@reboot {} supervise --detach {}", bin.display(), args.iter().skip(1).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "));
             let current = Command::new("crontab").arg("-l").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
             if !current.lines().any(|l| l.trim() == line) {
-                let mut child = Command::new("crontab").arg("-").stdin(std::process::Stdio::piped()).spawn()?;
+                let mut child = Command::new("crontab").arg("-").stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
                 if let Some(mut stdin) = child.stdin.take() {
                     use std::io::Write as _;
                     let text: String = current.lines().filter(|l| !l.contains(&format!("{} supervise", bin.display()))).map(|l| format!("{l}\n")).collect();
-                    stdin.write_all(format!("{text}{line}\n").as_bytes())?;
+                    // A crontab that refuses may be gone before it reads this: its exit says so.
+                    let _ = stdin.write_all(format!("{text}{line}\n").as_bytes());
                 }
-                let _ = child.wait()?;
+                let out = child.wait_with_output()?;
+                if !out.status.success() {
+                    // busybox's crontab refuses anyone but root unless it's setuid.
+                    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                    say(format!(
+                        "boot        none: crontab refused it ({why}); start it with kiln supervise --detach -- {}",
+                        args.iter().skip(2).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
+                    ));
+                    return Ok(false);
+                }
             }
             say("boot        crontab @reboot");
             Ok(false)
@@ -642,7 +653,8 @@ fn stale_supervisors(ours: &[String]) -> (Vec<u32>, bool) {
     (stale, inside)
 }
 
-/// This user's processes, but this one: the system's view, and each one's pid and command line.
+/// This user's processes, but this one (and not their threads, which Linux lists beside them):
+/// the system's view, and each one's pid and command line.
 fn user_procs() -> (sysinfo::System, Vec<(u32, Vec<String>)>) {
     use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
@@ -652,7 +664,7 @@ fn user_procs() -> (sysinfo::System, Vec<(u32, Vec<String>)>) {
     let procs = sys
         .processes()
         .iter()
-        .filter(|(pid, p)| Some(**pid) != me && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
+        .filter(|(pid, p)| Some(**pid) != me && p.thread_kind().is_none() && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
         .map(|(pid, p)| (pid.as_u32(), p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()))
         .collect();
     (sys, procs)
@@ -1387,6 +1399,23 @@ fn remove_service(agent: bool) {
             let _ = Command::new("systemctl").args(flag).args(["disable", "--now", unit]).status();
         }
     }
+    if have("crontab")
+        && let Ok(out) = Command::new("crontab").arg("-l").stderr(Stdio::null()).output()
+    {
+        let current = String::from_utf8_lossy(&out.stdout).into_owned();
+        let kept = without_boot_line(&current, if agent { "agent" } else { "server" });
+        if kept != current
+            && let Ok(mut child) = Command::new("crontab").arg("-").stdin(Stdio::piped()).spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write as _;
+                let _ = stdin.write_all(kept.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                say("removed crontab @reboot");
+            }
+        }
+    }
     let mut paths = vec![
         home().join(format!(".config/systemd/user/{unit}.service")),
         home().join(format!(".config/autostart/{unit}.desktop")),
@@ -1418,6 +1447,19 @@ fn remove_service(agent: bool) {
             }
         }
     }
+}
+
+/// `crontab` without the `@reboot` line that starts kiln's `sub` service (`server`, `agent`), as
+/// [`setup_boot`] writes it: `@reboot <kiln> supervise --detach -- <sub> …`.
+fn without_boot_line(crontab: &str, sub: &str) -> String {
+    let ours = |l: &str| {
+        let Some(rest) = l.trim().strip_prefix("@reboot ") else { return false };
+        let mut words = rest.split_whitespace();
+        let exe = words.next().unwrap_or("").trim_matches('\'');
+        let rest: Vec<&str> = words.collect();
+        (exe.ends_with("/kiln") || exe.ends_with("/kiln.exe")) && rest.starts_with(&["supervise", "--detach", "--"]) && rest.get(3) == Some(&sub)
+    };
+    crontab.lines().filter(|l| !ours(l)).map(|l| format!("{l}\n")).collect()
 }
 
 /// Delete Scheduled Task `unit`. One registered with administrator rights (kiln's at boot) takes
@@ -1455,6 +1497,17 @@ mod tests {
         assert_eq!(win_quote(""), "\"\"");
         assert_eq!(win_quote(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(win_quote(r"C:\Program Files\kiln\"), r#""C:\Program Files\kiln\\""#);
+    }
+
+    #[test]
+    fn taking_kiln_out_of_a_crontab_takes_only_its_boot_line() {
+        let tab = "MAILTO=me\n@reboot /home/me/.local/bin/kiln supervise --detach -- server\n@reboot /home/me/.local/bin/kiln supervise --detach -- agent --server http://h:7070\n0 * * * * /usr/bin/backup -- server\n@reboot /opt/other supervise --detach -- server\n";
+        assert_eq!(
+            without_boot_line(tab, "server"),
+            "MAILTO=me\n@reboot /home/me/.local/bin/kiln supervise --detach -- agent --server http://h:7070\n0 * * * * /usr/bin/backup -- server\n@reboot /opt/other supervise --detach -- server\n"
+        );
+        assert!(!without_boot_line(tab, "agent").contains("-- agent"));
+        assert_eq!(without_boot_line("", "server"), "");
     }
 
     #[test]

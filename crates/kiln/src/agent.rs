@@ -239,10 +239,10 @@ enum Ev {
     /// The front door's status changed.
     FrontDoor,
     /// A blue/green upgrade step done off the loop (`crate::bluegreen`).
+    #[cfg(unix)]
     Bg(Bg),
     /// A server frame about something another runner process of this machine handed over (or a
     /// rollback took back), handled as if the server had sent it here.
-    #[cfg_attr(not(unix), allow(dead_code))]
     Forwarded(Vec<u8>),
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
@@ -281,6 +281,9 @@ enum Bg {
     /// A server frame for [`Ev::Forwarded`].
     #[cfg(unix)]
     Forwarded(Vec<u8>),
+    /// A server frame to take again ([`Ev::Forwarded`]): a terminal into a leg this runner holds,
+    /// asked for (by its session) before the leg had its shell.
+    Again(String, Vec<u8>),
 }
 
 /// What the new build said of one thing handed to it (blue/green).
@@ -355,6 +358,9 @@ impl Item {
 /// new build that it holds what was handed over.
 #[cfg(unix)]
 const RETIRE_QUIET: Duration = Duration::from_secs(8);
+/// How long a terminal into a leg this runner holds waits for the leg's shell (its workspace and
+/// environment set up, its images pulled) before it's refused.
+const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 use crate::upgrade::with_instance;
@@ -651,6 +657,7 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    crate::updates::warm_own_binary().await;
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
     if cfg!(target_os = "macos") && !o.ephemeral {
         std::thread::spawn(crate::os::macsign::keep_watching);
@@ -819,6 +826,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Terminals outlive the server connection: kept (with their replay state) across disconnects and
     // announced again on every reconnect.
     let mut terms: HashMap<String, (PtySession, Arc<crate::termsess::Session>)> = HashMap::new();
+    // Terminals into legs asked for before the leg had its shell, by session: taken again once it
+    // has, with what was typed meanwhile.
+    let mut shell_waits: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
     // Upgrades: a new binary on disk is taken up once no job runs, every terminal handed on so
     // shells survive. On Linux this process re-executes itself (same pid). On macOS, where a
@@ -1013,6 +1023,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             b = bg_rx.recv().fuse() => match b {
                 #[cfg(unix)]
                 Ok(Bg::Forwarded(data)) => Ev::Forwarded(data),
+                // Unless the terminal was closed meanwhile.
+                Ok(Bg::Again(session, data)) => if shell_waits.contains_key(&session) { Ev::Forwarded(data) } else { Ev::Watchdog },
+                #[cfg(unix)]
                 Ok(b) => Ev::Bg(b),
                 Err(_) => Ev::Watchdog,
             },
@@ -1043,8 +1056,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                 }
             }
-            #[cfg(not(unix))]
-            Ev::Bg(b) => match b {},
             #[cfg(unix)]
             Ev::Bg(b) => {
                 use crate::bluegreen::Frame;
@@ -1336,8 +1347,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         draining = false;
                         uplink.msg(AgentMsg::Instance(instance_hello.clone())).await;
                     }
-                    // Turned into Ev::Forwarded as it's received.
-                    Bg::Forwarded(_) => {}
+                    // Turned into Ev::Forwarded as they're received.
+                    Bg::Forwarded(_) | Bg::Again(..) => {}
                 }
             }
             Ev::Redial => {
@@ -1519,7 +1530,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
                 // an outpost says it's one instead.
-                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
+                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
                 // It sends its conversations' store: the server keeps them from that.
                 if shipper.is_some()
                     && let AgentMsg::Build { caps, .. } = &mut build
@@ -1843,6 +1854,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if let Some((pty, _)) = terms.get(&session) {
                             pty.write(data);
+                        } else if let Some(typed) = shell_waits.get_mut(&session) {
+                            typed.push(data);
                         }
                     }
                     ServerMsg::TermResize { session, cols, rows } => {
@@ -1875,6 +1888,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if crate::runner::firecracker::to_session(&session, crate::runner::guest::ToGuest::TermClose { session: session.clone() }) {
                             continue;
                         }
+                        shell_waits.remove(&session);
                         terms.remove(&session);
                     }
                     ServerMsg::AiTranscript { req, pid } => match &ai {
@@ -2393,9 +2407,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             continue;
                         }
                         let Some(shell) = crate::runner::kept::shell(&job) else {
+                            // A leg this runner holds but is still setting up: its shell comes once
+                            // its workspace and environment are ready, and the ask is taken again
+                            // then (or after LEG_SHELL_WAIT).
+                            if jobs.contains_key(&job) && !shell_waits.contains_key(&session) {
+                                shell_waits.insert(session.clone(), Vec::new());
+                                let (again, frame, waiting) = (bg_tx.clone(), data.clone(), session.clone());
+                                crate::rt::spawn(async move {
+                                    let until = Instant::now() + LEG_SHELL_WAIT;
+                                    while crate::runner::kept::shell(&job).is_none() && Instant::now() < until {
+                                        crate::rt::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    let _ = again.send(Bg::Again(waiting, frame)).await;
+                                });
+                                continue;
+                            }
+                            shell_waits.remove(&session);
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg isn't running or kept on this runner".into()) })).await.ok();
                             continue;
                         };
+                        let typed = shell_waits.remove(&session).unwrap_or_default();
                         let l = shell.launch(command.as_deref(), o.shell.as_deref());
                         let env: Vec<(&str, String)> = l.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                         match terminal::spawn_at(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env) {
@@ -2409,6 +2440,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     }
                                 });
                                 let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
+                                for data in typed {
+                                    pty.write(data);
+                                }
                                 terms.insert(session, (pty, state));
                             }
                             Err(e) => {
