@@ -252,7 +252,7 @@ mod tests {
             };
 
             // The first release: a CREATE change set, executed; the stack comes up.
-            let first = released("cloudformation", spec(), "1.0.0", &[("deploy/infra.yaml", V1)])?;
+            let first = released("cloudformation", spec(), "1.0.0", &[("deploy/infra.yaml", V1)], &[])?;
             let stack1 = first.first().cloned().unwrap_or_default();
             assert_eq!(stack1.pointer("/spec/parameters/Env"), Some(&json!("staging")), "the environment's name, filled by the release");
             assert_eq!(stack1.pointer("/spec/parameters/Version"), Some(&json!("1.0.0")));
@@ -270,7 +270,7 @@ mod tests {
             assert_eq!(fq_fake.state.lock().calls.len(), 2, "a stack as kiln wants it is let be: {:?}", fq_fake.state.lock().calls);
 
             // The next release: an UPDATE adding a topic.
-            let second = released("cloudformation", spec(), "1.1.0", &[("deploy/infra.yaml", V2)])?;
+            let second = released("cloudformation", spec(), "1.1.0", &[("deploy/infra.yaml", V2)], &[])?;
             let stack2 = second.first().cloned().unwrap_or_default();
             apply(&cx, &stack2).await?;
             let updated = settle().await?;
@@ -279,13 +279,13 @@ mod tests {
             assert_eq!(fq_fake.state.lock().calls.last().map(String::as_str), Some("ExecuteChangeSet shop-infra"));
 
             // A change set CloudFormation can't make is let go, saying why.
-            let serverless = released("cloudformation", spec(), "1.1.1", &[("deploy/infra.yaml", "Transform: AWS::Serverless-2016-10-31\nResources:\n  Fn:\n    Type: AWS::Serverless::Function\n")])?;
+            let serverless = released("cloudformation", spec(), "1.1.1", &[("deploy/infra.yaml", "Transform: AWS::Serverless-2016-10-31\nResources:\n  Fn:\n    Type: AWS::Serverless::Function\n")], &[])?;
             let refused = apply(&cx, serverless.first().unwrap_or(&Value::Null)).await;
             assert!(refused.is_err_and(|e| format!("{e:#}").contains("CAPABILITY_AUTO_EXPAND")));
             assert!(fq_fake.state.lock().change_sets.is_empty(), "the failed change set went");
 
             // One whose update fails: CloudFormation rolls it back, and the stack reads Degraded.
-            let broken = released("cloudformation", spec(), "1.2.0", &[("deploy/infra.yaml", BROKEN)])?;
+            let broken = released("cloudformation", spec(), "1.2.0", &[("deploy/infra.yaml", BROKEN)], &[])?;
             apply(&cx, broken.first().unwrap_or(&Value::Null)).await?;
             // Read as the engine reads it: with what kiln last applied, the broken template.
             let rolled = cx.with_applied(settle().await?);
@@ -302,7 +302,7 @@ mod tests {
             assert_eq!(fq_fake.state.lock().calls.len(), calls, "no change set for what runs already");
             assert_eq!(kiln_cd::providers::health(&back).map(|h| h.health), Some(kiln_cd::model::Health::Healthy), "{back}");
             // A later release updates it as any.
-            let third = released("cloudformation", spec(), "1.3.0", &[("deploy/infra.yaml", V1)])?;
+            let third = released("cloudformation", spec(), "1.3.0", &[("deploy/infra.yaml", V1)], &[])?;
             apply(&cx, third.first().unwrap_or(&Value::Null)).await?;
             assert_eq!(obj::str_at(&settle().await?, &["status", "status"]), Some("UPDATE_COMPLETE"));
 

@@ -14,6 +14,7 @@
 //! platform's answers read into objects, the requests a change makes, and health. The I/O half
 //! (the platform's API, credentials, polling) is the server's (`kiln::cd::targets`).
 
+pub mod aws_beanstalk;
 pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod cloudflare_workers;
@@ -179,11 +180,19 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "aws",
         place: &["region"],
         scope: None,
-        settings: &[s("application", true, "the application"), s("environment", true, "the environment"), s("bundle", true, "the source bundle (${{ artifacts.* }})")],
+        settings: &[
+            s("application", true, "the application (made if it isn't there)"),
+            s("environment", true, "the environment"),
+            s("bundle", true, "the source bundle: a zip CI built (${{ artifacts.* }}), or s3://bucket/key"),
+            s("platform", false, "for an environment kiln makes: a solution stack's name, or a platform's ARN"),
+            s("tier", false, "for an environment kiln makes: WebServer (the default) or Worker"),
+            s("cname", false, "for an environment kiln makes: its CNAME prefix"),
+            s("options", false, "option settings by namespace: {aws:elasticbeanstalk:command: {DeploymentPolicy: Rolling}}"),
+        ],
         kinds: &[kind("elasticbeanstalk.aws.kiln.dev", "Application", "Application"), kind("elasticbeanstalk.aws.kiln.dev", "ApplicationVersion", "Application version"), kind("elasticbeanstalk.aws.kiln.dev", "Environment", "Environment")],
-        capabilities: &[Traffic, Versions, Events, Logs, Drift, Adopt],
+        capabilities: &[Versions, Events, Drift, Adopt],
         reads: &["Dockerrun.aws.json", ".ebextensions"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "aws-ec2",
@@ -650,6 +659,7 @@ pub struct RenderInput<'a> {
 /// Renders an app's definition for `provider` into objects.
 pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, String> {
     match provider {
+        "aws-beanstalk" => aws_beanstalk::render(input),
         "aws-ecs" => aws_ecs::render(input),
         "aws-lambda" => aws_lambda::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
@@ -666,6 +676,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
 /// directory: what the render key covers.
 pub fn files(provider: &str, spec: &Value) -> Vec<String> {
     match provider {
+        "aws-beanstalk" => aws_beanstalk::files(spec),
         "aws-ecs" => aws_ecs::files(spec),
         "aws-lambda" => aws_lambda::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
@@ -684,6 +695,7 @@ pub fn health(obj: &Value) -> Option<Status> {
     }
     let group = crate::obj::group(obj);
     match for_group(group)?.name {
+        "aws-beanstalk" => aws_beanstalk::health(obj),
         "aws-ecs" => aws_ecs::health(obj),
         "aws-lambda" => aws_lambda::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),

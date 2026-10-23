@@ -43,10 +43,34 @@ pub struct ChangeSet {
     pub busy: u32,
 }
 
+/// A Beanstalk environment as the fake keeps it.
+#[derive(Clone, Debug, Default)]
+pub struct BeanstalkEnv {
+    pub id: String,
+    pub app: String,
+    pub label: String,
+    pub stack: String,
+    pub platform: String,
+    pub tier: String,
+    pub cname: String,
+    pub status: String,
+    pub health: String,
+    pub options: BTreeMap<(String, String), String>,
+    /// Describes left before what it's doing is done.
+    pub busy: u32,
+    /// Newest first.
+    pub events: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct State {
     pub stacks: BTreeMap<String, Stack>,
     pub change_sets: BTreeMap<String, ChangeSet>,
+    /// Beanstalk: applications by name, their descriptions.
+    pub apps: BTreeMap<String, String>,
+    /// Versions by (application, label): bucket, key, status, describes left.
+    pub versions: BTreeMap<(String, String), (String, String, String, u32)>,
+    pub envs: BTreeMap<String, BeanstalkEnv>,
     /// Every operation, in order: `ExecuteChangeSet shop-network`.
     pub calls: Vec<String>,
 }
@@ -117,6 +141,7 @@ impl srv::Handler for FakeQuery {
         let mut st = self.state.lock();
         match f.get("Version").map(String::as_str) {
             Some("2010-05-15") => cloudformation(&mut st, &action, &f),
+            Some("2010-12-01") => beanstalk(&mut st, &action, &f),
             _ => error(400, "InvalidAction", &format!("the fake takes no {action}")),
         }
     }
@@ -297,6 +322,197 @@ fn cloudformation(st: &mut State, action: &str, f: &BTreeMap<String, String>) ->
     }
 }
 
+fn env_json(name: &str, e: &BeanstalkEnv) -> Value {
+    json!({
+        "EnvironmentName": name, "EnvironmentId": e.id, "ApplicationName": e.app, "VersionLabel": e.label, "SolutionStackName": e.stack, "PlatformArn": e.platform,
+        "Tier": { "Name": e.tier, "Type": if e.tier == "Worker" { "SQS/HTTP" } else { "Standard" } }, "CNAME": format!("{}.us-east-1.elasticbeanstalk.com", e.cname),
+        "Status": e.status, "Health": e.health, "AbortableOperationInProgress": if e.status == "Updating" { "true" } else { "false" },
+        "EnvironmentArn": format!("arn:aws:elasticbeanstalk:us-east-1:123456789012:environment/{}/{name}", e.app)
+    })
+}
+
+fn beanstalk(st: &mut State, action: &str, f: &BTreeMap<String, String>) -> Response {
+    let invalid = |m: &str| error(400, "InvalidParameterValue", m);
+    let app = f.get("ApplicationName").cloned().unwrap_or_default();
+    let env_name = f.get("EnvironmentName").cloned().unwrap_or_default();
+    let options = |f: &BTreeMap<String, String>| -> BTreeMap<(String, String), String> {
+        (1..).map_while(|i| Some(((f.get(&format!("OptionSettings.member.{i}.Namespace"))?.clone(), f.get(&format!("OptionSettings.member.{i}.OptionName"))?.clone()), f.get(&format!("OptionSettings.member.{i}.Value")).cloned().unwrap_or_default()))).collect()
+    };
+    match action {
+        "CreateApplication" => {
+            if st.apps.contains_key(&app) {
+                return invalid(&format!("Application {app} already exists."));
+            }
+            st.apps.insert(app.clone(), f.get("Description").cloned().unwrap_or_default());
+            st.calls.push(format!("CreateApplication {app}"));
+            answer(action, &json!({ "Application": { "ApplicationName": app, "ApplicationArn": format!("arn:aws:elasticbeanstalk:us-east-1:123456789012:application/{app}") } }))
+        }
+        "DescribeApplications" => {
+            let names = list(f, "ApplicationNames");
+            let apps: Vec<Value> = st.apps.iter().filter(|(n, _)| names.is_empty() || names.contains(n)).map(|(n, d)| json!({ "ApplicationName": n, "Description": d, "Versions": st.versions.keys().filter(|(a, _)| a == n).map(|(_, l)| l.clone()).collect::<Vec<_>>() })).collect();
+            answer(action, &json!({ "Applications": apps }))
+        }
+        "CreateApplicationVersion" => {
+            let label = f.get("VersionLabel").cloned().unwrap_or_default();
+            if !st.apps.contains_key(&app) {
+                return invalid(&format!("No Application named '{app}' found."));
+            }
+            if st.versions.contains_key(&(app.clone(), label.clone())) {
+                return invalid(&format!("Application Version {label} already exists."));
+            }
+            let (bucket, key) = (f.get("SourceBundle.S3Bucket").cloned().unwrap_or_default(), f.get("SourceBundle.S3Key").cloned().unwrap_or_default());
+            st.versions.insert((app.clone(), label.clone()), (bucket, key, "PROCESSING".into(), 1));
+            st.calls.push(format!("CreateApplicationVersion {label}"));
+            answer(action, &json!({ "ApplicationVersion": { "ApplicationName": app, "VersionLabel": label, "Status": "PROCESSING" } }))
+        }
+        "DescribeApplicationVersions" => {
+            let labels = list(f, "VersionLabels");
+            let mut out = Vec::new();
+            for ((a, l), v) in st.versions.iter_mut() {
+                if (!app.is_empty() && *a != app) || (!labels.is_empty() && !labels.contains(l)) {
+                    continue;
+                }
+                if v.3 > 0 {
+                    v.3 -= 1;
+                } else if v.2 == "PROCESSING" {
+                    // A bundle that isn't a zip of an app fails as Beanstalk processes it.
+                    v.2 = if v.1.contains("broken") { "FAILED".into() } else { "PROCESSED".into() };
+                }
+                out.push(json!({ "ApplicationName": a, "VersionLabel": l, "SourceBundle": { "S3Bucket": v.0, "S3Key": v.1 }, "Status": v.2 }));
+            }
+            answer(action, &json!({ "ApplicationVersions": out }))
+        }
+        "CreateEnvironment" => {
+            let label = f.get("VersionLabel").cloned().unwrap_or_default();
+            if st.envs.get(&env_name).is_some_and(|e| e.status != "Terminated") {
+                return invalid(&format!("Environment {env_name} already exists."));
+            }
+            if !st.versions.contains_key(&(app.clone(), label.clone())) {
+                return invalid(&format!("No Application Version named '{label}' found."));
+            }
+            let mut opts: BTreeMap<(String, String), String> = [
+                (("aws:autoscaling:asg".to_owned(), "MinSize".to_owned()), "1".to_owned()),
+                (("aws:autoscaling:asg".to_owned(), "MaxSize".to_owned()), "4".to_owned()),
+                (("aws:elasticbeanstalk:command".to_owned(), "DeploymentPolicy".to_owned()), "AllAtOnce".to_owned()),
+            ]
+            .into_iter()
+            .collect();
+            opts.extend(options(f));
+            let e = BeanstalkEnv {
+                id: format!("e-{}", st.envs.len() + 1),
+                app: app.clone(),
+                label: label.clone(),
+                stack: f.get("SolutionStackName").cloned().unwrap_or_default(),
+                platform: f.get("PlatformArn").cloned().unwrap_or_default(),
+                tier: f.get("Tier.Name").cloned().unwrap_or_else(|| "WebServer".into()),
+                cname: f.get("CNAMEPrefix").cloned().unwrap_or_else(|| env_name.clone()),
+                status: "Launching".into(),
+                health: "Grey".into(),
+                options: opts,
+                busy: 2,
+                events: vec!["createEnvironment is starting.".into()],
+            };
+            st.calls.push(format!("CreateEnvironment {env_name} {label}"));
+            let out = env_json(&env_name, &e);
+            st.envs.insert(env_name, e);
+            answer(action, &out)
+        }
+        "UpdateEnvironment" => {
+            let label = f.get("VersionLabel").cloned();
+            let Some(e) = st.envs.get(&env_name).cloned().filter(|e| e.status != "Terminated") else { return invalid(&format!("No Environment found for EnvironmentName = '{env_name}'.")) };
+            if e.status != "Ready" {
+                return invalid(&format!("Environment named {env_name} is in an invalid state for this operation. Must be Ready."));
+            }
+            if let Some(l) = &label
+                && !st.versions.contains_key(&(e.app.clone(), l.clone()))
+            {
+                return invalid(&format!("No Application Version named '{l}' found."));
+            }
+            let crash = label.as_ref().and_then(|l| st.versions.get(&(e.app.clone(), l.clone()))).is_some_and(|v| v.1.contains("crash"));
+            let Some(live) = st.envs.get_mut(&env_name) else { return invalid("gone") };
+            if let Some(l) = &label {
+                live.label = l.clone();
+            }
+            live.options.extend(options(f));
+            live.status = "Updating".into();
+            // A version that crashes as it starts leaves the environment Red.
+            live.health = if crash { "Red".into() } else { "Grey".into() };
+            // Kiln's own reads as it applies take a step each.
+            live.busy = 3;
+            live.events.insert(0, "Environment update is starting.".into());
+            st.calls.push(format!("UpdateEnvironment {env_name} {}", label.unwrap_or_default()));
+            let out = st.envs.get(&env_name).map(|e| env_json(&env_name, e)).unwrap_or(Value::Null);
+            answer(action, &out)
+        }
+        "DescribeEnvironments" => {
+            let names = list(f, "EnvironmentNames");
+            let mut out = Vec::new();
+            for (n, e) in st.envs.iter_mut() {
+                if !names.is_empty() && !names.contains(n) {
+                    continue;
+                }
+                if e.busy > 0 {
+                    e.busy -= 1;
+                    if e.busy == 0 {
+                        match e.status.as_str() {
+                            "Terminating" => e.status = "Terminated".into(),
+                            _ => {
+                                e.status = "Ready".into();
+                                if e.health != "Red" {
+                                    e.health = "Green".into();
+                                }
+                                e.events.insert(0, if e.health == "Red" { "Environment health has transitioned from Pending to Severe.".into() } else { "Environment update completed successfully.".into() });
+                            }
+                        }
+                    }
+                }
+                if e.status != "Terminated" {
+                    out.push(env_json(n, e));
+                }
+            }
+            answer(action, &json!({ "Environments": out }))
+        }
+        "DescribeConfigurationSettings" => match st.envs.get(&env_name) {
+            Some(e) => {
+                let opts: Vec<Value> = e.options.iter().map(|((ns, n), v)| json!({ "Namespace": ns, "OptionName": n, "Value": v })).collect();
+                answer(action, &json!({ "ConfigurationSettings": [{ "ApplicationName": e.app, "EnvironmentName": env_name, "OptionSettings": opts }] }))
+            }
+            None => invalid(&format!("No Environment found for EnvironmentName = '{env_name}'.")),
+        },
+        "DescribeEvents" => {
+            let events: Vec<Value> = st.envs.get(&env_name).map(|e| e.events.iter().map(|m| json!({ "EventDate": "2026-10-22T00:00:00Z", "Message": m, "Severity": "INFO" })).collect()).unwrap_or_default();
+            answer(action, &json!({ "Events": events }))
+        }
+        "TerminateEnvironment" => {
+            if let Some(e) = st.envs.get_mut(&env_name) {
+                e.status = "Terminating".into();
+                e.busy = 1;
+                st.calls.push(format!("TerminateEnvironment {env_name}"));
+            }
+            answer(action, &json!({}))
+        }
+        "DeleteApplicationVersion" => {
+            let label = f.get("VersionLabel").cloned().unwrap_or_default();
+            if st.envs.values().any(|e| e.app == app && e.label == label && e.status != "Terminated") {
+                return invalid(&format!("Unable to delete application version {label} because it is being used by an environment."));
+            }
+            st.versions.remove(&(app, label.clone()));
+            st.calls.push(format!("DeleteApplicationVersion {label}"));
+            answer(action, &json!({}))
+        }
+        "DeleteApplication" => {
+            if st.envs.values().any(|e| e.app == app && e.status != "Terminated") {
+                return invalid(&format!("Unable to delete application {app} because it has running environments."));
+            }
+            st.apps.remove(&app);
+            st.versions.retain(|(a, _), _| *a != app);
+            st.calls.push(format!("DeleteApplication {app}"));
+            answer(action, &json!({}))
+        }
+        other => error(400, "InvalidAction", &format!("Beanstalk has no {other} in the fake")),
+    }
+}
+
 pub async fn start(fake: Arc<FakeQuery>) -> anyhow::Result<String> {
     let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 64).map_err(|e| anyhow::anyhow!("{e}"))?;
     let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -316,8 +532,9 @@ pub async fn start(fake: Arc<FakeQuery>) -> anyhow::Result<String> {
 /// release (`crate::deploy::kilncd::definition`), rendered for its target as KilnCD renders it,
 /// its source's files read from `files`, tracked as the app's, in wave order. The target is
 /// `<provider>/aws-test/us-east-1`.
-pub fn released(provider: &str, spec: Value, version: &str, files: &[(&str, &str)]) -> anyhow::Result<Vec<Value>> {
-    use crate::deploy::model::{App, Contacts, Environment, Package, Registration, ReleaseFile, RepoRef, SCHEMA, Targets};
+/// `artifacts` are the release's (its release.json's `artifacts`, by name: their digests).
+pub fn released(provider: &str, spec: Value, version: &str, files: &[(&str, &str)], artifacts: &[(&str, &str)]) -> anyhow::Result<Vec<Value>> {
+    use crate::deploy::model::{App, Artifact, Contacts, Environment, Package, Registration, ReleaseFile, RepoRef, SCHEMA, Targets};
     let package = Package::Platform { provider: provider.to_owned(), spec, repo: None, path: String::new() };
     let app = App { name: "shop".into(), project: "acme".into(), owners: vec![], package: package.clone(), namespace: None, properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None };
     let mut platforms = BTreeMap::new();
@@ -345,7 +562,7 @@ pub fn released(provider: &str, spec: Value, version: &str, files: &[(&str, &str
         enabled: true,
         version: Some(version.to_owned()),
         package,
-        artifacts: BTreeMap::new(),
+        artifacts: artifacts.iter().map(|(n, d)| ((*n).to_owned(), Artifact { repository: String::new(), tag: String::new(), digest: (*d).to_owned() })).collect(),
         requested_by: "ada".into(),
         at: String::new(),
         rollback_of: None,
