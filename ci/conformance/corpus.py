@@ -16,7 +16,10 @@ written from all of them, with the reason for each run that didn't pass.
         [--pass NAME]
 
 The server's runners must route `ubuntu-latest` (`[ci] github_labels = true`) and give legs
-Docker, as for the starter workflows (ci/conformance/starters.py).
+Docker, as for the starter workflows (ci/conformance/starters.py). The labels some of the
+repositories use for other hosted runners (Depot's, Namespace's, their own names for GitHub's
+larger runners) this script routes as GitHub's equivalents, with the server's routing rules
+(`PUT /api/ci/routing/rules`, which it replaces), as a user moving to kiln would.
 """
 
 import argparse
@@ -46,6 +49,22 @@ ORDER = [
     "vercel/next.js", "apache/arrow", "nodejs/node", "pytorch/pytorch",
 ]
 FINISHED = {"succeeded", "failed", "cancelled", "timed_out", "skipped"}
+
+# Other hosted runners' labels in the corpus, by the platform and image of GitHub's equivalent
+# (kiln's own rules for GitHub's labels, `github_label_rules`).
+HOSTED = {
+    ("linux", "x86_64", "kiln/runner-ubuntu-24.04"): [
+        "depot-ubuntu-24.04", "depot-ubuntu-24.04-4", "depot-ubuntu-24.04-8", "depot-ubuntu-24.04-16", "depot-ubuntu-latest-4",
+        "github-ubuntu-24.04-x86_64-2", "github-ubuntu-24.04-x86_64-4", "github-ubuntu-24.04-x86_64-8", "github-ubuntu-24.04-x86_64-32",
+        "ubuntu-24.04-xl", "ubuntu-latest-4-core-oss", "ubuntu-latest-16-core-oss",
+    ],
+    ("linux", "x86_64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-8", "depot-ubuntu-22.04-16"],
+    ("linux", "aarch64", "kiln/runner-ubuntu-24.04"): ["depot-ubuntu-24.04-arm-8", "depot-ubuntu-24.04-arm-16", "github-ubuntu-24.04-aarch64-4", "ubuntu-24.04-arm64-xl"],
+    ("linux", "aarch64", "kiln/runner-ubuntu-22.04"): ["depot-ubuntu-22.04-arm-4"],
+    ("macos", "aarch64", None): ["namespace-profile-macos-15"],
+    ("windows", "x86_64", None): ["namespace-profile-windows-2022-x86-64-4", "namespace-profile-windows-2022-x86-64-16x32", "windows-2022-xl", "windows-latest-8-core-oss"],
+    ("windows", "aarch64", None): ["github-windows-11-aarch64-8"],
+}
 
 # Failures that aren't kiln's, by what their notes say: the reason the table gives.
 KNOWN = [
@@ -115,6 +134,19 @@ class Api:
                 print(f"  {method} {path}: no answer ({e}); again in 30 s", flush=True)
                 time.sleep(30)
         return None
+
+
+def route_hosted(api):
+    """The server's routing rules: [`HOSTED`]'s labels each routed as its GitHub equivalent."""
+    rules = []
+    for (os_, arch, image), labels in HOSTED.items():
+        for label in labels:
+            rule = {"match": {"labels": [label]}, "require": [f"os == {os_}", f"arch == {arch}"]}
+            if image:
+                rule.update(executor=["docker", "host"], image=image)
+            rules.append(rule)
+    api.call("PUT", "/api/ci/routing/rules?scope=server", {"rules": rules})
+    print(f"routed {len(rules)} other hosted runners' labels as GitHub's", flush=True)
 
 
 def git(cwd, *args, check=True, env=None):
@@ -405,6 +437,7 @@ def main():
     os.makedirs(args.work, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
     srcs = sources()
+    route_hosted(api)
     for repo in ORDER:
         if args.only and repo not in args.only:
             continue
