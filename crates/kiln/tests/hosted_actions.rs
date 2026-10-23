@@ -176,9 +176,10 @@ fn w14_ac05_github_actions_on_a_native_repository() -> anyhow::Result<()> {
 
 /// `actions/checkout` v7 (as the corpus pins it, by commit): its credentials persisted in a
 /// configuration file of their own under `RUNNER_TEMP`, which a later `git fetch` in the job uses:
-/// on the host, in a job container, and in the `docker` executor. In the job container, root over
-/// a workspace this runner's user owns, git refuses the repository until it's a safe directory, as
-/// on GitHub (checkout adds it only to a global configuration of its own while it runs).
+/// on the host, and (`CHECKOUT_V7_DOCKER`, where Docker is) in a job container and in the `docker`
+/// executor. In the job container, root over a workspace this runner's user owns, git refuses the
+/// repository until it's a safe directory, as on GitHub (checkout adds it only to a global
+/// configuration of its own while it runs).
 const CHECKOUT_V7: &str = r#"on: push
 jobs:
   host:
@@ -186,7 +187,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: git fetch --tags && echo "fetched again"
-  container:
+"#;
+
+/// [`CHECKOUT_V7`]'s jobs that need Docker: a job container, and the `docker` executor.
+const CHECKOUT_V7_DOCKER: &str = r#"  container:
     runs-on: local
     container: docker.io/library/node:24-bookworm
     steps:
@@ -200,6 +204,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: git fetch --tags && echo "fetched again"
 "#;
+
+fn docker_works() -> bool {
+    Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]).output().is_ok_and(|o| o.status.success())
+}
 
 #[test]
 fn w07_r09_checkout_v7_persists_its_credentials() -> anyhow::Result<()> {
@@ -229,7 +237,13 @@ fn w07_r09_checkout_v7_persists_its_credentials() -> anyhow::Result<()> {
         Ok(body.contains("\"last_polled_at\":null").then_some(body))
     })?;
     std::fs::create_dir_all(work.join(".github/workflows"))?;
-    std::fs::write(work.join(".github/workflows/checkout.yml"), CHECKOUT_V7)?;
+    // Where no Docker answers (a CI pod), the host's job alone: the others would wait for it, and
+    // the run never end.
+    let docker = docker_works();
+    if !docker {
+        eprintln!("no Docker here: the host's job runs, not the job container's or the docker executor's");
+    }
+    std::fs::write(work.join(".github/workflows/checkout.yml"), if docker { format!("{CHECKOUT_V7}{CHECKOUT_V7_DOCKER}") } else { CHECKOUT_V7.to_owned() })?;
     git(&home, &work, &["add", "."])?;
     git(&home, &work, &["commit", "-qm", "checkout v7"])?;
     git(&home, &work, &["push", "-q", "origin", "main"])?;

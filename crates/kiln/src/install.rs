@@ -554,13 +554,23 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
             let line = format!("@reboot {} supervise --detach {}", bin.display(), args.iter().skip(1).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "));
             let current = Command::new("crontab").arg("-l").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
             if !current.lines().any(|l| l.trim() == line) {
-                let mut child = Command::new("crontab").arg("-").stdin(std::process::Stdio::piped()).spawn()?;
+                let mut child = Command::new("crontab").arg("-").stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
                 if let Some(mut stdin) = child.stdin.take() {
                     use std::io::Write as _;
                     let text: String = current.lines().filter(|l| !l.contains(&format!("{} supervise", bin.display()))).map(|l| format!("{l}\n")).collect();
-                    stdin.write_all(format!("{text}{line}\n").as_bytes())?;
+                    // A crontab that refuses may be gone before it reads this: its exit says so.
+                    let _ = stdin.write_all(format!("{text}{line}\n").as_bytes());
                 }
-                let _ = child.wait()?;
+                let out = child.wait_with_output()?;
+                if !out.status.success() {
+                    // busybox's crontab refuses anyone but root unless it's setuid.
+                    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                    say(format!(
+                        "boot        none: crontab refused it ({why}); start it with kiln supervise --detach -- {}",
+                        args.iter().skip(2).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
+                    ));
+                    return Ok(false);
+                }
             }
             say("boot        crontab @reboot");
             Ok(false)
@@ -643,7 +653,8 @@ fn stale_supervisors(ours: &[String]) -> (Vec<u32>, bool) {
     (stale, inside)
 }
 
-/// This user's processes, but this one: the system's view, and each one's pid and command line.
+/// This user's processes, but this one (and not their threads, which Linux lists beside them):
+/// the system's view, and each one's pid and command line.
 fn user_procs() -> (sysinfo::System, Vec<(u32, Vec<String>)>) {
     use sysinfo::{Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
@@ -653,7 +664,7 @@ fn user_procs() -> (sysinfo::System, Vec<(u32, Vec<String>)>) {
     let procs = sys
         .processes()
         .iter()
-        .filter(|(pid, p)| Some(**pid) != me && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
+        .filter(|(pid, p)| Some(**pid) != me && p.thread_kind().is_none() && user.as_ref().is_none_or(|u| p.user_id() == Some(u)))
         .map(|(pid, p)| (pid.as_u32(), p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()))
         .collect();
     (sys, procs)
