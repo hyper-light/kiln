@@ -448,7 +448,7 @@ async fn install_in(cluster: &Cluster, ctx: &str, ns: &str, image: (&str, &str),
             opened(&url, token, runners);
         }
         None => {
-            let runners = verify(&Via::Proxy(cluster, format!("/api/v1/namespaces/{ns}/services/{APP}:http/proxy")), READY_TIME).await?;
+            let runners = verify(&Via::Proxy(cluster, proxy_base(ns)), READY_TIME).await?;
             say("address     no node of the cluster can be reached from here: it was checked through the cluster's API server");
             say(format!("            open it from here with: kubectl --context {ctx} -n {ns} port-forward svc/{APP} 7070:7070"));
             opened("http://localhost:7070", token, runners);
@@ -456,6 +456,11 @@ async fn install_in(cluster: &Cluster, ctx: &str, ns: &str, image: (&str, &str),
     }
     say(format!("in cluster  kubectl --context {ctx} -n {ns} get pods"));
     Ok(())
+}
+
+/// Where kiln's service in `ns` is reached through the API server (its proxy).
+fn proxy_base(ns: &str) -> String {
+    format!("/api/v1/namespaces/{ns}/services/{APP}:http/proxy")
 }
 
 /// Makes `o`, a new object, and records it in `made`: the object as the cluster stored it.
@@ -692,7 +697,8 @@ mod tests {
     }
 
     /// A kiln stand-in on a port of its own: `/healthz`, its page (naming its script, when `ui`),
-    /// the script, and `/healthz/server` with `runners` connected.
+    /// the script, and `/healthz/server` with `runners` connected; at those paths, and through an
+    /// API server's proxy to kiln's service in namespace `kiln`.
     fn stand_in(ui: bool, runners: u64) -> anyhow::Result<String> {
         use std::io::Write as _;
         let l = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -707,7 +713,8 @@ mod tests {
                 } else {
                     "<!doctype html><html><p>The UI was not built into this binary.</p></html>"
                 };
-                let (status, body) = match req.split_whitespace().nth(1).unwrap_or("/") {
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                let (status, body) = match path.strip_prefix(proxy_base("kiln").as_str()).unwrap_or(path) {
                     "/healthz" => ("200 OK", "ok".to_owned()),
                     "/" => ("200 OK", page.to_owned()),
                     "/assets/index-x1.js" => ("200 OK", "export {}".to_owned()),
@@ -730,6 +737,17 @@ mod tests {
             assert!(format!("{e:#}").contains("built without its UI"), "{e:#}");
             let Err(e) = verify(&Via::Url(&http, alone), Duration::from_millis(10)).await else { bail!("a kiln without its runner was taken as whole") };
             assert!(format!("{e:#}").contains("not ready after 0 s") && format!("{e:#}").contains("runner isn't connected"), "{e:#}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_kiln_no_node_can_be_reached_at_is_checked_through_the_api_servers_proxy() -> anyhow::Result<()> {
+        let server = stand_in(true, 1)?;
+        crate::rt::block_on(async move {
+            let endpoint = kiln_cd::kube::Endpoint { server, ca: None, insecure: false, tls_server_name: None, auth: kiln_cd::kube::Auth::None, namespace: None };
+            let cluster = Cluster::new("stand-in", endpoint)?;
+            assert_eq!(check(&Via::Proxy(&cluster, proxy_base("kiln"))).await?, 1);
             Ok(())
         })
     }
