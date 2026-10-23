@@ -302,12 +302,10 @@ pub fn health(obj: &Value) -> Option<Status> {
                         let at = if percent.is_empty() { String::new() } else { format!(": {percent}%") };
                         return status(if s == "RollbackInProgress" { Health::Degraded } else { Health::Progressing }, format!("{what}{at}"));
                     }
-                    "Failed" | "Cancelled" | "RollbackSuccessful" | "RollbackFailed" => {
-                        // Once the group runs what kiln asks for (a rollback to what was put back),
-                        // a refresh that failed is history.
-                        if crate::obj::str_at(obj, &["spec", "launchTemplate", "version"]) != Some(KILNS) {
-                            return status(Health::Degraded, if reason.is_empty() { format!("the instance refresh {}", s.to_ascii_lowercase()) } else { format!("the instance refresh {}: {reason}", s.to_ascii_lowercase()) });
-                        }
+                    // Once the group runs what kiln asks for (a rollback to what was put back), a
+                    // refresh that failed is history.
+                    "Failed" | "Cancelled" | "RollbackSuccessful" | "RollbackFailed" if crate::obj::str_at(obj, &["spec", "launchTemplate", "version"]) != Some(KILNS) => {
+                        return status(Health::Degraded, if reason.is_empty() { format!("the instance refresh {}", s.to_ascii_lowercase()) } else { format!("the instance refresh {}: {reason}", s.to_ascii_lowercase()) });
                     }
                     _ => {}
                 }

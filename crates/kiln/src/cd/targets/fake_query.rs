@@ -231,10 +231,10 @@ fn resources_of(template: &str) -> Vec<(String, String)> {
         if indent == 2 && t.ends_with(':') {
             current = Some(t.trim_end_matches(':').to_owned());
             out.push((t.trim_end_matches(':').to_owned(), String::new()));
-        } else if let (Some(name), Some(ty)) = (&current, t.strip_prefix("Type:")) {
-            if let Some(last) = out.iter_mut().rev().find(|(n, _)| n == name) {
-                last.1 = ty.trim().to_owned();
-            }
+        } else if let (Some(name), Some(ty)) = (&current, t.strip_prefix("Type:"))
+            && let Some(last) = out.iter_mut().rev().find(|(n, _)| n == name)
+        {
+            last.1 = ty.trim().to_owned();
         }
     }
     out
