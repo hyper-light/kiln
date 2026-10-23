@@ -1027,6 +1027,40 @@ impl Claude {
         core.touch_state();
     }
 
+    /// The account Claude Code says it runs on now, in its status (`get_status`'s Email,
+    /// Organization and Login method rows): a sign-in made after it started, wherever it was made
+    /// (`claude auth login` in a terminal, another tool), shows there and never in its initialize.
+    /// Another account than the page names is switched to.
+    fn status_account(&mut self, core: &mut Core, body: &Value) {
+        let row = |label: &str| {
+            body.get("sections")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|sec| sec.get("rows").and_then(Value::as_array))
+                .flatten()
+                .find(|r| str_of(r, "label") == Some(label))
+                .and_then(|r| str_of(r, "value"))
+                .map(|v| strip_ansi(v).trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
+        let Some(who) = row("Email").or_else(|| row("Organization")) else { return };
+        let Some(was) = core.state.account.clone() else { return };
+        // "Claude Max account": the plan; another way in ("API key"...) leaves the plan as it was.
+        let plan = row("Login method")
+            .and_then(|m| m.strip_suffix(" account").map(str::to_owned))
+            .filter(|p| p.to_lowercase().starts_with("claude "))
+            .map(|p| plan_label(&p))
+            .or_else(|| core.state.plan.clone())
+            .unwrap_or_else(|| "Claude account".to_owned());
+        let now = account_id("claude", &plan, Some(&who));
+        if !same_account(&was, &now) {
+            core.state.account = Some(now);
+            core.state.plan = Some(plan);
+            self.switched_account(core);
+        }
+    }
+
     /// Signed in as someone else (here, or on the machine it moved to for room): the old account's
     /// usage limits go, and a pause for one of them ends (reached, its stop point, or reached by
     /// another session on it); what the session cost so far stays, and adds up. The new account's
@@ -1769,6 +1803,7 @@ impl Claude {
                 }
             }
             Pending::Status => {
+                self.status_account(core, &body);
                 let rows: Vec<StatusItem> = body
                     .get("sections")
                     .and_then(Value::as_array)
@@ -4700,6 +4735,37 @@ mod tests {
         core.set_status(Status::Idle);
         c3.command(&mut core, Command::Control { id: "account".into(), value: None });
         assert!(core.effects.iter().any(|e| matches!(e, Effect::Restart { .. })));
+    }
+
+    /// Signed in on its machine as someone else outside kiln: Claude Code's next status names the
+    /// account it runs on, and the page switches to it; the same account changes nothing.
+    #[test]
+    fn a_sign_in_made_outside_kiln_shows_when_claude_code_next_says_its_status() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": [], "account": {"email": "a@example.com", "subscriptionType": "max", "tokenSource": "claude.ai"}}));
+        core.set_status(Status::Running);
+        let old = core.state.account.clone();
+        let status = |email: &str| json!({"sections": [{"title": "Session", "rows": [{"label": "Login method", "value": "Claude Max account"}, {"label": "Email", "value": email}]}]});
+        // Now and then it asks Claude Code for its usage and status.
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "get_usage", json!({}));
+        reply_to(&mut c, &mut core, &reqs, "get_status", status("a@example.com"));
+        assert_eq!(core.state.account, old, "the same account: nothing changes");
+        core.state.limits = vec![Limit { id: "seven_day".into(), label: "Weekly".into(), used_percent: Some(95.0), account: old.clone(), ..Limit::default() }];
+        // `claude auth login` in a terminal: Claude Code runs on b's credentials now.
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "get_status", status("b@example.com"));
+        assert_eq!(core.state.account, Some(account_id("claude", "Claude Max", Some("b@example.com"))));
+        assert!(core.state.limits.is_empty(), "the old account's usage isn't shown as the new one's");
+        assert!(requests(&mut core).iter().any(|r| r.1 == "get_usage"), "the new account's usage is asked");
+        assert!(core.state.harness_status.iter().all(|r| !r.value.contains("b@example.com")), "the status shown masks the email");
     }
 
     /// Signed in on its machine as someone else, mid-turn: its page names the new account at once,

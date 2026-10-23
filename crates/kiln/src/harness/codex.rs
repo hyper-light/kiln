@@ -1330,9 +1330,11 @@ impl Codex {
         if core.state.mcp.iter().any(|m| m.status == McpStatus::Pending) && now - self.mcp_at > 4_000 {
             self.ask_mcp(core);
         }
-        if self.account_kind.as_deref() == Some("chatgpt") && now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits)) {
+        // Every few minutes its account, read again (one signed in outside kiln, `codex login` in a
+        // terminal, shows), and with a ChatGPT account its rate limits.
+        if now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits | Pending::Account)) {
             self.usage_at = now;
-            self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
+            self.request(core, Pending::Account, "account/read", json!({}));
         }
     }
 
@@ -2236,6 +2238,8 @@ impl Codex {
                 // old account's limits go, and a pause for one ends.
                 if was.is_some() && core.state.account != was {
                     core.state.limits.clear();
+                    // What was read of the old account's limits is never shown as the new one's.
+                    self.rate_limits.clear();
                     if core.state.pause.is_some()
                         && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
                     {
@@ -5179,6 +5183,27 @@ mod tests {
         let w = written(&mut core);
         assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
         respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_ne!(core.state.account, old);
+        assert!(core.state.limits.is_empty(), "the old account's limits go");
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
+    }
+
+    /// Signed in as someone else outside kiln (`codex login` in a terminal): the account read every
+    /// few minutes names the new one, the old one's limits go and the new one's are read.
+    #[test]
+    fn a_sign_in_made_outside_kiln_shows_at_the_next_look_at_the_account() {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"}}));
+        let old = core.state.account.clone();
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "account/rateLimits/read", json!({"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 95.0, "windowDurationMins": 10080}}}));
+        assert!(!core.state.limits.is_empty());
+        c.usage_at = 0;
+        c.tick(&mut core);
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_eq!(core.state.account, Some(account_id("codex", "Pro", Some("b@example.com"))));
         assert_ne!(core.state.account, old);
         assert!(core.state.limits.is_empty(), "the old account's limits go");
         assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
