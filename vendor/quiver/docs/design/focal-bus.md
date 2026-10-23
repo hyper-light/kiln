@@ -51,7 +51,11 @@ on the bus's format and budget:
   the payload.
 - **Every byte is charged to one `focal_memory::MemoryBudget`** (the node's `memory`), held by the
   message until the last reader lets it go. A publish the budget can't take lets the topic's
-  oldest go, a segment at a time, then is refused `Full`, typed.
+  oldest go, a segment at a time, then is refused `Full`, typed. It lets go only its own topic's:
+  another topic's kept messages are never let go for it, so a node's topics share its memory first
+  come. A user holding many topics bounds each (kiln: `topic_bytes`, and a session's topic let go
+  while nobody reads it); a policy across topics (the least recently read let go first) is open
+  (STATUS.md).
 - **A topic is a log of segments,** each up to 256 messages or 64 KiB, filled in order and never
   changed after. A publish takes the topic's lock to give the next offset and fill the next slot;
   readers take none. A subscription holds the one segment it reads and reaches the next by a weak

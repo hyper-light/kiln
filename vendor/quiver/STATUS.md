@@ -40,5 +40,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Open
 
+- **Memory across topics**: a publish the node's memory can't take lets go only its own topic's
+  oldest messages, never another topic's (`docs/design/focal-bus.md`); which topic gives way when
+  many share the budget is still to decide.
+
 Everything else the track's plan names (kiln plan `01a157fdefc37396957ea10adb51a19f`): each goal, its criteria and how each is
 measured are in `docs/requirements.toml`.
