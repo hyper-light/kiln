@@ -271,7 +271,8 @@ fn first_attempts(s: &Server, ids: &[String]) -> anyhow::Result<Vec<(String, Str
 /// W05-R05 across a restart: the server killed while its own runner runs two legs, which go with
 /// it, under a queue whose rebuild outlasts the runner's reconnecting (so it says hello first,
 /// running nothing). The legs it ran were lost with it, not held: each attempt fails `runner-lost`
-/// and the leg goes on to its next attempt (W05-R16), the runner's slots free for the next leg.
+/// and the next runs on it, the only runner that can take them (W05-R16's default); then its
+/// slots are free for the next leg.
 #[test]
 fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -280,7 +281,7 @@ fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
     let axis = (0..QUEUED).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     tree.commit(
         ".kiln/queue.yaml",
-        &format!("on: push\njobs:\n  slow:\n    runs-on: local\n    matrix: {{ n: [1, 2] }}\n    steps:\n      - run: sleep 120\n  queued:\n    runs-on: nowhere\n    matrix: {{ i: [{axis}] }}\n    steps:\n      - run: echo never\n"),
+        &format!("on: push\njobs:\n  slow:\n    runs-on: local\n    matrix: {{ n: [1, 2] }}\n    steps:\n      - run: if [ \"$KILN_ATTEMPT\" = 1 ]; then sleep 120; fi\n  queued:\n    runs-on: nowhere\n    matrix: {{ i: [{axis}] }}\n    steps:\n      - run: echo never\n"),
     )?;
     let run = run_of(&s, ".kiln/queue.yaml")?;
     let mut slow: Vec<String> = Vec::new();
@@ -294,7 +295,7 @@ fn w05_r05_a_restart_loses_what_its_runner_lost() -> anyhow::Result<()> {
     until(&s, 120, "the lost legs' next attempts", || {
         let all = legs(&s, &run)?;
         let on: Vec<_> = all.iter().filter(|(id, _, _, _)| slow.contains(id)).collect();
-        Ok((on.len() < 2 || on.iter().any(|(_, _, st, attempt)| *attempt < 2 || st == "running")).then(|| format!("{on:?}")))
+        Ok((on.len() < 2 || on.iter().any(|(_, _, st, attempt)| *attempt < 2 || st != "succeeded")).then(|| format!("{on:?}")))
     })?;
     for (conclusion, class) in first_attempts(&s, &slow)? {
         assert_eq!((conclusion.as_str(), class.as_str()), ("failure", "runner-lost"), "lost with the runner:\n{}", s.log());

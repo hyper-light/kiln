@@ -1662,8 +1662,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   connected; lists the ones offline), `unroutable` (no runner known to kiln could ever run it; lists
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
-  `max-parallel`, `capability` (eligible runners' builds lack a capability; which). It is stored
-  (`jobs.wait_reason`), sent as an event, and shown on the leg.
+  `max-parallel`, `capability` (eligible runners' builds lack a capability; which),
+  `other-runner` (only the runner its retry avoids could take it: R16's `runner: different`, or a
+  runner that refused it; which). It is stored (`jobs.wait_reason`), sent as an event, and shown
+  on the leg.
 
 **Requirements: retries** (G-16)
 
@@ -1686,7 +1688,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   `oom_kill` count rose, or exit 137 with memory at its limit), `disk-full` (ENOSPC seen, or the
   work volume full), `timeout`, `failure` (anything else).
 - **W05-R16 Defaults.** Without a policy: `runner-lost` is retried once on a different runner
-  (today's requeue, kept, and shown as "retried: runner X was lost"); nothing else is retried.
+  when one can take it, else on the same one (today's requeue, kept, and shown as "retried:
+  runner X was lost"); nothing else is retried. A policy's `runner: different` waits for another
+  runner, and says so (`other-runner`).
 - **W05-R17 Reruns**, GitHub-exact: re-run all jobs, re-run failed jobs (and the jobs that need
   them), re-run one job (and its dependents), optionally with debug logging. A rerun is a new run
   attempt (`github.run_attempt`); automatic leg retries are attempts of the leg
@@ -1959,12 +1963,18 @@ W20.
     machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
     ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
 - *Left.* AC11 on the live cluster.
-- *Open, for the user to decide:* R16's retry after `runner-lost` avoids the runner that lost the
-  leg, so where only one runner can take it, the retry waits for good. The options: wait (today);
-  prefer another runner and take the same one when none other can (at once, or after a few
-  minutes); don't retry when no other runner can; or the default prefers another while an
-  explicit `runner: different` stays strict and says it waits for a runner other than the one
-  lost. The last is recommended.
+- *Done* (2026-10-23), R16's retry where only the runner that lost the leg could take it, which
+  waited for good. Of the options put to the user (wait; prefer another runner and take the same
+  one when none other can, at once or after a few minutes; don't retry; or the default prefers
+  another while an explicit `runner: different` stays strict), the last, recommended, is taken
+  while their decision is open; another is a small change:
+  - The default retry goes to another runner when one could take it (connected, eligible and not
+    draining, busy or not), else to the one that lost it, at once. A leg that stayed off it goes
+    there first when the others go or drain.
+  - `runner: different` waits for another, and its wait reason says which runner it avoids
+    (`other-runner`), as a leg a runner refused does.
+  - Unit-tested (`w05_r16_a_lost_runners_retry`); a server's own runner, the only one, takes its
+    lost legs' retries across a restart (`tests/chaos.rs`, `tests/restart.rs`).
 
 ### W06 Step runtime on the runner
 
