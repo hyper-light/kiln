@@ -73,17 +73,18 @@ impl srv::Handler for Fake {
         }
         let target = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-target")).map(str::to_owned);
         let signed_sha = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-content-sha256")).map(str::to_owned);
+        let copy_source = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-copy-source")).map(str::to_owned);
         let method = req.method().clone();
         let path = srv::decode(req.uri().path());
         let query = srv::query(&req);
         let raw = srv::body_bytes(req.into_body(), 4 << 20).await.unwrap_or_default();
         let mut st = self.state.lock();
-        // STS's Query form, S3's buckets (kiln's are kiln-…), ECS's JSON, Lambda's REST.
+        // STS's Query form, S3's buckets (only S3 signs its payload's hash), ECS's JSON, Lambda's REST.
         if raw.starts_with(b"Action=GetCallerIdentity") {
             return srv::text(http::StatusCode::OK, "<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account><Arn>arn:aws:sts::123456789012:assumed-role/kiln/x</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>");
         }
-        if path.starts_with("/kiln-") {
-            return s3(&mut st, &method, &path, &raw, signed_sha.as_deref());
+        if path.starts_with("/kiln-") || signed_sha.is_some() {
+            return s3(&mut st, &method, &path, &query, &raw, signed_sha.as_deref(), copy_source.as_deref());
         }
         let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         match target {
@@ -385,10 +386,51 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
     }
 }
 
-fn s3(st: &mut State, method: &http::Method, path: &str, body: &[u8], signed: Option<&str>) -> Response {
+fn s3(st: &mut State, method: &http::Method, path: &str, query: &std::collections::HashMap<String, String>, body: &[u8], signed: Option<&str>, copy_source: Option<&str>) -> Response {
     let mut parts = path.trim_start_matches('/').splitn(2, '/');
-    let (bucket, key) = (parts.next().unwrap_or_default().to_owned(), parts.next().map(str::to_owned));
+    let (bucket, key) = (parts.next().unwrap_or_default().to_owned(), parts.next().map(str::to_owned).filter(|k| !k.is_empty()));
+    let no_bucket = || srv::text(http::StatusCode::NOT_FOUND, "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>");
+    // ListObjectsV2: keys under a prefix, those past a delimiter as common prefixes.
+    if method == http::Method::GET && key.is_none() && query.get("list-type").map(String::as_str) == Some("2") {
+        let Some(b) = st.buckets.get(&bucket) else { return no_bucket() };
+        let prefix = query.get("prefix").cloned().unwrap_or_default();
+        let delimiter = query.get("delimiter").cloned().filter(|d| !d.is_empty());
+        let mut contents = String::new();
+        let mut common = std::collections::BTreeSet::new();
+        for (k, v) in b.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)) {
+            match delimiter.as_ref().and_then(|d| k.get(prefix.len()..).and_then(|rest| rest.find(d.as_str())).map(|i| (d, i))) {
+                Some((d, i)) => {
+                    common.insert(format!("{}{}", k.get(..prefix.len() + i).unwrap_or_default(), d));
+                }
+                None => contents.push_str(&format!("<Contents><Key>{k}</Key><Size>{}</Size></Contents>", v.len())),
+            }
+        }
+        let common: String = common.iter().map(|p| format!("<CommonPrefixes><Prefix>{p}</Prefix></CommonPrefixes>")).collect();
+        return srv::text(http::StatusCode::OK, &format!("<ListBucketResult><Name>{bucket}</Name><Prefix>{prefix}</Prefix><IsTruncated>false</IsTruncated>{contents}{common}</ListBucketResult>"));
+    }
     match (method.as_str(), key) {
+        ("GET", Some(k)) => match st.buckets.get(&bucket).and_then(|b| b.get(&k)) {
+            Some(data) => srv::response(http::StatusCode::OK, "application/octet-stream", srv::full(data.clone())),
+            None => srv::text(http::StatusCode::NOT_FOUND, "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>"),
+        },
+        ("DELETE", Some(k)) => {
+            if let Some(b) = st.buckets.get_mut(&bucket) {
+                b.remove(&k);
+            }
+            st.calls.push(format!("DeleteObject {bucket}/{k}"));
+            srv::status(http::StatusCode::NO_CONTENT)
+        }
+        // CopyObject: the source's bytes, in S3, nothing uploaded.
+        ("PUT", Some(k)) if copy_source.is_some() => {
+            let source = srv::decode(copy_source.unwrap_or_default());
+            let mut sp = source.trim_start_matches('/').splitn(2, '/');
+            let (sb, sk) = (sp.next().unwrap_or_default().to_owned(), sp.next().unwrap_or_default().to_owned());
+            let Some(data) = st.buckets.get(&sb).and_then(|b| b.get(&sk)).cloned() else { return srv::text(http::StatusCode::NOT_FOUND, "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>") };
+            let Some(b) = st.buckets.get_mut(&bucket) else { return no_bucket() };
+            b.insert(k.clone(), data);
+            st.calls.push(format!("CopyObject {bucket}/{k}"));
+            srv::text(http::StatusCode::OK, "<CopyObjectResult><ETag>\"fake\"</ETag></CopyObjectResult>")
+        }
         ("HEAD", None) => srv::status(if st.buckets.contains_key(&bucket) { http::StatusCode::OK } else { http::StatusCode::NOT_FOUND }),
         ("PUT", None) => {
             st.buckets.entry(bucket.clone()).or_default();

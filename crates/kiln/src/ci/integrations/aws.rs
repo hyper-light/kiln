@@ -172,6 +172,10 @@ fn client() -> Result<&'static Client> {
 pub fn endpoint(service: &str, region: &str) -> String {
     super::endpoint(&format!("aws:{service}"), || {
         let domain = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+        // CloudFront is global: one endpoint, its requests signed for us-east-1.
+        if service == "cloudfront" {
+            return format!("https://cloudfront.{domain}");
+        }
         format!("https://{service}.{region}.{domain}")
     })
 }

@@ -18,6 +18,7 @@ pub mod aws_beanstalk;
 pub mod aws_ec2;
 pub mod aws_ecs;
 pub mod aws_lambda;
+pub mod aws_static;
 pub mod cloudflare_workers;
 pub mod cloudformation;
 pub mod vercel;
@@ -221,11 +222,18 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "aws",
         place: &["region"],
         scope: None,
-        settings: &[s("bucket", true, "the bucket"), s("prefix", false, "the prefix sites go under"), s("distribution", false, "the CloudFront distribution to switch and invalidate"), s("site", true, "the built site (${{ artifacts.* }})")],
+        settings: &[
+            s("bucket", true, "the bucket"),
+            s("prefix", false, "the prefix sites go under (sites/<app>)"),
+            s("site", true, "the built site CI made: a zip or a .tar.gz (${{ artifacts.* }})"),
+            s("distribution", false, "the CloudFront distribution whose origin path is switched to each release, then invalidated"),
+            s("origin", false, "the distribution's origin to switch, by its id (by default the one whose domain is the bucket's)"),
+            s("keep", false, "how many releases stay under the prefix for rollbacks (5)"),
+        ],
         kinds: &[kind("s3.aws.kiln.dev", "Site", "Site"), kind("cloudfront.aws.kiln.dev", "Distribution", "Distribution")],
         capabilities: &[Versions, Drift],
         reads: &[],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "cloudformation",
@@ -672,6 +680,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "aws-ec2" => aws_ec2::render(input),
         "aws-ecs" => aws_ecs::render(input),
         "aws-lambda" => aws_lambda::render(input),
+        "aws-static" => aws_static::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
         "cloudformation" => cloudformation::render(input),
         "vercel" => vercel::render(input),
@@ -690,6 +699,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "aws-ec2" => aws_ec2::files(spec),
         "aws-ecs" => aws_ecs::files(spec),
         "aws-lambda" => aws_lambda::files(spec),
+        "aws-static" => aws_static::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
         "cloudformation" => cloudformation::files(spec),
         "vercel" => vercel::files(spec),
@@ -710,6 +720,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "aws-ec2" => aws_ec2::health(obj),
         "aws-ecs" => aws_ecs::health(obj),
         "aws-lambda" => aws_lambda::health(obj),
+        "aws-static" => aws_static::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
         "cloudformation" => cloudformation::health(obj),
         "vercel" => vercel::health(obj),

@@ -96,6 +96,19 @@ pub struct Group {
     pub refreshes: Vec<Refresh>,
 }
 
+/// A CloudFront distribution as the fake keeps it.
+#[derive(Clone, Debug, Default)]
+pub struct Distribution {
+    /// Each origin's id, domain and origin path.
+    pub origins: Vec<(String, String, String)>,
+    /// Its config's version, which its ETag names.
+    pub etag: u32,
+    pub status: String,
+    pub busy: u32,
+    /// Each invalidation's paths.
+    pub invalidations: Vec<Vec<String>>,
+}
+
 #[derive(Default)]
 pub struct State {
     pub stacks: BTreeMap<String, Stack>,
@@ -109,6 +122,8 @@ pub struct State {
     pub templates: BTreeMap<String, Template>,
     /// Auto Scaling: groups by name.
     pub groups: BTreeMap<String, Group>,
+    /// CloudFront: distributions by id.
+    pub distributions: BTreeMap<String, Distribution>,
     /// Every operation, in order: `ExecuteChangeSet shop-network`.
     pub calls: Vec<String>,
 }
@@ -172,6 +187,13 @@ impl srv::Handler for FakeQuery {
         let auth = srv::header_str(&req, &http::header::AUTHORIZATION).unwrap_or("").to_owned();
         if !auth.starts_with("AWS4-HMAC-SHA256 Credential=") {
             return error(403, "InvalidClientTokenId", "unsigned");
+        }
+        // CloudFront's REST-XML API.
+        if req.uri().path().starts_with("/2020-05-31/") {
+            let (method, path) = (req.method().clone(), req.uri().path().to_owned());
+            let if_match = srv::header_str(&req, &http::header::IF_MATCH).map(str::to_owned);
+            let raw = srv::body_bytes(req.into_body(), 4 << 20).await.unwrap_or_default();
+            return cloudfront(&mut self.state.lock(), &method, &path, if_match.as_deref(), &String::from_utf8_lossy(&raw));
         }
         let raw = srv::body_bytes(req.into_body(), 4 << 20).await.unwrap_or_default();
         let f = form(&raw);
@@ -720,6 +742,55 @@ fn autoscaling(st: &mut State, action: &str, f: &BTreeMap<String, String>) -> Re
             answer(action, &json!({}))
         }
         other => error(400, "InvalidAction", &format!("Auto Scaling has no {other} in the fake")),
+    }
+}
+
+fn distribution_config(d: &Distribution) -> String {
+    let origins: String = d.origins.iter().map(|(id, domain, path)| format!("<Origin><Id>{id}</Id><DomainName>{domain}</DomainName><OriginPath>{path}</OriginPath><S3OriginConfig><OriginAccessIdentity></OriginAccessIdentity></S3OriginConfig></Origin>")).collect();
+    format!("<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/2020-05-31/\"><CallerReference>fake</CallerReference><Origins><Quantity>{}</Quantity><Items>{origins}</Items></Origins><Enabled>true</Enabled></DistributionConfig>", d.origins.len())
+}
+
+fn cloudfront(st: &mut State, method: &http::Method, path: &str, if_match: Option<&str>, body: &str) -> Response {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let not_found = || srv::text(http::StatusCode::NOT_FOUND, "<ErrorResponse><Error><Code>NoSuchDistribution</Code><Message>The specified distribution does not exist.</Message></Error></ErrorResponse>");
+    match (method.as_str(), parts.as_slice()) {
+        ("GET", ["2020-05-31", "distribution", id, "config"]) => match st.distributions.get(*id) {
+            Some(d) => srv::with_header(srv::text(http::StatusCode::OK, &distribution_config(d)), http::header::ETAG, &format!("E{}", d.etag)),
+            None => not_found(),
+        },
+        ("PUT", ["2020-05-31", "distribution", id, "config"]) => {
+            let Some(d) = st.distributions.get_mut(*id) else { return not_found() };
+            if if_match != Some(format!("E{}", d.etag).as_str()) {
+                return srv::text(http::StatusCode::PRECONDITION_FAILED, "<ErrorResponse><Error><Code>PreconditionFailed</Code><Message>The If-Match version is missing or not valid for the resource.</Message></Error></ErrorResponse>");
+            }
+            let field = |block: &str, tag: &str| crate::ci::integrations::aws::xml_text(block, tag).unwrap_or_default();
+            d.origins = crate::ci::integrations::aws::xml_all(body, "Origin").into_iter().map(|o| (field(o, "Id"), field(o, "DomainName"), field(o, "OriginPath"))).collect();
+            d.etag += 1;
+            d.status = "InProgress".into();
+            d.busy = 2;
+            st.calls.push(format!("UpdateDistribution {id}"));
+            let out = format!("<Distribution><Id>{id}</Id><Status>InProgress</Status>{}</Distribution>", distribution_config(d));
+            srv::with_header(srv::text(http::StatusCode::OK, &out), http::header::ETAG, &format!("E{}", d.etag))
+        }
+        ("GET", ["2020-05-31", "distribution", id]) => {
+            let Some(d) = st.distributions.get_mut(*id) else { return not_found() };
+            if d.busy > 0 {
+                d.busy -= 1;
+                if d.busy == 0 {
+                    d.status = "Deployed".into();
+                }
+            }
+            let out = format!("<Distribution><Id>{id}</Id><Status>{}</Status><DomainName>d111.cloudfront.net</DomainName>{}</Distribution>", d.status, distribution_config(d));
+            srv::with_header(srv::text(http::StatusCode::OK, &out), http::header::ETAG, &format!("E{}", d.etag))
+        }
+        ("POST", ["2020-05-31", "distribution", id, "invalidation"]) => {
+            let Some(d) = st.distributions.get_mut(*id) else { return not_found() };
+            let paths: Vec<String> = crate::ci::integrations::aws::xml_all(body, "Path").into_iter().map(str::to_owned).collect();
+            d.invalidations.push(paths);
+            st.calls.push(format!("CreateInvalidation {id}"));
+            srv::text(http::StatusCode::CREATED, &format!("<Invalidation><Id>I{}</Id><Status>InProgress</Status></Invalidation>", d.invalidations.len()))
+        }
+        _ => srv::text(http::StatusCode::BAD_REQUEST, "<ErrorResponse><Error><Code>InvalidArgument</Code><Message>the fake has no such CloudFront call</Message></Error></ErrorResponse>"),
     }
 }
 
