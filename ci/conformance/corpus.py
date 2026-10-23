@@ -75,6 +75,9 @@ KNOWN = [
     # `actions/upload-artifact@master` is that repository's old branch: 2.0.1 (2020), on the artifact
     # protocol GitHub retired on 2025-01-30.
     (r"Unable to create a container for the artifact", "its `upload-artifact@master` is 2.0.1, on the artifact protocol GitHub retired in January 2025: it fails there too"),
+    # A test that waits a few seconds for a message, or a minute for a release to boot, run while
+    # the lab's pacer froze its work (the machine's disks busy): to be run again quietly.
+    (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
     # The lab's runner has two slots and one Docker daemon; a hosted runner, a machine a job.
     (r'The container name "/cargo_test_\d+" is already in use|previous docker build failed, unable to run test', "two of its legs ran at once on the lab's one Docker daemon, and its tests name their containers (`cargo_test_0`): a hosted runner gives each job a daemon of its own (docs/ci.md W13-R04)"),
 ]
@@ -244,9 +247,16 @@ def wait_reason(w):
 ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|cannot|denied|refused|exception)\b")
 
 
+# A test runner's own words for a failed test, before the generic last line (make's, an exit code):
+# ExUnit's numbered failures (and the line after, what failed), libtest's, pytest's, Go's.
+FAILED_TEST = re.compile(r"^\d+\) test .+ \(.+\)$|^test \S+ \.\.\. FAILED$|^FAILED \S+::\S+|^--- FAIL: \S+")
+GENERIC = re.compile(r"^make(\[\d+\])?: \*\*\*|exit(ed with)? code|exit status \d+|^error: test failed, to rerun pass")
+
+
 def leg_detail(api, leg):
     """The failing step's name and its last useful line: the last that reads as an error, else
-    the last."""
+    the last. A generic one (make's, an exit code) is preceded by the first test the log says
+    failed, and what failed in it."""
     try:
         f = api.call("GET", f"/api/ci/legs/{leg['id']}/logs/failure")
     except RuntimeError:
@@ -254,6 +264,18 @@ def leg_detail(api, leg):
     lines = [re.sub(r"\x1b\[[0-9;]*m", "", x.get("text", "")).strip() for x in (f or {}).get("lines") or []]
     lines = [x for x in lines if x and not x.startswith("[command]")]
     said = next((x for x in reversed(lines) if ERRORISH.search(x) and not x.startswith("+ ")), lines[-1] if lines else "")
+    if GENERIC.search(said):
+        at = next((i for i, x in enumerate(lines) if FAILED_TEST.search(x)), None)
+        if at is not None:
+            test = lines[at]
+            # ExUnit says what failed on the next line.
+            if re.match(r"^\d+\) test ", test) and at + 2 < len(lines):
+                test = f"{test}: {lines[at + 2]}" if lines[at + 1].startswith(("test/", "lib/", "/")) else f"{test}: {lines[at + 1]}"
+            said = f"{test} ({said})"
+    # A line the known failures name, wherever it is in the step's log, goes with it.
+    known = next((x for x in lines if any(re.search(pat, x) for pat, _ in KNOWN) and x not in said), None)
+    if known and not any(re.search(pat, said) for pat, _ in KNOWN):
+        said = f"{said[:180]} — {known[:110]}"
     return (f or {}).get("step_name") or "", said[:300]
 
 
