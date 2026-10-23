@@ -22,6 +22,45 @@ export function planSteps(body: string): string[] {
   return out;
 }
 
+/**
+ * Step `n` (from 1) of a plain plan as its markdown, what's under it and all: its item of a top-level
+ * list, as `planSteps` counts them, with the lines indented under it (a nested list, a block of
+ * code), as far as the next line that isn't.
+ */
+export function stepMarkdown(body: string, n: number): string {
+  let fence = false;
+  let k = 0;
+  let out: string[] | null = null;
+  for (const line of body.split(/\r?\n/)) {
+    const trimmed = line.trimStart();
+    const top = line.length === trimmed.length;
+    if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
+      fence = !fence;
+      if (out && top) break;
+      if (out) out.push(line);
+      continue;
+    }
+    if (fence) {
+      if (out) out.push(line);
+      continue;
+    }
+    const item = top ? listItem(trimmed) : null;
+    if (item !== null) {
+      if (out) break;
+      if (item) k += 1;
+      if (item && k === n) out = [item];
+      continue;
+    }
+    if (!out) continue;
+    if (top && trimmed) break;
+    out.push(line);
+  }
+  if (!out) return "";
+  const rest = out.slice(1);
+  const indent = Math.min(...rest.filter((l) => l.trim()).map((l) => l.length - l.trimStart().length));
+  return [out[0], ...rest.map((l) => l.slice(Number.isFinite(indent) ? indent : 0))].join("\n").trim();
+}
+
 function listItem(line: string): string | null {
   let rest: string | null = null;
   for (const m of ["- ", "* ", "+ "]) {

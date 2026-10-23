@@ -22,6 +22,8 @@ import { pageOf } from "./page-of";
 import { LiveView } from "./live";
 import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
+import { researchCall } from "@/api/research";
+import { ResearchCard } from "@/views/research/research";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
@@ -31,6 +33,9 @@ import { useHeld, useRecent } from "./dom";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
+
+/** The calls that last touched each piece of research in the conversation: their steps open on it, as the agent reports it. */
+const Researched = React.createContext<ReadonlySet<string>>(new Set());
 
 /** The notice saying the harness isn't signed in (the latest, unless it has worked since), and where to sign it in. */
 const SignIn = React.createContext<{ notice: string; target: string; kind: string } | null>(null);
@@ -42,6 +47,7 @@ const Tasks = React.createContext<Task[]>(NO_TASKS);
 
 function Contexts({
   asking,
+  researched,
   signIn,
   findNow,
   tasks,
@@ -49,6 +55,7 @@ function Contexts({
   children,
 }: {
   asking: ReadonlySet<string>;
+  researched: ReadonlySet<string>;
   signIn: React.ContextType<typeof SignIn>;
   findNow: FindNow | null;
   tasks: Task[];
@@ -58,13 +65,15 @@ function Contexts({
 }) {
   return (
     <Asking.Provider value={asking}>
-      <SignIn.Provider value={signIn}>
-        <Tasks.Provider value={tasks}>
-          <FilesContext.Provider value={files}>
-            <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
-          </FilesContext.Provider>
-        </Tasks.Provider>
-      </SignIn.Provider>
+      <Researched.Provider value={researched}>
+        <SignIn.Provider value={signIn}>
+          <Tasks.Provider value={tasks}>
+            <FilesContext.Provider value={files}>
+              <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+            </FilesContext.Provider>
+          </Tasks.Provider>
+        </SignIn.Provider>
+      </Researched.Provider>
     </Asking.Provider>
   );
 }
@@ -262,9 +271,13 @@ function AskBody({ calls }: { calls: ToolEvent[] }) {
 }
 
 function ToolBody({ calls }: { calls: ToolEvent[] }) {
+  // Research the agent records or reads shows as the research, as it stands, once in the step: where it last touched it.
+  const research = calls.map((c) => (c.status === "error" ? null : researchCall(c)));
+  const lastOf = new Map(research.flatMap((r, i) => (r?.id ? [[r.id, i] as const] : [])));
   return (
     <div className="hx-stack">
-      {calls.map((c) => {
+      {calls.map((c, i) => {
+        const r = research[i];
         const input = c.input && typeof c.input === "object" && Object.keys(c.input as object).length ? JSON.stringify(c.input, null, 2) : null;
         return (
           <div key={c.id} className="hx-generic" data-ev={c.id}>
@@ -282,8 +295,14 @@ function ToolBody({ calls }: { calls: ToolEvent[] }) {
               )}
               <span className="hx-dim hx-trunc">{c.title}</span>
             </div>
-            {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
-            {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
+            {r?.id ? (
+              lastOf.get(r.id) === i && <ResearchCard id={r.id} />
+            ) : (
+              <>
+                {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
+                {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
+              </>
+            )}
           </div>
         );
       })}
@@ -340,6 +359,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const failures = step.calls.filter((c) => c.status === "error" || (c.tool === "shell" && c.exit_code !== undefined && c.exit_code !== 0)).length;
   const asking = React.useContext(Asking);
   const asked = step.calls.some((c) => asking.has(c.tool_id));
+  const researched = React.useContext(Researched);
   // Open by default: what needs attention, and what is happening right now (once it has gone on a moment).
   const [open, setOpen] = React.useState<boolean | null>(null);
   // A match found in it opens it.
@@ -353,7 +373,14 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   // of a second or so) and pulls everything after it up the page. Folding it is the person's.
   const [opened] = React.useState(() => ({ yes: false }));
   if (runs) opened.yes = true;
-  const isOpen = open ?? (opened.yes || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
+  const isOpen =
+    open ??
+    (opened.yes ||
+      failures > 0 ||
+      step.group === "agent" ||
+      step.group === "ask" ||
+      (step.group === "plan" && step.calls.some((c) => c.tool === "plan")) ||
+      step.calls.some((c) => researched.has(c.id)));
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
   const last = step.calls.at(-1);
@@ -1069,6 +1096,16 @@ export const Timeline = React.memo(function Timeline({
   const approvals = stillAsked(state?.approvals ?? NO_APPROVALS, done);
   const askingKey = approvals.map((a) => a.tool_id ?? "").join(" ");
   const asking = React.useMemo(() => new Set(askingKey.split(" ").filter(Boolean)), [askingKey]);
+  // The calls that last touched each piece of research: their steps open on it. A key, so the set only changes when they do.
+  const researchedKey = React.useMemo(() => {
+    const last = new Map<string, string>();
+    for (const e of events) {
+      const r = e.kind === "tool" && e.status !== "error" ? researchCall(e) : null;
+      if (r?.id) last.set(r.id, e.id);
+    }
+    return [...last.values()].join(" ");
+  }, [events]);
+  const researched = React.useMemo(() => new Set(researchedKey.split(" ").filter(Boolean)), [researchedKey]);
   // What waits on you sits where it was asked: the latest thing the agent did, the conversation's
   // end. Scrolled away from it, a pill floating over the bottom edge says so (nothing moves).
   const pending = onDecide ? approvals : NO_APPROVALS;
@@ -1102,7 +1139,7 @@ export const Timeline = React.memo(function Timeline({
   }, [events, parent, kind, accountOpen]);
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
+    <Contexts asking={asking} researched={researched} signIn={signIn} findNow={findNow} tasks={tasks} files={conversationFiles}>
       {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
       <div
         ref={keeper.ref}

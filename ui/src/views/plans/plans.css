@@ -734,9 +734,10 @@ a.plan-row-main:hover {
   margin: 0;
 }
 
-/* A plan's steps as their graph (graph.tsx): rounds across (down, narrow), a line from each step a
-   step waits for; where each stands drawn as the console draws work (status.tsx). Only a step at
-   work moves (its mark's light, its title's shimmer: transforms the GPU moves); waiting steps are
+/* A plan's steps as their graph (graph.tsx): rounds across, a line from each step a step waits for;
+   narrow (a phone, a side pane), down, a step a row the graph's width, a round's steps close
+   together. Where each stands is drawn as the console draws work (status.tsx). Only a step at work
+   moves (its mark's light, its title's shimmer: transforms the GPU moves); waiting steps are
    sketched and still; the lines never move. */
 .pg {
   position: relative;
@@ -779,10 +780,10 @@ a.plan-row-main:hover {
 @container (max-width: 560px) {
   .pg-rounds {
     grid-auto-flow: row;
-    gap: 22px;
+    gap: 18px;
   }
   .pg-round {
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 6px;
   }
 }
 .pg-node {
@@ -799,8 +800,29 @@ a.plan-row-main:hover {
   color: var(--color-bright);
   text-decoration: none;
 }
-a.pg-node:hover {
+a.pg-node:hover,
+button.pg-node:hover {
   border-color: #353b46;
+}
+/* A step to pick (a plan's page): tapped, it's picked, ringed in the prism's blue and ticked. */
+button.pg-node {
+  width: 100%;
+  padding-right: 26px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.pg-node[aria-pressed="true"] {
+  border-color: #a6c4ed;
+  background: #10151d;
+}
+.pg-node[aria-pressed="true"]::after {
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  color: #a6c4ed;
+  font-size: 12px;
+  content: "✓";
 }
 .pg-node[data-stand="working"] {
   border-color: #3a3f5a;
@@ -831,6 +853,11 @@ a.pg-node:hover {
 .pg-node[data-stand="waiting"] .pg-title,
 .pg-node[data-stand="stopped"] .pg-title {
   color: #9a9ca3;
+}
+.pg-code {
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.92em;
 }
 .pg-n {
   margin-right: 5px;
@@ -893,8 +920,8 @@ a.pg-node:hover {
 .pg-bar i[data-s="stopped"] {
   background: #4a4f58;
 }
-/* A plan, read (steps-view.tsx): its overview, then its steps as cards in the graph's own look, each
-   to pick (to run just those) or run alone. */
+/* A plan, read (steps-view.tsx): its overview, then its steps as their graph, to pick; what each
+   picked step is under it, in the graph's own look, and Run for just those. */
 .plan-overview {
   color: var(--color-secondary);
   font-size: 14px;
@@ -913,29 +940,34 @@ a.pg-node:hover {
   color: var(--color-bright);
   font-size: 12px;
 }
-.sv-list {
+.sv-picked-steps {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+.sv-details {
   display: grid;
   gap: 8px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
-.sv-step {
+.sv-detail {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: start;
-  gap: 12px;
+  gap: 10px;
   padding: 10px 12px;
   border: 1px solid #262a31;
   border-radius: 9px;
   background: #0d0f12;
+  font-size: 13px;
 }
-.sv-step[data-picked] {
-  border-color: var(--color-line-hover);
-  background: #12151a;
+.sv-body {
+  min-width: 0;
 }
-.sv-check {
-  margin-top: 3px;
+.sv-run {
+  justify-self: start;
 }
 .sv-title {
   margin: 0;
@@ -949,15 +981,6 @@ a.pg-node:hover {
   color: var(--color-meta);
   font-family: var(--font-mono);
   font-size: 12px;
-}
-.sv-after {
-  margin: 2px 0 0;
-  color: var(--color-meta);
-  font-size: 12px;
-}
-.sv-detail {
-  margin-top: 8px;
-  font-size: 13px;
 }
 .sv-link {
   margin: -6px 0;
@@ -975,18 +998,8 @@ a.pg-node:hover {
 .sv-link:hover {
   color: var(--color-bright);
 }
-/* On a phone, Run goes under the step's words. */
-@media (max-width: 640px) {
-  .sv-step {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-  .sv-step > :last-child {
-    grid-column: 2;
-    justify-self: start;
-  }
-}
-/* An agent's own plan, in its Plan tab (its-plan.tsx): the plan it proposed, kept by kiln, its steps
-   as cards; its to-do list, each item as a step stands. */
+/* An agent's own plan, in its Plan tab (its-plan.tsx): its to-do list as the tree of a plan's steps;
+   the plan it proposed in its words, kept by kiln. */
 .ip {
   display: grid;
   gap: 8px;
@@ -1008,41 +1021,6 @@ a.pg-node:hover {
   color: var(--color-meta);
   font-size: 12px;
 }
-.ip .plan-section {
-  padding-top: 0;
-  border-top: 0;
-}
-.ip .plan-h {
-  font-size: 13px;
-}
-.ip > .sv-link {
-  justify-self: start;
-}
-.ip-run {
-  display: flex;
-}
-.ip-todos {
-  display: grid;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.ip-todo {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  align-items: start;
-  gap: 8px;
-  color: var(--color-secondary);
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
-.ip-todo[data-stand="met"] {
-  color: var(--color-meta);
-}
-.ip-todo[data-stand="working"] {
-  color: var(--color-bright);
-}
-.ip-todo > :first-child {
+.ip-todos .pg-bar {
   margin-top: 2px;
 }

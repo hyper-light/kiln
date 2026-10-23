@@ -42,7 +42,7 @@ pub fn safe_ref(path: &str) -> bool {
 }
 
 /// git's rules for a ref's name (`git check-ref-format`).
-fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     !name.ends_with('/')
         && !name.ends_with('.')
         && !name.contains("..")

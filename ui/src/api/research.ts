@@ -106,7 +106,37 @@ const enc = encodeURIComponent;
 
 export const researchApi = {
   get: (id: string, signal?: AbortSignal) => request<Research>("GET", `/api/research/${enc(id)}?markdown=false`, undefined, { signal }),
-  list: (signal?: AbortSignal) => request<{ research: Research[] }>("GET", "/api/research", undefined, { signal }),
+  /** Research, newest change first: one agent's (`agent`), one plan's (`plan`), or all. */
+  list: (of: { agent?: string; plan?: string } = {}, signal?: AbortSignal) => {
+    const q = new URLSearchParams(Object.entries(of).filter((e): e is [string, string] => !!e[1])).toString();
+    return request<{ research: Research[] }>("GET", `/api/research${q ? `?${q}` : ""}`, undefined, { signal });
+  },
 };
 
 export const researchHref = (id: string) => `/agents/research/${enc(id)}`;
+
+const parsed = (s: string): unknown => {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * The research an agent's tool call starts, adds to, reads or skips a side of (kiln's `research_*`
+ * tools), and its id, from the call as any harness reports it: an MCP call of kiln's (Claude Code,
+ * Codex: its server and the tool's own name), or one an ACP agent reports in words ("Called
+ * research_add from kiln", Devin), its input as text. The id is the one it names, else the one its
+ * answer opens with. Null for any other call.
+ */
+export function researchCall(c: { server?: string; tool_short?: string; title?: string; input?: unknown; output?: string }): { verb: string; id: string | null } | null {
+  const tool = c.server?.startsWith("kiln") && c.tool_short?.startsWith("research_") ? c.tool_short : /^Called (research_\w+) from kiln\b/.exec(c.title ?? "")?.[1];
+  const verb = tool?.slice("research_".length) ?? "";
+  if (!["start", "add", "get", "skip"].includes(verb)) return null;
+  const input = typeof c.input === "string" ? parsed(c.input) : c.input;
+  const named = input && typeof input === "object" && "id" in input && typeof input.id === "string" ? input.id : null;
+  // Its answer is the research (JSON, or JSON quoted as text), its id first.
+  const answered = /\\?"id\\?"\s*:\s*\\?"([^"\\]+)\\?"/.exec(c.output ?? "")?.[1] ?? null;
+  return { verb, id: named || answered };
+}

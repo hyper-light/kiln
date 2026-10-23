@@ -21,6 +21,7 @@ pub mod repos;
 pub mod runner;
 pub mod scan;
 pub mod server;
+pub mod share;
 pub mod tasks;
 pub mod wire;
 

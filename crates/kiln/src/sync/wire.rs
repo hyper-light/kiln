@@ -8,7 +8,7 @@
 //! answered by [`Msg::Task`]): only to runners announcing `CAP_REPOS`. A side that doesn't know a
 //! kind skips it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,14 @@ pub enum Msg {
     /// Runner → server: an agent session moving between machines with a synced repo's files, as
     /// this machine saw its part (`crate::harness::session`), for the repo's activity.
     Move(MoveNews),
+    /// Server → runner: the repositories this machine holds that others hold too, whole: each with
+    /// the batch its work goes to next (`crate::sync::share`).
+    Shares { shares: Vec<ShareSlot> },
+    /// Runner → server: this machine's work in a repository others hold, sent to the slot's batch.
+    Shared(Box<Work>),
+    /// Server → runner: another machine's work in a repository this one holds: taken in beside its
+    /// own (`refs/remotes/kiln/<machine>/…`), nothing of its own touched.
+    Take(Box<Work>),
 }
 
 /// An agent session's move, as one of the two machines saw its part.
@@ -134,6 +142,57 @@ pub struct Found {
     pub active: i64,
     /// kiln cloned it there.
     pub kiln: bool,
+    /// Its branch checked out against the same branch on the other machines that hold it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<Peer>,
+}
+
+/// A repository this machine holds that others hold too: where its branches' bundle and its work
+/// in progress's go next (`PUT /api/sync/bundles/:batch`), and whether the server has none of its
+/// work yet (it goes whatever it is).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShareSlot {
+    pub key: String,
+    pub batch: String,
+    pub wip_batch: String,
+    pub fresh: bool,
+}
+
+/// A machine's work in a repository: its branches, the work in progress of its folders of it (a
+/// commit of its files as they are, on the branch checked out), and two bundles: the commits its
+/// branches name that its remote lacks, and the work in progress beyond them. Each goes again only
+/// when it changes: a batch left empty is the one before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Work {
+    pub key: String,
+    /// The machine it's from (the server fills it in).
+    pub from: String,
+    /// Branch → commit.
+    pub branches: BTreeMap<String, String>,
+    /// Branch checked out → its work in progress.
+    pub wip: BTreeMap<String, String>,
+    /// The branches' bundle: its batch, and its SHA-256 and size when there's one.
+    pub batch: String,
+    pub hash: Option<String>,
+    pub size: u64,
+    /// The work in progress's bundle, the same way.
+    pub wip_batch: String,
+    pub wip_hash: Option<String>,
+    pub wip_size: u64,
+}
+
+/// How a folder's branch stands against the same branch on another machine (its work, taken in).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Peer {
+    pub machine: String,
+    /// Commits of this branch the other's lacks, and of the other's this one lacks.
+    pub ahead: u32,
+    pub behind: u32,
+    /// It has work in progress on the branch.
+    pub wip: bool,
 }
 
 /// Clone a repository into `path`, which must be absent or an empty folder: from a bundle the

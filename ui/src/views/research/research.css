@@ -204,6 +204,72 @@
 a.rs-loc:hover {
   color: #c9cbd1;
 }
+/* In brief (research.tsx `ResearchBrief`): its first findings, a small chip of its grade each. */
+.rs-claims {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rs-claims li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.rs-grade-sm b {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  font-size: 10.5px;
+}
+.rs-more {
+  margin: 0;
+  font-size: 12px;
+}
+/* As its agent reports it (its conversation, its Plan tab): a card, its links under it. */
+.rs-list {
+  display: grid;
+  gap: 8px;
+}
+.rs-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #262a31;
+  border-radius: 9px;
+  background: #0d0f12;
+}
+.rs-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 0;
+  font-size: 12px;
+}
+.rs-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-secondary);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.rs-link:hover {
+  color: var(--color-bright);
+}
+/* All of it, on the Plans page. */
+.plans-research {
+  margin-top: 28px;
+}
 @media (max-width: 480px) {
   .rs-claim-row {
     flex-direction: column;
