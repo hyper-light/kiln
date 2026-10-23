@@ -563,7 +563,10 @@ fn w13_r07_docker_actions_in_pods_need_the_pools_sidecar() -> anyhow::Result<()>
     assert_eq!(without, "failure", "{detail}");
     assert!(why.contains("KCI4032") && why.contains("`docker://alpine:3.20` needs Docker") && why.contains("pool `pods`") && why.contains("`docker` executor"), "{why}");
     let (with, notes, log) = legs.get("with").cloned().unwrap_or_default();
-    assert_eq!(with, "success", "{notes}\n{log}\n{detail}\n{}", s.log());
+    let pods_log = std::fs::read_dir(dir.path().join("pods"))
+        .map(|d| d.flatten().map(|e| std::fs::read_to_string(e.path().join("log")).unwrap_or_default()).collect::<Vec<_>>().join("\n---\n"))
+        .unwrap_or_default();
+    assert_eq!(with, "success", "{notes}\n{log}\n{detail}\n{pods_log}\n{}", s.log());
     assert!(log.contains("from-the-sidecar"), "{log}");
     let seen = kube.seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
     assert_eq!(seen.created.len(), 1, "a pod for the job with the sidecar only: {:?}", seen.created);
