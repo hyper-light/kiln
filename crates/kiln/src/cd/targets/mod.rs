@@ -26,6 +26,11 @@ pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod aws_s3;
 pub mod aws_static;
+pub mod azure;
+pub mod azure_containerapps;
+pub mod azure_static;
+pub mod azure_vmss;
+pub mod azure_web;
 pub mod cloudflare_workers;
 pub mod cloudformation;
 pub mod gcp;
@@ -36,6 +41,8 @@ pub mod gcp_run;
 pub mod vercel;
 #[cfg(test)]
 pub mod fake;
+#[cfg(test)]
+pub mod fake_azure;
 #[cfg(test)]
 pub mod fake_gcp;
 #[cfg(test)]
@@ -209,6 +216,14 @@ impl Cx<'_> {
         match &self.creds {
             Creds::Bearer(token) if self.conn.def.integration == "gcp" => Ok(integrations::gcp::Gcp { token }),
             _ => bail!("{} isn't a Google Cloud target", self.conn.target.name()),
+        }
+    }
+
+    /// Azure's APIs, for `azure-*` providers.
+    pub fn arm(&self) -> Result<integrations::azure::Arm<'_>> {
+        match &self.creds {
+            Creds::Bearer(token) if self.conn.def.integration == "azure" => Ok(integrations::azure::Arm { token }),
+            _ => bail!("{} isn't an Azure target", self.conn.target.name()),
         }
     }
 
@@ -573,6 +588,10 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "aws-ec2" => aws_ec2::list(cx, kind, names).await?,
         "aws-lambda" => aws_lambda::list(cx, kind, names).await?,
         "aws-static" => aws_static::list(cx, kind, names).await?,
+        "azure-appservice" | "azure-functions" => azure_web::list(cx, kind, names).await?,
+        "azure-containerapps" => azure_containerapps::list(cx, kind, names).await?,
+        "azure-static" => azure_static::list(cx, kind, names).await?,
+        "azure-vmss" => azure_vmss::list(cx, kind, names).await?,
         "aws-ecs" => aws_ecs::list(cx, kind, names).await?,
         "cloudflare-workers" => cloudflare_workers::list(cx, kind, names).await?,
         "cloudformation" => cloudformation::list(cx, kind, names).await?,
@@ -598,6 +617,10 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "aws-ec2" => aws_ec2::apply(cx, desired).await,
         "aws-lambda" => aws_lambda::apply(cx, desired).await,
         "aws-static" => aws_static::apply(cx, desired).await,
+        "azure-appservice" | "azure-functions" => azure_web::apply(cx, desired).await,
+        "azure-containerapps" => azure_containerapps::apply(cx, desired).await,
+        "azure-static" => azure_static::apply(cx, desired).await,
+        "azure-vmss" => azure_vmss::apply(cx, desired).await,
         "aws-ecs" => aws_ecs::apply(cx, desired).await,
         "cloudflare-workers" => cloudflare_workers::apply(cx, desired).await,
         "cloudformation" => cloudformation::apply(cx, desired).await,
@@ -618,6 +641,10 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "aws-ec2" => aws_ec2::delete(cx, key).await,
         "aws-lambda" => aws_lambda::delete(cx, key).await,
         "aws-static" => aws_static::delete(cx, key).await,
+        "azure-appservice" | "azure-functions" => azure_web::delete(cx, key).await,
+        "azure-containerapps" => azure_containerapps::delete(cx, key).await,
+        "azure-static" => azure_static::delete(cx, key).await,
+        "azure-vmss" => azure_vmss::delete(cx, key).await,
         "aws-ecs" => aws_ecs::delete(cx, key).await,
         "cloudflare-workers" => cloudflare_workers::delete(cx, key).await,
         "cloudformation" => cloudformation::delete(cx, key).await,
