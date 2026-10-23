@@ -218,6 +218,13 @@ kiln install --join <code>                   # join a kiln, rather than start on
   the node is in the cluster, and says where to open it. It never ends half installed: a failure
   says what failed and leaves nothing running.
 
+**Built ahead of the phases** (`crates/kiln/src/install_targets.rs`, today's server as the node):
+`--on kubernetes` (the default; one Deployment until P3 makes it three, a NodePort service, its
+admin token a secret, an image built from the installing binary and loaded into minikube, kind or
+k3d, or pushed to `--registry`), `--on docker` and `--on machine`. Each ends once the kiln answers,
+its UI's page and script load and its runner is connected (`/healthz/server`), and otherwise takes
+back what it made. `--join` comes with P5.
+
 ## Getting there from today
 
 Production keeps working at every step; each phase ships, is checked live, then the next starts.
