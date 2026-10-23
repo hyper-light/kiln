@@ -705,8 +705,10 @@ def renote(api, out_dir, only=None):
                 changed += sum(1 for a, b in zip(notes, new) if a != b)
                 w["notes"] = new
         if changed:
-            with open(p, "w") as f:
+            # Whole or not at all: a pass under way reads every result after each repository.
+            with open(p + ".new", "w") as f:
                 json.dump(d, f, indent=1)
+            os.replace(p + ".new", p)
         print(f"{repo}: {changed} notes read again", flush=True)
     write(out_dir)
 
