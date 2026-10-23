@@ -19,7 +19,8 @@
  */
 import type http from "node:http";
 import type { WebSocket } from "ws";
-import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task } from "../src/api/harness.ts";
+import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import { PROPOSED } from "./pages.ts";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -152,6 +153,19 @@ const family = new Map<string, Member>(
   const m = family.get("fam-migr");
   if (m) m.info.approvals = [{ id: migrApproval.id, tool: migrApproval.tool, tool_name: migrApproval.tool_name, title: migrApproval.title, at: migrApproval.at }];
 }
+
+// Release prep proposed a plan (plan mode), kept by kiln (pages.ts `pl_proposed`), and works through its to-do list.
+{
+  const m = family.get("fam-orch");
+  m?.events.push({ id: "fam-orch-plan", seq: 3, at: t0 + 50_000, kind: "tool", tool_id: "tp1", name: "ExitPlanMode", tool: "plan", title: "Plan ready for review", input: { plan: PROPOSED }, status: "done", started: t0 + 50_000 } as unknown as HEvent);
+}
+const ORCH_TODOS: Todo[] = [
+  { text: "Reproduce it with the CLI test", status: "completed" },
+  { text: "Key WritableOpens by handle and inode", status: "completed" },
+  { text: "Adopt unseen handles on a restored mount", status: "in_progress" },
+  { text: "Red-first tests: the CLI and coherence tests", status: "pending" },
+  { text: "Clippy, the doc gate and CI", status: "pending" },
+];
 
 /* ------------------------------------------------------------------ a plan run, one agent per step */
 
@@ -507,7 +521,7 @@ function stateOf(m: Member): State {
     queue: [],
     delivery: {},
     tasks: m.tasks ?? [],
-    todos: [],
+    todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
   } as State;

@@ -469,23 +469,32 @@ async fn clear_for_refs(hub: &Hub, path: &str) {
 /// `/<owner>/<name>.git/info/refs` and `…/git-upload-pack`, `…/git-receive-pack` of a native
 /// repository.
 pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req: Request) -> Result<Response, Fail> {
-    let Some(who) = pusher(hub, req.headers()).await else { return Ok(unauthorized()) };
-    let read = match &who {
-        // `git.read`: a reader's token (Argo CD's, docs/deploy-api.md §7), git and nothing else.
-        Pusher::Caller(c) => c.is_owner() || c.can("diffs.read", &Scope::Repo { repo: repo.name.clone() }) || c.can("git.read", &Scope::Repo { repo: repo.name.clone() }),
-        Pusher::Job(j) => j.repo == repo.id && j.may("contents", kiln_ci::plan::perms::Level::Read),
-    };
-    if !read {
-        return Err((StatusCode::FORBIDDEN, format!("{} may not read {}", who.name(), repo.name)));
-    }
     let q = srv::query(&req);
     let pushing = matches!(tail, ["git-receive-pack"]) || (matches!(tail, ["info", "refs"]) && q.get("service").map(String::as_str) == Some("git-receive-pack"));
-    if pushing && matches!(&who, Pusher::Job(j) if j.repo != repo.id) {
-        return Err((StatusCode::FORBIDDEN, format!("this job's token pushes to its own repository only, not {}", repo.name)));
+    let who = match pusher(hub, req.headers()).await {
+        Some(w) => Some(w),
+        // A public repository is anyone's to read, without a token, as a public GitHub
+        // repository is (a step that fetches after `actions/checkout`'s `persist-credentials:
+        // false`). A token that isn't kiln's is refused all the same, and a push needs one.
+        None if !pushing && super::token::from_headers(req.headers()).is_none() && hub.store.repo_public(repo.id.clone()).await.unwrap_or(false) => None,
+        None => return Ok(unauthorized()),
+    };
+    if let Some(who) = &who {
+        let read = match who {
+            // `git.read`: a reader's token (Argo CD's, docs/deploy-api.md §7), git and nothing else.
+            Pusher::Caller(c) => c.is_owner() || c.can("diffs.read", &Scope::Repo { repo: repo.name.clone() }) || c.can("git.read", &Scope::Repo { repo: repo.name.clone() }),
+            Pusher::Job(j) => j.repo == repo.id && j.may("contents", kiln_ci::plan::perms::Level::Read),
+        };
+        if !read {
+            return Err((StatusCode::FORBIDDEN, format!("{} may not read {}", who.name(), repo.name)));
+        }
+        if pushing && matches!(who, Pusher::Job(j) if j.repo != repo.id) {
+            return Err((StatusCode::FORBIDDEN, format!("this job's token pushes to its own repository only, not {}", repo.name)));
+        }
     }
     let (Some(root), Some(dir)) = (path.parent(), path.file_name()) else { return Err((StatusCode::INTERNAL_SERVER_ERROR, "the repository's path".into())) };
     let path_info = format!("/{}/{}", dir.to_string_lossy(), tail.join("/"));
-    let user = who.name();
+    let user = who.as_ref().map_or_else(|| "anonymous".to_owned(), Pusher::name);
     let configs: &[&str] = if pushing { &["http.receivepack=true", "receive.advertisePushOptions=true"] } else { &["uploadpack.allowAnySHA1InWant=true", "uploadpack.allowFilter=true"] };
     let cgi = super::facade::Cgi { root, path_info: &path_info, configs, user: &user, method: req.method().as_str().to_owned(), query: req.uri().query().unwrap_or_default().to_owned(), headers: req.headers().clone() };
     let p = path.to_string_lossy().into_owned();
@@ -500,6 +509,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         clear_for_refs(hub, &p).await;
         return super::facade::backend(&cgi, body.to_vec(), None).await;
     }
+    let Some(who) = who else { return Ok(unauthorized()) };
     if req.headers().get(http::header::CONTENT_ENCODING).is_some_and(|e| e.as_bytes() != b"identity") {
         return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "a push's request body isn't compressed".into()));
     }

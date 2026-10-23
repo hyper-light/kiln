@@ -32,11 +32,14 @@ pub struct Limits {
     pub max_size: u64,
     /// Names or `/`-separated path prefixes left out, besides the defaults and git's rules.
     pub exclude: Vec<String>,
+    /// Its files, its git refs, or both.
+    #[serde(default)]
+    pub mode: super::Mode,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_size: 256 << 20, exclude: Vec::new() }
+        Self { max_size: 256 << 20, exclude: Vec::new(), mode: super::Mode::Files }
     }
 }
 

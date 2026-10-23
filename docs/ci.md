@@ -1958,6 +1958,12 @@ W20.
     machine's CPUs times 1.5 ran one after the other on a runner with two slots, and a small one
     ran beside one of them. Unit-tested: requests as written (`w05_r03_requests_as_written`).
 - *Left.* AC11 on the live cluster.
+- *Open, for the user to decide:* R16's retry after `runner-lost` avoids the runner that lost the
+  leg, so where only one runner can take it, the retry waits for good. The options: wait (today);
+  prefer another runner and take the same one when none other can (at once, or after a few
+  minutes); don't retry when no other runner can; or the default prefers another while an
+  explicit `runner: different` stays strict and says it waits for a runner other than the one
+  lost. The last is recommended.
 
 ### W06 Step runtime on the runner
 
@@ -3864,7 +3870,13 @@ enforcement points to W18, agent isolation to W20.
   - the command-line tools of GitHub's image that scripts call: `python` (Python 3), fakeroot
     (bat's Debian packages need it), Bison and Flex, patchelf, ShellCheck, the SQLite shell,
     tree, lz4, pigz, 7-Zip, GNU parallel, Brotli, zsync, aria2, sshpass, dig, ping, netstat,
-    telnet, ftp, the ACL tools, SWIG, Texinfo, rpm, UPX, MediaInfo, Mercurial and Xvfb.
+    telnet, ftp, the ACL tools, SWIG, Texinfo, rpm, UPX, MediaInfo, Mercurial and Xvfb;
+  - git from the git-core PPA, current as GitHub's is (2.55 when added; Ubuntu 24.04's own is
+    2.43). Tools go by its version: cargo retries a failed `git fetch` itself only below 2.54,
+    and its ssh and https tests count the retries;
+  - a `snap` that does what a container can: snapd needs a machine of its own, so
+    `snap install NAME` installs Ubuntu's package of each name, as `taiki-e/install-action`'s
+    Valgrind asks for (tokio's stress tests), and anything else says why it can't.
 
   On Ubuntu 24.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's image's
   does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.
@@ -4333,7 +4345,13 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     from network URLs only); `repos` gains `mode` and `default_branch` (R13's first part);
   - clone and push over HTTPS at `/git/<owner>/<repo>.git` (and at the root, for legs), with a
     PAT or an agent token as git's password, or a leg's `GITHUB_TOKEN`;
-  - fetches need `diffs.read` (a leg: `contents: read`, its own repository only);
+  - fetches need `diffs.read` (a leg: `contents: read`, its own repository only), except of a
+    public repository (`POST /api/repos` with `public: true`, shown as `public` in its listing),
+    which anyone reads without a token, as anyone reads a public GitHub repository. A step's
+    `git fetch` after `actions/checkout`'s `persist-credentials: false` relies on it (the
+    corpus's elixir; its repositories are public, as on GitHub). A token that isn't kiln's is
+    refused, public or not, and a push always needs one
+    (`w14_r01_public_repositories_read_without_a_token`);
   - a push's ref updates are read before git sees the pack, and the push is refused whole, in
     git's own report and as `remote: kiln: …` lines, when one of them breaks policy:
     - only the owner, or a principal `.kiln/review.yaml` `direct-push` names (read from trunk),
@@ -4513,7 +4531,11 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     its certificate authority with each leg, and the leg's tools trust it beside the machine's
     roots. Node adds it to its own (`NODE_EXTRA_CA_CERTS`); git, curl, Python and OpenSSL take a
     bundle of the machine's roots and it (`GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`,
-    `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`). A job's own say wins. The server's certificate names
+    `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`). A job's own say wins. In kiln's runner image the
+    authority goes in the leg's machine's own store instead (`update-ca-certificates`), as a
+    hosted runner's machine trusts what it reaches. Then only Node and Python's requests, which
+    read bundles of their own, are told, and git says what it says on GitHub (`CAfile: none`,
+    which cargo's https tests check). The server's certificate names
     `host.docker.internal` too, which containers on its machine reach it by. GitHub Enterprise
     Server's clients go `https://` to the host they're given whatever its scheme, as
     `create-pull-request` and `actions-gh-pages` do, so this is what lets them run. Checked end to

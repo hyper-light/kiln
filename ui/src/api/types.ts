@@ -1650,11 +1650,16 @@ export interface SyncConflict {
   beside: string;
 }
 
+/** What a synced repo keeps the same on its copies: its files (uncommitted work too), its branches and commits, or both. */
+export type SyncMode = "files" | "files_and_git" | "git";
+
 export interface SyncRepo {
   id: string;
   name: string;
   created: number;
   exclude: string[];
+  /** Older servers: none, files. */
+  mode?: SyncMode;
   files: number;
   index: number;
   conflicts: SyncConflict[];
@@ -1847,6 +1852,8 @@ export interface PlaceAsk {
   branch?: string;
   to?: { machine: string; path: string }[];
   delete?: boolean;
+  /** A new sync's: what its copies keep the same. */
+  mode?: SyncMode;
 }
 
 /** What to plan (`/api/cd/plans`): one commit, a stack (`head`, from where it leaves trunk or

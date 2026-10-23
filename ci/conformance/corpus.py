@@ -246,14 +246,15 @@ def commits(dest, repo, name=""):
 
 
 def native(api, repo, branch):
-    """kiln's own repository `repo`, its default branch `branch` (one of that name polled from
-    elsewhere, from an earlier pass, or on another branch, goes)."""
+    """kiln's own repository `repo`, its default branch `branch`, public as the repository is on
+    GitHub (one of that name polled from elsewhere, from an earlier pass, on another branch, or
+    private, goes)."""
     found = next((r for r in api.call("GET", "/api/repos") or [] if r["name"] == repo), None)
-    if found and (found.get("mode") != "native" or found.get("default_branch") != branch):
+    if found and (found.get("mode") != "native" or found.get("default_branch") != branch or not found.get("public")):
         api.call("DELETE", "/api/repos/" + found["id"])
         found = None
     if not found:
-        api.call("POST", "/api/repos", {"name": repo, "mode": "native", "default_branch": branch})
+        api.call("POST", "/api/repos", {"name": repo, "mode": "native", "default_branch": branch, "public": True})
 
 
 def push(api, dest, repo, refspec):

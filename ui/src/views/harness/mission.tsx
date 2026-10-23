@@ -89,20 +89,23 @@ function lineOf(a: AgentInfo, stand: Stand): string {
 /** Answered at once (answered.ts): the row moves on now; if the answer doesn't go, it's back. */
 function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
   const decide = (decision: "allow" | "deny") => void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => toast.error("Couldn't answer", errorMessage(e)));
-  if (ap.tool === "question" || ap.tool === "plan")
+  if (ap.tool === "question")
     return (
       <Button size="xs" asChild>
-        <Link to={`/agents/${a.id}`}>{ap.tool === "plan" ? "Review the plan" : "Answer"}</Link>
+        <Link to={`/agents/${a.id}`}>Answer</Link>
       </Button>
     );
+  // A plan it proposes is approved here; to keep it planning (with what to change), review it on its page.
   return (
     <>
       <Button size="xs" onClick={() => decide("allow")}>
-        Allow
+        {ap.tool === "plan" ? "Approve" : "Allow"}
       </Button>
-      <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
-        Deny
-      </Button>
+      {ap.tool !== "plan" && (
+        <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
+          Deny
+        </Button>
+      )}
       <Link to={`/agents/${a.id}`} className="ms-link">
         Review
       </Link>

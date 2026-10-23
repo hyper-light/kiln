@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { api } from "@/api/client";
-import type { SyncConflict, SyncCopy, SyncKeep, SyncRepo } from "@/api/types";
+import type { SyncConflict, SyncCopy, SyncKeep, SyncMode, SyncRepo } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Confirm, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
@@ -23,9 +23,30 @@ export const DOT: Record<SyncCopy["state"], string> = {
   error: "failed",
 };
 
-/** Starting a synced repo: its name, where its copies are, and what to leave out. */
+/** What a synced repo can keep the same, as a choice says it. */
+export const MODES: { value: SyncMode; label: string }[] = [
+  { value: "files", label: "Its files" },
+  { value: "files_and_git", label: "Its files, branches and commits" },
+  { value: "git", label: "Its branches and commits" },
+];
+
+/** What a synced repo keeps the same, in a few words. */
+export function modeWords(mode: SyncMode | undefined): string {
+  return mode === "git" ? "branches and commits" : mode === "files_and_git" ? "files, branches and commits" : "files";
+}
+
+/** A path of a synced repo as people say it: a branch's or tag's name, else the path. */
+export function pathWords(path: string): string {
+  if (path === ".git/HEAD") return "the branch checked out";
+  if (path.startsWith(".git/refs/heads/")) return `branch ${path.slice(".git/refs/heads/".length)}`;
+  if (path.startsWith(".git/refs/tags/")) return `tag ${path.slice(".git/refs/tags/".length)}`;
+  return path;
+}
+
+/** Starting a synced repo: its name, where its copies are, what it keeps the same and leaves out. */
 export function NewRepo({ machines, onDone, onCancel }: { machines: string[]; onDone: () => void; onCancel: () => void }) {
   const [name, setName] = React.useState("");
+  const [mode, setMode] = React.useState<SyncMode>("files");
   const [copies, setCopies] = React.useState<{ machine: string; path: string }[]>([
     { machine: "", path: "" },
     { machine: "", path: "" },
@@ -47,6 +68,7 @@ export function NewRepo({ machines, onDone, onCancel }: { machines: string[]; on
           .split(",")
           .map((x) => x.trim())
           .filter(Boolean),
+        mode,
       });
       onDone();
     } catch (err) {
@@ -74,6 +96,12 @@ export function NewRepo({ machines, onDone, onCancel }: { machines: string[]; on
           Another copy
         </Button>
       </fieldset>
+      <div>
+        <SelectField label="Keeps the same" value={mode} onChange={(v) => setMode(v as SyncMode)} options={MODES} />
+        <div className="field-hint">
+          {mode === "files" ? "Uncommitted work too, both ways, within seconds." : mode === "git" ? "Each machine's working tree stays its own. For a git repository." : "Uncommitted work too, and the branch checked out. For a git repository."}
+        </div>
+      </div>
       <TextField
         label="Leave out"
         value={exclude}
@@ -170,7 +198,8 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
         <div className="min-w-0">
           <h2>{title ?? repo.name}</h2>
           <p className="sync-meta">
-            {repo.files.toLocaleString()} files · {summary(repo) || "no copies"}
+            {modeWords(repo.mode)} · {repo.mode !== "git" && `${repo.files.toLocaleString()} files · `}
+            {summary(repo) || "no copies"}
             {repo.exclude.length > 0 && ` · leaves out ${repo.exclude.join(", ")}`}
           </p>
         </div>
@@ -331,8 +360,8 @@ function ConflictRow({ conflict, onResolve }: { conflict: SyncConflict; onResolv
   const [busy, setBusy] = React.useState(false);
   return (
     <li className="sync-conflict">
-      <code className="sync-path">{conflict.beside}</code>
-      <code className="sync-path sync-beside">{conflict.path}</code>
+      <code className="sync-path">{pathWords(conflict.beside)}</code>
+      <code className="sync-path sync-beside">{pathWords(conflict.path)}</code>
       <div className="sync-resolve">
         <SelectField label="Resolve" hideLabel value={keep} onChange={(v) => setKeep(v as SyncKeep)} options={KEEP} />
         <Button

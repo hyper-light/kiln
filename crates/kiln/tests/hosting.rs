@@ -1526,6 +1526,56 @@ fn w14_r01_first_branch_and_refusals_said() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W14-R01: a public native repository is anyone's to read over git, as a public GitHub
+/// repository is (a step's `git fetch` after `actions/checkout`'s `persist-credentials: false`);
+/// pushing still needs a token, a token that isn't kiln's is refused, and a private repository
+/// stays private.
+#[test]
+fn w14_r01_public_repositories_read_without_a_token() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    for (name, public) in [("acme/open", true), ("acme/closed", false)] {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native", "public": public })))?;
+        anyhow::ensure!(st == 200, "{name}: {st} {body}");
+        assert_eq!(serde_json::from_str::<Value>(&body)?.get("public").and_then(Value::as_bool), Some(public), "{body}");
+    }
+    let (_, repos) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+    let repos: Value = serde_json::from_str(&repos)?;
+    let listed = |name: &str| repos.as_array().and_then(|r| r.iter().find(|x| x.get("name").and_then(Value::as_str) == Some(name))).and_then(|x| x.get("public")).and_then(Value::as_bool);
+    assert_eq!((listed("acme/open"), listed("acme/closed")), (Some(true), Some(false)), "{repos}");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    must(git(&home, &work, &["init", "-q", "-b", "main"]), "init")?;
+    std::fs::write(work.join("README.md"), "open\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "open"]), "commit")?;
+    for name in ["acme/open", "acme/closed"] {
+        must(git(&home, &work, &["push", &format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port), "main"]), "push")?;
+    }
+    let anonymous = |name: &str| format!("http://127.0.0.1:{}/git/{name}.git", s.port);
+    // Read without a token: cloned, then fetched.
+    let clone = dir.path().join("clone");
+    must(git(&home, dir.path(), &["clone", "-q", &anonymous("acme/open"), clone.to_string_lossy().as_ref()]), "an anonymous clone of a public repository")?;
+    assert_eq!(std::fs::read_to_string(clone.join("README.md"))?, "open\n");
+    must(git(&home, &clone, &["fetch", "--tags", "-q"]), "an anonymous fetch")?;
+    // Not pushed without one.
+    std::fs::write(clone.join("README.md"), "changed\n")?;
+    must(git(&home, &clone, &["commit", "-qam", "changed"]), "commit")?;
+    let (pushed, out) = git(&home, &clone, &["-c", "credential.helper=", "push", "-q", "origin", "main"])?;
+    assert!(!pushed, "an anonymous push is refused: {out}");
+    // A token that isn't kiln's is refused, public or not (sent as checkout's extraheader sends
+    // its own: a URL's credentials go only after a 401).
+    let bad = format!("http.extraHeader=Authorization: Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "x:not-a-token"));
+    let (read, out) = git(&home, dir.path(), &["-c", &bad, "ls-remote", &anonymous("acme/open")])?;
+    assert!(!read, "a wrong token reads nothing: {out}");
+    // A private repository stays private.
+    let (read, out) = git(&home, dir.path(), &["-c", "credential.helper=", "ls-remote", &anonymous("acme/closed")])?;
+    assert!(!read, "a private repository needs a token: {out}");
+    Ok(())
+}
+
 /// kiln's other native events (W03-R02, R09): a change request's `pull_request` activity (ready
 /// for review, edited, labeled and unlabeled, closed by abandoning, reopened by reclaiming), and
 /// kiln's `agent` (an agent asks for a run), `webhook` (a signed call to a hook of the repository)

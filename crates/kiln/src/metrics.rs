@@ -515,7 +515,7 @@ fn render_sync(o: &mut String) {
         ("kiln_sync_transfers_total", "Contents moved with the server, by direction and result.", &m.transfers),
         ("kiln_sync_transfer_bytes_total", "Bytes of contents moved with the server, by direction.", &m.transfer_bytes),
         ("kiln_moves_total", "Agent sessions moving off this machine, by result.", &m.moves),
-        ("kiln_move_carried_bytes_total", "What moving sessions' repositories carried besides synced files (git, ignored, worktree).", &m.move_carried_bytes),
+        ("kiln_move_carried_bytes_total", "What moving sessions carried besides synced files (git, ignored, worktree; home: what their harness keeps for them).", &m.move_carried_bytes),
     ] {
         help(o, name, "counter", h);
         v.render(o, name);

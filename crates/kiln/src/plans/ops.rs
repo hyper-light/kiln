@@ -60,7 +60,11 @@ const ID: &str = "The plan's id.";
 
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
-    json_of(&json!({"plans": super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?}))
+    // An agent's (made in its conversation), and the one it proposed (plan mode), when asked.
+    let session = s("session").filter(|x| !x.trim().is_empty());
+    let proposed = v.get("proposed").and_then(|p| p.as_bool().or_else(|| p.as_str().map(|s| s == "true" || s == "1"))).unwrap_or(false);
+    let plans = super::of_source(super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?, session.as_deref(), proposed);
+    json_of(&json!({"plans": plans}))
 }
 
 async fn get(cx: Cx, v: Value) -> Out {
@@ -293,10 +297,10 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "plans.list",
-            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag.",
+            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"q": {"type": "string"}, "tag": {"type": "string"}}), &[]),
+            input: || schema(json!({"q": {"type": "string"}, "tag": {"type": "string"}, "session": {"type": "string"}, "proposed": {"type": "boolean"}}), &[]),
             route: |_| Ok((Method::GET, path(&["api", "plans"]))),
             run: |cx, v| Box::pin(list(cx, v)),
         },

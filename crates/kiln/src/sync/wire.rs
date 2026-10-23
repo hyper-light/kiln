@@ -203,6 +203,9 @@ pub struct CopySpec {
     pub exclude: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_size: Option<u64>,
+    /// Its files, its git refs, or both (`docs/sync.md`, "Modes").
+    #[serde(default, skip_serializing_if = "super::Mode::is_files")]
+    pub mode: super::Mode,
     /// A folder kiln has just cloned for this copy: it takes the group's files once it has the
     /// log through this index (what it holds that the group doesn't goes), proposing nothing till
     /// then. Only for a copy whose machine has no state for it yet.

@@ -325,6 +325,10 @@ impl Host {
             pkg.spec.cwd = Some(cwd.clone());
         }
         let items = super::moving::install(&pkg, &cwd)?;
+        // What its harness keeps for it in its home (its memories, tasks, plans, checkpoints), said
+        // with the move.
+        let said = super::moving::install_home(&pkg, &cwd, note.is_none());
+        let note = note.into_iter().chain(said).reduce(|a, b| format!("{a}. {b}"));
         // Its repository's state, the files git ignores and its worktree, kept on disk until its
         // files are here (a restart keeps them too), readable by this user alone: they may hold
         // secrets.

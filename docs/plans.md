@@ -25,9 +25,12 @@ any harness kiln runs (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...
   side by side. Moving or removing a step keeps what the others wait for. A step can't wait for
   itself, or for a step that waits for it.
 - **Agents → Plans → New plan**: the same, with tags, and the plan's text in markdown as well.
-- **Save plan** under a plan an agent proposes: a plan-mode plan waiting for approval, the plan an
-  agent laid out, or its todo list. The plan keeps where it came from (agent, harness, machine,
-  folder); naming only the agent (`source.session`) is enough, kiln fills in the rest.
+- **Kept by kiln**: the plan an agent proposes in plan mode (Claude Code's plan, waiting for approval
+  or approved) is kept as one of the plans by itself: one an agent, a new version each time it
+  proposes another, its title from its words (`source.proposed`; a plan longer than 16 KB keeps its
+  head and tail). **Save plan** keeps another: a plan waiting for approval in the conversation, or
+  an agent's to-do list. A plan keeps where it came from (agent, harness, machine, folder); naming
+  only the agent (`source.session`) is enough, kiln fills in the rest.
 - **Agents** keep theirs with kiln's MCP tools: `plans_create` (and `plans_list`, `plans_get`,
   `plans_update`, `plans_versions`, `plans_run`, `plans_delete`), or `kiln.plans.*` in code mode.
   An agent on a runner has `plans_create`, `plans_list`, `plans_get`, `plans_update`, `plans_run`
@@ -75,8 +78,13 @@ goal stack of its own** (on by default for steps with acceptance criteria or tes
 step's criteria and tests on the stack at once, a goal each, before the step: the step is met
 once they are.
 
-From an agent: its **Plan** tab shows the plan it proposed (with **Save plan**), **Your plans** (write
-one, pick one, **Run here** any of the three ways) and its **Goal stack**.
+From an agent: its **Plan** tab shows **Its plan**: the plan it proposed, as kiln keeps it, its steps
+as cards to pick or run (**Run** opens the plan's page with them picked, **Run it** set to start
+there), its words folded under them (**Its words**); and its to-do list, each item as a step stands
+(done met, the one under way working, in the prism's shimmer, the rest waiting). Then **Your
+plans** (write one, pick one, **Run here** any of the three ways) and its **Goal stack**. A plan's
+page opened with `?pick=2,3` has those steps picked, its **Run it** in view, on the agent the plan
+came from while it runs.
 
 A run sends the saved version and is listed under the plan with the agent it went to.
 
@@ -93,7 +101,9 @@ conversation draws its work: a step at work with hyperlight's mark turning and i
 holographic shimmer; one needing a person with the optic held in amber; met, its loop closed; not
 met, broken; skipped, dashed; stopped, faint; waiting, sketched and still. Only steps at work move.
 A plan's page draws its steps the same way, without where they stand, so **Runs after** reads as a
-graph while it's written.
+graph while it's written. Wide, its rounds run across; narrow (a phone, a side panel), down, two
+steps a row. A line that would run behind another step isn't drawn: the step it leads to says
+what it waits for instead (**after 2, 3**).
 
 - **Which steps run when.** A step starts once each step it waits for is met (**Runs after**;
   `needs` in the API). Steps that don't wait for each other run side by side: the run's page says
@@ -177,7 +187,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/plans` | every plan, newest change first |
+| GET | `/api/plans` | every plan, newest change first; `session`: an agent's (made in its conversation), `proposed=1`: the plans agents proposed (plan mode), kept by kiln |
 | POST | `/api/plans` | `{title?, body, tags?, source?}` |
 | GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
