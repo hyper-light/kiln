@@ -338,31 +338,44 @@ pub async fn sweep(work: &Path) {
     let Ok(Some(bin)) = crate::rt::blocking(find).await else { return };
     let cli = Cli::new(&bin, work.join("_docker_config")).owned_by(work);
     let Some(owner) = cli.owner.clone() else { return };
+    // And what its legs made through their own sockets.
+    let mut labels = vec![owner.clone()];
+    labels.extend(owner.split_once('=').map(|(_, v)| format!("{}={v}", super::docker_sock::SOCKET_RUNNER)));
+    let [containers, networks, volumes] = remove_labelled(&cli, &labels, SWEEP).await;
+    if containers + networks + volumes > 0 {
+        tracing::info!(containers, networks, volumes, "removed what this runner left running when it last stopped");
+    }
+}
+
+/// Removes what has one of `labels` (`key=value`): the containers (their anonymous volumes with
+/// them), then the networks and volumes they may have used. How many of each it found.
+async fn remove_labelled(cli: &Cli, labels: &[String], wait: Duration) -> [usize; 3] {
     let none = BTreeMap::new();
-    let filter = [s("--filter"), format!("label={owner}")];
-    let mut ps = vec![s("ps"), s("-aq")];
-    ps.extend(filter.clone());
-    let ids: Vec<String> = cli.run(&ps, &none, SWEEP).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
-    if !ids.is_empty() {
-        let mut rm = vec![s("rm"), s("--force")];
-        rm.extend(ids.iter().cloned());
-        if let Err(e) = cli.run(&rm, &none, SWEEP).await {
-            tracing::warn!(error = %format!("{e:#}"), "what this runner left running could not be removed");
+    let mut found = [0; 3];
+    for (count, kind) in found.iter_mut().zip([None, Some("network"), Some("volume")]) {
+        let mut ids = Vec::new();
+        for label in labels {
+            let mut ls = kind.map_or_else(|| vec![s("ps"), s("-aq")], |k| vec![s(k), s("ls"), s("-q")]);
+            ls.extend([s("--filter"), format!("label={label}")]);
+            ids.extend(cli.run(&ls, &none, wait).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()));
+        }
+        ids.sort();
+        ids.dedup();
+        *count = ids.len();
+        if ids.is_empty() {
+            continue;
+        }
+        let mut rm = match kind {
+            None => vec![s("rm"), s("--force"), s("--volumes")],
+            Some("volume") => vec![s("volume"), s("rm"), s("--force")],
+            Some(k) => vec![s(k), s("rm")],
+        };
+        rm.extend(ids);
+        if let Err(e) = cli.run(&rm, &none, wait).await {
+            tracing::warn!(error = %format!("{e:#}"), kind = kind.unwrap_or("container"), "what was left could not all be removed");
         }
     }
-    let mut ls = vec![s("network"), s("ls"), s("-q")];
-    ls.extend(filter);
-    let nets: Vec<String> = cli.run(&ls, &none, SWEEP).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
-    if !nets.is_empty() {
-        let mut rm = vec![s("network"), s("rm")];
-        rm.extend(nets.iter().cloned());
-        if let Err(e) = cli.run(&rm, &none, SWEEP).await {
-            tracing::warn!(error = %format!("{e:#}"), "the networks this runner left could not be removed");
-        }
-    }
-    if !ids.is_empty() || !nets.is_empty() {
-        tracing::info!(containers = ids.len(), networks = nets.len(), "removed what this runner left running when it last stopped");
-    }
+    found
 }
 
 /// The CLI, with the leg's own credential store.
@@ -1053,23 +1066,12 @@ impl Containers {
         Ok((out, port))
     }
 
+    /// Removes the leg's containers and networks (the relay's among them, all labelled the leg's)
+    /// and what the leg made through its own socket ([`super::docker_sock`]), as the end of a
+    /// machine of its own would.
     pub async fn stop(&self) {
-        let none = BTreeMap::new();
-        let ids = self.cli.run(&[s("ps"), s("-aq"), s("--filter"), format!("label={}", self.label)], &none, CALL).await.unwrap_or_default();
-        let ids: Vec<String> = ids.lines().map(str::to_owned).filter(|l| !l.is_empty()).collect();
-        if !ids.is_empty() {
-            let mut args = vec![s("rm"), s("--force")];
-            args.extend(ids);
-            if let Err(e) = self.cli.run(&args, &none, CALL).await {
-                tracing::warn!(error = %format!("{e:#}"), "the leg's containers could not be removed");
-            }
-        }
-        let relay = self.relay.as_ref().map(|(n, _)| n.clone());
-        for network in std::iter::once(self.network.clone()).filter(|n| n != "host").chain(relay) {
-            if let Err(e) = self.cli.run(&[s("network"), s("rm"), network], &none, CALL).await {
-                tracing::warn!(error = %format!("{e:#}"), "the leg's network could not be removed");
-            }
-        }
+        let made = format!("{}={}", super::docker_sock::SOCKET_LEG, self.label.strip_prefix("kiln.leg=").unwrap_or(&self.label));
+        remove_labelled(&self.cli, &[self.label.clone(), made], CALL).await;
     }
 }
 

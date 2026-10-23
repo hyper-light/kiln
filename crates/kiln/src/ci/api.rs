@@ -34,6 +34,9 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         // W08: blobs, the cache (as GHES serves it) and the results service (artifacts).
         ["_kiln", "blob", id] => Some(super::services::blob::serve(hub, id, req).await),
         ["_apis", "artifactcache", rest @ ..] => Some(super::services::cache_v1::route(hub, rest, req).await),
+        // W08-R08: artifacts as v1 to v3 of the artifact actions keep them.
+        ["_apis", "pipelines", "workflows", _, "artifacts"] => Some(super::services::pipelines::artifacts(hub, req).await),
+        ["_apis", "resources", "Containers", id] => Some(super::services::pipelines::container(hub, id, req).await),
         // W15-R05: `kiln/deploy@v1`'s releases.
         ["_kiln", "deploy", rest @ ..] => Some(super::deploy_step::route(hub, rest, req).await),
         // W08-R09: kiln's chunked cache, for `kiln/cache@v1`.

@@ -207,6 +207,118 @@ fn finished_event(s: &Server, event: &str, workflow: &str, secs: u64) -> anyhow:
     Ok(found)
 }
 
+/// What v1 to v3 of `upload-artifact` do, as `@actions/artifact` 0.x does it: a container, each
+/// file put in `Content-Range` chunks (gzipped when that's smaller, its whole length said), then
+/// the artifact's size.
+const V3_UPLOAD: &str = r#"
+import gzip, json, os, urllib.parse, urllib.request
+base = os.environ["ACTIONS_RUNTIME_URL"] + "_apis/pipelines/workflows/" + os.environ["GITHUB_RUN_ID"] + "/artifacts?api-version=6.0-preview"
+auth = {"Authorization": "Bearer " + os.environ["ACTIONS_RUNTIME_TOKEN"], "Accept": "application/json;api-version=6.0-preview"}
+part = os.environ["PART"]
+def call(method, url, body, headers):
+    with urllib.request.urlopen(urllib.request.Request(url, body, dict(auth, **headers), method=method)) as r:
+        return json.loads(r.read() or b"null")
+def upload(name, files):
+    made = call("POST", base, json.dumps({"Type": "actions_storage", "Name": name}).encode(), {"Content-Type": "application/json"})
+    size = 0
+    for path, data, zipped in files:
+        body = gzip.compress(data) if zipped else data
+        headers = {"Content-Type": "application/octet-stream"}
+        if zipped:
+            headers.update({"Content-Encoding": "gzip", "x-tfs-filelength": str(len(data))})
+        step = len(body) if zipped else 4
+        for at in range(0, len(body), step):
+            chunk = body[at:at + step]
+            ranged = dict(headers, **{"Content-Range": "bytes %d-%d/%d" % (at, at + len(chunk) - 1, len(body))})
+            call("PUT", made["fileContainerResourceUrl"] + "?itemPath=" + urllib.parse.quote(name + "/" + path), chunk, ranged)
+        size += len(body)
+    call("PATCH", base + "&artifactName=" + urllib.parse.quote(name), json.dumps({"Size": size}).encode(), {"Content-Type": "application/json"})
+    print("uploaded", name, "from", part)
+upload("shared", [("from-" + part + ".txt", ("made by " + part + "\n").encode(), part == "a"), ("dir/" + part + ".txt", (part * 300 + "\n").encode(), True)])
+if part == "a":
+    upload("solo", [("only.txt", b"only a\n", False)])
+"#;
+
+/// What v1 to v3 of `download-artifact` do: the run's artifacts listed, each one's files, then
+/// each file read. Then the same artifacts as v4's actions and the REST API read them, zipped.
+const V3_DOWNLOAD: &str = r#"
+import io, json, os, urllib.parse, urllib.request, zipfile
+base = os.environ["ACTIONS_RUNTIME_URL"] + "_apis/pipelines/workflows/" + os.environ["GITHUB_RUN_ID"] + "/artifacts?api-version=6.0-preview"
+def get(url, token, accept="application/json;api-version=6.0-preview"):
+    with urllib.request.urlopen(urllib.request.Request(url, None, {"Authorization": "Bearer " + token, "Accept": accept})) as r:
+        return r.read()
+runtime = os.environ["ACTIONS_RUNTIME_TOKEN"]
+listed = json.loads(get(base, runtime))
+print("listed", ",".join(sorted(a["name"] for a in listed["value"])), listed["count"])
+for a in sorted(listed["value"], key=lambda a: a["name"]):
+    items = json.loads(get(a["fileContainerResourceUrl"] + "?itemPath=" + urllib.parse.quote(a["name"]), runtime))
+    for item in sorted(items["value"], key=lambda i: i["path"]):
+        data = get(item["contentLocation"], runtime, "application/octet-stream;api-version=6.0-preview").decode()
+        print("file", item["path"], item["fileLength"], len(data), data.splitlines()[0][:12])
+api = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"]
+runs = json.loads(get(api + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/artifacts", os.environ["TOKEN"], "application/json"))
+for a in sorted(runs["artifacts"], key=lambda a: a["name"]):
+    z = zipfile.ZipFile(io.BytesIO(get(api + "/actions/artifacts/%d/zip" % a["id"], os.environ["TOKEN"], "application/zip")))
+    print("zip", a["name"], ",".join(sorted(z.namelist())), z.read(sorted(z.namelist())[-1]).decode().strip()[:12])
+"#;
+
+/// W08-R08: an artifact as v1 to v3 of the artifact actions keep it, which GitHub still takes
+/// (bat's `upload-artifact@master`): a matrix's two legs upload to one, by its name, and one of
+/// them another; a later job reads them back that way, and as v4's actions and the REST API do.
+#[test]
+fn w08_r08_artifacts_as_v3_keeps_them() -> anyhow::Result<()> {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: no python3 on PATH");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/storage", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/storage.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "storage\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    let workflow = format!(
+        "on: push\njobs:\n  up:\n    runs-on: local\n    strategy:\n      matrix:\n        part: [a, b]\n    steps:\n      - run: python3 -c \"$UPLOAD\"\n        env:\n          UPLOAD: {}\n          PART: ${{{{ matrix.part }}}}\n  down:\n    needs: up\n    runs-on: local\n    permissions:\n      actions: read\n    steps:\n      - run: python3 -c \"$DOWNLOAD\"\n        env:\n          DOWNLOAD: {}\n          TOKEN: ${{{{ github.token }}}}\n",
+        serde_json::to_string(V3_UPLOAD)?,
+        serde_json::to_string(V3_DOWNLOAD)?
+    );
+    std::fs::write(work.join(".github/workflows/v3.yml"), workflow)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "v3"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let run = finished_event(&s, "push", "v3", 300)?;
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let legs = legs(&s, &id)?;
+    let all: String = legs.iter().map(|(k, c, l)| format!("== {k} {c}\n{l}\n")).collect();
+    assert_eq!(run.get("conclusion").and_then(Value::as_str), Some("success"), "{all}\n{}", s.log());
+    let down = legs.iter().find(|(k, _, _)| k == "down").map(|(_, _, l)| l.clone()).unwrap_or_default();
+    let said = |what: &str| down.contains(what);
+    assert!(said("listed shared,solo 2"), "{down}");
+    for line in [
+        "file shared/dir/a.txt 301 301 aaaaaaaaaaaa",
+        "file shared/dir/b.txt 301 301 bbbbbbbbbbbb",
+        "file shared/from-a.txt 10 10 made by a",
+        "file shared/from-b.txt 10 10 made by b",
+        "file solo/only.txt 7 7 only a",
+        "zip shared dir/a.txt,dir/b.txt,from-a.txt,from-b.txt made by b",
+        "zip solo only.txt only a",
+    ] {
+        assert!(said(line), "{line}: {down}");
+    }
+    Ok(())
+}
+
 /// W08-AC09: cache access as the published client sees it. A dispatched run's jobs, unset
 /// (`write`), `read`, `write-only` and `none`: each has its `ACTIONS_CACHE_MODE`, and the client
 /// restores and saves as the mode allows, saying what it skipped. A `pull_request_target` run

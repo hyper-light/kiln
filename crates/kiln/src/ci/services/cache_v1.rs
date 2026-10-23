@@ -233,7 +233,7 @@ async fn part(hub: &Arc<Hub>, claims: &Claims, id: &str, req: Request) -> Result
 }
 
 /// Writes a request body of exactly `len` bytes at `offset` in `path` (created if missing).
-async fn write_at(req: Request, path: &std::path::Path, offset: u64, len: u64) -> anyhow::Result<()> {
+pub(super) async fn write_at(req: Request, path: &std::path::Path, offset: u64, len: u64) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         let d = dir.to_path_buf();
         crate::rt::blocking(move || std::fs::create_dir_all(d)).await??;

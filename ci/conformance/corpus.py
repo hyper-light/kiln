@@ -74,14 +74,19 @@ KNOWN = [
     (r"xtask-bump-check", "it compares the pull request with its base, an empty trunk in the corpus"),
     # bat's: the pull request's own changelog line, by its number and its author on GitHub.
     (r"Search for added line in changelog", "it looks for the pull request's own changelog line (its number, its author from GitHub's API); the corpus's pull request is the whole tree"),
-    # `actions/upload-artifact@master` is that repository's old branch: 2.0.1 (2020), on the artifact
-    # protocol GitHub retired on 2025-01-30.
-    (r"Unable to create a container for the artifact", "its `upload-artifact@master` is 2.0.1, on the artifact protocol GitHub retired in January 2025: it fails there too"),
     # A test that waits a few seconds for a message, or a minute for a release to boot, run while
     # the lab's pacer froze its work (the machine's disks busy): to be run again quietly.
     (r"no matching message after \d+ms|ExUnit\.TimeoutError|test timed out after \d+ms", "a test's timed wait, in the lab while its pacer freezes the work when the machine's disks are busy: timing, to be run again when quiet"),
-    # The lab's runner has two slots and one Docker daemon; a hosted runner, a machine a job.
-    (r'The container name "/cargo_test_\d+" is already in use|previous docker build failed, unable to run test', "two of its legs ran at once on the lab's one Docker daemon, and its tests name their containers (`cargo_test_0`): a hosted runner gives each job a daemon of its own (docs/ci.md W13-R04)"),
+    # buildx's debug adapter tests wait 5 s for a build to end (`require.Fail(t, "timeout reached")`).
+    (r"Error:\s+timeout reached", "a test's timed wait (buildx's debug adapter waits 5 s for a build to end), in the lab, which runs at nice 19 and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    (r"panic: test timed out after 10m0s", "a package's tests ran past `go test`'s ten minutes in the lab, which runs at nice 19 with idle I/O and freezes its work while the machine's disks are busy: timing, to be run again when quiet"),
+    # The lab's firewall keeps containers on networks of their own from its server, so its legs
+    # share the host's network (`KILN_CONTAINER_NETWORK=host`), where what listens on the host
+    # answers. Prometheus's Triton test expects nothing at 127.0.0.1:443.
+    (r"an error occurred unmarshaling the discovery response json: invalid character '<'", "the lab's legs share the host's network, where a server listens on 443; a hosted runner's own machine has nothing there"),
+    # Two legs at once on that network share one EPMD (Erlang's port mapper), and name their
+    # nodes alike: elixir's `primary@<host>`.
+    (r"seems to be in use by another Erlang node", "two of its legs at once share the lab's host network, so their Erlang nodes share one port mapper and one name; a hosted runner's own machine has one each"),
 ]
 
 
@@ -212,6 +217,46 @@ def snapshot(work, repo, commit):
     return dest, branch
 
 
+# A version's tag (`v1.2.3`, `1.2`, `release-1.2.3` aside): those a checkout of the whole history
+# fetches that a build reads (elixir's docs list them for their version chooser).
+VERSION_TAG = re.compile(r"^v?\d+(\.\d+)+([-.+][0-9A-Za-z.-]+)?$")
+
+
+def upstream_tags(work, repo, commit):
+    """The upstream's tag nearest `commit`, as `git describe --tags --abbrev=0` finds it in a
+    checkout of the whole history there (`fetch-depth: 0`), and its version tags (a thousand at
+    most, the newest first): `(None, [])` without them. Only the commits are fetched, none of
+    their files."""
+    d = os.path.join(work, "describe", repo.replace("/", "_") + ".git")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    try:
+        git(work, "clone", "-q", "--bare", "--filter=tree:0", f"https://github.com/{repo}.git", d)
+        if not git(d, "rev-parse", "-q", "--verify", commit + "^{commit}", check=False):
+            git(d, "fetch", "-q", "--filter=tree:0", "origin", commit)
+        nearest = git(d, "describe", "--tags", "--abbrev=0", commit, check=False) or None
+        tags = [t for t in git(d, "tag", "--sort=-v:refname").splitlines() if VERSION_TAG.match(t)][:1000]
+        return nearest, tags
+    except RuntimeError as e:
+        print(f"{repo}: no tags of the upstream's found ({e})", flush=True)
+        return None, []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def version_tags(work, repo, commit, dest):
+    """`upstream_tags`, kept with the snapshot at `dest`."""
+    mark = os.path.join(dest, ".git", "kiln-snapshot-tags.json")
+    if os.path.exists(mark):
+        with open(mark) as f:
+            kept = json.load(f)
+        return kept.get("nearest"), kept.get("tags", [])
+    nearest, tags = upstream_tags(work, repo, commit)
+    with open(mark, "w") as f:
+        json.dump({"nearest": nearest, "tags": tags}, f)
+    return nearest, tags
+
+
 def only_corpus(dest, repo):
     """A commit keeping only the workflows F-03 took of `repo` (the one made before, when there
     is one: its runs are the ones to read); its sha."""
@@ -251,7 +296,7 @@ ERRORISH = re.compile(r"(?i)\b(error|fatal|not found|failed|panicked|no such|can
 
 # A test runner's own words for a failed test, before the generic last line (make's, an exit code):
 # ExUnit's numbered failures (and the line after, what failed), libtest's, pytest's, Go's.
-FAILED_TEST = re.compile(r"^\d+\) test .+ \(.+\)$|^test \S+ \.\.\. FAILED$|^FAILED \S+::\S+|^--- FAIL: \S+")
+FAILED_TEST = re.compile(r"^\d+\) test .+ \(.+\)$|^test \S+ \.\.\. FAILED$|^FAILED \S+::\S+|^--- FAIL: \S+|^---- \S+ stdout ----$")
 GENERIC = re.compile(r"^make(\[\d+\])?: \*\*\*|exit(ed with)? code|exit status \d+|^error: test failed, to rerun pass")
 
 
@@ -273,6 +318,10 @@ def leg_detail(api, leg):
             # ExUnit says what failed on the next line.
             if re.match(r"^\d+\) test ", test) and at + 2 < len(lines):
                 test = f"{test}: {lines[at + 2]}" if lines[at + 1].startswith(("test/", "lib/", "/")) else f"{test}: {lines[at + 1]}"
+            # libtest, after where the test panicked.
+            if m := re.match(r"^---- (\S+) stdout ----$", test):
+                panicked = next((i for i in range(at + 1, min(at + 8, len(lines))) if "panicked at" in lines[i]), None)
+                test = f"{m.group(1)}: {lines[panicked + 1]}" if panicked is not None and panicked + 1 < len(lines) else m.group(1)
             said = f"{test} ({said})"
     # A line the known failures name, wherever it is in the step's log, goes with it.
     known = next((x for x in lines if any(re.search(pat, x) for pat, _ in KNOWN) and x not in said), None)
@@ -318,13 +367,13 @@ def native(api, repo, branch):
         api.call("POST", "/api/repos", {"name": repo, "mode": "native", "default_branch": branch, "public": True})
 
 
-def push(api, dest, repo, refspec):
+def push(api, dest, repo, *refspecs):
     """Pushes to kiln's repository `repo`, the token in a header (not in the URL)."""
     import base64
 
     basic = base64.b64encode(f"x:{api.token}".encode()).decode()
     env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": "Authorization: Basic " + basic}
-    git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", refspec, env=env)
+    git(dest, "push", "-q", "-f", f"{api.server}/git/{repo}.git", *refspecs, env=env)
 
 
 def settle(api, repo, event, sha, timeout):
@@ -392,6 +441,21 @@ def run_repo(api, args, repo, commit):
     trunk, top = commits(dest, repo, args.pass_name or "")
     native(api, repo, branch)
     push(api, dest, repo, f"{trunk}:refs/heads/{branch}")
+    # The upstream's tags, on the trunk, as a checkout of the whole history (`fetch-depth: 0`) has
+    # them on GitHub: a build that says its version by `git describe` (buildx's, which compose
+    # checks) says `<nearest>-1-g<sha>` there, not a bare sha, and one that lists the versions
+    # (elixir's docs) finds them. The nearest is annotated, which `describe` takes over the others
+    # on the same commit (and without `--tags`, alone). The trunk has no workflows: these pushes
+    # run nothing.
+    nearest, tags = version_tags(args.work, repo, commit, dest)
+    for t in tags:
+        if t != nearest:
+            git(dest, "tag", "-f", t, trunk)
+    if nearest:
+        git(dest, "tag", "-f", "-a", "-m", f"F-03: {repo}'s nearest tag upstream", nearest, trunk)
+    names = [t for t in tags if t != nearest] + ([nearest] if nearest else [])
+    for i in range(0, len(names), 200):
+        push(api, dest, repo, *[f"refs/tags/{t}:refs/tags/{t}" for t in names[i : i + 200]])
     corpus = sorted(f for f in os.listdir(os.path.join(CORPUS, repo.replace("/", "_"))) if re.search(r"\.ya?ml$", f))
     out = {"repo": repo, "commit": commit, "branch": branch, "sha": top, "events": {}}
     for event in EVENTS:

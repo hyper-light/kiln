@@ -53,8 +53,7 @@ impl Remote {
         if owner.is_empty() || repo.is_empty() || git_ref.is_empty() {
             return None;
         }
-        let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) && !s.starts_with('.');
-        if !safe(owner) || !safe(repo) || git_ref.starts_with('-') || git_ref.contains("..") {
+        if !plain_name(owner) || !plain_name(repo) || git_ref.starts_with('-') || git_ref.contains("..") {
             return None;
         }
         Some(Remote { owner: owner.into(), repo: repo.into(), path: parts.next().unwrap_or_default().trim_matches('/').into(), git_ref: git_ref.into(), native })
@@ -62,6 +61,11 @@ impl Remote {
 
     fn full(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// Its repository's `path` at `sha`, as a `uses:` names it.
+    pub(crate) fn at(&self, path: &str, sha: &str) -> String {
+        format!("{}{}/{}@{sha}", if self.native { "kiln://" } else { "" }, self.full(), path.trim_start_matches('/'))
     }
 
     /// Its mirror: one of kiln's own repositories' apart from GitHub's of the same name.
@@ -83,6 +87,13 @@ impl Remote {
         }
         Ok(())
     }
+}
+
+/// Whether `s` is an owner's or a repository's name as GitHub allows one: letters, digits, `-`,
+/// `_` and `.`, a leading dot too (an owner's `.github`, where its shared actions and workflows
+/// are), but never dots alone (`.`, `..`), which would name a directory where it's a path's.
+pub(crate) fn plain_name(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) && s.chars().any(|c| c != '.')
 }
 
 pub(crate) fn mirror(hub: &Hub, owner: &str, repo: &str) -> PathBuf {
@@ -436,8 +447,7 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
     };
     let [owner, repo, file] = rest else { return Err((StatusCode::NOT_FOUND, "no such action".into())) };
     let sha = file.trim_end_matches(".tar.gz");
-    let ok_name = |s: &str| !s.is_empty() && !s.starts_with('.') && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-    if !ok_name(owner) || !ok_name(repo) || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !plain_name(owner) || !plain_name(repo) || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err((StatusCode::NOT_FOUND, "no such action".into()));
     }
     let Some(leg) = token::from_headers(req.headers()).and_then(|t| token::verify(hub, &t)) else {
@@ -628,9 +638,16 @@ mod tests {
     fn forms() {
         assert_eq!(Remote::parse("actions/checkout@v4"), Some(Remote { owner: "actions".into(), repo: "checkout".into(), path: String::new(), git_ref: "v4".into(), native: false }));
         assert_eq!(Remote::parse("github/codeql-action/init@v3").map(|r| r.path), Some("init".into()));
-        for local in ["./.github/actions/x", "$/actions/y", "docker://alpine:3", "kiln/cache@v1", "nope", "a/b@", "../x/y@v1", "a/b@-x", "kiln://a/b@", "kiln://../x@v1"] {
+        for local in
+            ["./.github/actions/x", "$/actions/y", "docker://alpine:3", "kiln/cache@v1", "nope", "a/b@", "../x/y@v1", "a/b@-x", "kiln://a/b@", "kiln://../x@v1", "a/../x@v1", "a/./x@v1", "a/.../x@v1"]
+        {
             assert!(Remote::parse(local).is_none(), "{local}");
         }
+        // An owner's `.github`, where its repositories' shared actions and workflows are.
+        let shared = Remote::parse("crazy-max/.github/.github/actions/gotest-annotations@f91220cba053bd54299ba645a599ee8ed436f222");
+        assert_eq!(shared.as_ref().map(|r| (r.owner.as_str(), r.repo.as_str(), r.path.as_str())), Some(("crazy-max", ".github", ".github/actions/gotest-annotations")));
+        assert_eq!(shared.map(|r| r.at(".github/workflows/x.yml", "abc")), Some("crazy-max/.github/.github/workflows/x.yml@abc".to_owned()));
+        assert!(["dotfiles", ".github", "a.b-c_d"].iter().all(|n| plain_name(n)) && ["", ".", "..", "a/b", "a b"].iter().all(|n| !plain_name(n)));
     }
 
     /// W07-R01: `kiln://owner/repo[/path]@ref`, one of kiln's own repositories, its owner's

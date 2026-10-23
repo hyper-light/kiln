@@ -45,8 +45,8 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
         }
         return pass_through(owner, name, tail, hub, req).await;
     }
-    // Its own repository, with `contents: read` (W10-R04).
-    if !job.may("contents", kiln_ci::plan::perms::Level::Read) {
+    // Its own repository, with `contents: read` (W10-R04), unless it's public: anyone reads that.
+    if !job.may("contents", kiln_ci::plan::perms::Level::Read) && !hub.store.repo_public(run.repo_id.clone()).await.unwrap_or(false) {
         return Err((StatusCode::FORBIDDEN, "this job's token lacks `contents: read`".into()));
     }
     let repo = repos.into_iter().find(|r| r.id == run.repo_id).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
@@ -64,9 +64,8 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
 /// streamed back. Nothing is kept, so a shallow fetch stays shallow. One that needs credentials
 /// there isn't found.
 async fn pass_through(owner: &str, name: &str, tail: &[&str], hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
-    let plain = |s: &str| !s.is_empty() && !s.starts_with('.') && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     let not_found = |why: String| (StatusCode::NOT_FOUND, why);
-    if !plain(owner) || !plain(name) {
+    if !super::actions::plain_name(owner) || !super::actions::plain_name(name) {
         return Err(not_found("no such repository".into()));
     }
     let base = super::actions::source(hub, owner, name).map_err(|e| not_found(format!("{e:#}")))?;

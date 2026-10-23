@@ -2249,7 +2249,8 @@ impl Leg {
         let path = leg_socket_path(l);
         // One a runner that stopped short left behind.
         let _ = std::fs::remove_file(&path);
-        super::docker_sock::Socket::listen(path, PathBuf::from("/var/run/docker.sock")).await
+        let names = super::docker_sock::Names::for_leg(&self.a.job_id, Some(&super::docker::owner_label(&self.work_dir)));
+        super::docker_sock::Socket::listen(path, PathBuf::from("/var/run/docker.sock"), names).await
     }
 
     /// Whether the `docker` executor's container has GitHub's hosted runners' paths
