@@ -3352,7 +3352,9 @@ enforcement points to W18, agent isolation to W20.
     `job.services` context;
   - teardown;
   - Docker actions (W07-R06);
-  - `CAP_DOCKER` announced when a CLI answers.
+  - `CAP_DOCKER` announced when a CLI answers. One probe runs at a time, waited for 10 s from
+    its start. A daemon too busy to answer by then (a loaded machine) is asked again at the
+    runner's next connection, rather than taken for absent until a restart.
 - *Done.* R04's `docker` executor:
   - a leg runs in a fresh container of its routing rule's image, without the host's Docker
     socket;

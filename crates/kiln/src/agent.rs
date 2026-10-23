@@ -651,6 +651,7 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    crate::updates::warm_own_binary().await;
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
     if cfg!(target_os = "macos") && !o.ephemeral {
         std::thread::spawn(crate::os::macsign::keep_watching);
@@ -1519,7 +1520,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
                 // an outpost says it's one instead.
-                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
+                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
                 // It sends its conversations' store: the server keeps them from that.
                 if shipper.is_some()
                     && let AgentMsg::Build { caps, .. } = &mut build

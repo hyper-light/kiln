@@ -196,6 +196,13 @@ pub fn own_binary() -> Result<(String, u64), String> {
     .clone()
 }
 
+/// Reads this build's hash ([`own_binary`]) once, off the runtime. The runner and the server ask
+/// for it from async code without waiting (`own_build()`), and the first ask reads the whole
+/// binary: seconds for a test build, a runtime shard and every task on it held that long.
+pub async fn warm_own_binary() {
+    let _ = crate::rt::blocking(own_binary).await;
+}
+
 /// This binary's build id ("unknown" if it can't be read): the build it was before kiln signed it
 /// on this Mac, when it did (`crate::os::macsign`).
 pub fn own_build() -> String {
@@ -2359,10 +2366,10 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
 }
 
 /// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do,
-/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once), and
-/// `CAP_FIRECRACKER` when it can boot microVMs (W13-R05).
-pub fn runner_build() -> AgentMsg {
-    let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
+/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01: probed until it answers,
+/// waited for 10 s at a time), and `CAP_FIRECRACKER` when it can boot microVMs (W13-R05).
+pub async fn runner_build() -> AgentMsg {
+    let docker = if crate::rt::blocking(crate::runner::docker::available).await.unwrap_or(false) { crate::proto::CAP_DOCKER } else { 0 };
     #[cfg(target_os = "linux")]
     let microvms = if crate::runner::firecracker::Machine::find().is_some() { crate::proto::CAP_FIRECRACKER } else { 0 };
     #[cfg(not(target_os = "linux"))]
@@ -2370,7 +2377,7 @@ pub fn runner_build() -> AgentMsg {
     // Under a supervisor that can start a new build beside it (`kiln supervise` on Unix).
     let blue_green = if crate::bluegreen::Supervisor::from_env().is_some() { crate::proto::CAP_BLUE_GREEN } else { 0 };
     // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
-    let rootless = if docker != 0 && crate::runner::docker::rootless_engine() { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
+    let rootless = if docker != 0 && crate::rt::blocking(crate::runner::docker::rootless_engine).await.unwrap_or(false) { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
     AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | microvms | blue_green | rootless }
 }
 
@@ -2527,7 +2534,7 @@ mod tests {
     #[test]
     fn runners_announce_every_capability_they_have() -> anyhow::Result<()> {
         use crate::proto::{CAP_DIRS, CAP_FRONT_DOOR, CAP_TAKEOVER, CAP_TAKEOVER_STOP};
-        let AgentMsg::Build { caps, build } = runner_build() else { anyhow::bail!("runner_build is not a Build") };
+        let AgentMsg::Build { caps, build } = crate::rt::block_on(async { Ok(runner_build().await) })? else { anyhow::bail!("runner_build is not a Build") };
         assert!(!build.is_empty());
         for cap in [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_FRONT_DOOR] {
             assert_eq!(caps & cap, cap, "capability {cap} is announced");

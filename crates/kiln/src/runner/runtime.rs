@@ -902,8 +902,11 @@ impl Leg {
             self.note(0, &format!("{} ({}){}: {}", i.name, i.kind, if i.job { "" } else { ", for its steps" }, names.join(", "))).await;
             st.integrations.insert(i.name.clone(), applied);
         }
-        // For `kiln auth`: the leg's integrations, readable by this user alone, and the binary.
-        st.kiln_bin = super::auth::place_binary(&self.work_dir);
+        // For `kiln auth`: the leg's integrations, readable by this user alone, and the binary, put
+        // in place off the runtime: where the work directory is another filesystem (a pod's
+        // volumes), that's a copy of the whole binary.
+        let work = self.work_dir.clone();
+        st.kiln_bin = crate::rt::blocking(move || super::auth::place_binary(&work)).await.ok().flatten();
         let list = dir.join("integrations.json");
         if serde_json::to_vec(&a.integrations).ok().is_some_and(|b| super::auth::write_private(&list, &b).is_ok()) {
             st.env.insert("KILN_INTEGRATIONS".into(), list.to_string_lossy().into_owned());
