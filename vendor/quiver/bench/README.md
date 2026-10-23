@@ -42,7 +42,7 @@ QUIVER_COMMIT=$(git rev-parse HEAD) cargo bench -p quiver-bench --bench fanout -
 `bench/compare.sh OUT` runs every system on the same schedule, payloads and fan-out, measured by
 the same harness, and writes `OUT/report.md`: each system's best run beside Quiver's, load by load,
 and Quiver's lead over the best competitor at p99 and at p99.9. The bar is an order of magnitude
-at both.
+at both (Q-1.1, docs/requirements.toml).
 
 - **The class.** Quiver's ephemeral class keeps messages in memory, at most once across a node's
   loss, a gap announced. Its peers are the brokers' own in-memory delivery: NATS core (no
@@ -68,6 +68,11 @@ at both.
   to wake: on fedora up to 127 µs from C2 and 1,048 µs from C3 (`/sys/devices/system/cpu/cpu0/
   cpuidle`, the menu governor). Quiver's subscriber pays that once per message at most; a broker's
   path pays it at its server and again at its client.
+- **The floor.** The report sets beside the systems the kernel's own wake-up (`--system wake`):
+  the same open loop with no system around it, its publisher waking each waiter thread
+  (`Thread::unpark`, the futex Quiver's waits come down to) and each waiter taking what was
+  written. It's measured on the machine as it runs, idle states and all: what a system's waiting
+  subscriber takes above it is the system's own, and no system's waiting subscriber goes under it.
 - **Before each run** the publisher sends priming messages until every subscriber has taken one,
   so every subscription stands at its broker before the first measured message; Kafka's run has a
   topic of its own, read from its beginning. A broker's subscriber that hasn't taken everything

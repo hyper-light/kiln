@@ -15,6 +15,8 @@ pub struct Run {
     pub busy: bool,
     pub rate: f64,
     pub subscribers: usize,
+    /// The subscriptions it checked: one each, or one each waiter thread of the wake-up's floor.
+    pub subscriptions: usize,
     pub workers: usize,
     pub published: u64,
     /// Messages the schedule still held when its time was over: the system held its publisher
@@ -23,6 +25,8 @@ pub struct Run {
     /// Publishes the system refused or failed: their messages count as undelivered.
     pub publish_errors: u64,
     pub seconds: f64,
+    /// The measured window's length: deliveries of its messages over it are the rate delivered.
+    pub window_s: u64,
     pub seen: Seen,
     /// The window's messages a subscriber never took, and of those, the ones no lag notice came before.
     pub undelivered: u64,
@@ -107,7 +111,7 @@ pub fn row(i: &str, r: &Run) -> String {
         r.lags,
         r.silent,
         r.kept_up,
-        r.subscribers,
+        r.subscriptions,
         r.cpu_s,
         r.publisher_cpu_s,
         r.broker_cpu_s
@@ -117,7 +121,7 @@ pub fn row(i: &str, r: &Run) -> String {
     )
 }
 
-const FIELDS: [&str; 16] = [
+const FIELDS: [&str; 17] = [
     "system",
     "busy",
     "rate",
@@ -134,6 +138,7 @@ const FIELDS: [&str; 16] = [
     "p99_ns",
     "p999_ns",
     "max_ns",
+    "window_s",
 ];
 
 /// Appends `r` to the runs file at `path`, its header first if the file is new.
@@ -166,6 +171,7 @@ pub fn record(path: &Path, r: &Run) {
         ns(l.quantile(0.99)),
         ns(l.quantile(0.999)),
         ns(l.largest()),
+        r.window_s.to_string(),
     ];
     writeln!(file, "{}", fields.join("\t")).unwrap();
 }
@@ -242,7 +248,7 @@ pub fn compare(paths: &[std::path::PathBuf]) -> String {
         }
     }
     let mut out = String::from(
-        "| subscribers' threads | rate /s | subscribers | Quiver p99 / p99.9 µs | NATS | Redis | Kafka | the best competitor | Quiver's lead, p99 / p99.9 | an order of magnitude |\n|---|---|---|---|---|---|---|---|---|---|\n",
+        "| subscribers' threads | rate /s | subscribers | the wake-up's floor, p99 / p99.9 µs | Quiver | NATS | Redis | Kafka | the best competitor | Quiver's lead, p99 / p99.9 | an order of magnitude |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     let pair = |l: Option<&&Line>| {
         l.map_or_else(
@@ -265,12 +271,55 @@ pub fn compare(paths: &[std::path::PathBuf]) -> String {
             _ => ("-".to_owned(), "-".to_owned(), "-"),
         };
         out.push_str(&format!(
-            "| {busy} | {rate} | {subscribers} | {} | {} | {} | {} | {} | {lead_p99} / {lead_p999} | {verdict} |\n",
+            "| {busy} | {rate} | {subscribers} | {} | {} | {} | {} | {} | {} | {lead_p99} / {lead_p999} | {verdict} |\n",
+            pair(systems.get(System::Wake.name())),
             pair(quiver),
             pair(systems.get(System::Nats.name())),
             pair(systems.get(System::Redis.name())),
             pair(systems.get(System::Kafka.name())),
             best.map_or_else(|| "-".to_owned(), |(name, _)| name.to_owned()),
+        ));
+    }
+    out.push_str(&delivered(&loads));
+    out
+}
+
+/// The deliveries a second of the window's messages each system's best run made, against what
+/// was offered (the rate times the subscribers): where a broker can't fan out as fast as messages
+/// come, its tail is undelivered and this says how far short it fell.
+fn delivered(loads: &BTreeMap<(String, u64, u64), BTreeMap<String, &Line>>) -> String {
+    let rate_of = |l: &Line| -> Option<f64> {
+        let measured: f64 = l.get("measured").parse().ok()?;
+        let window: f64 = l.get("window_s").parse().ok()?;
+        (window > 0.0).then(|| measured / window)
+    };
+    let cell = |l: Option<&&Line>| {
+        l.and_then(|l| rate_of(l))
+            .map_or_else(|| "-".to_owned(), |r| format!("{:.2}M", r / 1e6))
+    };
+    let mut out = String::from(
+        "\n| subscribers' threads | rate /s | subscribers | offered deliveries /s | Quiver | NATS | Redis | Kafka | Quiver's lead |\n|---|---|---|---|---|---|---|---|---|\n",
+    );
+    for ((busy, rate, subscribers), systems) in loads {
+        let quiver = systems.get(System::Quiver.name());
+        let best = [System::Nats, System::Redis, System::Kafka]
+            .iter()
+            .filter_map(|s| systems.get(s.name()).and_then(|l| rate_of(l)))
+            .fold(None, |best: Option<f64>, r| {
+                Some(best.map_or(r, |b| b.max(r)))
+            });
+        let lead = match (quiver.and_then(|l| rate_of(l)), best) {
+            (Some(q), Some(c)) if c > 0.0 => format!("{:.1}×", q / c),
+            (Some(_), Some(_)) => "∞".to_owned(),
+            _ => "-".to_owned(),
+        };
+        out.push_str(&format!(
+            "| {busy} | {rate} | {subscribers} | {:.2}M | {} | {} | {} | {} | {lead} |\n",
+            (*rate as f64) * (*subscribers as f64) / 1e6,
+            cell(quiver),
+            cell(systems.get(System::Nats.name())),
+            cell(systems.get(System::Redis.name())),
+            cell(systems.get(System::Kafka.name())),
         ));
     }
     out

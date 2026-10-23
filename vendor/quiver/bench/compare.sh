@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Quiver's ephemeral class against NATS core, Redis Pub/Sub and Kafka, class for class, on one
-# machine (CLAUDE.md §7; bench/README.md, "The comparison"). For each system: its broker up in
-# Docker on CPUs of its own (Quiver has none: its node is in the generator's process), each load run
-# on the generator's CPUs, every run added to OUT/runs.tsv and printed to OUT/<system>.md, the
+# machine (CLAUDE.md §7; bench/README.md, "The comparison"), beside the kernel's own wake-up (the
+# floor under a subscriber that waits). For each system: its broker up in Docker on CPUs of its own
+# (Quiver and the floor have none: they run in the generator's process), each load run on the
+# generator's CPUs, every run added to OUT/runs.tsv and printed to OUT/<system>.md, the
 # broker down. Then OUT/report.md: each system's best run beside Quiver's, load by load.
 #
 #   bench/compare.sh OUT
 #
 # The loads and the placement, from the environment (defaults in brackets):
-#   SYSTEMS [quiver nats redis kafka]  RATES [100000]  SUBSCRIBERS [1 100 1000]  WAITS [wait busy]
+#   SYSTEMS [wake quiver nats redis kafka]  RATES [100000]  SUBSCRIBERS [1 100 1000]  WAITS [wait busy]
 #   RUNS [3]  DURATION [30] seconds measured  WARMUP [5] seconds  PAYLOAD [256] bytes
 #   BROKER_CPUS [8-15]: the broker's CPUs (on fedora's i9-14900HX, four P-cores, both threads each)
 #   CLIENT_CPUS [0-7,16-31]: the generator's: its publisher and subscribers, and Quiver's node
@@ -19,7 +20,7 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 out=${1:?usage: bench/compare.sh OUT}
 mkdir -p "$out"
-systems=${SYSTEMS:-quiver nats redis kafka}
+systems=${SYSTEMS:-wake quiver nats redis kafka}
 rates=${RATES:-100000}
 fanouts=${SUBSCRIBERS:-1 100 1000}
 waits=${WAITS:-wait busy}
@@ -96,7 +97,7 @@ ready() {
 
 for system in $systems; do
   cgroup=""
-  if [ "$system" != quiver ]; then
+  if [ "$system" != quiver ] && [ "$system" != wake ]; then
     start "$system"
     n=0
     until ready "$system"; do

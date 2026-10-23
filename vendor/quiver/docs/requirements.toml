@@ -171,3 +171,13 @@ criteria = [
 tests = [
   { id = "T-T2.13.1", text = "Fire drills: a node powered off, a disk stalled 10 s, a partition, a region lost" },
 ]
+
+# Quiver's own requirements, beside the plan's: each with where it came from.
+
+[[own]]
+id = "Q-1"
+title = "An order of magnitude over Kafka, Redis and NATS"
+source = "Ada, 2026-10-22, on kiln's CP-T2.1: \"You must retain an order of magnitude lead\""
+criteria = [
+  { id = "Q-1.1", text = "Quiver's publish-to-deliver p99 and p99.9 are each at most a tenth of the best of NATS core, Redis Pub/Sub and Kafka, class for class, at every load and fan-out the comparison runs, measured by the comparison harness (bench/compare.sh) on one machine" },
+]

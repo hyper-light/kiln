@@ -152,7 +152,9 @@ async fn subscriber(
                 }
             }
         }
-        System::Quiver => return Err("Quiver runs in this process (embedded.rs)".to_owned()),
+        System::Quiver | System::Wake => {
+            return Err("Quiver and the wake-up floor run in this process".to_owned());
+        }
     }
     Ok(())
 }
@@ -297,7 +299,9 @@ impl Publisher {
                     .create_with_context(Deliveries::default())
                     .map_err(|e| e.to_string())?,
             )),
-            System::Quiver => Err("Quiver runs in this process (embedded.rs)".to_owned()),
+            System::Quiver | System::Wake => {
+                Err("Quiver and the wake-up floor run in this process".to_owned())
+            }
         }
     }
 
@@ -588,11 +592,13 @@ pub fn run(a: &Args, system: System, seed: u64, index: usize) -> Run {
         busy: a.busy,
         rate: a.rate,
         subscribers: a.subscribers,
+        subscriptions: a.subscribers,
         workers,
         published: p.schedule.offered(),
         unoffered: p.schedule.unoffered,
         publish_errors: p.errors,
         seconds: p.seconds,
+        window_s: a.seconds,
         seen,
         undelivered: t.undelivered,
         silent: t.silent,

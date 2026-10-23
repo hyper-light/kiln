@@ -14,7 +14,8 @@
 //!
 //! Every system runs the same schedule, payloads and fan-out, measured the same way: Quiver in this
 //! process, as kiln runs it (`embedded.rs`), the brokers over loopback through their own clients
-//! (`brokers.rs`).
+//! (`brokers.rs`), and beside them the kernel's own wake-up with no system around it (`wake.rs`),
+//! the floor under a subscriber that waits.
 //!
 //! The mode is the first argument:
 //! - `fanout` runs `--system` `--runs` times and reports each run and the best (the least p99,
@@ -47,6 +48,7 @@ mod embedded;
 mod follow;
 mod histogram;
 mod report;
+mod wake;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -59,6 +61,8 @@ pub enum System {
     Nats,
     Redis,
     Kafka,
+    /// The kernel's own wake-up, no system around it: the floor under a subscriber that waits.
+    Wake,
 }
 
 impl System {
@@ -68,6 +72,7 @@ impl System {
             Self::Nats => "nats",
             Self::Redis => "redis",
             Self::Kafka => "kafka",
+            Self::Wake => "wake",
         }
     }
 
@@ -77,7 +82,8 @@ impl System {
             "nats" => Self::Nats,
             "redis" => Self::Redis,
             "kafka" => Self::Kafka,
-            other => panic!("unknown system {other:?}: quiver, nats, redis or kafka"),
+            "wake" => Self::Wake,
+            other => panic!("unknown system {other:?}: quiver, nats, redis, kafka or wake"),
         }
     }
 
@@ -88,6 +94,7 @@ impl System {
             Self::Nats => "127.0.0.1:14222",
             Self::Redis => "127.0.0.1:16380",
             Self::Kafka => "127.0.0.1:19092",
+            Self::Wake => "the kernel's wake-up alone, in this process",
         }
     }
 }
@@ -329,6 +336,7 @@ fn main() {
         let seed = a.seed.wrapping_add(i as u64);
         let r = match a.system {
             System::Quiver => embedded::run(&a, seed, |_, _| {}),
+            System::Wake => wake::run(&a, seed),
             other => broker(&a, other, seed, i),
         };
         println!("{}", report::row(&(i + 1).to_string(), &r));
