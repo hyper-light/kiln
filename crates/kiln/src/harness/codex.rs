@@ -885,6 +885,14 @@ impl Codex {
             // Older consoles' MCP controls (now commands of their own).
             "mcp_refresh" => self.command(core, Command::McpRefresh),
             "mcp_reload" => self.mcp_reload(core),
+            // Signed in on its machine (kiln's sign-in, `codex login`): it reads its account at
+            // once (another one: the old one's limits go and the new one's are read), and starts
+            // again when idle so its app-server certainly runs on the new login.
+            "account" => {
+                self.request(core, Pending::Account, "account/read", json!({}));
+                self.reload = Some("Signed in".to_owned());
+                self.reload_when_idle(core);
+            }
             // Settings changed outside it (its own screen, beside it): start again to load them.
             "reload_config" => {
                 self.reload = Some(value.as_ref().and_then(|v| v.get("what")).and_then(Value::as_str).unwrap_or("Changed settings").to_owned());
@@ -5156,6 +5164,24 @@ mod tests {
         assert!(said.contains("Continue the work") && said.contains("kiln stopped your subagents") && said.contains("(kid)") && said.contains("(grandkid)"), "{said}");
         assert!(c.stopped.is_empty());
         Ok(())
+    }
+
+    /// Signed in on its machine: Codex reads its account at once, and a new account's sign-in takes
+    /// the old one's limits away and reads the new one's.
+    #[test]
+    fn a_sign_in_reads_the_account_again_and_shows_the_new_one_s_limits() {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"}}));
+        let old = core.state.account.clone();
+        core.state.limits = vec![Limit { id: "codex.primary".into(), label: "Weekly".into(), used_percent: Some(95.0), account: old.clone(), ..Limit::default() }];
+        let _ = written(&mut core);
+        c.command(&mut core, Command::Control { id: "account".into(), value: None });
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("account/read"))), "it reads its account again");
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "b@example.com", "planType": "pro"}}));
+        assert_ne!(core.state.account, old);
+        assert!(core.state.limits.is_empty(), "the old account's limits go");
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("account/rateLimits/read"))), "the new account's are read");
     }
 
     /// A person stops a subagent from its row: its turn is interrupted, and its parent isn't told

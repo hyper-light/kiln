@@ -247,6 +247,17 @@ pub struct Claude {
     bg_files: HashMap<String, (String, String)>,
 }
 
+/// Whether two account ids name the same account: the short hash that ends an id says who it is,
+/// and different places name the same plan differently ("max", "claude_max"); ids without a who
+/// compare whole.
+fn same_account(a: &str, b: &str) -> bool {
+    let who = |id: &str| id.split(':').nth(2).map(str::to_owned);
+    match (who(a), who(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 impl Claude {
     pub fn new(allow_bypass: bool) -> Self {
         Self {
@@ -408,6 +419,26 @@ impl Claude {
             // Signed in on this machine (kiln's /login): Claude Code takes the account when it
             // starts, so it starts again once nothing is under way, the conversation going on.
             "account" => {
+                // Signed in on its machine as someone else: the page names that account at once,
+                // and the old one's limits go for the new one's (Claude Code takes the machine's
+                // new credentials as it runs; starting again below makes sure of it).
+                if let Some(a) = value.as_ref().filter(|v| v.is_object()) {
+                    let field = |k: &str| a.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                    let plan = match (field("plan"), field("method")) {
+                        (Some(p), _) => plan_label(p),
+                        (None, Some(m)) if m.to_lowercase().contains("api") || m.to_lowercase().contains("console") => "API key".to_owned(),
+                        _ => "Claude account".to_owned(),
+                    };
+                    // `claude auth status` names the plan "max" where Claude Code says "claude_max": the
+                    // same plan, so the same id (and the person is what tells accounts apart).
+                    let plan = if plan.to_lowercase().starts_with("claude") || plan == "API key" { plan } else { format!("Claude {plan}") };
+                    let now = account_id("claude", &plan, field("email").or_else(|| field("org")));
+                    if core.state.account.as_deref().is_none_or(|was| !same_account(was, &now)) {
+                        core.state.account = Some(now);
+                        core.state.plan = Some(plan);
+                        self.switched_account(core);
+                    }
+                }
                 self.reload = Some("Signed in".to_owned());
                 if self.busy(core) {
                     self.notice(core, Level::Info, "Signed in: Claude Code starts again with that account when this turn ends (the conversation continues)".to_owned(), None);
@@ -1008,6 +1039,9 @@ impl Claude {
         {
             self.go_on(core, p);
         }
+        // A usage answer still on its way was asked for the old account: it's dropped, and the new
+        // one's is asked.
+        self.pending.retain(|_, p| !matches!(p, Pending::Usage));
         self.ask_usage(core);
     }
 
@@ -1564,7 +1598,9 @@ impl Claude {
                 if let Some(a) = body.get("account") {
                     let was = core.state.account.clone();
                     Self::account(core, a);
-                    if was.is_some() && core.state.account != was {
+                    if let (Some(was), Some(now)) = (was.as_deref(), core.state.account.as_deref())
+                        && !same_account(was, now)
+                    {
                         self.switched_account(core);
                     }
                 }
@@ -4664,6 +4700,30 @@ mod tests {
         core.set_status(Status::Idle);
         c3.command(&mut core, Command::Control { id: "account".into(), value: None });
         assert!(core.effects.iter().any(|e| matches!(e, Effect::Restart { .. })));
+    }
+
+    /// Signed in on its machine as someone else, mid-turn: its page names the new account at once,
+    /// the old one's usage goes and the new one's is asked; the same account changes nothing.
+    #[test]
+    fn a_sign_in_as_someone_else_shows_that_account_and_its_usage_at_once() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": [], "account": {"email": "a@example.com", "subscriptionType": "max", "tokenSource": "claude.ai"}}));
+        let old = core.state.account.clone();
+        core.state.limits = vec![Limit { id: "seven_day".into(), label: "Weekly".into(), used_percent: Some(95.0), account: old.clone(), ..Limit::default() }];
+        core.set_status(Status::Running);
+        let _ = requests(&mut core);
+        let same = json!({"email": "a@example.com", "plan": "max", "method": "Claude subscription"});
+        c.command(&mut core, Command::Control { id: "account".into(), value: Some(same) });
+        assert_eq!((core.state.account.clone(), core.state.limits.len()), (old.clone(), 1), "the same account: nothing changes");
+        let other = json!({"email": "b@example.com", "plan": "max", "method": "Claude subscription"});
+        c.command(&mut core, Command::Control { id: "account".into(), value: Some(other) });
+        assert!(core.state.account.as_deref().is_some_and(|now| same_account(now, &account_id("claude", "Max", Some("b@example.com")))), "{:?}", core.state.account);
+        assert!(!same_account(&account_id("claude", "Claude max", Some("b@example.com")), &account_id("claude", "Max", Some("a@example.com"))));
+        assert!(core.state.limits.is_empty(), "the old account's usage isn't shown as the new one's");
+        assert!(requests(&mut core).iter().any(|r| r.1 == "get_usage"), "the new account's usage is asked");
     }
 
     #[test]
