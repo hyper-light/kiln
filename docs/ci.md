@@ -3377,7 +3377,10 @@ enforcement points to W18, agent isolation to W20.
   - the command-line tools of GitHub's image that scripts call: `python` (Python 3), fakeroot
     (bat's Debian packages need it), Bison and Flex, patchelf, ShellCheck, the SQLite shell,
     tree, lz4, pigz, 7-Zip, GNU parallel, Brotli, zsync, aria2, sshpass, dig, ping, netstat,
-    telnet, ftp, the ACL tools, SWIG, Texinfo, rpm, UPX, MediaInfo, Mercurial and Xvfb.
+    telnet, ftp, the ACL tools, SWIG, Texinfo, rpm, UPX, MediaInfo, Mercurial and Xvfb;
+  - git from the git-core PPA, current as GitHub's is (2.55 when added; Ubuntu 24.04's own is
+    2.43). Tools go by its version: cargo retries a failed `git fetch` itself only below 2.54,
+    and its ssh and https tests count the retries.
 
   On Ubuntu 24.04, `/etc/pip.conf` lets pip install into the system Python, as GitHub's image's
   does. The `runner` user's `~/.local/bin`, where `pip install` puts scripts, is on `PATH`.
@@ -4026,7 +4029,11 @@ GraphQL, landing through the queue as a branch that requires a merge queue lands
     its certificate authority with each leg, and the leg's tools trust it beside the machine's
     roots. Node adds it to its own (`NODE_EXTRA_CA_CERTS`); git, curl, Python and OpenSSL take a
     bundle of the machine's roots and it (`GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`,
-    `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`). A job's own say wins. The server's certificate names
+    `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`). A job's own say wins. In kiln's runner image the
+    authority goes in the leg's machine's own store instead (`update-ca-certificates`), as a
+    hosted runner's machine trusts what it reaches. Then only Node and Python's requests, which
+    read bundles of their own, are told, and git says what it says on GitHub (`CAfile: none`,
+    which cargo's https tests check). The server's certificate names
     `host.docker.internal` too, which containers on its machine reach it by. GitHub Enterprise
     Server's clients go `https://` to the host they're given whatever its scheme, as
     `create-pull-request` and `actions-gh-pages` do, so this is what lets them run. Checked end to

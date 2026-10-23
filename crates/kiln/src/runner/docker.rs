@@ -233,6 +233,15 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
             // says this (Ubuntu's Python is otherwise "externally managed", PEP 668).
             d.push_str("RUN printf '[global]\\nbreak-system-packages = true\\n' > /etc/pip.conf\n");
         }
+        // Git as GitHub's images have it, the git-core PPA's (2.55 when added) rather than the
+        // release's (Ubuntu 24.04's is 2.43): tools go by its version. cargo retries a failed
+        // `git fetch` itself only below 2.54, which retries on its own (cargo's ssh and https tests
+        // count the retries). Last, so a change here builds on the layers before it.
+        d.push_str(
+            "RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common gpg-agent \\\n    \
+             && add-apt-repository -y ppa:git-core/ppa && apt-get update && apt-get install -y --no-install-recommends git \\\n    \
+             && rm -rf /var/lib/apt/lists/*\n",
+        );
     }
     if let Some((uid, gid)) = user.filter(|(uid, _)| *uid != 0) {
         // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000).
@@ -1107,6 +1116,7 @@ mod tests {
         assert!(full.starts_with(&d), "the full image starts as the slim one");
         assert!(full.contains("libssl-dev") && !d.contains("libssl-dev"), "the headers native builds look for (openssl-sys)");
         for tool in [
+            "ppa:git-core/ppa",
             "fakeroot",
             "python-is-python3",
             "shellcheck",
