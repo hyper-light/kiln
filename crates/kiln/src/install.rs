@@ -68,7 +68,9 @@ pub struct InstallArgs {
     /// Do not start it now.
     #[arg(long)]
     pub no_start: bool,
-    /// Agent: server URL.
+    /// Agent: server URL. Kubernetes, Docker: a kiln to fetch the Linux kiln the image is built
+    /// from, when this one isn't one for the cluster's CPU (else the one this machine's runner is
+    /// enrolled with).
     #[arg(long, env = "KILN_SERVER")]
     pub server: Option<String>,
     /// Agent: QUIC address to dial (overrides what the server advertises, e.g. when the server
@@ -94,9 +96,9 @@ pub struct InstallArgs {
     /// Agent: the installed agent's service (unit, launchd label or task name) for --upgrade.
     #[arg(long, default_value = "kiln-agent")]
     pub service: String,
-    /// Where a server goes: Kubernetes (the default; the kubeconfig's current context), Docker on
-    /// this machine, or this machine itself (the default with --system). An agent goes on this
-    /// machine.
+    /// Where a server goes: Kubernetes (the default where a kubeconfig names a cluster: its current
+    /// context), Docker on this machine, or this machine itself (the default with --system, and
+    /// where no kubeconfig names a cluster). An agent goes on this machine.
     #[arg(long, value_enum)]
     pub on: Option<On>,
     /// Kubernetes: the kubeconfig context to install into, rather than the current one.
@@ -109,7 +111,8 @@ pub struct InstallArgs {
     #[arg(long)]
     pub image: Option<String>,
     /// Kubernetes: a registry to push the image built from this binary to, for a cluster that
-    /// can't take it from this machine's Docker (minikube's, kind's, k3d's and Docker Desktop's can).
+    /// can't take it from this machine's Docker (minikube's, kind's, k3d's, Docker Desktop's and
+    /// OrbStack's can); without one, the registry the cluster names.
     #[arg(long)]
     pub registry: Option<String>,
     /// Docker: the port on this machine for kiln's UI and API (QUIC takes the next one).
@@ -119,16 +122,29 @@ pub struct InstallArgs {
 
 impl InstallArgs {
     /// Where this install goes: an agent on this machine; a server where `--on` says, else on
-    /// this machine for a system-wide install (`--system`), else in Kubernetes.
+    /// this machine for a system-wide install (`--system`), else in Kubernetes where a kubeconfig
+    /// names a cluster (or `--context` does), else on this machine, as before there were targets.
     pub fn target(&self) -> anyhow::Result<On> {
+        self.target_where(self.context.is_some() || crate::install_targets::has_cluster())
+    }
+
+    /// [`InstallArgs::target`], `cluster` saying whether a kubeconfig names one.
+    fn target_where(&self, cluster: bool) -> anyhow::Result<On> {
         match (self.agent, self.on) {
             (true, None | Some(On::Machine)) => Ok(On::Machine),
             (true, Some(_)) => anyhow::bail!("an agent is installed on this machine: leave out --on"),
             (false, Some(on)) if on != On::Machine && self.system => anyhow::bail!("--system installs on this machine: give --on machine, or leave out --system"),
             (false, Some(on)) => Ok(on),
             (false, None) if self.system => Ok(On::Machine),
-            (false, None) => Ok(On::Kubernetes),
+            (false, None) if cluster => Ok(On::Kubernetes),
+            (false, None) => Ok(On::Machine),
         }
+    }
+
+    /// Whether the target is the default one, chosen without `--on` (an agent's, or a system-wide
+    /// install's, isn't a choice).
+    fn defaulted(&self) -> bool {
+        self.on.is_none() && !self.agent && !self.system
     }
 }
 
@@ -235,6 +251,9 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     match a.target()? {
         On::Kubernetes => {
             eprintln_header("Installing kiln on Kubernetes");
+            if a.defaulted() {
+                say("target      the kubeconfig's cluster (the default where one is named; --on machine installs on this machine)");
+            }
             return crate::install_targets::kubernetes_install(&a).await;
         }
         On::Docker => {
@@ -291,6 +310,9 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
         }
     }
     eprintln_header(if a.agent { "Installing kiln agent" } else { "Installing kiln server" });
+    if a.defaulted() {
+        say("target      this machine (no kubeconfig names a cluster here; --on kubernetes or --on docker installs elsewhere)");
+    }
     match install_here(&a, system, &bin, &config_path, &mut on_path).await {
         Err(e) if fresh => {
             say("");
@@ -1560,17 +1582,23 @@ mod tests {
     }
 
     #[test]
-    fn a_server_goes_to_kubernetes_unless_told_otherwise_and_an_agent_stays_here() -> anyhow::Result<()> {
+    fn a_server_goes_to_a_named_cluster_unless_told_otherwise_and_an_agent_stays_here() -> anyhow::Result<()> {
         #[derive(clap::Parser)]
         struct Install {
             #[command(flatten)]
             a: InstallArgs,
         }
-        let on = |words: &[&str]| -> anyhow::Result<On> {
+        let parse = |words: &[&str]| -> anyhow::Result<InstallArgs> {
             use clap::Parser as _;
-            Install::try_parse_from(std::iter::once("install").chain(words.iter().copied()))?.a.target()
+            Ok(Install::try_parse_from(std::iter::once("install").chain(words.iter().copied()))?.a)
         };
+        let on = |words: &[&str]| parse(words)?.target_where(true);
         assert_eq!(on(&[])?, On::Kubernetes);
+        // Where no kubeconfig names a cluster, a server goes on this machine, as before there were
+        // targets; one asked for still goes there.
+        assert_eq!(parse(&[])?.target_where(false)?, On::Machine);
+        assert_eq!(parse(&["--on", "kubernetes"])?.target_where(false)?, On::Kubernetes);
+        assert!(parse(&[])?.defaulted() && !parse(&["--on", "machine"])?.defaulted() && !parse(&["--agent"])?.defaulted());
         assert_eq!(on(&["--on", "docker"])?, On::Docker);
         assert_eq!(on(&["--on", "machine"])?, On::Machine);
         assert_eq!(on(&["--system"])?, On::Machine, "a system-wide install is one on this machine");

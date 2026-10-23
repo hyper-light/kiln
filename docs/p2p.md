@@ -198,7 +198,7 @@ each other relay through any node both can (the steadiest first), not a fixed se
 `kiln install` installs a whole node, on the target the person picks, and leaves it running:
 
 ```
-kiln install                                 # Kubernetes, the current context (the default)
+kiln install                                 # Kubernetes, the current context (the default; without one, this machine)
 kiln install --on kubernetes --context lab   # another context
 kiln install --on docker                     # a container on this machine
 kiln install --on machine                    # this machine itself, as a service
@@ -219,9 +219,11 @@ kiln install --join <code>                   # join a kiln, rather than start on
   says what failed and leaves nothing running.
 
 **Built ahead of the phases** (`crates/kiln/src/install_targets.rs`, today's server as the node):
-`--on kubernetes` (the default; one Deployment until P3 makes it three, a NodePort service, its
-admin token a secret, an image built from the installing binary and loaded into minikube, kind or
-k3d, or pushed to `--registry`), `--on docker` and `--on machine`. Each ends once the kiln answers,
+`--on kubernetes` (the default where a kubeconfig names a cluster, else `--on machine`; one
+Deployment until P3 makes it three, a NodePort service, its admin token a secret, an image built
+for the nodes' CPU, from the installing binary or the static Linux build its kiln server has, and
+loaded into minikube, kind or k3d, shared with Docker Desktop's and OrbStack's, or pushed to
+`--registry` or the registry the cluster names), `--on docker` and `--on machine`. Each ends once the kiln answers,
 its UI's page and script load and its runner is connected (`/healthz/server`), and otherwise takes
 back what it made. `--join` comes with P5.
 
