@@ -4700,6 +4700,9 @@ Firecracker microVMs, R01 in `k8s` pods, and R06. R03 is W06-R13's debug reruns.
   - Output is masked with the leg's secrets. What could start a secret is held back until output
     pauses for 25 ms.
   - Sessions are audited, and a terminal closes when its leg ends or is let go.
+  - A leg is running once it's assigned, and has its shell once its workspace and environment are
+    set up: a terminal asked for in between waits for it, 60 s at most, and opens with what was
+    typed meanwhile (`w17_r01_kiln_debug_terminal` asks as soon as the leg runs).
   - Runners announce it with `CAP_JOB_TTY` and offer it when `[terminal]` is enabled.
 - *R02, keep on failure*:
   - `debug: { keep-on-failure: 30m }`, or "Keep failed legs" when rerunning
