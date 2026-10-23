@@ -106,6 +106,9 @@ pub struct Task {
     /// What its clone checked out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
+    /// A sync's: what the copies keep the same.
+    #[serde(default, skip_serializing_if = "super::Mode::is_files")]
+    pub mode: super::Mode,
 }
 
 impl Task {
@@ -152,6 +155,9 @@ pub struct Ask {
     pub to: Vec<Target>,
     #[serde(default)]
     pub delete: bool,
+    /// A sync's: what the copies keep the same (their files, their git refs, or both).
+    #[serde(default)]
+    pub mode: super::Mode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,6 +379,8 @@ struct Batch {
     source_copy: Option<(String, u64)>,
     /// The repository's synced repo, when it has one.
     synced: Option<String>,
+    /// What a new synced repo keeps the same.
+    mode: super::Mode,
 }
 
 fn row_of(view: &super::places::View, key: &str) -> Result<Row, String> {
@@ -480,6 +488,7 @@ pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
             updated: now,
             synced: None,
             head: None,
+            mode: if ask.kind == Kind::Sync { ask.mode } else { super::Mode::Files },
         })
         .collect();
     {
@@ -501,6 +510,7 @@ pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
         source_git,
         source_copy,
         synced: row.synced.clone(),
+        mode: if ask.kind == Kind::Sync { ask.mode } else { super::Mode::Files },
     };
     let h = hub.clone();
     crate::rt::spawn(async move { drive(h, b).await });
@@ -542,6 +552,7 @@ async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View
         updated: now,
         synced: None,
         head: None,
+        mode: super::Mode::Files,
     };
     hub.tasks.inner.lock().tasks.push(task.clone());
     hub.tasks.save();
@@ -583,6 +594,7 @@ pub async fn retry(hub: &Arc<Hub>, id: &str) -> Result<Vec<Task>, String> {
         branch: t.branch.clone(),
         to: if t.kind == Kind::Remove { Vec::new() } else { vec![Target { machine: t.machine.clone(), path: t.path.clone() }] },
         delete: t.delete,
+        mode: t.mode,
     };
     let started = start(hub, ask).await?;
     hub.tasks.dismiss(id);
@@ -697,7 +709,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         _ => {
             let Some(&(id, m, p, _)) = cloned.first() else { return Ok(()) };
             hub.tasks.set(hub, id, "joining", format!("{} starts syncing", m));
-            let repo = hub.sync.ask(super::server::Ask::Create { name: unique_name(hub, &b.name), copies: vec![(m.clone(), p.clone())], exclude: Vec::new(), transient: None }).await?;
+            let repo = hub.sync.ask(super::server::Ask::Create { name: unique_name(hub, &b.name), copies: vec![(m.clone(), p.clone())], exclude: Vec::new(), mode: b.mode, transient: None }).await?;
             let member = member_at(hub, &repo, m, p).ok_or_else(|| "the new synced repo has no copy".to_owned())?;
             joined.push((id, m, p, repo.clone(), member));
             (repo, false)
@@ -779,7 +791,8 @@ async fn seed(hub: &Arc<Hub>, b: &Batch, machine: &str, path: &str, transient: b
         hub.tasks.set(hub, id, "joining", format!("{machine} starts syncing {path}"));
     }
     let name = if transient { unique_name(hub, &format!("{} (moving)", b.name)) } else { unique_name(hub, &b.name) };
-    let repo = hub.sync.ask(super::server::Ask::Create { name, copies: vec![(machine.to_owned(), path.to_owned())], exclude: Vec::new(), transient: transient.then(|| b.id.clone()) }).await?;
+    let mode = if transient { super::Mode::Files } else { b.mode };
+    let repo = hub.sync.ask(super::server::Ask::Create { name, copies: vec![(machine.to_owned(), path.to_owned())], exclude: Vec::new(), mode, transient: transient.then(|| b.id.clone()) }).await?;
     let member = member_at(hub, &repo, machine, path).ok_or_else(|| "the new synced repo has no copy".to_owned())?;
     wait_in_step(hub, &repo, member, ids, &format!("the copy on {machine}")).await?;
     Ok(repo)
@@ -955,6 +968,7 @@ mod tests {
             updated,
             synced: None,
             head: None,
+            mode: super::super::Mode::Files,
         };
         let saved = vec![task("running", "cloning", now), task("done", "done", now), task("ancient", "done", now - KEEP_FOR - 10)];
         std::fs::write(dir.path().join("tasks.json"), serde_json::to_vec(&saved)?)?;
@@ -1006,6 +1020,7 @@ mod tests {
                 updated: now,
                 synced: None,
                 head: None,
+                mode: crate::sync::Mode::Files,
             };
             hub.tasks.inner.lock().tasks.extend([task("quick", "laptop"), task("slow", "busy-box")]);
             let b = Batch {
@@ -1021,6 +1036,7 @@ mod tests {
                 source_git: false,
                 source_copy: None,
                 synced: None,
+                mode: crate::sync::Mode::Files,
             };
             let h = hub.clone();
             crate::rt::spawn(async move { drive(h, b).await });

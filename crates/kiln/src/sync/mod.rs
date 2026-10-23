@@ -16,6 +16,7 @@ pub mod disk;
 pub mod git;
 pub mod group;
 pub mod places;
+pub mod refs;
 pub mod repos;
 pub mod runner;
 pub mod scan;
@@ -38,6 +39,37 @@ use scan::{Entry, Limits};
 pub enum Version {
     File { hash: String, exec: bool },
     Link { target: String },
+    /// A ref's (`refs`): the commit (a tag's object) it names, or for `HEAD` the branch checked out.
+    Ref {
+        commit: String,
+    },
+}
+
+/// What a synced repo keeps the same on its copies (`docs/sync.md`, "Modes").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Its files, uncommitted work included: the working tree.
+    #[default]
+    Files,
+    /// Its files, and its branches, tags and commits, and the branch checked out.
+    FilesAndGit,
+    /// Its branches, tags and commits: each copy's working tree is its own.
+    Git,
+}
+
+impl Mode {
+    pub fn files(self) -> bool {
+        self != Self::Git
+    }
+
+    pub fn git(self) -> bool {
+        self != Self::Files
+    }
+
+    pub fn is_files(&self) -> bool {
+        *self == Self::Files
+    }
 }
 
 /// One path's change: what it becomes (none: it is deleted), from what (none: it was new here).
@@ -48,6 +80,9 @@ pub struct Change {
     pub to: Option<Version>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<Version>,
+    /// A ref's: the blob of the git bundle holding the commits `to` names that the copies lack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
 }
 
 /// Changes in one step at the most: a look that finds more proposes several, each small enough for
@@ -77,6 +112,9 @@ pub struct Tree {
     pub files: BTreeMap<String, Version>,
     #[serde(default)]
     pub seqs: BTreeMap<u64, u64>,
+    /// Each ref's last bundle: a copy that takes the tree whole (far behind) takes its commits there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bundles: BTreeMap<String, String>,
 }
 
 /// What a committed change did to the tree.
@@ -104,34 +142,50 @@ impl Tree {
             }
             *last = step.seq;
         }
-        let decide = |files: &mut BTreeMap<String, Version>, c: &Change| {
-            if !safe_path(&c.path) {
+        let decide = |tree: &mut Tree, c: &Change| {
+            // A ref is a ref's path with a ref's version; a file, a file's.
+            let is_ref = refs::is_ref(&c.path);
+            let fits = |v: &Option<Version>| v.as_ref().is_none_or(|v| matches!(v, Version::Ref { .. }) == is_ref);
+            if !(if is_ref { refs::safe_ref(&c.path) } else { safe_path(&c.path) }) || !fits(&c.to) || !fits(&c.base) {
                 return Decision::Refuse;
             }
-            let now = files.get(&c.path);
+            let now = tree.files.get(&c.path);
             if c.base.as_ref() == now {
-                set(files, &c.path, c.to.clone());
+                set(&mut tree.files, &c.path, c.to.clone());
+                match (&c.bundle, &c.to) {
+                    (Some(b), Some(_)) => {
+                        tree.bundles.insert(c.path.clone(), b.clone());
+                    }
+                    (None, None) => {
+                        tree.bundles.remove(&c.path);
+                    }
+                    // A ref moved to a commit the copies hold: the bundle that brought it still does.
+                    (None, Some(_)) | (Some(_), None) => {}
+                }
                 return Decision::Take;
             }
             if c.to.as_ref() == now {
                 return Decision::Same;
             }
-            let name = c.to.as_ref().map(|_| conflict_name(&c.path, &step.by, step.at)).filter(|n| safe_path(n));
+            let name = c.to.as_ref().and_then(|_| if is_ref { refs::conflict_name(&c.path, &step.by, step.at) } else { Some(conflict_name(&c.path, &step.by, step.at)).filter(|n| safe_path(n)) });
             if let (Some(name), Some(v)) = (&name, &c.to) {
-                files.insert(name.clone(), v.clone());
+                tree.files.insert(name.clone(), v.clone());
+                if let Some(b) = &c.bundle {
+                    tree.bundles.insert(name.clone(), b.clone());
+                }
             }
             Decision::Beside(name)
         };
-        Some(step.changes.iter().map(|c| decide(&mut self.files, c)).collect())
+        Some(step.changes.iter().map(|c| decide(self, c)).collect())
     }
 
     /// The step that turns this tree into `to`, each change made from what this tree holds.
-    pub fn diff(&self, to: &BTreeMap<String, Version>) -> Vec<Change> {
-        let paths: BTreeSet<&String> = self.files.keys().chain(to.keys()).collect();
+    pub fn diff(&self, to: &Self) -> Vec<Change> {
+        let paths: BTreeSet<&String> = self.files.keys().chain(to.files.keys()).collect();
         paths
             .into_iter()
-            .filter(|p| self.files.get(*p) != to.get(*p))
-            .map(|p| Change { path: p.clone(), to: to.get(p).cloned(), base: self.files.get(p).cloned() })
+            .filter(|p| self.files.get(*p) != to.files.get(*p))
+            .map(|p| Change { path: p.clone(), to: to.files.get(p).cloned(), base: self.files.get(p).cloned(), bundle: to.bundles.get(p).cloned() })
             .collect()
     }
 }
@@ -208,12 +262,25 @@ pub fn conflict_name(path: &str, by: &str, at_ms: i64) -> String {
         Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
         _ => (name, String::new()),
     };
+    let file = format!("{stem}.conflict-{}{ext}", stamp(by, at_ms));
+    if dir.is_empty() { file } else { format!("{dir}/{file}") }
+}
+
+/// A conflict's machine and time (UTC), as its copy's name says them: `fedora-20261022-183000`.
+fn stamp(by: &str, at_ms: i64) -> String {
     let when = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000)
         .map(|t| format!("{:04}{:02}{:02}-{:02}{:02}{:02}", t.year(), u8::from(t.month()), t.day(), t.hour(), t.minute(), t.second()))
         .unwrap_or_else(|_| at_ms.to_string());
     let machine: String = by.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' }).collect();
-    let file = format!("{stem}.conflict-{machine}-{when}{ext}");
-    if dir.is_empty() { file } else { format!("{dir}/{file}") }
+    format!("{machine}-{when}")
+}
+
+/// The commit a ref's version names: none for a file's, or a `HEAD` on a branch.
+fn commit_of(v: Option<&Version>) -> Option<&str> {
+    match v {
+        Some(Version::Ref { commit }) if !commit.starts_with("ref: ") => Some(commit),
+        _ => None,
+    }
 }
 
 fn set(map: &mut BTreeMap<String, Version>, path: &str, v: Option<Version>) {
@@ -232,8 +299,11 @@ impl Copy {
         Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new() }
     }
 
-    /// What this copy's file at `path` holds now (none: no file).
+    /// What this copy's file at `path` holds now (none: no file); a ref's, what it names.
     fn now(&self, path: &str) -> io::Result<Option<Version>> {
+        if refs::is_ref(path) {
+            return refs::now(&self.root, path);
+        }
         let full = self.root.join(path);
         let meta = match std::fs::symlink_metadata(&full) {
             Ok(m) => m,
@@ -273,8 +343,17 @@ impl Copy {
         if self.adopting() {
             return Ok(Vec::new());
         }
-        let (found, skipped) = scan::scan(&self.root, &self.state.seen, &self.limits)?;
+        let mode = self.limits.mode;
+        let (mut found, skipped) = if mode.files() { scan::scan(&self.root, &self.state.seen, &self.limits)? } else { (BTreeMap::new(), Vec::new()) };
         self.skipped = skipped;
+        // Refs wait while git is in the middle of something here.
+        let with_refs = mode.git() && refs::is_repo(&self.root) && !refs::busy(&self.root);
+        if with_refs {
+            self.catch_up_refs(blobs);
+            for (path, version) in refs::read(&self.root, mode.files())? {
+                found.insert(path, Entry { size: 0, mtime_ns: 0, version });
+            }
+        }
         let mut paths: BTreeSet<String> = found.keys().cloned().collect();
         paths.extend(self.state.synced.keys().cloned());
         paths.extend(self.state.pending.keys().cloned());
@@ -289,7 +368,11 @@ impl Copy {
                 continue;
             }
             // Not listed but still there (left out: too big, excluded, unreadable): not deleted.
-            if here.is_none() && std::fs::symlink_metadata(self.root.join(&path)).is_ok() {
+            if here.is_none() && !refs::is_ref(&path) && std::fs::symlink_metadata(self.root.join(&path)).is_ok() {
+                continue;
+            }
+            // Refs only where they sync, and not while git is busy.
+            if refs::is_ref(&path) && !with_refs {
                 continue;
             }
             if let Some(Version::File { hash, .. }) = &here
@@ -299,7 +382,11 @@ impl Copy {
                 // Changed again while it was read: the next look takes it.
                 continue;
             }
-            changes.push(Change { path, to: here, base: expected });
+            changes.push(Change { path, to: here, base: expected, bundle: None });
+        }
+        if with_refs {
+            self.settle_refs(&mut changes);
+            self.bundle_refs(&mut changes, blobs)?;
         }
         self.state.seen = found;
         for c in &changes {
@@ -321,9 +408,13 @@ impl Copy {
     /// log index it takes the group's files through). A clone of the source's commit then becomes
     /// the source's working tree, uncommitted work and all, with no conflict copies.
     pub fn adopt(&mut self, at: u64) -> io::Result<()> {
-        let (found, skipped) = scan::scan(&self.root, &BTreeMap::new(), &self.limits)?;
+        let (found, skipped) = if self.limits.mode.files() { scan::scan(&self.root, &BTreeMap::new(), &self.limits)? } else { (BTreeMap::new(), Vec::new()) };
         self.skipped = skipped;
         self.state.synced = found.iter().map(|(p, e)| (p.clone(), e.version.clone())).collect();
+        // Its refs too: the log's replace them as it brings them.
+        if self.limits.mode.git() && refs::is_repo(&self.root) {
+            self.state.synced.extend(refs::read(&self.root, self.limits.mode.files())?);
+        }
         self.state.seen = found;
         self.state.adopt = Some(at);
         Ok(())
@@ -343,6 +434,11 @@ impl Copy {
         if !self.state.tree.files.is_empty() {
             let extra: Vec<(String, Version)> = self.state.synced.iter().filter(|(p, _)| !self.state.tree.files.contains_key(*p)).map(|(p, v)| (p.clone(), v.clone())).collect();
             for (path, v) in extra {
+                // A ref the log lacks stays, and is proposed like any new one.
+                if refs::is_ref(&path) {
+                    self.state.synced.remove(&path);
+                    continue;
+                }
                 if self.parents_real(&path) && self.now(&path)? == Some(v) {
                     self.write(&path, None, blobs)?;
                     out.push(Outcome::Applied { path: path.clone() });
@@ -369,6 +465,12 @@ impl Copy {
         for c in &step.changes {
             if let Some(Version::File { hash, .. }) = &c.to {
                 out.push(hash.clone());
+            }
+            // Another's ref: the commits it brings.
+            if let Some(b) = &c.bundle
+                && !self.ours(step)
+            {
+                out.push(b.clone());
             }
             let log_now = self.state.tree.files.get(&c.path);
             if self.ours(step)
@@ -404,10 +506,17 @@ impl Copy {
         }
         let before: Vec<Option<Version>> = step.changes.iter().map(|c| self.state.tree.files.get(&c.path).cloned()).collect();
         let Some(decisions) = self.state.tree.take(step) else { return Ok(Vec::new()) };
+        if !ours {
+            self.take_bundles(step, blobs);
+        }
         let mut out = Vec::new();
         for ((c, log_now), decision) in step.changes.iter().zip(before).zip(decisions) {
             if ours && self.state.pending.get(&c.path) == Some(&c.to) {
                 self.state.pending.remove(&c.path);
+            }
+            if refs::is_ref(&c.path) {
+                out.push(self.apply_ref(c, log_now, decision, ours));
+                continue;
             }
             match decision {
                 Decision::Refuse => out.push(Outcome::Refused { path: c.path.clone(), why: "not a path kiln writes".to_owned() }),
@@ -449,6 +558,163 @@ impl Copy {
             }
         }
         Ok(out)
+    }
+
+    /// Refs moved here, measured against the log's commit for them: one moved past it (a commit on
+    /// it, a merge of what won a conflict, a rebase onto it) is a change of the log's, not a
+    /// conflict; one behind it (the log moved on from it) is no change at all, and the log's is
+    /// brought once it can be ([`Copy::catch_up_refs`]).
+    fn settle_refs(&mut self, changes: &mut Vec<Change>) {
+        let root = self.root.clone();
+        let tree = &self.state.tree.files;
+        let mut behind = Vec::new();
+        changes.retain_mut(|c| {
+            let (Some(to), Some(log)) = (commit_of(c.to.as_ref()), commit_of(tree.get(&c.path))) else { return true };
+            if !refs::is_ref(&c.path) || c.base.as_ref() == tree.get(&c.path) {
+                return true;
+            }
+            if refs::descends(&root, to, log) {
+                c.base = tree.get(&c.path).cloned();
+                return true;
+            }
+            if refs::descends(&root, log, to) {
+                behind.push((c.path.clone(), c.to.clone()));
+                return false;
+            }
+            true
+        });
+        for (path, v) in behind {
+            set(&mut self.state.synced, &path, v);
+        }
+    }
+
+    /// Bundles the commits the refs `changes` move to that the log's refs don't reach (what the
+    /// other copies hold), as one blob each of them names.
+    fn bundle_refs(&self, changes: &mut [Change], blobs: &Blobs) -> io::Result<()> {
+        let commit = |v: &Option<Version>| commit_of(v.as_ref()).map(str::to_owned);
+        let tips: Vec<String> = changes.iter().filter(|c| refs::is_ref(&c.path)).filter_map(|c| commit(&c.to)).collect();
+        if tips.is_empty() {
+            return Ok(());
+        }
+        let have: Vec<String> = self.state.tree.files.iter().filter(|(p, _)| refs::is_ref(p)).filter_map(|(_, v)| commit(&Some(v.clone()))).collect();
+        let file = std::env::temp_dir().join(format!("{}{}.bundle", scan::TEMP_PREFIX, crate::util::new_id()));
+        let tips: Vec<&str> = tips.iter().map(String::as_str).collect();
+        let have: Vec<&str> = have.iter().map(String::as_str).collect();
+        let made = refs::bundle(&self.root, &tips, &have, &file).and_then(|made| if made { blobs.put_file(&file).map(Some) } else { Ok(None) });
+        let _ = std::fs::remove_file(&file);
+        if let Some(hash) = made? {
+            for c in changes.iter_mut().filter(|c| refs::is_ref(&c.path) && commit(&c.to).is_some()) {
+                c.bundle = Some(hash.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the commits another's step brings into the repository, before any of its refs moves.
+    fn take_bundles(&self, step: &Step, blobs: &Blobs) {
+        let mut taken: HashSet<&str> = HashSet::new();
+        for c in step.changes.iter().filter(|c| refs::is_ref(&c.path)) {
+            let Some(b) = c.bundle.as_deref() else { continue };
+            let held = matches!(&c.to, Some(Version::Ref { commit }) if refs::holds(&self.root, commit));
+            if held || !taken.insert(b) {
+                continue;
+            }
+            if let Some(file) = blobs.path(b).filter(|p| p.is_file())
+                && let Err(e) = refs::take(&self.root, &file)
+            {
+                tracing::warn!(target: "kiln.sync", error = %e, path = %c.path, "a ref's commits couldn't be taken");
+            }
+        }
+    }
+
+    /// Applies a committed change of a ref, as `apply` does a file's: git's word on what it can't
+    /// do is the outcome, never the step's failure.
+    fn apply_ref(&mut self, c: &Change, log_now: Option<Version>, decision: Decision, ours: bool) -> Outcome {
+        let files = self.limits.mode.files();
+        let refused = |path: &str, e: io::Error| Outcome::Refused { path: path.to_owned(), why: e.to_string() };
+        match decision {
+            Decision::Refuse => Outcome::Refused { path: c.path.clone(), why: "not a ref kiln syncs".to_owned() },
+            Decision::Take | Decision::Same if ours => {
+                set(&mut self.state.synced, &c.path, c.to.clone());
+                Outcome::Applied { path: c.path.clone() }
+            }
+            Decision::Take | Decision::Same => self.bring_ref(&c.path, c.to.as_ref()),
+            Decision::Beside(copy) => {
+                if let (Some(name), Some(v)) = (&copy, &c.to) {
+                    if let Err(e) = refs::set(&self.root, name, Some(v), files) {
+                        return refused(name, e);
+                    }
+                    set(&mut self.state.synced, name, Some(v.clone()));
+                }
+                if ours {
+                    match refs::now(&self.root, &c.path) {
+                        // Ours, unmoved since: its commits are beside it now, and it takes the log's.
+                        Ok(here) if here == c.to => match refs::set(&self.root, &c.path, log_now.as_ref(), files) {
+                            Ok(refs::Set::Done) => set(&mut self.state.synced, &c.path, log_now),
+                            // Checked out, its files its own: it stays, and moving on from the log's
+                            // (a merge of it) proposes it again.
+                            Ok(refs::Set::Kept(why)) => {
+                                tracing::info!(target: "kiln.sync", path = %c.path, why = %why, "a ref that lost stays");
+                                set(&mut self.state.synced, &c.path, c.to.clone());
+                            }
+                            Err(e) => return refused(&c.path, e),
+                        },
+                        // Moved again since: proposed as a change of what lost.
+                        Ok(_) => set(&mut self.state.synced, &c.path, c.to.clone()),
+                        Err(e) => return refused(&c.path, e),
+                    }
+                }
+                Outcome::Conflict { path: c.path.clone(), copy }
+            }
+        }
+    }
+
+    /// Brings another member's version of a ref here, unless it moved here (its own proposal meets
+    /// the log's), or it is checked out and its files can't take it (it stays, and is brought once
+    /// they can: [`Copy::catch_up_refs`]).
+    fn bring_ref(&mut self, path: &str, to: Option<&Version>) -> Outcome {
+        let here = match refs::now(&self.root, path) {
+            Ok(h) => h,
+            Err(e) => return Outcome::Refused { path: path.to_owned(), why: e.to_string() },
+        };
+        if here.as_ref() == to {
+            set(&mut self.state.synced, path, to.cloned());
+            return Outcome::Applied { path: path.to_owned() };
+        }
+        if self.state.pending.contains_key(path) || here != self.state.synced.get(path).cloned() {
+            return Outcome::Kept { path: path.to_owned() };
+        }
+        match refs::set(&self.root, path, to, self.limits.mode.files()) {
+            Ok(refs::Set::Done) => {
+                set(&mut self.state.synced, path, to.cloned());
+                Outcome::Applied { path: path.to_owned() }
+            }
+            Ok(refs::Set::Kept(_)) => Outcome::Kept { path: path.to_owned() },
+            Err(e) => Outcome::Refused { path: path.to_owned(), why: e.to_string() },
+        }
+    }
+
+    /// Refs the log moved that this copy couldn't take then (checked out, its files in the way) and
+    /// hasn't moved itself since: brought now, if they can be.
+    fn catch_up_refs(&mut self, blobs: &Blobs) {
+        let behind: Vec<(String, Option<Version>)> = self
+            .state
+            .tree
+            .files
+            .iter()
+            .filter(|(p, v)| refs::is_ref(p) && self.state.synced.get(*p) != Some(*v) && !self.state.pending.contains_key(*p))
+            .map(|(p, v)| (p.clone(), Some(v.clone())))
+            .collect();
+        for (path, to) in behind {
+            if let Some(b) = self.state.tree.bundles.get(&path)
+                && let Some(Version::Ref { commit }) = &to
+                && !refs::holds(&self.root, commit)
+                && let Some(file) = blobs.path(b).filter(|p| p.is_file())
+            {
+                let _ = refs::take(&self.root, &file);
+            }
+            let _ = self.bring_ref(&path, to.as_ref());
+        }
     }
 
     /// Brings another member's version of `path` here, unless the file changed here (its own
@@ -515,6 +781,8 @@ impl Copy {
                 gone(std::fs::remove_file(&full))?;
                 link(target, &full)
             }
+            // Refs are set through git (`apply_ref`), never written as files.
+            Some(Version::Ref { .. }) => Err(io::Error::other(format!("{path} is a ref"))),
         }
     }
 }
@@ -604,6 +872,150 @@ mod tests {
             }
             Ok(out)
         }
+    }
+
+    /// Runs git in `dir`: what it printed; a failure fails the test.
+    fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()?;
+        anyhow::ensure!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
+    /// Two clones of one repository, synced as `mode` says, in step.
+    fn two_repos(mode: Mode) -> anyhow::Result<Two> {
+        let mut t = Two::new()?;
+        let origin = t._dir.path().join("origin");
+        std::fs::create_dir_all(&origin)?;
+        git(&origin, &["init", "-q", "-b", "main"])?;
+        std::fs::write(origin.join("README"), "hello\n")?;
+        git(&origin, &["add", "README"])?;
+        git(&origin, &["commit", "-q", "-m", "first"])?;
+        let from = origin.to_string_lossy().into_owned();
+        for c in [&mut t.a, &mut t.b] {
+            git(&c.root, &["clone", "-q", &from, "."])?;
+            c.limits.mode = mode;
+        }
+        t.propose('a', 1_000)?;
+        t.sync()?;
+        t.propose('b', 1_500)?;
+        t.sync()?;
+        Ok(t)
+    }
+
+    fn commit(c: &Copy, path: &str, body: &str, message: &str) -> anyhow::Result<String> {
+        Two::write(c, path, body)?;
+        git(&c.root, &["add", path])?;
+        git(&c.root, &["commit", "-q", "-m", message])?;
+        git(&c.root, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn the_log_takes_refs_by_the_files_rule_and_refuses_what_isnt_one() {
+        let mut tree = Tree::default();
+        let r = |c: &str| Some(Version::Ref { commit: c.into() });
+        let step = |by: &str, at: i64, changes: Vec<Change>| Step { by: by.into(), member: 0, seq: 0, at, changes };
+        let main = ".git/refs/heads/main";
+        let took = tree.take(&step("a", 1, vec![Change { path: main.into(), to: r("x"), base: None, bundle: Some("b1".into()) }]));
+        assert_eq!(took, Some(vec![Decision::Take]));
+        assert_eq!(tree.bundles.get(main).map(String::as_str), Some("b1"));
+        let late = tree.take(&step("b", 2_000, vec![Change { path: main.into(), to: r("y"), base: None, bundle: Some("b2".into()) }]));
+        let beside = ".git/refs/heads/main.conflict-b-19700101-000002";
+        assert_eq!(late, Some(vec![Decision::Beside(Some(beside.into()))]));
+        assert_eq!((tree.files.get(main), tree.files.get(beside)), (r("x").as_ref(), r("y").as_ref()));
+        assert_eq!(tree.bundles.get(beside).map(String::as_str), Some("b2"));
+        // Not a ref kiln syncs, a ref's version for a file, a file's for a ref: refused.
+        let bad = tree.take(&step(
+            "a",
+            3,
+            vec![
+                Change { path: ".git/config".into(), to: r("z"), base: None, bundle: None },
+                Change { path: "src/a.rs".into(), to: r("z"), base: None, bundle: None },
+                Change { path: main.into(), to: Some(Version::File { hash: "h".into(), exec: false }), base: r("x"), bundle: None },
+            ],
+        ));
+        assert_eq!(bad, Some(vec![Decision::Refuse; 3]));
+    }
+
+    #[test]
+    fn a_commit_on_one_copy_moves_its_branch_on_the_other_and_their_status_agrees() -> anyhow::Result<()> {
+        let mut t = two_repos(Mode::FilesAndGit)?;
+        let x = commit(&t.a, "src/x.txt", "one", "x")?;
+        t.propose('a', 2_000)?;
+        t.sync()?;
+        assert_eq!(git(&t.b.root, &["rev-parse", "main"])?, x);
+        assert_eq!(Two::read(&t.b, "src/x.txt").as_deref(), Some("one"));
+        assert_eq!(git(&t.b.root, &["status", "--porcelain"])?, "", "git status agrees");
+        // A branch made there, checked out, and a tag: here too.
+        git(&t.b.root, &["switch", "-q", "-c", "feature"])?;
+        let f = commit(&t.b, "f.txt", "f", "f")?;
+        git(&t.b.root, &["tag", "v1"])?;
+        t.propose('b', 3_000)?;
+        t.sync()?;
+        assert_eq!(git(&t.a.root, &["rev-parse", "--abbrev-ref", "HEAD"])?, "feature");
+        assert_eq!((git(&t.a.root, &["rev-parse", "feature"])?, git(&t.a.root, &["rev-parse", "v1"])?), (f.clone(), f));
+        assert_eq!(git(&t.a.root, &["status", "--porcelain"])?, "", "git status agrees");
+        Ok(())
+    }
+
+    #[test]
+    fn a_branch_moved_on_both_at_once_keeps_both_commits_beside_each_other() -> anyhow::Result<()> {
+        let mut t = two_repos(Mode::FilesAndGit)?;
+        let ours = commit(&t.a, "a.txt", "a", "a")?;
+        let theirs = commit(&t.b, "b.txt", "b", "b")?;
+        t.propose('a', 2_000)?;
+        t.propose('b', 2_000)?;
+        let out = t.sync()?;
+        let beside = ".git/refs/heads/main.conflict-b-19700101-000002";
+        assert!(out.iter().any(|o| matches!(o, Outcome::Conflict { path, copy: Some(c) } if path == ".git/refs/heads/main" && c == beside)), "{out:?}");
+        for c in [&t.a, &t.b] {
+            assert_eq!(git(&c.root, &["rev-parse", "main"])?, ours, "the first to the log keeps the name");
+            assert_eq!(git(&c.root, &["rev-parse", "main.conflict-b-19700101-000002"])?, theirs, "the other's commit is beside it, on every copy");
+        }
+        // b's work is there still, on the log's main: its file, uncommitted, as on a.
+        assert_eq!(Two::read(&t.b, "b.txt").as_deref(), Some("b"));
+        assert_eq!(git(&t.a.root, &["status", "--porcelain"])?, git(&t.b.root, &["status", "--porcelain"])?);
+        // Merged into main there (its file, uncommitted, makes way for the commit's), it is main's
+        // next commit, no conflict.
+        std::fs::remove_file(t.b.root.join("b.txt"))?;
+        git(&t.b.root, &["merge", "-q", "--no-edit", "main.conflict-b-19700101-000002"])?;
+        let merged = git(&t.b.root, &["rev-parse", "main"])?;
+        t.propose('b', 3_000)?;
+        let out = t.sync()?;
+        assert!(!out.iter().any(|o| matches!(o, Outcome::Conflict { .. })), "{out:?}");
+        assert_eq!(git(&t.a.root, &["rev-parse", "main"])?, merged);
+        Ok(())
+    }
+
+    #[test]
+    fn without_its_files_a_branch_checked_out_moves_only_forward_and_once_it_can() -> anyhow::Result<()> {
+        let mut t = two_repos(Mode::Git)?;
+        let start = git(&t.b.root, &["rev-parse", "main"])?;
+        // b has a draft of README, which a's commit changes too.
+        std::fs::write(t.b.root.join("README"), "b's draft\n")?;
+        let x = commit(&t.a, "README", "hello again\n", "x")?;
+        t.propose('a', 2_000)?;
+        t.sync()?;
+        assert_eq!(git(&t.b.root, &["rev-parse", "main"])?, start, "the draft is in the way: main stays");
+        assert_eq!(std::fs::read_to_string(t.b.root.join("README"))?, "b's draft\n", "and so does the draft");
+        assert!(refs::holds(&t.b.root, &x), "the commit is there for it");
+        // The draft goes: the next look brings main, proposing nothing.
+        git(&t.b.root, &["checkout", "--", "README"])?;
+        let before = t.log.len();
+        t.propose('b', 3_000)?;
+        assert_eq!(t.log.len(), before, "nothing changed on b");
+        assert_eq!(git(&t.b.root, &["rev-parse", "main"])?, x);
+        assert_eq!(std::fs::read_to_string(t.b.root.join("README"))?, "hello again\n");
+        // Files aren't synced: a file of b's own stays b's.
+        Two::write(&t.b, "notes.txt", "mine")?;
+        t.propose('b', 4_000)?;
+        t.sync()?;
+        assert_eq!(Two::read(&t.a, "notes.txt"), None);
+        Ok(())
     }
 
     #[test]
@@ -701,11 +1113,11 @@ mod tests {
         let outside = t.a.root.parent().map(|p| p.join("outside")).unwrap_or_default();
         std::fs::create_dir_all(&outside)?;
         let hash = t.blobs.put_bytes(b"pwned")?;
-        let file = |path: &str| Change { path: path.into(), to: Some(Version::File { hash: hash.clone(), exec: false }), base: None };
+        let file = |path: &str| Change { path: path.into(), to: Some(Version::File { hash: hash.clone(), exec: false }), base: None, bundle: None };
         let mut evil = vec![file("../outside/x"), file("/etc/x"), file(".git/config"), file("a/./b"), file(".kiln-sync-1.tmp")];
         // A link to outside, then a write through it.
         #[cfg(unix)]
-        evil.push(Change { path: "door".into(), to: Some(Version::Link { target: outside.to_string_lossy().into_owned() }), base: None });
+        evil.push(Change { path: "door".into(), to: Some(Version::Link { target: outside.to_string_lossy().into_owned() }), base: None, bundle: None });
         evil.push(file("door/x"));
         let out = t.a.apply(&Step { by: "b".into(), member: 3, seq: 0, at: 1, changes: evil }, &t.blobs)?;
         let refused = out.iter().filter(|o| matches!(o, Outcome::Refused { .. })).count();
