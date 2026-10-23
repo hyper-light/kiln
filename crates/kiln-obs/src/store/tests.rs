@@ -1303,6 +1303,57 @@ fn the_newest_samples_are_read_by_a_tag() {
     assert!(none.is_empty());
 }
 
+/// Each series' rate a second at its newest sample, by a tag: a cumulative counter's last two
+/// samples' rise over the time between them (a reset counted from 0), a count's newest over the
+/// time since the one before, a gauge's as a counter's; only those with a tag's value where one is
+/// asked (none where no series has it); one with a single sample since the bound, none; read alike
+/// from a block.
+#[test]
+fn the_newest_rates_are_read_by_a_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let key = |host: &str, op: &str, kind: Kind| SeriesKey::new("io", [("host", host), ("operation", op)], kind).unwrap();
+    let keys = [
+        key("a", "read", Kind::Counter),
+        key("b", "read", Kind::Counter),
+        key("c", "read", Kind::Count),
+        key("d", "read", Kind::Counter),
+        key("a", "write", Kind::Counter),
+        key("e", "read", Kind::Gauge),
+    ];
+    let mut b = Builder::new();
+    for k in &keys {
+        b.define(k);
+    }
+    b.run(keys[0].fp, [(100_000, 1_000.0), (115_000, 4_000.0)]);
+    b.run(keys[1].fp, [(100_000, 5_000.0), (110_000, 300.0)]);
+    b.run(keys[2].fp, [(100_000, 600.0), (115_000, 450.0)]);
+    b.run(keys[3].fp, [(10_000, 1.0), (120_000, 9.0)]);
+    b.run(keys[4].fp, [(100_000, 0.0), (115_000, 99.0)]);
+    b.run(keys[5].fp, [(100_000, 2.0), (103_000, 8.0)]);
+    s.apply(&b.finish()).unwrap();
+    let rates = |s: &Store, only: Option<(&str, &str)>| {
+        let mut out: Vec<(String, f64)> = Vec::new();
+        let q = Reads { metric: "io", by: ["host", ""], only, any_of: &[], reading: Reading::Rate, since_ms: 50_000 };
+        s.read_by(&q, &mut Scratch::default(), &mut |[h, _], v, _| out.push((h.to_owned(), v)));
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        out
+    };
+    let want = vec![("a".to_owned(), 200.0), ("b".to_owned(), 30.0), ("c".to_owned(), 30.0), ("e".to_owned(), 2.0)];
+    assert_eq!(rates(&s, Some(("operation", "read"))), want);
+    assert_eq!(rates(&s, Some(("operation", "write"))), [("a".to_owned(), 6.6)]);
+    assert!(rates(&s, Some(("operation", "nonesuch"))).is_empty());
+    assert_eq!(rates(&s, None).len(), 5, "d's one sample since the bound gives none");
+    let with = |any_of: &[&str]| {
+        let mut n = 0;
+        s.read_by(&Reads { metric: "io", by: ["host"], only: None, any_of, reading: Reading::Newest, since_ms: 0 }, &mut Scratch::default(), &mut |_, _, _| n += 1);
+        n
+    };
+    assert_eq!((with(&["operation"]), with(&["nonesuch", "host"]), with(&["nonesuch"])), (6, 6, 0), "a series without any of the tags asked passed over");
+    s.cut(Point { index: 1, term: 1 }).unwrap();
+    assert_eq!(rates(&s, Some(("operation", "read"))), want, "from a block, the same");
+}
+
 /// Each host as the index says it: its series, its newest sample, its metrics' namespaces, and the
 /// tags asked of its first series; a host whose newest sample is before the bound is left out, and
 /// one gone with retention is gone.

@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde::ser::{SerializeSeq as _, Serializer};
 
 use super::super::api::{Fail, fail};
-use super::inventory::{Container, Inventory};
+use super::inventory::{Container, Figure, Inventory};
 use crate::http::server::{self as srv, Response};
 
 /// A page's containers when it does not say, and at the most.
@@ -106,7 +106,9 @@ fn sort_key(c: &Container, field: &str) -> Option<f64> {
     let f = &c.figures;
     match field {
         "cpu" => f.cpu,
-        "memory" => f.memory,
+        // As the list shows it: its working set, else its usage (Docker's collector gives a
+        // working set alone).
+        "memory" => f.working_set.or(f.memory),
         // Of its limit: the nearest to theirs first.
         "cpu_limit" => f.cpu.zip(f.cpu_limit).filter(|(_, l)| *l > 0.0).map(|(u, l)| u / l),
         "memory_limit" => f.working_set.or(f.memory).zip(f.memory_limit).filter(|(_, l)| *l > 0.0).map(|(u, l)| u / l),
@@ -344,11 +346,53 @@ pub fn find<'a>(inv: &'a Inventory, id: &str) -> Option<&'a Container> {
     })
 }
 
+/// A line of a container's chart: its name and the query that draws it.
+#[derive(Serialize)]
+struct LineOut {
+    name: &'static str,
+    query: String,
+}
+
+/// A container's charts, each line drawn by the first of its figure's sources that reported it
+/// (kiln's check's series, or an OpenTelemetry collector's in its own names and units): a line no
+/// source reported is not there.
+#[derive(Serialize)]
+struct ChartsOut {
+    /// Cores.
+    cpu: Vec<LineOut>,
+    /// Bytes.
+    memory: Vec<LineOut>,
+    /// Milliseconds a second.
+    throttled: Vec<LineOut>,
+    /// Bytes a second.
+    io: Vec<LineOut>,
+}
+
+impl ChartsOut {
+    fn of(c: &Container) -> Self {
+        let lines = |of: &[(Figure, &'static str)]| of.iter().filter_map(|&(f, name)| Some(LineOut { name, query: c.query(f)? })).collect();
+        Self {
+            cpu: lines(&[(Figure::Cpu, "In use"), (Figure::CpuLimit, "Limit")]),
+            memory: lines(&[(Figure::Memory, "In use"), (Figure::WorkingSet, "Working set"), (Figure::MemoryLimit, "Limit")]),
+            throttled: lines(&[(Figure::Throttled, "Throttled")]),
+            io: lines(&[(Figure::IoRead, "Read"), (Figure::IoWrite, "Written")]),
+        }
+    }
+}
+
+/// A container as `GET containers/{id}` gives it: as listed, and its charts.
+#[derive(Serialize)]
+struct OneOut<'a> {
+    #[serde(flatten)]
+    container: ContainerOut<'a>,
+    charts: ChartsOut,
+}
+
 /// `GET containers/{id}`.
 pub async fn one(id: &str) -> Result<Response, Fail> {
     let inv = super::inventory::get().inventory().await?;
     let c = find(&inv, id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such container (listed an hour past its last sample)"))?;
-    Ok(srv::json(StatusCode::OK, &ContainerOut::of(c, inv.at_ms)))
+    Ok(srv::json(StatusCode::OK, &OneOut { container: ContainerOut::of(c, inv.at_ms), charts: ChartsOut::of(c) }))
 }
 
 #[cfg(test)]
@@ -364,6 +408,7 @@ mod tests {
             last_ms,
             tags: vec![("host", host.into()), ("container_name", name.into()), ("image_name", format!("shop/{name}").into()), ("kube_namespace", "shop".into())],
             figures: Figures { cpu, cpu_limit: limit, ..Figures::default() },
+            drawn: [None; super::super::inventory::FIGURES],
         }
     }
 

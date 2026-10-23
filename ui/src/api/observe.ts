@@ -1221,6 +1221,17 @@ export interface Container {
   tags: string[];
 }
 
+/** A line of a container's chart: its name and the query that draws it. */
+export interface ChartLine {
+  name: string;
+  query: string;
+}
+
+/** A container as its page reads it: its charts' lines, each of the first of its figure's sources that reported it (kiln's check's, or an OpenTelemetry collector's in its own names). */
+export interface ContainerDetail extends Container {
+  charts: { cpu: ChartLine[]; memory: ChartLine[]; throttled: ChartLine[]; io: ChartLine[] };
+}
+
 export interface ContainerQuery {
   state?: "running" | "stopped" | "all";
   filter?: string;
@@ -1701,7 +1712,7 @@ export const observeApi = {
     for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
     return request<{ containers: Container[]; total_matching: number; total_returned: number; totals: { running: number; stopped: number } }>("GET", `${BASE}/containers?${p}`, undefined, { signal });
   },
-  container: (id: string, signal?: AbortSignal) => request<Container>("GET", `${BASE}/containers/${enc(id)}`, undefined, { signal }),
+  container: (id: string, signal?: AbortSignal) => request<ContainerDetail>("GET", `${BASE}/containers/${enc(id)}`, undefined, { signal }),
   /** Notebooks, as Datadog's list gives them, without their cells. */
   notebooks: (q: NotebookQuery, signal?: AbortSignal) => {
     const p = new URLSearchParams({ include_cells: "false" });

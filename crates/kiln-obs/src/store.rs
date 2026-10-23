@@ -1961,8 +1961,38 @@ impl Store {
     /// nothing decoded where the head holds it in order (most series: what a host reported last),
     /// else as [`Store::read_with`] reads it: what a host list's figures are.
     pub fn newest_by(&self, metric: &str, key: &str, since_ms: i64, scratch: &mut Scratch, each: &mut dyn FnMut(&str, f64)) {
-        let Some(m) = self.symbols.find(metric) else { return };
-        let k = self.symbols.find(key);
+        let q = Reads { metric, by: [key, ""], only: None, any_of: &[], reading: Reading::Newest, since_ms };
+        self.read_by(&q, scratch, &mut |[k, _], v, _| each(k, v));
+    }
+
+    /// Each series of `q.metric` with samples at or after `q.since_ms` (where `q.only` names a tag
+    /// and its value, that tag; where `q.any_of` names tags, one of them at the least: a series
+    /// without is passed over before anything of it is read), to `each`: its values of the tags
+    /// `q.by` (`""` where it has none), what `q.reading` reads of it there, and its newest sample's
+    /// time (ms). Its newest sample is read from the head with nothing
+    /// decoded where the head holds it in order, else as [`Store::read_with`] reads it. Its rate a
+    /// second: a cumulative counter's last two samples' rise over the time between them (a value
+    /// below the one before is a reset: the newer counted from 0), as a gauge's; a count's newest
+    /// over the time since the sample before it; none with one sample since then. What a host's or
+    /// a container's figures are made of (OpenTelemetry collectors' cumulative CPU time and bytes
+    /// read among them).
+    pub fn read_by<const N: usize>(&self, q: &Reads<'_, N>, scratch: &mut Scratch, each: &mut dyn FnMut([&str; N], f64, i64)) {
+        let Some(m) = self.symbols.find(q.metric) else { return };
+        let keys = q.by.map(|k| self.symbols.find(k));
+        let any_of: Vec<Sym> = q.any_of.iter().filter_map(|k| self.symbols.find(k)).collect();
+        if !q.any_of.is_empty() && any_of.is_empty() {
+            // No series has any of them.
+            return;
+        }
+        let (reading, since_ms) = (q.reading, q.since_ms);
+        let only = match q.only {
+            Some((tk, tv)) => match (self.symbols.find(tk), self.symbols.find(tv)) {
+                (Some(tk), Some(tv)) => Some((tk, tv)),
+                // No series has it.
+                _ => return,
+            },
+            None => None,
+        };
         let since = since_ms.max(self.cutoff);
         let (mut ts, mut vs) = (std::mem::take(&mut scratch.ts), std::mem::take(&mut scratch.vs));
         for &id in self.index.series_of(m) {
@@ -1971,20 +2001,45 @@ impl Store {
                 continue;
             }
             let Some(info) = self.index.info(id) else { continue };
-            let tagged = k.and_then(|k| self.index.tags(&info).iter().find(|(tk, _)| *tk == k)).map_or("", |&(_, v)| self.symbols.get(v));
-            let value = match self.head.get(id as usize).and_then(HeadSeries::newest) {
-                Some((t, v)) if t == last => v,
-                _ => {
+            let tags = self.index.tags(&info);
+            if only.is_some_and(|o| !tags.contains(&o)) || (!any_of.is_empty() && !tags.iter().any(|(k, _)| any_of.contains(k))) {
+                continue;
+            }
+            let (value, at) = match reading {
+                Reading::Newest => match self.head.get(id as usize).and_then(HeadSeries::newest) {
+                    Some((t, v)) if t == last => (v, t),
+                    _ => {
+                        ts.clear();
+                        vs.clear();
+                        if self.read_with(id, since, i64::MAX, scratch, &mut ts, &mut vs).is_err() {
+                            continue;
+                        }
+                        let (Some(&t), Some(&v)) = (ts.last(), vs.last()) else { continue };
+                        (v, t)
+                    }
+                },
+                Reading::Rate => {
                     ts.clear();
                     vs.clear();
                     if self.read_with(id, since, i64::MAX, scratch, &mut ts, &mut vs).is_err() {
                         continue;
                     }
-                    let Some(&v) = vs.last() else { continue };
-                    v
+                    let (Some(&[t0, t1]), Some(&[v0, v1])) = (ts.last_chunk::<2>(), vs.last_chunk::<2>()) else { continue };
+                    #[allow(clippy::cast_precision_loss)]
+                    let secs = (t1 - t0) as f64 / 1000.0;
+                    if secs <= 0.0 || !v0.is_finite() || !v1.is_finite() {
+                        continue;
+                    }
+                    let rate = match info.kind {
+                        Kind::Count => v1 / secs,
+                        Kind::Counter | Kind::Gauge if v1 >= v0 => (v1 - v0) / secs,
+                        Kind::Counter | Kind::Gauge => v1 / secs,
+                    };
+                    (rate, t1)
                 }
             };
-            each(tagged, value);
+            let tagged = keys.map(|k| k.and_then(|k| tags.iter().find(|(tk, _)| *tk == k)).map_or("", |&(_, v)| self.symbols.get(v)));
+            each(tagged, value, at);
         }
         scratch.ts = ts;
         scratch.vs = vs;
@@ -2150,6 +2205,26 @@ impl Store {
 /// A snapshot's directory name for a durable point: names sort as points do.
 pub fn snapshot_name(at: Point) -> String {
     format!("{:020}-{:020}", at.index, at.term)
+}
+
+/// What [`Store::read_by`] reads of each series: its newest sample, or its rate a second there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    Newest,
+    Rate,
+}
+
+/// A [`Store::read_by`]: of which series, by which tags, what.
+#[derive(Debug, Clone, Copy)]
+pub struct Reads<'q, const N: usize> {
+    pub metric: &'q str,
+    pub by: [&'q str; N],
+    /// A tag and its value a series must have.
+    pub only: Option<(&'q str, &'q str)>,
+    /// Tags a series must have one of at the least (none: any series).
+    pub any_of: &'q [&'q str],
+    pub reading: Reading,
+    pub since_ms: i64,
 }
 
 /// Buffers a reader keeps across [`Store::read_with`] calls.

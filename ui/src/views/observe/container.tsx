@@ -1,11 +1,12 @@
 /**
  * A container (docs/observe.md §10.10): whether it runs, its image, engine, host and pod; its CPU
  * and memory against its limits, its throttling, processes and uptime; its CPU (with its limit),
- * memory (in use, its working set, its limit), throttling and I/O over a range; its tags; its logs a
- * click away.
+ * memory (in use, its working set, its limit), throttling and I/O over a range, each line drawn as
+ * the source that reported it names it (kiln's check, or an OpenTelemetry collector: §10.11); its
+ * tags; its logs a click away.
  */
-import type * as React from "react";
-import { observeApi, type Container } from "@/api/observe";
+import * as React from "react";
+import { observeApi, type ChartLine, type ContainerDetail } from "@/api/observe";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -16,13 +17,7 @@ import { Link, useParams } from "@/lib/router";
 import { OfLimit, cores, coresText, imageOf, nameOf } from "./containers";
 import { QueryChart, RangePicker, compact, useRange, type Range } from "./parts";
 
-// The charts' series, named.
-const CPU = ["In use", "Limit"];
-const MEMORY = ["In use", "Working set", "Limit"];
-const THROTTLED = ["Throttled"];
-const IO = ["Read", "Written"];
-
-const containerRes = (id: string): Res<Container> => ({ key: `observe/containers/one/${id}`, fetch: (s) => observeApi.container(id, s), opts: { pollMs: 15_000 } });
+const containerRes = (id: string): Res<ContainerDetail> => ({ key: `observe/containers/one/${id}`, fetch: (s) => observeApi.container(id, s), opts: { pollMs: 15_000 } });
 
 export default function ContainerPage() {
   const { id = "" } = useParams();
@@ -39,8 +34,6 @@ export default function ContainerPage() {
 function ContainerView({ id, range, onRange }: { id: string; range: Range; onRange: (r: Range) => void }) {
   const c = useRes(containerRes(id)).data;
   const f = c.figures;
-  // Its series are tagged with its full id, Datadog's tag or OpenTelemetry's attribute.
-  const scope = `container_id:${c.id}`;
   const pod = c.kube.pod ? `${c.kube.namespace ? `${c.kube.namespace}/` : ""}${c.kube.pod}` : null;
   const memory = f.working_set_bytes ?? f.memory_bytes;
   return (
@@ -85,29 +78,16 @@ function ContainerView({ id, range, onRange }: { id: string; range: Range; onRan
       </div>
       <div className="mb-8 grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Panel title="CPU" description="Cores in use, and its limit.">
-          <Loadable label="its CPU" fallback={<Hold height={180} />}>
-            <QueryChart queries={[`avg:container.cpu.usage{${scope}} / 1000000000`, `avg:container.cpu.limit{${scope}} / 1000000000`]} names={CPU} range={range} unit="cores" />
-          </Loadable>
+          <Lines label="its CPU" lines={c.charts.cpu} range={range} unit="cores" />
         </Panel>
         <Panel title="Memory" description="In use, its working set (what an out-of-memory kill reads), and its limit.">
-          <Loadable label="its memory" fallback={<Hold height={180} />}>
-            <QueryChart
-              queries={[`avg:container.memory.usage{${scope}}`, `avg:container.memory.working_set{${scope}}`, `avg:container.memory.limit{${scope}}`]}
-              names={MEMORY}
-              range={range}
-              unit="B"
-            />
-          </Loadable>
+          <Lines label="its memory" lines={c.charts.memory} range={range} unit="B" />
         </Panel>
         <Panel title="Throttling" description="Time its quota held it back, a second.">
-          <Loadable label="its throttling" fallback={<Hold height={180} />}>
-            <QueryChart queries={[`avg:container.cpu.throttled{${scope}} / 1000000`]} names={THROTTLED} range={range} unit="ms/s" />
-          </Loadable>
+          <Lines label="its throttling" lines={c.charts.throttled} range={range} unit="ms/s" />
         </Panel>
         <Panel title="I/O" description="Bytes read and written, a second.">
-          <Loadable label="its I/O" fallback={<Hold height={180} />}>
-            <QueryChart queries={[`avg:container.io.read{${scope}}`, `avg:container.io.write{${scope}}`]} names={IO} range={range} unit="B/s" />
-          </Loadable>
+          <Lines label="its I/O" lines={c.charts.io} range={range} unit="B/s" />
         </Panel>
       </div>
       <div className="mb-8 grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -152,5 +132,17 @@ function ContainerView({ id, range, onRange }: { id: string; range: Range; onRan
         </Panel>
       </div>
     </>
+  );
+}
+
+/** A chart of a container's lines, each as the first of its sources that reported it draws it; none reported, said so. */
+function Lines({ label, lines, range, unit }: { label: string; lines: ChartLine[]; range: Range; unit: string }) {
+  const queries = React.useMemo(() => lines.map((l) => l.query), [lines]);
+  const names = React.useMemo(() => lines.map((l) => l.name), [lines]);
+  if (lines.length === 0) return <p className="empty-line flex min-h-[180px] items-center justify-center">None of its sources reports this.</p>;
+  return (
+    <Loadable label={label} fallback={<Hold height={180} />}>
+      <QueryChart queries={queries} names={names} range={range} unit={unit} />
+    </Loadable>
   );
 }

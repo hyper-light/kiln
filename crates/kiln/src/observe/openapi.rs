@@ -1680,46 +1680,60 @@ fn schemas() -> Map<String, Value> {
         ),
     );
     // Containers (§10.10).
-    put(
-        "Container",
-        object(
-            &[
-                ("id", string()),
-                ("name", nullable(string())),
-                ("state", one_of(&["running", "stopped"])),
-                ("host", nullable(string())),
-                ("runtime", nullable(string())),
-                ("image", object(&[("name", nullable(string())), ("tag", nullable(string())), ("short", nullable(string()))], &[])),
-                ("kube", object(&[("namespace", nullable(string())), ("pod", nullable(string())), ("container", nullable(string())), ("qos", nullable(string()))], &[])),
-                ("compose", object(&[("service", nullable(string())), ("project", nullable(string()))], &[])),
-                ("last_reported", describe(integer(), "ms since the epoch: its newest sample")),
-                ("series", integer()),
-                (
-                    "figures",
-                    describe(
-                        object(
-                            &[
-                                ("cpu_nanocores", nullable(number())),
-                                ("cpu_limit_nanocores", nullable(number())),
-                                ("cpu_throttled_ns", nullable(number())),
-                                ("memory_bytes", nullable(number())),
-                                ("working_set_bytes", nullable(number())),
-                                ("memory_limit_bytes", nullable(number())),
-                                ("pids", nullable(number())),
-                                ("io_read_bytes", nullable(number())),
-                                ("io_write_bytes", nullable(number())),
-                                ("uptime_seconds", nullable(number())),
-                            ],
-                            &[],
-                        ),
-                        "each its newest sample of the last ten minutes (I/O and throttling a second)",
-                    ),
+    let container_fields = [
+        ("id", string()),
+        ("name", nullable(string())),
+        ("state", one_of(&["running", "stopped"])),
+        ("host", nullable(string())),
+        ("runtime", nullable(string())),
+        ("image", object(&[("name", nullable(string())), ("tag", nullable(string())), ("short", nullable(string()))], &[])),
+        ("kube", object(&[("namespace", nullable(string())), ("pod", nullable(string())), ("container", nullable(string())), ("qos", nullable(string()))], &[])),
+        ("compose", object(&[("service", nullable(string())), ("project", nullable(string()))], &[])),
+        ("last_reported", describe(integer(), "ms since the epoch: its newest sample")),
+        ("series", integer()),
+        (
+            "figures",
+            describe(
+                object(
+                    &[
+                        ("cpu_nanocores", nullable(number())),
+                        ("cpu_limit_nanocores", nullable(number())),
+                        ("cpu_throttled_ns", nullable(number())),
+                        ("memory_bytes", nullable(number())),
+                        ("working_set_bytes", nullable(number())),
+                        ("memory_limit_bytes", nullable(number())),
+                        ("pids", nullable(number())),
+                        ("io_read_bytes", nullable(number())),
+                        ("io_write_bytes", nullable(number())),
+                        ("uptime_seconds", nullable(number())),
+                    ],
+                    &[],
                 ),
-                ("tags", array(string())),
-            ],
-            &["id", "state", "last_reported", "figures", "tags"],
+                "each its newest sample of the last ten minutes (I/O and throttling a second)",
+            ),
         ),
-    );
+        ("tags", array(string())),
+    ];
+    put("Container", object(&container_fields, &["id", "state", "last_reported", "figures", "tags"]));
+    let line = object(&[("name", string()), ("query", describe(string(), "a metric query (§6) of its series, in the chart's unit"))], &["name", "query"]);
+    let lines = |what: &str| describe(array(line.clone()), what);
+    let mut detail_fields: Vec<(&str, Value)> = container_fields.to_vec();
+    detail_fields.push((
+        "charts",
+        describe(
+            object(
+                &[
+                    ("cpu", lines("cores: in use, its limit")),
+                    ("memory", lines("bytes: in use, its working set, its limit")),
+                    ("throttled", lines("milliseconds a second")),
+                    ("io", lines("bytes a second: read, written")),
+                ],
+                &["cpu", "memory", "throttled", "io"],
+            ),
+            "its charts' lines, each drawn by the first of its figure's sources that reported it (kiln's check's series, or an OpenTelemetry collector's in its own names, §10.11); a line no source reported is not there",
+        ),
+    ));
+    put("ContainerDetail", object(&detail_fields, &["id", "state", "last_reported", "figures", "tags", "charts"]));
     // Downtimes (§9.3): Datadog's v2 downtime.
     let time_in = describe(any(), "ms since the epoch, or RFC 3339");
     let downtime_fields = [
@@ -2875,7 +2889,14 @@ fn ops() -> Vec<Op<'static>> {
         },
         Op {
             params: vec![id()],
-            ..op("get", "/containers/{id}", "A container, by its id or 12 or more of its first hex", "observe.read", None, vec![("200", answer_of("the container", schema("Container")))])
+            ..op(
+                "get",
+                "/containers/{id}",
+                "A container, by its id or 12 or more of its first hex",
+                "observe.read",
+                None,
+                vec![("200", answer_of("the container, and its charts", schema("ContainerDetail")))],
+            )
         },
         // The infrastructure list (§10.9).
         Op {

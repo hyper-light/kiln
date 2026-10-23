@@ -158,3 +158,138 @@ fn a_machine_s_containers_are_listed_with_their_limits_throttling_and_oom_kills(
     drop(started);
     Ok(())
 }
+
+/// The OpenTelemetry Collector the scenario runs (contrib: its `docker_stats` receiver).
+const COLLECTOR: &str = "otel/opentelemetry-collector-contrib:0.162.0";
+
+/// Containers an OpenTelemetry Collector reports (§10.11), and nothing else does: a kiln server
+/// and a runner as processes of their own (each node looks at its host's containers once, as it
+/// starts, then not for an hour), then a container of the test's own, busy under half a core and
+/// 64 MiB and writing a megabyte a second to its disk, and the Collector (contrib
+/// 0.162.0) reading Docker every 2 s with its `docker_stats` receiver (its CPU limit, throttled
+/// time, processes and uptime asked for) and sending OTLP to the runner. The container listed in
+/// kiln's units from the Collector's names: its CPU near its quota (Docker's cumulative
+/// nanoseconds read as a rate), its limits as Docker has them, throttled, its working set (Docker's
+/// usage less the cache), its processes, its writes, its uptime; its name, image and engine from
+/// the Collector's attributes. Its page's CPU chart the Collector's series' query, a rate of
+/// cumulative nanoseconds, and that query's answer its CPU in cores.
+#[test]
+#[ignore = "needs Docker: runs containers and an OpenTelemetry Collector, and a kiln server and runner as processes"]
+fn a_collector_s_containers_are_listed_in_kiln_s_units() -> anyhow::Result<()> {
+    let mut f = Fleet::new()?;
+    f.start_runner("r1")?;
+    let otlp = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    // Each node's one look as it starts, done before the containers are.
+    std::thread::sleep(Duration::from_secs(5));
+    let run = now_ms();
+    let (busy, collector) = (format!("kiln-e2e-otel-busy-{run}"), format!("kiln-e2e-otelcol-{run}"));
+    let started = Started(vec![busy.clone(), collector.clone()]);
+    let busy_id = docker(&[
+        "run",
+        "-d",
+        "--name",
+        &busy,
+        "--cpus",
+        "0.5",
+        "--memory",
+        "64m",
+        "alpine:latest",
+        "sh",
+        "-c",
+        // A megabyte a second written and flushed (its writeback the container's), and a core's
+        // worth of spinning under half a core's quota.
+        "while :; do dd if=/dev/zero of=/tmp/f bs=1M count=1 conv=fsync 2>/dev/null; sleep 1; done & while :; do :; done",
+    ])?;
+    let dir = tempfile::tempdir()?;
+    let config = format!(
+        "receivers:
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    api_version: \"1.44\"
+    collection_interval: 2s
+    metrics:
+      container.cpu.limit:
+        enabled: true
+      container.cpu.throttling_data.throttled_time:
+        enabled: true
+      container.pids.count:
+        enabled: true
+      container.uptime:
+        enabled: true
+processors:
+  resource:
+    attributes:
+      - key: host.name
+        value: otel-e2e-{run}
+        action: upsert
+exporters:
+  otlphttp:
+    endpoint: http://127.0.0.1:{otlp}
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    metrics:
+      receivers: [docker_stats]
+      processors: [resource]
+      exporters: [otlphttp]
+"
+    );
+    std::fs::write(dir.path().join("config.yaml"), config)?;
+    let socket_group = docker(&["run", "--rm", "-v", "/var/run/docker.sock:/s:ro", "alpine:latest", "stat", "-c", "%g", "/s"])?;
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &collector,
+        "--network",
+        "host",
+        "--group-add",
+        &socket_group,
+        "-v",
+        "/var/run/docker.sock:/var/run/docker.sock:ro",
+        "-v",
+        &format!("{}:/etc/otelcol-contrib/config.yaml:ro", dir.path().join("config.yaml").display()),
+        COLLECTOR,
+    ])?;
+
+    // Listed from the Collector's series alone, in kiln's units.
+    let mut seen = Value::Null;
+    wait(&f, "the busy container listed from the Collector's series", Duration::from_secs(120), || {
+        seen = named(&listed(&f, &format!("filter={busy}"))?, &busy).cloned().unwrap_or(Value::Null);
+        let g = &seen["figures"];
+        Ok(g["cpu_nanocores"].as_f64().is_some_and(|c| c > 1e8) && g["cpu_throttled_ns"].as_f64().is_some_and(|t| t > 0.0) && g["io_write_bytes"].as_f64().is_some_and(|w| w > 0.0))
+    })
+    .map_err(|e| anyhow::anyhow!("{e}\nlast seen: {seen}\nthe Collector's log: {}", docker(&["logs", "--tail", "30", &collector]).unwrap_or_default()))?;
+    let g = &seen["figures"];
+    anyhow::ensure!(
+        seen["id"] == busy_id.as_str() && seen["runtime"] == "docker" && seen["image"]["name"].as_str().is_some_and(|i| i.starts_with("alpine")) && seen["state"] == "running",
+        "its name, engine and image: {seen}"
+    );
+    let cpu = g["cpu_nanocores"].as_f64().unwrap_or(0.0);
+    anyhow::ensure!((3.5e8..=5.5e8).contains(&cpu), "near its quota of half a core: {cpu} nanocores");
+    anyhow::ensure!(g["cpu_limit_nanocores"] == 5e8 && g["memory_limit_bytes"] == 67_108_864.0, "its limits as Docker has them: {g}");
+    anyhow::ensure!(g["working_set_bytes"].as_f64().is_some_and(|w| w > 0.0 && w < 67_108_864.0) && g["memory_bytes"].is_null(), "Docker's usage less the cache, its working set: {g}");
+    anyhow::ensure!(g["pids"].as_f64().is_some_and(|p| p >= 2.0) && g["uptime_seconds"].as_f64().is_some_and(|u| u > 0.0), "its processes and uptime: {g}");
+
+    // Its page draws its CPU from the Collector's series, and that query answers its cores.
+    let one = f.call("GET", &format!("/api/observe/v1/containers/{busy_id}"), None)?;
+    let query = one["charts"]["cpu"][0]["query"].as_str().unwrap_or_default().to_owned();
+    anyhow::ensure!(query == format!("sum:container.cpu.usage.total{{container.id:{busy_id}}}.as_rate() / 1000000000"), "the Collector's series drawn: {}", one["charts"]);
+    anyhow::ensure!(
+        one["charts"]["io"].as_array().is_some_and(|l| l.len() == 2) && one["charts"]["memory"].as_array().is_some_and(|l| l.iter().any(|l| l["name"] == "Working set")),
+        "its I/O and working set drawn: {}",
+        one["charts"]
+    );
+    // Its buckets' cores but the newest (still filling: a counter's rise over a whole bucket's
+    // width), their median.
+    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": query, "from": now_ms() - 120_000, "to": now_ms(), "step": 10_000 })))?;
+    let mut cores: Vec<f64> = a["series"][0]["values"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+    cores.pop();
+    cores.sort_by(f64::total_cmp);
+    let median = cores.get(cores.len() / 2).copied().unwrap_or(f64::NAN);
+    anyhow::ensure!(cores.len() >= 3 && (0.35..=0.55).contains(&median), "the chart's query, its cores: {median} of {cores:?} ({a})");
+    drop(started);
+    Ok(())
+}

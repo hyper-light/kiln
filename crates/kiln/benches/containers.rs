@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use hyper_measure::alloc;
+use hyper_measure::{alloc, usage};
 use kiln::observe::containers::inventory::{self, Inventory};
 use kiln::observe::containers::{Check, cgroup, http};
 use kiln_obs::batch::{Builder, Kind, SeriesKey};
@@ -197,12 +197,16 @@ fn node(root: &Path, links: &Path, proc: &Path, containers: usize, look: u64) ->
 /// The least of nine and their median: on a machine others load, the least is what the work
 /// itself takes, the median what it took.
 #[derive(Clone, Copy)]
-struct Took(Duration, Duration);
+struct Took(Duration, Duration, Option<Duration>);
 
 /// What `f` takes (nine runs) and allocates (its second run).
 fn measure<T>(mut f: impl FnMut() -> T) -> (Took, alloc::Counts) {
     let mut times = Vec::new();
     let mut counted = alloc::Counts::default();
+    // The CPU time the process was charged over the nine runs, a run's on average: what others'
+    // load leaves of a measurement (a run waiting for a core is charged nothing), in the OS's
+    // ticks (Linux's 10 ms: nine runs make it finer).
+    let cpu = usage::this().ok();
     for n in 0..9 {
         let t = Instant::now();
         if n == 1 {
@@ -214,12 +218,14 @@ fn measure<T>(mut f: impl FnMut() -> T) -> (Took, alloc::Counts) {
         }
         times.push(t.elapsed());
     }
+    let cpu = cpu.zip(usage::this().ok()).map(|(a, b)| Duration::from_nanos(b.since(&a).cpu_ns() / 9));
     times.sort();
-    (Took(times[0], times[times.len() / 2]), counted)
+    (Took(times[0], times[times.len() / 2], cpu), counted)
 }
 
 fn line(what: &str, t: Took, a: &alloc::Counts, more: &str) {
-    println!("{what:<60} {:>9.3} / {:>9.3}ms {:>10} allocations  {more}", t.0.as_secs_f64() * 1e3, t.1.as_secs_f64() * 1e3, a.calls());
+    let cpu = t.2.map_or_else(|| "?".to_owned(), |c| format!("{:.1}", c.as_secs_f64() * 1e3));
+    println!("{what:<60} {:>9.3} / {:>9.3}ms (CPU {cpu:>7} ms) {:>10} allocations  {more}", t.0.as_secs_f64() * 1e3, t.1.as_secs_f64() * 1e3, a.calls());
 }
 
 /// A node's looks: found, then looked at whole (the check's second look onward, its rates taken).
@@ -304,6 +310,76 @@ fn fleet(containers: usize) -> kiln_obs::machine::Shared {
     Arc::new(RwLock::new(s))
 }
 
+/// A fleet's store as OpenTelemetry Collectors' `docker_stats` receivers write it: `containers`
+/// containers on nodes of 1,000, each its 21 series (its default metrics and those a page asks for:
+/// cumulative CPU, throttled time and two devices' bytes read and written, its memory, limits,
+/// processes and uptime, its network), two scrapes 15 s apart, a sixth stopped half an hour ago.
+fn otel_fleet(containers: usize) -> kiln_obs::machine::Shared {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    const COUNTERS: [&str; 7] = [
+        "container.cpu.usage.total",
+        "container.cpu.usage.kernelmode",
+        "container.cpu.usage.usermode",
+        "container.cpu.throttling_data.throttled_time",
+        "container.network.io.usage.rx_bytes",
+        "container.network.io.usage.tx_bytes",
+        "container.network.io.usage.rx_dropped",
+    ];
+    const GAUGES: [&str; 10] = [
+        "container.cpu.utilization",
+        "container.cpu.limit",
+        "container.memory.usage.total",
+        "container.memory.usage.limit",
+        "container.memory.file",
+        "container.memory.percent",
+        "container.memory.total_cache",
+        "container.pids.count",
+        "container.uptime",
+        "container.network.io.usage.tx_dropped",
+    ];
+    for chunk in (0..containers).collect::<Vec<_>>().chunks(500) {
+        let mut b = Builder::new();
+        let mut keys = Vec::new();
+        for &n in chunk {
+            let (host, cid, name) = (format!("node-{:04}", n / 1000), id(n, 9), format!("app-{n}"));
+            let tags: Vec<(&str, &str)> = vec![
+                ("host", &host),
+                ("host.name", &host),
+                ("container.id", &cid),
+                ("container.name", &name),
+                ("container.hostname", &cid[..12]),
+                ("container.image.name", "registry.example.com/shop/app:2.4.1"),
+                ("container.runtime", "docker"),
+            ];
+            for m in COUNTERS {
+                let k = SeriesKey::new(m, tags.iter().copied(), Kind::Counter).unwrap();
+                b.define(&k);
+                keys.push((k, n, true));
+            }
+            for m in GAUGES {
+                let k = SeriesKey::new(m, tags.iter().copied(), Kind::Gauge).unwrap();
+                b.define(&k);
+                keys.push((k, n, false));
+            }
+            for (major, op) in [("8", "read"), ("8", "write"), ("259", "read"), ("259", "write")] {
+                let mut t = tags.clone();
+                t.extend([("device_major", major), ("device_minor", "0"), ("operation", op)]);
+                let k = SeriesKey::new("container.blockio.io_service_bytes_recursive", t, Kind::Counter).unwrap();
+                b.define(&k);
+                keys.push((k, n, true));
+            }
+        }
+        for (k, n, counter) in &keys {
+            let last = if n % 6 == 0 { NOW - 1_800_000 } else { NOW - 5_000 };
+            let v = (n % 1000) as f64 * 1e6;
+            let next = if *counter { v + 1.5e9 } else { v + 1.0 };
+            b.run(k.fp, [(last - 15_000, v), (last, next)]);
+        }
+        s.apply(&b.finish()).unwrap();
+    }
+    Arc::new(RwLock::new(s))
+}
+
 fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
 }
@@ -339,5 +415,13 @@ fn main() {
         let short = &inv.containers[inv.containers.len() / 2].id[..12];
         let (t, a) = measure(|| http::find(&inv, short).is_some());
         line("one by the first 12 of its id", t, &a, "");
+        // The same fleet as OpenTelemetry Collectors report it: its rates read from cumulative
+        // counters (two samples a series decoded) where kiln's check's are newest samples.
+        let store = otel_fleet(n);
+        let series = store.read().unwrap().series_count();
+        let (t, a) = measure(|| inventory::make(&store, NOW).containers.len());
+        let inv: Inventory = inventory::make(&store, NOW);
+        let with_cpu = inv.containers.iter().filter(|c| c.figures.cpu.is_some()).count();
+        line(&format!("the list made of Collectors' series ({series})"), t, &a, &format!("{} containers, {with_cpu} with their CPU", inv.containers.len()));
     }
 }

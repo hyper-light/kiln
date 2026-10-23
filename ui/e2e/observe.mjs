@@ -2558,6 +2558,56 @@ const scenarios = {
     await page.getByRole("button", { name: `Edit ${name}`, exact: true }).waitFor({ state: "detached" });
   },
 
+  /** A container an OpenTelemetry Collector reports (§10.11), its Docker receiver's series sent as
+   * OTLP: listed in kiln's units (its CPU a rate of cumulative nanoseconds against its limit in
+   * CPUs, what Docker calls usage its working set against its limit), its page's charts drawn from
+   * the Collector's own series, those none of its sources reports said so. */
+  async "a container a Collector reports is listed in kiln's units and drawn from its own series"() {
+    const id = (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", "");
+    const name = `otel-web-${run}`;
+    const now = Date.now();
+    const attrs = Object.entries({ "container.id": id, "container.name": name, "container.image.name": "nginx:1.27", "container.runtime": "docker", "host.name": `e2e-otel-${run}` }).map(
+      ([key, v]) => ({
+        key,
+        value: { stringValue: v },
+      }),
+    );
+    // Ten minutes, a scrape every 15 s: a quarter of a core (3.75e9 ns a scrape), 150 MiB of 256 MiB.
+    const times = Array.from({ length: 40 }, (_, i) => now - (39 - i) * 15_000);
+    const ns = (t) => `${BigInt(t) * 1000000n}`;
+    const sum = (metric, unit, isMonotonic, v) => ({
+      name: metric,
+      unit,
+      sum: { aggregationTemporality: 2, isMonotonic, dataPoints: times.map((t, i) => ({ timeUnixNano: ns(t), asInt: `${v(i)}` })) },
+    });
+    const gauge = (metric, unit, v) => ({ name: metric, unit, gauge: { dataPoints: times.map((t) => ({ timeUnixNano: ns(t), asDouble: v })) } });
+    const MiB = 2 ** 20;
+    const metrics = [
+      sum("container.cpu.usage.total", "ns", true, (i) => 10_000_000_000 + i * 3_750_000_000),
+      gauge("container.cpu.limit", "{cpus}", 0.5),
+      sum("container.memory.usage.total", "By", false, () => 150 * MiB),
+      sum("container.memory.usage.limit", "By", false, () => 256 * MiB),
+    ];
+    const body = { resourceMetrics: [{ resource: { attributes: attrs }, scopeMetrics: [{ scope: { name: "otelcol/dockerstatsreceiver" }, metrics }] }] };
+    const sent = await fetch(`${BASE}/v1/metrics`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect(sent.status === 200, `sent as OTLP: ${sent.status}`);
+    await until(
+      "listed in kiln's units",
+      async () => {
+        const f = (await api("GET", `/api/observe/v1/containers?filter=${name}`)).body?.containers?.[0]?.figures;
+        return f?.cpu_nanocores === 2.5e8 && f.cpu_limit_nanocores === 5e8 && f.working_set_bytes === 150 * MiB && f.memory_limit_bytes === 256 * MiB && f.memory_bytes === null;
+      },
+      45_000,
+    );
+    await page.goto(`${BASE}/observe/containers/${id}`);
+    await page.getByRole("heading", { name, level: 1 }).waitFor();
+    await page.getByRole("img", { name: `sum:container.cpu.usage.total{container.id:${id}}.as_rate() / 1000000000; avg:container.cpu.limit{container.id:${id}}`, exact: true }).waitFor();
+    await page.getByRole("img", { name: `avg:container.memory.usage.total{container.id:${id}}; avg:container.memory.usage.limit{container.id:${id}}`, exact: true }).waitFor();
+    expect((await page.getByText("No series match in this range.").count()) === 0, "its charts drawn");
+    expect((await page.getByText("None of its sources reports this.", { exact: true }).count()) === 2, "its throttling and I/O, reported by none of its sources, said so");
+    await fitsAcross("a Collector's container");
+  },
+
   /** Containers as Datadog's Agent's container check reports them (§10.10): one running near its CPU
    * quota and throttled, listed against its limits, its page read (its figures, its pod, its tags,
    * its host's page and back); another whose samples stopped five minutes ago, among the stopped. */

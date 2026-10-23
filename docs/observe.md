@@ -43,6 +43,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-29 | Notebooks (§11.1), Datadog's: Markdown and graph cells (Datadog's widget definitions, drawn as the dashboards draw them) over a time, fixed or the last of a span, cells' own times and sizes, types and templates; kept a file each, their heads alone read at the start; Datadog's v1 API (made, listed with its filters, order and pages, read, changed whole, removed); postmortems made of a template and an incident (Datadog's incident variables, kiln's template after the Google SRE book's) and attached to it; the charts on fixed times; their pages; checked live and in browsers (§13) | done |
 | O-30 | Containers (§10.10): every container each node runs, read from Linux's cgroups (v2 and v1; Docker, containerd, CRI-O, Podman, Kubernetes' pods, nested nodes'), named by Kubernetes' links and the engine's API (its socket, std alone), the engine's stats where cgroups are not seen (Docker Desktop on macOS and Windows); Datadog's container check's names (CPU, throttling, memory and working set, OOM kills, I/O, processes, uptime); listed by the server from the store's index; the API, OpenAPI, its pages; checked live (real Docker containers: a quota's CPU and throttling, OOM kills) and in browsers (§13), measured (§12.34) | done |
 | O-31 | Log indexes (§8.10): Datadog's indexes, exclusion filters (a rate, by an attribute's values or a trace), daily quotas (a warning, the quota reached, each an event; past it, records not kept for search until the day turns) and retention a part of the store each (§4.6: a file a part, each part's cutoff its own, replicated); routed where records are taken, every node told; what is not kept still seen live, archived and counted by metrics from logs; Datadog's estimated usage; the API, OpenAPI, the Indexes page and the explorer's pick of an index; checked live (§13) and measured (§12.35) | done |
+| O-32 | OpenTelemetry's containers (§10.11): Docker's, the kubelet's and the cluster's receivers' container metrics and the semantic conventions', read in their own names and units (cumulative time a rate, a working set for what Docker calls usage, limits in cores and bytes, devices and modes summed), a container kiln's check also sees one container, the kubelet's series joined by pod and name; each chart of its page drawn by the source that reported it; checked live against a real Collector and in browsers (§13), measured against O-30 (§12.34) | done |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
@@ -2354,7 +2355,8 @@ sees them: each node looks at its own every 15 seconds, on a thread of its own.
 - **Listed** by the server (`GET /api/observe/v1/containers`, `…/containers/{id}`: kiln's API): made
   of the store's index, as the host list is (each container's series by its `container_id` or
   OpenTelemetry's `container.id`, their tags and newest sample; `Store::tag_seen`), and of each
-  figure's series' newest sample (`Store::newest_by`); made again at most every 15 seconds. Running
+  figure's series' newest sample or rate (`Store::read_by`; OpenTelemetry's, §10.11); made again at
+  most every 15 seconds. Running
   while it has a sample within two minutes, listed an hour past its last; found by a part of its
   name, image, id, pod, namespace or host, or by a tag (`*` any part of its value); ordered by its
   CPU, memory, either's share of its limit, throttling, I/O or uptime; one found by its id or the
@@ -2363,6 +2365,51 @@ sees them: each node looks at its own every 15 seconds, on a thread of its own.
   is written as JSON from the list itself. A list older than 15 seconds is given while another is
   made, one at a time, up to a minute old; the first asked after a quiet while is made first. A
   host's page lists its containers from it: running ones, then those stopped within the hour.
+
+### 10.11 OpenTelemetry's containers
+
+Containers an OpenTelemetry Collector reports are listed beside those kiln's check finds, read in
+their own names and units (`crate::observe::containers::inventory::SOURCES`): what Docker's
+(`docker_stats`), the kubelet's (`kubeletstats`) and the cluster's (`k8s_cluster`) receivers write,
+and the semantic conventions' container metrics, from the receivers' own documentation (contrib
+`main`, 2026-10-23) and the conventions' page. Datadog maps a few of them onto its own names at
+intake (`container.cpu.usage.total` to `container.cpu.usage` among them, with no unit changed:
+its OTLP mapping's tables), which would put Docker's cumulative nanoseconds and the kubelet's cores
+under the name of the check's nanocores a second; kiln keeps each series as it came and reads it for
+what it is, so nothing is written twice and no unit is mistaken.
+
+- **Named** by `container.id`, which Docker's receiver sets, and the cluster's (its containers'
+  identifying attribute), and the kubelet's where it is asked for (`extra_metadata_labels:
+  [container.id]`); a container kiln's check also sees (the same id, without the runtime's
+  `containerd://`) is one container, its figures from both. The kubelet not asked for ids names a
+  container by its namespace, pod and name alone (`k8s.namespace.name`, `k8s.pod.name`,
+  `k8s.container.name`): its series join the container the cluster's receiver or kiln's check
+  names so (found by those three's hash, then compared), and its page draws them by those names; a
+  container the kubelet alone reports, so named, is not listed (nothing gives its id). Its name, image, engine, pod and namespace from the
+  resource's attributes (`container.name`, `container.image.name`, `container.runtime`,
+  `k8s.pod.name`, `k8s.namespace.name`, `k8s.container.name`), as the list already read them.
+- **Read** each figure from each of its sources: kiln's check's (Datadog's container check's names:
+  nanocores, bytes, rates a second, a sample's newest), then Docker's (CPU and throttled time, its
+  cumulative nanoseconds a rate; its "usage", Docker's own figure of usage less the inactive file
+  cache, which is a working set, not a usage; its memory limit, the host's memory where no limit is
+  set, which is the limit in effect; bytes read and written, each device's summed, `operation` read
+  or write, its other operations left out; a CPU limit in CPUs, processes and uptime where they are
+  asked for, not by default), the kubelet's (CPU in cores, or its cumulative seconds a rate; usage,
+  working set), the cluster's (limits in cores and bytes) and the conventions' (`container.cpu.time`
+  and `container.cpu.usage` by `cpu.mode`, summed; `container.disk.io` by `disk.io.direction`). A
+  rate is a series' last two samples' rise over the time between them, a fall a reset (the newer
+  counted from 0), or, of a delta count, its newest over the time since the one before
+  (`Store::read_by`, a series' newest samples decoded); a container's series of one reporter at
+  its newest time are summed (its devices', its modes': one scrape's), one its reporter no longer
+  writes left out however recent (its tags since changed, a name learned: summed with the series
+  that took its place, it would double a figure for ten minutes), its reporters' and its sources'
+  taken on average. A metric of
+  kiln's and OpenTelemetry's both (`container.cpu.usage`: nanocores in one, cores in the other) is
+  told apart by the tag that names its container.
+- **Drawn** on its page by the first of each figure's sources that reported it: its API answer
+  carries each chart's lines, a query each (`sum:container.cpu.usage.total{container.id:…}.as_rate()
+  / 1000000000`: a rate a second whether the series are cumulative or each interval's counts), and
+  a line no source reported is not there; a chart of none says so.
 
 ## 11. UI
 
@@ -2496,8 +2543,11 @@ time range and the search in the address (a page is a link).
   more of a limit told apart), how long it has run; on a phone, its name and a line of its figures. A
   container's page: its state, id, figures against its limits, throttling, processes, I/O and
   uptime; its CPU (with its limit), memory (in use, its working set, its limit), throttling and I/O
-  over a range; where it runs (host, image, engine, pod, QoS class, Compose service); its tags;
-  its logs a click away. A host's containers lead to theirs.
+  over a range, each line drawn from the series of the source that reported it (kiln's check's, or
+  an OpenTelemetry Collector's in its own names, §10.11), a chart none of its sources reports said
+  so; where it runs (host, image, engine, pod, QoS class, Compose service); its tags; its logs a
+  click away. A host's containers lead to theirs. Ordered by memory, by the working set the list
+  shows (else its usage).
 - **Delivery** (§10.7): DORA's four keys over 7, 30 or 90 days, narrowed to a service, an
   environment or a team: each its value, what it was taken from, and the 2024 report's four ranges
   beside it, the one it falls in marked in words (a change failure rate beside the clusters' own
@@ -4242,6 +4292,37 @@ container's is read once (it was read again at each comparison, a match on the f
 them) and the page selected before it alone is sorted (a selection is linear): 0.65 ms at 50,000
 where sorting all of them took 7.4.
 
+**OpenTelemetry's sources (O-32, §10.11).** The same fleets, and as OpenTelemetry Collectors'
+`docker_stats` receivers write them (each container 21 series: cumulative CPU and throttled time,
+each of two devices' bytes read and written, its memory, limits, processes, uptime, network;
+1,050,000 series at 50,000), the list made by each build in turn (2026-10-23, release; each round
+the least of nine runs and their median; the builds run one after another, three rounds, the
+machine's load 22 to 45 from others' work). O-30 is the list before OpenTelemetry's sources (its
+commit, built apart).
+
+| the list made, least / median of a round (ms) | 10,000, kiln's check's | 50,000 | 10,000, Collectors' | 50,000 |
+| --- | --- | --- | --- | --- |
+| O-30 | 13.4–15.3 / 13.8–18.6 | 80.8–96.1 / 85.8–107.4 | | |
+| O-32 as first written | 19.2–20.5 / 19.7–24.2 | 125.9–134.0 / 131.1–141.1 | 19.4–20.1 / 19.8–20.9 | 146.8–150.1 / 153.6–157.3 |
+| the tags a source needs, foldhash | 14.3–15.6 / 14.8–17.3 | 93.8–115.2 / 97.1–130.9 | 14.4–15.1 / 14.9–15.8 | 115.9–119.6 / 117.7–127.6 |
+| kiln's series by their id and host | 13.8–15.9 / 14.2–17.5 | 88.1–105.6 / 91.6–121.9 | 13.5–19.8 / 14.3–22.4 | 107.7–142.5 / 114.6–163.9 |
+| each container's first reporter a slot | 12.0–13.6 / 12.4–16.3 | 75.5–109.9 / 77.5–119.0 | 11.9–21.2 / 14.7–22.7 | 101.9–109.2 / 106.7–124.3 |
+
+As first written, the list read each figure from its 27 sources a source at a time: five of
+OpenTelemetry's metrics have kiln's names (`container.cpu.usage` among them), so their sources read
+kiln's every series again only to find no `container.id` on them; each series' five tags were
+looked up (its id, host, namespace, pod and name) where kiln's need two; and each series went into a
+map by its container and reporter, its container's id (64 characters) found by std's SipHash: half
+again O-30's time at 50,000. Now a source passes over a series that has none of the tags it needs
+before anything of it is read (`Reads::any_of`); kiln's sources look up two tags; the maps hash
+with foldhash (seeded, already built for hashbrown and serde_json); and a container's first reporter
+in a pass sums into a slot of its own (a container most often has one; a second goes into a map),
+the slots the pass reached listed and made empty after it: the map's two hashings a series gone.
+Its allocations are O-30's (40,107 and 200,157 against 40,069 and 200,115), and its time no more
+than O-30's, though it reads three times the sources; a Collectors' fleet, a third less than as
+first written. The rounds' spread is others' work on the machine: measured in turn, each round's
+order holds (the slots' version the least in each of the two quieter rounds).
+
 ### 12.35 Log indexes
 
 `cargo bench -p kiln --bench indexes` (adacachy, 2026-10-23, release; the least of nine runs and
@@ -5024,6 +5105,22 @@ own found what the scenario could not: a CPU of 0.000434 cores written `4.34e-4`
 host's name wrapping in its column, charts' lines named `1: *` and `2: *` (now In use, Limit, …;
 a host's page's too), and a y axis cutting `47.7 KiB/s` to `.7 KiB/s` (every chart's axis is now as
 wide as its longest label).
+
+**OpenTelemetry's containers** (`crates/kiln/tests/observe_containers.rs`, on a machine with
+Docker): a kiln server and a runner as processes of their own, each looking at its host's
+containers once as it starts and not again for an hour; then a container of the test's own
+(`alpine:latest`, busy under half a core and 64 MiB, writing and flushing a megabyte a second), and
+an OpenTelemetry Collector (`otel/opentelemetry-collector-contrib:0.162.0`) reading Docker every
+2 s with its `docker_stats` receiver (its CPU limit, throttled time, processes and uptime asked for;
+the socket by its group alone, `--group-add`) and sending OTLP to the runner: the Collector its only
+source. The container listed in kiln's units: its CPU between 0.35 and 0.55 cores (Docker's
+cumulative nanoseconds read as a rate), its limits as Docker has them (0.5 cores, 64 MiB),
+throttled, written to, its working set below its limit (Docker's usage less the cache) and no usage
+said, its processes and uptime; its name, image (`alpine…`) and engine (`docker`) from the
+Collector's attributes. Its page's CPU chart the Collector's series' query
+(`sum:container.cpu.usage.total{container.id:…}.as_rate() / 1000000000`), its I/O and working set
+drawn; that query's answer, the median of its finished buckets, its cores. 2026-10-23: passes on
+its first run (beside the check's scenario: 132 s for both; adacachy).
 
 **Log indexes** (`crates/kiln/tests/observe_indexes.rs`): a kiln server and a runner as processes of
 their own. `main` as kiln makes it: alone, of every record, of the main part. Refused, saying why
