@@ -894,28 +894,28 @@ a.pg-node:hover {
   color: var(--color-secondary);
   font-size: 14px;
 }
-.ps-top {
+.sv-top {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
   gap: 4px 12px;
 }
-.ps-hint {
+.sv-hint {
   font-size: 12px;
 }
-.ps-picked {
+.sv-picked {
   color: var(--color-bright);
   font-size: 12px;
 }
-.ps-list {
+.sv-list {
   display: grid;
   gap: 8px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
-.ps-step {
+.sv-step {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: start;
@@ -925,36 +925,36 @@ a.pg-node:hover {
   border-radius: 9px;
   background: #0d0f12;
 }
-.ps-step[data-picked] {
+.sv-step[data-picked] {
   border-color: var(--color-line-hover);
   background: #12151a;
 }
-.ps-check {
+.sv-check {
   margin-top: 3px;
 }
-.ps-title {
+.sv-title {
   margin: 0;
   color: var(--color-bright);
   font-size: 14px;
   overflow-wrap: anywhere;
 }
-.ps-n {
+.sv-n {
   display: inline-block;
   min-width: 1.7em;
   color: var(--color-meta);
   font-family: var(--font-mono);
   font-size: 12px;
 }
-.ps-after {
+.sv-after {
   margin: 2px 0 0;
   color: var(--color-meta);
   font-size: 12px;
 }
-.ps-detail {
+.sv-detail {
   margin-top: 8px;
   font-size: 13px;
 }
-.ps-link {
+.sv-link {
   margin: -6px 0;
   padding: 6px 0;
   border: 0;
@@ -967,16 +967,77 @@ a.pg-node:hover {
   text-underline-offset: 3px;
   cursor: pointer;
 }
-.ps-link:hover {
+.sv-link:hover {
   color: var(--color-bright);
 }
 /* On a phone, Run goes under the step's words. */
 @media (max-width: 640px) {
-  .ps-step {
+  .sv-step {
     grid-template-columns: auto minmax(0, 1fr);
   }
-  .ps-step > :last-child {
+  .sv-step > :last-child {
     grid-column: 2;
     justify-self: start;
   }
+}
+/* An agent's own plan, in its Plan tab (its-plan.tsx): the plan it proposed, kept by kiln, its steps
+   as cards; its to-do list, each item as a step stands. */
+.ip {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.ip-head {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.ip-head a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-underline-offset: 3px;
+}
+.ip-meta {
+  color: var(--color-meta);
+  font-size: 12px;
+}
+.ip .plan-section {
+  padding-top: 0;
+  border-top: 0;
+}
+.ip .plan-h {
+  font-size: 13px;
+}
+.ip > .sv-link {
+  justify-self: start;
+}
+.ip-run {
+  display: flex;
+}
+.ip-todos {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ip-todo {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  color: var(--color-secondary);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.ip-todo[data-stand="met"] {
+  color: var(--color-meta);
+}
+.ip-todo[data-stand="working"] {
+  color: var(--color-bright);
+}
+.ip-todo > :first-child {
+  margin-top: 2px;
 }

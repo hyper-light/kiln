@@ -1794,6 +1794,9 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
 
 async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
     let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
+    let plans = crate::plans::of_source(plans, q.get("session").map(String::as_str).filter(|s| !s.is_empty()), proposed);
     Ok(srv::json(StatusCode::OK, &plans))
 }
 

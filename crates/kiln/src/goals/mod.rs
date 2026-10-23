@@ -1388,6 +1388,13 @@ where
                 // What agents' goals wait on a person for, on their info: Mission Control's Needs
                 // you, and a card wherever you are in kiln.
                 hub.harness.set_held(hub, &held_stacks(self.store).await);
+                // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
+                // one an agent, a version each time it proposes another.
+                for (agent, words) in hub.harness.take_proposed() {
+                    if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
+                        tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
+                    }
+                }
             }
         }
     }

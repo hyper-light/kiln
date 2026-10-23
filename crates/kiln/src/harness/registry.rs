@@ -263,6 +263,9 @@ pub struct Registry {
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
     /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
     epochs: Mutex<HashMap<String, u64>>,
+    /// The plan each session last proposed (plan mode), not yet kept as one of kiln's plans: the
+    /// goals' driver keeps it ([`Self::take_proposed`], `crate::plans::keep_proposed`).
+    proposed: Mutex<HashMap<String, String>>,
     /// Restoring the conversation store from a mirror's copy of it.
     restore: Mutex<Restore>,
     /// The mirrors to ask for their copy as they connect: the store was found empty at start
@@ -376,6 +379,7 @@ impl Registry {
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            proposed: Mutex::new(HashMap::new()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
             restore: Mutex::new(Restore::Idle),
@@ -525,6 +529,11 @@ impl Registry {
             m.info.clone()
         };
         hub.emit(&json!({"type": "harness", "info": info}));
+    }
+
+    /// The plans sessions proposed (plan mode) since the last look, by session, each its latest.
+    pub fn take_proposed(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.proposed.lock()).into_iter().collect()
     }
 
     /// What each agent's goals wait on a person for (`goals::held_stacks`, every tick of the goals'
@@ -827,6 +836,8 @@ impl Registry {
         let mut gone = false;
         // Finished messages' mentions of files, to keep once the mirrors are let go.
         let mut jobs: Vec<Job> = Vec::new();
+        // The plan it proposed (plan mode) in these events, to keep as one of kiln's plans.
+        let mut proposed: Option<String> = None;
         let mut save_names = false;
         // The account's other sessions, which pause too (`hold_account`).
         let mut hold: Option<(Command, Vec<(String, Location)>)> = None;
@@ -938,6 +949,9 @@ impl Registry {
                         if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
                             jobs.push(job);
                         }
+                        if let Some(plan) = proposed_in(e) {
+                            proposed = Some(plan);
+                        }
                         if let Ok(v) = serde_json::to_value(e) {
                             m.upsert(v);
                         }
@@ -975,6 +989,9 @@ impl Registry {
         }
         for job in jobs {
             self.keeper.enqueue(job);
+        }
+        if let Some(plan) = proposed {
+            self.proposed.lock().insert(id.to_owned(), plan);
         }
         if save_names {
             self.save_names();
@@ -1534,9 +1551,35 @@ fn default_name(kind: &str) -> String {
     super::kinds::Kind::get(kind).map_or_else(|| kind.to_owned(), |k| k.name.to_owned())
 }
 
+/// The plan an event proposes (plan mode): its main thread's plan tool, with its words.
+fn proposed_in(e: &super::model::Event) -> Option<String> {
+    let super::model::Body::Tool(call) = &e.body else { return None };
+    if e.parent.is_some() || call.tool != super::model::ToolKind::Plan {
+        return None;
+    }
+    call.input.get("plan").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan its main thread proposes (plan mode) is one to keep; a subagent's, another tool's,
+    /// or one without words isn't.
+    #[test]
+    fn a_plan_proposed_in_plan_mode_is_one_to_keep() -> anyhow::Result<()> {
+        let ev = |parent: Value, tool: &str, input: Value| -> anyhow::Result<crate::harness::model::Event> {
+            Ok(serde_json::from_value(
+                json!({"id": "e1", "seq": 1, "at": 1, "parent": parent, "kind": "tool", "tool_id": "t1", "name": "ExitPlanMode", "tool": tool, "title": "Plan", "input": input, "status": "pending", "started": 1}),
+            )?)
+        };
+        let plan = "# Fix it\n\n1. Read\n2. Fix";
+        assert_eq!(proposed_in(&ev(Value::Null, "plan", json!({ "plan": plan }))?).as_deref(), Some(plan));
+        assert_eq!(proposed_in(&ev(json!("task1"), "plan", json!({"plan": "1. a"}))?), None, "a subagent's");
+        assert_eq!(proposed_in(&ev(Value::Null, "shell", json!({"plan": "1. a"}))?), None, "another tool's");
+        assert_eq!(proposed_in(&ev(Value::Null, "plan", json!({"plan": "  "}))?), None, "no words");
+        Ok(())
+    }
 
     #[test]
     fn a_name_given_here_holds_whatever_the_machine_knows_of_names() {

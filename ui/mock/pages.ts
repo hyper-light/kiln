@@ -639,7 +639,40 @@ export function planning(goal: { agent: string; id: string; text: string }): str
   return id;
 }
 
+/** The plan Release prep proposed (plan mode), as its conversation has it and as kiln keeps it (`pl_proposed`). */
+export const PROPOSED = `# Fix: a mount taken over by a restarted daemon dropped a store
+
+The successor's handle store starts fresh, so a page re-fetched after the takeover was never tracked, and its write-back was judged fresh.
+
+1. Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.
+2. Track handles the successor never saw opened: \`WritableOpens\` keyed by handle and inode (coherence.rs).
+3. Adopt an unseen handle on a restored mount before serving its write (channel.rs).
+4. Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.
+5. Verify: workspace clippy, the doc gate, and CI.`;
+
 const PLANS = [
+  {
+    id: "pl_proposed",
+    title: "Fix: a mount taken over by a restarted daemon dropped a store",
+    body: PROPOSED,
+    items: [],
+    tags: [],
+    source: { session: "fam-orch", agent: "Release prep", harness: "claude", proposed: true },
+    share: null,
+    version: 2,
+    created_at: T0 - 40 * 60,
+    updated_at: T0 - 20 * 60,
+    steps: [
+      "Reproduce it: the CLI test that writes through a mount taken over by a restarted daemon fails 3 of 3.",
+      "Track handles the successor never saw opened: `WritableOpens` keyed by handle and inode (coherence.rs).",
+      "Adopt an unseen handle on a restored mount before serving its write (channel.rs).",
+      "Tests, red first: the CLI test and the coherence unit tests, then the guest tests on the box.",
+      "Verify: workspace clippy, the doc gate, and CI.",
+    ],
+    runs: 0,
+    phase: "ready",
+    research: null,
+  },
   {
     id: "pl_release",
     title: "Cut the 0.2 release",
@@ -1368,7 +1401,13 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     return (r ? json(res, 200, r) : err(res, 404, "no such research"), true);
   }
   // Plans
-  if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
+  if (p === "/api/plans" && m === "GET") {
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    const session = url.searchParams.get("session");
+    const proposed = url.searchParams.get("proposed") === "1";
+    const of = (pl: (typeof PLANS)[number]) => (pl as { source?: { session?: string; proposed?: boolean } | null }).source;
+    return (void json(res, 200, PLANS.filter((pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed))), true);
+  }
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
     const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
     if (!pl) return (err(res, 404, "no such plan"), true);
