@@ -216,7 +216,11 @@ function NewFleetForm() {
           ) : (
             <p className="rel-quiet">No app is registered there.</p>
           ))}
-        {pick === "all" && <p className="rel-quiet">{candidates.length ? `${candidates.length} apps: ${candidates.map((a) => a.name).join(", ")}.` : "No app is registered there."}</p>}
+        {pick === "all" && (
+          <p className="rel-quiet">
+            {candidates.length ? `${candidates.length} ${candidates.length === 1 ? "app" : "apps"}: ${candidates.map((a) => a.name).join(", ")}.` : "No app is registered there."}
+          </p>
+        )}
       </Panel>
       {made.wrong && <p className="rel-msg">{made.wrong}</p>}
       <div className="rel-settings-actions">

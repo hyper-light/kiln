@@ -527,17 +527,18 @@ function Deploys({ a, registered }: { a: App; registered: string[] }) {
     <Panel eyebrow="How it deploys" title={kind === "platform" ? `To ${def?.title ?? provider}` : "Its package"} description="A change reaches each environment with its next release there.">
       <div className="cd-new-grid">
         <SelectField label="Template" value={template} onChange={setTemplate} options={[{ value: "", label: "None" }, ...templates.map((t) => ({ value: t.name, label: t.name }))]} />
-        <Segmented
-          label="What it deploys"
-          value={kind}
-          onChange={setKind}
-          options={[
-            { value: "helm", label: "A Helm chart" },
-            { value: "git", label: "A path in git" },
-            ...(platforms.length || p.kind === "platform" ? [{ value: "platform" as const, label: "A platform" }] : []),
-          ]}
-        />
       </div>
+      <Segmented
+        className="rel-gap"
+        label="What it deploys"
+        value={kind}
+        onChange={setKind}
+        options={[
+          { value: "helm", label: "A Helm chart" },
+          { value: "git", label: "A path in git" },
+          ...(platforms.length || p.kind === "platform" ? [{ value: "platform" as const, label: "A platform" }] : []),
+        ]}
+      />
       {kind === "platform" ? (
         <>
           <div className="cd-new-grid">
@@ -567,7 +568,7 @@ function Deploys({ a, registered }: { a: App; registered: string[] }) {
           )}
           {lacking.length > 0 && (
             <p className="rel-msg">
-              {lacking.join(", ")} can't run it yet: a KilnCD environment with a {provider} target (<code>targets.platforms.{provider}</code>, an account and its place) runs it.
+              {lacking.join(", ")} can't run it yet: it runs in a KilnCD environment whose <code>targets.platforms</code> has {provider} (an account, and its place).
             </p>
           )}
         </>

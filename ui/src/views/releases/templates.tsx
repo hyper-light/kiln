@@ -110,7 +110,7 @@ function NewTemplate() {
         <Plus /> New template
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent eyebrow="Templates" title="New template" description="`{app}` and `{project}` are each app's. One that makes source repositories is made by someone who may add them.">
+        <DialogContent eyebrow="Templates" title="New template" description="{app} and {project} are each app's own. One that makes source repositories is made by someone who may add them.">
           <div className="rel-dialog">
             <YamlEditor value={text} onChange={setText} label="The template, as YAML" />
             {wrong && <p className="rel-msg">{wrong}</p>}
