@@ -1388,6 +1388,23 @@ fn remove_service(agent: bool) {
             let _ = Command::new("systemctl").args(flag).args(["disable", "--now", unit]).status();
         }
     }
+    if have("crontab")
+        && let Ok(out) = Command::new("crontab").arg("-l").stderr(Stdio::null()).output()
+    {
+        let current = String::from_utf8_lossy(&out.stdout).into_owned();
+        let kept = without_boot_line(&current, if agent { "agent" } else { "server" });
+        if kept != current
+            && let Ok(mut child) = Command::new("crontab").arg("-").stdin(Stdio::piped()).spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write as _;
+                let _ = stdin.write_all(kept.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                say("removed crontab @reboot");
+            }
+        }
+    }
     let mut paths = vec![
         home().join(format!(".config/systemd/user/{unit}.service")),
         home().join(format!(".config/autostart/{unit}.desktop")),
@@ -1419,6 +1436,19 @@ fn remove_service(agent: bool) {
             }
         }
     }
+}
+
+/// `crontab` without the `@reboot` line that starts kiln's `sub` service (`server`, `agent`), as
+/// [`setup_boot`] writes it: `@reboot <kiln> supervise --detach -- <sub> …`.
+fn without_boot_line(crontab: &str, sub: &str) -> String {
+    let ours = |l: &str| {
+        let Some(rest) = l.trim().strip_prefix("@reboot ") else { return false };
+        let mut words = rest.split_whitespace();
+        let exe = words.next().unwrap_or("").trim_matches('\'');
+        let rest: Vec<&str> = words.collect();
+        (exe.ends_with("/kiln") || exe.ends_with("/kiln.exe")) && rest.starts_with(&["supervise", "--detach", "--"]) && rest.get(3) == Some(&sub)
+    };
+    crontab.lines().filter(|l| !ours(l)).map(|l| format!("{l}\n")).collect()
 }
 
 /// Delete Scheduled Task `unit`. One registered with administrator rights (kiln's at boot) takes
@@ -1456,6 +1486,17 @@ mod tests {
         assert_eq!(win_quote(""), "\"\"");
         assert_eq!(win_quote(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(win_quote(r"C:\Program Files\kiln\"), r#""C:\Program Files\kiln\\""#);
+    }
+
+    #[test]
+    fn taking_kiln_out_of_a_crontab_takes_only_its_boot_line() {
+        let tab = "MAILTO=me\n@reboot /home/me/.local/bin/kiln supervise --detach -- server\n@reboot /home/me/.local/bin/kiln supervise --detach -- agent --server http://h:7070\n0 * * * * /usr/bin/backup -- server\n@reboot /opt/other supervise --detach -- server\n";
+        assert_eq!(
+            without_boot_line(tab, "server"),
+            "MAILTO=me\n@reboot /home/me/.local/bin/kiln supervise --detach -- agent --server http://h:7070\n0 * * * * /usr/bin/backup -- server\n@reboot /opt/other supervise --detach -- server\n"
+        );
+        assert!(!without_boot_line(tab, "agent").contains("-- agent"));
+        assert_eq!(without_boot_line("", "server"), "");
     }
 
     #[test]
