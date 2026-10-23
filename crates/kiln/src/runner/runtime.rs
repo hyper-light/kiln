@@ -2385,6 +2385,11 @@ impl Leg {
             }
             inner.insert("PATH".into(), path);
             inner.insert("HOME".into(), j.home.clone());
+            for k in ["USER", "LOGNAME"] {
+                if let Some(l) = &j.login {
+                    inner.entry(k.to_owned()).or_insert_with(|| l.clone());
+                }
+            }
             let args: Vec<String> = args.iter().map(|a| j.map.translate(a)).collect();
             // What it starts carries a mark of the step, so a cancel reaches it in the container
             // as GitHub's reaches a step on the host (`docker exec` passes no signal on).

@@ -679,6 +679,10 @@ pub struct JobContainer {
     pub user: Option<String>,
     /// `HOME` for its steps.
     pub home: String,
+    /// The name its steps' user goes by (`USER`, `LOGNAME`): kiln's runner image's `runner`, as a
+    /// hosted runner's steps have it (scripts lean on it: ORT's action makes its container's paths
+    /// with `${PROJECT_PATH/$USER/ort}`). None in another image, where GitHub gives steps none.
+    pub login: Option<String>,
     /// The image's `PATH`, to which `GITHUB_PATH` entries are prepended.
     pub path: String,
     /// It has `sh`, which a step's cancel reaches the step through ([`Cli::signal_in`]).
@@ -895,11 +899,11 @@ impl Containers {
                     Err(_) => (false, false),
                 };
                 let musl = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s(MUSL_PROBE)], &none, CALL).await.is_ok_and(|o| o.trim() == "musl");
-                let (user, home) = match user {
-                    Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
-                    None => (as_runner, "/github/home".to_owned()),
+                let (user, home, login) = match user {
+                    Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned(), Some(if uid == 0 { "root" } else { "runner" }.to_owned())),
+                    None => (as_runner, "/github/home".to_owned(), None),
                 };
-                c.job = Some(JobContainer { id, user, home, path, has_sh, has_bash, musl, map });
+                c.job = Some(JobContainer { id, user, home, login, path, has_sh, has_bash, musl, map });
             }
             // Health checks, then the ports the host got.
             let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();

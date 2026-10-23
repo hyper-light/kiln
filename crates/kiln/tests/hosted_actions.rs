@@ -38,6 +38,53 @@ fn until(s: &Server, secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Resul
 }
 
 /// Whether github.com answers here.
+/// W13-R04: a `docker` leg in kiln's runner image has its hosted runner's user: `runner`, by
+/// `USER` and `LOGNAME` too, as a hosted runner's steps have them. ORT's action makes its
+/// container's paths with `${PROJECT_PATH/$USER/ort}`: without `USER` they stayed the host's, and
+/// the corpus's elixir found "path does not exist".
+#[test]
+fn w13_r04_a_hosted_legs_steps_say_their_user() -> anyhow::Result<()> {
+    if !docker_works() {
+        eprintln!("skipped: no Docker here");
+        return Ok(());
+    }
+    let images = Command::new("docker").args(["images", "--format", "{{.Repository}}"]).output()?;
+    if !String::from_utf8_lossy(&images.stdout).lines().any(|l| l == "kiln/runner-ubuntu-24.04") {
+        eprintln!("skipped: kiln's runner image isn't built on this machine");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    // On this machine's network: the server listens on its loopback only.
+    let rule = "[[ci.routing]]\nmatch = { labels = [\"hosted\"] }\nexecutor = [\"docker\"]\nimage = \"kiln/runner-ubuntu-24.04\"\n";
+    let s = common::start_env(dir.path(), &Options { agent: true, ci: "", extra: rule }, false, &[("KILN_CONTAINER_NETWORK", "host")])?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, dir.path(), &["clone", "-q", &url, "work"])?;
+    let work = dir.path().join("work");
+    git(&home, &work, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "README.md"])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    let who = "on: push\njobs:\n  who:\n    runs-on: hosted\n    steps:\n      - run: echo \"user=$USER logname=$LOGNAME home=$HOME ort=${GITHUB_WORKSPACE/$USER/ort}\"\n";
+    std::fs::write(work.join(".github/workflows/who.yml"), who)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "who"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    let (run, log) = finished(&s, "push", 900)?;
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{run}\n{log}\n{}", s.log());
+    assert!(log.contains("user=runner logname=runner home=/home/runner ort=/home/ort/work/app/app"), "{log}");
+    Ok(())
+}
+
 fn github() -> bool {
     Command::new("curl").args(["-fsSI", "--max-time", "10", "https://github.com/actions/checkout"]).output().is_ok_and(|o| o.status.success())
 }
