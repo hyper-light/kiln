@@ -38,6 +38,7 @@ pub mod gcp_appengine;
 pub mod gcp_compute;
 pub mod gcp_functions;
 pub mod gcp_run;
+pub mod render;
 pub mod vercel;
 #[cfg(test)]
 pub mod fake;
@@ -45,6 +46,8 @@ pub mod fake;
 pub mod fake_azure;
 #[cfg(test)]
 pub mod fake_gcp;
+#[cfg(test)]
+pub mod fake_hosting;
 #[cfg(test)]
 pub mod fake_query;
 
@@ -599,6 +602,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
         "gcp-compute" => gcp_compute::list(cx, kind, names).await?,
         "gcp-functions" => gcp_functions::list(cx, kind, names).await?,
         "gcp-run" => gcp_run::list(cx, kind, names).await?,
+        "render" => render::list(cx, kind, names).await?,
         "vercel" => vercel::list(cx, kind, names).await?,
         other => bail!("no reading {other} yet"),
     };
@@ -628,6 +632,7 @@ pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
         "gcp-compute" => gcp_compute::apply(cx, desired).await,
         "gcp-functions" => gcp_functions::apply(cx, desired).await,
         "gcp-run" => gcp_run::apply(cx, desired).await,
+        "render" => render::apply(cx, desired).await,
         "vercel" => vercel::apply(cx, desired).await,
         other => bail!("no applying to {other} yet"),
     }
@@ -652,6 +657,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
         "gcp-compute" => gcp_compute::delete(cx, key).await,
         "gcp-functions" => gcp_functions::delete(cx, key).await,
         "gcp-run" => gcp_run::delete(cx, key).await,
+        "render" => render::delete(cx, key).await,
         "vercel" => vercel::delete(cx, key).await,
         other => bail!("no deleting from {other} yet"),
     }

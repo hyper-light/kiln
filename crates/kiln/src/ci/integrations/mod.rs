@@ -15,6 +15,7 @@ pub mod aws;
 pub mod azure;
 pub mod cloudflare;
 pub mod gcp;
+pub mod hosting;
 pub mod oci;
 pub mod oracle;
 pub mod stores;
@@ -395,7 +396,7 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false, signing: None },
     KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false, signing: None },
     KindInfo { kind: "netlify", title: "Netlify", category: "hosting", mode: Mode::Token, fields: &[f("account", false, "the team slug")], secret: Some("personal access token"), built: false, signing: None },
-    KindInfo { kind: "render", title: "Render", category: "hosting", mode: Mode::Token, fields: &[f("owner_id", false, "the workspace")], secret: Some("API key"), built: false, signing: None },
+    KindInfo { kind: "render", title: "Render", category: "hosting", mode: Mode::Token, fields: &[f("owner_id", false, "the workspace")], secret: Some("API key"), built: true, signing: None },
     KindInfo { kind: "heroku", title: "Heroku", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("API key"), built: false, signing: None },
     KindInfo { kind: "digitalocean", title: "DigitalOcean", category: "hosting", mode: Mode::Token, fields: &[], secret: Some("personal access token"), built: false, signing: None },
     KindInfo {
@@ -788,6 +789,11 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
             k if crate::ci::notify::CHANNELS.contains(&k) => Box::pin(crate::ci::notify::verify(hub, &i)).await,
             "vercel" => match secret(hub, &i).await {
                 Ok(Some(token)) => Box::pin(vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str))).await.map_err(|e| format!("{e:#}")),
+                Ok(None) => Err("no token stored".into()),
+                Err(e) => Err(format!("{e:#}")),
+            },
+            "render" | "netlify" | "heroku" | "digitalocean" | "fly" => match secret(hub, &i).await {
+                Ok(Some(token)) => Box::pin(hosting::verify(&i.kind, &token, &i.config)).await.map_err(|e| format!("{e:#}")),
                 Ok(None) => Err("no token stored".into()),
                 Err(e) => Err(format!("{e:#}")),
             },

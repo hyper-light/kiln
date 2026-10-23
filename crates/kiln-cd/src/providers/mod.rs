@@ -29,6 +29,7 @@ pub mod gcp_appengine;
 pub mod gcp_compute;
 pub mod gcp_functions;
 pub mod gcp_run;
+pub mod render;
 pub mod vercel;
 
 use serde::Serialize;
@@ -520,11 +521,15 @@ pub const CATALOG: &[ProviderDef] = &[
         integration: "render",
         place: &[],
         scope: None,
-        settings: &[s("service", true, "the service"), s("image", false, "an image (${{ artifacts.* }}); otherwise the commit")],
+        settings: &[
+            s("service", true, "the service, made on Render"),
+            s("image", false, "an image-backed service's image (${{ release.artifacts.<name>.digest }})"),
+            s("commit", false, "a git-backed service's commit (${{ release.version }})"),
+        ],
         kinds: &[kind("render.kiln.dev", "Service", "Service"), child(kind("render.kiln.dev", "Deploy", "Deploy"))],
-        capabilities: &[Versions, Logs, Drift, Adopt],
-        reads: &["render.yaml"],
-        built: false,
+        capabilities: &[Versions, Drift, Adopt],
+        reads: &[],
+        built: true,
     },
     ProviderDef {
         name: "heroku",
@@ -760,6 +765,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "gcp-compute" => gcp_compute::render(input),
         "gcp-functions" => gcp_functions::render(input),
         "gcp-run" => gcp_run::render(input),
+        "render" => render::render(input),
         "vercel" => vercel::render(input),
         other => match get(other) {
             Some(p) => Err(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", p.title)),
@@ -787,6 +793,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "gcp-compute" => gcp_compute::files(spec),
         "gcp-functions" => gcp_functions::files(spec),
         "gcp-run" => gcp_run::files(spec),
+        "render" => render::files(spec),
         "vercel" => vercel::files(spec),
         _ => Vec::new(),
     }
@@ -816,6 +823,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "gcp-compute" => gcp_compute::health(obj),
         "gcp-functions" => gcp_functions::health(obj),
         "gcp-run" => gcp_run::health(obj),
+        "render" => render::health(obj),
         "vercel" => vercel::health(obj),
         _ => None,
     }
