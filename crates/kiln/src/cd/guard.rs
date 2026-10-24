@@ -564,6 +564,7 @@ async fn say(c: &Cluster, a: &Args, result: &str, reason: &str) {
         "held" => ("Warning", "KilnDeployHeld"),
         "rolled-back" | "rolling-back" => ("Warning", "KilnDeployRolledBack"),
         "rolled-forward" => ("Warning", "KilnRollbackFailedRolledForward"),
+        "rollback-blocked" => ("Warning", "KilnRollbackBlocked"),
         _ => ("Warning", "KilnRollbackFailed"),
     };
     let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
@@ -609,6 +610,35 @@ fn after_rollback(back: Start, served: bool) -> AfterRollback {
     }
 }
 
+/// The schema epoch the new version's data needs (`/healthz/server`'s `schema.min_reader`), as its
+/// pods say; nothing when none answers (it never came up, or it's older than epochs).
+async fn data_needs(c: &Cluster, a: &Args) -> Option<u32> {
+    let d = Box::pin(read_deployment(c, a)).await.ok()??;
+    let selector = obj::get(&d, &["spec", "selector", "matchLabels"])?.as_object()?.iter().filter_map(|(k, v)| Some(format!("{k}={}", v.as_str()?))).collect::<Vec<_>>().join(",");
+    let path = format!("/api/v1/namespaces/{}/pods?labelSelector={}", kiln_cd::kube::enc(&a.namespace), kiln_cd::kube::enc(&selector));
+    let list: Value = match c.request(Method::GET, &path, None, None).await {
+        Ok((200, bytes)) => serde_json::from_slice(&bytes).ok()?,
+        _ => return None,
+    };
+    let client = crate::http::client::Client::public().ok()?;
+    for (ip, port) in addresses(&list, &a.container, &a.expect) {
+        let Ok(resp) = client.request(crate::http::client::Method::Get, &format!("http://{ip}:{port}{SERVER_HEALTH}")).timeout(SERVER_HEALTH_TIMEOUT).send().await else { continue };
+        if resp.status() != 200 {
+            continue;
+        }
+        let Ok(bytes) = resp.bytes(64 << 10).await else { continue };
+        if let Some(need) = serde_json::from_slice::<Value>(&bytes).ok().as_ref().and_then(schema_needs) {
+            return Some(need);
+        }
+    }
+    None
+}
+
+/// What a report of itself says its data needs.
+fn schema_needs(report: &Value) -> Option<u32> {
+    obj::get(report, &["schema", "min_reader"]).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+}
+
 /// Puts `image` in kiln's container, with the guard's note.
 async fn put(c: &Cluster, a: &Args, image: &str, note: String) -> Result<()> {
     let body = json!({
@@ -621,6 +651,17 @@ async fn put(c: &Cluster, a: &Args, image: &str, note: String) -> Result<()> {
 /// Puts the previous image back, then watches it come up (`served`: the new version was up and
 /// serving before it failed, so it's the one to go back to when the previous can't start).
 async fn roll_back(c: &Cluster, a: &Args, reason: &str, checks: Vec<Value>, served: bool) -> Result<()> {
+    // The guard runs the previous image: what it reads is what the previous kiln reads. Data the
+    // new one migrated past that would crash-loop it (docs/resilience.md, G2), so it stays.
+    let reads = crate::store::migrations::SCHEMA_EPOCH;
+    if let Some(need) = Box::pin(data_needs(c, a)).await
+        && need > reads
+    {
+        let said = format!("{reason}; {} can't read its data (it needs schema epoch {need}, and {} reads {reads}), so it wasn't rolled back", a.expect, a.previous);
+        eprintln!("{said}");
+        let _ = Box::pin(annotate(c, a, "rollback-blocked", &said, &checks, None)).await;
+        bail!("{} didn't take: {said}", a.expect)
+    }
     eprintln!("{} didn't take ({reason}): putting {} back", a.expect, a.previous);
     put(c, a, &a.previous, note(a, "rolling-back", reason, &checks, None)).await.context("putting the previous image back")?;
     let back = Args { previous: a.expect.clone(), expect: a.previous.clone(), deadline: ROLLBACK_DEADLINE, watch: Watch::default(), ..a.clone() };
@@ -774,7 +815,7 @@ impl Cd {
             };
             let Ok(live) = serde_json::from_slice::<Value>(&bytes) else { return };
             let (now, guard) = seen(&m, &live);
-            let said = guard.as_ref().and_then(|g| g.get("result")).and_then(Value::as_str).is_some_and(|r| matches!(r, "ready" | "held" | "rolled-back" | "rolled-forward" | "rollback-failed"));
+            let said = guard.as_ref().and_then(|g| g.get("result")).and_then(Value::as_str).is_some_and(|r| matches!(r, "ready" | "held" | "rolled-back" | "rolled-forward" | "rollback-failed" | "rollback-blocked"));
             if m.watch.window_s == 0 || said || now != m.to || super::now_ms() >= give_up {
                 break live;
             }
@@ -850,7 +891,7 @@ impl Cd {
 /// (docs/resilience.md, G7).
 fn notice(result: &str) -> Option<&'static str> {
     match result {
-        "held" => Some("deploy.held"),
+        "held" | "rollback-blocked" => Some("deploy.held"),
         "rolled-back" => Some("deploy.rolled_back"),
         "rolled-forward" | "rollback-failed" => Some("deploy.rollback_failed"),
         _ => None,
@@ -876,6 +917,8 @@ fn outcome(m: &Marker, live: &Value, ended: Option<&str>) -> (bool, String) {
     if now == m.to && result == Some("rolled-forward") {
         // It runs, but it failed its watch: not a deploy that took, so automation doesn't count it.
         (false, format!("{} didn't take ({}); the guard put it forward again", m.to, reason.unwrap_or("its watch failed")))
+    } else if now == m.to && result == Some("rollback-blocked") {
+        (false, format!("{} didn't take ({}); the guard kept it", m.to, reason.unwrap_or("its watch failed, and the version before it can't read its data")))
     } else if now == m.to && result == Some("held") {
         (true, format!("kiln restarted into {}; its guard held it ({}) and kept it", m.to, reason.unwrap_or("a check that holds failed")))
     } else if now == m.to {
@@ -1113,6 +1156,11 @@ mod tests {
         assert_eq!(outcome(&m, &forward, None), (false, format!("kiln:new didn't take ({reason}); the guard put it forward again")));
         let held = live("kiln:new", json!({ "result": "held", "to": "kiln:new", "reason": "memory: failed: … (failing for 2m)" }));
         assert_eq!(outcome(&m, &held, None), (true, "kiln restarted into kiln:new; its guard held it (memory: failed: … (failing for 2m)) and kept it".into()));
+        let blocked_why = "memory: failed; kiln:new can't read its data (it needs schema epoch 2, and kiln:old reads 1), so it wasn't rolled back";
+        let blocked = live("kiln:new", json!({ "result": "rollback-blocked", "to": "kiln:new", "reason": blocked_why }));
+        assert_eq!(outcome(&m, &blocked, None), (false, format!("kiln:new didn't take ({blocked_why}); the guard kept it")));
+        assert_eq!(schema_needs(&json!({ "schema": { "epoch": 2, "min_reader": 2 } })), Some(2));
+        assert_eq!(schema_needs(&json!({ "commit": "older, before epochs" })), None);
         let neither = live("kiln:old", json!({ "result": "rollback-failed", "to": "kiln:new", "reason": reason }));
         assert_eq!(outcome(&m, &neither, None), (false, format!("kiln:new didn't take ({reason}); the guard put kiln:old back")));
         let before_windows = Marker { watch: Watch::default(), ..m };
@@ -1124,7 +1172,7 @@ mod tests {
     /// its work done, had gone: now it puts back the version that served.
     #[test]
     fn a_rollback_that_cant_start_goes_forward_again() {
-        assert_eq!(["ready", "watching", "held", "rolled-back", "rolled-forward", "rollback-failed"].map(notice), [None, None, Some("deploy.held"), Some("deploy.rolled_back"), Some("deploy.rollback_failed"), Some("deploy.rollback_failed")]);
+        assert_eq!(["ready", "watching", "held", "rollback-blocked", "rolled-back", "rolled-forward", "rollback-failed"].map(notice), [None, None, Some("deploy.held"), Some("deploy.held"), Some("deploy.rolled_back"), Some("deploy.rollback_failed"), Some("deploy.rollback_failed")]);
         assert_eq!(after_rollback(Start::Up, true), AfterRollback::Back);
         assert_eq!(after_rollback(Start::Moved, true), AfterRollback::Moved);
         assert_eq!(after_rollback(Start::Failed("crash loop".into()), true), AfterRollback::Forward("crash loop".into()));

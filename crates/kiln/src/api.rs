@@ -4930,6 +4930,9 @@ fn server_health(hub: &Hub) -> Response {
             "uptime_s": hub.started.elapsed().as_secs(),
             "restarts": hub.generation.saturating_sub(1),
             "memory": memory,
+            // What this build reads, and what its data needs (docs/resilience.md, G2): a guard
+            // doesn't roll back to a build older than `min_reader`.
+            "schema": { "epoch": crate::store::migrations::SCHEMA_EPOCH, "min_reader": crate::store::migrations::min_reader() },
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
             // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
