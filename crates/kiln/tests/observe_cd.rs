@@ -1,9 +1,10 @@
 //! Kiln CD in observe, live (docs/observe.md §8, §10.7, §13): a kiln server as a process of its own
 //! deploys an app's plain manifests from a git repository (kiln's `[[repos]]` mirrors it too) to a
 //! real Kubernetes cluster: the one `KOBS_KUBECONFIG` names, or a throwaway one kind or minikube
-//! starts. Four commits deployed in turn, each a sync a person asked for: a ConfigMap and a
-//! Deployment that come up; an image no registry has, the rollout past its deadline; that commit
-//! reverted; an object the API server refuses. What observe says of each is what kiln CD and the
+//! starts. The app follows the repository's `main`; four commits land on it in turn, each synced as
+//! a person asks: a ConfigMap and a Deployment that come up; an image no registry has, the rollout
+//! past its deadline; that commit reverted (what the first deployed, again); an object the API
+//! server refuses. What observe says of each is what kiln CD and the
 //! cluster say: a deploy counted by result with the objects it applied, an event each deploy and
 //! each change of the app's health or sync, the apps counted by health and sync (a monitor on the
 //! degraded ones alerts Slack, then recovers), and DORA's deployments of the app: each commit's
@@ -155,11 +156,11 @@ const CONFIG: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web-co
 /// A name the API server refuses (not a DNS label).
 const REFUSED: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: Bad_Name\ndata:\n  color: red\n";
 
-/// The app kept in kiln, at commit `sha` of `repo`.
-fn app(repo: &str, sha: &str, namespace: &str) -> Value {
+/// The app kept in kiln, following `repo`'s `main`.
+fn app(repo: &str, namespace: &str) -> Value {
     json!({
         "name": "web", "project": "default",
-        "sources": [{ "repo": repo, "path": "deploy", "revision": sha, "chart": null, "as_ref": null, "engine": { "Directory": { "recurse": false, "include": null, "exclude": null } } }],
+        "sources": [{ "repo": repo, "path": "deploy", "revision": "main", "chart": null, "as_ref": null, "engine": { "Directory": { "recurse": false, "include": null, "exclude": null } } }],
         "destination": { "cluster": CLUSTER, "namespace": namespace },
         "sync": { "auto": false, "prune": true, "self_heal": false, "allow_empty": false, "options": { "create_namespace": true }, "retry": null },
         "ignore": [], "tracking": "Kiln", "origin": "Api", "environment": null, "labels": { "team": "web-team" },
@@ -224,10 +225,11 @@ fn near(v: &Value, n: i64, slack: i64) -> bool {
     v.as_f64().is_some_and(|x| (x - n as f64).abs() <= slack as f64)
 }
 
-/// The app at `sha`, synced as a person asks: its deployment, once kiln CD has recorded it.
-fn deploy(f: &Fleet, repo: &str, sha: &str, namespace: &str, n: usize) -> anyhow::Result<Value> {
-    f.call("POST", "/api/cd/apps", Some(&app(repo, sha, namespace)))?;
-    // Rendered at the commit, and no sync under way, before it's synced.
+/// The app at `sha`, `main` now, synced as a person asks: its deployment, once kiln CD has
+/// recorded it.
+fn deploy(f: &Fleet, sha: &str, n: usize) -> anyhow::Result<Value> {
+    // Read at the commit (kiln CD looks at `main` every 2 s), and no sync under way, before it's
+    // synced.
     until(f, 120, &format!("the app read at {sha}"), || {
         let s = status(f)?;
         let running = s["operation"]["phase"].as_str().is_some_and(|p| matches!(p, "DryRun" | "Running" | "Failing" | "Terminating"));
@@ -250,16 +252,13 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
     let ns = cluster.namespace.clone();
     let image = cluster.local_image()?;
 
-    // The repository: the app (c1), its image changed to one nowhere (c2), that reverted (c3), an
-    // object the API server refuses added (c4).
+    // The repository: the app (c1). Then, each as its deploy comes: its image changed to one nowhere
+    // (c2), that reverted (c3), an object the API server refuses added (c4); their authors' times
+    // hours before.
     let repo = tmp.path().join("web");
     std::fs::create_dir_all(&repo)?;
     git(&repo, now - 4 * HOUR, &["init", "-q", "-b", "main"]);
     let c1 = commit(&repo, now - 3 * HOUR, &[("deploy/config.yaml", CONFIG), ("deploy/web.yaml", &deployment(&image, 120))], "Add web");
-    let c2 = commit(&repo, now - 2 * HOUR, &[("deploy/web.yaml", &deployment(NOWHERE, 10))], "Use web 2");
-    git(&repo, now - HOUR, &["revert", "--no-edit", &c2]);
-    let c3 = git(&repo, now - HOUR, &["rev-parse", "HEAD"]);
-    let c4 = commit(&repo, now - HOUR / 2, &[("deploy/refused.yaml", REFUSED)], "Add a config");
     let url = format!("file://{}", repo.display());
 
     let tables = Tables { cd: "enabled = true\npoll_seconds = 2", host_seconds: 2 };
@@ -290,7 +289,8 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
     )?;
 
     // c1: deployed, and up.
-    let d1 = deploy(&f, &url, &c1, &ns, 1)?;
+    f.call("POST", "/api/cd/apps", Some(&app(&url, &ns)))?;
+    let d1 = deploy(&f, &c1, 1)?;
     anyhow::ensure!(d1["succeeded"] == true && d1["revision"] == c1.as_str() && d1["trigger"] == "manual", "the first deployment: {d1:#}\n{}", f.logs());
     let applied = d1["applied"].as_f64().unwrap_or(0.0);
     anyhow::ensure!(applied >= 2.0, "the ConfigMap and the Deployment applied: {d1:#}");
@@ -324,7 +324,8 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
     })?;
 
     // c2: deployed, its rollout stuck past its deadline: degraded, and Slack told.
-    let d2 = deploy(&f, &url, &c2, &ns, 2)?;
+    let c2 = commit(&repo, now - 2 * HOUR, &[("deploy/web.yaml", &deployment(NOWHERE, 10))], "Use web 2");
+    let d2 = deploy(&f, &c2, 2)?;
     anyhow::ensure!(d2["succeeded"] == true && d2["revision"] == c2.as_str(), "the second deployment applies: {d2:#}");
     anyhow::ensure!(cluster.kubectl(&["get", "deployment", "web", "-n", &ns, "-o", "jsonpath={.spec.template.spec.containers[0].image}"])? == NOWHERE, "the image changed in the cluster");
     until(&f, 180, "the app degraded", || {
@@ -341,8 +342,11 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
         Ok((said.iter().any(|t| t.contains("[Triggered] kobs degraded apps") && t.contains("1 app degraded")), json!(said)))
     })?;
 
-    // c3, the revert: deployed, up again; no app degraded, and Slack told.
-    let d3 = deploy(&f, &url, &c3, &ns, 3)?;
+    // c3, the revert: what c1 deployed, again (the render c1's), deployed as c3; up again, no app
+    // degraded, and Slack told.
+    git(&repo, now - HOUR, &["revert", "--no-edit", &c2]);
+    let c3 = git(&repo, now - HOUR, &["rev-parse", "HEAD"]);
+    let d3 = deploy(&f, &c3, 3)?;
     anyhow::ensure!(d3["succeeded"] == true && d3["revision"] == c3.as_str(), "the revert deploys: {d3:#}");
     until(&f, 180, "the app healthy again", || {
         let s = status(&f)?;
@@ -358,7 +362,8 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
     })?;
 
     // c4: refused by the API server: a failed deploy, an error event, nothing for DORA.
-    let d4 = deploy(&f, &url, &c4, &ns, 4)?;
+    let c4 = commit(&repo, now - HOUR / 2, &[("deploy/refused.yaml", REFUSED)], "Add a config");
+    let d4 = deploy(&f, &c4, 4)?;
     anyhow::ensure!(d4["succeeded"] == false && d4["revision"] == c4.as_str(), "the refused deployment fails: {d4:#}");
     until(&f, 60, "the failed deploy counted", || {
         let failed = total(&f, &format!("sum:kiln.cd.deploys{{app:{APP},result:failed}}.as_count()"), t0)?;
