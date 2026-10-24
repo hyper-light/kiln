@@ -2608,9 +2608,15 @@ reusing the results of jobs whose inputs have not changed.
     `GHESNotSupportedError` when `GITHUB_SERVER_URL`'s host is not github.com, `*.ghe.com` or
     `*.localhost`. That covers `upload-artifact@v4` and `download-artifact@v4` and every later
     version.
-    - Actions whose scripts carry that refusal get `GITHUB_SERVER_URL=http://kiln.localhost`
-      from the runner.
-    - They call only `ACTIONS_RESULTS_URL` and `GITHUB_API_URL`.
+    - Actions whose scripts carry that refusal get `GITHUB_SERVER_URL=http://kiln.localhost:<port>`
+      from the runner, the server's own port (kiln's listener answers plain HTTP on its TLS port
+      too).
+    - The name reaches the server: on the host `*.localhost` is loopback, and a leg's containers
+      have it where the server is (beside `host.docker.internal`), the ones its steps make through
+      its Docker socket too (`ExtraHosts`, but a name they give themselves). docker's build-push
+      and bake actions make their git context of it, which BuildKit's own container fetches; with
+      a port-less `http://kiln.localhost` and no such names, buildx's bake jobs found nothing there.
+    - Their artifact calls go only to `ACTIONS_RESULTS_URL` and `GITHUB_API_URL`.
     - The runner puts the real server back in what they print and output, so `artifact-url`
       links to kiln.
   - **Unzipped files.** A file uploaded with `archive: false` downloads raw, under its own name

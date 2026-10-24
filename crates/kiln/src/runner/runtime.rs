@@ -452,8 +452,13 @@ struct State {
     action_state: Vec<(String, String)>,
     /// The index the next pre or post step gets (after the job's own steps).
     next_idx: u32,
-    /// `GITHUB_SERVER_URL` as the leg reaches it, which [`NOT_GHES`] stands in for.
+    /// `GITHUB_SERVER_URL` as the leg reaches it, which [`not_ghes`] stands in for.
     server_url: String,
+    /// [`not_ghes`]'s URL for it.
+    not_ghes: String,
+    /// The server's address for the leg's containers, when it isn't on this host
+    /// ([`super::docker::server_address`]).
+    server_at: Option<String>,
     /// The leg's containers (W13-R08): its network, services and job container.
     containers: Option<super::docker::Containers>,
     /// The Docker socket a `docker` executor's container has in the host's place (W13-R04).
@@ -580,14 +585,30 @@ struct Reading {
     enospc: bool,
 }
 
-/// The `GITHUB_SERVER_URL` actions that refuse GitHub Enterprise Server see (docs/ci.md
-/// W08-R08). The toolkit counts every server but github.com, `*.ghe.com` and `*.localhost` as
-/// GHES. On GHES, `@actions/artifact` v2 and later (so `upload-artifact@v4`,
-/// `download-artifact@v4` and every newer version) throw `GHESNotSupportedError`. kiln serves
-/// those actions' protocol, so they run with this URL instead, and what they print or output
-/// gets the real one back. Their requests go to `ACTIONS_RESULTS_URL` and `GITHUB_API_URL`,
-/// never to this one.
-pub const NOT_GHES: &str = "http://kiln.localhost";
+/// The host of the `GITHUB_SERVER_URL` actions that refuse GitHub Enterprise Server see
+/// (docs/ci.md W08-R08). The toolkit counts every server but github.com, `*.ghe.com` and
+/// `*.localhost` as GHES. On GHES, `@actions/artifact` v2 and later (so `upload-artifact@v4`,
+/// `download-artifact@v4`, docker's build actions and every newer version) throw
+/// `GHESNotSupportedError`. kiln serves those actions' protocol, so they run with a URL of this
+/// host instead ([`not_ghes`]), and what they print or output gets the real one back.
+pub const NOT_GHES_HOST: &str = "kiln.localhost";
+
+/// The `GITHUB_SERVER_URL` such actions get for a leg that reaches the server at `server_url`:
+/// [`NOT_GHES_HOST`] at the server's port, over plain HTTP (kiln's listener answers it on its TLS
+/// port too). It reaches the server: on the host `*.localhost` is loopback, and a leg's
+/// containers have the name where the server is ([`super::docker::container_hosts`]). docker's
+/// build-push and bake actions make their git context of it, which BuildKit's own container
+/// fetches.
+pub fn not_ghes(server_url: &str) -> String {
+    let rest = server_url.split_once("://").map_or(server_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let port = match authority.rsplit_once(':') {
+        Some((host, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && (!host.starts_with('[') || host.ends_with(']')) => p,
+        _ if server_url.starts_with("https://") => "443",
+        _ => "80",
+    };
+    format!("http://{NOT_GHES_HOST}:{port}")
+}
 
 /// Whether any of an action's scripts carry the toolkit's GHES refusal.
 fn refuses_ghes(dir: &Path, scripts: &[&str]) -> bool {
@@ -602,13 +623,13 @@ impl State {
         self.containers.as_ref().and_then(|c| c.job.as_ref()).map_or_else(|| s.to_string(), |j| j.map.translate(&s))
     }
 
-    /// `s` with [`NOT_GHES`] put back to the real server.
+    /// `s` with [`not_ghes`]'s URL put back to the real server.
     fn unfake(&self, s: &str) -> String {
-        s.replace(NOT_GHES, &self.server_url)
+        s.replace(&self.not_ghes, &self.server_url)
     }
 
     fn unfake_bytes(&self, b: Vec<u8>) -> Vec<u8> {
-        let needle = NOT_GHES.as_bytes();
+        let needle = self.not_ghes.as_bytes();
         if b.windows(needle.len()).any(|w| w == needle) { self.unfake(&String::from_utf8_lossy(&b)).into_bytes() } else { b }
     }
 
@@ -1207,6 +1228,9 @@ impl Leg {
             m.insert("api_url".into(), serde_json::json!(a.runtime.api_url));
             m.insert("graphql_url".into(), serde_json::json!(a.runtime.graphql_url));
         }
+        // Where the leg's containers find the server, when it isn't on this host.
+        let facade = a.runtime.facade_url.clone();
+        let server_at = crate::rt::blocking(move || super::docker::server_address(&facade)).await.ok().flatten();
         let mut st = State {
             started: std::time::SystemTime::now(),
             rerun_label: None,
@@ -1236,6 +1260,8 @@ impl Leg {
             corrupting: None,
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
+            not_ghes: not_ghes(&a.runtime.facade_url),
+            server_at,
             containers: None,
             docker_sock: None,
             pod_services: None,
@@ -1969,6 +1995,7 @@ impl Leg {
             (l.commands.clone(), "/github/file_commands".into()),
             (l.temp.clone(), "/github/runner_temp".into()),
         ])
+        .with_server(st.server_at.clone())
     }
 
     /// A container spec from the job's `container` or a `services` entry, its keys evaluated.
@@ -2129,7 +2156,7 @@ impl Leg {
         let work = self.work_dir.clone();
         let dirs = [config.clone(), l.temp.join("_github_home"), l.temp.join("_github_workflow"), work.join("_actions"), l.tool_cache.clone(), work.join("_externals")];
         crate::rt::blocking(move || dirs.iter().try_for_each(std::fs::create_dir_all)).await??;
-        let map = self.container_map(l);
+        let map = self.container_map(l).with_server(st.server_at.clone());
         let workdir = map.translate(&l.workspace.to_string_lossy());
         // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
         // A leg with a network policy never gets the host's Docker socket: it would get around it.
@@ -2215,10 +2242,10 @@ impl Leg {
         let started = started?;
         if let (Some(p), Some(j)) = (proxy, started.job.as_ref()) {
             match super::docker_sock::paths_of(&started.cli, &j.id).await {
-                Ok(paths) if paths.has_root() => p.set_paths(paths),
+                Ok(paths) if paths.has_root() => p.set_paths(paths.with_server(st.server_at.clone())),
                 Ok(paths) => {
                     self.note(idx, "Docker can't see this leg's own files: a step's bind mounts find only its workspace, temporary and action directories.").await;
-                    p.set_paths(paths);
+                    p.set_paths(paths.with_server(st.server_at.clone()));
                 }
                 Err(e) => self.note(idx, &format!("The leg container's mounts: {e:#}")).await,
             }
@@ -2372,7 +2399,7 @@ impl Leg {
             let name = format!("kiln_{}_{}", self.a.job_id, id.get(id.len().saturating_sub(8)..).unwrap_or(&id));
             // An image made for GitHub's runner user runs as this runner's (the workspace's owner).
             let user = super::docker::as_runner(&cli, &image).await;
-            let run_args = super::docker::action_run_args(&name, &labels, user.as_deref(), network.as_deref(), &map.mounts(), &inner, entrypoint.as_deref(), &image, &args);
+            let run_args = super::docker::action_run_args(&name, &labels, user.as_deref(), network.as_deref(), &map.mounts(), map.server(), &inner, entrypoint.as_deref(), &image, &args);
             let mut c = Command::new(&cli.bin);
             c.args(&run_args).envs(&inner);
             c
@@ -4094,7 +4121,7 @@ impl Leg {
                 let script = loc.dir.join(main);
                 let (dir, scripts) = (loc.dir.clone(), [Some(main.to_owned()), action.runs.post.clone()].into_iter().flatten().collect::<Vec<_>>());
                 if crate::rt::blocking(move || refuses_ghes(&dir, &scripts.iter().map(String::as_str).collect::<Vec<_>>())).await.unwrap_or(false) {
-                    aenv.insert("GITHUB_SERVER_URL".into(), NOT_GHES.into());
+                    aenv.insert("GITHUB_SERVER_URL".into(), st.not_ghes.clone());
                 }
                 let ran = self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![script.to_string_lossy().to_string()] }, wd, aenv.clone(), deadline).await?;
                 if let Some(post) = &action.runs.post {
@@ -4252,7 +4279,7 @@ impl Leg {
             } else {
                 let (dir, script) = (loc.dir.clone(), pre.clone());
                 if crate::rt::blocking(move || refuses_ghes(&dir, &[script.as_str()])).await.unwrap_or(false) {
-                    env.insert("GITHUB_SERVER_URL".into(), NOT_GHES.into());
+                    env.insert("GITHUB_SERVER_URL".into(), st.not_ghes.clone());
                 }
                 match self.node(&action.runs.using, musl_here(st)).await {
                     Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &ws, env, deadline).await,
@@ -4517,6 +4544,17 @@ fn release_line(id: i64, r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server URL actions that refuse GitHub Enterprise Server get keeps the server's port, so
+    /// what they fetch from it reaches kiln (docs/ci.md W08-R08).
+    #[test]
+    fn w08_r08_not_ghes_keeps_the_servers_port() {
+        assert_eq!(not_ghes("http://127.0.0.1:42511"), "http://kiln.localhost:42511");
+        assert_eq!(not_ghes("https://kiln.example:8443/"), "http://kiln.localhost:8443");
+        assert_eq!(not_ghes("https://kiln.example"), "http://kiln.localhost:443");
+        assert_eq!(not_ghes("http://[::1]:7070"), "http://kiln.localhost:7070");
+        assert_eq!(not_ghes("http://kiln.example/"), "http://kiln.localhost:80");
+    }
 
     /// The checkout tries the server again while it's away: on git's words for a server it couldn't
     /// reach, waiting 1 s and doubling to 15 s, for two minutes in all.

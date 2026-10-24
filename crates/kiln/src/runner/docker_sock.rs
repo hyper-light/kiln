@@ -33,6 +33,8 @@ pub struct Paths {
     root: Option<PathBuf>,
     /// Its mounts with a source on the host, `(inside, host)`, the deepest first.
     mounts: Vec<(PathBuf, PathBuf)>,
+    /// kiln's server's address, when it isn't on this host ([`super::docker::server_address`]).
+    server: Option<String>,
 }
 
 impl Paths {
@@ -43,7 +45,14 @@ impl Paths {
             mounts.iter().filter_map(|(inside, host)| inside.strip_prefix("/var/run").ok().map(|rest| (normalize(&Path::new("/run").join(rest).to_string_lossy()), host.clone()))).collect();
         mounts.extend(aliases);
         mounts.sort_by_key(|(inside, _)| std::cmp::Reverse(inside.components().count()));
-        Paths { root, mounts }
+        Paths { root, mounts, server: None }
+    }
+
+    /// These paths, with kiln's server at `address` when it isn't on this host: where the leg's
+    /// containers find it ([`super::docker::container_hosts`]).
+    pub fn with_server(mut self, address: Option<String>) -> Paths {
+        self.server = address;
+        self
     }
 
     /// Whether the leg container's own files are the host's to mount.
@@ -655,6 +664,28 @@ fn name_references(v: &mut Value, names: &mut Names, name: Option<&str>) -> bool
 fn translate_create(v: &mut Value, paths: &Paths) -> bool {
     let Some(config) = v.get_mut("HostConfig") else { return false };
     let mut changed = false;
+    // The names the leg's own containers have for the host and kiln's server, as its job
+    // container has them (BuildKit's fetches a build's git context from kiln through them), but
+    // a name the container gives itself. One sharing another's network has that one's hosts.
+    let mode = config.get("NetworkMode").and_then(Value::as_str).unwrap_or_default().to_owned();
+    if !mode.starts_with("container:")
+        && mode != "none"
+        && let Some(o) = config.as_object_mut()
+    {
+        let extra = o.entry("ExtraHosts").or_insert(Value::Null);
+        if extra.is_null() {
+            *extra = Value::Array(Vec::new());
+        }
+        if let Some(list) = extra.as_array_mut() {
+            for h in super::docker::container_hosts(mode == "host", paths.server.as_deref()) {
+                let name = h.split(':').next().unwrap_or_default().to_owned();
+                if !list.iter().any(|e| e.as_str().is_some_and(|x| x.split([':', '=']).next() == Some(name.as_str()))) {
+                    list.push(Value::String(h));
+                    changed = true;
+                }
+            }
+        }
+    }
     // `-v src:dst[:options]`: a source that isn't a path is a volume's name.
     if let Some(binds) = config.get_mut("Binds").and_then(Value::as_array_mut) {
         for bind in binds {
@@ -1404,8 +1435,29 @@ mod tests {
         assert_eq!(out.pointer("/HostConfig/Mounts/0/Source").and_then(serde_json::Value::as_str), Some("/var/lib/docker/rootfs/overlayfs/abc/tmp/data"));
         assert_eq!(out.pointer("/HostConfig/Mounts/1/Source").and_then(serde_json::Value::as_str), Some("named"));
         assert_eq!(out.get("Image"), body.get("Image"));
+        // The host's and kiln's server's names, as the leg's job container has them: at the
+        // host's gateway, its loopback on its network, the server's own address when it's elsewhere.
+        assert_eq!(out.pointer("/HostConfig/ExtraHosts"), Some(&serde_json::json!(["host.docker.internal:host-gateway", "kiln.localhost:host-gateway"])));
+        let hosts = |body: serde_json::Value, paths: &Paths| -> anyhow::Result<serde_json::Value> {
+            let out = translated(&serde_json::to_vec(&body)?, paths).ok_or_else(|| anyhow::anyhow!("nothing translated: {body}"))?;
+            Ok(serde_json::from_slice::<serde_json::Value>(&out)?.pointer("/HostConfig/ExtraHosts").cloned().unwrap_or_default())
+        };
+        assert_eq!(hosts(serde_json::json!({"HostConfig": {"NetworkMode": "host"}}), &p)?, serde_json::json!(["host.docker.internal:127.0.0.1", "kiln.localhost:127.0.0.1"]));
+        let elsewhere = leg().with_server(Some("10.0.0.5".to_owned()));
+        assert_eq!(
+            hosts(serde_json::json!({"HostConfig": {"NetworkMode": "bridge", "ExtraHosts": null}}), &elsewhere)?,
+            serde_json::json!(["host.docker.internal:host-gateway", "kiln.localhost:10.0.0.5"])
+        );
+        // A name the container gives itself stays its own.
+        assert_eq!(
+            hosts(serde_json::json!({"HostConfig": {"ExtraHosts": ["host.docker.internal=192.168.1.9"]}}), &p)?,
+            serde_json::json!(["host.docker.internal=192.168.1.9", "kiln.localhost:host-gateway"])
+        );
+        // One on another container's network, or none, takes no hosts of its own.
+        let shared = serde_json::json!({"HostConfig": {"NetworkMode": "container:abc"}});
+        assert_eq!(translated(&serde_json::to_vec(&shared)?, &p), None);
         // Nothing to change, or not JSON: on as it came.
-        let same = serde_json::json!({"HostConfig": {"Binds": ["/work/w/1234/ripgrep:/src"]}});
+        let same = serde_json::json!({"HostConfig": {"Binds": ["/work/w/1234/ripgrep:/src"], "ExtraHosts": ["host.docker.internal:host-gateway", "kiln.localhost:host-gateway"]}});
         assert_eq!(translated(&serde_json::to_vec(&same)?, &p), None);
         assert_eq!(translated(b"{not json", &p), None);
         Ok(())
@@ -1622,7 +1674,15 @@ mod tests {
         assert_eq!(rewritten(&Gather::NetworkMember(false), &json!({"Container": "db", "Force": false}), &mut names)?, json!({"Container": format!("db{k}"), "Force": false}));
         assert_eq!(rewrite(&Gather::NetworkMember(true), br#"{"Container":"theirs"}"#, &leg(), &mut names), None);
         // A socket whose names are the daemon's: on as it came, unless a bind mount is the host's elsewhere.
-        assert_eq!(rewrite(&Gather::ContainerCreate(Some("web".to_owned())), br#"{"HostConfig":{"NetworkMode":"net","Binds":["data:/d"]}}"#, &leg(), &mut Names::default()), None);
+        assert_eq!(
+            rewrite(
+                &Gather::ContainerCreate(Some("web".to_owned())),
+                br#"{"HostConfig":{"NetworkMode":"net","Binds":["data:/d"],"ExtraHosts":["host.docker.internal:host-gateway","kiln.localhost:host-gateway"]}}"#,
+                &leg(),
+                &mut Names::default()
+            ),
+            None
+        );
         Ok(())
     }
 

@@ -3,7 +3,7 @@
 read: for `ci/conformance/probes.py github --token-file` (docs/ci.md W22-AC03) on the machine
 where the App's private key is. The App's JWT is signed with that key by `openssl`, the
 repository's installation is looked up, and a token is asked for with only the permissions the
-probes use (contents and workflows to push them, actions to read their runs). Neither the key nor
+probes use (contents and workflows to push them, actions and checks to read their runs). Neither the key nor
 the token is printed.
 
     python3 -I ci/conformance/github_app_token.py --app-id 123456 \\
@@ -23,8 +23,9 @@ import time
 import urllib.error
 import urllib.request
 
-# What the probes do on GitHub: push their workflows, then read their runs, jobs and logs.
-PERMISSIONS = {"contents": "write", "workflows": "write", "actions": "read", "metadata": "read"}
+# What the probes do on GitHub: push their workflows, then read their runs, jobs, logs and
+# annotations (their check runs').
+PERMISSIONS = {"contents": "write", "workflows": "write", "actions": "read", "checks": "read", "metadata": "read"}
 
 
 def b64(raw):
