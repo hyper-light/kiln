@@ -44,6 +44,7 @@ pub mod providers;
 pub mod registry;
 pub mod replies;
 pub mod signing;
+pub mod sigstore;
 pub mod smtp;
 pub mod repo_config;
 pub mod results;

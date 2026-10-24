@@ -32,6 +32,14 @@ const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 const HISTORY: usize = 720;
 /// How long an agent that declined a job is not offered that job again.
 const DECLINE_BACKOFF: Duration = Duration::from_secs(15);
+/// How long a command whose caller doesn't wait for it is waited for, to log what came of it.
+pub(crate) const LOG_WITHIN: Duration = Duration::from_secs(300);
+/// How long a person's command (through the API) waits for its runner's answer.
+pub const COMMAND_WITHIN: Duration = Duration::from_secs(30);
+/// How often the server says again what it has of each runner's channel streams.
+const HAVE_AGAIN: Duration = Duration::from_secs(5);
+/// How many sessions' digests one `ServerMsg::Kept` carries at the most.
+const KEPT_A_FRAME: usize = 32;
 /// How soon a refused pod launch is tried again.
 const LAUNCH_RETRY: Duration = Duration::from_secs(15);
 
@@ -106,6 +114,71 @@ fn is_outpost(labels: &[String], slots: u32) -> bool {
     slots == 0 && labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL)
 }
 
+/// A command on its way to a runner ([`Hub::command_start`]): its answer, once its runner gives
+/// it.
+pub struct Pending {
+    agent: String,
+    what: &'static str,
+    waits: Vec<futures::channel::oneshot::Receiver<crate::wire::commands::Answer>>,
+    /// What it is already: sent to processes that can't answer, or reaching none.
+    at_once: crate::wire::commands::Answer,
+    /// A parked command whose runner is away: it goes once the runner is back.
+    away: bool,
+}
+
+impl Pending {
+    /// Its answer, when it has one already: none of its runner's processes could take it, or
+    /// none can answer.
+    pub fn at_once(&self) -> Option<&crate::wire::commands::Answer> {
+        self.waits.is_empty().then_some(&self.at_once)
+    }
+
+    /// Its answer, waited for up to `within`: every process it went to answers, and the first
+    /// answer that isn't a taking is what comes back.
+    pub async fn answer(self, within: Duration) -> crate::wire::commands::Answer {
+        use crate::wire::commands::Answer;
+        let deadline = Instant::now() + within;
+        let mut answer = self.at_once;
+        for rx in self.waits {
+            let a = match crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
+                Ok(Ok(a)) => a,
+                Ok(Err(_)) => Answer::Unanswered { why: "the server let go of it".into() },
+                Err(_) => Answer::Unanswered { why: format!("no answer from {} in {} s", self.agent, within.as_secs()) },
+            };
+            if answer.taken() && !a.taken() {
+                answer = a;
+            }
+        }
+        if !answer.taken() && answer != Answer::Sent {
+            tracing::info!(agent = %self.agent, command = self.what, answer = %answer.words(), "a command to a runner wasn't taken");
+        }
+        answer
+    }
+
+    /// Its answer, or [`Answer::Parked`] at once when its runner is away and it waits for it: for
+    /// a person's command, which needn't wait for the runner to come back.
+    ///
+    /// [`Answer::Parked`]: crate::wire::commands::Answer::Parked
+    pub async fn answer_or_parked(self, within: Duration) -> crate::wire::commands::Answer {
+        if self.away {
+            self.log_when_answered(LOG_WITHIN);
+            return crate::wire::commands::Answer::Parked;
+        }
+        self.answer(within).await
+    }
+
+    /// Its answer whenever it comes (`within` at the most), said in the log when it isn't a
+    /// taking: for a caller that doesn't wait for it.
+    pub fn log_when_answered(self, within: Duration) {
+        if self.waits.is_empty() {
+            return;
+        }
+        crate::rt::spawn(async move {
+            let _ = self.answer(within).await;
+        });
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentLive {
     pub name: String,
@@ -128,6 +201,12 @@ pub struct AgentLive {
     /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub battery: Option<crate::os::battery::Battery>,
+    /// What its QUIC layer let go before the wire, by lane and reason, as it last said
+    /// ([`AgentMsg::NetDrops`]); and what the server's let go of what it had for it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<proto::NetDrop>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_toward: Vec<proto::NetDrop>,
     pub terminal: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. It takes no jobs and the server doesn't upgrade it.
@@ -185,6 +264,11 @@ pub struct Hub {
     pub harness: crate::harness::registry::Registry,
     /// What the server has of each runner's channel streams (docs/wire.md).
     pub wire: crate::wire::link::Links,
+    /// Commands to each runner process on the channel, until it answers them (docs/wire.md,
+    /// "Commands").
+    pub cmds: Mutex<crate::wire::commands::Commands>,
+    /// The process each machine that's away last had: its parked commands wait for it there.
+    away_peers: Mutex<HashMap<String, PeerId>>,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: Mutex<HashMap<String, Vec<crate::aisessions::AiSession>>>,
     /// Transcript requests waiting for their machine's answer, by request number.
@@ -316,6 +400,10 @@ impl Hub {
             terminals: crate::termsess::Sessions::new(),
             harness,
             wire: crate::wire::link::Links::new(),
+            // Named for this server process (53 bits, as JSON carries a number exactly), so a runner
+            // never mistakes another's commands for these.
+            cmds: Mutex::new(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
+            away_peers: Mutex::new(HashMap::new()),
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
@@ -602,6 +690,8 @@ impl Hub {
                     draining: false,
                     sample: None,
                     battery: None,
+                    dropped: Vec::new(),
+                    dropped_toward: Vec::new(),
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
@@ -622,6 +712,7 @@ impl Hub {
         }
         for a in &mut out {
             a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
+            a.dropped_toward = a.peer.map(|p| metrics::net().toward(p)).unwrap_or_default();
         }
         out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
         out
@@ -810,10 +901,11 @@ impl Hub {
         }
     }
 
-    /// Send to a machine. While it runs more than one runner process (see `crate::instances`),
-    /// a message about something one of them holds (a terminal, an agent session, a job) goes to
-    /// that one, anything new to the newest, and Drain to all of them.
-    pub async fn send_to_agent(&self, agent: &str, lane: u32, msg: &ServerMsg) -> bool {
+    /// The runner processes of machine `agent` a message goes to. While it runs more than one
+    /// (see `crate::instances`), a message about something one of them holds (a terminal, an
+    /// agent session, a job) goes to that one, anything new to the newest, and Drain to all of
+    /// them.
+    fn peers_for(&self, agent: &str, msg: &ServerMsg) -> Vec<PeerId> {
         let mut peers: Vec<PeerId> = {
             let mut inst = self.instances.lock();
             if matches!(msg, ServerMsg::Drain) { inst.of(agent) } else { inst.route(agent, msg).into_iter().collect() }
@@ -821,6 +913,108 @@ impl Hub {
         if peers.is_empty() {
             peers.extend(self.agents.lock().get(agent).and_then(|a| a.peer));
         }
+        peers
+    }
+
+    /// Sends `msg` to machine `agent` as a command (docs/wire.md, "Commands"), to the processes
+    /// [`Hub::peers_for`] picks, and waits up to `within` for its answer.
+    /// A parked command whose runner is away answers [`Answer::Parked`] at once.
+    ///
+    /// [`Answer::Parked`]: crate::wire::commands::Answer::Parked
+    pub async fn command(&self, agent: &str, msg: &ServerMsg, within: Duration) -> crate::wire::commands::Answer {
+        self.command_start(agent, msg).await.answer_or_parked(within).await
+    }
+
+    /// Sends `msg` to machine `agent` as a command, to the processes [`Hub::peers_for`] picks: its
+    /// answer to come (a caller that mustn't wait for it, the scheduler say, takes it later).
+    pub async fn command_start(&self, agent: &str, msg: &ServerMsg) -> Pending {
+        use crate::wire::{Away, Class};
+        let mut peers = self.peers_for(agent, msg);
+        // A parked command to a machine that's away waits for the process it last had, which
+        // comes back under the same certificate.
+        if peers.is_empty() && matches!(crate::wire::server_class(msg), Class::Command(Away::Park) | Class::State) {
+            let last = self.away_peers.lock().get(agent).copied();
+            peers.extend(last.filter(|p| self.cmds.lock().keeps(*p)));
+        }
+        self.command_peers(agent, peers, msg).await
+    }
+
+    /// Sends `msg` as a command to runner processes `peers` of machine `agent`. One that keeps the
+    /// channel gets it on its command stream (parked or live, as the message's class says) and
+    /// answers it once it applied it; one from before the channel gets it as it always did.
+    pub async fn command_peers(&self, agent: &str, peers: Vec<PeerId>, msg: &ServerMsg) -> Pending {
+        use crate::wire::commands::{Answer, Kind as Stream};
+        use crate::wire::{Away, Class};
+        let what = crate::wire::server_name(msg);
+        let at_once = |a: Answer| Pending { agent: agent.to_owned(), what, waits: Vec::new(), at_once: a, away: false };
+        if peers.is_empty() {
+            return at_once(Answer::Unreachable { why: format!("{agent} is not connected") });
+        }
+        let stream = match crate::wire::server_class(msg) {
+            Class::Command(Away::Refuse) => Some(Stream::Live),
+            Class::Command(Away::Park | Away::AsItsCommand) | Class::State => Some(Stream::Parked),
+            _ => None,
+        };
+        let body = match proto::encode(msg) {
+            Ok(b) => b,
+            Err(e) => return at_once(Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }),
+        };
+        let mut waits = Vec::new();
+        let mut sent = false;
+        let mut away = stream == Some(Stream::Parked);
+        for p in peers {
+            let on_channel = stream.filter(|_| self.cmds.lock().keeps(p));
+            match on_channel {
+                Some(kind) => {
+                    away &= !self.cmds.lock().is_up(p);
+                    waits.push(self.cmds.lock().push(p, kind, body.clone(), Instant::now()));
+                }
+                None => {
+                    away = false;
+                    sent |= self.net.send(p, LANE_CONTROL, Kind::Control, body.clone()).await;
+                }
+            }
+        }
+        self.flush_commands().await;
+        let first = if sent { Answer::Sent } else if waits.is_empty() { Answer::Unreachable { why: format!("{agent} is not connected") } } else { Answer::Taken };
+        Pending { agent: agent.to_owned(), what, away: away && !waits.is_empty(), waits, at_once: first }
+    }
+
+    /// The runners' commands due now: those not sent yet on their link, and those whose answer is
+    /// overdue (lost below the channel).
+    async fn flush_commands(&self) {
+        let frames = self.cmds.lock().poll(Instant::now());
+        for (peer, f) in frames {
+            self.send_peer(peer, &ServerMsg::Wire(f)).await;
+        }
+    }
+
+    /// Sends the runners' commands that come due on their own (docs/wire.md, "Commands"), once a
+    /// second: answers overdue, parked commands whose runner never came back.
+    pub async fn commands_loop(self: Arc<Self>) -> anyhow::Result<()> {
+        let mut tick = Interval::new(Duration::from_secs(1));
+        let mut said = Instant::now();
+        loop {
+            futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = tick.tick().fuse() => {}
+            }
+            self.flush_commands().await;
+            // What the server has of each runner's streams, said again every few seconds: one lost
+            // below the channel mustn't hold a runner's updates up until its next connection.
+            if said.elapsed() >= HAVE_AGAIN {
+                said = Instant::now();
+                let runners: Vec<(String, PeerId)> = self.agents.lock().values().filter(|a| a.connected && self.wire.keeps(&a.name)).filter_map(|a| Some((a.name.clone(), a.peer?))).collect();
+                for (name, peer) in runners {
+                    self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&name))).await;
+                }
+            }
+        }
+    }
+
+    /// Send to a machine, to the processes [`Hub::peers_for`] picks.
+    pub async fn send_to_agent(&self, agent: &str, lane: u32, msg: &ServerMsg) -> bool {
+        let peers = self.peers_for(agent, msg);
         if peers.is_empty() {
             return false;
         }
@@ -868,9 +1062,12 @@ impl Hub {
         peers.sort_unstable();
         peers.dedup();
         for p in peers {
+            // What it hadn't answered of the server's commands ends here.
+            self.cmds.lock().gone(p, "its runner was forgotten");
             self.net.command(crate::net::Out::Disconnect { peer: p }).await;
         }
         self.net.command(crate::net::Out::Revoke { name: agent.to_owned() }).await;
+        self.away_peers.lock().remove(agent);
         self.reach.lock().forget(agent);
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
@@ -943,6 +1140,8 @@ impl Hub {
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
                 self.tunnels.closed(peer);
+                // Its live commands not yet answered end; its parked ones wait for it.
+                self.cmds.lock().down(peer);
                 // Its reach links end; the runners at their other ends hear so (and resume later).
                 let closes = self.reach.lock().lost(peer, "disconnected from the kiln server");
                 for (p, m) in closes {
@@ -1036,6 +1235,9 @@ impl Hub {
             let mut g = self.agents.lock();
             let Some(a) = g.get_mut(name) else { return };
             a.connected = false;
+            if let Some(p) = a.peer {
+                self.away_peers.lock().insert(name.to_owned(), p);
+            }
             a.peer = None;
             a.lost_at = Some(Instant::now());
             a.clone()
@@ -1129,8 +1331,12 @@ impl Hub {
                     self.send_peer(peer, &ServerMsg::Wire(a)).await;
                 }
             }
-            // Answers to items the server sent: it sends none before plan step 3.
-            Frame::Ack(_) | Frame::Want { .. } | Frame::Have(_) => {}
+            // The runner's answers to the server's commands, its wants, and what it has of them
+            // after a reconnect: what's due goes now.
+            frame @ (Frame::Ack(_) | Frame::Want { .. } | Frame::Have(_)) => {
+                self.cmds.lock().on_frame(peer, frame);
+                self.flush_commands().await;
+            }
         }
     }
 
@@ -1362,6 +1568,7 @@ impl Hub {
                 self.instances.lock().set_wide(peer, caps);
                 self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
                 if caps & proto::CAP_WIRE != 0 {
+                    self.cmds.lock().connected(peer);
                     self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&agent))).await;
                 }
             }
@@ -1440,12 +1647,19 @@ impl Hub {
                 }
             }
             AgentMsg::Power { json } => self.on_power(&agent, &json).await,
+            AgentMsg::NetDrops { dropped } => {
+                let series = dropped.iter().map(|d| (vec![agent.clone(), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
+                metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([agent.clone()]), series);
+                if let Some(a) = self.agents.lock().get_mut(&agent) {
+                    a.dropped = dropped;
+                }
+            }
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
                 // A copy of a session that went on elsewhere since (an older epoch): its machine
                 // lets go of it, and nothing it says of it counts.
-                Ok(crate::harness::core::Update::Open { info }) if self.harness.stale(&session, info.epoch) => {
+                Ok(crate::harness::core::Update::Open { info, .. }) if self.harness.stale(&session, info.epoch) => {
                     tracing::info!(%agent, %session, epoch = info.epoch, "an agent session that went on elsewhere: this machine lets go of its copy");
                     // A runner from before letting go stops its copy instead (what it says of it
                     // doesn't count either way).
@@ -1604,8 +1818,7 @@ impl Hub {
                 keep.push(j.clone());
                 self.emit_job(j).await;
             } else {
-                self.send_peer(peer, &ServerMsg::Cancel { job: j.clone(), reason: "job was reassigned".into() })
-                    .await;
+                self.command_peers(&name, vec![peer], &ServerMsg::Cancel { job: j.clone(), reason: "job was reassigned".into() }).await.log_when_answered(LOG_WITHIN);
             }
         }
         let outpost = is_outpost(&h.labels, h.slots);
@@ -1629,6 +1842,8 @@ impl Hub {
             draining: false,
             sample: None,
             battery: None,
+            dropped: Vec::new(),
+            dropped_toward: Vec::new(),
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
@@ -1684,7 +1899,12 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS }).await;
+        // What its sessions' copies have here, so a stream it starts sends only what they lack
+        // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
+        for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
+            self.send_peer(peer, &ServerMsg::Kept { sessions: part.to_vec() }).await;
+        }
         self.send_peer(
             peer,
             &ServerMsg::Welcome {
@@ -1698,7 +1918,7 @@ impl Hub {
         // Older processes of this machine take no new jobs; what they run, they keep.
         for p in &joined.drain {
             tracing::info!(agent = %name, peer = p, "a newer runner process of this machine connected; the older one keeps what it runs and takes nothing new");
-            self.send_peer(*p, &ServerMsg::Drain).await;
+            self.command_peers(&name, vec![*p], &ServerMsg::Drain).await.log_when_answered(LOG_WITHIN);
         }
         self.update_slot_gauges();
         self.emit_agent(&live);
@@ -1740,7 +1960,7 @@ impl Hub {
         let Some(name) = self.agent_of(peer) else { return };
         tracing::info!(agent = %name, peer, "a new runner process of this machine took over: new work goes to it");
         for p in &drain {
-            self.send_peer(*p, &ServerMsg::Drain).await;
+            self.command_peers(&name, vec![*p], &ServerMsg::Drain).await.log_when_answered(LOG_WITHIN);
         }
         self.newest_changed(&name).await;
         self.wake.notify();
@@ -1850,7 +2070,7 @@ impl Hub {
         }
         for (name, newest, instance) in sends {
             tracing::info!(agent = %name, %instance, "an older runner process of this machine holds nothing any more; asking the newest to retire it");
-            self.send_peer(newest, &ServerMsg::Retire { instance }).await;
+            self.command_peers(&name, vec![newest], &ServerMsg::Retire { instance }).await.log_when_answered(LOG_WITHIN);
         }
     }
 
@@ -1889,7 +2109,7 @@ impl Hub {
         if let Some(a) = snapshot {
             self.emit_agent(&a);
             if a.ephemeral {
-                self.send_to_agent(agent, LANE_CONTROL, &ServerMsg::Drain).await;
+                self.command_start(agent, &ServerMsg::Drain).await.log_when_answered(LOG_WITHIN);
             }
         }
         self.emit_job(&r.job).await;
@@ -1919,8 +2139,7 @@ impl Hub {
         let running = self.store.cancel_run(run_id.to_owned(), reason.to_owned()).await?;
         for (job, agent) in running {
             if let Some(agent) = agent {
-                self.send_to_agent(&agent, LANE_CONTROL, &ServerMsg::Cancel { job: job.clone(), reason: reason.into() })
-                    .await;
+                self.command_start(&agent, &ServerMsg::Cancel { job: job.clone(), reason: reason.into() }).await.log_when_answered(LOG_WITHIN);
                 self.release_slot(&agent, &job);
             }
             self.logs.finish(&job);
@@ -2070,9 +2289,16 @@ impl Hub {
                     };
                     tracing::info!(job = %job.id, key = %job.key, agent = %agent, "job assigned");
                     let _rx = self.logs.subscribe(&job.id); // create the live channel early
-                    if !self.send_to_agent(&agent, LANE_CONTROL, &ServerMsg::Assign(Box::new(assign))).await {
-                        self.release_slot(&agent, &job.id);
-                        self.store.requeue_job(job.id.clone(), "assignment could not be delivered".into()).await?;
+                    // A live command: refused at once while its runner is away. Once taken, the leg's
+                    // own answer (JobStarted or Reject) says what came of it.
+                    let pending = self.command_start(&agent, &ServerMsg::Assign(Box::new(assign))).await;
+                    match pending.at_once() {
+                        Some(a) if *a != crate::wire::commands::Answer::Sent => {
+                            let why = format!("assignment could not be delivered: {}", a.words());
+                            self.release_slot(&agent, &job.id);
+                            self.store.requeue_job(job.id.clone(), why).await?;
+                        }
+                        _ => pending.log_when_answered(LOG_WITHIN),
                     }
                     self.emit_job(&job.id).await;
                     self.emit_run(&run.id).await;
@@ -2217,8 +2443,7 @@ impl Hub {
             match sent {
                 None => {
                     if let Some(agent) = &job.agent {
-                        self.send_to_agent(agent, LANE_CONTROL, &ServerMsg::Cancel { job: job.id.clone(), reason: "timeout".into() })
-                            .await;
+                        self.command_start(agent, &ServerMsg::Cancel { job: job.id.clone(), reason: "timeout".into() }).await.log_when_answered(LOG_WITHIN);
                     }
                     self.cancel_sent.lock().insert(job.id.clone(), Instant::now());
                 }

@@ -513,8 +513,31 @@ fn prepare(start: &LegStart) -> anyhow::Result<()> {
     if let Err(e) = docker_daemon() {
         eprintln!("kiln guest: the image's Docker: {e:#}");
     }
+    if let Err(e) = podman_config() {
+        eprintln!("kiln guest: the image's Podman: {e:#}");
+    }
     Ok(())
 }
+
+/// When the image has Podman (kiln's runner images do), what its containers need here (W13):
+/// their storage on the scratch disk (an overlay can't hold their layers); the guest's own network
+/// for them, the only one there is (no device but its loopback, out through the egress proxy,
+/// whose address the steps' environment gives); and cgroupfs and file events, as no systemd runs.
+fn podman_config() -> anyhow::Result<()> {
+    if crate::os::which("podman").is_none() {
+        return Ok(());
+    }
+    let data = Path::new("/.kiln/mnt/scratch/containers");
+    std::fs::create_dir_all(data)?;
+    std::fs::create_dir_all("/var/lib/containers")?;
+    nix::mount::mount(Some(data), "/var/lib/containers", None::<&str>, MsFlags::MS_BIND, None::<&str>).context("its storage on the scratch disk")?;
+    std::fs::create_dir_all("/etc/containers/containers.conf.d")?;
+    std::fs::write("/etc/containers/containers.conf.d/50-kiln-microvm.conf", PODMAN_CONF)?;
+    Ok(())
+}
+
+/// [`podman_config`]'s settings.
+const PODMAN_CONF: &str = "# kiln: a microVM's Podman (docs/ci.md W13)\n[containers]\nnetns = \"host\"\n\n[engine]\ncgroup_manager = \"cgroupfs\"\nevents_logger = \"file\"\n";
 
 /// When the image has Docker (`dockerd`), its daemon, for the leg's Docker actions and services
 /// (W13-R05): its data on the scratch disk (an overlay can't hold its layers), its pulls through

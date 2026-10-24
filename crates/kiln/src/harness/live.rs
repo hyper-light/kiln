@@ -51,13 +51,15 @@ pub fn now_us() -> u64 {
     u64::try_from(BASE.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// A frame as the bus carries it: when it was published ([`now_us`], 8 bytes, little-endian),
-/// its whole text's length (4 bytes, little-endian), the text, then what changed in a state when
-/// there's a patch (the rest). The topic is this process's alone, so the form is free to change.
+/// A frame as the bus carries it: when it was published ([`now_us`], 8 bytes, little-endian), the
+/// copy's revision it carries (8 bytes, little-endian; docs/wire.md, "Revisions"), its whole text's
+/// length (4 bytes, little-endian), the text, then what changed in a state when there's a patch
+/// (the rest). The topic is this process's alone, so the form is free to change.
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let patch = frame.patch.as_deref().unwrap_or_default();
-    let mut out = Vec::with_capacity(frame.text.len().saturating_add(patch.len()).saturating_add(12));
+    let mut out = Vec::with_capacity(frame.text.len().saturating_add(patch.len()).saturating_add(20));
     out.extend_from_slice(&now_us().to_le_bytes());
+    out.extend_from_slice(&frame.rev.to_le_bytes());
     out.extend_from_slice(&u32::try_from(frame.text.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(frame.text.as_bytes());
     out.extend_from_slice(patch.as_bytes());
@@ -72,11 +74,12 @@ pub fn published_us(bytes: &[u8]) -> Option<u64> {
 /// A frame from what [`encode`] made; `None` for bytes it didn't make.
 pub fn decode(bytes: &[u8]) -> Option<Frame> {
     let (_, rest) = bytes.split_first_chunk::<8>()?;
+    let (rev, rest) = rest.split_first_chunk::<8>()?;
     let (len, rest) = rest.split_first_chunk::<4>()?;
     let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
     let text = std::str::from_utf8(rest.get(..len)?).ok()?;
     let patch = std::str::from_utf8(rest.get(len..)?).ok()?;
-    Some(Frame { text: Arc::from(text), patch: (!patch.is_empty()).then(|| Arc::from(patch)) })
+    Some(Frame { text: Arc::from(text), patch: (!patch.is_empty()).then(|| Arc::from(patch)), rev: u64::from_le_bytes(*rev) })
 }
 
 /// How a feed's publish went.
@@ -296,17 +299,21 @@ mod tests {
         Ok(Arc::new(crate::bus::QuiverBus::open(&crate::bus::Config::default(), Arc::new(kiln_seams::clock::SimClock::new()))?))
     }
 
-    /// A frame goes on the bus and comes back as it went, its patch with it; bytes it didn't make
-    /// come back as none.
+    /// A frame goes on the bus and comes back as it went, its patch and its revision with it; bytes
+    /// it didn't make come back as none.
     #[test]
     fn a_frame_comes_back_from_the_bus_as_it_went() {
-        let frames = [Frame::of(r#"{"t":"events","events":[]}"#.to_owned()), Frame { text: Arc::from(r#"{"t":"state","state":{"a":1}}"#), patch: Some(Arc::from(r#"{"t":"state_patch","set":{"a":1}}"#)) }];
+        let frames = [
+            Frame::of(r#"{"t":"events","events":[]}"#.to_owned()),
+            Frame { text: Arc::from(r#"{"t":"state","state":{"a":1},"rev":42}"#), patch: Some(Arc::from(r#"{"t":"state_patch","set":{"a":1},"rev":42}"#)), rev: 42 },
+        ];
         for f in frames {
-            let back = decode(&encode(&f)).map(|b| (b.text.to_string(), b.patch.as_deref().map(str::to_owned)));
-            assert_eq!(back, Some((f.text.to_string(), f.patch.as_deref().map(str::to_owned))));
+            let back = decode(&encode(&f)).map(|b| (b.text.to_string(), b.patch.as_deref().map(str::to_owned), b.rev));
+            assert_eq!(back, Some((f.text.to_string(), f.patch.as_deref().map(str::to_owned), f.rev)));
         }
         assert!(decode(b"\x09\x00").is_none());
         assert!(decode(b"\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00abc").is_none());
+        assert!(decode(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00abc").is_none());
     }
 
     /// A frame carries when it was published, on this process's microsecond clock: what the

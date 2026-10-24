@@ -127,6 +127,11 @@ impl CounterVec {
         self.series.read().get(&key).copied().unwrap_or(0)
     }
 
+    /// Every series counted so far: its label values and its count.
+    pub fn series(&self) -> Vec<(Vec<String>, u64)> {
+        self.series.read().iter().map(|(k, n)| (k.clone(), *n)).collect()
+    }
+
     fn render(&self, out: &mut String, name: &str) {
         for (vals, n) in self.series.read().iter() {
             let _ = writeln!(out, "{name}{{{}}} {n}", labels(self.keys, vals));
@@ -236,6 +241,9 @@ pub struct Metrics {
     pub runner_update_policy: GaugeVec,
     /// The kiln each runner runs (1).
     pub runner_version_info: GaugeVec,
+    /// What each runner's QUIC layer dropped, by lane and reason, as it last said
+    /// (`AgentMsg::NetDrops`).
+    pub runner_net_dropped: GaugeVec,
     /// The CI engine's (docs/ci.md W19-R02): cache lookups by result and saves (W08-R13),
     /// attempts by conclusion and failure class, queue seconds by wait reason, and how far
     /// behind the rollups are.
@@ -272,6 +280,7 @@ pub fn global() -> &'static Metrics {
         runner_behind: GaugeVec::new(&["runner"]),
         runner_update_policy: GaugeVec::new(&["runner", "policy"]),
         runner_version_info: GaugeVec::new(&["runner", "version"]),
+        runner_net_dropped: GaugeVec::new(&["runner", "lane", "reason"]),
         ci_cache: CounterVec::new(&["result"]),
         ci_attempts: CounterVec::new(&["conclusion", "class"]),
         ci_wait_seconds: CounterVec::new(&["reason"]),
@@ -454,6 +463,69 @@ fn render_agents(m: &AgentMetrics, o: &mut String) {
     let _ = writeln!(o, "{} {}", polls.name, m.harness_polls.get());
     head(o, written);
     let _ = writeln!(o, "{} {}", written.name, m.harness_records_written.get());
+}
+
+/// What kiln's QUIC layer let go before it reached the wire (`crate::net`, docs/wire.md, "Loss
+/// below the channel"), by `lane` (`crate::proto::lane_name`) and `reason`: `shed` (a lane that
+/// may lose frames had its queue full: its oldest went), `stuck` (a control lane had its queue
+/// full: its connection was closed, and what it held went with it), `refused` (the transport
+/// wouldn't take it), `closed` (its connection closed, or its peer wasn't connected, with it
+/// queued), `ended` (the net loop started over, or stopped, with it queued) and `chaos` (a test
+/// build's fault). The channel sends again what of these it carried. `toward`: the same by peer, for
+/// the server's runner pages.
+pub struct NetMetrics {
+    pub frames_dropped: CounterVec,
+    toward: RwLock<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
+}
+
+impl NetMetrics {
+    /// `n` frames of `lane` to `peer` dropped, for `reason`.
+    pub fn dropped(&self, peer: u64, lane: u32, reason: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let lane = crate::proto::lane_name(lane);
+        self.frames_dropped.add(&[lane, reason], n);
+        *self.toward.write().entry(peer).or_default().entry((lane, reason)).or_insert(0) += n;
+    }
+
+    /// What this process dropped, by lane and reason.
+    pub fn counts(&self) -> Vec<crate::proto::NetDrop> {
+        self.frames_dropped
+            .series()
+            .into_iter()
+            .filter_map(|(k, frames)| match k.as_slice() {
+                [lane, reason] => Some(crate::proto::NetDrop { lane: lane.clone(), reason: reason.clone(), frames }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What this process dropped of what it had for `peer`, by lane and reason.
+    pub fn toward(&self, peer: u64) -> Vec<crate::proto::NetDrop> {
+        self.toward
+            .read()
+            .get(&peer)
+            .map(|m| m.iter().map(|((lane, reason), n)| crate::proto::NetDrop { lane: (*lane).to_owned(), reason: (*reason).to_owned(), frames: *n }).collect())
+            .unwrap_or_default()
+    }
+}
+
+pub fn net() -> &'static NetMetrics {
+    static M: OnceLock<NetMetrics> = OnceLock::new();
+    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: RwLock::new(BTreeMap::new()) })
+}
+
+/// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each
+/// runner last said its own were.
+fn render_net(o: &mut String) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_net_frames_dropped_total Frames kiln's QUIC layer let go before they reached the wire, by lane and reason (shed, stuck, refused, closed, ended, chaos).\n# TYPE kiln_net_frames_dropped_total counter"
+    );
+    net().frames_dropped.render(o, "kiln_net_frames_dropped_total");
+    let _ = writeln!(o, "# HELP kiln_runner_net_frames_dropped Frames each runner's QUIC layer let go, by lane and reason, as it last said.\n# TYPE kiln_runner_net_frames_dropped gauge");
+    global().runner_net_dropped.render(o, "kiln_runner_net_frames_dropped");
 }
 
 /// kiln's bytes behind kiln-seams' `Blobs` (docs/blobs.md), by `store` (`local`, `s3`): requests by
@@ -859,6 +931,7 @@ pub fn render() -> String {
     render_agents(agents(), &mut o);
     render_blobs(&mut o);
     render_bus(&mut o);
+    render_net(&mut o);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {

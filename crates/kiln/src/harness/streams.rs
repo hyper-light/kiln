@@ -22,7 +22,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::hub::Hub;
-use crate::proto::{CAP_STREAM, LANE_STREAM, ServerMsg};
+use crate::proto::{CAP_STREAM, ServerMsg};
 
 /// A stream nobody has looked at for this long closes.
 const UNWATCHED: Duration = Duration::from_secs(600);
@@ -190,9 +190,12 @@ impl Relay {
             resized: Mutex::default(),
         });
         self.live.lock().insert(id.clone(), live.clone());
-        if !hub.send_to_agent(&machine, LANE_STREAM, &msg).await {
+        // A live command (`crate::wire::commands`): refused at once while its runner is away, and
+        // answered once its runner opened the page. Unanswered, it goes on: its picture says.
+        let answer = hub.command_start(&machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await;
+        if let a @ (crate::wire::commands::Answer::Refused { .. } | crate::wire::commands::Answer::Unreachable { .. }) = answer {
             self.live.lock().remove(&id);
-            anyhow::bail!("{machine} is not connected");
+            anyhow::bail!("{machine}: {}", a.words());
         }
         crate::rt::spawn(close_when_unwatched(hub.clone(), id));
         Ok(live)
@@ -354,7 +357,7 @@ impl Relay {
     pub async fn close(&self, hub: &Hub, id: &str) -> bool {
         let Some(live) = self.live.lock().remove(id) else { return false };
         self.ended(&live);
-        let _ = hub.send_to_agent(&live.machine, LANE_STREAM, &ServerMsg::StreamClose { stream: live.id.clone(), session: live.session.clone() }).await;
+        hub.command_start(&live.machine, &ServerMsg::StreamClose { stream: live.id.clone(), session: live.session.clone() }).await.log_when_answered(crate::hub::LOG_WITHIN);
         live.send(&ToViewer::Event(json!({"closed": {"why": "it was closed"}}).to_string()));
         true
     }
@@ -500,7 +503,8 @@ impl Live {
         if let Some(r) = c.get("resize") {
             *self.resized.lock() = Some(r.clone());
         }
-        let _ = hub.send_to_agent(&self.machine, LANE_STREAM, &ServerMsg::StreamControl { stream: self.id.clone(), session: self.session.clone(), json: c.to_string() }).await;
+        // In order, each answered, none waited for: a viewer's asks follow one another closely.
+        hub.command_start(&self.machine, &ServerMsg::StreamControl { stream: self.id.clone(), session: self.session.clone(), json: c.to_string() }).await.log_when_answered(crate::hub::LOG_WITHIN);
     }
 
     /// Its picture's codec (WebCodecs' string), as its last configuration said, else as it was
@@ -512,7 +516,7 @@ impl Live {
 
     /// What a viewer did, to its runner.
     pub async fn input(&self, hub: &Hub, events: &Value) {
-        let _ = hub.send_to_agent(&self.machine, LANE_STREAM, &ServerMsg::StreamInput { stream: self.id.clone(), session: self.session.clone(), json: events.to_string() }).await;
+        hub.command_start(&self.machine, &ServerMsg::StreamInput { stream: self.id.clone(), session: self.session.clone(), json: events.to_string() }).await.log_when_answered(crate::hub::LOG_WITHIN);
     }
 
     /// How it is, for the API.

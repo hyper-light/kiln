@@ -97,6 +97,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         server: true,
         dial_deadline: crate::net::DIAL_DEADLINE,
     })?;
+    // A test build's fault (`KILN_CHAOS`): frames lost below the channel, which it makes up for.
+    if let Some(rule) = crate::runner::chaos::get().and_then(|c| c.shed) {
+        net.command(crate::net::Out::Shed(rule)).await;
+    }
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone())?;
@@ -116,6 +120,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Process restarts by the supervisor count as restarts too (generation 1 = first start).
     crate::metrics::global().supervisor_restarts.add(hub.generation.saturating_sub(1));
 
+    // The copies of agent sessions its store has, rebuilt before any runner's message is taken
+    // in: a runner that comes back after this server started again finds them, and sends only
+    // what they lack (docs/wire.md, "Restarts").
+    if !cfg.ci.local {
+        crate::harness::registry::Registry::list_away(&hub).await;
+    }
+
     // Transport events. Each message is handled in isolation; the stream itself never ends while
     // the net thread lives (it restarts its endpoint internally).
     {
@@ -134,6 +145,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }};
     }
     child!("scheduler", h => h.scheduler_loop());
+    child!("commands", h => h.commands_loop());
     child!("blobs", h => crate::blobs::run(h));
     child!("transcripts", h => crate::harness::archive::run(h));
     // `kiln workflow run`'s own server (docs/ci.md W17-R06) runs CI and nothing else: no polling

@@ -438,7 +438,7 @@ pub async fn ask(hub: &Hub, runner: &str) {
             continue;
         }
         let Ok(json) = serde_json::to_string(&a) else { continue };
-        hub.send_peer(peer, &ServerMsg::Undeploy { json }).await;
+        hub.command_peers(runner, vec![peer], &ServerMsg::Undeploy { json }).await.log_when_answered(crate::hub::LOG_WITHIN);
         ASKED.lock().get_or_insert_with(HashMap::new).insert(key, Instant::now());
     }
 }

@@ -837,7 +837,10 @@ export type Command =
   | ({ type: "move_on_limit"; on: boolean } & MovePlan);
 
 export type Update =
-  | { t: "open"; info: AgentInfo }
+  /** The session whole follows; `rev` is the server's copy's revision, `born` its process's incarnation (docs/wire.md, "Revisions"). */
+  | { t: "open"; info: AgentInfo; rev?: number; born?: number }
+  /** Only what changed since the revision asked for follows (`?after=`), then "synced". */
+  | { t: "resumed"; info: AgentInfo; rev?: number; born?: number }
   | { t: "changes"; files: FileChange[] }
   /** Files finished messages mention, kept by the server (ahead of the events in a snapshot). */
   | { t: "files"; files: KeptFile[] }
@@ -1234,6 +1237,12 @@ export class SessionStore {
   private wsAt = 0;
   /** Frames on this connection so far. */
   private frames = 0;
+  /** How far what's shown goes in the server's copy (docs/wire.md, "Revisions"): its process's
+   * incarnation and the copy's revision. A reconnect asks for only what came after. */
+  private born = 0;
+  private rev = 0;
+  /** What an "open" or "resumed" said, taken once what follows it is in. */
+  private pending: { born: number; rev: number } | null = null;
   /** Something shows it (or will in a moment): the socket stays up. */
   private wanted = false;
   private unhook: (() => void)[] = [];
@@ -1389,7 +1398,9 @@ export class SessionStore {
     this.incoming = null;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}`));
+      // What's shown already: only what came after it, when the server's copy can say.
+      const after = this.born && this.rev ? `&after=${this.born}.${this.rev}` : "";
+      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}${after}`));
     } catch {
       this.retry();
       return;
@@ -1446,6 +1457,19 @@ export class SessionStore {
     }
     this.frames += 1;
     this.apply(u);
+    this.mark(u);
+  }
+
+  /** Where a frame says the server's copy is: an "open" or "resumed" once what follows it is in, a
+   * live frame at once. */
+  private mark(u: Update) {
+    const rev = (u as { rev?: unknown }).rev;
+    if (u.t === "open" || u.t === "resumed") {
+      const born = (u as { born?: unknown }).born;
+      this.pending = typeof born === "number" && typeof rev === "number" ? { born, rev } : null;
+      return;
+    }
+    if (!this.incoming && typeof rev === "number" && rev > this.rev) this.rev = rev;
   }
 
   /** The socket closed: try again (rarely once it has ended, in case it was only away). */
@@ -1453,7 +1477,9 @@ export class SessionStore {
     if (!this.wanted) return;
     window.clearTimeout(this.quiet);
     window.clearTimeout(this.hold);
+    // A snapshot or resume cut off isn't what's shown: a reconnect asks from what was before it.
     this.incoming = null;
+    this.pending = null;
     if (this.ended) {
       this.retry(ENDED_RETRY_MS);
       return;
@@ -1491,12 +1517,14 @@ export class SessionStore {
         this.patch({ error: u.error });
         return;
       case "open":
+      case "resumed":
         this.opened = true;
         this.ended = false;
         this.misses = 0;
         this.attempt = 0;
-        // Sent as the socket opens: the server's own snapshot, which it ends with "synced".
-        this.begin(u.info, this.frames === 1);
+        // Sent as the socket opens: the server's own snapshot, which it ends with "synced"; or
+        // only what came after what's shown (resumed), taken in with it.
+        this.begin(u.info, this.frames === 1, u.t === "resumed");
         if (this.snap.ready && this.snap.conn !== "open") this.patch({ conn: "open" });
         return;
       case "synced":
@@ -1526,9 +1554,11 @@ export class SessionStore {
     this.schedule();
   }
 
-  private begin(info: AgentInfo | null, told: boolean) {
+  private begin(info: AgentInfo | null, told: boolean, resumed = false) {
     window.clearTimeout(this.hold);
-    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, files: null, byId: new Map(), events: false, told };
+    // A resume adds to what's shown; a snapshot replaces it.
+    const byId = resumed ? new Map(this.byId) : new Map<string, HEvent>();
+    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: resumed ? this.snap.changes : null, files: null, byId, events: false, told };
     this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
     this.wait();
   }
@@ -1582,6 +1612,12 @@ export class SessionStore {
     }
     this.byId = byId;
     this.reorder = true;
+    // What's shown goes as far as the open or resume said.
+    if (this.pending) {
+      this.born = this.pending.born;
+      this.rev = this.pending.rev;
+      this.pending = null;
+    }
     const s = this.snap;
     this.snap = {
       ...s,

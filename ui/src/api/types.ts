@@ -194,12 +194,22 @@ export interface Agent {
   sample: HostSample | null;
   /** Its battery, when it has one. */
   battery?: Battery | null;
+  /** What its QUIC layer let go before the wire, by lane and reason, as it last said; and what the server's let go of what it had for it (docs/wire.md, "Loss below the channel"). */
+  dropped?: NetDrop[];
+  dropped_toward?: NetDrop[];
   /** While a new runner replaces an old one without a restart: both processes, newest first. */
   instances?: RunnerInstance[];
   /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
   outpost?: boolean;
   /** What its probes found and its administrator declared (docs/ci.md W13-R01, R02): what routing decides over. */
   facts?: RunnerFacts;
+}
+
+/** Frames a QUIC layer let go of one lane, for one reason: shed, stuck, refused, closed, ended or chaos. */
+export interface NetDrop {
+  lane: string;
+  reason: string;
+  frames: number;
 }
 
 /** A runner's facts (kiln_ci::facts::RunnerFacts). */

@@ -374,7 +374,7 @@ mod tests {
                 let hub = crate::hub::tests::scratch_hub().await?;
                 let there = crate::harness::registry::Location::Machine("elsewhere".into());
                 for id in ["at-work", "waiter"] {
-                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), status: Status::Running, ..Info::default() }) });
+                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), status: Status::Running, ..Info::default() }), since: None });
                 }
                 let item = |id: String, text: &str| QueueItem { id, text: text.into(), at: 1, attachments: Vec::new(), overrides: None };
                 let queue = |items: Vec<QueueItem>| Update::State { state: Box::new(State { status: Status::Running, queue: items, ..State::default() }) };

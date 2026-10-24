@@ -30,7 +30,7 @@ fn pem_of(label: &str, der: &[u8]) -> String {
 }
 
 /// The DER inside a PEM block, and its label.
-fn der_of(pem: &str) -> Option<(String, Vec<u8>)> {
+pub(crate) fn der_of(pem: &str) -> Option<(String, Vec<u8>)> {
     let begin = pem.find("-----BEGIN ")?;
     let rest = pem.get(begin + 11..)?;
     let label = rest.split("-----").next()?.to_owned();
@@ -129,9 +129,14 @@ pub async fn bundle(hub: &Hub, statement: &Value, workload: &kiln_ci::oidc::Work
 }
 
 /// Whether `bundle`'s signature is the configured signer's (kiln's key, the key file's, KMS's).
-/// Keyless bundles are verified against Fulcio's and Rekor's roots, which kiln doesn't keep: they
-/// answer `Err`.
+/// Keyless bundles verify as Sigstore's do ([`super::sigstore`]): against the trusted root
+/// (`[ci.attest] trusted_root`), signed by an identity of kiln's OIDC issuer.
 pub async fn verify(hub: &Hub, bundle: &Value) -> anyhow::Result<bool> {
+    if hub.cfg.ci.attest.signing.as_deref() == Some("keyless") {
+        let root = super::sigstore::trusted_root(&hub.cfg).await?;
+        let identity = super::sigstore::Identity { issuer: super::oidc::issuer(hub), subject: None, claims: Vec::new() };
+        return Ok(super::sigstore::verify(bundle, &root, &identity, None).map_err(|e| tracing::debug!(error = %format!("{e:#}"), "a keyless bundle didn't verify")).is_ok());
+    }
     let Some((signed, sig)) = a::signed_of(bundle) else { return Ok(false) };
     let spki = match hub.cfg.ci.attest.signing.as_deref().unwrap_or("kiln") {
         "kiln" => {

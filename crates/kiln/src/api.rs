@@ -4637,12 +4637,19 @@ struct Takes {
     packed: bool,
     /// `patch=state`: a state as only what changed in it (`state_patch`), after the snapshot's.
     patches: bool,
+    /// `after=<born>.<rev>`: it had the session through that revision of this server's copy
+    /// (docs/wire.md, "Revisions"), and gets only what it lacks when the copy can say.
+    after: Option<(u64, u64)>,
 }
 
 impl Takes {
     fn of(query: Option<&str>) -> Self {
         let has = |p: &str| query.is_some_and(|q| q.split('&').any(|x| x == p));
-        Self { packed: has("z=gzip"), patches: has("patch=state") }
+        let after = query
+            .and_then(|q| q.split('&').find_map(|x| x.strip_prefix("after=")))
+            .and_then(|v| v.split_once('.'))
+            .and_then(|(b, r)| Some((b.parse().ok()?, r.parse().ok()?)));
+        Self { packed: has("z=gzip"), patches: has("patch=state"), after }
     }
 }
 
@@ -4722,7 +4729,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     use kiln_seams::Bus as _;
     use kiln_seams::bus::Refusal;
     let (mut tx, mut rx) = socket.split();
-    let Some(att) = hub.harness.attach(&id) else {
+    let Some(att) = hub.harness.attach_from(&id, takes.after) else {
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
@@ -4733,6 +4740,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     let mut at = att.at;
     // The feed's refusals as of the snapshot it has.
     let mut refusals = att.refusals;
+    // The newest revision of the copy this viewer has: what it catches up from when it starts
+    // over, and what a live frame it already has (a catch-up held it) is told by (docs/wire.md,
+    // "Revisions").
+    let mut have = att.rev;
     let closed = || ws::text(json!({"t": "closed"}).to_string());
     loop {
         let live = {
@@ -4779,10 +4790,13 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                                     tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
                                     return Ok(());
                                 }
+                                // One its catch-up already held.
+                                Some(frame) if frame.rev != 0 && frame.rev <= have => {}
                                 Some(frame) => {
                                     if let Some(at) = crate::harness::live::published_us(&m.payload) {
                                         crate::metrics::bus().delivery_seconds.observe(now.saturating_sub(at) as f64 / 1e6);
                                     }
+                                    have = have.max(frame.rev);
                                     tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
                                 }
                                 None => {
@@ -4834,14 +4848,16 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             },
         }
         if start_over {
-            // From the current state (it begins with "open"), and the feed from where that is.
-            let Some((frames, from, now)) = hub.harness.frames(&id) else {
+            // What it missed since what it has (it begins with "resumed"), or all of it when the copy
+            // can't tell (it begins with "open"); and the feed from where that is.
+            let Some((frames, from, now, rev)) = hub.harness.frames_since(&id, have) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
             send_snapshot(&mut tx, frames, takes.packed).await?;
             at = from;
             refusals = now;
+            have = have.max(rev);
         }
     }
 }
