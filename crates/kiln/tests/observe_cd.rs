@@ -219,6 +219,13 @@ fn dora(f: &Fleet, sha: &str, from: i64) -> anyhow::Result<Option<Value>> {
     Ok(Some(f.call("GET", &format!("/api/observe/v1/dora/deployments/{id}"), None)?["data"].clone()))
 }
 
+/// What Slack was told: each message's headline (its `text`: the title and the value) and its body
+/// (the monitor's message, rendered, in its attachment's first block).
+fn slack(mock: &Mock) -> Vec<(String, String)> {
+    let text = |v: &Value, path: &[&str]| path.iter().try_fold(v, |v, k| v.get(*k).or_else(|| k.parse::<usize>().ok().and_then(|i| v.get(i)))).and_then(Value::as_str).unwrap_or("").to_owned();
+    mock.at("/slack").iter().map(|g| g.json()).map(|v| (text(&v, &["text"]), text(&v, &["attachments", "0", "blocks", "0", "text", "text"]))).collect()
+}
+
 /// Whether `v` is `n` seconds, give or take `slack`.
 fn near(v: &Value, n: i64, slack: i64) -> bool {
     #[allow(clippy::cast_precision_loss)]
@@ -338,8 +345,8 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
     })?;
     anyhow::ensure!(degraded[0]["status"] == "warn" && degraded[0]["message"].as_str().is_some_and(|m| m.starts_with(&format!("{APP} is Degraded"))), "{degraded:#}");
     until(&f, 90, "Slack told of the degraded app", || {
-        let said: Vec<String> = mock.at("/slack").iter().filter_map(|g| g.json()["text"].as_str().map(str::to_owned)).collect();
-        Ok((said.iter().any(|t| t.contains("[Triggered] kobs degraded apps") && t.contains("1 app degraded")), json!(said)))
+        let said = slack(&mock);
+        Ok((said.iter().any(|(t, body)| t == "[Triggered] kobs degraded apps — 1" && body.contains("1 app degraded")), json!(said)))
     })?;
 
     // c3, the revert: what c1 deployed, again (the render c1's), deployed as c3; up again, no app
@@ -357,8 +364,8 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
         Ok((n == Some(0.0), json!(n)))
     })?;
     until(&f, 90, "Slack told the app recovered", || {
-        let said: Vec<String> = mock.at("/slack").iter().filter_map(|g| g.json()["text"].as_str().map(str::to_owned)).collect();
-        Ok((said.iter().any(|t| t.contains("[Recovered] kobs degraded apps")), json!(said)))
+        let said = slack(&mock);
+        Ok((said.iter().any(|(t, body)| t.starts_with("[Recovered] kobs degraded apps") && body.contains("no app degraded")), json!(said)))
     })?;
 
     // c4: refused by the API server: a failed deploy, an error event, nothing for DORA.
