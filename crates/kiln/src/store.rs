@@ -1841,7 +1841,7 @@ mod tests {
             Ok(out)
         };
         for t in objects(&a, "table")? {
-            if t != group::STATE && t != group::CONF {
+            if t != group::STATE && t != group::CONF && t != group::MARK {
                 assert_eq!(dump(&a, &t)?, dump(&b, &t)?, "table {t}");
             }
         }

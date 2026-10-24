@@ -301,8 +301,13 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   copy made later stands in for that point: an entry its `seq` holds already is skipped, as a restart
   skips them. So a learner the log has moved past (a runner away while the log compacted) is sent an
   image that only says where the group stands, and fetches a fresh copy. It takes that copy in whole,
-  with SQLite's backup, while its readers go on. While it has learners, the server keeps up to
-  64 MiB of the log behind what's applied for one a little behind, and beats once a second.
+  with SQLite's backup, while its readers go on. One that meets a write numbered past the next (a
+  write the log lacks: the server stopped before it got there) takes a fresh copy before it applies
+  anything after it. A replica kept by a build from before that, which went on past such a gap
+  without the write, is copied again as its learner starts: `cluster_mark` says where this build
+  last left it, and a replica standing anywhere else is copied. While it has learners, the server
+  keeps up to 64 MiB of the log behind what's applied for one a little behind, and beats once a
+  second.
 - **Messages.** The group's messages go over each runner's link on the sync lane
   (`ServerMsg::Cluster`, `AgentMsg::Cluster`), in parts past 512 KiB. A learner whose runner is away
   misses them, and the log sends what it needs once it's back.
