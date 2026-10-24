@@ -2823,7 +2823,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Over the channel: kept until the server has it, down or not. A new session's
                     // stream starts with its Open; a closed one's ends once answered.
                     let key = crate::wire::uplink::session_key(&session);
-                    if !updates.started(&key) && matches!(u, crate::harness::core::Update::Open { .. }) {
+                    if !updates.started(&key)
+                        && let crate::harness::core::Update::Open { info, .. } = &u
+                    {
+                        // Announced after the server said what its copy has, of this epoch (a
+                        // session that started again from the store): its stream starts as the
+                        // Welcome starts one, with only what the copy lacks.
+                        let kept = server_kept.get(&session).filter(|k| k.epoch == info.epoch);
+                        if let (Some(kept), Some(s)) = (kept, harness.as_ref().and_then(|h| h.get(&session))) {
+                            start_stream(&mut updates, &session, &s, Some(kept));
+                            if connected {
+                                flush_updates(&mut updates, &uplink).await;
+                            }
+                            continue 'events;
+                        }
                         updates.start(&key);
                     }
                     push_update(&mut updates, &session, &u);

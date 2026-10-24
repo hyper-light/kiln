@@ -860,7 +860,15 @@ fn kept_seed(store: &crate::convo::store::Store, id: &str) -> Option<session::Se
         }
     };
     let state: super::model::State = kept.state.as_deref().and_then(|s| serde_json::from_str(s).ok())?;
-    let events: Vec<super::model::Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();
+    let mut events: Vec<super::model::Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();
+    // Cut at the bound: from where a run of the server's digests begins, as the timeline lets go
+    // of its oldest (`crate::wire::sums::run_after`).
+    if kept.events.len() >= super::core::MAX_EVENTS
+        && let Some(first) = events.first().map(|e| e.seq)
+    {
+        let from = crate::wire::sums::run_after(first);
+        events.retain(|e| e.seq >= from);
+    }
     if events.is_empty() {
         return None;
     }
@@ -1131,13 +1139,26 @@ mod tests {
             store.send("timeline", &said("m2", 3, "second"));
             store.sync()?;
             // After it: the session comes back with that timeline, in order, by id.
-            let (tx, _rx) = async_channel::unbounded();
+            let (tx, rx) = async_channel::unbounded();
             let again = sim(tx, Some(file.clone()), Limits::default());
             again.restore_from(Some(&store));
             let back = again.sessions.lock().get("timeline").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
-            let core = back.core.lock();
-            assert_eq!(core.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1", "n1", "m2"]);
-            assert_eq!(core.state.title, "the parser");
+            {
+                let core = back.core.lock();
+                assert_eq!(core.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1", "n1", "m2"]);
+                assert_eq!(core.state.title, "the parser");
+            }
+            // It announces itself without it: the store has it as it was, and its feed to the
+            // server carries only what's new (docs/wire.md, "Restarts").
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            let said: Vec<Update> = std::iter::from_fn(|| rx.try_recv().ok()).filter(|(s, _)| s == "timeline").map(|(_, u)| u).collect();
+            assert!(said.iter().any(|u| matches!(u, Update::Open { .. })), "{said:?}");
+            let again_said = |u: &Update| match u {
+                Update::Reset { .. } => true,
+                Update::Events { events } => events.iter().any(|e| ["m1", "n1", "m2"].contains(&e.id.as_str())),
+                _ => false,
+            };
+            assert!(!said.iter().any(again_said), "{said:?}");
             Ok(())
         })
     }

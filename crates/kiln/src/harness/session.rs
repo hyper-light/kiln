@@ -807,7 +807,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     let restored = seed.as_ref().is_some_and(|sd| sd.restored);
     if let Some(sd) = seed.as_ref().filter(|_| restored) {
         // Restarted here: its timeline and state as the store kept them, and nothing said of it.
-        core.adopt(sd.events.clone(), sd.state.clone());
+        core.restore(sd.events.clone(), sd.state.clone());
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
@@ -2287,8 +2287,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             }
         }
     }
-    // Announce it, whole, before anything else: whoever mirrors it starts from all of it.
+    // Announce it, whole, before anything else: whoever mirrors it starts from all of it. One
+    // that started again from the conversation store announces all but its timeline: the store
+    // has that, and the server's copy gets what it lacks as the session's stream starts.
+    let stored = std::mem::take(&mut s.core.lock().stored);
     for u in s.snapshot() {
+        if stored && matches!(u, Update::Reset { .. } | Update::Events { .. }) {
+            continue;
+        }
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;

@@ -19,6 +19,9 @@ use super::session::{Held, Info, MAX_NAME, Spec, SubagentBrief};
 use super::live::{Feed, Viewer};
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
+/// How long a session this server opened on a machine waits for the machine to announce it before
+/// a report from the machine that leaves it out ends it.
+const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
@@ -71,6 +74,9 @@ struct Mirror {
     /// Each event's digest as a runner that starts again compares it (`crate::wire::sums`), by
     /// its id: made when first asked for, and again once the event changes.
     sums: HashMap<String, u64>,
+    /// When this server opened it, until its machine announces it: a report from the machine
+    /// that left it out was made before its open got there, and doesn't end it.
+    opened_at: Option<std::time::Instant>,
 }
 
 /// This server process's incarnation: viewers resume from a copy's revision only under it. 53
@@ -99,6 +105,7 @@ impl Mirror {
             changed: HashMap::new(),
             started_over_pending: false,
             sums: HashMap::new(),
+            opened_at: None,
         }
     }
 
@@ -167,7 +174,16 @@ impl Mirror {
         self.index.insert(id, self.events.len());
         self.events.push(Arc::new(e));
         if self.events.len() > MAX_EVENTS + MAX_EVENTS / 4 {
-            let drop = self.events.len() - MAX_EVENTS;
+            // From where a run of the digests begins, as its machine's timeline lets go of its
+            // oldest (`crate::wire::sums::run_after`).
+            let over = self.events.len() - MAX_EVENTS;
+            let drop = match self.events.get(over).and_then(|e| seq(e)) {
+                Some(q) => {
+                    let from = crate::wire::sums::run_after(q);
+                    self.events.partition_point(|x| seq(x).is_some_and(|s| s < from))
+                }
+                None => over,
+            };
             self.events.drain(..drop);
             self.reindex();
         }
@@ -864,7 +880,15 @@ impl Registry {
             let mut out = Vec::new();
             for u in st.unended(since)? {
                 let keep = if recent.contains(&u.id) { MAX_EVENTS } else { AWAY_EVENTS };
-                let events = st.events(&u.id, None, keep)?;
+                let mut events = st.events(&u.id, None, keep)?;
+                // Cut at `keep`: from where a run of the digests begins, as a live copy lets go of
+                // its oldest (`crate::wire::sums::run_after`).
+                if events.len() >= keep
+                    && let Some(first) = events.first().map(|e| e.seq)
+                {
+                    let from = crate::wire::sums::run_after(first);
+                    events.retain(|e| e.seq >= from);
+                }
                 out.push((u, events));
             }
             Ok(out)
@@ -1093,6 +1117,8 @@ impl Registry {
                 // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
                 info.held = g.get(id).and_then(|m| m.info.held.clone());
                 let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone(), Arc::clone(&self.bus)));
+                // Its machine announced it: what it reports from now on counts.
+                m.opened_at = None;
                 m.info = info.clone();
                 m.reported = reported;
                 m.location = from.clone();
@@ -1288,9 +1314,11 @@ impl Registry {
         let keep: std::collections::HashSet<String> = inv.sessions.into_iter().collect();
         let gone: Vec<String> = {
             let mut g = self.mirrors.lock();
+            // Not one this server opened there that the machine hasn't announced yet: the report
+            // was made before the open got there.
             let gone: Vec<String> = g
                 .iter()
-                .filter(|(id, m)| m.location == Location::Machine(machine.to_owned()) && !keep.contains(*id))
+                .filter(|(id, m)| m.location == Location::Machine(machine.to_owned()) && !keep.contains(*id) && m.opened_at.is_none_or(|t| t.elapsed() > OPEN_GRACE))
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &gone {
@@ -1402,6 +1430,8 @@ impl Registry {
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
     pub fn files_added(&self, id: &str, added: &[Kept]) {
         if let Some(m) = self.mirrors.lock().get_mut(id) {
+            // A revision of its own, past what its viewers have: else they'd take it as had.
+            m.rev = m.rev.saturating_add(1);
             m.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
         }
     }
@@ -1523,7 +1553,7 @@ impl Registry {
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };
-                    self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus)));
+                    self.mirrors.lock().entry(id).or_insert_with(|| Mirror { opened_at: Some(std::time::Instant::now()), ..Mirror::new(info.clone(), loc.clone(), Arc::clone(&self.bus)) });
                     out.push(info);
                 }
             }
@@ -2069,6 +2099,34 @@ mod tests {
             hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(13)] });
             want.extend(names(12..=14));
             anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
+    }
+
+    /// A session this server opened on a machine isn't ended by a report the machine made before
+    /// the open got there; one it had announced is, once a report leaves it out.
+    #[test]
+    fn a_report_made_before_an_open_got_there_doesnt_end_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
+            let bus: Arc<dyn kiln_seams::Bus> = Arc::new(hub.bus.clone());
+            hub.harness.mirrors.lock().insert("opened".into(), Mirror { opened_at: Some(std::time::Instant::now()), ..Mirror::new(info("opened"), there.clone(), bus) });
+            hub.harness.ingest(&hub, &there, "announced", Update::Open { info: Box::new(info("announced")), since: None });
+            let att = hub.harness.attach("announced").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let at = att.at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
+            hub.harness.inventory(&hub, "box", crate::harness::host::Inventory::default());
+            let left: Vec<String> = hub.harness.mirrors.lock().keys().cloned().collect();
+            anyhow::ensure!(left == vec!["opened".to_owned()], "{left:?}");
+            // Its viewer hears it's gone: its feed's last frame.
+            let read = futures::executor::block_on(kiln_seams::Bus::read(&hub.bus, &att.topic, at, 100))?;
+            let said: Vec<String> = read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect();
+            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::CLOSED), "its viewer heard {said:?}");
+            // Its machine announces it: from then on its reports count.
+            hub.harness.ingest(&hub, &there, "opened", Update::Open { info: Box::new(info("opened")), since: None });
+            hub.harness.inventory(&hub, "box", crate::harness::host::Inventory::default());
+            anyhow::ensure!(hub.harness.mirrors.lock().is_empty());
             Ok(())
         })
     }

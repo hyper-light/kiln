@@ -38,8 +38,8 @@ acknowledgements come from that process, never from the transport under it.
 
 Ada made this kiln's top priority on 2026-10-23: nothing kiln sends is fire-and-forget, and no
 crash or reconnect replays a whole session. This split was proposed to the T3 Sends agent by
-message on 2026-10-23; its answer is awaited. Messages *to agents* are critical-path track T3's,
-on `cp/t3-sends` (its `docs/sends.md`):
+message on 2026-10-23, and it agreed by message on 2026-10-24. Messages *to agents* are
+critical-path track T3's, on `cp/t3-sends` (its `docs/sends.md`):
 - `Send`, `SkillRun` and the queue's commands: their ids made once (CP-T3.2), the inbox that takes
   each once (CP-T3.2), their states end to end and parking for a runner that's away (CP-T3.3);
 - the composer's durable outbox (CP-T3.4);
@@ -54,7 +54,28 @@ its processes is fire-and-forget"):
 - loss below the channel counted and repaired;
 - a lab that injects faults.
 
-Messages to agents ride the same channel, and their answers are T3's inbox answers.
+Messages to agents ride the same channel, and their answers are T3's inbox answers:
+- `Send` and `SkillRun` go to a runner that says `CAP_INBOX` as `ServerMsg::HarnessSend`. Its inbox
+  takes each id once, or refuses it with a typed reason. The answer comes back as `Update::Inbox`
+  (`Said { session, message, answer }`), which the registry waits for, and asks again for the
+  epoch it names. The session's other commands (open, close, files, stop, interrupt, approve,
+  control) are this plan's, and take that answer's shape.
+- An `Update::Inbox` rides its session's update stream like any update. The channel takes each item
+  once. A stream that starts over drops what it hadn't had answered and starts from the session's
+  snapshot, which holds no `Update::Inbox`. That happens when either side restarted, or the stream
+  filled up. One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
+  One case is open. After a server restart, a stream the old server took items of but answered
+  none of goes on: nothing says it lost them, since a server that never received any says the
+  same. Its inbox answer then reaches the new server too. That server finds no waiter for it,
+  unless a retry of that very message waits there, which is then handed the first answer and not
+  marked a repeat. CP-T3.3 closes it with a nonce for each send that `Said` echoes. Until then,
+  nothing sends an inbox answer again on purpose.
+- CP-T3.1 puts a gate on the same stream (`harness/host.rs`): what a session says goes on only once
+  the record that shows it is committed. The channel's buffer of what the server hasn't answered
+  is past that gate (the runner's uplink, `agent.rs`), so it holds only committed updates.
+- On the wire, `ServerMsg::HarnessSend` goes after `Kept` (index 57). `CAP_INBOX` can't be
+  `1 << 31`, which is P2's `CAP_CLUSTER` on main. It's `1 << 34` in `AgentMsg::Caps`'s 64 bits,
+  and this plan's next bits start at 35.
 
 ## Commands
 
@@ -94,7 +115,10 @@ Callers take it in one of two ways:
   the server gives itself (away, too many waiting) is known at once.
 
 A runner process that started again has neither stream. Its parked commands not yet answered go
-again on a new generation, and its live ones end `unanswered`. A parked command waits for its
+again on a new generation, and its live ones end `unanswered`. It connects with the same
+certificate, so to the server it's the same peer: each link that comes up starts its commands over
+as a drop does, whether or not the server heard the old one go, and the new link's first `Have`
+says what the process has (nothing, for one that started again). A parked command waits for its
 runner a day at the most. A forgotten runner's waiting commands end `unreachable`. Commands live
 in the server's memory: one that restarts lets go of them, which their callers see as `unanswered`.
 
@@ -107,7 +131,7 @@ peer and lane. It counts every frame it lets go before the wire, by lane and rea
 | Reason | When |
 |---|---|
 | `shed` | A lane that may lose frames (every lane but control and sync: the channel's own items among them, which it sends again) had its queue full: its oldest frame went. |
-| `stuck` | The control or sync lane had its queue full. Its peer is stuck, so the connection is closed rather than a control frame lost, and what it held goes with it. |
+| `stuck` | The control or sync lane had its queue full. Its peer is stuck, so the connection is closed rather than a control frame lost, and what it held goes with it. The warning says which messages filled it (`filled_with`: each variant's index, and how many). |
 | `refused` | The transport wouldn't take the frame. |
 | `closed` | Its connection closed, or its peer wasn't connected, with the frame queued. |
 | `ended` | The net loop started over (a rebuild), or stopped, with the frame queued. |
@@ -115,7 +139,11 @@ peer and lane. It counts every frame it lets go before the wire, by lane and rea
 
 The channel makes up for what of these it carried, without waiting for a reconnect:
 - A receiver that sees an item past a gap drops it and asks for the stream again from the gap
-  (`Want`).
+  (`Want`): once for the gap, and again every 64 items past it in case that want was lost, rather
+  than for each. Its sender sends what follows the gap again at once; a want for the same items soon after (an older receiver's, made before they
+  got there again) sends them again only once 250 ms have passed.
+- A receiver behind its sender's `low` (it started again with less, and the stream went on) goes on
+  from there: every item through `low` is answered.
 - An item whose answer doesn't come within the stream's patience (15 s for session updates and
   terminal output) is sent again, and the receiver takes it once.
 - A closed connection resumes as every reconnect does (`Have`).
@@ -142,7 +170,9 @@ Every frame a viewer gets carries the copy's revision, and an attach starts with
 It gets the whole session (`open`) only when the copy can't resume it: another incarnation, an
 `Open` or `Reset` since, or a revision past what the copy has. A viewer that falls behind is caught
 up the same way, from the last revision it was sent, and the live frames that catch-up already
-holds are skipped.
+holds are skipped. Its socket holds at most 128 KiB the kernel hasn't sent yet
+(`TCP_NOTSENT_LOWAT`, where the platform has it): past that, the server's writer waits and the
+viewer falls behind, rather than reading megabytes of frames that are stale by then.
 
 ## Restarts
 
@@ -150,8 +180,9 @@ A runner that starts again starts each session's stream anew (its streams' names
 Each new stream sends the server only what its copy of the session lacks, not the session whole:
 
 - Before `Welcome`, the server says what each of its copies of the runner's sessions has (`Kept`):
-  the copy's epoch, its oldest and newest events' numbers, a digest of each run of 64 events from
-  its oldest on, and a digest of each of its newest 64 events. A digest is of an event as the copy
+  the copy's epoch, where its first run begins and its newest event's number, a digest of each run
+  of 64 events from there on, and a digest of each of its newest 64 events. Runs begin at the same
+  numbers whoever counts them (1, 65, 129 …). A digest is of an event as the copy
   keeps it: its JSON as it went over the wire (cut to fit), read back. The copy keeps each event's
   digest and makes it again once the event changes.
 - The runner works out the same of its own timeline. It sends an `Open` whose `since` says through
@@ -164,9 +195,18 @@ Each new stream sends the server only what its copy of the session lacks, not th
 - An event sent again under a number the copy has under another id takes that one's place (the
   timeline went another way). The copy's viewers start over from it then, as they do when it lets
   go of events. Otherwise an `Open` with `since` isn't one to them: they go on with what they have.
+- A timeline lets go of its oldest events a whole run at a time: the runner's past 4,000 events,
+  the server's copies past 5,000. A timeline taken up again from a store that was cut at its bound
+  begins where a run does. So a copy that has more of a session than its runner still compares run
+  for run with it, and the runner doesn't send the part of a run it has again.
 - The session goes whole when there's no copy, when the copy is of another epoch, or when there's a
-  gap between the copy's newest and the runner's oldest. It also goes whole when its announcement
-  comes after the runner's `Welcome`: its stream starts with the announcement then.
+  gap between the copy's newest and the runner's oldest. A session announced after the runner's
+  `Welcome` whose copy the server has, of its epoch, starts its stream as the `Welcome` starts one.
+  A new one, or one that moved here, starts with its announcement.
+- A session the runner takes up again from its conversation store isn't written to that store
+  again: the store has its timeline as it was. Its events go again only when their numbers had to
+  change, the store having lost some of them. So the store's feed to the server carries only
+  what's new.
 
 Before its `Welcome`, a runner sends no session's updates outside the channel: the `Welcome` brings
 the server what it lacks of each (or, to a server from before the channel, all of each).
@@ -177,6 +217,31 @@ copy keeps; an older one gets its last 200, to show. The server has none of its 
 any more, and the first `Have` it sends says so. Each stream then starts again as above, sending
 only what the rebuilt copy lacks. A viewer attaches to the rebuilt copy at once, and gets it whole:
 the server's incarnation is new.
+
+`tests/resume_lab.rs` puts this together. Three sessions stream on a runner whose link is cut
+every few seconds, watched by four viewers. The lab then:
+- holds one viewer's reading still until it falls behind (a test build's live feeds keep 64
+  frames, `fanout=`) and is caught up in-band;
+- has another drop its socket and resume;
+- kills the runner and then the server with `kill -9`, starting each again.
+
+It holds the copies and every viewer to each line once, in order, and prints each fault's
+bytes.
+
+## Capability bits past `Build`'s 32
+
+`AgentMsg::Build`'s caps are 32 bits, and every one of them is taken (`CAP_CLUSTER` has bit 31).
+Capabilities past them are bits of a `u64`, said in a message of their own once a link comes up.
+A runner's `AgentMsg::Caps` holds its `Build` caps as well, in their 32 bits. Each new capability
+takes a new bit, never one that means something already, even in the other direction.
+
+| Bit | Name | Said in | Says |
+|---|---|---|---|
+| 32 | `CAP_WIRE` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side keeps the channel |
+| 33 | `CAP_NET_DROPS` | `ServerMsg::Caps` | the server takes what a runner's QUIC layer dropped (`NetDrops`) |
+| 34 | `CAP_INBOX` | `AgentMsg::Caps` | the runner's inbox takes `HarnessSend` (T3, CP-T3.2) |
+
+Bits from 35 are free. Take the next one, and add its row here in the same change.
 
 ## Runner to server: `AgentMsg`
 

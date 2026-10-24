@@ -51,6 +51,9 @@ where
 /// How long a new connection may take to say whether it speaks TLS, and to finish the handshake.
 const FIRST_BYTE: std::time::Duration = std::time::Duration::from_secs(30);
 const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(15);
+/// The most a connection's socket holds that it hasn't sent (`TCP_NOTSENT_LOWAT`): past that,
+/// kiln's writer waits. Linux would let a slow reader's backlog grow to 4 MiB in the kernel.
+const NOTSENT_LOWAT: u32 = 128 << 10;
 
 /// What a client speaking HTTP/2 without TLS sends first (RFC 9113 §3.4): the front door, which
 /// ends a browser's TLS and passes its bytes on, passes HTTP/2 on this way.
@@ -82,6 +85,9 @@ fn opening(head: &[u8]) -> Opening {
 /// HTTP/2 inside. Over TLS the client says which (ALPN); in the clear, HTTP/2 starts with its
 /// preface. Nearly every connection tells by its first byte; only those starting with `P` take more.
 pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handler: Arc<H>, remote: Option<std::net::SocketAddr>, tls: Option<&super::tls::ServerTls>) {
+    // Where the platform offers it: a slow reader's backlog waits here, where kiln can catch it
+    // up (a session's viewer: docs/wire.md, "Revisions"), not megabytes deep in the kernel.
+    let _ = stream.set_notsent_lowat(NOTSENT_LOWAT);
     let mut head = Vec::with_capacity(H2_PREFACE.len());
     let mut buf = [0u8; 32];
     let kind = loop {

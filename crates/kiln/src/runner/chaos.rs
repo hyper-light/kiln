@@ -20,6 +20,9 @@
 //!   variant index, is `variant`, when given), picked by a seeded draw, as a frame lost below the
 //!   channel would be, counted as `chaos` (docs/wire.md, "Loss below the channel"). A runner's
 //!   or, from `KILN_CHAOS`, a server's.
+//! - `fanout=<frames>`: the server's: each session's live feed keeps that many frames for its
+//!   viewers (`crate::harness::live`), so one that stops reading falls behind sooner (and is caught
+//!   up in-band).
 //!
 //! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
 //! recovers; `drop` and `delay` are the connection's.
@@ -47,6 +50,7 @@ pub struct Chaos {
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
     pub shed: Option<crate::net::Shed>,
+    pub fanout: Option<usize>,
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -92,7 +96,8 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             }
             "rebuild" => c.rebuild_after = Some(d()?),
             "shed" => c.shed = Some(shed(v).ok_or_else(|| anyhow::anyhow!("chaos `shed` takes <lane>[/<variant>]:<every> (term/46:7), not `{v}`"))?),
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild or shed"),
+            "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild, shed or fanout"),
         }
     }
     Ok(c)
@@ -300,7 +305,8 @@ mod tests {
                 corrupt: true,
                 platform: None,
                 rebuild_after: None,
-                shed: None
+                shed: None,
+                fanout: None
             }
         );
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
@@ -314,6 +320,8 @@ mod tests {
         assert_eq!(parse("shed=term/46:7")?.shed, Some(crate::net::Shed { lane: crate::proto::LANE_TERM, variant: Some(46), every: 7 }));
         assert_eq!(parse("shed=0:5")?.shed, Some(crate::net::Shed { lane: crate::proto::LANE_CONTROL, variant: None, every: 5 }));
         assert!(parse("shed=term:0").is_err() && parse("shed=nowhere:3").is_err() && parse("shed=term/x:3").is_err());
+        assert_eq!(parse("fanout=32")?.fanout, Some(32));
+        assert!(parse("fanout=0").is_err());
         Ok(())
     }
 }

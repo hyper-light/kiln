@@ -3,9 +3,12 @@
 //! (docs/wire.md, "Restarts").
 //!
 //! The server says it of each session of a runner it has a copy of, before `Welcome`
-//! ([`crate::proto::KeptSession`]): the copy's epoch, its oldest and newest events' numbers, a
-//! digest of each run of [`RUN`] events from its oldest on, and one of each of its last [`LAST`]
-//! events. The runner works out the same of its own timeline ([`delta`]) and sends the events after
+//! ([`crate::proto::KeptSession`]): the copy's epoch, where its first run begins and its newest
+//! event's number, a digest of each run of [`RUN`] events from there on, and one of each of its
+//! last [`LAST`] events. Runs begin at the same numbers whoever counts them (1, 65, 129 …:
+//! [`run_start`]), and a timeline that lets go of its oldest events lets go of whole runs
+//! ([`run_after`]: the runner's, and the server's copies), so a copy that has more of a session
+//! than its runner still compares run for run with it. The runner works out the same of its own timeline ([`delta`]) and sends the events after
 //! the copy's newest, and those through it whose digest differs; the copy keeps the rest as they
 //! are. Past the runner's own newest the copy lets go (it had what the runner lost: a store that
 //! hadn't kept it yet when the runner stopped). A digest is of an event as the copy keeps it: its
@@ -19,6 +22,17 @@ use crate::proto::KeptSession;
 pub const RUN: u64 = 64;
 /// How many of its newest events a copy gives a digest of each.
 pub const LAST: u64 = 64;
+
+/// Where the run `seq` is in begins: runs are of [`RUN`] events, numbered from 1 (1, 65, 129 …).
+pub fn run_start(seq: u64) -> u64 {
+    seq.saturating_sub(1) / RUN * RUN + 1
+}
+
+/// The first run's beginning at `seq` or after it: where a timeline that lets go of its oldest
+/// events, up to `seq`, begins.
+pub fn run_after(seq: u64) -> u64 {
+    run_start(seq.saturating_add(RUN - 1))
+}
 
 /// The first eight bytes of a SHA-256, as a number.
 fn short(h: Sha256) -> u64 {
@@ -52,10 +66,13 @@ fn within(events: &[(u64, u64)], a: u64, b: u64) -> &[(u64, u64)] {
 /// What a copy has of `session`'s events, said in digests. `events`: each its number and digest,
 /// by number.
 pub fn kept(session: String, epoch: u64, events: &[(u64, u64)]) -> KeptSession {
-    let (Some(&(from, _)), Some(&(seq, _))) = (events.first(), events.last()) else {
+    let (Some(&(oldest, _)), Some(&(seq, _))) = (events.first(), events.last()) else {
         return KeptSession { session, epoch, seq: 0, from: 0, run: RUN, runs: Vec::new(), last: Vec::new() };
     };
-    let tail = seq.saturating_add(1).saturating_sub(LAST).max(from);
+    let tail = seq.saturating_add(1).saturating_sub(LAST).max(oldest);
+    // Its first run begins where runs do, before its oldest event when that's past it (the copy
+    // has none of the run before it).
+    let from = run_start(oldest);
     let mut runs = Vec::new();
     let mut a = from;
     while a < tail {
@@ -170,10 +187,33 @@ mod tests {
         // This side holds only its newest 60 of 210: the copy's older ones aren't compared or sent.
         let copy = kept("s".into(), 2, &events(1, 200, "line"));
         assert_eq!(delta(&copy, &events(151, 210, "line")), Some(Delta { since: 200, again: Vec::new() }));
-        // Its oldest inside a run the copy has whole: only its part of that run goes, when it differs.
+        // Its oldest inside a run the copy has whole: that run's digest isn't one it can make, so
+        // its part of the run goes again. Timelines let go of whole runs, so that it isn't.
         let copy = kept("s".into(), 2, &events(1, 300, "line"));
         let d = delta(&copy, &events(100, 300, "line")).unwrap_or(Delta { since: 0, again: Vec::new() });
         assert_eq!((d.since, d.again.first().copied(), d.again.last().copied()), (300, Some(100), Some(128)));
+    }
+
+    #[test]
+    fn runs_begin_at_the_same_numbers_on_every_side() {
+        assert_eq!([run_start(1), run_start(64), run_start(65), run_start(130)], [1, 1, 65, 129]);
+        assert_eq!([run_after(0), run_after(1), run_after(2), run_after(65), run_after(66)], [1, 1, 65, 65, 129]);
+        // A copy whose oldest is past where a run begins says where its first run does.
+        let copy = kept("s".into(), 2, &events(70, 300, "line"));
+        assert_eq!(copy.from, 65);
+        assert_eq!(delta(&copy, &events(70, 340, "line")), Some(Delta { since: 300, again: Vec::new() }));
+    }
+
+    /// A long session: its runner keeps its newest few thousand events, letting go of whole runs,
+    /// and the server's copy more of them. After a restart nothing but what follows the copy's
+    /// newest goes, not the part of a run the runner has.
+    #[test]
+    fn a_timeline_that_lets_go_of_whole_runs_compares_run_for_run() {
+        let copy = kept("s".into(), 2, &events(1, 5_000, "line"));
+        assert_eq!(delta(&copy, &events(run_after(1_003), 5_040, "line")), Some(Delta { since: 5_000, again: Vec::new() }));
+        // Let go of one at a time, it would send the part of the run it has again.
+        let d = delta(&copy, &events(1_003, 5_040, "line")).unwrap_or(Delta { since: 0, again: Vec::new() });
+        assert_eq!((d.again.first().copied(), d.again.len()), (Some(1_003), 22));
     }
 
     #[test]
