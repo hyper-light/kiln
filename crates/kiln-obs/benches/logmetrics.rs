@@ -3,7 +3,8 @@
 //! counting every window of the records once and as the server does it, each a little after it ends.
 //!
 //! `KOBS_LOGS=<journal>:<pods> cargo bench -p kiln-obs --bench logmetrics` (`KOBS_CASE=dense` or
-//! `sparse`: that case alone)
+//! `sparse`: that case alone). `KOBS_CASE=fleet`, no corpus: a fleet's records made at its rate
+//! (`KOBS_RATE` records a second, 100,000; for `KOBS_SECS`, 30), counted at three fleets' sizes.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use std::sync::Arc;
@@ -61,6 +62,9 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn main() {
+    if std::env::var("KOBS_CASE").is_ok_and(|c| c == "fleet") {
+        return fleet();
+    }
     let (mut records, raw_bytes) = match loglines::load() {
         Ok(r) => r,
         Err(e) => {
@@ -162,5 +166,106 @@ fn count_all(what: &str, store: &Store, one: &[LogMetric], five: &[LogMetric], f
             points,
             allocs as f64 / windows.len() as f64
         );
+    }
+}
+
+/// The services of a fleet's hosts: Argo CD's records a gRPC call's time each, kube's warnings among
+/// what the five metrics count.
+const FLEET_SERVICES: [&str; 10] = ["web", "api", "auth", "db", "cache", "queue", "argocd", "kube", "billing", "search"];
+
+/// A fleet's records, written as entries as they are made (none kept): `hosts` hosts each running
+/// the ten services, `rate` a second for `secs` seconds ending at `end` (ns), each host's services in
+/// turn; a fiftieth errors, a twentieth warnings; messages of six shapes, numbers in them.
+fn fleet_entries(hosts: usize, rate: u64, secs: u64, end: i64) -> Vec<Vec<u8>> {
+    let host_names: Vec<String> = (0..hosts).map(|h| format!("node-{h:05}")).collect();
+    let total = rate * secs;
+    let step = 1_000_000_000 / rate.max(1) as i64;
+    let start = end - secs as i64 * 1_000_000_000;
+    let at = end / 1_000_000 + 60_000;
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut b = Builder::new();
+    let mut chunk = Vec::with_capacity(PER_ENTRY);
+    let mut out = Vec::new();
+    for i in 0..total {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let service = FLEET_SERVICES[(i % FLEET_SERVICES.len() as u64) as usize];
+        let host = &host_names[((i / FLEET_SERVICES.len() as u64) % hosts as u64) as usize];
+        let severity = if rng.is_multiple_of(50) {
+            17
+        } else if rng.is_multiple_of(20) {
+            13
+        } else {
+            9
+        };
+        let n = rng >> 20;
+        let message = match (rng >> 8) % 6 {
+            0 => format!("GET /api/v1/orders/{} 200 {} ms", n % 100_000, n % 500),
+            1 => format!("connection refused to db-{}:5432", n % 8),
+            2 => format!("job {} done in {} ms", n % 1_000_000, n % 9_000),
+            3 => format!("cache miss for key user:{}", n % 50_000),
+            4 => format!("POST /v1/charge {} {} ms", [200, 201, 402, 500][(n % 4) as usize], n % 800),
+            _ => format!("reconciled {} objects in {} ms", n % 300, n % 2_000),
+        };
+        let attrs = if service == "argocd" {
+            vec![("grpc.service".into(), ["application", "repository", "cluster"][(n % 3) as usize].into()), ("grpc.time_ms".into(), (n % 2_000).to_string())]
+        } else {
+            Vec::new()
+        };
+        chunk.push(kiln_obs::logs::record::Record {
+            ts: start + i as i64 * step,
+            severity,
+            service: service.into(),
+            host: host.clone(),
+            source: "app".into(),
+            message,
+            attrs,
+            trace_id: None,
+            span_id: None,
+        });
+        if chunk.len() == PER_ENTRY {
+            b.logs(&chunk);
+            out.push(command::write(7, out.len() as u64 + 1, at, &b.finish()));
+            chunk.clear();
+        }
+    }
+    if !chunk.is_empty() {
+        b.logs(&chunk);
+        out.push(command::write(7, out.len() as u64 + 1, at, &b.finish()));
+    }
+    out
+}
+
+/// Metrics from logs at a fleet's rates: its records applied, then every window counted (one metric
+/// and five), at 20, 200 and 2,000 hosts of ten services each (`status:error` by service and host
+/// 200, 2,000 and 20,000 groups: the last past OpenTelemetry's limit, its rest in the overflow).
+fn fleet() {
+    let rate: u64 = std::env::var("KOBS_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let secs: u64 = std::env::var("KOBS_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let one = vec![metric("fleet.errors", "status:error", &["service", "host"], Compute::Count)];
+    let five = vec![
+        metric("fleet.records", "*", &["service"], Compute::Count),
+        metric("fleet.errors", "status:error", &["service", "host"], Compute::Count),
+        metric("kube.warnings", "service:kube status:warn", &[], Compute::Count),
+        metric("refused", "\"connection refused\"", &["service"], Compute::Count),
+        metric("argocd.grpc", "service:argocd @grpc.time_ms:*", &["@grpc.service"], Compute::Distribution { path: "@grpc.time_ms".into(), percentiles: true }),
+    ];
+    // The windows whole: the records end where one does.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+    let end = window_of(now);
+    println!("a fleet's records: {rate} a second for {secs} s ({} a window of {} s)", rate * (WINDOW as u64 / 1_000_000_000), WINDOW / 1_000_000_000);
+    for hosts in [20usize, 200, 2_000] {
+        let entries = fleet_entries(hosts, rate, secs, end);
+        let (applied, allocs, store) = apply_all(&entries, None);
+        let n = rate * secs;
+        println!("\n{hosts} hosts of {} services: applied {:.0} records/s, {:.3} allocations a record", FLEET_SERVICES.len(), n as f64 / applied, allocs as f64 / n as f64);
+        let first = end - secs as i64 * 1_000_000_000;
+        count_all(&format!("{hosts} hosts, every window"), &store, &one, &five, first, end - 1);
+        // The groups and the overflow of the last window, one metric: what the limit kept.
+        if let Ok(Some(c)) = store.count_log_metrics(&one, window_of(end - 1)) {
+            let t = c.tallies.first().cloned().unwrap_or_default();
+            println!("{:<34} {} records, {} groups, {} in the overflow", "  its last window", t.records, t.groups, t.overflowed);
+        }
     }
 }
