@@ -876,6 +876,9 @@ impl Registry {
         {
             let mut g = self.mirrors.lock();
             if let Update::Open { info } = &u {
+                if let Location::Machine(machine) = from {
+                    tracing::info!(session = id, %machine, "an agent session's copy starts from its machine's Open");
+                }
                 let mut info = (**info).clone();
                 // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
                 info.held = g.get(id).and_then(|m| m.info.held.clone());

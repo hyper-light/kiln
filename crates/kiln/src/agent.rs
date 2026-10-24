@@ -808,6 +808,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // server late.
     let chaos = crate::runner::chaos::get();
     let mut chaos_drop: Option<Instant> = None;
+    // A test build's link cut for a while: no dialing again before this.
+    let mut chaos_down: Option<Instant> = None;
     let (delay_line, delayed) = match chaos.and_then(|c| c.delay).map(crate::runner::chaos::DelayLine::new) {
         Some((line, due)) => (Some(line), Some(due)),
         None => (None, None),
@@ -855,6 +857,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
     let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
+    // Their updates over the channel, once the server says it keeps it (docs/wire.md): kept until
+    // the server has them, and sent again after a reconnect from where it has them, never whole.
+    let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+    // The server keeps the channel: it said so on this connection, before its Welcome.
+    let mut server_wire = false;
+    // The channel's updates go (a server that keeps it welcomed this runner since it started).
+    let mut updates_on = false;
+    // The server's items: none before plan step 3, each refused, saying so.
+    let mut wire_in = crate::wire::channel::Receiver::new();
     // Blue/green: this runner's upgrade under way (it is the old one), its steps' results, and (it is
     // the new one) the runner it takes over from.
     #[cfg_attr(not(unix), allow(unused_variables))]
@@ -1052,7 +1063,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::ChaosDrop => {
                 chaos_drop = None;
                 if connected {
-                    tracing::warn!("chaos: dropping the connection to the server");
+                    chaos_down = chaos.and_then(|c| c.down_for).map(|d| Instant::now() + d);
+                    tracing::warn!(down_for = ?chaos.and_then(|c| c.down_for), "chaos: dropping the connection to the server");
                     net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                 }
             }
@@ -1542,6 +1554,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
+                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md).
+                if !o.ephemeral {
+                    let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE }) {
+                        net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    }
+                }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
                 // part of the fleet).
                 if !o.ephemeral
@@ -1602,6 +1621,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
+                // The channel's items in flight go again once the server says what it has.
+                updates.down();
+                server_wire = false;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -1615,6 +1637,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 dialing_since = None;
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
+                if let Some(until) = chaos_down.take() {
+                    redial = redial.map(|r| r.max(until));
+                }
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
@@ -1642,10 +1667,51 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     continue;
                 }
                 match msg {
-                    // What the server can do past Build's 32 bits (docs/wire.md). The channel
-                    // starts once both sides said CAP_WIRE, which this runner doesn't yet.
-                    ServerMsg::Caps { caps } => tracing::debug!(caps, "the server's capabilities"),
-                    ServerMsg::Wire(frame) => tracing::warn!(?frame, "a channel frame from a server this runner never said it keeps the channel to: not taken"),
+                    // What the server can do past Build's 32 bits (docs/wire.md): said before its
+                    // Welcome, so this runner sends its sessions over the channel, not whole. It
+                    // says what it has of the server's streams (none yet).
+                    ServerMsg::Caps { caps } => {
+                        server_wire = caps & proto::CAP_WIRE != 0;
+                        if server_wire {
+                            uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                        }
+                    }
+                    ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
+                        use crate::wire::channel::{Arrival, Refusal};
+                        // Nothing the server sends rides the channel before plan step 3: refused,
+                        // saying so, never dropped.
+                        let answer = match wire_in.on_item(&stream, seq, low, body) {
+                            Arrival::Take(_) => Some(wire_in.refused(&stream, seq, Refusal::Unsupported, "this runner takes nothing from the server on the channel yet")),
+                            Arrival::Answered(a) => a,
+                            Arrival::Gap(want) => Some(want),
+                        };
+                        if let Some(a) = answer {
+                            uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
+                        }
+                    }
+                    // What the server has of this runner's streams, its answers and wants: what it
+                    // lacks goes; a stream it lost starts over, its snapshot first.
+                    ServerMsg::Wire(frame) => {
+                        updates.on_frame(frame);
+                        for key in updates.take_stale() {
+                            if let Some(id) = key.strip_prefix("s:") {
+                                if let Some(s) = harness.as_ref().and_then(|h| h.get(id)) {
+                                    start_stream(&mut updates, id, &s);
+                                }
+                            } else if let Some(id) = key.strip_prefix("t:")
+                                && let Some((_, state)) = terms.get(id)
+                            {
+                                // A terminal's stream starts over with its picture now.
+                                let a = state.attach();
+                                state.detach();
+                                updates.start(&key);
+                                if let Ok(b) = proto::encode(&AgentMsg::TermReplay { session: id.to_owned(), data: a.replay }) {
+                                    updates.push(&key, b);
+                                }
+                            }
+                        }
+                        flush_updates(&mut updates, &uplink).await;
+                    }
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
                         // What waited for the connection, in order: what was held while it was
@@ -1685,21 +1751,46 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(ai) = &ai {
                             ai.reset();
                         }
-                        // The server learns (again) which agent sessions run here, then all of each.
+                        // Its battery is said again too (a state: the newest, sent on every connect).
+                        power_said = None;
+                        power_read_at = None;
+                        // The server learns (again) which agent sessions run here, then what it lacks
+                        // of each: over the channel only that (a session's stream not started yet
+                        // starts with its snapshot), else all of each.
                         if let Some(h) = &harness {
-                            while harness_rx.try_recv().is_ok() {}
+                            if server_wire {
+                                updates_on = true;
+                                // Updates queued meanwhile go on their streams; those of sessions
+                                // whose stream starts now are in its snapshot.
+                                while let Ok((session, u)) = harness_rx.try_recv() {
+                                    if updates.started(&crate::wire::uplink::session_key(&session)) {
+                                        push_update(&mut updates, &session, &u);
+                                    }
+                                }
+                            } else {
+                                updates_on = false;
+                                updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+                                while harness_rx.try_recv().is_ok() {}
+                            }
                             if let Ok(json) = serde_json::to_string(&h.inventory()) {
                                 harness_kinds_sent = serde_json::to_string(&crate::harness::kinds::offered()).ok();
                                 uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
                             }
                             for info in h.list() {
                                 let Some(s) = h.get(&info.id) else { continue };
+                                if updates_on {
+                                    if !updates.started(&crate::wire::uplink::session_key(&info.id)) {
+                                        start_stream(&mut updates, &info.id, &s);
+                                    }
+                                    continue;
+                                }
                                 for u in s.snapshot() {
                                     for json in harness_frames(&info.id, &u) {
                                         uplink.0.send(Up::Term(AgentMsg::Harness { session: info.id.clone(), json })).await.ok();
                                     }
                                 }
                             }
+                            flush_updates(&mut updates, &uplink).await;
                         }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                         // A new build started to take over from the runner being upgraded (blue/green):
@@ -2517,7 +2608,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         AgentMsg::TermExit { session, code, error: None }
                     }
                 };
-                uplink.0.send(Up::Term(msg)).await.ok();
+                if updates_on {
+                    // Over the channel: its output comes once, in order, through a cut too.
+                    let (key, exited) = match &msg {
+                        AgentMsg::TermExit { session, .. } => (crate::wire::uplink::terminal_key(session), true),
+                        AgentMsg::TermOutput { session, .. } => (crate::wire::uplink::terminal_key(session), false),
+                        _ => (String::new(), false),
+                    };
+                    if !updates.started(&key) {
+                        updates.start(&key);
+                    }
+                    if let Ok(b) = proto::encode(&msg) {
+                        updates.push(&key, b);
+                    }
+                    if exited {
+                        updates.closing(&key);
+                    }
+                    if connected {
+                        flush_updates(&mut updates, &uplink).await;
+                    }
+                } else {
+                    uplink.0.send(Up::Term(msg)).await.ok();
+                }
             }
             Ev::Up(mut up) => {
                 // A job's event: numbered, and kept until the job's result is received.
@@ -2572,8 +2684,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Harness(session, u) => {
-                // Not kept across a disconnect: the reconnect sends every session whole.
-                if connected {
+                if updates_on {
+                    // Over the channel: kept until the server has it, down or not. A new session's
+                    // stream starts with its Open; a closed one's ends once answered.
+                    let key = crate::wire::uplink::session_key(&session);
+                    if !updates.started(&key) && matches!(u, crate::harness::core::Update::Open { .. }) {
+                        updates.start(&key);
+                    }
+                    push_update(&mut updates, &session, &u);
+                    if matches!(u, crate::harness::core::Update::Closed) {
+                        updates.closing(&key);
+                    }
+                    if connected {
+                        flush_updates(&mut updates, &uplink).await;
+                    }
+                } else if connected {
+                    // A server from before the channel: not kept across a disconnect, the
+                    // reconnect sends every session whole.
                     for json in harness_frames(&session, &u) {
                         uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
                     }
@@ -2615,6 +2742,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Sample => {
+                if connected && updates_on {
+                    // Items whose answers are overdue (lost below the channel) go again.
+                    flush_updates(&mut updates, &uplink).await;
+                }
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
@@ -2667,6 +2798,34 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
     credentials(o, &Shutdown::new()).await.map(|_| ())
 }
 
+
+/// One agent-session update onto its session's channel stream, as the frames it needs.
+fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update) {
+    let key = crate::wire::uplink::session_key(session);
+    for json in harness_frames(session, u) {
+        if let Ok(b) = proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }) {
+            updates.push(&key, b);
+        }
+    }
+}
+
+/// Starts `session`'s channel stream (again), its snapshot first: what the server gets of it when
+/// it has none of it.
+fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &crate::harness::session::Session) {
+    let key = crate::wire::uplink::session_key(session);
+    updates.start(&key);
+    tracing::info!(%session, stream = %updates.stream(&key), "an agent session's updates start on the channel, whole");
+    for u in s.snapshot() {
+        push_update(updates, session, &u);
+    }
+}
+
+/// Sends what the channel has to send now.
+async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Uplink) {
+    for f in updates.poll(Instant::now()) {
+        uplink.0.send(Up::Term(AgentMsg::Wire(f))).await.ok();
+    }
+}
 
 /// Most of one agent-session update a frame carries. They go on the interactive lane, which
 /// refuses frames past 1 MiB ([`net::Kiln`]); a resumed session's history can be several.

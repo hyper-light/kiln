@@ -183,6 +183,8 @@ pub struct Hub {
     pub terminals: crate::termsess::Sessions,
     /// Every kiln-native agent session, local and on machines.
     pub harness: crate::harness::registry::Registry,
+    /// What the server has of each runner's channel streams (docs/wire.md).
+    pub wire: crate::wire::link::Links,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: Mutex<HashMap<String, Vec<crate::aisessions::AiSession>>>,
     /// Transcript requests waiting for their machine's answer, by request number.
@@ -307,6 +309,7 @@ impl Hub {
             terms: Mutex::new(HashMap::new()),
             terminals: crate::termsess::Sessions::new(),
             harness,
+            wire: crate::wire::link::Links::new(),
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
@@ -979,14 +982,14 @@ impl Hub {
         if let Err(e) = self.store.agent_disconnected(name.to_owned()).await {
             tracing::warn!(error = %e, "agent_disconnected");
         }
-        // That machine's terminals keep running there; park them until it reconnects.
-        let sessions: Vec<String> = self
-            .terms
-            .lock()
-            .keys()
-            .filter(|k| k.starts_with(&format!("{name}/")))
-            .cloned()
-            .collect();
+        // That machine's terminals keep running there; park them until it reconnects. One that
+        // keeps the channel sends their output again once it's back, so they stay open meanwhile
+        // (docs/wire.md).
+        let sessions: Vec<String> = if self.wire.keeps(name) {
+            Vec::new()
+        } else {
+            self.terms.lock().keys().filter(|k| k.starts_with(&format!("{name}/"))).cloned().collect()
+        };
         for s in sessions {
             if let Some(tx) = self.terms.lock().remove(&s) {
                 let _ = tx.try_send(TermOut::Gone);
@@ -1041,6 +1044,33 @@ impl Hub {
         }
         self.update_slot_gauges();
         self.wake.notify();
+    }
+
+    /// A frame of a runner's channel (docs/wire.md). An item is applied as the message it carries,
+    /// then answered: taken, or refused saying why. Never answered before it's applied.
+    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame) {
+        use crate::wire::channel::{Arrival, Frame, Refusal};
+        match frame {
+            Frame::Item { stream, seq, low, body } => {
+                let answer = match self.wire.on_item(agent, &stream, seq, low, body) {
+                    Arrival::Take(body) => {
+                        let refusal = match proto::decode::<AgentMsg>(&body) {
+                            Ok(AgentMsg::Wire(_)) => Some((Refusal::Malformed, "a channel frame inside a channel item".to_owned())),
+                            Ok(inner) => Box::pin(self.on_agent_msg(peer, inner)).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
+                            Err(e) => Some((Refusal::Malformed, format!("{e:#}"))),
+                        };
+                        Some(self.wire.answer(agent, &stream, seq, refusal))
+                    }
+                    Arrival::Answered(a) => a,
+                    Arrival::Gap(want) => Some(want),
+                };
+                if let Some(a) = answer {
+                    self.send_peer(peer, &ServerMsg::Wire(a)).await;
+                }
+            }
+            // Answers to items the server sent: it sends none before plan step 3.
+            Frame::Ack(_) | Frame::Want { .. } | Frame::Have(_) => {}
+        }
     }
 
     async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
@@ -1251,11 +1281,16 @@ impl Hub {
             AgentMsg::Executor { json } => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.clone(), json }),
             // A preview's deployment it was asked to take down (docs/ci.md W15-R07).
             AgentMsg::Undeployed { json } => crate::ci::previews::undeployed(self, &agent, &json).await,
-            // What it can do past Build's 32 bits: whether it keeps the channel (docs/wire.md).
-            AgentMsg::Caps { caps } => self.instances.lock().set_wide(peer, caps),
-            // A frame of the channel. Nothing sends one before both sides said CAP_WIRE, and this
-            // server doesn't yet: said, and not taken.
-            AgentMsg::Wire(frame) => tracing::warn!(agent = %agent, ?frame, "a channel frame from a runner this server never said it keeps the channel to: not taken"),
+            // What it can do past Build's 32 bits. One that keeps the channel too is told what the
+            // server has of its streams, and sends from there (docs/wire.md).
+            AgentMsg::Caps { caps } => {
+                self.instances.lock().set_wide(peer, caps);
+                self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
+                if caps & proto::CAP_WIRE != 0 {
+                    self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&agent))).await;
+                }
+            }
+            AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {
@@ -1572,6 +1607,9 @@ impl Hub {
         if let Some(j) = &h.dedicated_job {
             self.launching.lock().remove(j);
         }
+        // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
+        // Welcome not to send its sessions whole. An older runner skips the frame.
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE }).await;
         self.send_peer(
             peer,
             &ServerMsg::Welcome {

@@ -29,7 +29,7 @@ acknowledgements come from that process, never from the transport under it.
 | answer | The answer to an ask or a command. |
 | ack | An acknowledgement, or a NACK, itself. |
 | stream | An item of an ordered stream: a session's timeline, a terminal's output, a job's events. Items are numbered and acknowledged cumulatively. After a reconnect they are sent again from where the receiver says it has them, and a snapshot is sent only when the sender no longer has what's missing. |
-| state | The newest of something that changes: an inventory, a session's state, a terminal's size. It is versioned, the newest wins, and it is acknowledged by version and sent again until it is. |
+| state | The newest of something that changes: an inventory, a session's state, a terminal's size. The newest wins, and it is sent again on every connect, so one lost to a cut comes once the link is back. |
 | carried (…) | A protocol of its own, carried on the link, that acknowledges and resends by itself: the conversation feed (`convo/feed.rs`), repo sync's Raft, reach's links, ports' windows, the tunnel, and the channel itself (`crate::wire::channel`, whose items carry other messages, each with its own class). |
 | telemetry | Measurements sent every few seconds. The next one stands in for a lost one, so there is no ACK. |
 | media | Live pictures and sound. A lost frame is overtaken by the next and never sent again. |
@@ -37,8 +37,9 @@ acknowledgements come from that process, never from the transport under it.
 ## Who builds what
 
 Ada made this kiln's top priority on 2026-10-23: nothing kiln sends is fire-and-forget, and no
-crash or reconnect replays a whole session. Messages *to agents* are critical-path track T3's, on
-`cp/t3-sends` (its `docs/sends.md`):
+crash or reconnect replays a whole session. This split was proposed to the T3 Sends agent by
+message on 2026-10-23; its answer is awaited. Messages *to agents* are critical-path track T3's,
+on `cp/t3-sends` (its `docs/sends.md`):
 - `Send`, `SkillRun` and the queue's commands: their ids made once (CP-T3.2), the inbox that takes
   each once (CP-T3.2), their states end to end and parking for a runner that's away (CP-T3.3);
 - the composer's durable outbox (CP-T3.4);
@@ -68,13 +69,13 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
 | `JobFinished` | stream | A leg's result: its stream's last item. | Kept until `Received` and sent again after a reconnect (`CAP_RECEIVED`). |
 | `JobSample` | telemetry | A running leg's memory and CPU. | As its class says. |
 | `Reject` | answer | The NACK of an `Assign`: the runner couldn't take the leg, and why. | Not acknowledged as a frame. |
-| `TermOutput` | stream | A terminal's output, by byte offset. | Not kept across a reconnect; a viewer attaches again (`TermAttach`). |
-| `TermExit` | stream | A terminal's last item. | Not kept across a reconnect. |
+| `TermOutput` | stream | A terminal's output, in order. | On the channel: a stream per terminal (`t:<terminal>#<boot>.<gen>`), kept until the server has it, sent again after a cut, its viewer kept attached through it. A stream that starts over starts with the terminal's replay, and its viewer is repainted. Without the channel: not kept across a reconnect; a viewer attaches again (`TermAttach`). |
+| `TermExit` | stream | A terminal's last item. | On the channel: its stream's last item. Without it: not kept across a reconnect. |
 | `TermList` | state | The terminals still running here. | Sent on every connect, not acknowledged. |
 | `TermReplay` | answer | Answers `TermAttach`. | As its class says. |
 | `AiSessions` | state | The AI sessions found running on this machine. | Sent when they change, not acknowledged. |
 | `AiTranscript` | answer | Answers `AiTranscript`. | As its class says. |
-| `Harness` | stream | A session's updates, in order, a stream per session. | Fire-and-forget. Updates made while the link is down are thrown away, and every connect sends every session whole (`agent.rs`, "then all of each"). |
+| `Harness` | stream | A session's updates, in order, a stream per session. | On the channel: a stream per session (`s:<session>#<boot>.<gen>`), each update kept until the server has applied it, sent again after a cut from where the server has it. The session goes whole only when its stream starts: at its start, or once a server that restarted lost it. Without the channel (an older runner or server): fire-and-forget, and every connect sends every session whole. |
 | `HarnessInventory` | state | The sessions this machine runs and the harnesses it offers. | Sent on every connect, not acknowledged. |
 | `AiView` | answer | Answers `AiView`. | As its class says. |
 | `Instance` | handshake | Which runner process of its machine this connection is. | As its class says. |

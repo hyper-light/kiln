@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""A stand-in for Claude Code's stream-json mode, for kiln's tests (crates/kiln/tests/wire_updates.rs).
+
+It answers kiln's control requests with success. Each user message it's sent gets a turn of
+FAKE_CLAUDE_LINES assistant messages ("line 00000", "line 00001" ...), FAKE_CLAUDE_EVERY_MS apart,
+then a result. It calls no model and reads no account.
+"""
+import json
+import os
+import sys
+import time
+import uuid
+
+LINES = int(os.environ.get("FAKE_CLAUDE_LINES", "100"))
+EVERY = int(os.environ.get("FAKE_CLAUDE_EVERY_MS", "50")) / 1000.0
+VERSION = "2.1.296"
+
+
+def out(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    args = sys.argv[1:]
+    if "--version" in args:
+        print(f"{VERSION} (Claude Code)")
+        return
+    session = str(uuid.uuid4())
+    for flag in ("--session-id", "--resume"):
+        if flag in args and args.index(flag) + 1 < len(args):
+            session = args[args.index(flag) + 1]
+    for line in sys.stdin:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        kind = m.get("type")
+        if kind == "control_request":
+            req = m.get("request") or {}
+            resp = {}
+            if req.get("subtype") == "initialize":
+                resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": VERSION}
+            out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
+        elif kind == "user":
+            out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": VERSION})
+            for n in range(LINES):
+                out({
+                    "type": "assistant",
+                    "message": {"id": f"msg_{n:05d}", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": f"line {n:05d}"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}},
+                    "parent_tool_use_id": None,
+                    "session_id": session,
+                })
+                time.sleep(EVERY)
+            out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+
+if __name__ == "__main__":
+    main()

@@ -10,6 +10,8 @@
 
 pub mod channel;
 pub mod keep;
+pub mod link;
+pub mod uplink;
 
 use crate::harness::core::Update;
 use crate::harness::model::Command;
@@ -47,8 +49,8 @@ pub enum Class {
     /// numbered, acknowledged cumulatively, sent again after a reconnect from where the receiver
     /// has it; a snapshot only when the sender no longer has what's missing.
     Stream,
-    /// The newest of something that changes (a machine's inventory, a session's state): versioned,
-    /// the newest wins, acknowledged by version and sent again until it is.
+    /// The newest of something that changes (a machine's inventory, a session's state): the newest
+    /// wins, sent again on every connect.
     State,
     /// A protocol of its own carried on the link, which acknowledges and resends by itself.
     Carried(&'static str),

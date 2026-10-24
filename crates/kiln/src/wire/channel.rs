@@ -245,6 +245,17 @@ impl Sender {
         events
     }
 
+    /// Lets go of a stream: it ended, or starts over under another name. What it kept
+    /// unanswered (by number) is dropped with it, never sent.
+    pub fn drop_stream(&mut self, stream: &str) -> Vec<Seq> {
+        self.streams.remove(stream).map(|o| o.pending.into_iter().map(|p| p.seq).collect()).unwrap_or_default()
+    }
+
+    /// The streams this side sends.
+    pub fn streams(&self) -> impl Iterator<Item = &str> {
+        self.streams.keys().map(String::as_str)
+    }
+
     /// What `stream` keeps unanswered, oldest first (what a durable stream keeps on disk).
     pub fn pending(&self, stream: &str) -> Vec<Seq> {
         self.streams.get(stream).map(|o| o.pending.iter().map(|p| p.seq).collect()).unwrap_or_default()
@@ -370,6 +381,11 @@ impl Receiver {
     /// Lets go of a stream that ended (a session closed, a sender's earlier incarnation).
     pub fn forget(&mut self, stream: &str) {
         self.streams.remove(stream);
+    }
+
+    /// Lets go of every stream whose name `drop` picks.
+    pub fn forget_where(&mut self, mut drop: impl FnMut(&str) -> bool) {
+        self.streams.retain(|s, _| !drop(s));
     }
 }
 
