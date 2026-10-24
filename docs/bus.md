@@ -23,17 +23,22 @@ on any device (`crate::harness::live`):
   `meta`, `state`, `state_patch`, `events`, `stream`, `changes`, `files`, `closed`). A state goes
   whole and as what changed in it, and each viewer takes the form it asked for (`?patch=state`).
 - **No frame missed or seen twice.** A viewer (`GET /api/harness/sessions/:id/ws`) is sent a
-  snapshot and reads the feed from the offset the snapshot was taken at: both are taken under the
-  mirrors' lock, which every publish takes too. The lock holds only while the snapshot's parts are
-  taken (its events by reference); the snapshot is made after it's let go, so a viewer starting
-  over never holds up another session's frames.
-- **A viewer that falls behind starts over, alone.** One further behind than the feed keeps is
-  refused `Behind` by the bus (its typed lag notice), and it starts over from a fresh snapshot (with
-  `{"t":"synced"}` after it), as a viewer that fell behind always did. A publish never waits for a
-  viewer, so a stalled one holds up neither the session nor any other viewer.
+  snapshot, or only what changed since the revision it says it has (`?after=`, docs/wire.md,
+  "Revisions"), and reads the feed from the offset that was taken at: both are taken under the
+  mirrors' lock, which every publish takes too. The lock holds only while the parts are taken (the
+  events by reference); the frames are made after it's let go, so a viewer starting over never holds
+  up another session's frames. Each frame on the feed carries the copy's revision, and one a
+  catch-up already held is skipped.
+- **A viewer that falls behind catches up, alone.** One further behind than the feed keeps is
+  refused `Behind` by the bus (its typed lag notice), and it catches up from the last revision it
+  was sent: only what changed since (`resumed`), or the session whole (`open`) when the copy can't
+  tell, with `{"t":"synced"}` after it. A publish never waits for a viewer, so a stalled one holds
+  up neither the session nor any other viewer.
 - **Nothing dropped silently.** A frame the bus refuses (over 1 MiB, or the bus's memory full)
   marks the feed broken: its next frame goes after a resync marker, which sends every viewer reading
-  it back to a snapshot, and the refusal is counted (`kiln_bus_refused_total`). A full bus may
+  it back to catch up as one that fell behind does, and the refusal is counted
+  (`kiln_bus_refused_total`). A copy whose events went another way than its viewers have them (a
+  runner that started again, docs/wire.md) publishes the marker too, and its viewers take it whole. A full bus may
   refuse the marker too, so no viewer relies on it: each counts its feed's refusals and, with
   nothing to read for 4 seconds, starts over if there were more since its snapshot, so every viewer
   of a broken feed starts over within 5 seconds of the refusal. While the bus can't make a session's
