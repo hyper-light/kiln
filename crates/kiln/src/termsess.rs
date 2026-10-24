@@ -539,10 +539,13 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
             match ev {
                 Ev::Out(Some(TermOut::Data(d))) => s.output(&d),
                 Ev::Out(Some(TermOut::Replay(d))) => {
-                    // An adopted session starts from the agent's picture of it.
-                    if s.is_empty() {
-                        s.output(&d);
+                    // An adopted session starts from the agent's picture of it. One that has a
+                    // picture already (its machine's output stream started over, docs/wire.md) is
+                    // repainted from the new one.
+                    if !s.is_empty() {
+                        s.output(b"\x1bc");
                     }
+                    s.output(&d);
                 }
                 Ev::Out(Some(TermOut::Exit { code, error })) => {
                     s.finish(code, error);
