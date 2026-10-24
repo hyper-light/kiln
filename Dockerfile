@@ -43,6 +43,12 @@ COPY .cargo/ .cargo/
 COPY crates/ crates/
 # Turso, vendored for the conversation store (vendor/turso/UPSTREAM.md); kiln depends on it by path.
 COPY vendor/turso/ vendor/turso/
+# Quiver, Focal's bus and hyper-raft, vendored (vendor/MANIFEST.toml): the live feed's bus, kiln's
+# transport, runtime and replicated stores, each a workspace of its own that Cargo.toml's [patch]
+# points kiln's names at.
+COPY vendor/quiver/ vendor/quiver/
+COPY vendor/focal-bus/ vendor/focal-bus/
+COPY vendor/hyper-raft/ vendor/hyper-raft/
 COPY --from=ui /src/ui/dist ui/dist
 # The UI is already built in the `ui` stage; a build.rs must not try to run npm again.
 # The final binary must be fully static (checked below): job pods copy /kiln into arbitrary images.
