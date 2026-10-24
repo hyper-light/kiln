@@ -87,9 +87,11 @@ nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term
 rustix = { version = "1.1", features = ["process", "termios", "net", "thread"] }
 filedescriptor = "0.8"
 
-# Windows: process trees as job objects.
+# Windows: process trees as job objects; a file's identity (its volume and file index), which the
+# log collector knows files by.
 [target.'cfg(windows)'.dependencies]
 command-group = "5.0.1"
+winapi-util = "0.1.11"
 
 [lints]
 workspace = true

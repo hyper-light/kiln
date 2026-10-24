@@ -87,6 +87,20 @@ mod tests {
         assert_eq!(n.get(ID).map(|p| p.pod.as_str()), Some("web-0"));
     }
 
+    /// A directory's handle whose times may be set. Windows opens a directory only with backup
+    /// semantics (`FILE_FLAG_BACKUP_SEMANTICS`), and sets times through one with
+    /// `FILE_WRITE_ATTRIBUTES`.
+    #[cfg(windows)]
+    fn dir_handle(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new().access_mode(0x0100).custom_flags(0x0200_0000).open(p)
+    }
+
+    #[cfg(not(windows))]
+    fn dir_handle(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(p)
+    }
+
     /// Kept between looks: read again when a link comes or goes (the directory's time), at once
     /// while it is a second old (its clock's tick may hide another), and every [`AGAIN`].
     #[test]
@@ -99,7 +113,7 @@ mod tests {
         assert_eq!(kept.of(dir.path(), 10, now).len(), 1, "a link made: read again");
         // Its time as when read, and settled (seconds past): kept, the directory not read again.
         std::fs::remove_file(dir.path().join(format!("web-0_default_nginx-{ID}.log"))).unwrap();
-        std::fs::File::open(dir.path()).unwrap().set_modified(SystemTime::now() - Duration::from_secs(5)).unwrap();
+        dir_handle(dir.path()).unwrap().set_modified(SystemTime::now() - Duration::from_secs(5)).unwrap();
         kept.read = Some((std::fs::metadata(dir.path()).unwrap().modified().unwrap(), now, true));
         assert_eq!(kept.of(dir.path(), 10, now).len(), 1, "its time as when read: kept");
         assert!(kept.of(dir.path(), 10, now + AGAIN).is_empty(), "a minute on: read again");

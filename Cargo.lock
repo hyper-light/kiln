@@ -2056,6 +2056,7 @@ dependencies = [
  "uuid",
  "vt100",
  "webpki-roots",
+ "winapi-util",
  "x509-parser",
 ]
 

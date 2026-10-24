@@ -1,7 +1,7 @@
 //! Files tailed (`docs/observe.md` §8.1), as Datadog's Agent and Vector tail them: the globs
 //! looked at every [`SCAN`], each file read as it grows, from where its last written record ends.
-//! A file is known by its identity (device and inode; off Unix, its creation time, which a rename
-//! keeps) and by its leading bytes, so that:
+//! A file is known by its identity (device and inode; on Windows, its volume's serial number and
+//! its file index) and by its leading bytes, so that:
 //!
 //! - renamed (logrotate's `create`), it is read to its end and closed once it stops growing;
 //! - truncated or rewritten (logrotate's `copytruncate`), it is read again from its start, and its
@@ -71,10 +71,28 @@ fn key_of(m: &std::fs::Metadata, _path: &Path) -> Key {
     Key(m.dev(), m.ino())
 }
 
-/// Off Unix stable Rust has no file index: its creation time, which a rename keeps (its leading
-/// bytes tell a new file that took an old one's from it); failing that, its path.
-#[cfg(not(unix))]
+/// On Windows, its volume's serial number and its file index, as `GetFileInformationByHandle` says
+/// them (stable Rust's metadata has neither): a rename keeps both. Not its creation time: a file
+/// made at a name another was renamed from moments before takes that one's creation time (NTFS's
+/// tunneling, 15 s by default), so the new file of a rotation would pass for the old. Failing that,
+/// its creation time, then its path.
+#[cfg(windows)]
 fn key_of(m: &std::fs::Metadata, path: &Path) -> Key {
+    match File::open(path).and_then(|f| winapi_util::file::information(&f)) {
+        Ok(i) => Key(i.volume_serial_number(), i.file_index()),
+        Err(_) => created_key(m, path),
+    }
+}
+
+/// Elsewhere off Unix: its creation time, which a rename keeps (its leading bytes tell a new file
+/// that took an old one's from it); failing that, its path.
+#[cfg(not(any(unix, windows)))]
+fn key_of(m: &std::fs::Metadata, path: &Path) -> Key {
+    created_key(m, path)
+}
+
+#[cfg(not(unix))]
+fn created_key(m: &std::fs::Metadata, path: &Path) -> Key {
     match m.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
         Some(d) => Key(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX), 1),
         None => Key(fnv(path.to_string_lossy().as_bytes()), 2),
