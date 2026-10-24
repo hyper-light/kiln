@@ -430,8 +430,9 @@ impl Drop for Group {
 
 /// What waits to go into the log, in order, while it has no room. A replica stalled for room
 /// refuses every proposal and makes again only the writes it had taken, so a write the store sent
-/// then would be in kiln.db and never in the log: a hole no learner fills. So each part and barrier
-/// is offered from here, oldest first, and nothing goes before one the log had no room for.
+/// then would be in kiln.db and never in the log, and every learner would need a new copy of the
+/// database for it. So each part and barrier is offered from here, oldest first, and nothing goes
+/// before one the log had no room for.
 #[derive(Default)]
 struct Held {
     items: std::collections::VecDeque<Item>,
@@ -505,7 +506,17 @@ impl Held {
             self.bytes = self.bytes.saturating_sub(item.bytes());
             let what = item.what();
             if let Err(why) = to.offer(item) {
-                refused.push((what, why));
+                refused.push((what, why.clone()));
+                // A write goes into the log whole or not at all: its parts after a refused one go
+                // too, so a learner meets its absence as a gap in the writes' numbers.
+                if let What::Part(seq) = what {
+                    while matches!(self.items.front(), Some(Item::Part(s, _)) if *s == seq) {
+                        if let Some(rest) = self.items.pop_front() {
+                            self.bytes = self.bytes.saturating_sub(rest.bytes());
+                            refused.push((rest.what(), why.clone()));
+                        }
+                    }
+                }
             }
         }
         refused
@@ -733,7 +744,7 @@ impl Driver {
         // Whole or not at all: a learner joins a write's parts before it applies them.
         let bytes: u64 = parts.iter().map(|p| p.len() as u64).sum();
         if self.held.bytes.saturating_add(bytes) > HELD_BYTES {
-            tracing::error!(seq, held = self.held.bytes, "a write kiln.db holds isn't in the cluster log: it has had no room for {} MiB of writes", HELD_BYTES >> 20);
+            tracing::error!(seq, held = self.held.bytes, "a write kiln.db holds isn't in the cluster log: no room for {} MiB of writes (a learner takes a copy at the gap)", HELD_BYTES >> 20);
             return;
         }
         for data in parts {
@@ -935,6 +946,56 @@ impl Machine {
         }
     }
 
+    /// Fetches a copy of the database made now and takes it in whole, as its readers see it at
+    /// once; says it stands at `at` under `configuration`. Its last write's number, now this one's.
+    fn take_a_copy(&mut self, at: Point, configuration: &ConfState) -> Result<u64, Fatal> {
+        let Some(fetch) = self.fetch.clone() else { return Err(Fatal("only a learner takes a copy of the database")) };
+        let part = self.path.with_extension("copy");
+        let took = (|| -> anyhow::Result<u64> {
+            // The server may be busy or a moment away: a few tries before the learner gives up.
+            let mut tried = 0;
+            while let Err(e) = fetch(&part) {
+                tried += 1;
+                if tried >= FETCH_TRIES {
+                    return Err(e.context("fetching a copy of kiln.db"));
+                }
+                tracing::warn!(tried, "fetching a copy of kiln.db: {e:#}");
+                thread::sleep(Duration::from_secs(2 << tried));
+            }
+            {
+                let copy = Connection::open_with_flags(&part, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                rusqlite::backup::Backup::new(&copy, &mut self.conn)?.run_to_completion(4096, Duration::ZERO, None)?;
+            }
+            self.conn.execute_batch("PRAGMA journal_mode = WAL")?;
+            let (_, seq, _) = stands(&self.conn)?;
+            stand(&self.conn, at, configuration)?;
+            Ok(seq)
+        })();
+        std::fs::remove_file(&part).ok();
+        match took {
+            Ok(seq) => {
+                self.seq.store(seq, Ordering::SeqCst);
+                self.known.clear();
+                Ok(seq)
+            }
+            Err(e) => {
+                tracing::error!("a learner couldn't take a copy of kiln.db: {e:#}");
+                Err(Fatal("a copy of kiln.db couldn't be taken"))
+            }
+        }
+    }
+
+    /// A learner meets writes its log lacks: a copy of the database now, said to stand where this
+    /// one is durable (its log holds everything after that; what it applies of it the copy holds
+    /// already is skipped by its `seq`). Its replica answers nothing meanwhile: its last write stays
+    /// behind the server's.
+    fn copy_again(&mut self) -> Result<(), Fatal> {
+        let (at, configuration) = (self.durable, self.configuration.clone());
+        let seq = self.take_a_copy(at, &configuration)?;
+        tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db over writes its log lacked");
+        Ok(())
+    }
+
     /// Applies an entry's rows (a write kiln.db doesn't hold) and, with its last part, its `seq`.
     fn apply_entry(&mut self, e: &Entry) -> anyhow::Result<()> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -979,6 +1040,15 @@ impl StateMachine for Machine {
         match postcard::from_bytes::<Entry>(entry.data) {
             Ok(e) => {
                 self.logged = self.logged.max(e.seq);
+                // A learner hears the writes one number after another. A number past the next is
+                // writes the log lacks (the server stopped before they reached it, or its log had no
+                // room for them), and its replica would answer without them: it takes a copy of the
+                // database first, which has them (the server's kiln.db holds every write).
+                let have = self.seq.load(Ordering::SeqCst);
+                if self.fetch.is_some() && e.part == 0 && e.seq > have.saturating_add(1) {
+                    tracing::warn!(index = entry.index, seq = e.seq, have, "the cluster log lacks writes this replica doesn't hold: it takes a copy of kiln.db");
+                    self.copy_again()?;
+                }
                 // kiln.db holds what this node wrote (it committed it first); a write past that is
                 // one the disk lost from kiln.db and the log kept.
                 // (A large write's number is recorded with its last part, so its parts all apply.)
@@ -1029,45 +1099,13 @@ impl StateMachine for Machine {
     fn install(&mut self, _image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
         // The image is only where the group stands: a learner fetches a copy of the database made
         // now, which stands in for `at` (the entries after `at` it holds already are skipped by
-        // their `seq`), and takes it in whole, as its readers see it at once.
-        let Some(fetch) = self.fetch.clone() else { return Err(Fatal("only a learner takes a copy of the database")) };
-        let part = self.path.with_extension("copy");
-        let took = (|| -> anyhow::Result<u64> {
-            // The server may be busy or a moment away: a few tries before the learner gives up.
-            let mut tried = 0;
-            while let Err(e) = fetch(&part) {
-                tried += 1;
-                if tried >= FETCH_TRIES {
-                    return Err(e.context("fetching a copy of kiln.db"));
-                }
-                tracing::warn!(tried, "fetching a copy of kiln.db: {e:#}");
-                thread::sleep(Duration::from_secs(2 << tried));
-            }
-            {
-                let copy = Connection::open_with_flags(&part, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                rusqlite::backup::Backup::new(&copy, &mut self.conn)?.run_to_completion(4096, Duration::ZERO, None)?;
-            }
-            self.conn.execute_batch("PRAGMA journal_mode = WAL")?;
-            let (_, seq, _) = stands(&self.conn)?;
-            stand(&self.conn, at, configuration)?;
-            Ok(seq)
-        })();
-        std::fs::remove_file(&part).ok();
-        match took {
-            Ok(seq) => {
-                tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db");
-                self.seq.store(seq, Ordering::SeqCst);
-                self.known.clear();
-                self.applied = at;
-                self.durable = at;
-                self.configuration = configuration.clone();
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("a learner couldn't take a copy of kiln.db: {e:#}");
-                Err(Fatal("a copy of kiln.db couldn't be taken"))
-            }
-        }
+        // their `seq`).
+        let seq = self.take_a_copy(at, configuration)?;
+        tracing::info!(index = at.index, seq, "a learner took a copy of kiln.db");
+        self.applied = at;
+        self.durable = at;
+        self.configuration = configuration.clone();
+        Ok(())
     }
 
     fn persist(&mut self) -> Result<(), Fatal> {
@@ -1321,7 +1359,7 @@ mod tests {
     }
 
     /// A log that has room for `left` more proposals, then none until given more; what it took,
-    /// in order; and one item it refuses for good.
+    /// in order; and an item it refuses for good, once.
     struct Room {
         left: usize,
         took: Vec<What>,
@@ -1336,6 +1374,7 @@ mod tests {
         fn offer(&mut self, item: Item) -> Result<(), String> {
             self.left = self.left.saturating_sub(1);
             if self.refuse == Some(item.what()) {
+                self.refuse = None;
                 return Err("refused".into());
             }
             self.took.push(item.what());
@@ -1376,6 +1415,16 @@ mod tests {
         held.push(Item::Part(5, Vec::new()));
         assert_eq!(held.drain(&mut log), [(What::Part(4), "refused".to_string())]);
         assert_eq!(log.took.last(), Some(&What::Part(5)));
+        // Its first part refused, a write's other parts go with it, never offered: the write is
+        // in the log whole or not at all. The write after it goes in.
+        log.refuse = Some(What::Part(9));
+        for item in [Item::Part(9, vec![9; 3]), Item::Part(9, vec![9; 2]), Item::Part(10, Vec::new())] {
+            held.push(item);
+        }
+        let took = log.took.len();
+        assert_eq!(held.drain(&mut log), [(What::Part(9), "refused".to_string()), (What::Part(9), "refused".to_string())]);
+        assert_eq!(log.took.get(took..), Some(&[What::Part(10)][..]), "only the write after it went in");
+        assert_eq!(held.bytes, 0);
         // Given up, everything held is said, in order.
         log.left = 0;
         held.push(Item::Part(6, vec![6]));
@@ -1432,6 +1481,64 @@ mod tests {
         assert_eq!(copies.load(Ordering::SeqCst), 2, "left behind by the log, it took a new copy");
         set(&server, "later", "3")?;
         until("a write after the new copy", || Ok(read("later")?.as_deref() == Some("3")))?;
+        done.store(true, Ordering::SeqCst);
+        links.join().ok();
+        Ok(())
+    }
+
+    /// A write kiln.db holds and the log never got (the server stopped before it reached the log,
+    /// or the log had no room past what's held): a learner meets it as a write number past the
+    /// next, and takes a copy of the database before it applies anything after it. Its last write
+    /// stays behind the server's until then, so its front door answers nothing from it.
+    #[test]
+    fn a_learner_that_meets_a_write_the_log_lacks_takes_a_copy_before_it_goes_on() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("kiln.db");
+        let server = Store::open_grouped(&db, &dir.path().join("cluster"))?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        let g = server.group().context("grouped")?;
+        g.learners([member].into());
+        until("the learner in the configuration", || Ok(g.point().1.learners.contains(&member)))?;
+        let copies = Arc::new(AtomicU64::new(0));
+        let fetch: Fetch = {
+            let (server, copies) = (server.clone(), copies.clone());
+            Arc::new(move |dest: &Path| {
+                copies.fetch_add(1, Ordering::SeqCst);
+                crate::rt::block_on({
+                    let (s, d) = (server.clone(), dest.to_path_buf());
+                    async move { s.copy_for_learner(d).await }
+                })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        set(&server, "after", "2")?;
+        until("the write after the copy on the learner", || Ok(read("after")?.as_deref() == Some("2")))?;
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "it started from a copy");
+        // A write kiln.db commits that never reaches the log, as a stop before it did leaves one.
+        let lost = g.next_seq();
+        {
+            let c = Connection::open(&db)?;
+            c.execute("INSERT INTO kv (k, v) VALUES ('lost', 'l')", [])?;
+            c.execute(&format!("UPDATE {STATE} SET seq = ?1 WHERE one = 1"), [i64::try_from(lost)?])?;
+        }
+        g.seq.store(lost, Ordering::SeqCst);
+        // The next write is numbered past it: the learner meets the gap.
+        set(&server, "next", "3")?;
+        until("the write after the gap on the learner", || Ok(read("next")?.as_deref() == Some("3")))?;
+        assert_eq!(read("lost")?.as_deref(), Some("l"), "it holds the write the log lacked");
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "it took a copy for it");
+        set(&server, "later", "4")?;
+        until("a write after the copy", || Ok(read("later")?.as_deref() == Some("4")))?;
+        assert_eq!(copies.load(Ordering::SeqCst), 2, "one copy for the gap, not one a write");
+        assert_eq!(learner.standing().0, server.group_standing().map_or(0, |s| s.0), "the learner holds the server's last write");
         done.store(true, Ordering::SeqCst);
         links.join().ok();
         Ok(())

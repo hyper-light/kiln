@@ -112,4 +112,7 @@ Watch:
 - Reads for anyone but the owner go to the server (its route table judges them).
 - While the log has no room (stalled under a slow disk), the store's writes wait for it in order
   (`Held`), up to 256 MiB. Past that, a write kiln.db holds goes without its entry, and the
-  server's log says so; a learner then lacks it until it takes a new copy.
+  server's log says so. So does a stop before a write reached the log. A learner meets such a gap
+  as a write number past the next. It takes a new copy of the database before it applies anything
+  after the gap, and its front door answers no read from it until then: its last write stays
+  behind the server's, so reads go to the server.
