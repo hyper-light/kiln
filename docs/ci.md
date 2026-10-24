@@ -2613,9 +2613,25 @@ reusing the results of jobs whose inputs have not changed.
       too).
     - The name reaches the server: on the host `*.localhost` is loopback, and a leg's containers
       have it where the server is (beside `host.docker.internal`), the ones its steps make through
-      its Docker socket too (`ExtraHosts`, but a name they give themselves). docker's build-push
-      and bake actions make their git context of it, which BuildKit's own container fetches; with
-      a port-less `http://kiln.localhost` and no such names, buildx's bake jobs found nothing there.
+      its Docker socket too (`ExtraHosts`, but a name they give themselves). With a port-less
+      `http://kiln.localhost` and no such names, buildx's bake jobs found nothing there.
+    - **BuildKit's container.** docker's build-push and bake actions make their git context of
+      the name, and BuildKit's own container fetches it with git. git's curl takes every
+      `*.localhost` name for its own loopback, whatever `/etc/hosts` says, so the name alone never
+      took it to kiln (*corrected 2026-10-24*: corpus pass 1023d, buildx's own validate jobs). A
+      BuildKit container a leg makes through its socket gets a loopback relay. That is
+      `setup-buildx-action`'s builder, known by its image or buildx's `buildx_buildkit_` name, on
+      a network of its own:
+      - the runner's static kiln (the egress relay's, W18-R08) is mounted into it and run there
+        once it runs, taking connections at `127.0.0.1:<port>`; the name points there too, for
+        what reads `/etc/hosts`;
+      - the runner dials in through a port published on the host's loopback and splices each
+        connection on to the server. Nothing in the container connects to the host, whose firewall
+        need not let containers in, and the server may be anywhere the runner reaches;
+      - a runner without a static kiln gives none, and such a build's git context still fails;
+      - tests: `w08_r08_buildkit_containers_get_a_loopback_relay`, and
+        `w08_r08_a_buildkit_container_reaches_kiln_through_its_relay` with Docker and
+        `KILN_EGRESS_BINARY`.
     - Their artifact calls go only to `ACTIONS_RESULTS_URL` and `GITHUB_API_URL`.
     - The runner puts the real server back in what they print and output, so `artifact-url`
       links to kiln.

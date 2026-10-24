@@ -967,6 +967,8 @@ mod tests {
 
     #[test]
     fn w10_r12_published_to_cloud_storage() -> anyhow::Result<()> {
+        // Cloud Storage's endpoint is the process's, as the GCP fake's tests point it.
+        let _one = crate::cd::targets::fake_gcp::GCP.lock();
         crate::rt::block_on(async {
             let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
             let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
