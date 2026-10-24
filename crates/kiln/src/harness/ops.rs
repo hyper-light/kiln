@@ -50,21 +50,27 @@ pub fn starter(cx: &Cx) -> Result<Starter, Fail> {
         Some(id) => Some(cx.hub.harness.info(id).ok_or_else(|| (StatusCode::FORBIDDEN, format!("kiln doesn't run agent {} any more, so it can't start agents for it", lineage::short(id))))?),
         None => None,
     };
-    Ok(Starter { parent, opener: cx.caller.opener(), actor: cx.caller.name.clone(), plan_run: None })
+    Ok(Starter { parent, opener: cx.caller.opener(), actor: cx.caller.name.clone(), plan_run: None, asker: Some(cx.caller.clone()) })
 }
 
 /// An agent calling may steer, interrupt or end only itself and the agents it started (and theirs).
-fn may_steer(cx: &Cx, id: &str) -> Result<(), Fail> {
-    lineage::may_steer(&cx.hub, &cx.caller, id)
+async fn may_steer(cx: &Cx, id: &str) -> Result<(), Fail> {
+    lineage::may_steer(&cx.hub, &cx.caller, id).await
+}
+
+/// The agent `id` names (or begins), when the caller sees it (docs/agents.md, "Whose agents"):
+/// one it doesn't see answers as one kiln doesn't run.
+async fn seen(cx: &Cx, id: &str) -> Result<Info, Fail> {
+    let info = known(cx, id)?;
+    lineage::may_see(&cx.hub, &cx.caller, &info.id).await?;
+    Ok(info)
 }
 
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
     let (machine, harness, state, parent, run) = (s("machine"), s("harness"), s("state"), s("parent"), s("plan_run"));
-    let agents: Vec<Value> = cx
-        .hub
-        .harness
-        .list()
+    let agents: Vec<Value> = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list())
+        .await
         .iter()
         .filter(|i| machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local")))
         .filter(|i| harness.as_deref().is_none_or(|h| i.kind == h))
@@ -80,7 +86,7 @@ async fn list(cx: Cx, v: Value) -> Out {
 const HEAVY: &[&str] = &["skills", "plugins", "mcp", "harness_status", "delivery", "control_values", "inventory", "limits", "stop_waived"];
 
 async fn get(cx: Cx, v: Value) -> Out {
-    let info = known(&cx, &agent_of(&v)?)?;
+    let info = seen(&cx, &agent_of(&v)?).await?;
     let id = info.id.clone();
     let (mut state, _, _) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     if let Some(o) = state.as_object_mut() {
@@ -209,6 +215,11 @@ fn flag(v: &Value, k: &str) -> bool {
 async fn wait_for(cx: Cx, v: Value) -> Out {
     // Each by its id or the start of it; one kiln doesn't run (any more) has ended.
     let ids: Vec<String> = ids_of(&v)?.into_iter().map(|id| known(&cx, &id).map_or(id, |i| i.id)).collect();
+    for id in &ids {
+        if cx.hub.harness.info(id).is_some() {
+            lineage::may_see(&cx.hub, &cx.caller, id).await?;
+        }
+    }
     let until = match v.get("until").and_then(Value::as_str).unwrap_or("settled") {
         "settled" => Until::Settled,
         "change" => Until::Change,
@@ -249,7 +260,7 @@ fn reply_of(e: &Value) -> Option<Value> {
 }
 
 async fn result(cx: Cx, v: Value) -> Out {
-    let info = known(&cx, &agent_of(&v)?)?;
+    let info = seen(&cx, &agent_of(&v)?).await?;
     let id = info.id.clone();
     // Its parent reading it now isn't told of it again (`told`).
     if info.parent.is_some() && info.parent == cx.caller.agent {
@@ -286,14 +297,14 @@ async fn result(cx: Cx, v: Value) -> Out {
 
 async fn change(cx: Cx, v: Value) -> Out {
     let info = known(&cx, &agent_of(&v)?)?;
-    may_steer(&cx, &info.id)?;
+    may_steer(&cx, &info.id).await?;
     let want: crate::workspace::change::Want = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
     let r = crate::workspace::change::open(&cx.hub, &cx.caller.name, &info, want).await?;
     Ok(json!({"change_request": crate::workspace::change::shown(&r)}))
 }
 
 async fn workspace(cx: Cx, v: Value) -> Out {
-    let info = known(&cx, &agent_of(&v)?)?;
+    let info = seen(&cx, &agent_of(&v)?).await?;
     let Some(w) = info.workspace.clone() else {
         return Ok(json!({"workspace": Value::Null, "drift": []}));
     };
@@ -303,7 +314,7 @@ async fn workspace(cx: Cx, v: Value) -> Out {
 
 async fn land(cx: Cx, v: Value) -> Out {
     let info = known(&cx, &agent_of(&v)?)?;
-    may_steer(&cx, &info.id)?;
+    may_steer(&cx, &info.id).await?;
     if info.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
         return Err((StatusCode::CONFLICT, format!("{} works in its folder itself: what it changed is there already", info.name)));
     }
@@ -327,9 +338,20 @@ async fn changes(cx: Cx, v: Value) -> Out {
     let list: Vec<Value> = match one {
         Some(a) => {
             let id = known(&cx, a).map_or_else(|_| a.to_owned(), |i| i.id);
+            if cx.hub.harness.info(&id).is_some() {
+                lineage::may_see(&cx.hub, &cx.caller, &id).await?;
+            }
             crate::workspace::change::of(&cx.hub, &id).await.iter().map(crate::workspace::change::shown).collect()
         }
-        None => crate::workspace::change::all(&cx.hub).await.iter().map(crate::workspace::change::shown).collect(),
+        None => {
+            let mut out = Vec::new();
+            for r in crate::workspace::change::all(&cx.hub).await {
+                if cx.hub.harness.info(&r.agent).is_none() || lineage::may_see(&cx.hub, &cx.caller, &r.agent).await.is_ok() {
+                    out.push(crate::workspace::change::shown(&r));
+                }
+            }
+            out
+        }
     };
     Ok(json!({"changes": list}))
 }
@@ -337,7 +359,7 @@ async fn changes(cx: Cx, v: Value) -> Out {
 async fn interrupt(cx: Cx, v: Value) -> Out {
     let info = known(&cx, &agent_of(&v)?)?;
     let id = info.id.clone();
-    may_steer(&cx, &id)?;
+    may_steer(&cx, &id).await?;
     match cx.hub.harness.command(&cx.hub, &id, Command::Interrupt).await {
         Sent::Ok => Ok(json!({"interrupted": true})),
         Sent::NoSession => Err((StatusCode::NOT_FOUND, format!("no agent {id}"))),
@@ -357,7 +379,7 @@ pub async fn end(hub: &crate::hub::Hub, id: &str, actor: &str) -> bool {
 
 async fn stop(cx: Cx, v: Value) -> Out {
     let id = known(&cx, &agent_of(&v)?)?.id;
-    may_steer(&cx, &id)?;
+    may_steer(&cx, &id).await?;
     let mut ended: Vec<String> = Vec::new();
     // Its children first (those that ended too: they leave with it), the deepest first, so none
     // outlives the one it reports to.
@@ -377,7 +399,7 @@ async fn stop(cx: Cx, v: Value) -> Out {
 }
 
 async fn children(cx: Cx, v: Value) -> Out {
-    let id = known(&cx, &agent_of(&v)?)?.id;
+    let id = seen(&cx, &agent_of(&v)?).await?.id;
     Ok(json!({"children": lineage::children_brief(&cx.hub, &id)}))
 }
 

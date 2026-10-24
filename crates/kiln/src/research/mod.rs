@@ -777,7 +777,7 @@ mod checked_tests {
                 hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
                 let folder = tempfile::tempdir()?;
                 std::fs::write(folder.path().join("store.rs"), "pub fn search(&self,\n    q: Query) -> Vec<Row> {}\n")?;
-                let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+                let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
                 let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(folder.path().to_string_lossy().into_owned()), name: Some("R".into()), count: Some(1), ..Ask::default() };
                 let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
                 let r = super::start(&hub, "Does the store search?", Some(&a.id), "admin", None).await?;

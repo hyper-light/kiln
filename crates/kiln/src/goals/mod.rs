@@ -3048,7 +3048,7 @@ mod stack_tests {
             });
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let folder = tempfile::tempdir()?;
-            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask {
                 kind: "claude".into(),
                 on: Some("local".into()),
@@ -3293,7 +3293,7 @@ mod stack_tests {
             });
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             let folder = tempfile::tempdir()?;
-            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+            let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask {
                 kind: "claude".into(),
                 on: Some("local".into()),
@@ -3461,7 +3461,7 @@ mod stack_tests {
         });
         hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         let folder = tempfile::tempdir()?;
-        let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None };
+        let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
         let ask = Ask {
             kind: "claude".into(),
             on: Some("local".into()),

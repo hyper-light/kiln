@@ -113,6 +113,21 @@ pub fn opener_key(id: &str) -> String {
     format!("agents/opener/{id}")
 }
 
+/// Where the person who opened agent session `id` is kept, whatever token they used.
+pub fn opened_by_key(id: &str) -> String {
+    format!("agents/opened-by/{id}")
+}
+
+/// Whose agent session `session` is (`owner` or `user:<id>`): the person who opened it, whatever
+/// token they used (docs/agents.md, "Whose agents"), else whom it acts for ([`acts_for`]). One
+/// opened with a token narrower than its person acts for no one, but is still theirs.
+pub async fn whose(hub: &Hub, session: &str) -> Option<String> {
+    match hub.store.kv_get(opened_by_key(session)).await.ok().flatten() {
+        Some(p) => Some(p),
+        None => acts_for(hub, session).await,
+    }
+}
+
 /// Whom agent session `session` acts for (`owner` or `user:<id>`): whoever started it, or for one
 /// started with `kiln spawn` in a kiln shell, whoever opened that shell; the owner on a kiln nobody
 /// else signs in to. `None`: kiln doesn't know.

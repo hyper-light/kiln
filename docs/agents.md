@@ -334,6 +334,40 @@ timeline when the session turns idle (Codex's latest 100 turns, listed with
 `/rename` into its transcript with the next exchange: a name given just before the session ends
 is not kept.
 
+## Whose agents
+
+Each agent session is someone's: the person who opened it, whatever token they used, or the person
+it acts for (`crate::mcp::whose`). A child is its parent's person's.
+
+| Caller | Reaches |
+|---|---|
+| The owner, or a person with `agents.manage` (the `maintainer` role has it) | every session: lists, reads, watches, commands and closes it |
+| Any other person | their own sessions, their children included, as fully; no other |
+| An agent | itself and the agents it started (and theirs), to steer, interrupt and end; it sees (lists, reads, watches) the other agents that work for its person, and may send them queued messages ("Messages between agents") |
+| A job, a peer | no session |
+
+A session a caller doesn't reach is one kiln doesn't run, as far as they can tell. It isn't in their
+list (`GET /api/harness/sessions`, `agents.list`, the events socket's agent events, conversation
+search). Every route under `/api/harness/sessions/<id>` and the session's socket answer 404, the
+socket before it's upgraded. So do the agents operations (`get`, `children`, `result`, `changes`,
+`workspace`, `send`, `interrupt`, `stop`, `change`, `land`, `wait`), over MCP and `/api/ops`. A
+session they see but don't act on (an agent watching a fellow agent) is read-only: its socket
+answers each command with an error. A broadcast and `POST /api/harness/command` pick only among
+the sessions the caller acts on, and name the others they were asked for (`unreached`). A session
+kiln can't say whose it is (opened before kiln kept that) is reached by the owner and managers
+alone.
+
+Agents run programs as their machine's user, as terminals do, so opening one needs
+`runners.terminal` on that machine: `runner:<name>`, or the server's own scope for `local`. That
+holds for `POST /api/harness/sessions`, for `agents.start`, and for a plan's steps, which start
+only where the person who ran the plan could start them. The sessions found running on a machine
+(`/api/ai-sessions`: listed, read, taken over or branched) and the ones it keeps
+(`/api/harness/history`) need it too. A session taken over or branched is the person's who did it.
+
+Commands and closes are audited as the person who made them. A request's own row names them, and
+what its handlers note joins that row. A command sent on a session's socket gets a row of its own,
+`agent.command`, which names the command's kind but not what it says.
+
 ## Agents that run agents
 
 An agent can start agents for parts of its work, on any machine, wait for them and read what
