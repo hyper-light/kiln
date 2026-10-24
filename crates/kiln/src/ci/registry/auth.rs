@@ -210,6 +210,26 @@ pub fn challenge(hub: &Hub, scope: Option<(&str, &[Action])>) -> String {
     }
 }
 
+/// Whether `host` (a request's `Host`) is the GHES stand-in's name, at any port
+/// ([`crate::runner::runtime::NOT_GHES_HOST`]).
+pub fn is_stand_in(host: &str) -> bool {
+    kiln_ci::trust::split_host(host).0 == crate::runner::runtime::NOT_GHES_HOST
+}
+
+/// `r` with its challenge's realm at `host` over plain HTTP, when it names the public URL's
+/// (`public_url`): what came by the GHES stand-in's name gets its token there.
+pub fn realm_at(mut r: crate::http::server::Response, public_url: &str, host: &str) -> crate::http::server::Response {
+    use http::header::WWW_AUTHENTICATE;
+    let public = format!("realm=\"{}/v2/token\"", public_url.trim_end_matches('/'));
+    let Some(www) = r.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).filter(|w| w.contains(&public)).map(|w| w.replace(&public, &format!("realm=\"http://{host}/v2/token\""))) else {
+        return r;
+    };
+    if let Ok(v) = http::HeaderValue::from_str(&www) {
+        r.headers_mut().insert(WWW_AUTHENTICATE, v);
+    }
+    r
+}
+
 /// A challenge for several names' access at once (a mount: the target's push, the source's pull).
 pub fn challenge_for(hub: &Hub, scopes: &[(&str, &[Action])]) -> String {
     let realm = format!("{}/v2/token", hub.cfg.server.public_url.trim_end_matches('/'));
@@ -220,6 +240,29 @@ pub fn challenge_for(hub: &Hub, scopes: &[(&str, &[Action])]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What comes by the GHES stand-in's name (a BuildKit container's, through its loopback relay)
+    /// is told to get its token there, over plain HTTP; other challenges, and other names, as they were.
+    #[test]
+    fn w12_r02_the_stand_ins_challenge_names_the_stand_in() -> anyhow::Result<()> {
+        use http::header::WWW_AUTHENTICATE;
+        assert!(is_stand_in("kiln.localhost:42511") && is_stand_in("KILN.localhost") && !is_stand_in("kiln.example:42511") && !is_stand_in("127.0.0.1:42511"));
+        let challenged = |www: &str| {
+            let mut r = crate::http::server::json(http::StatusCode::UNAUTHORIZED, &serde_json::json!({}));
+            if let Ok(v) = http::HeaderValue::from_str(www) {
+                r.headers_mut().insert(WWW_AUTHENTICATE, v);
+            }
+            r
+        };
+        let www = |r: &crate::http::server::Response| r.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let public = "https://kiln.example/";
+        let r = realm_at(challenged("Bearer realm=\"https://kiln.example/v2/token\",service=\"kiln\",scope=\"repository:docker.io/library/alpine:pull\""), public, "kiln.localhost:443");
+        assert_eq!(www(&r).as_deref(), Some("Bearer realm=\"http://kiln.localhost:443/v2/token\",service=\"kiln\",scope=\"repository:docker.io/library/alpine:pull\""));
+        assert_eq!(r.headers().get_all(WWW_AUTHENTICATE).iter().count(), 1);
+        let theirs = realm_at(challenged("Basic realm=\"kiln\""), public, "kiln.localhost:443");
+        assert_eq!(www(&theirs).as_deref(), Some("Basic realm=\"kiln\""));
+        Ok(())
+    }
 
     #[test]
     fn w12_r01_scopes() {

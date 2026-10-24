@@ -266,8 +266,20 @@ pub async fn token(hub: &Arc<Hub>, req: Request) -> Response {
     base(srv::json(StatusCode::OK, &json!({ "token": t, "access_token": t, "expires_in": auth::TOKEN_SECS, "issued_at": issued })))
 }
 
-/// `/v2/…`: the registry. `rest` is the path after `/v2`.
+/// `/v2/…`: the registry. `rest` is the path after `/v2`. A request by the GHES stand-in's name (a
+/// BuildKit container's, through its loopback relay: docs/ci.md W08-R08, W12-R02) is told to ask
+/// for its token there too, over plain HTTP as it came: the public URL may be one it can't reach,
+/// or whose certificate it doesn't trust.
 pub async fn serve(hub: &Arc<Hub>, rest: &str, req: Request) -> Response {
+    let stand_in = srv::header_str(&req, &header::HOST).filter(|h| auth::is_stand_in(h)).map(str::to_owned);
+    let r = serve_v2(hub, rest, req).await;
+    match stand_in {
+        Some(host) => auth::realm_at(r, &hub.cfg.server.public_url, &host),
+        None => r,
+    }
+}
+
+async fn serve_v2(hub: &Arc<Hub>, rest: &str, req: Request) -> Response {
     let Some(route) = route_of(rest) else { return err(StatusCode::NOT_FOUND, "NAME_UNKNOWN", "no such route").response(hub, None) };
     let needed = needs(&route, req.method());
     let who = match who(hub, &req).await {

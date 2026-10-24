@@ -16,3 +16,23 @@ mysql = { version = "26", default-features = false, features = ["minimal"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# kiln names its vendored crates by version and patches each name to its one copy (kiln's root
+# Cargo.toml, docs/vendoring.md): a workspace of its own patches them the same way, so no name
+# resolves to an unrelated crate on crates.io.
+[patch.crates-io]
+focal-bus = { path = "../../vendor/focal-bus/crates/focal-bus" }
+focal-memory = { path = "../../vendor/focal-bus/crates/focal-memory" }
+hyper-block = { path = "../../vendor/hyper-raft/crates/hyper-block" }
+hyper-durable = { path = "../../vendor/hyper-raft/crates/hyper-durable" }
+hyper-liveness = { path = "../../vendor/hyper-raft/crates/hyper-liveness" }
+hyper-log = { path = "../../vendor/hyper-raft/crates/hyper-log" }
+hyper-quic = { path = "../../vendor/hyper-raft/crates/hyper-quic" }
+hyper-raft = { path = "../../vendor/hyper-raft/crates/hyper-raft" }
+hyper-rt = { path = "../../vendor/hyper-raft/crates/hyper-rt" }
+hyper-rt-transport = { path = "../../vendor/hyper-raft/crates/hyper-rt-transport" }
+hyper-seal = { path = "../../vendor/hyper-raft/crates/hyper-seal" }
+hyper-timing = { path = "../../vendor/hyper-raft/crates/hyper-timing" }
+hyper-transport = { path = "../../vendor/hyper-raft/crates/hyper-transport" }
+quiver = { path = "../../vendor/quiver/crates/quiver" }
+quiver-api = { path = "../../vendor/quiver/crates/quiver-api" }

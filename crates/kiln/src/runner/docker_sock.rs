@@ -81,6 +81,9 @@ impl Paths {
 /// `p` with `.` and `..` resolved as written: never above `/`.
 /// Where a static kiln goes in a BuildKit container the leg makes.
 const RELAY_PATH: &str = "/.kiln-relay";
+/// Where kiln's config for it goes (outside `/etc/buildkit`, which buildx copies a workflow's own
+/// config into).
+const BUILDKITD_PATH: &str = "/.kiln-buildkitd.toml";
 
 /// What a BuildKit container a leg makes needs to reach kiln by the GHES stand-in's name
 /// (`kiln.localhost`, docs/ci.md W08-R08): BuildKit fetches a build's git context with git, whose
@@ -99,6 +102,9 @@ pub struct Loopback {
     pub server: (String, u16),
     /// The CLI the runner sets the relay up with.
     pub cli: super::docker::Cli,
+    /// BuildKit's config naming kiln's pull-through caches ([`buildkitd_config`]), where the runner
+    /// wrote it: `None` when kiln mirrors no registry.
+    pub buildkitd: Option<PathBuf>,
 }
 
 impl Loopback {
@@ -109,8 +115,28 @@ impl Loopback {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
         let (host, port) = kiln_ci::trust::split_host(authority.rsplit_once('@').map_or(authority, |(_, h)| h));
         let port = port.unwrap_or(if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 });
-        (!host.is_empty()).then_some(Loopback { binary, port, server: (host, port), cli })
+        (!host.is_empty()).then_some(Loopback { binary, port, server: (host, port), cli, buildkitd: None })
     }
+}
+
+/// BuildKit's config for the registries kiln mirrors (`(upstream, prefix)`, docs/ci.md W12-R02):
+/// each upstream's mirror is kiln's, under its prefix (`/v2/<prefix>/…`), by the stand-in's name at
+/// `port`, which a BuildKit container's loopback relay takes to kiln, over plain HTTP as the
+/// stand-in is. BuildKit goes to the upstream itself when the mirror can't answer.
+pub fn buildkitd_config(mirrors: &[(String, String)], port: u16) -> anyhow::Result<String> {
+    let host = format!("{}:{port}", super::runtime::NOT_GHES_HOST);
+    let mut registry = toml::Table::new();
+    for (upstream, prefix) in mirrors {
+        let mut one = toml::Table::new();
+        one.insert("mirrors".into(), toml::Value::Array(vec![toml::Value::String(format!("{host}/{}", prefix.trim_matches('/')))]));
+        registry.insert(upstream.clone(), toml::Value::Table(one));
+    }
+    let mut plain = toml::Table::new();
+    plain.insert("http".into(), toml::Value::Boolean(true));
+    registry.insert(host, toml::Value::Table(plain));
+    let mut top = toml::Table::new();
+    top.insert("registry".into(), toml::Value::Table(registry));
+    Ok(format!("# kiln's pull-through caches (docs/ci.md W12-R02), through the loopback relay (W08-R08).\n{}", toml::to_string(&top)?))
 }
 
 /// Whether `v`, the create of a container `name`d so, is a BuildKit daemon's (a `docker-container`
@@ -124,10 +150,23 @@ fn wants_relay(v: &Value, name: &str) -> bool {
 
 /// A BuildKit container's create made ready for its relay: the static kiln mounted at
 /// [`RELAY_PATH`], the relay's runner port published on the host's loopback, and the stand-in's
-/// name its own loopback for what reads `/etc/hosts` too.
-fn with_relay(v: &mut Value, binary: &Path) -> bool {
+/// name its own loopback for what reads `/etc/hosts` too. With kiln's config for BuildKit
+/// (`buildkitd`), BuildKit reads it, unless the workflow gave its own (a `--config` of buildx's).
+fn with_relay(v: &mut Value, binary: &Path, buildkitd: Option<&Path>) -> bool {
     let port = format!("{}/tcp", super::egress::RUNNER_PORT);
+    let configured = v.get("Cmd").and_then(Value::as_array).is_some_and(|args| args.iter().filter_map(Value::as_str).any(|a| a == "--config" || a.starts_with("--config=")));
+    let entrypoint = v.get("Entrypoint").is_some_and(|e| e.as_array().is_some_and(|a| !a.is_empty()) || e.as_str().is_some_and(|e| !e.is_empty()));
+    let buildkitd = buildkitd.filter(|_| !configured && !entrypoint);
     let Some(o) = v.as_object_mut() else { return false };
+    if buildkitd.is_some() {
+        let cmd = o.entry("Cmd").or_insert(Value::Null);
+        if !cmd.is_array() {
+            *cmd = serde_json::json!([]);
+        }
+        if let Some(args) = cmd.as_array_mut() {
+            args.extend([Value::String("--config".into()), Value::String(BUILDKITD_PATH.into())]);
+        }
+    }
     let exposed = o.entry("ExposedPorts").or_insert(Value::Null);
     if !exposed.is_object() {
         *exposed = serde_json::json!({});
@@ -142,6 +181,9 @@ fn with_relay(v: &mut Value, binary: &Path) -> bool {
     }
     if let Some(b) = binds.as_array_mut() {
         b.push(Value::String(format!("{}:{RELAY_PATH}:ro", binary.display())));
+        if let Some(config) = buildkitd {
+            b.push(Value::String(format!("{}:{BUILDKITD_PATH}:ro", config.display())));
+        }
     }
     let published = hc.entry("PortBindings").or_insert(Value::Null);
     if !published.is_object() {
@@ -630,7 +672,7 @@ fn rewrite(gather: &Gather, body: &[u8], paths: &Paths, names: &mut Names, loopb
             let named = name_references(&mut v, names, name.as_deref());
             // After the mounts' translation: the static kiln's path is the host's.
             let relay = match (loopback, name) {
-                (Some(l), Some(n)) if wants_relay(&v, n) && with_relay(&mut v, &l.binary) => {
+                (Some(l), Some(n)) if wants_relay(&v, n) && with_relay(&mut v, &l.binary, l.buildkitd.as_deref()) => {
                     *relayed = Some(names.own(Kind::Container, n));
                     true
                 }
@@ -1434,6 +1476,9 @@ impl Drop for Socket {
         self.task.abort();
         self.leg.stop.cancel();
         let _ = std::fs::remove_file(&self.path);
+        if let Some(config) = self.leg.loopback.read().as_ref().and_then(|l| l.buildkitd.as_ref()) {
+            let _ = std::fs::remove_file(config);
+        }
     }
 }
 
@@ -1890,6 +1935,163 @@ mod tests {
             assert_eq!(relayed, None, "{name:?} {body}");
             assert!(!out.to_string().contains(RELAY_PATH), "{out}");
         }
+        Ok(())
+    }
+
+    /// Where kiln mirrors Docker Hub (W12-R02), a builder buildx makes through a leg's socket (its
+    /// `docker-container` driver, as `setup-buildx-action` uses) pulls a `FROM` image through kiln,
+    /// by the stand-in's name through its loopback relay: the image is only at a mirror on the
+    /// runner's loopback, so the build finds it there or not at all. Needs Docker, buildx, BuildKit's
+    /// image here already (nothing is pulled from Docker Hub) and a static kiln (`KILN_EGRESS_BINARY`).
+    #[test]
+    fn w12_r02_a_buildkit_builder_pulls_through_kiln() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let Some(bin) = super::super::docker::find() else { return Ok(()) };
+        let Some(binary) = super::super::egress::relay_binary() else { return Ok(()) };
+        let have = |args: &[&str]| std::process::Command::new(&bin).args(args).output().is_ok_and(|o| o.status.success());
+        if !Path::new("/var/run/docker.sock").exists() || super::super::docker::host_network() || !have(&["buildx", "version"]) || !have(&["image", "inspect", "moby/buildkit:buildx-stable-1"]) {
+            return Ok(());
+        }
+        // An image of no layers, at a mirror on the runner's loopback only.
+        let config = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{}}"#.to_vec();
+        let digest = |b: &[u8]| format!("sha256:{}", crate::util::sha256_hex(b));
+        let (config_digest, config_size) = (digest(&config), config.len());
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config_size},
+            "layers": []
+        }))?;
+        let manifest_digest = digest(&manifest);
+        let mirror = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = mirror.local_addr()?.port();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for conn in mirror.incoming().flatten() {
+                let (config, manifest, config_digest, manifest_digest, seen) = (config.clone(), manifest.clone(), config_digest.clone(), manifest_digest.clone(), Arc::clone(&seen));
+                std::thread::spawn(move || {
+                    let mut conn = conn;
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && head.len() < 64 << 10 && conn.read(&mut byte).is_ok_and(|n| n == 1) {
+                        head.extend_from_slice(&byte);
+                    }
+                    let line = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_owned();
+                    let mut words = line.split_whitespace();
+                    let (method, target) = (words.next().unwrap_or_default().to_owned(), words.next().unwrap_or_default().to_owned());
+                    seen.lock().push(format!("{method} {target}"));
+                    // A mirror is asked with the upstream's name in `ns` (`?ns=docker.io`).
+                    let at = target.split('?').next().unwrap_or_default().to_owned();
+                    let image = "/v2/docker.io/library/kiln-mirror-probe";
+                    let (status, kind, body): (&str, &str, Vec<u8>) = if at == format!("{image}/manifests/1") || at == format!("{image}/manifests/{manifest_digest}") {
+                        ("200 OK", "application/vnd.oci.image.manifest.v1+json", manifest)
+                    } else if at == format!("{image}/blobs/{config_digest}") {
+                        ("200 OK", "application/vnd.oci.image.config.v1+json", config)
+                    } else if at == "/v2/" {
+                        ("200 OK", "application/json", b"{}".to_vec())
+                    } else {
+                        ("404 Not Found", "application/json", br#"{"errors":[{"code":"NAME_UNKNOWN","message":"not here"}]}"#.to_vec())
+                    };
+                    let _ = write!(conn, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nDocker-Content-Digest: {}\r\nConnection: close\r\n\r\n", body.len(), digest(&body));
+                    if method != "HEAD" {
+                        let _ = conn.write_all(&body);
+                    }
+                });
+            }
+        });
+        let tmp = tempfile::tempdir()?;
+        let context = tmp.path().join("context");
+        std::fs::create_dir_all(&context)?;
+        std::fs::write(context.join("Dockerfile"), "FROM docker.io/library/kiln-mirror-probe:1\nCOPY f /f\n")?;
+        std::fs::write(context.join("f"), "built\n")?;
+        let buildkitd = tmp.path().join("buildkitd.toml");
+        std::fs::write(&buildkitd, buildkitd_config(&[("docker.io".into(), "docker.io".into())], port)?)?;
+        let (at, dir) = (tmp.path().join("leg.sock"), tmp.path().to_owned());
+        let leg = format!("test-mirror-{}", std::process::id());
+        let builder = format!("kiln-mirror-{}", std::process::id());
+        crate::rt::block_on(async move {
+            let cli = super::super::docker::Cli::new(&bin, dir.join("docker")).owned_by(&dir);
+            let socket = Socket::listen(at.clone(), PathBuf::from("/var/run/docker.sock"), Names::for_leg(&leg, cli.owner())).await?;
+            socket.set_paths(Paths::new(None, Vec::new()));
+            let l = Loopback::new(binary, &format!("http://127.0.0.1:{port}"), cli.clone()).ok_or_else(|| anyhow::anyhow!("no loopback"))?;
+            socket.set_loopback(Loopback { buildkitd: Some(buildkitd), ..l });
+            // buildx's own state stays here, not in the user's.
+            let env =
+                std::collections::BTreeMap::from([("DOCKER_HOST".to_owned(), format!("unix://{}", at.display())), ("BUILDX_CONFIG".to_owned(), dir.join("buildx").to_string_lossy().into_owned())]);
+            let checked: anyhow::Result<()> = async {
+                docker_at(&cli, &env, &["buildx", "create", "--name", &builder, "--driver", "docker-container", "--driver-opt", "image=moby/buildkit:buildx-stable-1", "--bootstrap"]).await?;
+                let container = format!("buildx_buildkit_{builder}0");
+                // Its relay is up once it answers at the stand-in's name (a workflow's next steps
+                // give it that time).
+                let mut up = false;
+                for _ in 0..60 {
+                    let probe = format!("http://kiln.localhost:{port}/v2/");
+                    if docker_at(&cli, &env, &["exec", &container, "wget", "-qO-", "-T", "5", &probe]).await.is_ok() {
+                        up = true;
+                        break;
+                    }
+                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                anyhow::ensure!(up, "the builder's relay never answered");
+                let context = context.to_string_lossy().into_owned();
+                let built = docker_at(&cli, &env, &["buildx", "build", "--builder", &builder, "--progress", "plain", "--output", "type=cacheonly", &context]).await;
+                let asked = asked.lock().clone();
+                anyhow::ensure!(built.is_ok(), "the build: {built:?}; the mirror was asked {asked:?}");
+                anyhow::ensure!(asked.iter().any(|a| a.contains("/v2/docker.io/library/kiln-mirror-probe/manifests/1")), "the mirror was asked {asked:?}");
+                Ok(())
+            }
+            .await;
+            let _ = docker_at(&cli, &env, &["buildx", "rm", &builder]).await;
+            // What the leg made goes with it, whatever buildx left.
+            super::super::docker::Containers::start(cli.clone(), &leg, super::super::docker::PathMap::new(Vec::new()), "/w", None, Vec::new(), None, &|_| {}).await?.stop().await;
+            drop(socket);
+            checked
+        })
+    }
+
+    /// Where kiln mirrors registries (W12-R02), a BuildKit container a leg makes reads kiln's
+    /// config naming them, by the stand-in's name over plain HTTP; one the workflow configured
+    /// itself (buildx's `--config`), or whose entrypoint isn't BuildKit's, keeps its own.
+    #[test]
+    fn w12_r02_buildkit_containers_pull_through_kiln() -> anyhow::Result<()> {
+        use serde_json::json;
+        let config = buildkitd_config(&[("docker.io".into(), "docker.io".into()), ("ghcr.io".into(), "/mirrors/ghcr/".into())], 42511)?;
+        let read: toml::Table = toml::from_str(&config)?;
+        let registry = read.get("registry").and_then(toml::Value::as_table).ok_or_else(|| anyhow::anyhow!("no registry: {config}"))?;
+        let mirrors = |upstream: &str| {
+            registry.get(upstream).and_then(|r| r.get("mirrors")).and_then(toml::Value::as_array).map(|m| m.iter().filter_map(toml::Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+        };
+        assert_eq!(mirrors("docker.io"), Some(vec!["kiln.localhost:42511/docker.io".to_owned()]), "{config}");
+        assert_eq!(mirrors("ghcr.io"), Some(vec!["kiln.localhost:42511/mirrors/ghcr".to_owned()]), "{config}");
+        assert_eq!(registry.get("kiln.localhost:42511").and_then(|r| r.get("http")).and_then(toml::Value::as_bool), Some(true), "{config}");
+        let flags = |v: &Value| v.get("Cmd").cloned().unwrap_or_default();
+        let binds = |v: &Value| v.pointer("/HostConfig/Binds").and_then(Value::as_array).map(|b| b.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+        let (binary, at) = (PathBuf::from("/opt/kiln/kiln-musl"), PathBuf::from("/work/w/1234.buildkitd.toml"));
+        // As setup-buildx-action has buildx make its builder.
+        let mut v = json!({"Image": "moby/buildkit:buildx-stable-1", "Cmd": ["--allow-insecure-entitlement=network.host"], "HostConfig": {"Privileged": true}});
+        assert!(with_relay(&mut v, &binary, Some(&at)));
+        assert_eq!(flags(&v), json!(["--allow-insecure-entitlement=network.host", "--config", BUILDKITD_PATH]));
+        assert_eq!(binds(&v), ["/opt/kiln/kiln-musl:/.kiln-relay:ro", "/work/w/1234.buildkitd.toml:/.kiln-buildkitd.toml:ro"]);
+        // No flags at all: BuildKit's entrypoint takes kiln's alone.
+        let mut bare = json!({"Image": "moby/buildkit:v0.25.1", "Cmd": null});
+        assert!(with_relay(&mut bare, &binary, Some(&at)));
+        assert_eq!(flags(&bare), json!(["--config", BUILDKITD_PATH]));
+        // The workflow's own config, or another entrypoint: kiln's isn't given.
+        for (cmd, entrypoint) in [
+            (json!(["--debug", "--config", "/etc/buildkit/buildkitd.toml"]), json!(null)),
+            (json!(["--config=/etc/buildkit/buildkitd.toml"]), json!(null)),
+            (json!(["--debug"]), json!(["/bin/sh", "-c"])),
+        ] {
+            let mut theirs = json!({"Image": "moby/buildkit:master", "Cmd": cmd.clone(), "Entrypoint": entrypoint});
+            assert!(with_relay(&mut theirs, &binary, Some(&at)));
+            assert_eq!(flags(&theirs), cmd);
+            assert_eq!(binds(&theirs), ["/opt/kiln/kiln-musl:/.kiln-relay:ro"]);
+        }
+        // Without mirrors, none.
+        let mut plain = json!({"Image": "moby/buildkit:buildx-stable-1", "Cmd": ["--debug"]});
+        assert!(with_relay(&mut plain, &binary, None));
+        assert_eq!(flags(&plain), json!(["--debug"]));
         Ok(())
     }
 

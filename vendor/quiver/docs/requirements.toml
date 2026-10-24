@@ -1,0 +1,183 @@
+# Quiver's requirement registry: the goals of track T2 of kiln's critical path (kiln plan
+# 01a157fdefc37396957ea10adb51a19f), each acceptance criterion (AC-T2.n.k) and test (T-T2.n.k) with its ID,
+# from the plan's version below on 2026-10-20. Code comments, commits, tests and benchmarks cite these IDs;
+# kiln's citation gate (CP-T6.6) reads them from kiln's vendored copy. Quiver's own IDs join them as
+# its design names them.
+
+plan = "01a157fdefc37396957ea10adb51a19f"
+plan_version = 2
+track = "CP-T2"
+
+[[goal]]
+id = "CP-T2.1"
+title = "Quiver set up; Focal's bus vendored; kiln's live feed on it"
+criteria = [
+  { id = "AC-T2.1.1", text = "Usable now: kiln's live feed rides Quiver on the ephemeral class, in a change request that passes the gate; Quiver's repository has its CLAUDE.md, STATUS.md and gate" },
+  { id = "AC-T2.1.2", text = "ephemeral publish-to-deliver p99 at 100,000 messages/s on one node is at most 300 µs, measured by Quiver's bench harness on adacachy" },
+  { id = "AC-T2.1.3", text = "subscribers fanned out to with that p99 kept is at least 1000, measured by the same bench" },
+  { id = "AC-T2.1.4", text = "frames lost to a subscriber that keeps up, over 1 hour is exactly 0, measured by a sequence check in the soak bench" },
+  { id = "AC-T2.1.5", text = "A slow subscriber gets a typed lag notice and never delays another subscriber, shown by a test with one stalled subscriber among 100" },
+]
+tests = [
+  { id = "T-T2.1.1", text = "The UI's live feed in the sync and session labs, unchanged in what it shows" },
+  { id = "T-T2.1.2", text = "RamStore outside cfg(test) fails the build (a compile-fail test)" },
+]
+
+[[goal]]
+id = "CP-T2.2"
+title = "The persisted class's tail fixed; elections cheap"
+criteria = [
+  { id = "AC-T2.2.1", text = "Usable now: kiln's CI and deploy events survive a crash of the server, in a change request that passes the gate; the fix offered to Focal as a branch" },
+  { id = "AC-T2.2.2", text = "persisted publish p99 at 10,000 messages/s, 3 nodes on a LAN is at most 10 ms, measured by the comparison harness on adacachy, fedora and jupiter" },
+  { id = "AC-T2.2.3", text = "persisted publish p99.9 at that load is at most 30 ms, measured by the same harness" },
+  { id = "AC-T2.2.4", text = "elections started by a 2 s disk stall on the leader is exactly 0, measured by a stall injected with dm-delay" },
+  { id = "AC-T2.2.5", text = "acknowledged publishes lost under kill -9 of any node is exactly 0, measured by the simulator over 10,000 seeds and the three-machine lab" },
+]
+tests = [
+  { id = "T-T2.2.1", text = "A webhook endpoint down for 10 minutes, then back — passes when every event is delivered, in order, at least once" },
+]
+
+[[goal]]
+id = "CP-T2.3"
+title = "Typed acknowledgements and the loss bound"
+criteria = [
+  { id = "AC-T2.3.1", text = "Usable now: kiln's notifications show accepted, persisted and delivered from typed acknowledgements, in a change request that passes the gate" },
+  { id = "AC-T2.3.2", text = "Each class's acknowledgement states its loss bound, and a model-based test checks every acknowledgement against the serial specification" },
+  { id = "AC-T2.3.3", text = "acknowledgements that claim more than the fate reached is exactly 0, measured by the simulator with crashes and partitions over 10,000 seeds" },
+]
+tests = [
+  { id = "T-T2.3.1", text = "A quorum lost after an acknowledgement of each class — passes when what was lost is within the class's stated bound, and nothing persisted is lost" },
+]
+
+[[goal]]
+id = "CP-T2.4"
+title = "The windowed class, calibration and suspicion; runner liveness that holds under load"
+criteria = [
+  { id = "AC-T2.4.1", text = "Usable now: kiln never calls a loaded but alive runner offline, in a change request that passes the gate" },
+  { id = "AC-T2.4.2", text = "runners falsely called offline in 24 hours at load average 100 to 300 is exactly 0, measured by a load lab on fedora and adacachy" },
+  { id = "AC-T2.4.3", text = "time to detect a runner that died, p99 is at most 5 s, measured by kill -9 and cable-pull drills" },
+  { id = "AC-T2.4.4", text = "memory of the windowed class at 100,000 messages/s is at most 64 MiB, measured by the bench's accounted memory" },
+]
+tests = [
+  { id = "T-T2.4.1", text = "Calibration under a changing network (10 ms to 300 ms round trips, 5% loss) — passes when timeouts follow within one window and no false suspicion is raised" },
+]
+
+[[goal]]
+id = "CP-T2.5"
+title = "The topic catalog, with schemas, in Amphora"
+criteria = [
+  { id = "AC-T2.5.1", text = "Usable now: kiln's event kinds are typed topics listed by the API, and a malformed event is refused at publish, in a change request that passes the gate" },
+  { id = "AC-T2.5.2", text = "Schema compatibility (backward, forward, full) is checked by a model-based test against Confluent's rules" },
+  { id = "AC-T2.5.3", text = "added publish latency from the schema check, p99 is at most 20 µs, measured by a bench of the check" },
+]
+tests = [
+  { id = "T-T2.5.1", text = "A schema change that breaks a consumer — passes when it is refused, naming the field and the consumer" },
+]
+
+[[goal]]
+id = "CP-T2.6"
+title = "Partitions and placement"
+criteria = [
+  { id = "AC-T2.6.1", text = "Usable now: kiln's session events are partitioned by session, ordered per session and spread over the fleet, in a change request that passes the gate" },
+  { id = "AC-T2.6.2", text = "messages per second across 3 nodes, replicated class is at least 500000, measured by the comparison harness" },
+  { id = "AC-T2.6.3", text = "p99 at that rate is at most 20 ms, measured by the same harness" },
+  { id = "AC-T2.6.4", text = "messages lost or doubled across 1,000 reassignments under load is exactly 0, measured by the simulator and the three-machine lab" },
+]
+tests = [
+  { id = "T-T2.6.1", text = "A node added and one removed under load — passes when leaders rebalance and order per key holds" },
+]
+
+[[goal]]
+id = "CP-T2.7"
+title = "Consumer groups and share groups"
+criteria = [
+  { id = "AC-T2.7.1", text = "Usable now: kiln's webhooks and notifications are delivered in order per endpoint and again after a crash, and plans.run's work items go to another agent when theirs dies, in a change request that passes the gate" },
+  { id = "AC-T2.7.2", text = "messages lost by a share group over 10,000 consumer crashes is exactly 0, measured by the simulator" },
+  { id = "AC-T2.7.3", text = "rebalance pause for a group of 100 consumers, p99 is at most 100 ms, measured by a bench of joins and leaves" },
+]
+tests = [
+  { id = "T-T2.7.1", text = "A poison message — passes when it goes to the dead-letter topic after its delivery limit and blocks nothing else" },
+]
+
+[[goal]]
+id = "CP-T2.8"
+title = "The SQS-compatible API"
+criteria = [
+  { id = "AC-T2.8.1", text = "Usable now: kiln's CI legs and any AWS SDK use Quiver as SQS, in a change request that passes the gate" },
+  { id = "AC-T2.8.2", text = "The AWS CLI, boto3 and the AWS SDKs for Rust, Go and JavaScript pass a conformance suite of every operation, checked against AWS's documented examples" },
+  { id = "AC-T2.8.3", text = "SendMessage then ReceiveMessage round trip p99 on a LAN is at most 5 ms, measured by a bench through boto3" },
+]
+tests = [
+  { id = "T-T2.8.1", text = "FIFO queues: deduplication ids and message groups — passes when a duplicate within 5 minutes is dropped and order holds per group" },
+]
+
+[[goal]]
+id = "CP-T2.9"
+title = "Retention, compaction and tiering to Mantle"
+criteria = [
+  { id = "AC-T2.9.1", text = "Usable now: kiln keeps weeks of session event history without filling a disk, in a change request that passes the gate" },
+  { id = "AC-T2.9.2", text = "read p99 of a tiered segment's first message is at most 50 ms, measured by a bench against Mantle on the LAN" },
+  { id = "AC-T2.9.3", text = "keys lost by compaction is exactly 0, measured by a model-based test over generated histories" },
+]
+tests = [
+  { id = "T-T2.9.1", text = "Mantle unreachable while tiering — passes when segments stay local within their budget, and tiering resumes without loss" },
+]
+
+[[goal]]
+id = "CP-T2.10"
+title = "Idempotent producers and transactions"
+criteria = [
+  { id = "AC-T2.10.1", text = "Usable now: kiln's results pipeline runs exactly once in effect, in a change request that passes the gate" },
+  { id = "AC-T2.10.2", text = "duplicates or losses in consume-transform-produce over 10,000 crash seeds is exactly 0, measured by the simulator with crashes at every await" },
+  { id = "AC-T2.10.3", text = "transaction commit p99 across 3 partitions is at most 15 ms, measured by the comparison harness" },
+]
+tests = [
+  { id = "T-T2.10.1", text = "A coordinator crash at every step of a transaction — passes when it ends committed or aborted on every partition" },
+]
+
+[[goal]]
+id = "CP-T2.11"
+title = "Access and quotas"
+criteria = [
+  { id = "AC-T2.11.1", text = "Usable now: an agent reads only its own sessions' topics, and a runaway publisher is throttled while the cluster stays healthy, in a change request that passes the gate" },
+  { id = "AC-T2.11.2", text = "unauthorized reads or publishes accepted, in a property test of generated principals and rules is exactly 0, measured by the test's oracle" },
+  { id = "AC-T2.11.3", text = "p99 of well-behaved tenants while one tenant publishes at 10x its quota rises by no more than 10% compared with the same load without the noisy tenant, measured by the comparison harness" },
+]
+tests = [
+  { id = "T-T2.11.1", text = "A revoked principal — passes when it loses access within one second, mid-stream" },
+]
+
+[[goal]]
+id = "CP-T2.12"
+title = "Kiln's traffic onto topics"
+criteria = [
+  { id = "AC-T2.12.1", text = "Usable now: every kiln event rides Quiver, with replay, and the UI misses no frame across a reconnect, in a change request that passes the gate" },
+  { id = "AC-T2.12.2", text = "events lost or doubled across a server restart and a runner reconnect is exactly 0, measured by the sessions, sync and CI labs with sequence checks" },
+  { id = "AC-T2.12.3", text = "The old paths are gone after one release (a grep gate), with a capability guarding the mixed-version fleet" },
+]
+tests = [
+  { id = "T-T2.12.1", text = "A mixed-version fleet, one runner a release behind, through the sessions, sync and CI labs" },
+]
+
+[[goal]]
+id = "CP-T2.13"
+title = "Quiver's bar, multi-region, and Quiver on its own"
+criteria = [
+  { id = "AC-T2.13.1", text = "Usable now: production kiln on Quiver across regions, with the comparison published, and Quiver installable on its own" },
+  { id = "AC-T2.13.2", text = "Quiver's p99 against Kafka's, persisted class at 10,000 messages/s, same hardware is at most 50%, measured by the comparison harness" },
+  { id = "AC-T2.13.3", text = "an idle node's CPU wakeups per second is at most 2, measured by powermetrics on the Mac and turbostat on Linux" },
+  { id = "AC-T2.13.4", text = "acknowledged multi-region-class messages lost when a region is lost is exactly 0, measured by the region-loss drill" },
+]
+tests = [
+  { id = "T-T2.13.1", text = "Fire drills: a node powered off, a disk stalled 10 s, a partition, a region lost" },
+]
+
+# Quiver's own requirements, beside the plan's: each with where it came from.
+
+[[own]]
+id = "Q-1"
+title = "An order of magnitude over Kafka, Redis and NATS"
+source = "Ada, 2026-10-22, on kiln's CP-T2.1: \"You must retain an order of magnitude lead\""
+criteria = [
+  { id = "Q-1.1", text = "Quiver's publish-to-deliver p99 and p99.9 are each at most a tenth of the best of NATS core, Redis Pub/Sub and Kafka, class for class, at every load and fan-out the comparison runs, measured by the comparison harness (bench/compare.sh) on one machine" },
+]

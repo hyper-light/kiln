@@ -477,6 +477,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,6 +804,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -834,6 +853,16 @@ name = "crc-catalog"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
+name = "crc-fast"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+dependencies = [
+ "digest 0.10.7",
+ "spin 0.10.1",
+]
 
 [[package]]
 name = "crc32c"
@@ -1293,6 +1322,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "focal-bus"
+version = "0.1.0"
+dependencies = [
+ "crc-fast",
+ "focal-memory",
+ "focal-platform",
+ "focal-seal",
+ "hyper-block",
+ "hyper-durable",
+ "hyper-liveness",
+ "hyper-log",
+ "hyper-raft",
+ "hyper-rt",
+ "hyper-rt-transport",
+ "hyper-timing",
+ "hyper-transport",
+ "rcgen",
+]
+
+[[package]]
+name = "focal-memory"
+version = "0.1.0"
+
+[[package]]
+name = "focal-platform"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "focal-seal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "focal-platform",
+ "getrandom 0.3.4",
+ "hyper-block",
+ "hyper-seal",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1529,7 +1603,7 @@ dependencies = [
  "hash32",
  "rustc_version",
  "serde",
- "spin",
+ "spin 0.9.9",
  "stable_deref_trait",
 ]
 
@@ -1620,7 +1694,6 @@ dependencies = [
 [[package]]
 name = "hyper-block"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "crc32c",
  "getrandom 0.4.3",
@@ -1634,7 +1707,6 @@ dependencies = [
 [[package]]
 name = "hyper-datagram"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "aws-lc-rs",
  "crc32c",
@@ -1643,7 +1715,6 @@ dependencies = [
 [[package]]
 name = "hyper-durable"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "hyper-block",
  "hyper-liveness",
@@ -1656,7 +1727,6 @@ dependencies = [
 [[package]]
 name = "hyper-liveness"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "hyper-timing",
 ]
@@ -1664,7 +1734,6 @@ dependencies = [
 [[package]]
 name = "hyper-log"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "crc32c",
  "getrandom 0.4.3",
@@ -1677,7 +1746,6 @@ dependencies = [
 [[package]]
 name = "hyper-quic"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1697,7 +1765,6 @@ dependencies = [
 [[package]]
 name = "hyper-raft"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "crc32c",
  "hyper-timing",
@@ -1707,7 +1774,6 @@ dependencies = [
 [[package]]
 name = "hyper-rt"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "crc32c",
  "libc",
@@ -1720,7 +1786,6 @@ dependencies = [
 [[package]]
 name = "hyper-rt-transport"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "hyper-datagram",
  "hyper-rt",
@@ -1730,10 +1795,10 @@ dependencies = [
 [[package]]
 name = "hyper-seal"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "aws-lc-rs",
  "getrandom 0.4.3",
+ "hyper-block",
  "rustix",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
@@ -1742,12 +1807,10 @@ dependencies = [
 [[package]]
 name = "hyper-timing"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 
 [[package]]
 name = "hyper-tls"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -1764,10 +1827,9 @@ dependencies = [
 [[package]]
 name = "hyper-transport"
 version = "0.1.0"
-source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "bytes",
- "crc32c",
+ "crc-fast",
  "hyper-quic",
  "hyper-timing",
  "thiserror 2.0.21",
@@ -2134,6 +2196,8 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "postcard",
+ "quiver",
+ "quiver-api",
  "rand 0.10.3",
  "rcgen",
  "rpassword",
@@ -2959,6 +3023,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
+name = "quiver"
+version = "0.1.0"
+dependencies = [
+ "focal-bus",
+ "focal-memory",
+ "futures",
+ "quiver-api",
+]
+
+[[package]]
+name = "quiver-api"
+version = "0.1.0"
+dependencies = [
+ "event-listener",
+ "futures",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3721,6 +3803,12 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
+
+[[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spki"
