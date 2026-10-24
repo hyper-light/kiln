@@ -3936,6 +3936,19 @@ enforcement points to W18, agent isolation to W20.
   corpus lab's sends them to microVMs, the user's choice (rails' `rails-new-docker`;
   `w13_a_leg_that_runs_podman_leaves_container_executors`). `POST /api/ci/routing/explain` takes
   `nests_containers` too.
+- *Done.* kiln's runner images in Firecracker microVMs, and Podman in them. No registry has
+  `kiln/runner-*`, so a microVM leg of one builds it with Docker as the `docker` executor does
+  (once per version), saves it (`docker save`, unpacked as it streams), and builds its layers into
+  the microVM's ext4 as a pulled image's are, kept by Docker's id for the image: gzip, as Docker's
+  containerd image store keeps them, or plain tar (zstd is refused)
+  (`w13_saved_images_read_in_order`). Podman's storage there is on the scratch disk, and its
+  containers share the guest's own network, the only one it has (out through the egress
+  proxy), with cgroupfs and file events. Checked with `kiln workflow run --executor firecracker`
+  (Firecracker 1.17, its 6.1 kernel, Docker 29 with the containerd image store): Podman 4.9.3
+  built an image whose `RUN apk add` reached the internet through the proxy, ran it, and served
+  nginx on its port. On the guest's network a published port is the container's own
+  (`-p 3000:3000`, as rails' test has it); one mapped to another (`-p 8080:80`) stays the
+  container's.
 - *Done.* `kiln/runner-ubuntu-24.04-android` (and `-26.04`, `-22.04`): the full image and
   Android's SDK where GitHub's images have it (`ANDROID_HOME` and `ANDROID_SDK_ROOT`
   `/usr/local/lib/android/sdk`; the command-line tools, latest, checked against the SHA-1 Google's

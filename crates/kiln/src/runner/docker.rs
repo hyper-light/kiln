@@ -360,6 +360,52 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
     Some(d)
 }
 
+/// One of kiln's runner images (`kiln/runner-*`), built with `cli` when it isn't here yet: tagged
+/// by its Dockerfile's digest (so per version and user, and a changed one is built again), and a
+/// new build removes the user's older ones. `None` for any other image.
+pub async fn runner_image(cli: &Cli, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Option<String>> {
+    let Some(dockerfile) = runner_dockerfile(image, user) else { return Ok(None) };
+    let _g = IMAGE_BUILD.lock().await;
+    let digest = crate::util::sha256_hex(dockerfile.as_bytes());
+    let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
+    if cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
+        return Ok(Some(tag));
+    }
+    let owner = user.map_or_else(|| "0".to_owned(), |(uid, _)| uid.to_string());
+    let dockerfile = format!("{dockerfile}LABEL kiln.runner-image={image} kiln.runner-user={owner}\n");
+    say(format!("Building kiln's runner image {tag} (once per machine and version)"));
+    let dir = cli.config.join(format!("image-{}", crate::util::new_id()));
+    let d = dir.clone();
+    crate::rt::blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&d)?;
+        std::fs::write(d.join("Dockerfile"), dockerfile)
+    })
+    .await??;
+    let r = cli.run(&[s("build"), s("--quiet"), s("-t"), tag.clone(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
+    let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
+    if r.is_ok() {
+        forget_older(cli, image, &owner, &tag).await;
+    }
+    r.map(|_| Some(tag))
+}
+
+/// Removes this user's earlier builds of runner image `image`, all but `keep`; one a container
+/// still uses stays until a later build.
+async fn forget_older(cli: &Cli, image: &str, owner: &str, keep: &str) {
+    let none = BTreeMap::new();
+    let filters = [s("--filter"), format!("label=kiln.runner-image={image}"), s("--filter"), format!("label=kiln.runner-user={owner}")];
+    let mut args = vec![s("image"), s("ls")];
+    args.extend(filters);
+    args.extend([s("--format"), s("{{.Repository}}:{{.Tag}}")]);
+    let Ok(out) = cli.run(&args, &none, CALL).await else { return };
+    let old: Vec<String> = out.lines().map(str::trim).filter(|t| !t.is_empty() && *t != keep && !t.ends_with(":<none>")).map(str::to_owned).collect();
+    for t in old {
+        if cli.run(&[s("image"), s("rm"), t.clone()], &none, CALL).await.is_ok() {
+            tracing::info!(image = %t, "removed an older build of a runner image");
+        }
+    }
+}
+
 /// One runner image build at a time on this machine.
 static IMAGE_BUILD: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
@@ -498,6 +544,17 @@ impl Cli {
         }
         say(format!("{} pull {image}", self.bin));
         self.run(&[s("pull"), s("--quiet"), image.to_owned()], &none, SLOW).await.map(|_| ())
+    }
+
+    /// `image` saved and unpacked into `dir` as it streams (Docker's archive: `manifest.json`, the
+    /// config and the layers, plain tar), never whole on disk. Blocking.
+    pub fn save_into(&self, image: &str, dir: &Path) -> anyhow::Result<()> {
+        let mut child = self.command(&[s("save"), image.to_owned()], &BTreeMap::new()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
+        let out = child.stdout.take().ok_or_else(|| anyhow::anyhow!("{} save: no output", self.bin))?;
+        let unpacked = tar::Archive::new(out).unpack(dir);
+        let done = child.wait_with_output()?;
+        anyhow::ensure!(done.status.success(), "{} save {image}: {}", self.bin, String::from_utf8_lossy(&done.stderr).trim());
+        unpacked.map_err(|e| anyhow::anyhow!("{} save {image}: unpacking it: {e}", self.bin))
     }
 
     fn command(&self, args: &[String], env: &BTreeMap<String, String>) -> Command {
@@ -1032,53 +1089,14 @@ impl Containers {
         self.cli.run(&[s("info"), s("--format"), s("{{json .SecurityOptions}}")], &none, CALL).await.is_ok_and(|o| o.contains("rootless"))
     }
 
-    /// The image to run `image` as: kiln's runner images are built here, tagged by their
-    /// Dockerfile's digest (so per version and user, and a changed one is built again); others
-    /// are pulled.
+    /// The image to run `image` as: kiln's runner images are built here ([`runner_image`]);
+    /// others are pulled.
     async fn prepare(&self, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<String> {
-        if let Some(dockerfile) = runner_dockerfile(image, user) {
-            let _g = IMAGE_BUILD.lock().await;
-            let digest = crate::util::sha256_hex(dockerfile.as_bytes());
-            let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
-            if self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
-                return Ok(tag);
-            }
-            let owner = user.map_or_else(|| "0".to_owned(), |(uid, _)| uid.to_string());
-            let dockerfile = format!("{dockerfile}LABEL kiln.runner-image={image} kiln.runner-user={owner}\n");
-            say(format!("Building kiln's runner image {tag} (once per machine and version)"));
-            let dir = self.cli.config.join(format!("image-{}", crate::util::new_id()));
-            let d = dir.clone();
-            crate::rt::blocking(move || -> std::io::Result<()> {
-                std::fs::create_dir_all(&d)?;
-                std::fs::write(d.join("Dockerfile"), dockerfile)
-            })
-            .await??;
-            let r = self.cli.run(&[s("build"), s("--quiet"), s("-t"), tag.clone(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
-            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
-            if r.is_ok() {
-                self.forget_older(image, &owner, &tag).await;
-            }
-            return r.map(|_| tag);
+        if let Some(tag) = runner_image(&self.cli, image, user, say).await? {
+            return Ok(tag);
         }
         self.cli.pull(image, say).await?;
         Ok(image.to_owned())
-    }
-
-    /// Removes this user's earlier builds of runner image `image`, all but `keep`; one a
-    /// container still uses stays until a later build.
-    async fn forget_older(&self, image: &str, owner: &str, keep: &str) {
-        let none = BTreeMap::new();
-        let filters = [s("--filter"), format!("label=kiln.runner-image={image}"), s("--filter"), format!("label=kiln.runner-user={owner}")];
-        let mut args = vec![s("image"), s("ls")];
-        args.extend(filters);
-        args.extend([s("--format"), s("{{.Repository}}:{{.Tag}}")]);
-        let Ok(out) = self.cli.run(&args, &none, CALL).await else { return };
-        let old: Vec<String> = out.lines().map(str::trim).filter(|t| !t.is_empty() && *t != keep && !t.ends_with(":<none>")).map(str::to_owned).collect();
-        for t in old {
-            if self.cli.run(&[s("image"), s("rm"), t.clone()], &none, CALL).await.is_ok() {
-                tracing::info!(image = %t, "removed an older build of a runner image");
-            }
-        }
     }
 
     async fn image_path(&self, image: &str) -> Option<String> {
