@@ -38,8 +38,8 @@ acknowledgements come from that process, never from the transport under it.
 
 Ada made this kiln's top priority on 2026-10-23: nothing kiln sends is fire-and-forget, and no
 crash or reconnect replays a whole session. This split was proposed to the T3 Sends agent by
-message on 2026-10-23; its answer is awaited. Messages *to agents* are critical-path track T3's,
-on `cp/t3-sends` (its `docs/sends.md`):
+message on 2026-10-23, and it agreed by message on 2026-10-24. Messages *to agents* are
+critical-path track T3's, on `cp/t3-sends` (its `docs/sends.md`):
 - `Send`, `SkillRun` and the queue's commands: their ids made once (CP-T3.2), the inbox that takes
   each once (CP-T3.2), their states end to end and parking for a runner that's away (CP-T3.3);
 - the composer's durable outbox (CP-T3.4);
@@ -54,7 +54,28 @@ its processes is fire-and-forget"):
 - loss below the channel counted and repaired;
 - a lab that injects faults.
 
-Messages to agents ride the same channel, and their answers are T3's inbox answers.
+Messages to agents ride the same channel, and their answers are T3's inbox answers:
+- `Send` and `SkillRun` go to a runner that says `CAP_INBOX` as `ServerMsg::HarnessSend`. Its inbox
+  takes each id once, or refuses it with a typed reason. The answer comes back as `Update::Inbox`
+  (`Said { session, message, answer }`), which the registry waits for, and asks again for the
+  epoch it names. The session's other commands (open, close, files, stop, interrupt, approve,
+  control) are this plan's, and take that answer's shape.
+- An `Update::Inbox` rides its session's update stream like any update. The channel takes each item
+  once. A stream that starts over drops what it hadn't had answered and starts from the session's
+  snapshot, which holds no `Update::Inbox`. That happens when either side restarted, or the stream
+  filled up. One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
+  One case is open. After a server restart, a stream the old server took items of but answered
+  none of goes on: nothing says it lost them, since a server that never received any says the
+  same. Its inbox answer then reaches the new server too. That server finds no waiter for it,
+  unless a retry of that very message waits there, which is then handed the first answer and not
+  marked a repeat. CP-T3.3 closes it with a nonce for each send that `Said` echoes. Until then,
+  nothing sends an inbox answer again on purpose.
+- CP-T3.1 puts a gate on the same stream (`harness/host.rs`): what a session says goes on only once
+  the record that shows it is committed. The channel's buffer of what the server hasn't answered
+  is past that gate (the runner's uplink, `agent.rs`), so it holds only committed updates.
+- On the wire, `ServerMsg::HarnessSend` goes after `Kept` (index 57). `CAP_INBOX` can't be
+  `1 << 31`, which is P2's `CAP_CLUSTER` on main. It's `1 << 34` in `AgentMsg::Caps`'s 64 bits,
+  and this plan's next bits start at 35.
 
 ## Commands
 
@@ -203,6 +224,21 @@ every few seconds, watched by four viewers. The lab then:
 
 It holds the copies and every viewer to each line once, in order, and prints each fault's
 bytes.
+
+## Capability bits past `Build`'s 32
+
+`AgentMsg::Build`'s caps are 32 bits, and every one of them is taken (`CAP_CLUSTER` has bit 31).
+Capabilities past them are bits of a `u64`, said in a message of their own once a link comes up.
+A runner's `AgentMsg::Caps` holds its `Build` caps as well, in their 32 bits. Each new capability
+takes a new bit, never one that means something already, even in the other direction.
+
+| Bit | Name | Said in | Says |
+|---|---|---|---|
+| 32 | `CAP_WIRE` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side keeps the channel |
+| 33 | `CAP_NET_DROPS` | `ServerMsg::Caps` | the server takes what a runner's QUIC layer dropped (`NetDrops`) |
+| 34 | `CAP_INBOX` | `AgentMsg::Caps` | the runner's inbox takes `HarnessSend` (T3, CP-T3.2) |
+
+Bits from 35 are free. Take the next one, and add its row here in the same change.
 
 ## Runner to server: `AgentMsg`
 
