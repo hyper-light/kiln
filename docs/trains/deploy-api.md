@@ -10,11 +10,33 @@ The deploying-by-API phases that land together (docs/deploy-api.md, §19's plan)
 These notes cover what each delivers, what deploying it does and how to watch it, its risks, its
 rollback, and what's still open.
 
-**Where it stands (2026-10-23, when written):**
-- **Merged:** with this file, as one fast-forward of main. The landing commit's message has the
-  gate's evidence.
-- **Deployed:** not yet. Deploys go through Ada.
-- **Gated** on fedora before the push, on the commit that carries this file.
+**Where it stands (2026-10-24):**
+- **Merged:** 8975293, as one fast-forward of main from d0ee456, pushed at 23:11Z on 2026-10-23 on
+  Ada's word ("No, you push it."). It carried the first version of this file.
+- **Deployed:** kiln:2493f75, live since 02:02:17Z on 2026-10-24, when its pod started
+  (`kiln-967f89c4c-prqff` on kiln-m02: Ready, no restarts).
+  - 2493f75 is a commit of main after 8975293 ("KilnCD: while main's newest commit has no image
+    yet, the newest commit since what runs that has one goes out"). It holds this train and P1.
+  - It got there through a manual sync in KilnCD, by `admin`, at 02:02:11Z (KilnCD's history,
+    entry 90: "successfully synced (all tasks run)", 22 objects applied). The session projects-e7
+    ran it to ship P1, and that carried this train too.
+  - Its guard kept it at 02:12:30Z (entry 91): "kiln restarted into kiln:2493f75…, and stayed
+    healthy for 10m (checks: serving, steady, memory, commit, runners)". The commit check says
+    production serves 2493f75.
+  - Before it, production ran kiln:a53a8bc, which its guard kept at 17:13:59Z on 2026-10-23
+    ("stayed healthy for 10m").
+  - Read through production's own operations on 2026-10-23 and again at 02:02Z: 0 environments,
+    apps and releases, so P6's copy there had nothing to copy.
+- **Gated** on fedora on 8975293 exactly, 22:34 to 23:00Z, by `bash gate.sh.new`: the gate's
+  script with cargo test in a HOME of its own and an empty, writable .gitconfig (main's CI-actions
+  tests write git's global config), at -j 8.
+  - clippy passed on Linux, macOS and Windows;
+  - cargo test: 2,117 passed, none failed;
+  - the vendor checks passed;
+  - the UI's npm ci, typecheck, lint, unit tests (133) and build passed.
+
+  The first gate, on 08e6c7c, failed Windows clippy only: `large_enum_variant` on
+  `kiln deploy env add`'s arguments, which are bigger on Windows. They're boxed now (e0f59f7).
 - **Merged with main's P1** (7c8774c, kiln.db's writes through the cluster group) at 8e8dcd6. This
   train's own transactions became P1's nesting `crate::store::tx`, as main's had: kiln's Records,
   owners as groups, and the registry's.
@@ -49,6 +71,22 @@ rollback, and what's still open.
      in 3 s, its repositories and runs read back, and it read deploy's apps from its own tables,
      as they were when P6 first started (7, without the 2 made since), with no error.
   3. This train's build started again: all 9 apps, the change kept, no error.
+- **Rolling back to production's own release, drilled** (2026-10-24, 02:01Z, on fedora), on a
+  scratch copy of test server A's database (89 migrations, 443 records rows), taken while that
+  server was stopped. Ports 17076 and 17077, an empty kubeconfig, nothing of production's.
+  - a53a8bc's kiln built in 143 s at -j 8 from a clean clone. The train's side was the 8975293
+    gate's own build. Each start's commit was read from `/healthz/server`.
+  1. 8975293: health in 3 s, grouped (it made `data/cluster`). It changed an app's project on
+     the seam through the group, and its repositories, runs and 9 deploy apps read back.
+  2. a53a8bc: health and `/healthz` in 2 s. Its repositories and runs read back, and its
+     migration runner left the six migrations it doesn't know alone (90 recorded). Its
+     `/api/deploy/apps` answered 500: "read a deploy record: unknown field `registries`". The
+     copy's old deploy tables hold apps that early P5 code made on the test servers. Production's
+     old tables were empty, so this doesn't reach it.
+  3. 8975293 again: health in 1 s, all 9 apps, the change kept.
+
+  Each start logged one warning, "couldn't take over from the runner being upgraded": a handover
+  socket in the copy's state that fedora doesn't have.
 - **Rolling back past P6, drilled first:** on a scratch copy of test server A's database, 94924e5
   migrated it and copied its rows onto the seam. Then a build from before P6 started on it: the
   ci-actions worktree's, holding 7656471, the release production ran that day. Its health answered
@@ -159,33 +197,38 @@ Each item's row in docs/deploy-api.md's Status table has the detail and how it w
 
 ## Rolling back
 
-- **To the release before** (kiln:7656471, or later from main): a KilnCD rollback
+- **To the release before,** kiln:a53a8bc (drilled, above): a KilnCD rollback
   (`kiln cd rollback default/kiln-production <id>`), or revert the landing on main, then build and
-  sync.
+  sync. It takes P1 back too.
+- **The rule: deploy data made after the upgrade lives only on the seam.**
+  - a53a8bc doesn't see it. It reads deploy's old tables, as they were when P6 first started.
+  - What a53a8bc changes in those tables while rolled back doesn't carry forward: coming forward
+    again copies nothing, since the counter row is there.
 - **No config to take out:** the train adds no setting.
 - **The release before runs on this train's data** (drilled, above):
   - its migration runner applies only the migrations it lists that aren't recorded yet, so it
-    ignores the five new ones;
+    ignores this train's five and main's `20261023-1600_notice_marks`;
   - it keeps no schema version that it could refuse (`crates/kiln/src/store/migrations.rs`, the
-    same in 7656471 and in this train).
+    same in 7656471, a53a8bc and this train).
 - **What the release before sees:**
   - **Deploy's records as they were when P6 first started.** The copy leaves kiln's deploy tables
     whole. Whatever deploy recorded on the seam after that, the release before doesn't see.
   - **Nothing copied a second time when coming forward again,** since the counter row is there.
     Whatever the release before recorded in its tables in between stays in its tables only.
-  - **Environments with P5's fields** (`targets.kilncd`, from `kiln deploy env add --kilncd`),
-    which stop it reading environments. Take those fields out, or the environments, before going
-    back.
+  - **Records with P5's fields** in its tables (an environment's `targets.kilncd`, an app's
+    `registries`), which stop it reading them: its deploy calls answer 500. Only servers that ran
+    early P5 code have them. Production doesn't.
   - **Chat messages already posted,** as they were. It doesn't edit them.
   - **The new tables, read by nothing.** So is the kiln-base chart in the registry.
-- **Production today:** it holds no deploy records, so going back loses and hides nothing.
+- **Production:** it held no deploy records at the upgrade, so going back hides only what was made
+  through deploying by API since.
 
 ## Ada's open decisions
 
-1. **P6 in this train,** or on its own after it. Kiln Distro recommended it in, since the rollback
-   drill passed.
-2. **Compaction for kiln's Records** (under "Risks"): a follow-up goal, finished before production
+1. **Compaction for kiln's Records** (under "Risks"): a follow-up goal, finished before production
    deploys by API in earnest.
+
+Decided: P6 landed in this train, as Kiln Distro recommended once the rollback drill passed.
 
 ## Open with others
 
