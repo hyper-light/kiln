@@ -289,6 +289,9 @@ export async function handleGoals(req: http.IncomingMessage, res: http.ServerRes
     const b = await body<{ id?: string }>(req);
     const goal = s.items.find((i) => i.id === b.id) ?? s.items.find((i) => i.status === "active");
     if (!goal) return (json(res, 400, { error: "no goal to plan" }), true);
+    // Being planned already, its planning waiting its turn: a subagent plans it now (Plan it now).
+    const waiting = goal.planned_as && s.items.find((i) => i.part_of === goal.id && i.part_kind === "planning" && i.status === "pending");
+    if (waiting) return (json(res, 200, { plan: goal.planned_as, research: "", goal: goal.id, part: waiting.id, dispatched: true, why: null }), true);
     const plan = planning({ agent, id: goal.id, text: goal.text });
     const part: GoalItem = {
       id: `g_${Math.random().toString(36).slice(2, 8)}`,
@@ -301,7 +304,8 @@ export async function handleGoals(req: http.IncomingMessage, res: http.ServerRes
     goal.planned_as = plan;
     s.items.splice(s.items.indexOf(goal), 0, part);
     s.updated_at = Date.now();
-    json(res, 200, { plan, research: "", goal: goal.id, part: part.id });
+    // A goal it isn't on yet: a subagent of its agent's plans it now, as kiln's server says.
+    json(res, 200, { plan, research: "", goal: goal.id, part: part.id, dispatched: part.status === "pending", why: null });
     return true;
   } else if (action && method === "POST") {
     const why = control(s, action);

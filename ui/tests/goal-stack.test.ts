@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { GoalItem, GoalStack } from "../src/api/harness.ts";
-import { canPlan, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
+import { canPlan, canPlanNow, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "../src/views/harness/goal-stack.ts";
 
 const goal = (id: string, text: string, status: GoalItem["status"] = "pending"): GoalItem => ({ id, text, status });
 const stack = (rest: Partial<GoalStack> = {}): GoalStack => ({ agent: "a1", state: "running", items: [], updated_at: 1, ...rest });
@@ -133,4 +133,13 @@ test("a planned goal's steps stand as their parts do: under way while one of its
   assert.equal(canPlan(items[0]!), false, "a plan's step isn't planned on its own");
   assert.equal(canPlan({ ...g, planned_as: "p" }), false, "nor a goal planned already");
   assert.equal(canPlan({ ...g, status: "met" }), false, "nor one met");
+});
+
+test("a goal being planned, its planning waiting its turn, can be planned now by a subagent; one under way or planned can't", () => {
+  const g = { ...goal("g", "Build the storage layer"), planned_as: "p1" };
+  const planning = (status: GoalItem["status"]): GoalItem => ({ ...goal("pl", "Plan it", status), part_of: "g", part_kind: "planning" });
+  assert.equal(canPlanNow(g, [planning("pending"), g]), true);
+  assert.equal(canPlanNow(g, [planning("active"), g]), false, "its planning under way already");
+  assert.equal(canPlanNow(g, [planning("met"), g]), false, "planned");
+  assert.equal(canPlanNow({ ...g, planned_as: undefined }, [g]), false, "not being planned: Make a plan");
 });

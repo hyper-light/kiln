@@ -137,12 +137,57 @@ async fn update(cx: Cx, v: Value) -> Out {
 /// What an agent does once its goal has become a plan.
 const PLANNING: &str = "Plan it now, in this order. 1. Research it, inside and outside, and record what you find as you go (research_add, with this research's id): inside, the files on your machine and on others (code, docs, data, pictures, frames of video) and kiln's own records (conversations_search, plans, CI runs, deployments); outside, the web, official docs and standards, papers (arXiv, Semantic Scholar, Crossref, PubMed), blogs and forums. Each finding is a claim with its citations (the source, the exact words you quote, where they are) and any counterclaims you found. kiln looks for each quote where you say it is and grades each finding: describe the evidence, never the grade. 2. Write the plan's steps (plans_update with the plan's id: `items`, each with what to do, its acceptance criteria, its tests, the steps it waits for in `needs`, and the findings it rests on in `basis`). 3. Say it's ready (plans_ready, with `then`: `goals` to carry on here with its steps as this goal's parts, `agents` to run it with an agent per step, `review` to pause for the person to look first). It answers with the research, graded: show it to the person in your reply, as it is, every claim with its sources and grade. Once every step is met, so is the goal.";
 
+/// How long a subagent sent to plan a goal is left at it before another may be.
+const DISPATCH_AGAIN_MS: i64 = 30 * 60_000;
+
 async fn plan(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent)?;
-    let p = super::plan(&cx.hub, &agent, opt(&v, "id").as_deref(), opt(&v, "title").as_deref(), &cx.caller.name).await.map_err(fail)?;
-    cx.hub.store.audit(cx.caller.name.clone(), "goals.plan".into(), format!("{agent}: {} as plan {}", p.goal, p.plan)).await;
-    Ok(json!({"plan": p.plan, "research": p.research, "goal": p.goal, "part": p.part, "next": PLANNING}))
+    // A person's Make a plan (or another agent's): a goal the agent isn't on yet is planned now, by
+    // a subagent of its own, beside what it's doing.
+    let asked_by_another = cx.caller.agent.as_deref() != Some(agent.as_str());
+    let p = super::plan(&cx.hub, &agent, opt(&v, "id").as_deref(), opt(&v, "title").as_deref(), &cx.caller.name, asked_by_another).await.map_err(fail)?;
+    let (dispatched, why) = if p.delegate {
+        match dispatch(&cx.hub, &agent, &p).await {
+            Ok(()) => (true, None),
+            Err(why) => (false, Some(why)),
+        }
+    } else {
+        (false, None)
+    };
+    cx.hub.store.audit(cx.caller.name.clone(), "goals.plan".into(), format!("{agent}: {} as plan {}{}", p.goal, p.plan, if dispatched { ", a subagent planning it" } else { "" })).await;
+    Ok(json!({"plan": p.plan, "research": p.research, "goal": p.goal, "part": p.part, "dispatched": dispatched, "why": why, "next": PLANNING}))
+}
+
+/// Tells agent `agent`, steered into what it's doing, to plan goal `p` now with a subagent of its
+/// own ([`dispatch_words`]); else why it couldn't be (sent moments ago, not running, unreachable).
+async fn dispatch(hub: &crate::hub::Hub, agent: &str, p: &super::Planned) -> Result<(), String> {
+    let key = format!("goals.plan.dispatched:{}", p.plan);
+    let now = crate::util::now_ms();
+    if hub.store.kv_get(key.clone()).await.ok().flatten().and_then(|at| at.parse::<i64>().ok()).is_some_and(|at| now - at < DISPATCH_AGAIN_MS) {
+        return Err("a subagent is on it already: it was sent to plan it within the last half hour".into());
+    }
+    let id = format!("{}plan-{}", crate::harness::pause::KILN_ID, crate::util::new_id());
+    let send = crate::harness::model::Command::Send { id, text: dispatch_words(p), mode: crate::harness::model::SendMode::Steer, attachments: Vec::new(), overrides: None };
+    match hub.harness.command(hub, agent, send).await {
+        crate::harness::registry::Sent::Ok => {
+            let _ = hub.store.kv_set(key, now.to_string()).await;
+            Ok(())
+        }
+        crate::harness::registry::Sent::NoSession => Err("its agent isn't running: its planning waits its turn in the stack".into()),
+        crate::harness::registry::Sent::Unreachable => Err("its agent's machine can't be reached now: its planning waits its turn in the stack".into()),
+    }
+}
+
+/// What an agent hears to plan a goal of its now, beside its own work: to send a subagent of its own
+/// with [`PLANNING`]'s brief, the plan's and the research's ids in it, and to go on with its work.
+fn dispatch_words(p: &super::Planned) -> String {
+    format!(
+        "Your person asked for one of your goals to be planned now, beside what you're doing: \"{goal}\". Dispatch a subagent for it (your Agent or Task tool; without one, start an agent with agents_start), give it the brief below, and go on with your own work meanwhile. When it reports back, check the plan is ready (plans_get {plan}) and say so in a line.\n\nThe brief: plan the goal \"{goal}\" as plan {plan}, its research {research}. {PLANNING} Say it's ready with `then: goals`. Report back the plan's title and steps, and its research as research_get presents it.",
+        goal = p.words,
+        plan = p.plan,
+        research = p.research,
+    )
 }
 
 async fn settings(cx: Cx, v: Value) -> Out {

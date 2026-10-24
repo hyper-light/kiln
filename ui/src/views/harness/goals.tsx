@@ -17,6 +17,7 @@ import * as React from "react";
 import { ChevronRight, ListTree } from "lucide-react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
 import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
@@ -28,7 +29,7 @@ import { StandTitle, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
-import { canPlan, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "./goal-stack";
+import { canPlan, canPlanNow, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
@@ -476,8 +477,8 @@ function GoalPanel({
                             )}
                           </span>
                         </span>
-                        {/* What can be done with it: a goal of its own still to go becomes a plan. */}
-                        {canPlan(g) && (
+                        {/* What can be done with it: a goal of its own still to go becomes a plan, planned now by a subagent of its agent's (one being planned too, its planning waiting its turn). */}
+                        {(canPlan(g) || canPlanNow(g, items)) && (
                           <div className="gs-acts">
                             <Button
                               size="xs"
@@ -485,12 +486,14 @@ function GoalPanel({
                               disabled={busy}
                               onClick={() =>
                                 void act(async () => {
-                                  await harnessApi.planGoal(agent, g.id);
+                                  const r = await harnessApi.planGoal(agent, g.id);
+                                  if (r.dispatched) toast({ title: "A subagent is planning it now", tone: "running" });
+                                  else if (r.why) toast({ title: "Its planning waits its turn", description: r.why, tone: "info" });
                                   return harnessApi.goals(agent);
                                 })
                               }
                             >
-                              <ListTree aria-hidden="true" /> Make a plan
+                              <ListTree aria-hidden="true" /> {canPlan(g) ? "Make a plan" : "Plan it now"}
                             </Button>
                           </div>
                         )}

@@ -12,6 +12,11 @@ export function canPlan(g: GoalItem): boolean {
   return (g.status === "pending" || g.status === "active") && !g.part_of && !g.planned_as && !g.step && !g.waits_on;
 }
 
+/** A goal still to go that's being planned, its planning waiting its turn: a subagent of its agent can plan it now (Plan it now). */
+export function canPlanNow(g: GoalItem, items: readonly GoalItem[]): boolean {
+  return g.status === "pending" && !!g.planned_as && items.some((i) => i.part_of === g.id && i.part_kind === "planning" && i.status === "pending");
+}
+
 const PART_STAND = { pending: "waiting", active: "working", met: "met", unmet: "unmet", skipped: "skipped" } as const;
 
 /**
