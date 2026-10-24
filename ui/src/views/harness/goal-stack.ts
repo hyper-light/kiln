@@ -3,8 +3,100 @@
  * covers and how the box's lines go back to them, which reads of a stack came back too late to
  * show, which goals can become plans, and where a planned goal's steps stand.
  */
-import type { GoalItem, GoalStack } from "@/api/harness";
+import type { GoalItem, GoalStack, HEvent, QueueItem, Task, ToolCall } from "@/api/harness";
 import type { Stand } from "@/views/plans/status";
+import { taskLive, type ToolEvent } from "./derive";
+import { isSubagent } from "./tasks";
+
+/** How long kiln's ask to plan a goal now stands, its subagent not started yet (the server's `DISPATCH_AGAIN_MS`). */
+const ASK_STANDS_MS = 30 * 60_000;
+/** kiln's ask to plan a goal now: a steer, its id so (harness/pause.rs `KILN_ID`, goals/ops.rs `dispatch`). */
+const PLAN_ASK = "kiln-plan-";
+
+/**
+ * A goal's planning, as its agent's session shows it (Make a plan, Plan it now): kiln asked the
+ * agent to send a subagent (`asked`, none started yet), a subagent of its is at it (`planning`, its
+ * last calls), or one was and ended with the plan not ready (`ended`).
+ */
+export type Planner = { kind: "asked"; at: number } | { kind: "planning" | "ended"; task: Task; calls: ToolEvent[] };
+
+/**
+ * Who's planning plan `plan` in its agent's session: its subagent (the one its brief, which names the
+ * plan, went to; the latest), with its last `shown` calls; else kiln's ask, while it stands, said
+ * or still in the agent's queue. A subagent that ended having said the plan is ready: none (the
+ * stack shows its steps next).
+ */
+export function plannerOf(plan: string, tasks: readonly Task[], events: readonly HEvent[], queue: readonly QueueItem[], now: number, shown = 3): Planner | null {
+  let task: Task | undefined;
+  for (const t of tasks) if (isSubagent(t) && t.prompt?.includes(plan) && (!task || t.started > task.started)) task = t;
+  if (task) {
+    const live = taskLive(task);
+    const calls: ToolEvent[] = [];
+    let ready = false;
+    for (let i = events.length - 1; i >= 0 && (calls.length < shown || (!live && !ready)); i--) {
+      const e = events[i];
+      if (e?.kind !== "tool" || e.parent === undefined || e.parent !== task.tool_id) continue;
+      if (calls.length < shown) calls.unshift(e);
+      if (e.server === "kiln" && e.tool_short === "plans_ready" && e.status === "done") ready = true;
+    }
+    if (!live && ready) return null;
+    return { kind: live ? "planning" : "ended", task, calls };
+  }
+  const asked = (id: string | undefined, text: string) => !!id?.startsWith(PLAN_ASK) && text.includes(plan);
+  for (const q of queue) if (asked(q.id, q.text) && q.at >= now - ASK_STANDS_MS) return { kind: "asked", at: q.at };
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (!e || e.at < now - ASK_STANDS_MS) break;
+    if (e.kind === "user" && asked(e.client_id, e.text)) return { kind: "asked", at: e.at };
+  }
+  return null;
+}
+
+/** kiln's own tools, as a planner's call says what it did (`going`: it's at it now). */
+const KILN_SAYS: Record<string, (input: Record<string, unknown>, going: boolean) => string> = {
+  research_add: (input, going) => {
+    const found = Array.isArray(input.findings) ? (input.findings as { claim?: unknown }[]) : [];
+    const first = typeof found[0]?.claim === "string" ? `: ${found[0].claim}` : "";
+    return `${going ? "Adding" : "Added"} ${found.length === 1 ? "a finding" : `${found.length || "its"} findings`}${first}`;
+  },
+  research_get: () => "Read its research",
+  research_start: (_, going) => (going ? "Starting its research" : "Started its research"),
+  plans_get: () => "Read the plan",
+  plans_update: (input, going) => {
+    const steps = Array.isArray(input.items) ? (input.items as { title?: unknown }[]) : [];
+    const titles = steps.map((s) => (typeof s.title === "string" ? s.title : "")).filter(Boolean);
+    return steps.length
+      ? `${going ? "Writing" : "Wrote"} ${steps.length === 1 ? "a step" : `${steps.length} steps`}${titles.length ? `: ${titles.join(" · ")}` : ""}`
+      : going
+        ? "Changing the plan"
+        : "Changed the plan";
+  },
+  plans_ready: (_, going) => (going ? "Saying the plan is ready" : "Said the plan is ready"),
+};
+
+/** A call, in a line of plain words ("Reading crates/x.rs", "Added a finding: …"): what a planner's last calls say. */
+export function callWords(c: Pick<ToolCall, "tool" | "name" | "title" | "status" | "server" | "tool_short" | "input">): string {
+  const going = c.status === "running" || c.status === "pending";
+  const kiln = c.server === "kiln" ? KILN_SAYS[c.tool_short ?? ""] : undefined;
+  if (kiln) return kiln(c.input && typeof c.input === "object" ? (c.input as Record<string, unknown>) : {}, going);
+  const t = c.title;
+  switch (c.tool) {
+    case "read":
+      return `${going ? "Reading" : "Read"} ${t}`;
+    case "search":
+      return `${going ? "Searching" : "Searched"} for ${t}`;
+    case "web":
+      return c.name === "WebSearch" ? `${going ? "Searching" : "Searched"} the web for “${t}”` : `${going ? "Reading" : "Read"} ${t}`;
+    case "shell":
+      return `${going ? "Running" : "Ran"} ${t}`;
+    case "edit":
+      return `${going ? "Editing" : "Edited"} ${t}`;
+    case "agent":
+      return `${going ? "Handing" : "Handed"} on: ${t}`;
+    default:
+      return t ? `${c.tool_short ?? c.name}: ${t}` : (c.tool_short ?? c.name);
+  }
+}
 
 /** The goal that stopped a paused stack with none under way (the last to end, not met or skipped), to try again first. */
 /** One of its own goals still to go, not a part, a plan's step or planned already: it can become a plan (Make a plan). */

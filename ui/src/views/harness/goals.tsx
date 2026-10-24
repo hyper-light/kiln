@@ -15,7 +15,7 @@
  */
 import * as React from "react";
 import { ChevronRight, ListTree } from "lucide-react";
-import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
+import { harnessApi, type GoalItem, type GoalStack, type SessionStore } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
@@ -29,11 +29,12 @@ import { StandTitle, type Stand } from "@/views/plans/status";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
-import { canPlan, canPlanNow, fromLines, stackReads, startWords, stepStand, stoppedBy, toGo } from "./goal-stack";
+import { canPlan, canPlanNow, fromLines, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
 import { machineWord, type GoalStep } from "./goal-plan-layout";
+import { PlannerLive } from "./planner";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
@@ -109,7 +110,7 @@ const whoOf = (a: { kind_name: string; target: string } | undefined) => (a ? `${
  * or its run, an agent a step, saying who's at each. Being planned (none of its steps on the stack
  * yet, nor its run), its one step is the planning.
  */
-function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: string) {
+function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: string, planner?: Planner) {
   const p = usePlan(goal.planned_as ?? "");
   const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
   const view = useRunView(run);
@@ -119,7 +120,11 @@ function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: s
   const planning = p.phase === "planning" && !run && !items.some((i) => i.part_of === goal.id && i.part_kind === "plan");
   if (planning) {
     const part = items.find((i) => i.part_of === goal.id && i.part_kind === "planning");
-    const steps: GoalStep[] = [{ n: 1, title: "Research it inside and out, and write its steps", needs: [], stand: partStand(part, paused), who: own }];
+    // A subagent of its agent's at it (or asked for): the step at work, its planner under it.
+    const at = planner?.kind === "planning" || planner?.kind === "asked";
+    const stand: Stand = at ? "working" : planner?.kind === "ended" ? "unmet" : partStand(part, paused);
+    const word = planner ? { asked: "Asked", planning: "Planning", ended: "Stopped" }[planner.kind] : undefined;
+    const steps: GoalStep[] = [{ n: 1, title: "Research it inside and out, and write the steps", needs: [], stand, who: planner ? undefined : own, word }];
     return { plan: p, run, steps, planning };
   }
   const titles = p.items?.length ? p.items.map((it) => it.title || "Untitled step") : p.steps;
@@ -151,7 +156,7 @@ function PlannedWords({ goal, items, paused, agent }: { goal: GoalItem; items: G
       {run && (
         <>
           {" · "}
-          <Link to={runHref(run)}>its run</Link>
+          <Link to={runHref(run)}>the run</Link>
         </>
       )}
       {plan.research && (
@@ -164,11 +169,38 @@ function PlannedWords({ goal, items, paused, agent }: { goal: GoalItem; items: G
   );
 }
 
-/** A planned goal's steps, under it on its line. */
-function PlannedSteps({ goal, items, paused, agent }: { goal: GoalItem; items: GoalItem[]; paused: boolean; agent: string }) {
-  const planned = usePlanned(goal, items, paused, agent);
+/** A planned goal's steps, under it on its line; being planned now, who's at it under its planning. */
+function PlannedSteps({
+  goal,
+  items,
+  paused,
+  agent,
+  planner,
+  onOpenTask,
+  again,
+}: {
+  goal: GoalItem;
+  items: GoalItem[];
+  paused: boolean;
+  agent: string;
+  planner?: Planner;
+  onOpenTask?: (toolId: string) => void;
+  /** Its subagent stopped short: what plans it again, by why. */
+  again?: React.ReactNode;
+}) {
+  const planned = usePlanned(goal, items, paused, agent, planner);
+  const name = useRes(harnessSessionsRes).data.find((x) => x.id === agent)?.name || "the agent";
   if (!planned?.steps.length) return null;
-  return <GoalPlan steps={planned.steps} label={`Its plan, “${planned.plan.title}”`} />;
+  const live = planner && planned.planning ? <PlannerLive p={planner} agent={name} onOpen={onOpenTask} again={again} /> : null;
+  return <GoalPlan steps={planned.steps} label={`Plan “${planned.plan.title}”`} under={live ? (s: GoalStep) => (s.n === 1 ? live : null) : undefined} />;
+}
+
+const noStore = () => () => undefined;
+
+/** A part of the agent's live session, when the panel has it (none: undefined). */
+function useLive<T>(store: SessionStore | undefined, pick: (s: ReturnType<SessionStore["get"]>) => T): T | undefined {
+  const read = () => (store ? pick(store.get()) : undefined);
+  return React.useSyncExternalStore(store?.subscribe ?? noStore, read, read);
 }
 
 /** What a plan step's goal says before its criterion or test: its step and plan, said by the goal already. */
@@ -185,7 +217,7 @@ function PartSteps({ parts, items, paused, agent }: { parts: GoalItem[]; items: 
     who: own,
     checks: checksOf(p, items),
   }));
-  return <GoalPlan steps={steps} label="Its parts" />;
+  return <GoalPlan steps={steps} label="Parts" />;
 }
 
 /** An agent's name, from the agents kiln knows (its id's start until they're in). */
@@ -223,25 +255,27 @@ function readGoals(agent: string): Promise<{ stack: GoalStack | null; error: unk
   );
 }
 
-export function Goals({ agent, harness, working }: { agent: string; harness?: string; working?: boolean }) {
+export function Goals({ agent, harness, working, store, onOpenTask }: { agent: string; harness?: string; working?: boolean; store?: SessionStore; onOpenTask?: (toolId: string) => void }) {
   // Another agent's: these stay until its goals are in.
   const shown = React.useDeferredValue(agent);
   return (
     <Loadable label="Loading the goal stack" fallback={<GoalPanel agent={agent} harness={harness} stack={null} />}>
       {/* Its own: an edit or a goal half typed for one agent never goes to another. */}
-      <AgentGoals key={shown} agent={shown} harness={harness} working={working} />
+      <AgentGoals key={shown} agent={shown} harness={harness} working={working} store={shown === agent ? store : undefined} onOpenTask={onOpenTask} />
     </Loadable>
   );
 }
 
 /** The agent's goal stack, read again every few seconds while it shows. */
-function AgentGoals({ agent, harness, working }: { agent: string; harness?: string; working?: boolean }) {
+function AgentGoals({ agent, harness, working, store, onOpenTask }: { agent: string; harness?: string; working?: boolean; store?: SessionStore; onOpenTask?: (toolId: string) => void }) {
   const res = useSuspenseResource(`harness/goals/${agent}`, () => readGoals(agent), { pollMs: 2500 });
   return (
     <GoalPanel
       agent={agent}
       harness={harness}
       working={working}
+      store={store}
+      onOpenTask={onOpenTask}
       stack={res.data.stack}
       error={res.data.error}
       onStack={(s) => {
@@ -266,6 +300,8 @@ function GoalPanel({
   agent,
   harness,
   working = false,
+  store,
+  onOpenTask,
   stack,
   error: readError,
   onStack,
@@ -274,6 +310,9 @@ function GoalPanel({
   harness?: string;
   /** The agent is at work now. */
   working?: boolean;
+  /** Its live session (its subagents, what they do): who's planning a goal of its now. */
+  store?: SessionStore;
+  onOpenTask?: (toolId: string) => void;
   /** None until it's read. */
   stack: GoalStack | null;
   /** Why it couldn't be read. */
@@ -306,6 +345,21 @@ function GoalPanel({
   const startWord = startWords(stack);
   const who = harness ?? "the agent";
   const asMessage = (active ?? items.filter((i) => i.how).at(-1))?.how === "message";
+  // Who's planning each goal being planned now (Make a plan): its subagent, or kiln's ask for one.
+  const tasks = useLive(store, (s) => s.state?.tasks);
+  const queue = useLive(store, (s) => s.state?.queue);
+  const said = useLive(store, (s) => s.events);
+  const read = stack?.items;
+  const planners = React.useMemo(() => {
+    const out = new Map<string, Planner>();
+    const all = read ?? [];
+    for (const g of all) {
+      if (g.part_of || !g.planned_as || !all.some((i) => i.part_of === g.id && i.part_kind === "planning" && i.status === "pending")) continue;
+      const p = plannerOf(g.planned_as, tasks ?? [], said ?? [], queue ?? [], Date.now());
+      if (p) out.set(g.id, p);
+    }
+    return out;
+  }, [read, tasks, queue, said]);
 
   const act = async (f: () => Promise<GoalStack>) => {
     setBusy(true);
@@ -374,7 +428,7 @@ function GoalPanel({
           <p className="gs-what">
             {asMessage
               ? `Goals run one after another on this agent: each goes to ${who} as a message, and the next starts once it says the goal is met (GOAL MET).`
-              : `Goals run one after another on this agent: each goes to ${who} as its own /goal, and the next starts once it's met.`}{" "}
+              : `Goals run one after another on this agent: each goes to ${who} as a /goal, and the next starts once it's met.`}{" "}
             Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
           </p>
           {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
@@ -382,7 +436,7 @@ function GoalPanel({
             <input type="checkbox" className="check" checked={stack?.plan_big ?? true} disabled={busy} onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))} />
             <span>
               Plan big goals first
-              <span className="gs-option-hint">A goal longer than a couple of sentences is researched and planned before it&rsquo;s worked on, its steps run under it.</span>
+              <span className="gs-option-hint">A goal longer than a couple of sentences is researched and planned before it&rsquo;s worked on, with the plan&rsquo;s steps run under it.</span>
             </span>
           </label>
           {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
@@ -438,6 +492,29 @@ function GoalPanel({
                     // One handed to another agent (a program's track's worker): under way there.
                     const away = g.status === "pending" && !doing ? g.on : undefined;
                     const stand = standOf({ ...g, status }, held, doing?.waits_on ? true : working && !g.waits_on);
+                    const planner = planners.get(g.id);
+                    // Asked for, or at it: not to ask again.
+                    const planning = planner?.kind === "asked" || planner?.kind === "planning";
+                    // A goal of its own still to go becomes a plan, planned now by a subagent of its agent's; one being planned, its planning waiting its turn, too; one whose subagent stopped short, again.
+                    const planButton = (canPlan(g) || (canPlanNow(g, items) && !planning)) && (
+                      <Button
+                        size="xs"
+                        variant="secondary"
+                        disabled={busy}
+                        onClick={() =>
+                          void act(async () => {
+                            const r = await harnessApi.planGoal(agent, g.id);
+                            if (r.dispatched) toast({ title: "A subagent is planning it now", tone: "running" });
+                            else if (r.why) toast({ title: "Not planned now", description: r.why, tone: "info" });
+                            return harnessApi.goals(agent);
+                          })
+                        }
+                      >
+                        <ListTree aria-hidden="true" /> {canPlan(g) ? "Make a plan" : planner?.kind === "ended" ? "Plan it again" : "Plan it now"}
+                      </Button>
+                    );
+                    // Its subagent stopped short: planning it again goes by why, under its planning.
+                    const again = planner?.kind === "ended" && planButton ? planButton : undefined;
                     return (
                       <li key={g.id} className="gs-link" data-status={held ? "paused" : away ? "active" : status}>
                         {/* Its number in the stack, ringed by where it stands: the one at work in the turning light. */}
@@ -460,7 +537,7 @@ function GoalPanel({
                               WORD[status]
                             )}
                             {g.planned_as ? (
-                              <Loadable label="its plan" fallback={null}>
+                              <Loadable label="the plan" fallback={null}>
                                 <PlannedWords goal={g} items={items} paused={paused} agent={agent} />
                               </Loadable>
                             ) : g.status === "active" && !held && !g.waits_on ? (
@@ -472,38 +549,20 @@ function GoalPanel({
                             {g.waits_on && (
                               <>
                                 {" · waits for "}
-                                <Link to={runHref(g.waits_on)}>its run</Link>
+                                <Link to={runHref(g.waits_on)}>the run</Link>
                               </>
                             )}
                           </span>
                         </span>
-                        {/* What can be done with it: a goal of its own still to go becomes a plan, planned now by a subagent of its agent's (one being planned too, its planning waiting its turn). */}
-                        {(canPlan(g) || canPlanNow(g, items)) && (
-                          <div className="gs-acts">
-                            <Button
-                              size="xs"
-                              variant="secondary"
-                              disabled={busy}
-                              onClick={() =>
-                                void act(async () => {
-                                  const r = await harnessApi.planGoal(agent, g.id);
-                                  if (r.dispatched) toast({ title: "A subagent is planning it now", tone: "running" });
-                                  else if (r.why) toast({ title: "Its planning waits its turn", description: r.why, tone: "info" });
-                                  return harnessApi.goals(agent);
-                                })
-                              }
-                            >
-                              <ListTree aria-hidden="true" /> {canPlan(g) ? "Make a plan" : "Plan it now"}
-                            </Button>
-                          </div>
-                        )}
+                        {/* What can be done with it, under its words. */}
+                        {planButton && !again && <div className="gs-acts">{planButton}</div>}
                         {/* Its steps under it, on its line: its plan's, or the parts it was split into. */}
                         {g.planned_as ? (
-                          <Loadable label="its plan" fallback={null}>
-                            <PlannedSteps goal={g} items={items} paused={paused} agent={agent} />
+                          <Loadable label="the plan" fallback={null}>
+                            <PlannedSteps goal={g} items={items} paused={paused} agent={agent} planner={planner} onOpenTask={onOpenTask} again={again} />
                           </Loadable>
                         ) : items.some((i) => i.part_of === g.id) ? (
-                          <Loadable label="its parts" fallback={null}>
+                          <Loadable label="the parts" fallback={null}>
                             <PartSteps parts={items.filter((i) => i.part_of === g.id)} items={items} paused={paused} agent={agent} />
                           </Loadable>
                         ) : null}

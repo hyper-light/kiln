@@ -532,3 +532,87 @@
 .gs-toggle:hover {
   color: var(--color-bright);
 }
+
+/* A goal being planned now (planner.tsx), under its planning step: the subagent's last calls, a
+   line each cut to fit, the older fainter, on a hairline as output is; then who's at it, for how
+   long, and the subagent to open. Nothing here moves: the step is the one at work (its glyph's
+   turning light, its words in the shimmer). */
+.gp-live {
+  grid-column: 2 / -1;
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  margin-top: 6px;
+}
+.gp-row[data-lane="branch"] .gp-live {
+  grid-column: 3 / -1;
+}
+.gp-tail {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  margin: 0;
+  padding: 1px 0 1px 9px;
+  border-left: 1px solid #2a3039;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  list-style: none;
+}
+.gp-tail li {
+  overflow: hidden;
+  color: #c9cbd1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gp-tail li[data-age="1"] {
+  color: #8d9099;
+}
+.gp-tail li[data-age="2"] {
+  color: #5f636c;
+}
+.gp-live-meta {
+  color: #7d818b;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.gp-live-meta .hx-meta-num {
+  font: inherit;
+}
+.gp-open {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #b9bcc4;
+  font: inherit;
+  letter-spacing: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+  text-transform: inherit;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.gp-open:hover {
+  color: #eceef2;
+}
+/* Stopped with the plan not ready: why, in its own words. */
+.gp-live-why {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  padding-left: 9px;
+  border-left: 1px solid #8a6d4f;
+  color: #d8bb95;
+  font-size: 11.5px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+/* Planning it again, by why the subagent stopped. */
+.gp-again {
+  display: flex;
+  margin-top: 3px;
+}

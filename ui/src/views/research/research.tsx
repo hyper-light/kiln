@@ -333,7 +333,7 @@ export function ResearchLine({ id }: { id: string }) {
   const r = res.data;
   return (
     <>
-      <Link to={researchHref(id)}>its research</Link>: {r.summary.findings} finding{r.summary.findings === 1 ? "" : "s"}
+      <Link to={researchHref(id)}>research</Link>: {r.summary.findings} finding{r.summary.findings === 1 ? "" : "s"}
       {gradeWords(r) && ` (${gradeWords(r)})`}
     </>
   );
