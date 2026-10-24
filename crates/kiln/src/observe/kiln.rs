@@ -18,7 +18,9 @@
 //!   ends and the run's as it ends are one trace, and the same if written twice.
 //! - kiln CD's deploys (`kiln.cd.deploys` by app, trigger and result; objects applied and pruned)
 //!   and every change of an app's health or sync, as events (service `kiln.cd`); its apps counted
-//!   by health and sync each interval (`kiln.cd.apps`).
+//!   by health and sync each interval (`kiln.cd.apps`), a pair counted once written from then on, 0
+//!   when no app is in it, as a Prometheus gauge's labels stay (a monitor on the degraded apps sees
+//!   them leave).
 //! - The registry's families keep their Prometheus names (`kiln_jobs_queued`, ...), but for the
 //!   runners' host samples and the process's figures, which observe reports itself. Every runner's
 //!   own registry is read as the server's is, each tagged with its host; a histogram answers
@@ -290,6 +292,15 @@ pub fn cd_status(before: Option<&kiln_cd::engine::Summary>, now: &kiln_cd::engin
     o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity: if bad { 13 } else { 9 }, service: "kiln.cd".into(), host: String::new(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }]);
 }
 
+/// Apps (each its health and sync) counted by health and sync into `counts`: a pair counted before
+/// kept, 0 when no app is in it now.
+fn count_apps(counts: &mut std::collections::BTreeMap<(&'static str, &'static str), u64>, apps: impl Iterator<Item = (kiln_cd::model::Health, kiln_cd::model::Sync)>) {
+    counts.values_mut().for_each(|n| *n = 0);
+    for (health, sync) in apps {
+        *counts.entry((health.as_str(), sync.as_str())).or_default() += 1;
+    }
+}
+
 /// This node's registry (the server's, or a runner's), every `every`, as Prometheus would scrape
 /// `/metrics`, tagged with its machine; and, where kiln CD runs (the server), its apps counted by
 /// health and sync (`kiln.cd.apps`).
@@ -298,19 +309,18 @@ pub fn start_registry(o: Observe, host: String, every: Duration) {
         return;
     }
     let spawned = std::thread::Builder::new().name("kiln-observe-registry".into()).spawn(move || {
+        // The apps by health and sync: every pair counted since kiln started, 0 when none is in it.
+        let mut counts: std::collections::BTreeMap<(&'static str, &'static str), u64> = std::collections::BTreeMap::new();
         loop {
             let started = Instant::now();
             let text = crate::metrics::render();
             let mut scraped = kiln_obs::prom::parse(&text, crate::util::now_ms(), &[("host", host.as_str())]);
             scraped.series.retain(|(k, _)| kiln_obs::batch::parse_key(&k.key).is_ok_and(|p| !p.metric.starts_with("kiln_agent_") && !p.metric.starts_with("process_")));
             if let Some(cd) = crate::cd::get() {
-                let mut counts: std::collections::BTreeMap<(String, String), u64> = std::collections::BTreeMap::new();
-                for s in cd.statuses.read().values() {
-                    *counts.entry((s.health.as_str().to_owned(), s.sync.as_str().to_owned())).or_default() += 1;
-                }
+                count_apps(&mut counts, cd.statuses.read().values().map(|s| (s.health, s.sync)));
                 let ts = crate::util::now_ms();
-                for ((health, sync), n) in counts {
-                    point(&mut scraped.series, "kiln.cd.apps", Kind::Gauge, &[("host", host.as_str()), ("health", health.as_str()), ("sync", sync.as_str())], ts, n as f64);
+                for (&(health, sync), &n) in &counts {
+                    point(&mut scraped.series, "kiln.cd.apps", Kind::Gauge, &[("host", host.as_str()), ("health", health), ("sync", sync)], ts, n as f64);
                 }
             }
             o.write(scraped.series);
@@ -326,6 +336,16 @@ pub fn start_registry(o: Observe, host: String, every: Duration) {
 mod tests {
     use super::*;
     use crate::store::Step;
+
+    #[test]
+    fn a_health_once_counted_is_counted_0_when_no_app_is_in_it() {
+        use kiln_cd::model::{Health, Sync};
+        let mut counts = std::collections::BTreeMap::new();
+        count_apps(&mut counts, [(Health::Degraded, Sync::Synced), (Health::Healthy, Sync::Synced), (Health::Healthy, Sync::Synced)].into_iter());
+        assert_eq!(counts.iter().map(|(k, n)| (*k, *n)).collect::<Vec<_>>(), [(("Degraded", "Synced"), 1), (("Healthy", "Synced"), 2)]);
+        count_apps(&mut counts, [(Health::Healthy, Sync::Synced), (Health::Healthy, Sync::OutOfSync), (Health::Healthy, Sync::Synced)].into_iter());
+        assert_eq!(counts.iter().map(|(k, n)| (*k, *n)).collect::<Vec<_>>(), [(("Degraded", "Synced"), 0), (("Healthy", "OutOfSync"), 1), (("Healthy", "Synced"), 2)]);
+    }
 
     fn step(idx: u32, name: &str, from: i64, to: i64, status: Status) -> Step {
         Step { idx, name: name.into(), status, started_at: Some(from), finished_at: Some(to), exit_code: Some(i32::from(status == Status::Failed)), seq: None }

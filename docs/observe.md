@@ -731,7 +731,9 @@ time, sent again until answered; §5), from:
   span under it and each step under its job, their ids derived from the run's and the job's so that
   spans written as each job ends join the run's; the events carry the trace's ids.
 - **kiln CD**: each deploy (by app, trigger, result) and each change of an app's health or sync as
-  events; apps counted by health and sync.
+  events; apps counted by health and sync (`kiln.cd.apps`), a pair once counted written from then
+  on, 0 when no app is in it, as a Prometheus gauge's labels stay: a monitor on the degraded apps
+  sees them leave and recovers (it would hold its alert on no data otherwise).
 - **GitHub's webhooks**: pushes, pull requests, workflow runs and jobs (durations, conclusions),
   releases, deployments, issues; events and counts.
 - **The API**: Datadog's v1 series (`POST series`), log intake (`POST logs`) and events (`POST

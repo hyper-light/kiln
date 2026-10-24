@@ -62,6 +62,21 @@ pub struct Fleet {
     pub otlp: BTreeMap<String, u16>,
 }
 
+/// What a test sets in the server's own tables; the fleet's choices otherwise.
+pub struct Tables<'a> {
+    /// `[cd]`'s keys: off, unless the test deploys.
+    pub cd: &'a str,
+    /// How often the server looks at its host and scrapes its own registry (`[observe]
+    /// host_seconds`): hourly, unless the test reads what the registry says as it changes.
+    pub host_seconds: u32,
+}
+
+impl Default for Tables<'_> {
+    fn default() -> Self {
+        Self { cd: "enabled = false", host_seconds: 3600 }
+    }
+}
+
 impl Fleet {
     pub fn new() -> anyhow::Result<Self> {
         Self::with(|_| String::new())
@@ -74,6 +89,12 @@ impl Fleet {
 
     /// A fleet whose server's configuration has `extra(root)` too, and whose server has `env`.
     pub fn with_env(extra: impl Fn(&Path) -> String, env: &[(&str, &str)]) -> anyhow::Result<Self> {
+        Self::with_tables(&Tables::default(), extra, env)
+    }
+
+    /// A fleet whose server's own tables say what `tables` does, its configuration has
+    /// `extra(root)` too, and the server has `env`.
+    pub fn with_tables(tables: &Tables<'_>, extra: impl Fn(&Path) -> String, env: &[(&str, &str)]) -> anyhow::Result<Self> {
         let root = tempfile::tempdir()?;
         let (http, quic) = (free_port()?, free_port()?);
         let data = root.path().join("server");
@@ -99,7 +120,7 @@ enabled = false
 enabled = false
 
 [cd]
-enabled = false
+{cd}
 
 [telemetry]
 # Runners' host samples, and every node's own figures, once an hour: the test's writes are the
@@ -110,11 +131,13 @@ sample_seconds = 3600
 enabled = true
 # Each node looks at its host once, as it starts, and then not for an hour: the test's writes are the
 # writes.
-host_seconds = 3600
+host_seconds = {host_seconds}
 
 {extra}
 "#,
             data = data.display(),
+            cd = tables.cd,
+            host_seconds = tables.host_seconds,
             extra = extra(root.path())
         );
         std::fs::write(root.path().join("kiln.toml"), cfg)?;
