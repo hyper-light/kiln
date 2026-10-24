@@ -77,6 +77,29 @@ pub async fn artifact(cx: &Cx<'_>, files: &dyn Files, prefix: &str, hex: &str, e
     Ok((bucket, key))
 }
 
+/// `bytes` in kiln's bucket under `kiln/<prefix>/<sha256><extension>`, uploaded unless they
+/// already are: its bucket and key (a CloudFormation template too long to send inline).
+pub async fn put(cx: &Cx<'_>, prefix: &str, bytes: &[u8], extension: &str) -> Result<(String, String)> {
+    let bucket = bucket(cx).await?;
+    let hex = crate::util::sha256_hex(bytes);
+    let key = format!("kiln/{prefix}/{hex}{extension}");
+    let path = format!("/{bucket}/{}", encode(&key, true));
+    let (code, _) = status(cx, Method::Head, &path, Vec::new().into()).await?;
+    if code != 200 {
+        let (code, text) = status(cx, Method::Put, &path, bytes.to_vec().into()).await?;
+        if !(200..300).contains(&code) {
+            bail!("uploading {key} to {bucket}: HTTP {code} {}", crate::ci::integrations::aws::xml_text(&text, "Message").unwrap_or(text));
+        }
+    }
+    Ok((bucket, key))
+}
+
+/// The HTTPS address of an object in kiln's bucket, as CloudFormation takes a template's.
+pub fn url(cx: &Cx<'_>, bucket: &str, key: &str) -> Result<String> {
+    let region = cx.conn.region()?;
+    Ok(format!("https://{bucket}.s3.{region}.amazonaws.com/{}", encode(key, true)))
+}
+
 /// Where code an artifact holds is, as Lambda (and Beanstalk) take it.
 pub async fn code(cx: &Cx<'_>, files: &dyn Files, hex: &str) -> Result<Value> {
     let (bucket, key) = artifact(cx, files, "lambda", hex, ".zip").await?;

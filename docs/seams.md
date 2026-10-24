@@ -69,6 +69,8 @@ Methods: `spawn_boxed`.
 Every record kiln keeps, by family and key, each at the revision of the commit that last wrote it.
 
 - **Implementations:** Amphora's typed records (CP-T1.5, which takes this suite past 200 cases);
+  kiln's own (`kiln::records::StoreRecords`, durable in kiln's store, until CP-T1.5 takes its
+  place, copying each family through the seam);
   `kiln_seams::records::SimRecords`: linearizable, snapshot reads from each key's last 32
   versions and the last 100,000 deleted keys' histories (older: refused `Compacted`), a change
   feed of the last 100,000 changes (a read of changes or a wait from before it: refused
@@ -76,9 +78,11 @@ Every record kiln keeps, by family and key, each at the revision of the commit t
   lost a version, a snapshot from before the oldest kept is refused for every key (coarse,
   never wrong). Its `compact` forgets the history before a revision at once, as a compaction
   does; a suite's fixture makes its store do that for RECORDS-14.
-- **Used by:** goal stacks, goal items, plans, plan runs and keep-going, once CP-T1.5 moves them
-  off rusqlite; the session journal (CP-T3.1).
-- **Passed by:** the simulator, every clause; Amphora's, when CP-T1.5 lands it.
+- **Used by:** deploying by API's records (docs/deploy-api.md §14.1); goal stacks, goal items,
+  plans, plan runs and keep-going, once CP-T1.5 moves them off rusqlite; the session journal
+  (CP-T3.1).
+- **Passed by:** the simulator, every clause; kiln's own, every clause; Amphora's, when CP-T1.5
+  lands it.
 - **Bounds:** family names 1 to 64 of `a-z 0-9 _ - .`; keys 1 to 1024 bytes; values to 1 MiB;
   1000 conditions and 1000 writes a transaction; 1000 rows a page or a change read.
 

@@ -174,6 +174,13 @@ fn tables(conn: &Connection) -> anyhow::Result<HashMap<String, Table>> {
     Ok(out)
 }
 
+/// Each table of `conn`'s main database as a copy reads it: its stored columns (quoted, in
+/// order), and whether its rows have rowids of their own to keep (a rowid table without an
+/// `INTEGER PRIMARY KEY`, whose rowid is one of its columns).
+pub fn copy_columns(conn: &Connection) -> anyhow::Result<HashMap<String, (Vec<String>, bool)>> {
+    Ok(tables(conn)?.into_iter().map(|(name, t)| (name, (t.columns, t.pk.is_none() && t.alias.is_none()))).collect())
+}
+
 /// What the pre-update hook writes into.
 #[derive(Default)]
 pub struct Capture {

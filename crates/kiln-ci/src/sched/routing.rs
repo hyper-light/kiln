@@ -512,6 +512,8 @@ pub struct RuleMatch {
     pub job: Option<String>,
     /// Repository globs.
     pub repos: Vec<String>,
+    /// Whether the leg's steps run containers themselves (`podman`, `buildah`: [`runs_containers`]).
+    pub nests_containers: Option<bool>,
 }
 
 /// A routing rule (W05-R21): declared, ordered data.
@@ -590,6 +592,8 @@ pub struct LegRoute {
     pub caps: u64,
     /// An untrusted leg's limits (W18-R07); `None` for a trusted one.
     pub untrusted: Option<Untrusted>,
+    /// Its steps run containers themselves ([`runs_containers`]).
+    pub nests_containers: bool,
 }
 
 /// Where untrusted legs may run (`ci.untrusted`, W18-R07).
@@ -658,8 +662,24 @@ fn rule_applies(r: &Rule, leg: &LegRoute) -> bool {
     {
         return false;
     }
+    if m.nests_containers.is_some_and(|n| n != leg.nests_containers) {
+        return false;
+    }
     // A rule with nothing to match applies to every leg (a fleet-wide default).
     true
+}
+
+/// Whether a `run:` script runs containers itself: calls `podman` or `buildah` as a command (at a
+/// line's start, after `;`, `&&`, `||`, `|`, `(` or a backquote, past `sudo`, `exec`, `time` and
+/// `NAME=value`), not in a comment. Their containers need what a container executor's container
+/// doesn't give (W13).
+pub fn runs_containers(script: &str) -> bool {
+    script.lines().map(str::trim_start).filter(|l| !l.starts_with('#')).any(|line| {
+        line.split([';', '|', '&', '(', '`']).any(|cmd| {
+            let mut words = cmd.split_whitespace().skip_while(|w| matches!(*w, "sudo" | "exec" | "time" | "-E") || (w.contains('=') && !w.starts_with('-')));
+            words.next().is_some_and(|w| matches!(w.trim_start_matches('\\'), "podman" | "buildah"))
+        })
+    })
 }
 
 /// Whether a condition over a leg holds (a rule's `match.job`, a reservation's `for`): over `job`
@@ -700,6 +720,14 @@ pub fn resolve(leg: &LegRoute, rules: &[Rule]) -> Result<Requirement, String> {
     }
     for c in &leg.requires {
         req.constraints.push((c.clone(), Constraint::parse(c)?));
+    }
+    // Steps that run containers themselves can't in a container executor's container (`docker`,
+    // `k8s`): such a leg goes where it can, the other executors the rules allow, else a microVM.
+    if leg.nests_containers && req.executors.iter().any(|e| e == "docker" || e == "k8s") {
+        req.executors.retain(|e| e != "docker" && e != "k8s");
+        if req.executors.is_empty() {
+            req.executors = vec!["firecracker".to_owned()];
+        }
     }
     // An untrusted leg: only the executors the server lets untrusted code run on, whatever the
     // rules would have chosen (W18-R07).
@@ -936,6 +964,31 @@ mod tests {
         }
         // The same requirement, the same signature.
         assert_eq!(resolve(&leg, &github_label_rules())?.signature(), resolve(&LegRoute { job: "test".into(), ..leg }, &github_label_rules())?.signature());
+        Ok(())
+    }
+
+    /// Steps that run containers themselves (rails' `podman build`): such a leg leaves container
+    /// executors for the others its rules allow, else a microVM, and a rule can match it to send
+    /// it to one (docs/ci.md W13).
+    #[test]
+    fn w13_a_leg_that_runs_podman_leaves_container_executors() -> Result<(), String> {
+        for script in ["podman build -t app .", "set -e\npodman run --rm app", "cd x && sudo podman ps", "FOO=1 buildah bud .", "echo $(podman --version)", "  podman \\\n  build ."] {
+            assert!(runs_containers(script), "{script:?}");
+        }
+        for script in ["echo podman", "# podman build", "docker build .", "./podman-compose up", "apt-get install podman-docker", "grep -r podman ."] {
+            assert!(!runs_containers(script), "{script:?}");
+        }
+        let leg = LegRoute { labels: vec!["ubuntu-latest".into()], nests_containers: true, ..LegRoute::default() };
+        assert_eq!(resolve(&leg, &github_label_rules())?.executors, vec!["host".to_owned()], "not in the runner image's container");
+        let docker_only = Rule { executor: vec!["docker".into()], ..Rule::default() };
+        assert_eq!(resolve(&leg, std::slice::from_ref(&docker_only))?.executors, vec!["firecracker".to_owned()]);
+        // The rule the corpus lab has: such legs to Firecracker microVMs, the image still the label's.
+        let microvm = Rule { matches: RuleMatch { nests_containers: Some(true), ..RuleMatch::default() }, executor: vec!["firecracker".into()], ..Rule::default() };
+        let rules: Vec<Rule> = std::iter::once(microvm).chain(github_label_rules()).collect();
+        let req = resolve(&leg, &rules)?;
+        assert_eq!((req.executors, req.image.as_deref()), (vec!["firecracker".to_owned()], Some("kiln/runner-ubuntu-24.04")));
+        let plain = resolve(&LegRoute { nests_containers: false, ..leg }, &rules)?;
+        assert_eq!(plain.executors, vec!["docker".to_owned(), "host".to_owned()], "others as before");
         Ok(())
     }
 

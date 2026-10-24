@@ -820,7 +820,7 @@ mod end_to_end {
             let kids: Vec<String> = (0..3).map(|_| crate::util::new_id()).collect();
             for (n, k) in kids.iter().enumerate() {
                 let info = Info { id: k.clone(), kind: "claude".into(), name: format!("Helper {}", n + 1), parent: Some(p.clone()), status: Status::Running, ..Info::default() };
-                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info) });
+                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info), since: None });
             }
             let report = |k: &str, status: Status, said: String, at: i64| {
                 let state = State { status, summary: said, last_turn: (at > 0).then(|| TurnEnd { at, how: "done".into(), ..TurnEnd::default() }), ..State::default() };

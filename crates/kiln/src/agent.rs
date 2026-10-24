@@ -716,6 +716,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
+    // A test build's fault: frames lost below the channel, which it makes up for.
+    if let Some(rule) = crate::runner::chaos::get().and_then(|c| c.shed) {
+        net.command(net::Out::Shed(rule)).await;
+    }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
     let mut paths = if o.ephemeral {
         crate::tunnel::Paths::new(&o.server_url, &quic_addr)
@@ -739,6 +743,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         sync
     });
+    // The cluster group's learner: this machine's replica of kiln's records (docs/p2p.md, P2),
+    // started once the server says which member it is (never in a job pod or an outpost).
+    let cluster: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>> = Arc::default();
+    let cluster_starting = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
@@ -808,6 +816,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // server late.
     let chaos = crate::runner::chaos::get();
     let mut chaos_drop: Option<Instant> = None;
+    // A test build's link cut for a while: no dialing again before this.
+    let mut chaos_down: Option<Instant> = None;
     let (delay_line, delayed) = match chaos.and_then(|c| c.delay).map(crate::runner::chaos::DelayLine::new) {
         Some((line, due)) => (Some(line), Some(due)),
         None => (None, None),
@@ -855,6 +865,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
     let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
+    // Their updates over the channel, once the server says it keeps it (docs/wire.md): kept until
+    // the server has them, and sent again after a reconnect from where it has them, never whole.
+    let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+    // The server keeps the channel: it said so on this connection, before its Welcome.
+    let mut server_wire = false;
+    // The server takes what this runner's QUIC layer dropped (`AgentMsg::NetDrops`), and what it
+    // was last told of it on this connection.
+    let mut server_drops = false;
+    let mut drops_said: Option<Vec<proto::NetDrop>> = None;
+    // The channel's updates go (a server that keeps it welcomed this runner since it started).
+    let mut updates_on = false;
+    // The server's commands on the channel (`crate::wire::commands`): what this runner has of
+    // each stream; and the one being applied, answered at the top of the next turn of the loop
+    // (however its arm ended), taken unless its arm refused it.
+    let mut wire_in = crate::wire::channel::Receiver::new();
+    let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
+    // What the server's copy of each session here has, said in digests on this connection: a
+    // stream that starts sends only what the copy lacks (`crate::wire::sums`).
+    let mut server_kept: HashMap<String, proto::KeptSession> = HashMap::new();
+    // The sessions that announced themselves in this process (their Open went by): one that
+    // hasn't yet starts its stream with its announcement, not before it (which then comes whole).
+    let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Blue/green: this runner's upgrade under way (it is the old one), its steps' results, and (it is
     // the new one) the runner it takes over from.
     #[cfg_attr(not(unix), allow(unused_variables))]
@@ -979,7 +1011,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         terminal: o.terminal,
     };
 
-    loop {
+    'events: loop {
+        if let Some((stream, seq, refusal)) = answer_after.take() {
+            let a = match refusal {
+                Some((code, why)) => wire_in.refused(&stream, seq, code, why),
+                None => wire_in.took(&stream, seq),
+            };
+            uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
+        }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
         if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
@@ -1052,7 +1091,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::ChaosDrop => {
                 chaos_drop = None;
                 if connected {
-                    tracing::warn!("chaos: dropping the connection to the server");
+                    chaos_down = chaos.and_then(|c| c.down_for).map(|d| Instant::now() + d);
+                    tracing::warn!(down_for = ?chaos.and_then(|c| c.down_for), "chaos: dropping the connection to the server");
                     net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                 }
             }
@@ -1542,6 +1582,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
+                // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md).
+                if !o.ephemeral {
+                    let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE }) {
+                        net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    }
+                }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
                 // part of the fleet).
                 if !o.ephemeral
@@ -1574,6 +1621,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 connected = true;
+                // What the server's copies have is its to say again on this connection.
+                server_kept.clear();
                 if let Some(s) = &sync {
                     s.connected(true);
                 }
@@ -1602,6 +1651,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
+                // The channel's items in flight go again once the server says what it has.
+                updates.down();
+                server_wire = false;
+                server_drops = false;
+                drops_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -1615,6 +1669,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 dialing_since = None;
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
+                if let Some(until) = chaos_down.take() {
+                    redial = redial.map(|r| r.max(until));
+                }
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
@@ -1623,6 +1680,37 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Err(e) => {
                         tracing::warn!(error = %e, "bad frame from server");
                         continue;
+                    }
+                };
+                // A command on the channel (docs/wire.md, "Commands"): taken once, however often
+                // it comes, then applied as if it had come alone, and answered at the top of the
+                // next turn of the loop.
+                let (msg, data) = 'item: {
+                    match msg {
+                        ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
+                            use crate::wire::channel::{Arrival, Refusal};
+                            // A command stream's new generation: the ones before it are done with.
+                            if seq == 1
+                                && let Some(prefix) = crate::wire::commands::prefix_of(&stream)
+                            {
+                                wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix));
+                            }
+                            let answer = match wire_in.on_item(&stream, seq, low, body) {
+                                Arrival::Take(body) => match proto::decode::<ServerMsg>(&body) {
+                                    Ok(ServerMsg::Wire(_)) => wire_in.refused(&stream, seq, Refusal::Malformed, "a channel frame inside a command"),
+                                    Ok(inner) => {
+                                        answer_after = Some((stream, seq, None));
+                                        break 'item (inner, body);
+                                    }
+                                    Err(e) => wire_in.refused(&stream, seq, Refusal::Malformed, e.to_string()),
+                                },
+                                Arrival::Answered(Some(a)) | Arrival::Gap(a) => a,
+                                Arrival::Answered(None) => continue 'events,
+                            };
+                            uplink.0.send(Up::Term(AgentMsg::Wire(answer))).await.ok();
+                            continue 'events;
+                        }
+                        m => (m, data),
                     }
                 };
                 // About something handed to the new build (blue/green), or new while this runner
@@ -1642,6 +1730,44 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     continue;
                 }
                 match msg {
+                    // What the server can do past Build's 32 bits (docs/wire.md): said before its
+                    // Welcome, so this runner sends its sessions over the channel, not whole. It
+                    // says what it has of the server's streams (none yet).
+                    ServerMsg::Kept { sessions } => {
+                        server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
+                    }
+                    ServerMsg::Caps { caps } => {
+                        server_wire = caps & proto::CAP_WIRE != 0;
+                        server_drops = caps & proto::CAP_NET_DROPS != 0;
+                        if server_wire {
+                            uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                        }
+                    }
+                    // Taken above, before this match: what it carries came here instead.
+                    ServerMsg::Wire(crate::wire::channel::Frame::Item { .. }) => {}
+                    // What the server has of this runner's streams, its answers and wants: what it
+                    // lacks goes; a stream it lost starts over, its snapshot first.
+                    ServerMsg::Wire(frame) => {
+                        updates.on_frame(frame);
+                        for key in updates.take_stale() {
+                            if let Some(id) = key.strip_prefix("s:") {
+                                if let Some(s) = harness.as_ref().and_then(|h| h.get(id)) {
+                                    start_stream(&mut updates, id, &s, server_kept.get(id));
+                                }
+                            } else if let Some(id) = key.strip_prefix("t:")
+                                && let Some((_, state)) = terms.get(id)
+                            {
+                                // A terminal's stream starts over with its picture now.
+                                let a = state.attach();
+                                state.detach();
+                                updates.start(&key);
+                                if let Ok(b) = proto::encode(&AgentMsg::TermReplay { session: id.to_owned(), data: a.replay }) {
+                                    updates.push(&key, b);
+                                }
+                            }
+                        }
+                        flush_updates(&mut updates, &uplink).await;
+                    }
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
                         // What waited for the connection, in order: what was held while it was
@@ -1681,21 +1807,47 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(ai) = &ai {
                             ai.reset();
                         }
-                        // The server learns (again) which agent sessions run here, then all of each.
+                        // Its battery is said again too (a state: the newest, sent on every connect).
+                        power_said = None;
+                        power_read_at = None;
+                        // The server learns (again) which agent sessions run here, then what it lacks
+                        // of each: over the channel only that (a session's stream not started yet
+                        // starts with its snapshot), else all of each.
                         if let Some(h) = &harness {
-                            while harness_rx.try_recv().is_ok() {}
+                            if server_wire {
+                                updates_on = true;
+                                // Updates queued meanwhile go on their streams; those of sessions
+                                // whose stream starts now are in its snapshot.
+                                while let Ok((session, u)) = harness_rx.try_recv() {
+                                    note_announced(&mut announced, &session, &u);
+                                    if updates.started(&crate::wire::uplink::session_key(&session)) {
+                                        push_update(&mut updates, &session, &u);
+                                    }
+                                }
+                            } else {
+                                updates_on = false;
+                                updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+                                while harness_rx.try_recv().is_ok() {}
+                            }
                             if let Ok(json) = serde_json::to_string(&h.inventory()) {
                                 harness_kinds_sent = serde_json::to_string(&crate::harness::kinds::offered()).ok();
                                 uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
                             }
                             for info in h.list() {
                                 let Some(s) = h.get(&info.id) else { continue };
+                                if updates_on {
+                                    if !updates.started(&crate::wire::uplink::session_key(&info.id)) && announced.contains(&info.id) {
+                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id));
+                                    }
+                                    continue;
+                                }
                                 for u in s.snapshot() {
                                     for json in harness_frames(&info.id, &u) {
                                         uplink.0.send(Up::Term(AgentMsg::Harness { session: info.id.clone(), json })).await.ok();
                                     }
                                 }
                             }
+                            flush_updates(&mut updates, &uplink).await;
                         }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                         // A new build started to take over from the runner being upgraded (blue/green):
@@ -1787,6 +1939,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let error = format!("cancelled; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
                                 let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
                             });
+                        } else {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
                         }
                     }
                     ServerMsg::Drain => draining = true,
@@ -2128,6 +2282,80 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Sync { json, raft } => {
                         if let Some(s) = &sync {
                             s.heard(&json, raft);
+                        }
+                    }
+                    ServerMsg::Cluster { json, raft } => {
+                        use crate::store::learner::{Learner, Msg};
+                        match crate::store::learner::decode(&json) {
+                            Some(Msg::Join { member, token }) if !o.ephemeral && !o.outpost => {
+                                if cluster.lock().is_some() || cluster_starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                    continue;
+                                }
+                                // Fetching its first copy of kiln.db takes a while: not on this loop.
+                                let (slot, starting, up) = (cluster.clone(), cluster_starting.clone(), uplink.0.clone());
+                                let (dir, me, server, http) = (o.state_dir.clone(), name.clone(), o.server_url.clone(), http.clone());
+                                crate::rt::spawn(async move {
+                                    // A few tries: the process before this one may still hold the
+                                    // replica's files for a moment.
+                                    let mut tries = 0;
+                                    let started = loop {
+                                        let (dir, me, server, http, token) = (dir.clone(), me.clone(), server.clone(), http.clone(), token.clone());
+                                        // A thread of its own: fetching a copy takes minutes on a large
+                                        // store, and the blocking pool is the runtime's.
+                                        let (tx, rx) = async_channel::bounded(1);
+                                        let spawned = std::thread::Builder::new().name("kiln-learner".into()).spawn(move || {
+                                            let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
+                                        });
+                                        let r = match spawned {
+                                            Ok(_) => rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended")),
+                                            Err(e) => Err(anyhow::anyhow!("starting the learner's thread: {e}")),
+                                        };
+                                        tries += 1;
+                                        match r {
+                                            Ok(Ok(started)) => break Ok(started),
+                                            Ok(Err(e)) | Err(e) if tries >= 5 => break Err(e),
+                                            Ok(Err(e)) | Err(e) => {
+                                                tracing::debug!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records didn't start yet");
+                                                crate::rt::sleep(std::time::Duration::from_secs(15)).await;
+                                            }
+                                        }
+                                    };
+                                    match started {
+                                        Ok((learner, said)) => {
+                                            tracing::info!(member, "this machine holds a replica of kiln's records");
+                                            let learner = Arc::new(learner);
+                                            crate::store::learner::set_global(Some(Arc::clone(&learner)));
+                                            *slot.lock() = Some(learner);
+                                            crate::rt::spawn(async move {
+                                                while let Ok(m) = said.recv().await {
+                                                    if up.send(Up::Sync(m)).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
+                                    }
+                                    starting.store(false, std::sync::atomic::Ordering::SeqCst);
+                                });
+                            }
+                            Some(Msg::Leave) => {
+                                // Another process of this machine holds it now: its files are let go
+                                // (stopping it waits for its thread: not on this loop).
+                                if let Some(old) = cluster.lock().take() {
+                                    crate::store::learner::set_global(None);
+                                    crate::rt::spawn(async move {
+                                        let _ = crate::rt::blocking(move || drop(old)).await;
+                                    });
+                                }
+                            }
+                            Some(m @ (Msg::Raft { .. } | Msg::At { .. })) => {
+                                let learner = cluster.lock().clone();
+                                if let Some(l) = learner {
+                                    l.heard(&m, raft);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     ServerMsg::Convo { json, data } => {
@@ -2482,6 +2710,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if !crate::runner::runtime::rerun_step(&job, step, idx) {
                             tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("leg {job} isn't kept here"));
                         }
                     }
                     // The rest of CI's messages (W09, W13) land with their workstreams.
@@ -2513,7 +2742,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         AgentMsg::TermExit { session, code, error: None }
                     }
                 };
-                uplink.0.send(Up::Term(msg)).await.ok();
+                if updates_on {
+                    // Over the channel: its output comes once, in order, through a cut too.
+                    let (key, exited) = match &msg {
+                        AgentMsg::TermExit { session, .. } => (crate::wire::uplink::terminal_key(session), true),
+                        AgentMsg::TermOutput { session, .. } => (crate::wire::uplink::terminal_key(session), false),
+                        _ => (String::new(), false),
+                    };
+                    if !updates.started(&key) {
+                        updates.start(&key);
+                    }
+                    if let Ok(b) = proto::encode(&msg) {
+                        updates.push(&key, b);
+                    }
+                    if exited {
+                        updates.closing(&key);
+                    }
+                    if connected {
+                        flush_updates(&mut updates, &uplink).await;
+                    }
+                } else {
+                    uplink.0.send(Up::Term(msg)).await.ok();
+                }
             }
             Ev::Up(mut up) => {
                 // A job's event: numbered, and kept until the job's result is received.
@@ -2568,8 +2818,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Harness(session, u) => {
-                // Not kept across a disconnect: the reconnect sends every session whole.
-                if connected {
+                note_announced(&mut announced, &session, &u);
+                if updates_on {
+                    // Over the channel: kept until the server has it, down or not. A new session's
+                    // stream starts with its Open; a closed one's ends once answered.
+                    let key = crate::wire::uplink::session_key(&session);
+                    if !updates.started(&key) && matches!(u, crate::harness::core::Update::Open { .. }) {
+                        updates.start(&key);
+                    }
+                    push_update(&mut updates, &session, &u);
+                    if matches!(u, crate::harness::core::Update::Closed) {
+                        updates.closing(&key);
+                    }
+                    if connected {
+                        flush_updates(&mut updates, &uplink).await;
+                    }
+                } else if connected && welcomed {
+                    // A server from before the channel: not kept across a disconnect, the
+                    // reconnect sends every session whole (and before its Welcome, nothing: the
+                    // Welcome brings the server all of each, over the channel or not).
                     for json in harness_frames(&session, &u) {
                         uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
                     }
@@ -2611,9 +2878,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Sample => {
+                if connected && updates_on {
+                    // Items whose answers are overdue (lost below the channel) go again.
+                    flush_updates(&mut updates, &uplink).await;
+                }
+                // What it has of the server's commands, said again: one lost below the channel
+                // mustn't hold the server's commands up until the next connection.
+                if connected && server_wire {
+                    uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                }
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
+                    // What its QUIC layer let go below the channel, for its page: once it changed.
+                    let dropped = crate::metrics::net().counts();
+                    if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
+                        uplink.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
+                        drops_said = Some(dropped);
+                    }
                     // What its conversation stores are doing, for the server's board (a server from
                     // before takes it for nothing). Never waits: a full link skips one.
                     for (st, role, feed) in [(convo.as_ref(), "own", shipper.as_ref().map(crate::convo::feed::Shipper::stats)), (mirror_store.as_ref(), "mirror", None)] {
@@ -2664,6 +2946,112 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
 }
 
 
+/// One agent-session update onto its session's channel stream, as the frames it needs.
+fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update) -> usize {
+    let key = crate::wire::uplink::session_key(session);
+    let mut bytes = 0;
+    for json in harness_frames(session, u) {
+        if let Ok(b) = proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }) {
+            bytes += b.len();
+            updates.push(&key, b);
+        }
+    }
+    bytes
+}
+
+/// Starts `session`'s channel stream (again), its snapshot first: when the server's copy is of
+/// the same epoch (`kept`), only what the copy lacks (`crate::wire::sums`), else all of it.
+fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &crate::harness::session::Session, kept: Option<&proto::KeptSession>) {
+    use crate::harness::core::Update;
+    let key = crate::wire::uplink::session_key(session);
+    updates.start(&key);
+    let (snapshot, delta) = go_on(s.snapshot(), kept);
+    // Its bytes, and of them its newest meta, state and changes, and its events after the copy's.
+    let (mut bytes, mut newest, mut after) = (0, 0, 0);
+    for u in &snapshot {
+        let n = push_update(updates, session, u);
+        bytes += n;
+        match u {
+            Update::Meta { .. } | Update::State { .. } | Update::Changes { .. } => newest += n,
+            Update::Events { events } if delta.as_ref().is_some_and(|d| events.first().is_some_and(|e| e.seq > d.since)) => after += n,
+            _ => {}
+        }
+    }
+    match delta {
+        Some(d) => tracing::info!(
+            %session,
+            stream = %updates.stream(&key),
+            since = d.since,
+            again = d.again.len(),
+            bytes,
+            beyond = bytes - newest - after,
+            "an agent session's updates start on the channel after what the server's copy has"
+        ),
+        None => tracing::info!(%session, stream = %updates.stream(&key), bytes, "an agent session's updates start on the channel, whole"),
+    }
+}
+
+/// A session's `snapshot` as a stream that starts sends it to a server whose copy is `kept`: when
+/// that's of the same epoch, under an Open that says through which event the copy keeps its own
+/// (`since`), with no Reset, its newest info, meta, state and changes, and only the events after
+/// that and those through it whose digest differs from the copy's. Else the snapshot as it is.
+fn go_on(snapshot: Vec<crate::harness::core::Update>, kept: Option<&proto::KeptSession>) -> (Vec<crate::harness::core::Update>, Option<crate::wire::sums::Delta>) {
+    use crate::harness::core::Update;
+    let epoch = snapshot.iter().find_map(|u| if let Update::Open { info, .. } = u { Some(info.epoch) } else { None });
+    let Some(kept) = kept.filter(|k| Some(k.epoch) == epoch) else { return (snapshot, None) };
+    // Each event as the copy keeps it, and its digest.
+    let mine: Vec<(u64, u64)> = snapshot
+        .iter()
+        .filter_map(|u| if let Update::Events { events } = u { Some(events) } else { None })
+        .flatten()
+        .filter_map(sent_event)
+        .filter_map(|e| serde_json::to_value(&e).ok().map(|v| (e.seq, crate::wire::sums::event(&v))))
+        .collect();
+    let Some(d) = crate::wire::sums::delta(kept, &mine) else { return (snapshot, None) };
+    // Those it sends again go first, on their own, then those after the copy's newest: by number.
+    let mut again = Vec::new();
+    let mut out: Vec<Update> = Vec::new();
+    for u in snapshot {
+        match u {
+            Update::Open { info, .. } => out.push(Update::Open { info, since: Some(d.since) }),
+            Update::Reset { .. } => {}
+            Update::Events { events } => {
+                let (before, after): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| e.seq <= d.since);
+                again.extend(before.into_iter().filter(|e| d.again.binary_search(&e.seq).is_ok()));
+                if !after.is_empty() {
+                    out.push(Update::Events { events: after });
+                }
+            }
+            u => out.push(u),
+        }
+    }
+    if !again.is_empty() {
+        let at = out.iter().position(|u| matches!(u, Update::Events { .. })).unwrap_or(out.len());
+        out.insert(at, Update::Events { events: again });
+    }
+    (out, Some(d))
+}
+
+/// Notes a session's announcement in this process (and that it's gone, once closed).
+fn note_announced(announced: &mut std::collections::HashSet<String>, session: &str, u: &crate::harness::core::Update) {
+    match u {
+        crate::harness::core::Update::Open { .. } => {
+            announced.insert(session.to_owned());
+        }
+        crate::harness::core::Update::Closed => {
+            announced.remove(session);
+        }
+        _ => {}
+    }
+}
+
+/// Sends what the channel has to send now.
+async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Uplink) {
+    for f in updates.poll(Instant::now()) {
+        uplink.0.send(Up::Term(AgentMsg::Wire(f))).await.ok();
+    }
+}
+
 /// Most of one agent-session update a frame carries. They go on the interactive lane, which
 /// refuses frames past 1 MiB ([`net::Kiln`]); a resumed session's history can be several.
 const HARNESS_FRAME: usize = 512 * 1024;
@@ -2674,6 +3062,14 @@ const HARNESS_FRAME: usize = 512 * 1024;
 /// same way: dropped, its page would go on showing what no longer is, the agent looking stuck. A
 /// state still too large sheds its finished tasks, the oldest first. Only what still doesn't fit
 /// is dropped, and logged.
+/// The command being applied on the channel (`answer_after`) is refused, saying how and why: a
+/// message that came alone has no one to tell.
+fn refuse(answer_after: &mut Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)>, code: crate::wire::channel::Refusal, why: impl Into<String>) {
+    if let Some((_, _, refusal)) = answer_after.as_mut() {
+        *refusal = Some((code, why.into()));
+    }
+}
+
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
@@ -2714,15 +3110,11 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
     let mut part = Vec::new();
     let mut size = 0;
     for e in events {
-        let mut e = e.clone();
-        if json_len(&e) > one {
-            e = cut(e, one);
-        }
-        let n = json_len(&e).saturating_add(1);
-        if n > one {
-            tracing::warn!(session, event = %e.id, bytes = n, "agent session event too large to send, even cut; dropped");
+        let Some(e) = sent_event(e) else {
+            tracing::warn!(session, event = %e.id, "agent session event too large to send, even cut; dropped");
             continue;
-        }
+        };
+        let n = json_len(&e).saturating_add(1);
         if size + n > one && !part.is_empty() {
             frames.extend(serde_json::to_string(&Update::Events { events: std::mem::take(&mut part) }));
             size = 0;
@@ -2734,6 +3126,16 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
         frames.extend(serde_json::to_string(&Update::Events { events: part }));
     }
     frames
+}
+
+/// An event as it goes to the server: cut to fit a frame when it's larger. None: too large even cut.
+fn sent_event(e: &crate::harness::model::Event) -> Option<crate::harness::model::Event> {
+    let one = HARNESS_FRAME - 1024;
+    let mut e = e.clone();
+    if json_len(&e) > one {
+        e = cut(e, one);
+    }
+    (json_len(&e).saturating_add(1) <= one).then_some(e)
 }
 
 fn json_len<T: Serialize>(v: &T) -> usize {
@@ -3030,6 +3432,89 @@ mod tests {
     use super::*;
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event};
+
+    /// A stream that starts again sends a server whose copy has part of a session only what the
+    /// copy lacks. The digests it compares are of the copy as the server keeps it: every kind of
+    /// event, one cut to fit among them, taken in from the frames they went in. So an event the
+    /// copy has is never sent again, and one that changed since is.
+    #[test]
+    fn a_stream_that_starts_again_sends_only_what_the_copy_lacks() -> anyhow::Result<()> {
+        use crate::harness::model::{Level, ToolCall, ToolKind, ToolStatus};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), epoch: 2, ..Default::default() };
+            let tool = |n: u64, status| {
+                Body::Tool(Box::new(ToolCall {
+                    tool_id: format!("t{n}"),
+                    name: "Bash".into(),
+                    tool: ToolKind::Shell,
+                    title: "ls".into(),
+                    detail: None,
+                    input: serde_json::json!({"command": "ls -la", "timeout": 1.5, "nested": {"z": [1, 2.25, "\u{fc}"], "a": null}}),
+                    status,
+                    output: Some(format!("out {n}")),
+                    truncated: false,
+                    diffs: Vec::new(),
+                    todos: Vec::new(),
+                    task: None,
+                    exit_code: Some(0),
+                    started: 5,
+                    ended: None,
+                    server: None,
+                    tool_short: None,
+                    skill: None,
+                    runner: None,
+                }))
+            };
+            let body = |n: u64| match n % 5 {
+                0 => Body::User { text: format!("ask {n}"), images: 1, client_id: Some("c".into()), origin: None, attachments: vec!["/a.png".into()] },
+                1 => Body::Assistant { text: format!("line {n} \u{2713}"), streaming: false },
+                2 => Body::Thinking { text: format!("think {n}"), streaming: false, redacted: n.is_multiple_of(2) },
+                3 => tool(n, ToolStatus::Done),
+                _ => Body::Notice { level: Level::Warn, text: format!("notice {n}") },
+            };
+            let ev = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1_000 + i64::try_from(n).unwrap_or(0), parent: n.is_multiple_of(7).then(|| "e1".to_owned()), by: None, body: body(n) };
+            let mut timeline: Vec<Event> = (1..=200).map(ev).collect();
+            // One too large to go whole: cut on its way, and kept by the copy as cut.
+            if let Some(e) = timeline.get_mut(41) {
+                e.body = Body::Assistant { text: "y".repeat(HARNESS_FRAME * 2), streaming: false };
+            }
+            // The copy: the session's first 150 events, as they went over the wire.
+            for u in [Update::Open { info: Box::new(info.clone()), since: None }, Update::Events { events: timeline.iter().take(150).cloned().collect() }] {
+                for json in harness_frames("s", &u) {
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(&json)?);
+                }
+            }
+            let kept = hub.harness.kept_on("box");
+            let kept = kept.first().ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            // Meanwhile its 120th changed (a tool call that ended), and 50 more came.
+            if let Some(e) = timeline.get_mut(119) {
+                e.body = tool(120, ToolStatus::Error);
+            }
+            let snapshot = || {
+                vec![
+                    Update::Open { info: Box::new(info.clone()), since: None },
+                    Update::Reset { from: Some(1) },
+                    Update::Meta { meta: Box::default() },
+                    Update::State { state: Box::default() },
+                    Update::Events { events: timeline.iter().take(100).cloned().collect() },
+                    Update::Events { events: timeline.iter().skip(100).cloned().collect() },
+                ]
+            };
+            let (out, delta) = go_on(snapshot(), Some(kept));
+            anyhow::ensure!(delta == Some(crate::wire::sums::Delta { since: 150, again: vec![120] }), "{delta:?}");
+            anyhow::ensure!(matches!(out.first(), Some(Update::Open { since: Some(150), .. })), "under an Open that says through which event the copy keeps its own");
+            anyhow::ensure!(!out.iter().any(|u| matches!(u, Update::Reset { .. })), "no Reset: the copy keeps what it has");
+            anyhow::ensure!(out.iter().any(|u| matches!(u, Update::Meta { .. })) && out.iter().any(|u| matches!(u, Update::State { .. })), "its newest meta and state");
+            let sent: Vec<u64> = out.iter().filter_map(|u| if let Update::Events { events } = u { Some(events) } else { None }).flatten().map(|e| e.seq).collect();
+            anyhow::ensure!(sent == std::iter::once(120).chain(151..=200).collect::<Vec<_>>(), "{sent:?}");
+            // A copy of another epoch (it went on elsewhere since): all of it.
+            let (whole, none) = go_on(snapshot(), Some(&proto::KeptSession { epoch: 1, ..kept.clone() }));
+            anyhow::ensure!(none.is_none() && matches!(whole.get(1), Some(Update::Reset { .. })) && whole.len() == 6);
+            Ok(())
+        })
+    }
 
     fn said(id: usize, text: String) -> Event {
         Event { id: format!("e{id}"), seq: id as u64, at: 0, parent: None, by: None, body: Body::Assistant { text, streaming: false } }

@@ -1,4 +1,5 @@
-//! `kiln users`, `kiln grants`, `kiln roles` and `kiln tokens` (docs/ci.md W10), over the API.
+//! `kiln users`, `kiln groups`, `kiln grants`, `kiln roles` and `kiln tokens` (docs/ci.md W10;
+//! groups: docs/deploy-api.md §15), over the API.
 //! A grant is written `<role or capability>[@<scope>]`, `!` first to deny:
 //! `developer@org:acme`, `viewer@repo:acme/app`, `!runs.cancel@repo:acme/app`.
 
@@ -36,6 +37,37 @@ enum UsersCmd {
     SignOut { user: String },
     /// Disable a user: their sessions end and their tokens are revoked.
     Remove { user: String },
+}
+
+#[derive(clap::Args)]
+pub struct GroupsArgs {
+    #[arg(long, env = "KILN_URL", global = true)]
+    url: Option<String>,
+    /// The admin token, or a personal access token with `users.manage`.
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true, allow_hyphen_values = true)]
+    token: Option<String>,
+    #[command(subcommand)]
+    cmd: GroupsCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum GroupsCmd {
+    /// kiln's groups and their members.
+    List,
+    /// A new group, with members to start with (users by name).
+    Add {
+        name: String,
+        #[arg(long = "member")]
+        members: Vec<String>,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Put a user in a group.
+    AddMember { group: String, user: String },
+    /// Take a user out of a group.
+    RemoveMember { group: String, user: String },
+    /// Delete a group (refused while it owns apps).
+    Remove { name: String },
 }
 
 #[derive(clap::Args)]
@@ -154,6 +186,37 @@ pub async fn users(args: UsersArgs, cfg: &Config) -> Result<()> {
         UsersCmd::Remove { user } => {
             api.call_api(Method::Delete, &format!("/api/users/{}", enc(&user)), None).await?;
             println!("disabled {user}; their sessions ended and their tokens are revoked");
+        }
+    }
+    Ok(())
+}
+
+/// `kiln groups`.
+pub async fn groups(args: GroupsArgs, cfg: &Config) -> Result<()> {
+    let api = Api::connect(cfg, args.url.as_deref(), args.token.as_deref()).await?;
+    match args.cmd {
+        GroupsCmd::List => {
+            let v = api.call_api(Method::Get, "/api/groups", None).await?;
+            for g in v.get("groups").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let about = Some(s(&g, "description")).filter(|d| !d.is_empty()).map(|d| format!("  ({d})")).unwrap_or_default();
+                println!("{:<24} {}{about}", s(&g, "name"), list(&g, "members").join(" "));
+            }
+        }
+        GroupsCmd::Add { name, members, description } => {
+            let v = api.call_api(Method::Post, "/api/groups", Some(json!({ "name": name, "members": members, "description": description }))).await?;
+            println!("added {} ({})", s(&v, "name"), list(&v, "members").join(" "));
+        }
+        GroupsCmd::AddMember { group, user } => {
+            api.call_api(Method::Put, &format!("/api/groups/{}/members/{}", enc(&group), enc(&user)), None).await?;
+            println!("{user} is in {group}");
+        }
+        GroupsCmd::RemoveMember { group, user } => {
+            api.call_api(Method::Delete, &format!("/api/groups/{}/members/{}", enc(&group), enc(&user)), None).await?;
+            println!("{user} is out of {group}");
+        }
+        GroupsCmd::Remove { name } => {
+            api.call_api(Method::Delete, &format!("/api/groups/{}", enc(&name)), None).await?;
+            println!("deleted {name}");
         }
     }
     Ok(())

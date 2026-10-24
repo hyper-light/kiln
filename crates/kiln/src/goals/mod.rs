@@ -1560,25 +1560,31 @@ fn met_by_parts(stack: &Stack) -> Option<(String, String)> {
     Some((next.id.clone(), why))
 }
 
-/// A goal turned into a plan ([`plan`]): the plan, its research, the goal, and the part of the
-/// goal its planning is.
+/// A goal turned into a plan ([`plan`]): the plan, its research, the goal (and its words), the
+/// part of the goal its planning is, and whether a subagent of the agent's plans it now
+/// (`delegate`: asked by someone else for a goal the agent isn't on yet, its planning still to go).
 #[derive(Debug, Clone, Serialize)]
 pub struct Planned {
     pub plan: String,
     pub research: String,
     pub goal: String,
     pub part: String,
+    #[serde(skip)]
+    pub words: String,
+    #[serde(skip)]
+    pub delegate: bool,
 }
 
 /// Goal `id` (without: the one under way) of agent `agent` turned into a plan, its planning begun:
 /// a plan in its planning phase (the goal's words its brief, saying the goal it came from), its
 /// research, and a first part of the goal: plan it (research it inside and out, write its steps,
 /// say it's ready). The goal under way waits after that part, which goes to the agent now. A goal
-/// being planned already answers with the plan it's becoming.
-pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str) -> R<Planned> {
+/// being planned already answers with the plan it's becoming. `delegated`: asked by someone else
+/// than the agent, a goal it isn't on yet is for a subagent of its to plan now ([`Planned`]).
+pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str, delegated: bool) -> R<Planned> {
     let info = known(hub, agent)?;
     let _one = CHANGING.lock().await;
-    let (planned, sends) = plan_locked(hub, &info, agent, id, title, by).await?;
+    let (planned, sends) = plan_locked(hub, &info, agent, id, title, by, delegated).await?;
     // The goal under way put back after its planning: that goes to the agent at once.
     if sends {
         push(hub, agent, crate::metrics::agents()).await;
@@ -1589,7 +1595,7 @@ pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>,
 /// [`plan`], with the stacks held (`CHANGING`), but for sending what's first now: the plan, and
 /// whether that goes at once (the goal under way put back after its planning, on a running stack).
 /// The driver plans a big goal with it, then decides what goes itself.
-async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, title: Option<&str>, by: &str) -> R<(Planned, bool)> {
+async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, title: Option<&str>, by: &str, delegated: bool) -> R<(Planned, bool)> {
     let stack = get(hub, agent).await?;
     let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
         Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
@@ -1606,15 +1612,19 @@ async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, titl
         crate::plans::Error::Missing => Error::Bad("no such plan".into()),
         crate::plans::Error::Other(e) => Error::Other(e),
     };
-    // Being planned already: that plan.
+    // Being planned already: that plan (for a subagent to plan now, while its planning is still to go).
     if let Some(pid) = target.planned_as.clone()
         && let Ok(p) = crate::plans::get(hub, &pid).await
         && p.phase == "planning"
     {
-        let part = stack.items.iter().find(|i| i.part_of.as_deref() == Some(target.id.as_str()) && i.part_kind.as_deref() == Some("planning")).map(|i| i.id.clone()).unwrap_or_default();
+        let part = stack.items.iter().find(|i| i.part_of.as_deref() == Some(target.id.as_str()) && i.part_kind.as_deref() == Some("planning"));
+        let delegate = delegated && part.is_some_and(|i| i.status == "pending");
+        let part = part.map(|i| i.id.clone()).unwrap_or_default();
         let research = crate::research::of_plan(hub, &pid).await.unwrap_or_default();
-        return Ok((Planned { plan: pid, research, goal: target.id.clone(), part }, false));
+        return Ok((Planned { plan: pid, research, goal: target.id.clone(), part, words: target.text.clone(), delegate }, false));
     }
+    // A goal it isn't on yet, asked by someone else: a subagent of its plans it now.
+    let delegate = delegated && target.status == "pending";
     let words = target.text.clone();
     let title = title.map(str::trim).filter(|t| !t.is_empty()).map_or_else(|| words.chars().take(80).collect::<String>(), str::to_owned);
     let source = crate::plans::Source {
@@ -1625,10 +1635,17 @@ async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, titl
     let new = crate::plans::New { title, body: format!("Goal: {words}"), items: Vec::new(), tags: vec!["from a goal".to_owned()], source: Some(source) };
     let p = crate::plans::create_in(hub, new, by, "planning").await.map_err(as_plan_error)?;
     let research = crate::research::start(hub, &words, Some(agent), by, Some(&p.id)).await.map_err(|e| Error::Bad(e.to_string()))?;
-    let part_text = clean(&format!(
-        "Plan \"{}\" (plan {}, research {}) is ready: researched inside and outside with each claim's sources (research_add), its steps written with their acceptance criteria, tests and the findings each rests on (plans_update), and said ready (plans_ready)",
-        p.title, p.id, research.id
-    ))?;
+    let part_text = clean(&if delegate {
+        format!(
+            "Plan \"{}\" (plan {}, research {}) is ready: a subagent of yours plans it now (research_add, plans_update, plans_ready), and this is met once it says it's ready. If it isn't when you get here, see where it stands (plans_get) and wait for it; plan it yourself only if no subagent is on it",
+            p.title, p.id, research.id
+        )
+    } else {
+        format!(
+            "Plan \"{}\" (plan {}, research {}) is ready: researched inside and outside with each claim's sources (research_add), its steps written with their acceptance criteria, tests and the findings each rests on (plans_update), and said ready (plans_ready)",
+            p.title, p.id, research.id
+        )
+    })?;
     let (target_id, pid) = (target.id.clone(), p.id.clone());
     {
         let (t, pid) = (target_id.clone(), pid.clone());
@@ -1644,7 +1661,7 @@ async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, titl
     let t = target_id.clone();
     let ids = new_ids.clone();
     hub.store.call(move |c| note(c, &ids, Noted { part_of: Some(&t), kind: Some("planning"), step: None, waits_on: None })).await?;
-    Ok((Planned { plan: pid, research: research.id, goal: target_id, part: new_ids.first().cloned().unwrap_or_default() }, sends))
+    Ok((Planned { plan: pid, research: research.id, goal: target_id, part: new_ids.first().cloned().unwrap_or_default(), words, delegate }, sends))
 }
 
 /// How long a goal is that's planned first ([`big`]): sentences, and for a long sentence or two,
@@ -2061,7 +2078,7 @@ where
         && !rule.holds_new_goals()
         && plans_first(&stack, &id)
     {
-        match plan_locked(hub, i, agent, Some(&id), None, "kiln").await {
+        match plan_locked(hub, i, agent, Some(&id), None, "kiln", false).await {
             Ok((p, _)) => {
                 tracing::info!(%agent, goal = %id, plan = %p.plan, "a big goal planned first");
                 stack = stack_of(store, agent).await?;
@@ -3565,6 +3582,44 @@ mod stack_tests {
     /// Ready for review, the plan's steps wait in a paused stack, saying so; run with an agent per
     /// step, the goal waits for the run (nothing sent to its agent for it) and is met once the run
     /// is done.
+    /// A person's Make a plan on a goal its agent isn't on yet: a subagent of the agent's plans it
+    /// now (the agent told so, steered into what it's doing), its planning part saying so and waiting
+    /// its turn; asked again at once, nobody's sent again. The agent planning a goal of its own plans
+    /// it as before.
+    #[test]
+    fn a_goal_its_person_plans_is_planned_now_by_a_subagent_of_its_agent() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["one", "two", "three"]).await?;
+            let id = id.as_str();
+            let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            settled(&hub, id).await;
+            let s = get(&hub, id).await?;
+            let goal = |t: &str| s.items.iter().find(|i| i.text == t).map(|i| i.id.clone()).unwrap_or_default();
+            let (two, three) = (goal("two"), goal("three"));
+            let p = call_ok(crate::ops::call(person.clone(), "goals.plan", serde_json::json!({"agent": id, "id": two})).await)?;
+            let dispatched = p.get("dispatched").and_then(serde_json::Value::as_bool) == Some(true);
+            let why = p.get("why").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            assert!(dispatched || why.contains("isn't running") || why.contains("can't be reached"), "{p}");
+            let part_of = |s: &Stack, g: &str| s.items.iter().find(|i| i.part_of.as_deref() == Some(g) && i.part_kind.as_deref() == Some("planning")).cloned().unwrap_or_default();
+            let after = get(&hub, id).await?;
+            let part = part_of(&after, &two);
+            assert!(part.text.contains("a subagent of yours plans it now"), "{part:?}");
+            assert_eq!(part.status, "pending", "it waits its turn, met once the subagent says the plan is ready");
+            if dispatched {
+                let again = call_ok(crate::ops::call(person.clone(), "goals.plan", serde_json::json!({"agent": id, "id": two})).await)?;
+                assert_eq!(again.get("dispatched").and_then(serde_json::Value::as_bool), Some(false), "{again}");
+                assert!(again.get("why").and_then(serde_json::Value::as_str).is_some_and(|w| w.contains("on it already")), "{again}");
+            }
+            // The agent planning a goal of its own: as before, nobody sent.
+            let mut itself = crate::authz::Caller::owner();
+            itself.agent = Some(id.to_owned());
+            let mine = call_ok(crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: itself }, "goals.plan", serde_json::json!({"agent": id, "id": three})).await)?;
+            assert_eq!(mine.get("dispatched").and_then(serde_json::Value::as_bool), Some(false), "{mine}");
+            assert!(part_of(&get(&hub, id).await?, &three).text.contains("researched inside and outside"));
+            Ok(())
+        })
+    }
+
     #[test]
     fn a_planned_goal_waits_for_review_or_for_its_run() -> anyhow::Result<()> {
         within(async {

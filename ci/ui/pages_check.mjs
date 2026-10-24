@@ -5,10 +5,8 @@
 // - A run's tests (W16-R03): each with its last results on the branch, a bar each.
 // - A run's data flow (W04-R23): an output from its step to the job that reads it and where, and
 //   an exported environment and the job that takes it.
-// - Attaching an agent from a run's page (W20-R08): the form open on its workflow, offering what
-//   wakes a workflow's agent.
-// - An experiment (W20-R11): listed with what it recommends; its variants with their intervals on
-//   one scale, and "Continue with this" choosing one in place.
+// - Attaching an agent where it watches (W20-R08): a repository's Watched by, and its row of three
+//   to attach one (its name, its agent, what wakes it).
 // - Comparing two runs: what differs, the files changed between them, the steps side by side.
 // - Log search: what every run printed, found among the repository's runs.
 // - The land queue, and a diff's stack.
@@ -49,7 +47,6 @@ const run = cfg.runs[cfg.runs.length - 1];
 const base = cfg.runs[0];
 const NOTE = "a note from the repository's own action";
 const diff = await (await fetch(`${cfg.base}/api/diffs/D1`, { headers: { Authorization: `Bearer ${cfg.admin}` } })).json();
-const runWorkflow = (await (await fetch(`${cfg.base}/api/ci/runs/${run}`, { headers: { Authorization: `Bearer ${cfg.admin}` } })).json()).run.workflow;
 
 for (const [name, type, phone] of [
   ["chromium", chromium, { ...devices["Pixel 7"], viewport: { width: 390, height: 844 } }],
@@ -115,53 +112,23 @@ for (const [name, type, phone] of [
         await shot("flow");
       });
 
-      await flow(`${who}: attaching an agent from a run`, async () => {
-        await page.goto(`${cfg.base}/runs/${run}`);
-        await page.getByRole("link", { name: "Attach agent" }).first().click();
-        await page.waitForURL(/\/agents\/attached\?on=workflow/, { timeout: 15000 });
-        const form = page.locator("form.attach-form");
-        const asked = async () => `${await form.getByLabel("Repository", { exact: true }).inputValue()} ${await form.getByLabel("Workflow", { exact: true }).inputValue()}`;
-        check(who, "attaching an agent from a run: the form open on its workflow", await until(async () => (await asked()) === `acme/app ${runWorkflow}`, 20000), await asked());
-        const wakes = await text(form.locator("fieldset").first());
+      await flow(`${who}: attaching an agent where it watches`, async () => {
+        await page.goto(`${cfg.base}/repos`);
+        await page.locator("tr", { hasText: "acme/app" }).first().locator("td").first().click();
+        const watch = page.getByRole("region", { name: "Watched by" }).first();
+        check(who, "a repository's Watched by, in its panel", await until(async () => (await watch.count()) > 0, 20000));
+        await watch.getByRole("button", { name: /Attach/ }).click();
+        const form = watch.locator("form.watch-form");
         check(
           who,
-          "and what wakes a workflow's agent: a slow run, a job that can't run anywhere; not an app degrading",
-          /slower than usual/.test(wakes) && /can't run anywhere/.test(wakes) && !/degrades/.test(wakes),
-          wakes,
+          "attaching one: its name, its agent and what wakes it, a run failing first",
+          await until(async () => /a run fails/.test(await text(form)) && (await form.getByLabel("Name").count()) > 0 && (await form.getByLabel("Agent").count()) > 0, 20000),
+          await text(form),
         );
-        await form.getByLabel("a run is slower than usual").check();
-        check(who, "and by how much, once it wakes on it", await until(async () => (await form.getByLabel("Slower than usual by").inputValue()) === "25"), await text(form));
         await checkLayout(check, `${who}: attaching an agent`, page);
         await shot("attach");
-      });
-
-      await flow(`${who}: an experiment`, async () => {
-        await page.goto(`${cfg.base}/agents/experiments`);
-        const list = page.getByRole("list", { name: "Experiments" });
-        // What it recommends, or (once an earlier context chose in place, below) what was chosen.
-        check(
-          who,
-          "experiments: listed, with what each recommends or what was chosen",
-          await until(async () => /recommends fast\+cache|continuing with (fast|cache|fast\+cache)\b/.test(await text(list)), 20000),
-          await text(list),
-        );
-        await page.getByRole("link", { name: cfg.experiment, exact: true }).click();
-        await page.waitForURL(/\/agents\/experiments\//, { timeout: 15000 });
-        const variants = page.getByRole("list", { name: `${cfg.experiment}'s variants` });
-        const rows = variants.getByRole("listitem");
-        check(
-          who,
-          "an experiment: each variant with its interval against the baseline",
-          await until(async () => (await rows.count()) === 4 && /×0\.700 \(95% 0\.700 to 0\.700\)/.test(await text(variants)) && /recommended/i.test(await text(variants)), 20000),
-          await text(variants),
-        );
-        await checkLayout(check, `${who}: an experiment`, page);
-        await shot("experiment");
-        // Chosen in place (each context picks a different one, so every choice is new).
-        const pick = { "chromium-wide": "fast", "chromium-phone": "cache", "webkit-wide": "fast+cache", "webkit-phone": "baseline" }[`${name}-${tag}`];
-        const row = rows.filter({ has: page.locator("code", { hasText: new RegExp(`^${pick.replace("+", "\\+")}$`) }) });
-        await row.getByRole("button", { name: "Continue with this" }).click();
-        check(who, "and a variant chosen in place", await until(async () => /chosen/i.test(await text(row)), 20000), await text(row));
+        await form.getByRole("button", { name: "Cancel" }).click();
+        check(who, "and let go of", await until(async () => (await form.count()) === 0, 10000));
       });
 
       await flow(`${who}: comparing runs`, async () => {

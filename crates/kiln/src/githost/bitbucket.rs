@@ -303,6 +303,13 @@ impl Bitbucket {
         Ok(())
     }
 
+    /// Deletes `workspace/slug` (a repository kiln made and couldn't fill; gone already is fine).
+    pub async fn delete_repository(&self, name: &str) -> anyhow::Result<()> {
+        let (st, v) = self.call(Method::Delete, &format!("/repositories/{name}"), None).await?;
+        anyhow::ensure!(matches!(st, 204 | 404), "Bitbucket didn't delete {name} ({st}): {}", said(&v));
+        Ok(())
+    }
+
     /// The workspaces kiln's credentials cover (none: every one).
     pub fn workspaces(&self) -> &[String] {
         &self.workspaces

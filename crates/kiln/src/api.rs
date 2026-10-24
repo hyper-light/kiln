@@ -317,6 +317,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let hash = (*hash).to_owned();
             return sync_blob_get(&hub, &hash, &req);
         }
+        // A copy of kiln.db for a runner's learner of the cluster group (docs/p2p.md, P2).
+        (&Method::GET, ["api", "cluster", "copy"]) => return boxed(|| cluster_copy(&hub, &req)).await,
+        // Whether a request's credentials are the owner's: a runner's front door answers the owner's
+        // reads from its replica, and passes everyone else's here (docs/p2p.md, P2).
+        (&Method::GET, ["api", "cluster", "owner"]) => return Ok(srv::json(StatusCode::OK, &json!({ "owner": authed(&hub, req.headers()) }))),
         // The local store's presigned URLs (docs/blobs.md): the URL is the credential.
         (&Method::GET | &Method::HEAD | &Method::PUT, ["api", "blobs", _, ..]) => {
             let encoded = path.strip_prefix("/api/blobs/").unwrap_or_default().to_owned();
@@ -411,7 +416,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
     }
     let mut req = req;
     req.extensions_mut().insert(caller.clone());
-    if matches!(s.get(1), Some(&("users" | "grants" | "roles" | "tokens"))) {
+    if matches!(s.get(1), Some(&("users" | "groups" | "grants" | "roles" | "tokens"))) {
         return match boxed(|| crate::authz::api::route(&hub, &caller, &method, &s, &q, req)).await {
             Some(r) => r.map_err(|(c, m)| err(c, m)),
             None => Err(err(StatusCode::NOT_FOUND, "not found")),
@@ -463,6 +468,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), 1 << 20)).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             boxed(|| crate::ci::notify::mine(&hub, &caller, Some(body))).await.map_err(|(s, m)| ApiError(s, m))
         }
+        // docs/deploy-api.md §12.3: one's own chat accounts.
+        (_, ["api", "me", "chat", rest @ ..]) => {
+            let rest: Vec<&str> = rest.to_vec();
+            boxed(|| crate::ci::chat::mine(&hub, &caller, &method, &rest)).await.map_err(|(s, m)| ApiError(s, m))
+        }
         // W10: one's own passkeys and password.
         (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
         (&Method::POST, ["api", "me", "passkeys", "options"]) => {
@@ -500,19 +510,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
         (&Method::GET, ["api", "repos"]) => {
-            let mut repos = boxed(|| hub.store.repos()).await?;
-            repos.retain(|r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }));
-            let public = hub.store.public_repos().await.unwrap_or_default();
-            let listed: Vec<serde_json::Value> = repos
-                .iter()
-                .map(|r| {
-                    let mut v = serde_json::to_value(r).unwrap_or_default();
-                    if let Some(o) = v.as_object_mut() {
-                        o.insert("public".into(), json!(public.contains(&r.id)));
-                    }
-                    v
-                })
-                .collect();
+            let listed = boxed(|| crate::reads::repos(&hub.store, |r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }))).await?;
             Ok(srv::json(StatusCode::OK, &listed))
         }
         (&Method::POST, ["api", "repos"]) => boxed(|| add_repo(&hub, req)).await,
@@ -1513,6 +1511,55 @@ fn sync_machine(req: &Request) -> String {
     srv::query(req).get("machine").cloned().unwrap_or_default()
 }
 
+/// Copies of kiln.db for learners are made one at a time (each reads the whole database).
+static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
+
+/// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
+/// machine (`?machine=`), or the admin token. The copy goes once sent.
+async fn cluster_copy(hub: &Hub, req: &Request) -> R {
+    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
+    let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
+    if !theirs && !authed(hub, req.headers()) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
+    }
+    let dir = hub.cfg.data("cluster").join("copies");
+    let _one = CLUSTER_COPIES.acquire().await;
+    // Copies a stop left behind.
+    if let Ok(old) = std::fs::read_dir(&dir) {
+        for e in old.flatten() {
+            std::fs::remove_file(e.path()).ok();
+        }
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("making {}: {e}", dir.display())))?;
+    let path = dir.join(format!("{}.db", crate::util::new_id()));
+    let started = Instant::now();
+    if let Err(e) = hub.store.copy_for_learner(path.clone()).await {
+        std::fs::remove_file(&path).ok();
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
+    }
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
+    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    crate::rt::spawn(async move {
+        let p = path.clone();
+        let _ = crate::rt::blocking(move || -> std::io::Result<()> {
+            use std::io::Read as _;
+            let mut f = std::fs::File::open(&p)?;
+            let mut buf = vec![0u8; 256 << 10];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 || tx.send_blocking(Bytes::copy_from_slice(buf.get(..n).unwrap_or_default())).is_err() {
+                    return Ok(());
+                }
+            }
+        })
+        .await;
+        std::fs::remove_file(&path).ok();
+    });
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+}
+
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
 fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
     let direction = if req.method() == Method::HEAD { "up" } else { "down" };
@@ -2131,6 +2178,12 @@ fn logout() -> Response {
 
 async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     let caller = caller_of(hub, headers).await;
+    // The groups the person is in (kiln's, and their identity providers'): the owner teams they may
+    // name for an app (docs/deploy-api.md §3.1).
+    let groups = match caller.as_ref().and_then(|c| c.user.clone()) {
+        Some(u) => crate::authz::groups::of_user(hub, &u).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
     // What discovery announces anyway (when it does), so a probe can tell which instance answers.
     let d = &hub.discovery;
     let announced = d.announcing().then(|| {
@@ -2149,6 +2202,7 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "principal": caller.as_ref().map(|c| c.name.clone()),
             "kind": caller.as_ref().map(|c| c.kind),
             "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
+            "groups": groups,
             // What it may do (W10-R02), for pages that show only what one can use: each
             // capability held on the whole server, or only somewhere (a repository, …).
             "can": caller.as_ref().map(|c| {
@@ -2379,43 +2433,13 @@ async fn trigger(hub: &Hub, id: &str, req: Request) -> R {
 
 /// `GET /api/runs`: runs newest first, of the repositories the caller may read (W10).
 async fn runs(hub: &Hub, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> R {
-    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
-    let before = q.get("before").and_then(|v| v.parse().ok());
-    // Another order than newest first pages by `offset` (W21-R03's sort).
-    if let Some(sort) = q.get("sort").filter(|s| matches!(s.as_str(), "oldest" | "longest" | "shortest")) {
-        let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
-        let list = hub.store.runs_sorted(among, q.get("repo").cloned(), sort, limit, offset).await?;
-        return Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?));
-    }
-    let list = match crate::authz::gate::readable(hub, caller, "runs.read").await {
-        None => hub.store.runs(q.get("repo").cloned(), limit, before).await?,
-        Some(names) => hub.store.runs_among(names, q.get("repo").cloned(), limit, before).await?,
-    };
-    Ok(srv::json(StatusCode::OK, &with_hosts(hub, &list).await?))
-}
-
-/// Runs, each with the runners and executors its legs ran on (W21-R03's facets).
-async fn with_hosts(hub: &Hub, runs: &[crate::store::Run]) -> anyhow::Result<Vec<serde_json::Value>> {
-    let hosts = hub.store.run_hosts(runs.iter().map(|r| r.id.clone()).collect()).await?;
-    let mut out = Vec::with_capacity(runs.len());
-    for r in runs {
-        let mut v = serde_json::to_value(r)?;
-        if let (Some(o), Some((runners, executors))) = (v.as_object_mut(), hosts.get(&r.id)) {
-            o.insert("runners".into(), json!(runners));
-            o.insert("executors".into(), json!(executors));
-        }
-        out.push(v);
-    }
-    Ok(out)
+    let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
+    Ok(srv::json(StatusCode::OK, &crate::reads::runs(&hub.store, q, among).await?))
 }
 
 async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
-    let run = hub.store.run(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
-    // A CI run's attempt (docs/ci.md W05-R17); the current one by default.
-    let attempt = q.get("attempt").and_then(|a| a.parse().ok());
-    let jobs = hub.store.jobs_at(id.to_owned(), false, attempt).await?;
-    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "jobs": jobs })))
+    let run = crate::reads::run(&hub.store, id, q).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
+    Ok(srv::json(StatusCode::OK, &run))
 }
 
 async fn cancel(hub: &Hub, id: &str) -> R {
@@ -2444,7 +2468,7 @@ async fn retry(hub: &Hub, id: &str, req: Request) -> R {
 }
 
 async fn job(hub: &Hub, id: &str) -> R {
-    let j = hub.store.job(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?;
+    let j = crate::reads::job(&hub.store, id).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?;
     Ok(srv::json(StatusCode::OK, &j))
 }
 
@@ -2588,12 +2612,35 @@ async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
+/// How long a piece of a job's artifacts may go without a byte before what came of it is kept and
+/// answered for: longer than any pause of an upload still going, well inside the 120 s a runner
+/// gives a piece. A runner's HTTP client could stop up to 64 KiB short of a piece's end and wait
+/// for an answer (fixed in kiln-http's client); answered, it goes on from where the pieces end.
+const PIECE_STALL: Duration = Duration::from_secs(15);
+
 /// One piece of a job's artifacts, at byte `at`: taken only where the pieces so far end (the first
 /// starts them afresh), so a piece that broke off costs only itself. One elsewhere is refused with
-/// where they end (`409 {"have": n}`), for the upload to go on from there.
+/// where they end (`409 {"have": n}`), for the upload to go on from there. What came of a piece
+/// that stalls or breaks off is kept too, and answered for at once, so the runner sends only the
+/// rest, and nothing of it is held while a connection waits.
 async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
     let part = artifact_path(hub, id).with_extension("part");
-    let piece = srv::body_bytes(req.into_body(), ARTIFACT_PIECE).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("the piece broke off: {e:#}")))?;
+    let mut body = req.into_body();
+    let mut came = bytes::BytesMut::new();
+    let whole = loop {
+        match crate::rt::timeout(PIECE_STALL, srv::next_chunk(&mut body)).await {
+            Ok(Ok(Some(chunk))) => {
+                if came.len().saturating_add(chunk.len()) > ARTIFACT_PIECE {
+                    return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("a piece is at most {ARTIFACT_PIECE} bytes")));
+                }
+                came.extend_from_slice(&chunk);
+            }
+            Ok(Ok(None)) => break true,
+            Ok(Err(_)) | Err(_) => break false,
+        }
+    };
+    drop(body);
+    let piece = came.freeze();
     let had = crate::rt::blocking(move || -> anyhow::Result<Result<u64, u64>> {
         if let Some(dir) = part.parent() {
             std::fs::create_dir_all(dir)?;
@@ -2612,10 +2659,13 @@ async fn put_artifacts_piece(hub: &Hub, id: &str, at: u64, req: Request) -> R {
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok(match had {
+    let answer = match had {
         Ok(have) => srv::json(StatusCode::OK, &serde_json::json!({"have": have})),
         Err(have) => srv::json(StatusCode::CONFLICT, &serde_json::json!({"have": have})),
-    })
+    };
+    // The rest of a piece that didn't all come is left unread: the connection ends with the answer,
+    // and the runner doesn't send its next piece on it.
+    Ok(if whole { answer } else { srv::with_header(answer, header::CONNECTION, "close") })
 }
 
 /// `GET /api/jobs/:id/artifacts/upload`: how much of an upload in pieces has come (`{"have": n}`;
@@ -4094,7 +4144,7 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     Ok(srv::json(StatusCode::CREATED, &b))
 }
 
-/// One of the Programs view's changes (`programs.set`, `programs.assign`): the request's JSON
+/// One of a program's changes (`programs.set`, `programs.assign`): the request's JSON
 /// object with `base` (the program, and the track) on it.
 async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, base: serde_json::Value, req: Request) -> R {
     let mut b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -4587,12 +4637,19 @@ struct Takes {
     packed: bool,
     /// `patch=state`: a state as only what changed in it (`state_patch`), after the snapshot's.
     patches: bool,
+    /// `after=<born>.<rev>`: it had the session through that revision of this server's copy
+    /// (docs/wire.md, "Revisions"), and gets only what it lacks when the copy can say.
+    after: Option<(u64, u64)>,
 }
 
 impl Takes {
     fn of(query: Option<&str>) -> Self {
         let has = |p: &str| query.is_some_and(|q| q.split('&').any(|x| x == p));
-        Self { packed: has("z=gzip"), patches: has("patch=state") }
+        let after = query
+            .and_then(|q| q.split('&').find_map(|x| x.strip_prefix("after=")))
+            .and_then(|v| v.split_once('.'))
+            .and_then(|(b, r)| Some((b.parse().ok()?, r.parse().ok()?)));
+        Self { packed: has("z=gzip"), patches: has("patch=state"), after }
     }
 }
 
@@ -4643,19 +4700,29 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
-    let Some(att) = hub.harness.attach(&id) else {
+    let Some(att) = hub.harness.attach_from(&id, takes.after) else {
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
     send_snapshot(&mut tx, att.frames, takes.packed).await?;
     let mut live = att.live;
+    // The newest revision of the copy this viewer has: what it resumes from if it falls behind,
+    // and what live frames it already has (a catch-up holds them) are told by.
+    let mut have = att.rev;
     loop {
         futures::select_biased! {
             f = live.recv().fuse() => match f {
-                Ok(frame) => tx.send(ws::text(frame.for_viewer(takes.patches))).await?,
+                Ok(frame) if frame.rev != 0 && frame.rev <= have => {}
+                Ok(frame) => {
+                    have = have.max(frame.rev);
+                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+                }
                 Err(async_broadcast::RecvError::Overflowed(_)) => {
-                    // Fell behind: start over from the current state (it begins with "open").
-                    send_snapshot(&mut tx, hub.harness.frames(&id).unwrap_or_default(), takes.packed).await?;
+                    // Fell behind: what it missed since what it has (it begins with "resumed"),
+                    // or all of it when the copy can't tell (it begins with "open").
+                    let (frames, now) = hub.harness.frames_since(&id, have).unwrap_or_default();
+                    have = have.max(now);
+                    send_snapshot(&mut tx, frames, takes.packed).await?;
                 }
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },
@@ -4744,8 +4811,15 @@ fn server_health(hub: &Hub) -> Response {
             "restarts": hub.generation.saturating_sub(1),
             "memory": memory,
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
-            // The cluster group (docs/p2p.md P1): kiln.db's last write, and the log's last entry.
-            "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({ "group": true, "seq": seq, "applied": applied })),
+            // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
+            // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
+            "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
+                "group": true,
+                "seq": seq,
+                "applied": applied,
+                "learners": hub.store.group().map_or(0, |g| g.point().1.learners.len()),
+                "bytes": hub.store.file_bytes(),
+            })),
         }),
     )
 }

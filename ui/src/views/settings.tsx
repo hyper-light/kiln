@@ -22,6 +22,7 @@ import { invalidate } from "@/lib/resource";
 import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
 import { DeliveriesGroup, DeliveriesHold, MyNotificationsGroup, MyNotificationsHold, myNotificationsRes } from "@/views/settings-ci-notifications";
+import { ChatAccountsGroup, ChatAccountsHold, chatLinksRes } from "@/views/settings-chat";
 import { MyPasswordGroup, MyPasswordHold, PasskeysGroup, PasskeysHold, myPasswordRes, passkeysRes } from "@/views/settings-signin";
 import { PeopleGroup, PeopleHold, RolesGroup, RolesHold, peopleRes, rolesRes } from "@/views/settings-people";
 import { TokensGroup, TokensHold, tokensRes } from "@/views/settings-tokens";
@@ -55,7 +56,7 @@ export default function Settings() {
     passkeysRes,
     ...(signedIn ? [tokensRes, rolesRes] : []),
     ...(manages ? [peopleRes] : []),
-    ...(person ? [myPasswordRes] : []),
+    ...(person ? [myPasswordRes, chatLinksRes] : []),
     ...(pushes ? [pushStateRes, pushDevicesRes] : []),
   );
   // The sections shown, numbered in order.
@@ -171,10 +172,15 @@ export default function Settings() {
             )}
           </SettingsSection>
         )}
-        <SettingsSection id="you" index={next()} title="You" about="What kiln tells you of your repositories, wherever you sign in" words="person account">
+        <SettingsSection id="you" index={next()} title="You" about="What kiln tells you of your repositories, and the chat accounts that act as you" words="person account">
           <Loadable label="your notifications" fallback={<MyNotificationsHold />}>
             <MyNotificationsGroup />
           </Loadable>
+          {person && (
+            <Loadable label="your chat accounts" fallback={<ChatAccountsHold />}>
+              <ChatAccountsGroup />
+            </Loadable>
+          )}
         </SettingsSection>
       </SettingsSections>
     </div>

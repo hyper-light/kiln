@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
-import { ChartLine, Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
+import { Plus, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, Job, RunnerFacts, RunnerInstance, RunnerUpdate } from "@/api/types";
@@ -9,6 +9,7 @@ import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, EmptyState, Facts, Meter, PageIntro, SelectField } from "@/components/ui/misc";
+import { WatchedBy } from "@/views/attach/here";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
@@ -24,6 +25,7 @@ import { discoveryRes, joinRequestsRes } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
 import { BatteryLine, LowBattery } from "./battery";
+import { lostLine } from "./runner-lost";
 import { ImagesPanel, PoolsPanel } from "./runners-pools";
 import { useAuth } from "@/lib/auth";
 
@@ -495,24 +497,22 @@ function AgentDetails({
         <Chips labels={agent.labels} max={12} />
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal}>
-          <SquareTerminal /> Open terminal
+        <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal} title="Open a terminal on it">
+          Terminal
         </Button>
         {!agent.outpost && (
-          <Button asChild variant="ghost" size="xs">
-            <Link to={`/insights?runner=${encodeURIComponent(agent.name)}`}>
-              <ChartLine /> Insights
-            </Link>
+          <Button asChild variant="secondary" size="xs">
+            <Link to={`/insights?runner=${encodeURIComponent(agent.name)}`}>Insights</Link>
           </Button>
         )}
         {!agent.outpost && (
-          <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
-            {agent.draining ? "Resume scheduling" : "Drain"}
+          <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
+            {agent.draining ? "Resume" : "Drain"}
           </Button>
         )}
         {!forgetting && (
-          <Button variant="ghost-danger" size="xs" onClick={() => setForgetting(true)}>
-            <Trash2 /> Forget
+          <Button variant="secondary" size="xs" className="text-[#d1aaad]" onClick={() => setForgetting(true)}>
+            Forget
           </Button>
         )}
       </div>
@@ -538,6 +538,10 @@ function AgentDetails({
         </Confirm>
       )}
 
+      <div className="mt-6">
+        <WatchedBy on={`runner:${agent.name}`} watches={(on) => on === `runner:${agent.name}` || on === "runners"} />
+      </div>
+
       <UpgradeNote agent={agent} detailed />
 
       <div className="mt-6">
@@ -550,6 +554,7 @@ function AgentDetails({
             { label: "CPU", value: s ? `${formatPct(s.cpu_pct, 1)} · ${s.cpus} cores` : "—" },
             { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
             { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
+            { label: "Lost below the channel", value: lostLine(agent) },
           ]}
         />
       </div>

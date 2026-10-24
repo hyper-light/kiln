@@ -516,11 +516,21 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
         let key = format!("{machine}/{}", s.id);
         let (out_tx, out_rx) = async_channel::bounded::<TermOut>(4096);
         h.terms.lock().insert(key.clone(), out_tx);
-        if let Some(msg) = first
-            && !h.send_to_agent(&machine, LANE_TERM, &msg).await
-        {
+        // A terminal to open is a live command (`crate::wire::commands`): refused at once while its
+        // machine is away, and answered once it opened it. Unanswered, it goes on: its output says.
+        let failed = match first {
+            Some(msg) if matches!(crate::wire::server_class(&msg), crate::wire::Class::Command(_)) => {
+                match h.command_start(&machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await {
+                    a @ (crate::wire::commands::Answer::Refused { .. } | crate::wire::commands::Answer::Unreachable { .. }) => Some(a.words()),
+                    _ => None,
+                }
+            }
+            Some(msg) => (!h.send_to_agent(&machine, LANE_TERM, &msg).await).then(|| format!("machine {machine} is not connected")),
+            None => None,
+        };
+        if let Some(why) = failed {
             h.terms.lock().remove(&key);
-            s.finish(None, Some(format!("machine {machine} is not connected")));
+            s.finish(None, Some(why));
             h.emit_terminals();
             return;
         }
@@ -539,10 +549,13 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
             match ev {
                 Ev::Out(Some(TermOut::Data(d))) => s.output(&d),
                 Ev::Out(Some(TermOut::Replay(d))) => {
-                    // An adopted session starts from the agent's picture of it.
-                    if s.is_empty() {
-                        s.output(&d);
+                    // An adopted session starts from the agent's picture of it. One that has a
+                    // picture already (its machine's output stream started over, docs/wire.md) is
+                    // repainted from the new one.
+                    if !s.is_empty() {
+                        s.output(b"\x1bc");
                     }
+                    s.output(&d);
                 }
                 Ev::Out(Some(TermOut::Exit { code, error })) => {
                     s.finish(code, error);
@@ -555,14 +568,18 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
                     s.out.send(Frame::Exit { code: None, error: Some("__reconnect__".to_owned()) });
                     break;
                 }
+                // Commands (`crate::wire::commands`), in order, each answered, none waited for:
+                // keystrokes follow one another closely. Keystrokes are live (refused at once while
+                // the machine is away, never typed later); a size is its newest, and a close waits
+                // for the machine to come back.
                 Ev::In(Some(Input::Data(data))) => {
-                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermInput { session: s.id.clone(), data }).await;
+                    h.command_start(&machine, &ServerMsg::TermInput { session: s.id.clone(), data }).await.log_when_answered(crate::hub::LOG_WITHIN);
                 }
                 Ev::In(Some(Input::Resize { cols, rows })) => {
-                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermResize { session: s.id.clone(), cols, rows }).await;
+                    h.command_start(&machine, &ServerMsg::TermResize { session: s.id.clone(), cols, rows }).await.log_when_answered(crate::hub::LOG_WITHIN);
                 }
                 Ev::In(None) | Ev::Close => {
-                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermClose { session: s.id.clone() }).await;
+                    h.command_start(&machine, &ServerMsg::TermClose { session: s.id.clone() }).await.log_when_answered(crate::hub::LOG_WITHIN);
                     s.finish(None, Some("session closed".to_owned()));
                     break;
                 }

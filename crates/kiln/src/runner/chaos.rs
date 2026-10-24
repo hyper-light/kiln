@@ -4,6 +4,8 @@
 //!
 //! The spec is a comma list:
 //! - `drop=<duration>`: the runner drops its connection to the server that often;
+//! - `down=<duration>`: after each drop, the runner stays away that long before it dials again (a
+//!   link cut for a while, not a blip);
 //! - `delay=<duration>`: everything it sends the server waits that long first;
 //! - `oom=<duration>`: a leg's step on the host is killed that long after it starts, as the OOM
 //!   killer kills (SIGKILL, and counted where kiln counts the OOM killer's kills);
@@ -13,6 +15,11 @@
 //!   labels they give), a stand-in for a runner of another platform (W04-AC07);
 //! - `rebuild=<duration>`: the server's, not its runner's: the CI engine rebuilds its runs that
 //!   long after the server starts, so its runners say hello before it knows their legs (W05-R05).
+//! - `shed=<lane>[/<variant>]:<every>`: this process's QUIC layer drops about one frame in `every`
+//!   of `lane` (`control`, `term` ... or its number; of those whose first byte, a message's
+//!   variant index, is `variant`, when given), picked by a seeded draw, as a frame lost below the
+//!   channel would be, counted as `chaos` (docs/wire.md, "Loss below the channel"). A runner's
+//!   or, from `KILN_CHAOS`, a server's.
 //!
 //! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
 //! recovers; `drop` and `delay` are the connection's.
@@ -32,12 +39,14 @@ use crate::rt::Shutdown;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Chaos {
     pub drop_every: Option<Duration>,
+    pub down_for: Option<Duration>,
     pub delay: Option<Duration>,
     pub oom_after: Option<Duration>,
     pub disk_mib: Option<u32>,
     pub corrupt: bool,
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
+    pub shed: Option<crate::net::Shed>,
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -52,6 +61,18 @@ fn duration(s: &str) -> Option<Duration> {
     }
 }
 
+/// `term/46:7`: one frame in 7 of lane `term` whose first byte is 46; `control:5`: one in 5 of
+/// lane `control`.
+fn shed(v: &str) -> Option<crate::net::Shed> {
+    let (what, every) = v.split_once(':')?;
+    let (lane, variant) = match what.split_once('/') {
+        Some((lane, variant)) => (lane, Some(variant.parse().ok()?)),
+        None => (what, None),
+    };
+    let every: u64 = every.parse().ok().filter(|n| *n > 0)?;
+    Some(crate::net::Shed { lane: crate::proto::lane_named(lane)?, variant, every })
+}
+
 /// A `--chaos` spec.
 pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
     let mut c = Chaos::default();
@@ -60,6 +81,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
         let d = || duration(v).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes a duration (300ms, 2s, 1m), not `{v}`"));
         match k {
             "drop" => c.drop_every = Some(d()?),
+            "down" => c.down_for = Some(d()?),
             "delay" => c.delay = Some(d()?),
             "oom" => c.oom_after = Some(d()?),
             "disk" => c.disk_mib = Some(v.parse().map_err(|_| anyhow::anyhow!("chaos `disk` takes MiB, not `{v}`"))?),
@@ -69,7 +91,8 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 c.platform = Some(v.to_owned());
             }
             "rebuild" => c.rebuild_after = Some(d()?),
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, delay, oom, disk, corrupt, platform or rebuild"),
+            "shed" => c.shed = Some(shed(v).ok_or_else(|| anyhow::anyhow!("chaos `shed` takes <lane>[/<variant>]:<every> (term/46:7), not `{v}`"))?),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild or shed"),
         }
     }
     Ok(c)
@@ -270,20 +293,27 @@ mod tests {
             c,
             Chaos {
                 drop_every: Some(Duration::from_secs(2)),
+                down_for: None,
                 delay: Some(Duration::from_millis(300)),
                 oom_after: Some(Duration::from_secs(1)),
                 disk_mib: Some(8),
                 corrupt: true,
                 platform: None,
-                rebuild_after: None
+                rebuild_after: None,
+                shed: None
             }
         );
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
+        assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));
         assert!(parse("oom=soon").is_err());
         assert_eq!(parse("")?, Chaos::default());
+        // Frames lost below the channel: a lane by name or number, of one message variant or all.
+        assert_eq!(parse("shed=term/46:7")?.shed, Some(crate::net::Shed { lane: crate::proto::LANE_TERM, variant: Some(46), every: 7 }));
+        assert_eq!(parse("shed=0:5")?.shed, Some(crate::net::Shed { lane: crate::proto::LANE_CONTROL, variant: None, every: 5 }));
+        assert!(parse("shed=term:0").is_err() && parse("shed=nowhere:3").is_err() && parse("shed=term/x:3").is_err());
         Ok(())
     }
 }

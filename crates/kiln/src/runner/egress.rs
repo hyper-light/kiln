@@ -36,7 +36,7 @@ const HEAD_MAX: usize = 16 * 1024;
 /// releases are), else `KILN_EGRESS_BINARY`.
 pub fn relay_binary() -> Option<PathBuf> {
     if cfg!(all(target_os = "linux", target_env = "musl")) {
-        return std::env::current_exe().ok();
+        return crate::os::this_kiln().ok();
     }
     std::env::var_os("KILN_EGRESS_BINARY").map(PathBuf::from).filter(|p| p.is_file())
 }

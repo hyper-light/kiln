@@ -27,7 +27,7 @@ use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use super::Deploy;
+use super::{Deploy, store};
 use super::argocd::{self, Argo};
 use super::host::{Author, Change, CommitError, Committed, Hosted, LoggedCommit};
 use super::model::{BITBUCKET_HOST, Environment, GITHUB_HOST, GITLAB_HOST, Release, RepoRef, State as ReleaseState};
@@ -465,6 +465,51 @@ impl Remote {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ the repository itself
+
+    /// Whether the host has it, as it shows it to kiln.
+    pub async fn exists(&self) -> anyhow::Result<bool> {
+        Ok(match &self.host {
+            Host::Github(app) => app.repository(&self.name).await?.is_some(),
+            Host::Gitlab(g) => g.project(&self.name).await?.is_some(),
+            Host::Bitbucket(b) => b.repository(&self.name).await?.is_some(),
+        })
+    }
+
+    /// Makes it there, private and empty.
+    pub async fn make(&self, description: &str) -> anyhow::Result<()> {
+        match &self.host {
+            Host::Github(app) => app.create_repository(&self.name, description).await,
+            Host::Gitlab(g) => g.create_project(&self.name, description).await,
+            Host::Bitbucket(b) => b.create_repository(&self.name, description).await,
+        }
+    }
+
+    /// Deletes it there: one kiln made and couldn't fill.
+    pub async fn delete(&self) -> anyhow::Result<()> {
+        match &self.host {
+            Host::Github(app) => app.delete_repository(&self.name).await,
+            Host::Gitlab(g) => g.delete_project(&self.name).await,
+            Host::Bitbucket(b) => b.delete_repository(&self.name).await,
+        }
+    }
+
+    /// Pushes `refspec` of the git repository at `dir` to it, with credentials that write it (in
+    /// git's environment, as every call to the host is).
+    pub async fn push_from(&self, dir: &Path, refspec: &str) -> anyhow::Result<()> {
+        let mut cmd = std::process::Command::new("git");
+        crate::os::git_no_prompts(&mut cmd);
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+        let url = self.url();
+        cmd.arg("-C").arg(dir).args(["push", "--quiet", "--", &url, refspec]).stdin(std::process::Stdio::null());
+        for (k, v) in self.auth(true).await? {
+            cmd.env(k, v);
+        }
+        let out = crate::proc::output(cmd, NETWORK).await.context("git push")?;
+        anyhow::ensure!(out.status.success(), "git push to {url}: {}", said(&out));
+        Ok(())
+    }
+
     /// A release's branch, gone once its pull request is merged or closed.
     pub async fn drop_branch(&self, branch: &str) {
         let gone = match &self.host {
@@ -499,20 +544,10 @@ fn said(out: &std::process::Output) -> String {
 pub async fn ensure(d: &Deploy, rr: &RepoRef) -> Result<(), String> {
     let r = open(d, rr).await?;
     let e = |e: anyhow::Error| format!("{e:#}");
-    const WHAT: &str = "kiln's release repository: what each environment runs, one release a commit";
-    let there = match &r.host {
-        Host::Github(app) => app.repository(&rr.repo).await.map_err(e)?.is_some(),
-        Host::Gitlab(g) => g.project(&rr.repo).await.map_err(e)?.is_some(),
-        Host::Bitbucket(b) => b.repository(&rr.repo).await.map_err(e)?.is_some(),
-    };
-    if there {
+    if r.exists().await.map_err(e)? {
         return Ok(());
     }
-    match &r.host {
-        Host::Github(app) => app.create_repository(&rr.repo, WHAT).await.map_err(e)?,
-        Host::Gitlab(g) => g.create_project(&rr.repo, WHAT).await.map_err(e)?,
-        Host::Bitbucket(b) => b.create_repository(&rr.repo, WHAT).await.map_err(e)?,
-    }
+    r.make("kiln's release repository: what each environment runs, one release a commit").await.map_err(e)?;
     d.hub.store.audit("kiln".into(), "repo.create".into(), format!("{} on {} (a release repository, docs/deploy-api.md §6)", rr.repo, r.host.label())).await;
     Ok(())
 }
@@ -547,7 +582,7 @@ fn settled(state: &str) -> bool {
 /// from where it settled; tried again for a few minutes while the host doesn't take it.
 pub fn report(d: &Deploy, r: &Release) {
     let (Some(state), Some(_)) = (deployment_state(r.state), r.commit.as_ref()) else { return };
-    let (deploy, id, environment, app, at) = (DeployRef { hub: Arc::clone(&d.hub), mirrors: Arc::clone(&d.remote) }, r.id, r.environment.clone(), r.app.clone(), r.state);
+    let (deploy, id, environment, app, at) = (DeployRef { hub: Arc::clone(&d.hub), records: Arc::clone(&d.records), mirrors: Arc::clone(&d.remote) }, r.id, r.environment.clone(), r.app.clone(), r.state);
     crate::rt::spawn(async move {
         for attempt in 0..5u32 {
             match report_now(&deploy, id, &environment, &app, at, state).await {
@@ -563,11 +598,12 @@ pub fn report(d: &Deploy, r: &Release) {
 /// What a report in the background needs of the service.
 struct DeployRef {
     hub: Arc<Hub>,
+    records: Arc<dyn kiln_seams::Records>,
     mirrors: Arc<Mirrors>,
 }
 
 async fn report_now(d: &DeployRef, id: i64, environment: &str, app: &str, at: ReleaseState, state: &str) -> anyhow::Result<()> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let Some(env) = super::store::environment(st, environment).await? else { return Ok(()) };
     let rr = env.release_repo.clone();
     let host = match rr.host.as_str() {
@@ -582,7 +618,7 @@ async fn report_now(d: &DeployRef, id: i64, environment: &str, app: &str, at: Re
     let Some(commit) = r.commit.clone() else { return Ok(()) };
     // Its key from before GitLab: kept, so a release reported then isn't reported again.
     let key = format!("deploy/github/deployment/{id}");
-    let last = st.kv_get(key.clone()).await?;
+    let last = store::kv_get(st, &key).await?;
     // Settled once, it stays: a report that comes late never takes it back.
     if last.as_deref() == Some(state) || last.as_deref().is_some_and(settled) {
         return Ok(());
@@ -605,7 +641,7 @@ async fn report_now(d: &DeployRef, id: i64, environment: &str, app: &str, at: Re
             b.status(&d.hub, &repo, &commit, &s).await?;
         }
     }
-    st.kv_set(key, state.to_owned()).await?;
+    store::kv_set(st, &key, state).await?;
     Ok(())
 }
 
@@ -616,7 +652,7 @@ async fn report_now(d: &DeployRef, id: i64, environment: &str, app: &str, at: Re
 /// merged, closed) moves that release now. `full`: the repository's name on the host; `pushed`:
 /// the branch a push moved; `proposal`: a pull or merge request's branch, and whether it's merged.
 async fn on_event(d: &Deploy, kind: &str, full: &str, pushed: Option<&str>, proposal: Option<(&str, bool)>) {
-    let Ok(envs) = super::store::environments(&d.hub.store).await else { return };
+    let Ok(envs) = super::store::environments(&*d.records).await else { return };
     let ours: Vec<&Environment> = envs.iter().filter(|e| e.release_repo.host == kind && e.release_repo.repo.eq_ignore_ascii_case(full)).collect();
     if ours.is_empty() {
         return;
@@ -633,11 +669,11 @@ async fn on_event(d: &Deploy, kind: &str, full: &str, pushed: Option<&str>, prop
     }
     if let Some((head, _)) = proposal
         && let Some(id) = head.strip_prefix(PROPOSAL_PREFIX).and_then(|rest| rest.split('-').next()).and_then(|n| n.parse::<i64>().ok())
-        && let Ok(Some(r)) = super::store::release(&d.hub.store, id).await
+        && let Ok(Some(r)) = super::store::release(&*d.records, id).await
         && proposal_branch(&r) == head
         && ours.iter().any(|e| e.name == r.environment)
     {
-        let _ = super::store::schedule(&d.hub.store, id, crate::util::now_unix()).await;
+        let _ = super::store::schedule(&*d.records, id, crate::util::now_unix()).await;
     }
     d.wake.notify();
 }
@@ -705,7 +741,7 @@ const READER_LASTS: i64 = 45 * 60;
 pub async fn argo_reader(d: &Deploy, argo: &Argo, env: &Environment, url: &str) -> Result<(), String> {
     let key = format!("deploy/{}/argo-reader/{}/{}", env.release_repo.host, argo.integration, env.release_repo.repo);
     let now = crate::util::now_unix();
-    let kept: Value = d.hub.store.kv_get(key.clone()).await.ok().flatten().map(|s| serde_json::from_str(&s).unwrap_or_else(|_| json!({ "at": s.parse::<i64>().unwrap_or(0) }))).unwrap_or(Value::Null);
+    let kept: Value = store::kv_get(&*d.records, &key).await.ok().flatten().map(|s| serde_json::from_str(&s).unwrap_or_else(|_| json!({ "at": s.parse::<i64>().unwrap_or(0) }))).unwrap_or(Value::Null);
     let put = kept.get("at").and_then(Value::as_i64);
     let r = open(d, &env.release_repo).await?;
     let due = match &r.host {
@@ -754,7 +790,7 @@ pub async fn argo_reader(d: &Deploy, argo: &Argo, env: &Environment, url: &str) 
     {
         revoke_reader(&r, old).await;
     }
-    d.hub.store.kv_set(key, json!({ "at": now, "token_id": made }).to_string()).await.map_err(e)?;
+    store::kv_set(&*d.records, &key, &json!({ "at": now, "token_id": made }).to_string()).await.map_err(e)?;
     Ok(())
 }
 
@@ -782,7 +818,7 @@ async fn revoke_reader(r: &Remote, id: u64) {
 /// Every Argo CD environment's credentials for its release repository on another host, put again
 /// where they're due (the worker, every few minutes).
 pub async fn refresh_readers(d: &Deploy) {
-    let Ok(envs) = super::store::environments(&d.hub.store).await else { return };
+    let Ok(envs) = super::store::environments(&*d.records).await else { return };
     for env in envs.iter().filter(|e| super::model::remote_host(&e.release_repo.host)) {
         let Some(integration) = super::appset::integration_of(env) else { continue };
         let done = match argocd::Argo::of(&d.hub, integration).await {

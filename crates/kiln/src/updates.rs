@@ -32,7 +32,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::hub::Hub;
-use crate::proto::{AgentMsg, CAP_UPGRADE, LANE_CONTROL, ServerMsg};
+use crate::proto::{AgentMsg, CAP_UPGRADE, ServerMsg};
 
 /// Jobs kept for the UI.
 const KEEP_JOBS: usize = 40;
@@ -1622,9 +1622,14 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     let u = &hub.updates;
     // That exact build: the server may hand out more than one for a platform.
     let msg = ServerMsg::Upgrade { job: id.to_owned(), path: format!("/dl/kiln/{}/{}", b.target, b.build), sha256: b.sha256.clone(), size: b.size };
-    if !hub.send_to_agent(machine, LANE_CONTROL, &msg).await {
-        u.finish(hub, id, Err(format!("{machine} is not connected")));
-        return;
+    // A live command: refused at once while its runner is away. Refused, the upgrade ends there;
+    // unanswered (the runner restarting into its new build, say), it goes on to see what came of it.
+    match hub.command_start(machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await {
+        crate::wire::commands::Answer::Taken | crate::wire::commands::Answer::Sent | crate::wire::commands::Answer::Unanswered { .. } | crate::wire::commands::Answer::Parked => {}
+        other => {
+            u.finish(hub, id, Err(format!("{machine}: {}", other.words())));
+            return;
+        }
     }
     // A runner that upgrades blue/green is through once it says its new build took over.
     let blue_green = {
@@ -2439,7 +2444,8 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_WORKSPACE
     | crate::proto::CAP_POOLS
     | crate::proto::CAP_RECEIVED
-    | crate::proto::CAP_UNDEPLOY;
+    | crate::proto::CAP_UNDEPLOY
+    | crate::proto::CAP_CLUSTER;
 
 /// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions
 /// and agents (taking a session over, listing folders), none of its jobs, upgrades, front door,

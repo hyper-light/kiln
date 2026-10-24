@@ -157,6 +157,9 @@ enum Cmd {
     Auth(kiln::runner::auth::AuthArgs),
     /// The packages a tree's lockfiles pin, as an SBOM (SPDX 2.3 or CycloneDX 1.6).
     Sbom(kiln::ci::sbom::SbomArgs),
+    /// Attestations: `kiln attest verify` checks an artifact's Sigstore bundles (GitHub's
+    /// `actions/attest-build-provenance`, kiln's keyless signing).
+    Attest(kiln::ci::sigstore::AttestArgs),
     /// The egress relay in a leg's container (docs/ci.md W18-R08); the runner starts it.
     #[command(hide = true)]
     EgressRelay,
@@ -211,6 +214,8 @@ enum Cmd {
     Debug(kiln::ci::cli::DebugArgs),
     /// People who sign in: add (with a sign-in link), list, link, sign out, remove.
     Users(kiln::authz::cli::UsersArgs),
+    /// Groups of users, which own apps: list, add, add-member, remove-member, remove.
+    Groups(kiln::authz::cli::GroupsArgs),
     /// What users may do: roles and capabilities in scopes (`developer@org:acme`).
     Grants(kiln::authz::cli::GrantsArgs),
     /// The built-in roles and custom ones.
@@ -865,6 +870,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Auth(a) => boxed(|| kiln::runner::auth::cli(a)).await,
         Cmd::Sbom(a) => boxed(|| kiln::ci::sbom::cli(a)).await,
+        Cmd::Attest(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| async move { kiln::ci::sigstore::cli(a, &cfg).await }).await
+        }
         Cmd::Runner(a) => boxed(|| kiln::runner::setup::cli(a)).await,
         Cmd::EgressRelay => kiln::runner::egress::relay_main(),
         Cmd::Workflow(a) => {
@@ -939,6 +948,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Users(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::authz::cli::users(a, &cfg)).await
+        }
+        Cmd::Groups(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::groups(a, &cfg)).await
         }
         Cmd::Grants(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

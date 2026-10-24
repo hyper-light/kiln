@@ -159,6 +159,21 @@ pub fn normalize_task(task: &mut Value) {
     }
 }
 
+/// Whether a live task definition's containers read a secret of kiln's (an SSM parameter under
+/// `/kiln/`, docs/deploy-api.md §3.5) that `desired`'s no longer do.
+pub fn secrets_gone(desired: &Value, live: &Value) -> bool {
+    let containers = |o: &Value| o.pointer("/spec/containerDefinitions").and_then(Value::as_array).cloned().unwrap_or_default();
+    let names = |c: &Value, kiln: bool| -> Vec<String> {
+        c.get("secrets").and_then(Value::as_array).into_iter().flatten().filter(|s| !kiln || s.get("valueFrom").and_then(Value::as_str).is_some_and(|v| v.starts_with("/kiln/"))).filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_owned)).collect()
+    };
+    let want = containers(desired);
+    containers(live).iter().any(|l| {
+        let d = want.iter().find(|d| d.get("name") == l.get("name"));
+        let kept = d.map(|d| names(d, false)).unwrap_or_default();
+        names(l, true).iter().any(|n| !kept.contains(n))
+    })
+}
+
 // ------------------------------------------------------------------ ECS's answers → objects
 
 /// A TaskDefinition object from DescribeTaskDefinition's answer (`include: [TAGS]`).
@@ -315,6 +330,8 @@ pub fn health(obj: &Value) -> Option<Status> {
             _ => status(Health::Healthy, ""),
         },
         "Service" => service_health(obj),
+        // An app's secret (docs/deploy-api.md §3.5): there, or missing.
+        "Parameter" => status(Health::Healthy, ""),
         "Task" => match crate::obj::str_at(obj, &["status", "lastStatus"]) {
             Some("RUNNING") => status(Health::Healthy, ""),
             Some("STOPPED") => status(Health::Degraded, crate::obj::str_at(obj, &["status", "stoppedReason"]).unwrap_or("stopped")),

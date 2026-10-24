@@ -23,6 +23,7 @@ pub mod dns;
 pub mod mobileconfig;
 pub mod netinfo;
 pub mod proxy;
+pub mod replica;
 pub mod runner;
 pub mod tailnet;
 pub mod zone;

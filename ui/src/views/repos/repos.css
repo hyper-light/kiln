@@ -144,6 +144,12 @@
   align-items: center;
   gap: 8px;
 }
+/* The panel open now (cloning, syncing): its button lit. */
+.repo-actions [data-slot="button"][aria-pressed="true"] {
+  border-color: rgb(255 255 255 / 34%);
+  background: rgb(255 255 255 / 8%);
+  color: var(--color-bright);
+}
 .repo-error {
   margin: 0;
   color: var(--color-fail);

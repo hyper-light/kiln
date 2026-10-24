@@ -81,8 +81,9 @@ kiln app secret list web --env staging                   # names and versions: v
 ```
 
 Each release delivers them, at their versions as it commits, as the Secret `web-kiln` in the
-app's namespace (on KilnCD; Argo CD can't take them yet), and kiln-base reads it as env with
-`kilnSecrets: true`. A change is a release of its own, through the environment's gates; its pods
+app's namespace (on Argo CD too, where kiln reaches the cluster: `kiln deploy env add …
+--kilncd in-cluster=<a KilnCD cluster>`), and kiln-base reads it as env with `kilnSecrets: true`.
+On Lambda, ECS, Workers and Vercel they go the platform's own way (docs/deploy-api.md §3.5). A change is a release of its own, through the environment's gates; its pods
 roll with it. `kiln app secret uses web --env staging` says each time a delivery read them.
 
 ## 5. Look, change, roll back

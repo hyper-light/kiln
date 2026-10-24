@@ -11,6 +11,7 @@
  * on its stack (in a line); the Plans page (all of it, listed); and a page of its own.
  */
 import * as React from "react";
+import { Fold } from "@/views/harness/fold";
 import { useParams, Link } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { planHref } from "@/api/plans";
@@ -308,8 +309,7 @@ export function AgentResearch({ agent }: { agent: string }) {
   const newest = all[0];
   if (!newest) return null;
   return (
-    <section>
-      <h3 className="in-sec-head">Its research{all.length > 1 && <span>{all.length}</span>}</h3>
+    <Fold id="research" title="Its research" count={all.length > 1 ? all.length : undefined}>
       <div className="rs-list">
         <div className="rs-card">
           <ResearchView r={newest} live={newest.summary.checking > 0} />
@@ -322,7 +322,7 @@ export function AgentResearch({ agent }: { agent: string }) {
           </div>
         ))}
       </div>
-    </section>
+    </Fold>
   );
 }
 

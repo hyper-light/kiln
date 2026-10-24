@@ -39,6 +39,8 @@ pub struct State {
     pub services: BTreeMap<(String, String), Value>,
     /// S3: buckets, and their objects' bytes by key.
     pub buckets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+    /// SSM: parameters' values (as SSM decrypts them) and versions, by name.
+    pub parameters: BTreeMap<String, (String, i64)>,
     /// Every operation, in order: `CreateFunction thumbs`.
     pub calls: Vec<String>,
     /// An alias (`thumbs:live`) someone else moves right after kiln reads it.
@@ -53,6 +55,9 @@ pub struct Fake {
 /// Tests on a fake Lambda run one at a time: the endpoints they point at theirs are the
 /// process's.
 pub static LAMBDA: Mutex<()> = Mutex::new(());
+
+/// Tests on a fake Cloudflare (Workers, Pages) run one at a time, for the same reason.
+pub static CLOUDFLARE: Mutex<()> = Mutex::new(());
 
 fn err(status: u16, code: &str, message: &str) -> Response {
     let r = srv::json(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST), &json!({ "message": message, "__type": code }));
@@ -71,20 +76,22 @@ impl srv::Handler for Fake {
         }
         let target = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-target")).map(str::to_owned);
         let signed_sha = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-content-sha256")).map(str::to_owned);
+        let copy_source = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-copy-source")).map(str::to_owned);
         let method = req.method().clone();
         let path = srv::decode(req.uri().path());
         let query = srv::query(&req);
         let raw = srv::body_bytes(req.into_body(), 4 << 20).await.unwrap_or_default();
         let mut st = self.state.lock();
-        // STS's Query form, S3's buckets (kiln's are kiln-…), ECS's JSON, Lambda's REST.
+        // STS's Query form, S3's buckets (only S3 signs its payload's hash), ECS's JSON, Lambda's REST.
         if raw.starts_with(b"Action=GetCallerIdentity") {
             return srv::text(http::StatusCode::OK, "<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account><Arn>arn:aws:sts::123456789012:assumed-role/kiln/x</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>");
         }
-        if path.starts_with("/kiln-") {
-            return s3(&mut st, &method, &path, &raw, signed_sha.as_deref());
+        if path.starts_with("/kiln-") || signed_sha.is_some() {
+            return s3(&mut st, &method, &path, &query, &raw, signed_sha.as_deref(), copy_source.as_deref());
         }
         let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         match target {
+            Some(t) if t.starts_with("AmazonSSM.") => ssm(&mut st, t.rsplit('.').next().unwrap_or_default(), &body),
             Some(t) => ecs(&mut st, t.rsplit('.').next().unwrap_or_default(), &body),
             None => lambda(&mut st, &method, &path, &query, &body),
         }
@@ -382,10 +389,51 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
     }
 }
 
-fn s3(st: &mut State, method: &http::Method, path: &str, body: &[u8], signed: Option<&str>) -> Response {
+fn s3(st: &mut State, method: &http::Method, path: &str, query: &std::collections::HashMap<String, String>, body: &[u8], signed: Option<&str>, copy_source: Option<&str>) -> Response {
     let mut parts = path.trim_start_matches('/').splitn(2, '/');
-    let (bucket, key) = (parts.next().unwrap_or_default().to_owned(), parts.next().map(str::to_owned));
+    let (bucket, key) = (parts.next().unwrap_or_default().to_owned(), parts.next().map(str::to_owned).filter(|k| !k.is_empty()));
+    let no_bucket = || srv::text(http::StatusCode::NOT_FOUND, "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>");
+    // ListObjectsV2: keys under a prefix, those past a delimiter as common prefixes.
+    if method == http::Method::GET && key.is_none() && query.get("list-type").map(String::as_str) == Some("2") {
+        let Some(b) = st.buckets.get(&bucket) else { return no_bucket() };
+        let prefix = query.get("prefix").cloned().unwrap_or_default();
+        let delimiter = query.get("delimiter").cloned().filter(|d| !d.is_empty());
+        let mut contents = String::new();
+        let mut common = std::collections::BTreeSet::new();
+        for (k, v) in b.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)) {
+            match delimiter.as_ref().and_then(|d| k.get(prefix.len()..).and_then(|rest| rest.find(d.as_str())).map(|i| (d, i))) {
+                Some((d, i)) => {
+                    common.insert(format!("{}{}", k.get(..prefix.len() + i).unwrap_or_default(), d));
+                }
+                None => contents.push_str(&format!("<Contents><Key>{k}</Key><Size>{}</Size></Contents>", v.len())),
+            }
+        }
+        let common: String = common.iter().map(|p| format!("<CommonPrefixes><Prefix>{p}</Prefix></CommonPrefixes>")).collect();
+        return srv::text(http::StatusCode::OK, &format!("<ListBucketResult><Name>{bucket}</Name><Prefix>{prefix}</Prefix><IsTruncated>false</IsTruncated>{contents}{common}</ListBucketResult>"));
+    }
     match (method.as_str(), key) {
+        ("GET", Some(k)) => match st.buckets.get(&bucket).and_then(|b| b.get(&k)) {
+            Some(data) => srv::response(http::StatusCode::OK, "application/octet-stream", srv::full(data.clone())),
+            None => srv::text(http::StatusCode::NOT_FOUND, "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>"),
+        },
+        ("DELETE", Some(k)) => {
+            if let Some(b) = st.buckets.get_mut(&bucket) {
+                b.remove(&k);
+            }
+            st.calls.push(format!("DeleteObject {bucket}/{k}"));
+            srv::status(http::StatusCode::NO_CONTENT)
+        }
+        // CopyObject: the source's bytes, in S3, nothing uploaded.
+        ("PUT", Some(k)) if copy_source.is_some() => {
+            let source = srv::decode(copy_source.unwrap_or_default());
+            let mut sp = source.trim_start_matches('/').splitn(2, '/');
+            let (sb, sk) = (sp.next().unwrap_or_default().to_owned(), sp.next().unwrap_or_default().to_owned());
+            let Some(data) = st.buckets.get(&sb).and_then(|b| b.get(&sk)).cloned() else { return srv::text(http::StatusCode::NOT_FOUND, "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>") };
+            let Some(b) = st.buckets.get_mut(&bucket) else { return no_bucket() };
+            b.insert(k.clone(), data);
+            st.calls.push(format!("CopyObject {bucket}/{k}"));
+            srv::text(http::StatusCode::OK, "<CopyObjectResult><ETag>\"fake\"</ETag></CopyObjectResult>")
+        }
         ("HEAD", None) => srv::status(if st.buckets.contains_key(&bucket) { http::StatusCode::OK } else { http::StatusCode::NOT_FOUND }),
         ("PUT", None) => {
             st.buckets.entry(bucket.clone()).or_default();
@@ -404,6 +452,44 @@ fn s3(st: &mut State, method: &http::Method, path: &str, body: &[u8], signed: Op
             srv::status(http::StatusCode::OK)
         }
         _ => srv::text(http::StatusCode::BAD_REQUEST, "<Error><Code>NotImplemented</Code><Message>the fake has no such S3 call</Message></Error>"),
+    }
+}
+
+/// SSM's parameters: values are only SecureStrings here, and never answered decrypted.
+fn ssm(st: &mut State, op: &str, body: &Value) -> Response {
+    let name = body.get("Name").and_then(Value::as_str).unwrap_or_default().to_owned();
+    match op {
+        "PutParameter" => {
+            if body.get("Type").and_then(Value::as_str) != Some("SecureString") {
+                return err(400, "ValidationException", "the fake keeps SecureStrings");
+            }
+            if st.parameters.contains_key(&name) && body.get("Overwrite").and_then(Value::as_bool) != Some(true) {
+                return err(400, "ParameterAlreadyExists", "The parameter already exists.");
+            }
+            let value = body.get("Value").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let version = st.parameters.get(&name).map_or(1, |(_, v)| v + 1);
+            st.parameters.insert(name.clone(), (value, version));
+            st.calls.push(format!("PutParameter {name}"));
+            ok(json!({ "Version": version, "Tier": "Standard" }))
+        }
+        "GetParameters" => {
+            let (mut found, mut invalid) = (Vec::new(), Vec::new());
+            for n in body.get("Names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                match st.parameters.get(n) {
+                    Some((_, v)) => found.push(json!({ "Name": n, "Type": "SecureString", "Value": "AQICAHh...encrypted", "Version": v, "ARN": format!("arn:aws:ssm:us-east-1:1:parameter{n}"), "DataType": "text" })),
+                    None => invalid.push(json!(n)),
+                }
+            }
+            ok(json!({ "Parameters": found, "InvalidParameters": invalid }))
+        }
+        "DeleteParameter" => match st.parameters.remove(&name) {
+            Some(_) => {
+                st.calls.push(format!("DeleteParameter {name}"));
+                ok(json!({}))
+            }
+            None => err(400, "ParameterNotFound", "parameter not found"),
+        },
+        other => err(400, "InvalidAction", &format!("the fake has no SSM {other}")),
     }
 }
 
@@ -631,9 +717,9 @@ impl super::Records for MemRecords {
     }
 }
 
-/// Artifacts' content kept in memory, by SHA-256.
+/// Artifacts' content kept in memory, by SHA-256; and secrets' values, by their reference.
 #[derive(Default)]
-pub struct MemFiles(pub Mutex<BTreeMap<String, Vec<u8>>>);
+pub struct MemFiles(pub Mutex<BTreeMap<String, Vec<u8>>>, pub Mutex<BTreeMap<String, Vec<u8>>>);
 
 impl MemFiles {
     /// Keeps `data`: its SHA-256 (hex).
@@ -660,6 +746,10 @@ impl crate::cd::artifacts::Files for MemFiles {
             Ok((rx, len))
         })
     }
+
+    fn secret<'a>(&'a self, _app: &'a str, reference: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move { self.1.lock().get(reference).cloned().ok_or_else(|| anyhow::anyhow!("no secret {reference}")) })
+    }
 }
 
 /// An object as the engine sends it: tracking stamped for `app`.
@@ -684,6 +774,8 @@ pub struct Script {
     pub migration_tag: Option<String>,
     pub versions: u32,
     pub serving: String,
+    /// Its secrets' text, by name: never answered.
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// The parts of Cloudflare's API the Workers provider calls, in memory.
@@ -697,6 +789,13 @@ pub struct CfState {
     pub domains: Vec<Value>,
     /// Each upload: its metadata and its modules' names.
     pub uploads: Vec<Value>,
+    /// Pages: projects (their production branch, deployments newest first, the one in
+    /// production), the assets uploaded by hash, and the upload token given.
+    pub pages: BTreeMap<String, (String, Vec<Value>, Option<String>)>,
+    pub assets: BTreeMap<String, Vec<u8>>,
+    pub pages_jwt: Option<String>,
+    /// Each Pages call that changes something: `Upload 2 assets`.
+    pub pages_calls: Vec<String>,
     next: u32,
 }
 
@@ -753,7 +852,11 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 impl srv::Handler for FakeCf {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
-        if srv::header_str(&req, &http::header::AUTHORIZATION) != Some("Bearer cf-token") {
+        let auth = srv::header_str(&req, &http::header::AUTHORIZATION).unwrap_or("").to_owned();
+        // Pages' asset store takes the project's upload token; the rest, the account's.
+        let assets = req.uri().path().starts_with("/pages/assets/");
+        let allowed = if assets { self.state.lock().pages_jwt.as_ref().is_some_and(|j| auth == format!("Bearer {j}")) } else { auth == "Bearer cf-token" };
+        if !allowed {
             return cf_err(403, 10000, "Authentication error");
         }
         let method = req.method().clone();
@@ -788,6 +891,21 @@ impl srv::Handler for FakeCf {
                 for k in ["main_module", "migrations", "tags", "keep_bindings"] {
                     settings.remove(k);
                 }
+                // Secrets are kept apart: those the upload names, and (kept) the ones it had.
+                if !meta.get("keep_bindings").and_then(Value::as_array).is_some_and(|k| k.iter().any(|t| t == "secret_text")) {
+                    s.secrets.clear();
+                }
+                let mut plain = Vec::new();
+                for b in settings.get("bindings").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    match (b.get("type").and_then(Value::as_str), b.get("name").and_then(Value::as_str)) {
+                        (Some("secret_text"), Some(n)) => {
+                            s.secrets.insert(n.to_owned(), b.get("text").and_then(Value::as_str).unwrap_or_default().to_owned());
+                        }
+                        _ => plain.push(b),
+                    }
+                }
+                plain.extend(s.secrets.keys().map(|n| json!({ "type": "secret_text", "name": n })));
+                settings.insert("bindings".into(), Value::Array(plain));
                 s.settings = Value::Object(settings);
                 s.tags = meta.get("tags").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
                 s.versions += 1;
@@ -819,6 +937,21 @@ impl srv::Handler for FakeCf {
             ("POST", ["accounts", "acct1", "workers", "scripts", name, "subdomain"]) => {
                 st.subdomains.insert((*name).to_owned(), body.get("enabled").and_then(Value::as_bool).unwrap_or(false));
                 cf_ok(json!({}))
+            }
+            // A secret deleted: a new version without it, deployed.
+            ("DELETE", ["accounts", "acct1", "workers", "scripts", name, "secrets", secret]) => {
+                st.next += 1;
+                let serving = format!("ver-{}", st.next);
+                let Some(s) = st.scripts.get_mut(*name) else { return cf_err(404, 10007, "workers.api.error.script_not_found") };
+                if s.secrets.remove(*secret).is_none() {
+                    return cf_err(404, 10056, "workers.api.error.secret_not_found");
+                }
+                if let Some(Value::Array(b)) = s.settings.get_mut("bindings") {
+                    b.retain(|x| x.get("name").and_then(Value::as_str) != Some(*secret));
+                }
+                s.versions += 1;
+                s.serving = serving;
+                cf_ok(Value::Null)
             }
             ("DELETE", ["accounts", "acct1", "workers", "scripts", name]) => match st.scripts.remove(*name) {
                 Some(_) => cf_ok(Value::Null),
@@ -859,9 +992,119 @@ impl srv::Handler for FakeCf {
                 st.domains.retain(|d| d.get("id").and_then(Value::as_str) != Some(*id));
                 cf_ok(Value::Null)
             }
-            _ => cf_err(400, 7000, &format!("the fake has no {method} {path}")),
+            _ => pages(&mut st, &method, &segs, &ct, &raw, &body).unwrap_or_else(|| cf_err(400, 7000, &format!("the fake has no {method} {path}"))),
         }
     }
+}
+
+fn pages_project(name: &str, (branch, deployments, canonical): &(String, Vec<Value>, Option<String>)) -> Value {
+    let find = |id: &Option<String>| id.as_ref().and_then(|i| deployments.iter().find(|d| d.get("id").and_then(Value::as_str) == Some(i.as_str()))).cloned();
+    json!({ "name": name, "production_branch": branch, "subdomain": format!("{name}.pages.dev"), "canonical_deployment": find(canonical), "latest_deployment": deployments.first() })
+}
+
+/// Pages' calls: none for a call that isn't one.
+fn pages(st: &mut CfState, method: &http::Method, segs: &[&str], ct: &str, raw: &[u8], body: &Value) -> Option<Response> {
+    st.next += 1;
+    let n = st.next;
+    Some(match (method.as_str(), segs) {
+        ("GET", ["accounts", "acct1", "pages", "projects"]) => cf_ok(Value::Array(st.pages.iter().map(|(n, p)| pages_project(n, p)).collect())),
+        ("POST", ["accounts", "acct1", "pages", "projects"]) => {
+            let name = body.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let branch = body.get("production_branch").and_then(Value::as_str).unwrap_or("main").to_owned();
+            st.pages.insert(name.clone(), (branch, Vec::new(), None));
+            st.pages_calls.push(format!("CreateProject {name}"));
+            cf_ok(st.pages.get(&name).map(|p| pages_project(&name, p)).unwrap_or_default())
+        }
+        (_, ["accounts", "acct1", "pages", "projects", name, rest @ ..]) => {
+            let name = (*name).to_owned();
+            if !st.pages.contains_key(&name) {
+                return Some(cf_err(404, 8_000_007, "Project not found"));
+            }
+            match (method.as_str(), rest) {
+                ("GET", []) => cf_ok(st.pages.get(&name).map(|p| pages_project(&name, p)).unwrap_or_default()),
+                ("DELETE", []) => {
+                    st.pages.remove(&name);
+                    st.pages_calls.push(format!("DeleteProject {name}"));
+                    cf_ok(Value::Null)
+                }
+                ("GET", ["upload-token"]) => {
+                    let jwt = format!("pages-jwt-{n}");
+                    st.pages_jwt = Some(jwt.clone());
+                    cf_ok(json!({ "jwt": jwt }))
+                }
+                ("POST", ["deployments"]) => {
+                    let ps = parts(ct, raw);
+                    let Some(manifest) = ps.iter().find(|p| p.0 == "manifest").and_then(|p| serde_json::from_slice::<Value>(&p.2).ok()) else { return Some(cf_err(400, 8_000_096, "a manifest is required")) };
+                    let branch = ps.iter().find(|p| p.0 == "branch").map(|p| String::from_utf8_lossy(&p.2).into_owned()).unwrap_or_default();
+                    if let Some(h) = manifest.as_object().into_iter().flatten().filter_map(|(_, h)| h.as_str()).find(|h| !st.assets.contains_key(*h)) {
+                        return Some(cf_err(400, 8_000_097, &format!("asset {h} wasn't uploaded")));
+                    }
+                    let Some(p) = st.pages.get_mut(&name) else { return Some(cf_err(404, 8_000_007, "Project not found")) };
+                    let env = if branch == p.0 { "production" } else { "preview" };
+                    let d = json!({ "id": format!("dpl-{n}"), "url": format!("https://{n:x}.{name}.pages.dev"), "environment": env, "latest_stage": { "name": "queued", "status": "active" }, "manifest": manifest });
+                    p.1.insert(0, d.clone());
+                    st.pages_calls.push(format!("Deploy {name} {} files", manifest.as_object().map_or(0, Map::len)));
+                    cf_ok(d)
+                }
+                ("GET", ["deployments", id]) => {
+                    let assets = st.assets.clone();
+                    let Some(p) = st.pages.get_mut(&name) else { return Some(cf_err(404, 8_000_007, "Project not found")) };
+                    let Some(d) = p.1.iter_mut().find(|d| d.get("id").and_then(Value::as_str) == Some(*id)) else { return Some(cf_err(404, 8_000_009, "Deployment not found")) };
+                    let stage = d.pointer("/latest_stage/name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let mut canonical = None;
+                    match stage.as_str() {
+                        "queued" => {
+                            if let Some(m) = d.as_object_mut() {
+                                m.insert("latest_stage".into(), json!({ "name": "deploy", "status": "active" }));
+                            }
+                        }
+                        "deploy" if d.pointer("/latest_stage/status").and_then(Value::as_str) == Some("active") => {
+                            let broken = d.get("manifest").and_then(Value::as_object).into_iter().flatten().filter_map(|(_, h)| h.as_str().and_then(|h| assets.get(h))).any(|b| String::from_utf8_lossy(b).contains("broken"));
+                            if let Some(m) = d.as_object_mut() {
+                                m.insert("latest_stage".into(), json!({ "name": "deploy", "status": if broken { "failure" } else { "success" } }));
+                            }
+                            if !broken && d.get("environment").and_then(Value::as_str) == Some("production") {
+                                canonical = Some((*id).to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                    let answer = d.clone();
+                    if canonical.is_some() {
+                        p.2 = canonical;
+                    }
+                    cf_ok(answer)
+                }
+                ("POST", ["deployments", id, "rollback"]) => {
+                    let Some(p) = st.pages.get_mut(&name) else { return Some(cf_err(404, 8_000_007, "Project not found")) };
+                    let ok_to = p.1.iter().find(|d| d.get("id").and_then(Value::as_str) == Some(*id)).filter(|d| d.pointer("/latest_stage/status").and_then(Value::as_str) == Some("success")).cloned();
+                    let Some(d) = ok_to else { return Some(cf_err(400, 8_000_010, "only a deployment that succeeded is rolled back to")) };
+                    p.2 = Some((*id).to_owned());
+                    st.pages_calls.push(format!("Rollback {name} {id}"));
+                    cf_ok(d)
+                }
+                _ => return None,
+            }
+        }
+        ("POST", ["pages", "assets", "check-missing"]) => {
+            let missing: Vec<Value> = body.get("hashes").and_then(Value::as_array).into_iter().flatten().filter(|h| h.as_str().is_some_and(|h| !st.assets.contains_key(h))).cloned().collect();
+            cf_ok(Value::Array(missing))
+        }
+        ("POST", ["pages", "assets", "upload"]) => {
+            use base64::Engine as _;
+            let mut count = 0;
+            for a in body.as_array().into_iter().flatten() {
+                let (Some(key), Some(value)) = (a.get("key").and_then(Value::as_str), a.get("value").and_then(Value::as_str)) else { return Some(cf_err(400, 8_000_098, "an asset needs its key and value")) };
+                let Ok(data) = base64::engine::general_purpose::STANDARD.decode(value) else { return Some(cf_err(400, 8_000_098, "an asset's value is base64")) };
+                st.assets.insert(key.to_owned(), data);
+                count += 1;
+            }
+            st.pages_calls.push(format!("Upload {count} assets"));
+            cf_ok(json!({ "successful_key_count": count }))
+        }
+        ("POST", ["pages", "assets", "upsert-hashes"]) => cf_ok(Value::Null),
+        _ => return None,
+    })
 }
 
 /// Starts the fake Cloudflare on a free port: its base URL.
@@ -889,6 +1132,8 @@ pub struct VercelState {
     pub known: std::collections::BTreeSet<String>,
     pub uploads: u32,
     pub domains: BTreeMap<(String, String), Value>,
+    /// Projects' environment variables, with their values (a sensitive one's never answered).
+    pub env: BTreeMap<String, Vec<Value>>,
     next: u32,
 }
 
@@ -982,6 +1227,9 @@ impl srv::Handler for FakeVercel {
                 st.next += 1;
                 let id = format!("dpl_{}", st.next);
                 let mut d = body.as_object().cloned().unwrap_or_default();
+                // A production deployment takes the project's production variables as they are now.
+                let vars: Map<String, Value> = st.env.get(&project).into_iter().flatten().filter(|e| e.get("target").and_then(Value::as_array).is_some_and(|t| t.contains(&json!("production")))).filter_map(|e| Some((e.get("key")?.as_str()?.to_owned(), e.get("value")?.clone()))).collect();
+                d.insert("env".into(), Value::Object(vars));
                 d.insert("id".into(), json!(id));
                 d.insert("url".into(), json!(format!("site-{}.vercel.app", st.next)));
                 d.insert("readyState".into(), json!("BUILDING"));
@@ -1006,6 +1254,57 @@ impl srv::Handler for FakeVercel {
                     p.insert("targets".into(), json!({ "production": { "id": id } }));
                 }
                 ok(d)
+            }
+            ("GET", ["v9", "projects", project, "env"]) => {
+                let envs: Vec<Value> = st
+                    .env
+                    .get(*project)
+                    .into_iter()
+                    .flatten()
+                    .map(|e| {
+                        let mut e = e.clone();
+                        if let Value::Object(m) = &mut e
+                            && m.get("type") == Some(&json!("sensitive"))
+                        {
+                            m.remove("value");
+                        }
+                        e
+                    })
+                    .collect();
+                ok(json!({ "envs": envs }))
+            }
+            ("POST", ["v10", "projects", project, "env"]) => {
+                if !st.projects.contains_key(*project) {
+                    return vc_err(404, "not_found", "Project not found", json!({}));
+                }
+                let items: Vec<Value> = match &body {
+                    Value::Array(a) => a.clone(),
+                    one => vec![one.clone()],
+                };
+                let mut created = Vec::new();
+                for item in items {
+                    st.next += 1;
+                    let n = st.next;
+                    let key = item.get("key").cloned().unwrap_or(Value::Null);
+                    let list = st.env.entry((*project).to_owned()).or_default();
+                    if query.get("upsert").map(String::as_str) != Some("true") && list.iter().any(|e| e.get("key") == Some(&key)) {
+                        return vc_err(400, "ENV_ALREADY_EXISTS", "A variable with the name already exists", json!({}));
+                    }
+                    list.retain(|e| e.get("key") != Some(&key));
+                    let mut e = item.as_object().cloned().unwrap_or_default();
+                    e.insert("id".into(), json!(format!("env_{n}")));
+                    e.insert("updatedAt".into(), json!(1_760_000_000_000_u64 + u64::from(n)));
+                    list.push(Value::Object(e.clone()));
+                    e.remove("value");
+                    created.push(Value::Object(e));
+                }
+                ok(json!({ "created": created }))
+            }
+            ("DELETE", ["v9", "projects", project, "env", id]) => {
+                if let Some(list) = st.env.get_mut(*project) {
+                    list.retain(|e| e.get("id").and_then(Value::as_str) != Some(*id));
+                }
+                ok(json!({}))
             }
             ("GET", ["v9", "projects", project, "domains"]) => ok(json!({ "domains": st.domains.iter().filter(|((p, _), _)| p == project).map(|(_, d)| d.clone()).collect::<Vec<_>>() })),
             ("GET", ["v9", "projects", project, "domains", name]) => match st.domains.get(&((*project).to_owned(), (*name).to_owned())) {

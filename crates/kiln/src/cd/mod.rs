@@ -21,6 +21,7 @@ pub mod live;
 pub mod ops;
 pub mod plans;
 pub mod rollouts;
+pub mod runners;
 pub mod targets;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -470,6 +471,7 @@ impl Cd {
             let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
             let pin = self.store.read(|d| d.pins.get(&id).cloned());
             let mut seen = pin.clone();
+            let facts = (kube_version.clone(), api_versions.clone());
             let result = crate::rt::blocking(move || -> Result<(Resolved, Option<Resolved>)> {
                 let head = this.inputs_of(&def, kube_version.as_deref(), &api_versions, None)?;
                 // A rolled-back app holds its deployment's commits until git changes what it
@@ -485,7 +487,18 @@ impl Cd {
             // Artifacts resolve for each revision: the head's, and a rolled-back app's own.
             let result = match result {
                 Ok((mut head, mut held)) => async {
-                    let (a, p) = self.resolve_artifacts(&def_for_artifacts, &head.revision).await?;
+                    let (a, p) = match self.resolve_artifacts(&def_for_artifacts, &head.revision).await {
+                        Ok(r) => r,
+                        // The head's artifacts aren't built yet (pushes come faster than its image
+                        // builds): the newest commit since what runs whose are takes its place.
+                        Err(e) => match self.newest_built(&def_for_artifacts, &id, &head.revision, facts).await {
+                            Some((built, a, p)) => {
+                                head = built;
+                                (a, p)
+                            }
+                            None => return Err(e),
+                        },
+                    };
                     head.add_artifacts(a, p);
                     // Its secrets are the ones its definition pins, whichever commits it holds.
                     let secrets = self.app_secrets(&def_for_artifacts).await?;
@@ -520,6 +533,37 @@ impl Cd {
                 Err(e) => self.set_source_error(&id, Some(format!("{e:#}"))),
             }
         }
+    }
+
+    /// The newest commit from `head` back to the one the app runs whose artifacts are built (the
+    /// head's aren't): its inputs and artifacts, in the head's place until the head's are. `None`:
+    /// none of them is, or the head doesn't lead from what runs (then it waits for the head's).
+    async fn newest_built(self: &Arc<Self>, def: &AppDef, id: &str, head: &str, (kube_version, api_versions): (Option<String>, Vec<String>)) -> Option<(Resolved, Vec<ArtifactRef>, Vec<PullSecret>)> {
+        // What runs: its last deployment that succeeded (kept, so known after a restart too, before
+        // the app is compared), else what its status says.
+        let runs = self
+            .store
+            .read(|d| d.history.get(id).and_then(|h| h.iter().rev().find(|x| x.succeeded).and_then(|x| x.revision.clone())))
+            .or_else(|| self.statuses.read().get(id).and_then(|s| s.revision.as_deref().map(str::to_owned)))?;
+        // The source whose commit is the app's revision.
+        let i = def.sources.iter().position(|s| s.chart.is_none() && s.as_ref.is_none())?;
+        let source = def.sources.get(i)?;
+        let (dir, url, auth, from, to) = (self.mirror_dir(&source.repo), source.repo.clone(), self.git_auth(&source.repo), runs.clone(), head.to_owned());
+        let stack = crate::rt::blocking(move || Mirror::open(&dir, &url, auth)?.stack(Some(&from), &to, NEWEST_BUILT)).await.ok()?.ok()?;
+        for commit in in_place_of_head(stack, &runs) {
+            if self.resolve_artifacts(def, &commit).await.is_err() {
+                continue;
+            }
+            let at: Vec<Option<String>> = (0..def.sources.len()).map(|j| (j == i).then(|| commit.clone())).collect();
+            let (this, d, (kv, av)) = (Arc::clone(self), def.clone(), (kube_version.clone(), api_versions.clone()));
+            let built = crate::rt::blocking(move || this.inputs_of(&d, kv.as_deref(), &av, Some(&at))).await.ok()?.ok()?;
+            let (a, p) = self.resolve_artifacts(def, &built.revision).await.ok()?;
+            if commit != runs {
+                tracing::info!(app = %id, head = %head.get(..7).unwrap_or(head), commit = %commit.get(..7).unwrap_or(&commit), "deployments: the head's artifacts aren't built yet; the newest commit whose are takes its place");
+            }
+            return Some((built, a, p));
+        }
+        None
     }
 
     fn set_source_error(&self, id: &str, e: Option<String>) {
@@ -734,6 +778,34 @@ impl Cd {
         Ok(Some(AppSecrets { name: want.name.clone(), bundle }))
     }
 
+    /// Whether kiln knows a cluster by this name.
+    pub(crate) fn has_cluster(&self, name: &str) -> bool {
+        self.clusters.read().contains_key(name)
+    }
+
+    /// Applies `object` to the cluster kiln knows as `cluster` (server-side, as `manager`): what
+    /// kiln writes there for something it doesn't render itself (an Argo CD app's secrets).
+    pub(crate) async fn apply_to(&self, cluster: &str, object: &Value, manager: &str) -> Result<Value> {
+        let c = self.clusters.read().get(cluster).cloned().with_context(|| format!("kiln isn't connected to the cluster {cluster}"))?;
+        c.apply(object, manager, false).await
+    }
+
+    /// What kiln wrote with [`Cd::apply_to`] in the cluster kiln knows as `cluster`, if it's there.
+    pub(crate) async fn get_from(&self, cluster: &str, key: &ResKey) -> Result<Option<Value>> {
+        let c = self.clusters.read().get(cluster).cloned().with_context(|| format!("kiln isn't connected to the cluster {cluster}"))?;
+        c.get(key).await
+    }
+
+    /// Deletes what kiln wrote with [`Cd::apply_to`] in the cluster kiln knows as `cluster`, if
+    /// it's there and `ours` says it is kiln's.
+    pub(crate) async fn delete_from(&self, cluster: &str, key: &ResKey, ours: impl Fn(&Value) -> bool) -> Result<()> {
+        let c = self.clusters.read().get(cluster).cloned().with_context(|| format!("kiln isn't connected to the cluster {cluster}"))?;
+        match c.get(key).await? {
+            Some(o) if ours(&o) => c.delete(key, "Background").await,
+            _ => Ok(()),
+        }
+    }
+
     /// An app's secrets for a plan, from memory alone: those it was last rendered with.
     pub(crate) fn planned_secrets(&self, def: &AppDef) -> Option<AppSecrets> {
         let want = def.secrets.as_ref()?;
@@ -927,11 +999,22 @@ impl Cd {
         for p in &inputs.pull_secrets {
             objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
-        // Its secrets: one Secret, and the pods that read it marked with their versions.
+        // Its secrets: on a cluster one Secret, and the pods that read it marked with their
+        // versions; on a platform, references its provider reads the values of as it applies.
+        let platform = kiln_cd::providers::is_target(&def.destination.cluster);
+        if platform && let Some(o) = objects.iter().find(|o| apps::holds_secret_ref(o)) {
+            anyhow::bail!("{} {} holds `{}`, which is kiln's: an app's secrets reach it from its secrets (docs/deploy-api.md §3.5)", obj::kind(o), obj::name(o), apps::SECRET_REF);
+        }
         if let Some(s) = &inputs.secrets {
-            let versions = s.bundle.versions();
-            objects.push(apps::app_secret(&s.name, &def.destination.namespace, &versions, s.bundle.items.iter().map(|(n, _, v)| (n.as_str(), v.bytes()))));
-            apps::stamp_secrets(&mut objects, &s.name, &def.destination.namespace, &versions);
+            if platform {
+                let scope = def.secrets.as_ref().map(|r| r.scope.as_str()).unwrap_or_default();
+                let versions: Vec<(String, u32)> = s.bundle.items.iter().map(|(n, v, _)| (n.clone(), *v)).collect();
+                apps::platform_secrets(&mut objects, scope, &versions).map_err(|e| anyhow::anyhow!("its secrets: {e}"))?;
+            } else {
+                let versions = s.bundle.versions();
+                objects.push(apps::app_secret(&s.name, &def.destination.namespace, &versions, s.bundle.items.iter().map(|(n, _, v)| (n.as_str(), v.bytes()))));
+                apps::stamp_secrets(&mut objects, &s.name, &def.destination.namespace, &versions);
+            }
         }
         apps::stamp_rollout(def, &mut objects);
         let _ = std::fs::remove_dir_all(&views);
@@ -1363,6 +1446,19 @@ pub fn is_shadow(def: &AppDef) -> bool {
     matches!(def.origin, Origin::Argo { .. }) && def.labels.get("kiln.dev/take-over").map(String::as_str) != Some("true")
 }
 
+/// How many commits back from the head an app looks for the newest whose artifacts are built.
+const NEWEST_BUILT: usize = 64;
+
+/// The commits to try in place of a head whose artifacts aren't built, newest first: those after
+/// `runs` (the commit the app runs) and before the head, then `runs` itself, never older. `stack`:
+/// the commits from `runs` (left out) up to the head, oldest first.
+fn in_place_of_head(mut stack: Vec<String>, runs: &str) -> Vec<String> {
+    stack.pop();
+    stack.reverse();
+    stack.push(runs.to_owned());
+    stack
+}
+
 /// An app's status as the API and events show it.
 pub fn summary_json(s: &Summary) -> Value {
     json!({
@@ -1478,6 +1574,11 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         kustomize_options: cfg.kustomize_options.clone(),
         timeout: Duration::from_secs(cfg.render_timeout_seconds.max(5)),
         helm_home: Some(dir.join("helm")),
+        // kiln's own charts (kiln-base), under every name its registry goes by: laid in, not pulled.
+        local_charts: std::iter::once(crate::githost::host_of(&hub.cfg.server.public_url))
+            .chain(hub.cfg.ci.registry.hosts.iter().cloned())
+            .map(|host| (crate::deploy::init::charts_repository(&host), crate::deploy::init::local_charts(&hub.cfg)))
+            .collect(),
         ..Tools::default()
     };
     let cd = Arc::new(Cd {
@@ -1588,6 +1689,13 @@ mod tests {
         assert!(forgotten(&before, &ids(&["default/kiln-namespaces"]), &kept).is_empty());
         assert_eq!(forgotten(&before, &BTreeSet::new(), &kept), ["default/kiln-namespaces"], "one it no longer renders is forgotten");
         Ok(())
+    }
+
+    #[test]
+    fn a_head_not_built_yet_gives_way_to_the_newest_commit_since_what_runs() {
+        let stack: Vec<String> = ["c3", "c4", "c5", "head"].iter().map(|c| (*c).to_owned()).collect();
+        assert_eq!(in_place_of_head(stack, "c2"), ["c5", "c4", "c3", "c2"], "newest first, down to what runs and never past it");
+        assert_eq!(in_place_of_head(vec!["head".to_owned()], "c2"), ["c2"], "nothing between: what runs stays");
     }
 
     #[test]

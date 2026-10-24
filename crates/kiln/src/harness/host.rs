@@ -707,7 +707,8 @@ impl Host {
                         super::survivors::stop(&agents);
                     }
                     if !leftovers.is_empty() || !adopted.is_empty() {
-                        tracing::info!(count = leftovers.len() + adopted.len(), "stopping what agents' commands left running, now that they're between turns");
+                        let what: Vec<String> = seen.iter().filter(|(id, _)| settled.contains(*id)).flat_map(|(_, s)| &s.apart).chain(&adopted).take(8).map(|r| format!("{} {}", r.pid, super::survivors::shown(&r.command))).collect();
+                        tracing::info!(count = leftovers.len() + adopted.len(), ?what, "stopping what agents' commands left running, now that they're between turns");
                         super::survivors::stop(&leftovers);
                         adopted.iter().for_each(super::survivors::stop_tree);
                     }
@@ -737,10 +738,11 @@ impl Host {
         let running = s.pid.lock().is_some();
         let mut ran = s.ran.lock();
         let still = |r: &super::survivors::Ran| alive.get(&r.pid) == Some(&r.started);
-        let under: std::collections::HashSet<u32> = seen.under.iter().map(|r| r.pid).collect();
+        // Everything under it now, not only what's noted (a record keeps so many).
+        let under = |pid: u32| seen.below.contains(&pid) || seen.under.iter().any(|r| r.pid == pid);
         let mut apart = seen.apart;
         // As recorded, still running, neither under it nor marked (it cleared its environment).
-        for r in ran.1.iter().filter(|r| !under.contains(&r.pid) && still(r) && !super::survivors::login_agent(&r.command)) {
+        for r in ran.1.iter().filter(|r| !under(r.pid) && still(r) && !super::survivors::login_agent(&r.command)) {
             if !apart.iter().any(|a| a.pid == r.pid) {
                 apart.push(r.clone());
             }
@@ -977,7 +979,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         workspace: spec.workspace.clone(),
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
-    vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]
+    vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]
 }
 
 #[cfg(test)]
@@ -1326,6 +1328,30 @@ mod tests {
             // Once 22 ends, the next look ends it.
             host.note(&s, Seen::default(), &HashMap::new(), 1_800_000_010);
             assert!(s.core.lock().state.tasks.iter().all(|t| !t.live()), "nothing left running");
+            Ok(())
+        })
+    }
+
+    /// A harness running more than a look notes (two browsers, a server: a record keeps so many):
+    /// whichever of them one look notes and the next doesn't, all still run under it, and none is
+    /// taken for left running (and stopped once the agent is between turns).
+    #[test]
+    fn what_runs_under_a_harness_past_what_a_look_notes_is_never_left_running() -> anyhow::Result<()> {
+        use super::super::survivors::{Ran, Seen};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, None, Limits::default());
+            let s = host.open(Some("busy".into()), no_harness(dir.path()))?;
+            let all: Vec<Ran> = (100..180).map(|pid| Ran { pid, ppid: 99, started: 1_700_000_000, command: format!("chrome --type=renderer {pid}") }).collect();
+            let alive: HashMap<u32, u64> = all.iter().map(|r| (r.pid, r.started)).collect();
+            // Each look notes 64 of the 80, not the same 64.
+            let look = |from: usize| Seen { under: all.iter().skip(from).take(64).cloned().collect(), below: all.iter().map(|r| r.pid).collect(), ..Seen::default() };
+            host.note(&s, look(0), &alive, 1_800_000_000);
+            host.note(&s, look(16), &alive, 1_800_000_010);
+            let left = s.left.lock().clone();
+            assert!(left.is_empty(), "{left:?}");
+            assert!(s.core.lock().state.tasks.iter().all(|t| !t.live()), "nothing shown as left running");
             Ok(())
         })
     }

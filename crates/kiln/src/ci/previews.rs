@@ -396,6 +396,25 @@ pub async fn leg_ended(hub: &Hub, repo: &Repo, name: &str, runner: &str) {
     }
 }
 
+/// Takes environment `name`'s `kind` deployment (`container`, `microvm`) of `repo` down on
+/// `runners`, as a gone preview's is: asked now of each runner that's here, and again whenever
+/// one comes back, until it says it's done. A CD provider's object gone (docs/cd-targets.md §2.2).
+pub async fn undeploy_on(hub: &Hub, repo: &Repo, kind: &str, name: &str, runners: &[String]) -> anyhow::Result<()> {
+    let (repo_name, k, n, rs) = (repo.name.clone(), kind.to_owned(), name.to_owned(), runners.to_vec());
+    hub.store
+        .call(move |c| {
+            for r in &rs {
+                c.execute("INSERT OR IGNORE INTO ci_preview_removals (runner, kind, repo, environment, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![r, k, repo_name, n, crate::util::now_unix()])?;
+            }
+            Ok(())
+        })
+        .await?;
+    for r in runners {
+        ask(hub, r).await;
+    }
+    Ok(())
+}
+
 /// When each removal was last asked of its runner, so a runner that's slow to answer isn't asked
 /// again at once.
 static ASKED: Mutex<Option<HashMap<(String, String, String, String), Instant>>> = Mutex::new(None);
@@ -419,7 +438,7 @@ pub async fn ask(hub: &Hub, runner: &str) {
             continue;
         }
         let Ok(json) = serde_json::to_string(&a) else { continue };
-        hub.send_peer(peer, &ServerMsg::Undeploy { json }).await;
+        hub.command_peers(runner, vec![peer], &ServerMsg::Undeploy { json }).await.log_when_answered(crate::hub::LOG_WITHIN);
         ASKED.lock().get_or_insert_with(HashMap::new).insert(key, Instant::now());
     }
 }

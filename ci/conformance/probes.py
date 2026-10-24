@@ -67,6 +67,17 @@ def log_text(url, token):
             return r.read().decode(errors="replace")
 
 
+def annotations(url, token):
+    """A GitHub job's annotations, its check run's (a GitHub App's token needs `checks: read`: a
+    public repository's check runs aren't anyone's to read)."""
+    try:
+        return call(url, token) or []
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 404):
+            sys.exit(f"{url}: {e.code}: the token can't read check runs (a GitHub App needs Checks: Read-only)")
+        raise
+
+
 def git(cwd, *args):
     env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="probes", GIT_AUTHOR_EMAIL="probes@example.invalid", GIT_COMMITTER_NAME="probes", GIT_COMMITTER_EMAIL="probes@example.invalid")
     out = subprocess.run(["git", "-C", cwd, *args], env=env, capture_output=True, text=True)
@@ -187,14 +198,19 @@ def on_github(a):
     owner, name = a.repo.split("/", 1)
     info = api(f"/repos/{owner}/{name}")
     branch = info["default_branch"]
-    work = a.work
-    if not os.path.isdir(os.path.join(work, ".git")):
-        subprocess.run(["git", "clone", "-q", f"https://x-access-token:{token}@github.com/{owner}/{name}.git", work], check=True, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
-    tree(work)
-    git(work, "add", "-A")
-    git(work, "commit", "-qm", "the probes", "--allow-empty")
-    sha = git(work, "rev-parse", "HEAD")
-    git(work, "push", "-q", "origin", f"HEAD:{branch}")
+    if a.sha:
+        # Runs of the probes pushed before: read again, not run again.
+        sha = a.sha
+    else:
+        work = a.work
+        if not os.path.isdir(os.path.join(work, ".git")):
+            subprocess.run(["git", "clone", "-q", f"https://x-access-token:{token}@github.com/{owner}/{name}.git", work], check=True, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+        tree(work)
+        git(work, "add", "-A")
+        git(work, "commit", "-qm", "the probes", "--allow-empty")
+        sha = git(work, "rev-parse", "HEAD")
+        git(work, "push", "-q", "origin", f"HEAD:{branch}")
+        print(f"pushed the probes to {a.repo} at {sha}", flush=True)
     want = set(workflows())
 
     def done():
@@ -218,7 +234,7 @@ def on_github(a):
                     text = log_text(f"{gh}/repos/{owner}/{name}/actions/jobs/{j['id']}/logs", token)
                 except urllib.error.HTTPError:
                     text = ""
-                notes = api(f"/repos/{owner}/{name}/check-runs/{j['id']}/annotations?per_page=100") or []
+                notes = annotations(f"{gh}/repos/{owner}/{name}/check-runs/{j['id']}/annotations?per_page=100", token)
                 jobs[j["name"]] = {
                     "conclusion": {"success": "success", "failure": "failure", "cancelled": "cancelled", "skipped": "skipped"}.get(j.get("conclusion"), j.get("conclusion")),
                     "probes": probes_of(text),
@@ -294,6 +310,7 @@ def main():
     g.add_argument("--work", required=True)
     g.add_argument("--out", required=True)
     g.add_argument("--timeout", type=int, default=1800)
+    g.add_argument("--sha", help="read the runs of the probes pushed at this commit, pushing nothing")
     c = sub.add_parser("compare")
     c.add_argument("kiln")
     c.add_argument("golden")

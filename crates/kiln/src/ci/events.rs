@@ -397,6 +397,39 @@ pub async fn dispatch_run(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, of
     dispatch(hub, repo, git_ref, which, offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
 }
 
+/// [`dispatch_run`] at commit `sha` (a release's, docs/cd-targets.md §2.2): the workflow as that
+/// commit has it, run with the default branch as its ref; with `job`, that job of it and the jobs
+/// it needs.
+pub async fn dispatch_at(hub: &Hub, repo: &Repo, sha: &str, which: &str, job: Option<&str>, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
+    let full_ref = format!("refs/heads/{}", facts(hub, repo).await.default_branch);
+    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, job), offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
+}
+
+/// A workflow kiln wrote itself (a CD provider's jobs on its runners, docs/cd-targets.md §2.2),
+/// started in `repo` at commit `sha` as CD's own, at `path`: the run's id. One that doesn't read
+/// is refused before anything runs.
+pub async fn start_written(hub: &Hub, repo: &Repo, sha: &str, path: &str, yaml: &str, actor: &str) -> Result<String, Refused> {
+    if !hub.ci.enabled() {
+        return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
+    }
+    let (p, text) = (path.to_owned(), yaml.to_owned());
+    let (workflow, diags) = crate::rt::blocking(move || kiln_ci::wf::parse_workflow(&p, &text, kiln_ci::expr::Dialect::Kiln)).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let l = load::Loaded { path: path.to_owned(), dialect: kiln_ci::expr::Dialect::Kiln, runs: true, workflow, diagnostics: load::stored(&diags) };
+    if l.has_errors() {
+        let first = l.diagnostics.iter().find(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{}: {}", d.path, d.message)).unwrap_or_else(|| "it isn't a workflow".into());
+        return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, format!("the workflow kiln wrote for {path} doesn't read: {first}")));
+    }
+    let f = facts(hub, repo).await;
+    let full_ref = format!("refs/heads/{}", f.default_branch);
+    let (message, _) = gitops::commit_info(hub, repo, sha).await;
+    let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha: sha.to_owned(), actor: actor.to_owned(), trusted: true, source: Source::Cd, message: Some(message.clone()), ..Event::default() };
+    e.payload = context::workflow_dispatch(&e, &f.repo, path, &serde_json::Value::Object(serde_json::Map::new()));
+    let (tx, rx) = async_channel::bounded(1);
+    let given = super::dispatch::Given { reply: Some(tx), ..super::dispatch::Given::default() };
+    start_given(hub, repo, &e, &l, (&message, actor), serde_json::Value::Null, given).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.ok().and_then(Result::ok).ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{path} didn't start")))
+}
+
 /// With `offered`, the inputs are what's offered, of which the workflow takes those it declares,
 /// and the run's id comes back once it's made.
 #[allow(clippy::too_many_arguments)]
@@ -413,10 +446,38 @@ async fn dispatch(
     if !hub.ci.enabled() {
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
-    let (full_ref, sha) = named_ref(hub, repo, git_ref).await?;
+    let at = named_ref(hub, repo, git_ref).await?;
+    dispatch_with(hub, repo, at, (which, None), given, actor, started_by, offered).await
+}
+
+/// [`dispatch`] at a ref and commit resolved already: workflow `which`, or one job of it and the
+/// jobs that job needs.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_with(
+    hub: &Hub,
+    repo: &Repo,
+    (full_ref, sha): (String, String),
+    (which, job): (&str, Option<&str>),
+    given: &serde_json::Map<String, serde_json::Value>,
+    actor: &str,
+    started_by: Option<serde_json::Value>,
+    offered: bool,
+) -> Result<Option<String>, Refused> {
+    if !hub.ci.enabled() {
+        return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
+    }
     let commit = load::load(hub, repo, &sha).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let Some(l) = commit.workflows.iter().find(|l| l.path == which || l.path.rsplit('/').next() == Some(which)) else {
-        return Err(refused(http::StatusCode::NOT_FOUND, format!("Workflow {which} not found at {git_ref}")));
+        return Err(refused(http::StatusCode::NOT_FOUND, format!("Workflow {which} not found at {full_ref}")));
+    };
+    let only;
+    let l = match job {
+        None => l,
+        Some(job) => {
+            let w = l.workflow.as_ref().and_then(|w| super::uploads::only_job(w, job)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job `{job}`", l.path)))?;
+            only = load::Loaded { workflow: Some(w), ..l.clone() };
+            &only
+        }
     };
     let declared = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "workflow_dispatch")).map(|t| t.inputs.clone());
     let Some(declared) = declared else {

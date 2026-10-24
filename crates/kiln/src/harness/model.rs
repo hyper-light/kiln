@@ -1525,6 +1525,10 @@ pub enum Command {
         until: Option<i64>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         said: String,
+        /// The account that reached it (`account_id`): a session signed in as another by now, as
+        /// it knows itself, takes no hold for it. None from a server that didn't say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
 }
 
@@ -1551,6 +1555,18 @@ fn who_hash(who: &str) -> Option<String> {
     use sha2::Digest as _;
     let w = who.trim().to_lowercase();
     (!w.is_empty()).then(|| hex::encode(sha2::Sha256::digest(w.as_bytes()).get(..5).unwrap_or_default()))
+}
+
+/// Whether two account ids (`account_id`) name the same account: the short hash that ends an id
+/// says who it is, and different places name the same plan differently ("max", "claude_max"); ids
+/// without a who compare whole. Another harness's id is another account.
+pub fn same_account(a: &str, b: &str) -> bool {
+    let (ha, hb) = (a.split(':').next(), b.split(':').next());
+    let who = |id: &str| id.split(':').nth(2).map(str::to_owned);
+    match (who(a), who(b)) {
+        (Some(x), Some(y)) => ha == hb && x == y,
+        _ => a == b,
+    }
 }
 
 /// Whether account id `account` (`account_id`) is `harness` signed in as `who`: Some(true) or

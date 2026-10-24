@@ -93,9 +93,10 @@ harness process). What an agent started that runs on apart from its harness (a s
 `left-<pid>`) while its turn goes on; stopping that task stops it and what runs under it. Nothing
 outlives the turn that left it: once the agent is between turns (idle, nothing waiting on a
 person), what its commands left running apart from its harness is stopped. Its harness's own
-background tasks (a shell or a monitor it runs in the background, which run under it) are its work
-and stay until they end, it stops them, or the agent ends; a server meant to keep going runs as
-one. So does a job of the machine's own: a systemd user unit (`systemd-run --user`, a service or a
+background tasks (a shell or a monitor it runs in the background, which run under it, however many
+processes they make) are its work and stay until they end, it stops them, or the agent ends; a
+server meant to keep going runs as one. Its MCP servers stay too, with what they run (a browser one
+drives). So does a job of the machine's own: a systemd user unit (`systemd-run --user`, a service or a
 scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
 agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
@@ -109,10 +110,6 @@ left its harness's tree included) and removes the group. kiln's own helpers and 
 counted.
 
 ## Mission control
-
-Its **Programs** follow multi-stack programs (the critical path first), a row per track: its
-worker and how it stands, the goal under way, goals met, change requests, pass, threshold and
-usage, with the workers, slots and weights the person sets there ([programs.md](programs.md)).
 
 - **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
   paused for you) come first, longest waiting first, then those stopped, paused, finished since
@@ -655,8 +652,9 @@ otherwise it answers a comment with a new version.
 ## Attached agents
 
 An agent attached to what it looks after wakes when something happens there (docs/ci.md W20-R08 to
-R10; docs/agentic.md K2 and R4). **Agents → Attached** lists them and their incidents, and attaches
-one; `attachments.*` and `incidents.*` do the same for agents and code mode. An attachment names:
+R10; docs/agentic.md K2 and R4). **Watched by**, on a repository's panel (its workflows' and
+environments' too) and on a runner's details (every runner's too), lists them and attaches one;
+`attachments.*` and `incidents.*` do the same for agents and code mode. An attachment names:
 
 - **What it looks after** (`on`, written as access scopes are): `repo:acme/app`,
   `workflow:acme/app:.github/workflows/ci.yml`, `environment:acme/app:production`, `pool:gpu`,
@@ -712,9 +710,12 @@ open incident shows in the runner's row in System → Updates.
 | `incidents.report` | `POST /api/incidents/:id/report` | `{class?, summary?, links?, state?}`: its agent, or a person who may attach there |
 
 A run that woke an attached agent shows the incident on its page: who looks after it, where it
-stands, what its agent found and opened, and a link to the agent. **Attach agent** on a
-repository, a workflow, a run, an environment or a runner pool opens Agents → Attached with the
-form filled in for it.
+stands, what its agent found and opened, and a link to the agent. Under **Watched by** each one
+attached is a chip saying how it stands in a word (watching, on it, waiting for you, paused); a
+chip opens its line (what wakes it, its agent, its latest incident; Pause, Remove), and **Attach**
+asks three things: its name, its agent and what wakes it. The rest is kiln's defaults (ten
+incidents, 5,000,000 tokens and 300 runner minutes a day; it may read), or what trunk's
+`.kiln/agents.yaml` says.
 
 **In the repository.** A repository can keep its attachments in trunk's `.kiln/agents.yaml`, read
 like the rest of its policy (from trunk, never from a change, within a minute of landing):
@@ -774,7 +775,7 @@ console picks) and are answered with a `reply` update to that client.
 | `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
 | `max_subagents` | `count` (null: no limit of its own) | the most subagents it runs at once (`state.max_subagents`, Settings → Subagents): its harness's own and the agents it starts through kiln, each. Claude Code's Agent tool asks kiln first (a PreToolUse hook kiln registers at `initialize`, whatever its permissions), counting those running and those let start that haven't yet, and past the limit is told to wait for one to finish; Codex takes it as its own `agents.max_concurrent_threads_per_session` when it next starts; kiln refuses `agents.start` past it |
 | `move_on_limit` | `on, to?, kind?, model?` | at a limit, go on on another machine with room (`state.move_on_limit`): `to` (`agent:<name>`) that machine alone, `kind` and `model` that harness and model there (`state.move_plan`) |
-| `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too, if its own usage says the limit is its own as well |
+| `limit_hold` | `window?, label?, until?, said?, account?` | the server's: another session on `account` reached a usage limit, so this one pauses until it resets too, if it's signed in to that account and its own usage, asked then, says the limit is its own as well |
 
 ### Questions
 
@@ -914,15 +915,17 @@ turn (`harness/pause.rs`):
   index is used, so the folder, its index and its branches don't change. Untracked files are kept,
   ignored ones aren't. `git diff <commit>` shows what changed since; `git restore --source <commit>
   -- .` brings it back.
-- **The whole account.** The server pauses every other session on the same account, on every
-  machine (`limit_hold`), so they don't each find out by failing: each one the limit is its own
-  as well. A session whose own usage shows it isn't goes on: that window starts over at another
-  time there (it uses another account; an account id can go stale when a machine signs in to
-  another account under a running harness), or the window is another model's (Weekly · Opus, to
-  a session on Sonnet). One whose usage doesn't say (not used up as last reported, or nothing
-  known of that window) asks its harness first, and pauses only if the answer shows the limit
-  reached. Paused, it keeps to its own settings: it goes on by itself at the reset or not, and
-  goes on elsewhere or not, as set for it.
+- **The whole account.** The server tells every other session on the same account, on every
+  machine (`limit_hold`, naming the account), so they don't each find out by failing; each one the
+  limit is its own as well pauses. Only the account a session is signed in to now counts: one
+  signed in as someone else by now (as it knows itself, ahead of the server) goes on, and so does
+  one whose own usage shows the limit isn't its own: that window starts over at another time
+  there (another account's), or it's another model's (Weekly · Opus, to a session on Sonnet).
+  Every other session asks its harness who it's signed in as and its usage first, and pauses only
+  if that answer shows the limit reached on the same account: what it knew of its limits may be
+  out of date, or from before a sign-in, so a session with room is never paused for another's
+  limit. A harness that doesn't answer within 30 s isn't paused. Paused, it keeps to its own
+  settings: it goes on by itself at the reset or not, and goes on elsewhere or not, as set for it.
 - **Going on.** Once the window starts over (`until`, plus 30 s and a spread of up to 90 s across
   the account's sessions), kiln asks the harness for its usage (Claude Code's `get_usage`, Codex's
   `account/rateLimits/read`). A limit no longer reached ends the pause: the turn it cut off goes on

@@ -114,7 +114,7 @@ fn built_in(name: &str, r: &Release, app: &App) -> (bool, String) {
 async fn checks_of(d: &Deploy, env: &Environment, app: &App) -> anyhow::Result<Vec<Check>> {
     let mut checks = env.gates.checks.clone();
     if let Some(name) = &app.template
-        && let Some(t) = store::template(&d.hub.store, name).await?
+        && let Some(t) = store::template(&*d.records, name).await?
     {
         checks.extend(t.checks.into_iter().filter(|c| !env.gates.checks.iter().any(|e| e.name() == c.name())));
     }
@@ -402,7 +402,7 @@ struct Ran {
 
 /// An upstream environment of this server's.
 async fn local(d: &Deploy, app: &str, upstream: &str) -> anyhow::Result<Upstream> {
-    let st = &d.hub.store;
+    let st = &*d.records;
     let reg = store::registration(st, app, upstream).await?;
     let running = match reg.as_ref().and_then(|x| x.running) {
         Some(id) => store::release(st, id).await?,
@@ -573,12 +573,12 @@ mod tests {
     async fn deploy_with(f: impl FnOnce(&mut crate::config::Config)) -> anyhow::Result<Arc<Deploy>> {
         let hub = crate::hub::tests::scratch_hub_with(f).await?;
         let root = tempfile::tempdir()?.keep();
-        Ok(Arc::new(Deploy { hosted: super::super::host::Hosted::new(&root), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub }))
+        Ok(Arc::new(Deploy { records: Arc::clone(&hub.records), stand_in: None, hosted: super::super::host::Hosted::new(&root), owner: "test".into(), wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub }))
     }
 
     fn app(name: &str) -> anyhow::Result<App> {
         let package: Package = serde_json::from_value(json!({ "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "web" }))?;
-        Ok(App { name: name.into(), project: "shop".into(), owners: vec!["payments".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), source: None, archived: false })
+        Ok(App { name: name.into(), project: "shop".into(), owners: vec!["payments".into()], package, namespace: None, properties: BTreeMap::new(), template: None, contacts: Default::default(), source: None, archived: false, registries: None })
     }
 
     fn environment(name: &str, gates: Value) -> anyhow::Result<Environment> {
@@ -779,20 +779,20 @@ mod tests {
             let (tcp, addr) = listener()?;
             let up = deploy_with(|c| c.server.public_url = format!("http://{addr}")).await?;
             let digest = format!("sha256:{}", "a".repeat(64));
-            store::put_app(&up.hub.store, &app("web")?).await?;
-            store::put_environment(&up.hub.store, &environment("staging", json!({}))?).await?;
+            store::put_app(&*up.records, &app("web")?).await?;
+            store::put_environment(&*up.records, &environment("staging", json!({}))?).await?;
             let mut ran = release(0, "staging", "1.2.0", &digest)?;
             ran.state = State::Succeeded;
             ran.ended_at = Some(crate::util::now_unix() - 600);
-            let (ran, _) = store::insert_release(&up.hub.store, &ran).await?;
-            store::put_registration(&up.hub.store, &Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: Some(ran.id), created_at: 0, degraded: None }).await?;
+            let (ran, _) = store::insert_release(&*up.records, &ran).await?;
+            store::put_registration(&*up.records, &Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: Some(ran.id), created_at: 0, degraded: None }).await?;
             serve(tcp, Arc::new(Linked { d: Arc::clone(&up) }));
             // Here: `production` runs what runs there first, for five minutes.
             let d = deploy_with(|_| {}).await?;
             let integration = |name: &str, url: String, token: &str| {
                 let hub = Arc::clone(&d.hub);
                 let (name, token) = (name.to_owned(), token.to_owned());
-                async move { crate::ci::integrations::create(&hub, "kiln", &name, json!({ "url": url }), Some(&token), None, "test").await.map_err(anyhow::Error::msg) }
+                async move { crate::ci::integrations::create(&hub, "kiln", &name, json!({ "url": url }), crate::ci::integrations::Secrets { secret: Some(&token), signing: None }, None, "test").await.map_err(anyhow::Error::msg) }
             };
             integration("eu", format!("http://{addr}"), "reader").await?;
             let gates = json!({ "after": ["staging@eu"], "soak": "5m" });
@@ -834,7 +834,7 @@ mod tests {
             anyhow::ensure!(matches!(evaluate(&d, &release(10, "production", "1.2.0", &other)?, &env, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("with other artifacts")));
             let mut coming = release(0, "staging", "1.3.0", &digest)?;
             coming.state = State::Delivering;
-            store::insert_release(&up.hub.store, &coming).await?;
+            store::insert_release(&*up.records, &coming).await?;
             let Verdict::Hold { why, .. } = evaluate(&d, &release(11, "production", "1.3.0", &digest)?, &env, &web).await? else { anyhow::bail!("waits for 1.3.0 there") };
             anyhow::ensure!(why.contains("waits for staging@eu to run 1.3.0"), "{why}");
             // An app it doesn't have there.

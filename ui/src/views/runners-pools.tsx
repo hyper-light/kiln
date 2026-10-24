@@ -6,7 +6,6 @@
  * are.
  */
 import * as React from "react";
-import { attachHref } from "@/api/attach";
 import { ci, type CiImage, type CiPool, type CiPoolSpec } from "@/api/ci";
 import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
@@ -325,9 +324,6 @@ function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; man
           </Button>
           <Button size="xs" variant="ghost" aria-expanded={removing} onClick={() => setRemoving(!removing)}>
             Remove
-          </Button>
-          <Button asChild size="xs" variant="ghost">
-            <Link to={attachHref(`pool:${pool.name}`)}>Attach agent</Link>
           </Button>
         </div>
       )}

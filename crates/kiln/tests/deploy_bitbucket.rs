@@ -33,10 +33,13 @@ struct Bitbucket {
     /// (method, path with its query, body).
     calls: Vec<(String, String, Value)>,
     made: bool,
-    /// Bitbucket's JSON for each pull request of `acme/releases`.
+    /// Bitbucket's JSON for each pull request, with `repo` (its slug in acme), numbered in its
+    /// repository.
     prs: Vec<Value>,
     /// Each build status: (repository, commit, its body), the newest of a key in its place.
     statuses: Vec<(String, String, Value)>,
+    /// Repositories made besides the release repository (apps' sources), by slug.
+    sources: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Bitbucket>>;
@@ -138,6 +141,11 @@ fn serve(stream: std::net::TcpStream, root: &Path, shared: &Shared, port: u16) -
         .and_then(|a| a.strip_prefix("Basic ").and_then(|b| B64.decode(b).ok()))
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .filter(|up| up == &format!("x-token-auth:{TOKEN}"));
+    // A repository whose pushes this Bitbucket refuses: what kiln does with one it made and couldn't fill.
+    if path.starts_with("/acme/broken-") && (path.ends_with("/git-receive-pack") || query.contains("service=git-receive-pack")) {
+        write!(w, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return Ok(());
+    }
     if !path.starts_with("/acme/app.git") && token.is_none() {
         write!(w, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Bitbucket\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
         return Ok(());
@@ -201,6 +209,23 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
     let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let error = |m: &str| json!({ "type": "error", "error": { "message": m } });
     match (method, seg.as_slice()) {
+        ("GET", ["repositories", "acme", slug]) if *slug != "releases" => {
+            if b.sources.iter().any(|s| s == slug) { (200, json!({ "full_name": format!("acme/{slug}"), "is_private": true })) } else { (404, error("Repository not found")) }
+        }
+        ("POST", ["repositories", "acme", slug]) if *slug != "releases" && body.get("is_private") == Some(&json!(true)) => {
+            let made = !b.sources.iter().any(|s| s == slug) && git(root, &["init", "-q", "--bare", &format!("acme/{slug}.git")]).is_ok();
+            if made {
+                b.sources.push((*slug).to_owned());
+                (200, json!({ "full_name": format!("acme/{slug}"), "is_private": true }))
+            } else {
+                (400, error("Repository with this Slug and Owner already exists."))
+            }
+        }
+        ("DELETE", ["repositories", "acme", slug]) if b.sources.iter().any(|s| s == slug) => {
+            let _ = std::fs::remove_dir_all(root.join(format!("acme/{slug}.git")));
+            b.sources.retain(|s| s != slug);
+            (204, Value::Null)
+        }
         ("GET", ["repositories", "acme", "releases"]) => {
             if b.made {
                 (200, json!({ "full_name": "acme/releases", "is_private": true, "mainbranch": { "name": "main" }, "links": { "html": { "href": format!("{web}/acme/releases") } } }))
@@ -220,35 +245,35 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
             b.statuses.push((repo, sha, body.clone()));
             (201, body)
         }
-        ("GET", ["repositories", "acme", "releases", "pullrequests"]) => {
+        ("GET", ["repositories", "acme", slug, "pullrequests"]) => {
             // `q`: `source.branch.name="<branch>"`.
             let want = q.iter().find(|(k, _)| k == "q").and_then(|(_, v)| v.split('"').nth(1).map(str::to_owned)).unwrap_or_default();
-            let found: Vec<Value> = b.prs.iter().filter(|p| p.pointer("/source/branch/name") == Some(&json!(want))).cloned().collect();
+            let found: Vec<Value> = b.prs.iter().filter(|p| p.get("repo") == Some(&json!(slug)) && p.pointer("/source/branch/name") == Some(&json!(want))).cloned().collect();
             (200, json!({ "values": found, "pagelen": 50, "page": 1 }))
         }
-        ("POST", ["repositories", "acme", "releases", "pullrequests"]) => {
-            let id = b.prs.len() + 1;
+        ("POST", ["repositories", "acme", slug, "pullrequests"]) => {
+            let id = b.prs.iter().filter(|p| p.get("repo") == Some(&json!(slug))).count() + 1;
             let pr = json!({
-                "id": id, "state": "OPEN", "title": body.get("title"), "description": body.get("description"),
+                "repo": slug, "id": id, "state": "OPEN", "title": body.get("title"), "description": body.get("description"),
                 "source": body.get("source"), "destination": body.get("destination"),
                 "merge_commit": null, "closed_by": null,
-                "links": { "html": { "href": format!("{web}/acme/releases/pull-requests/{id}") } },
+                "links": { "html": { "href": format!("{web}/acme/{slug}/pull-requests/{id}") } },
             });
             b.prs.push(pr.clone());
             (201, pr)
         }
-        ("GET", ["repositories", "acme", "releases", "pullrequests", n]) => match n.parse::<usize>().ok().and_then(|n| b.prs.get(n.wrapping_sub(1))) {
+        ("GET", ["repositories", "acme", slug, "pullrequests", n]) => match b.prs.iter().find(|p| p.get("repo") == Some(&json!(slug)) && p.get("id").and_then(Value::as_u64).map(|i| i.to_string()).as_deref() == Some(n)) {
             Some(p) => (200, p.clone()),
             None => (404, error("Pull request not found")),
         },
-        ("POST", ["repositories", "acme", "releases", "pullrequests", n, "comments"]) => match n.parse::<usize>().ok().and_then(|n| b.prs.get_mut(n.wrapping_sub(1))).and_then(Value::as_object_mut) {
+        ("POST", ["repositories", "acme", slug, "pullrequests", n, "comments"]) => match b.prs.iter_mut().find(|p| p.get("repo") == Some(&json!(slug)) && p.get("id").and_then(Value::as_u64).map(|i| i.to_string()).as_deref() == Some(n)).and_then(Value::as_object_mut) {
             Some(p) => {
                 p.insert("comment".into(), body.pointer("/content/raw").cloned().unwrap_or(Value::Null));
                 (201, json!({ "id": 1 }))
             }
             None => (404, error("Pull request not found")),
         },
-        ("POST", ["repositories", "acme", "releases", "pullrequests", n, "decline"]) => match n.parse::<usize>().ok().and_then(|n| b.prs.get_mut(n.wrapping_sub(1))) {
+        ("POST", ["repositories", "acme", slug, "pullrequests", n, "decline"]) => match b.prs.iter_mut().find(|p| p.get("repo") == Some(&json!(slug)) && p.get("id").and_then(Value::as_u64).map(|i| i.to_string()).as_deref() == Some(n)) {
             Some(p) if p.get("state") == Some(&json!("OPEN")) => {
                 if let Some(o) = p.as_object_mut() {
                     o.insert("state".into(), json!("DECLINED"));
@@ -258,9 +283,9 @@ fn api_answer(method: &str, full: &str, body: Value, root: &Path, shared: &Share
             Some(_) => (400, error("Only open pull requests can be declined")),
             None => (404, error("Pull request not found")),
         },
-        ("DELETE", ["repositories", "acme", "releases", "refs", "branches", branch @ ..]) => {
+        ("DELETE", ["repositories", "acme", slug, "refs", "branches", branch @ ..]) => {
             let name = branch.iter().map(|s| decode(s)).collect::<Vec<_>>().join("/");
-            let gone = git(&root.join("acme/releases.git"), &["update-ref", "-d", &format!("refs/heads/{name}")]).is_ok();
+            let gone = git(&root.join(format!("acme/{slug}.git")), &["update-ref", "-d", &format!("refs/heads/{name}")]).is_ok();
             if gone { (204, Value::Null) } else { (404, error("Branch not found")) }
         }
         _ => (404, error("Resource not found")),
@@ -522,5 +547,25 @@ fn p3_bitbucket_release_repositories_and_ci() -> anyhow::Result<()> {
         let found = v.get("releases").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("origin") == Some(&json!("git")) && r.get("commit") == Some(&json!(c))));
         Ok((!found).then(|| format!("{body}\n{}", s.log())))
     })?;
+
+    // An app's source repository made on Bitbucket with kiln's access token, from a starter there.
+    common::source_on_host(&s, "bitbucket", &bb_root, &format!("http://127.0.0.1:{port}/acme/ci.git"), (".kiln/ci.yaml", "built on kiln"), true)?;
+    // A fleet change in it: a pull request there, followed until Bitbucket merges it.
+    common::fleet_on_host(&s, "bitbucket", &bb_root, |n, merge| {
+        let mut b = shared.lock().map_err(|_| anyhow::anyhow!("the fake Bitbucket"))?;
+        let p = b.prs.iter_mut().find(|p| p.get("repo") == Some(&json!("bitbucket-web")) && p.get("id") == Some(&json!(n))).and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("no pull request {n} of acme/bitbucket-web"))?;
+        p.insert("state".into(), json!("MERGED"));
+        p.insert("merge_commit".into(), json!({ "hash": merge }));
+        p.insert("closed_by".into(), json!({ "nickname": "ada" }));
+        Ok(())
+    })?;
+    // One made whose first commit Bitbucket refuses: deleted again, and no app made.
+    let t = json!({ "name": "broken-src", "package": { "kind": "helm", "repo": "oci://ghcr.io/acme/charts", "chart": "{app}" }, "repository": { "host": "bitbucket", "name": "acme/broken-{app}", "starter": format!("http://127.0.0.1:{port}/acme/app.git") } });
+    let (st, body) = http(s.port, "POST", "/api/deploy/templates", &s.admin, Some(&t))?;
+    anyhow::ensure!((200..300).contains(&st), "{st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/deploy/apps", &s.admin, Some(&json!({ "name": "shop", "template": "broken-src" })))?;
+    assert!(st == 502 && body.contains("deleted again"), "{st} {body}");
+    assert!(!bb_root.join("acme/broken-shop.git").exists() && saw("DELETE", "/repositories/acme/broken-shop") == 1, "nothing half made stays");
+    assert_eq!(http(s.port, "GET", "/api/deploy/apps/shop", &s.admin, None)?.0, 404, "no app");
     Ok(())
 }

@@ -4,8 +4,7 @@
  * step it waits for. Running, each step shows where it stands (status.tsx): lines into a step at
  * work in the prism, settled ones quiet, the rest only sketched. Nothing moves along them.
  *
- * Wide, the rounds run across; narrow (a phone, a side pane), down, a step a row, each the width of
- * the graph: a line where a step waits for the one above it, and what else it waits for said on it
+ * Down, a step a row at every width (a round's steps one under another), each the width of the graph: a line where a step waits for the one above it, and what else it waits for said on it
  * ("after 2, 3"). The lines are drawn from where the steps are laid out, again whenever that
  * changes (a ref's observer: no effect). Given `onPick`, steps are picked by tapping them.
  */
@@ -76,6 +75,7 @@ function lines(el: HTMLElement, steps: GraphStep[]): Drawn {
 /** Where a step's mark is across its box (its padding and half the mark): a line down a column runs from it. */
 const MARK_X = 18;
 
+
 /** A step's title: code as code, a long name broken where its parts meet. */
 export function TitleText({ parts }: { parts: TitlePart[] }) {
   return parts.map((p, i) =>
@@ -92,6 +92,7 @@ export function TitleText({ parts }: { parts: TitlePart[] }) {
 export function PlanGraph({ steps, label, picked, onPick }: { steps: GraphStep[]; label: string; picked?: readonly number[]; onPick?: (n: number) => void }) {
   const shape = steps.map((s) => `${s.n}:${s.needs.join(",")}`).join(";");
   const [drawn, setDrawn] = React.useState<Drawn>({ lines: [], after: {} });
+
   // The lines follow the layout: drawn when it's there, and whenever its size changes.
   const ref = React.useCallback(
     (el: HTMLDivElement | null) => {

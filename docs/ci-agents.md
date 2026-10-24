@@ -11,9 +11,9 @@ through the same API, review and land queue as everyone else.
 
 ## Attaching
 
-**In the UI:** "Attach agent" on a repository, pipeline, run or environment. Pick a live session
-or start a new one (Claude Code, Codex, any ACP agent), then set what wakes it, what it may do,
-its limits and who reviews its changes. Attachments made in the UI live in kiln; "Save to repo"
+**In the UI:** **Watched by** on a repository's panel or a runner's details: its name, its agent
+(Claude Code, Codex, any ACP agent) and what wakes it; what it may do, its limits and who reviews
+its changes are kiln's defaults there, or what `.kiln/agents.yaml` says. Attachments made in the UI live in kiln; "Save to repo"
 turns one into a diff to `.kiln/agents.yaml`.
 
 **In git:** trunk's `.kiln/agents.yaml`, read from trunk like all policy:

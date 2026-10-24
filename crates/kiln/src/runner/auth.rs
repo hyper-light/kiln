@@ -359,7 +359,7 @@ impl Refresh {
 /// a step can run `kiln auth` (W11-R04): linked where it can be, copied where it can't,
 /// replaced when the runner is. (A container needs the libc the binary was built against.)
 pub fn place_binary(work: &Path) -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::os::this_kiln().ok()?;
     let dir = work.join("_externals").join("kiln");
     let dst = dir.join(if cfg!(windows) { "kiln.exe" } else { "kiln" });
     let current = match (std::fs::metadata(&exe), std::fs::metadata(&dst)) {

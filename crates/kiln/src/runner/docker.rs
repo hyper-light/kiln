@@ -216,7 +216,12 @@ pub fn host_user() -> Option<(u32, u32)> {
 /// global directories are theirs, so `cargo install` and `npm install -g` work as on GitHub.
 pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String> {
     let name = image.strip_prefix("kiln/runner-")?;
+    // `-android`: the full image and Android's SDK, opt-in (see below).
+    let (name, android) = name.strip_suffix("-android").map_or((name, false), |n| (n, true));
     let (name, slim) = name.strip_suffix("-slim").map_or((name, false), |n| (n, true));
+    if android && slim {
+        return None;
+    }
     // `ImageOS` as GitHub's hosted runners set it: setup-ruby, setup-beam and others pick their
     // prebuilt tools by it.
     // And the release's ICU, which PowerShell needs.
@@ -308,6 +313,30 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              'apt-get update -qq && exec apt-get install -y --no-install-recommends $p' > /usr/local/bin/snap \\\n    \
              && chmod 0755 /usr/local/bin/snap\n",
         );
+        // Podman, Buildah and Skopeo, as GitHub's images have them. A leg whose steps run them
+        // goes where their containers can run, a microVM or a host, not a container executor's
+        // container (kiln_ci::sched::routing::runs_containers).
+        d.push_str("RUN apt-get update && apt-get install -y --no-install-recommends podman buildah skopeo fuse-overlayfs uidmap slirp4netns && rm -rf /var/lib/apt/lists/*\n");
+    }
+    if android {
+        // Android's SDK where GitHub's images have it, in an image only a routing rule that names
+        // it chooses: building it accepts the Android Software Development Kit License Agreement
+        // (developer.android.com/studio/terms), which `sdkmanager --licenses` asks for, so the
+        // administrator who names it accepts it, and the image says so. The command-line tools
+        // are checked against the SHA-1 Google's repository lists (repository2-3.xml), and
+        // `sdkmanager` checks NDK 27 and the platform tools against it as it installs them.
+        d.push_str(
+            "ENV ANDROID_HOME=/usr/local/lib/android/sdk ANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n\
+             LABEL kiln.android-sdk-license=accepted\n\
+             RUN f=commandlinetools-linux-16111833_latest.zip \\\n    \
+             && curl -fsSL -o \"/tmp/$f\" \"https://dl.google.com/android/repository/$f\" && echo \"e025545c62a8e64c7559119566a569fb1dec5f60  /tmp/$f\" | sha1sum -c - \\\n    \
+             && mkdir -p \"$ANDROID_HOME/cmdline-tools\" && unzip -q \"/tmp/$f\" -d /tmp/android && mv /tmp/android/cmdline-tools \"$ANDROID_HOME/cmdline-tools/latest\" && rm -rf \"/tmp/$f\" /tmp/android \\\n    \
+             && yes | \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --licenses > /dev/null \\\n    \
+             && \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --install 'ndk;27.3.13750724' platform-tools > /dev/null\n\
+             ENV ANDROID_NDK=/usr/local/lib/android/sdk/ndk/27.3.13750724 ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724 \\\n    \
+             ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724 ANDROID_NDK_LATEST_HOME=/usr/local/lib/android/sdk/ndk/27.3.13750724 \\\n    \
+             PATH=$PATH:/usr/local/lib/android/sdk/cmdline-tools/latest/bin:/usr/local/lib/android/sdk/platform-tools\n",
+        );
     }
     if let Some((uid, gid)) = user.filter(|(uid, _)| *uid != 0) {
         // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000).
@@ -322,9 +351,59 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
             // And the directories setup actions install into without sudo, as GitHub's images
             // let them (setup-dotnet's /usr/share/dotnet; conda's base environment).
             d.push_str(&format!("RUN mkdir -p /usr/share/dotnet && chown -R {uid}:{gid} /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda\n"));
+            if android {
+                // And the SDK, so `sdkmanager --install` works without sudo.
+                d.push_str(&format!("RUN chown -R {uid}:{gid} /usr/local/lib/android\n"));
+            }
         }
     }
     Some(d)
+}
+
+/// One of kiln's runner images (`kiln/runner-*`), built with `cli` when it isn't here yet: tagged
+/// by its Dockerfile's digest (so per version and user, and a changed one is built again), and a
+/// new build removes the user's older ones. `None` for any other image.
+pub async fn runner_image(cli: &Cli, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Option<String>> {
+    let Some(dockerfile) = runner_dockerfile(image, user) else { return Ok(None) };
+    let _g = IMAGE_BUILD.lock().await;
+    let digest = crate::util::sha256_hex(dockerfile.as_bytes());
+    let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
+    if cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
+        return Ok(Some(tag));
+    }
+    let owner = user.map_or_else(|| "0".to_owned(), |(uid, _)| uid.to_string());
+    let dockerfile = format!("{dockerfile}LABEL kiln.runner-image={image} kiln.runner-user={owner}\n");
+    say(format!("Building kiln's runner image {tag} (once per machine and version)"));
+    let dir = cli.config.join(format!("image-{}", crate::util::new_id()));
+    let d = dir.clone();
+    crate::rt::blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&d)?;
+        std::fs::write(d.join("Dockerfile"), dockerfile)
+    })
+    .await??;
+    let r = cli.run(&[s("build"), s("--quiet"), s("-t"), tag.clone(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
+    let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
+    if r.is_ok() {
+        forget_older(cli, image, &owner, &tag).await;
+    }
+    r.map(|_| Some(tag))
+}
+
+/// Removes this user's earlier builds of runner image `image`, all but `keep`; one a container
+/// still uses stays until a later build.
+async fn forget_older(cli: &Cli, image: &str, owner: &str, keep: &str) {
+    let none = BTreeMap::new();
+    let filters = [s("--filter"), format!("label=kiln.runner-image={image}"), s("--filter"), format!("label=kiln.runner-user={owner}")];
+    let mut args = vec![s("image"), s("ls")];
+    args.extend(filters);
+    args.extend([s("--format"), s("{{.Repository}}:{{.Tag}}")]);
+    let Ok(out) = cli.run(&args, &none, CALL).await else { return };
+    let old: Vec<String> = out.lines().map(str::trim).filter(|t| !t.is_empty() && *t != keep && !t.ends_with(":<none>")).map(str::to_owned).collect();
+    for t in old {
+        if cli.run(&[s("image"), s("rm"), t.clone()], &none, CALL).await.is_ok() {
+            tracing::info!(image = %t, "removed an older build of a runner image");
+        }
+    }
 }
 
 /// One runner image build at a time on this machine.
@@ -467,6 +546,17 @@ impl Cli {
         self.run(&[s("pull"), s("--quiet"), image.to_owned()], &none, SLOW).await.map(|_| ())
     }
 
+    /// `image` saved and unpacked into `dir` as it streams (Docker's archive: `manifest.json`, the
+    /// config and the layers, plain tar), never whole on disk. Blocking.
+    pub fn save_into(&self, image: &str, dir: &Path) -> anyhow::Result<()> {
+        let mut child = self.command(&[s("save"), image.to_owned()], &BTreeMap::new()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
+        let out = child.stdout.take().ok_or_else(|| anyhow::anyhow!("{} save: no output", self.bin))?;
+        let unpacked = tar::Archive::new(out).unpack(dir);
+        let done = child.wait_with_output()?;
+        anyhow::ensure!(done.status.success(), "{} save {image}: {}", self.bin, String::from_utf8_lossy(&done.stderr).trim());
+        unpacked.map_err(|e| anyhow::anyhow!("{} save {image}: unpacking it: {e}", self.bin))
+    }
+
     fn command(&self, args: &[String], env: &BTreeMap<String, String>) -> Command {
         let mut c = Command::new(&self.bin);
         c.args(args).envs(env).env("DOCKER_CONFIG", &self.config);
@@ -584,9 +674,10 @@ pub fn split_options(s: &str) -> Vec<String> {
 }
 
 /// Host paths and where they are in the job container, longest first, and the server's
-/// loopback addresses as a container reaches them.
+/// loopback addresses as a container reaches them; and kiln's server's address, when it isn't on
+/// this host ([`PathMap::with_server`]).
 #[derive(Debug, Clone, Default)]
-pub struct PathMap(Vec<(PathBuf, String)>);
+pub struct PathMap(Vec<(PathBuf, String)>, Option<String>);
 
 /// The host, as containers reach it (`--add-host host.docker.internal:host-gateway`).
 pub const HOST_ALIAS: &str = "host.docker.internal";
@@ -608,15 +699,53 @@ pub fn use_host_network() {
     HOST_NETWORK.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Where `host.docker.internal` points: the host's gateway, or the host itself on its network.
-fn host_alias() -> String {
-    format!("{HOST_ALIAS}:{}", if host_network() { "127.0.0.1" } else { "host-gateway" })
+/// The names a leg's containers have for the host and for kiln's server (`--add-host`, a
+/// created container's `ExtraHosts`): `host.docker.internal` at the host's gateway (on the host's
+/// network, its loopback), and [`super::runtime::NOT_GHES_HOST`] where the server is, the host
+/// unless `server` says it's elsewhere. What a step's tool fetches from kiln through either
+/// (docker's build actions' git context, from BuildKit's own container) reaches it.
+pub fn container_hosts(host_net: bool, server: Option<&str>) -> Vec<String> {
+    let host = if host_net { "127.0.0.1" } else { "host-gateway" };
+    vec![format!("{HOST_ALIAS}:{host}"), format!("{}:{}", super::runtime::NOT_GHES_HOST, server.unwrap_or(host))]
+}
+
+/// kiln's server's address as a leg's containers reach it when it isn't on this host: `None` when
+/// it is (its URL's host a loopback address or `localhost`), or when its name doesn't resolve to
+/// an IPv4 address. Resolving blocks: call it off the runtime's threads.
+pub fn server_address(server_url: &str) -> Option<String> {
+    use std::net::ToSocketAddrs as _;
+    let rest = server_url.split_once("://").map_or(server_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let ip = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => (host, 0u16).to_socket_addrs().ok()?.map(|a| a.ip()).find(std::net::IpAddr::is_ipv4)?,
+    };
+    (ip.is_ipv4() && !ip.is_loopback()).then(|| ip.to_string())
 }
 
 impl PathMap {
     pub fn new(mut pairs: Vec<(PathBuf, String)>) -> PathMap {
         pairs.sort_by_key(|(h, _)| std::cmp::Reverse(h.as_os_str().len()));
-        PathMap(pairs)
+        PathMap(pairs, None)
+    }
+
+    /// The map with kiln's server at `address` (its [`server_address`]), when it isn't on this host.
+    pub fn with_server(mut self, address: Option<String>) -> PathMap {
+        self.1 = address;
+        self
+    }
+
+    /// kiln's server's address, when it isn't on this host.
+    pub fn server(&self) -> Option<&str> {
+        self.1.as_deref()
     }
 
     /// `s` (a path, or text holding paths) with the host's paths swapped for the container's. A
@@ -854,7 +983,10 @@ impl Containers {
                 let image = c.prepare(&spec.image, user, say).await?;
                 // A job's `container:` made for GitHub's runner user runs as this runner's.
                 let as_runner = if user.is_none() { as_runner(&c.cli, &image).await } else { None };
-                let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), host_alias()];
+                let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone()];
+                for h in container_hosts(shared, map.server()) {
+                    args.extend([s("--add-host"), h]);
+                }
                 args.extend(c.cli.owner_args());
                 if let Some(u) = &as_runner {
                     args.extend([s("--user"), u.clone()]);
@@ -957,53 +1089,14 @@ impl Containers {
         self.cli.run(&[s("info"), s("--format"), s("{{json .SecurityOptions}}")], &none, CALL).await.is_ok_and(|o| o.contains("rootless"))
     }
 
-    /// The image to run `image` as: kiln's runner images are built here, tagged by their
-    /// Dockerfile's digest (so per version and user, and a changed one is built again); others
-    /// are pulled.
+    /// The image to run `image` as: kiln's runner images are built here ([`runner_image`]);
+    /// others are pulled.
     async fn prepare(&self, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<String> {
-        if let Some(dockerfile) = runner_dockerfile(image, user) {
-            let _g = IMAGE_BUILD.lock().await;
-            let digest = crate::util::sha256_hex(dockerfile.as_bytes());
-            let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
-            if self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
-                return Ok(tag);
-            }
-            let owner = user.map_or_else(|| "0".to_owned(), |(uid, _)| uid.to_string());
-            let dockerfile = format!("{dockerfile}LABEL kiln.runner-image={image} kiln.runner-user={owner}\n");
-            say(format!("Building kiln's runner image {tag} (once per machine and version)"));
-            let dir = self.cli.config.join(format!("image-{}", crate::util::new_id()));
-            let d = dir.clone();
-            crate::rt::blocking(move || -> std::io::Result<()> {
-                std::fs::create_dir_all(&d)?;
-                std::fs::write(d.join("Dockerfile"), dockerfile)
-            })
-            .await??;
-            let r = self.cli.run(&[s("build"), s("--quiet"), s("-t"), tag.clone(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
-            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
-            if r.is_ok() {
-                self.forget_older(image, &owner, &tag).await;
-            }
-            return r.map(|_| tag);
+        if let Some(tag) = runner_image(&self.cli, image, user, say).await? {
+            return Ok(tag);
         }
         self.cli.pull(image, say).await?;
         Ok(image.to_owned())
-    }
-
-    /// Removes this user's earlier builds of runner image `image`, all but `keep`; one a
-    /// container still uses stays until a later build.
-    async fn forget_older(&self, image: &str, owner: &str, keep: &str) {
-        let none = BTreeMap::new();
-        let filters = [s("--filter"), format!("label=kiln.runner-image={image}"), s("--filter"), format!("label=kiln.runner-user={owner}")];
-        let mut args = vec![s("image"), s("ls")];
-        args.extend(filters);
-        args.extend([s("--format"), s("{{.Repository}}:{{.Tag}}")]);
-        let Ok(out) = self.cli.run(&args, &none, CALL).await else { return };
-        let old: Vec<String> = out.lines().map(str::trim).filter(|t| !t.is_empty() && *t != keep && !t.ends_with(":<none>")).map(str::to_owned).collect();
-        for t in old {
-            if self.cli.run(&[s("image"), s("rm"), t.clone()], &none, CALL).await.is_ok() {
-                tracing::info!(image = %t, "removed an older build of a runner image");
-            }
-        }
     }
 
     async fn image_path(&self, image: &str) -> Option<String> {
@@ -1125,7 +1218,18 @@ pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(
 /// `docker run` for a Docker action's step, with GitHub's mounts: its arguments (the values
 /// come by name from `env`).
 #[allow(clippy::too_many_arguments)]
-pub fn action_run_args(name: &str, labels: &[String], user: Option<&str>, network: Option<&str>, mounts: &[String], env: &BTreeMap<String, String>, entrypoint: Option<&str>, image: &str, args: &[String]) -> Vec<String> {
+pub fn action_run_args(
+    name: &str,
+    labels: &[String],
+    user: Option<&str>,
+    network: Option<&str>,
+    mounts: &[String],
+    server: Option<&str>,
+    env: &BTreeMap<String, String>,
+    entrypoint: Option<&str>,
+    image: &str,
+    args: &[String],
+) -> Vec<String> {
     let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned()];
     for l in labels {
         a.extend([s("--label"), l.clone()]);
@@ -1133,7 +1237,10 @@ pub fn action_run_args(name: &str, labels: &[String], user: Option<&str>, networ
     if let Some(u) = user {
         a.extend([s("--user"), u.to_owned()]);
     }
-    a.extend([s("--workdir"), s("/github/workspace"), s("--add-host"), host_alias()]);
+    a.extend([s("--workdir"), s("/github/workspace")]);
+    for h in container_hosts(network.is_none() && host_network(), server) {
+        a.extend([s("--add-host"), h]);
+    }
     if let Some(n) = network {
         a.extend([s("--network"), n.to_owned()]);
     } else if host_network() {
@@ -1210,6 +1317,22 @@ mod tests {
         assert_eq!(Cli::new("docker", PathBuf::from("/tmp/x")).through("kiln.example", vec![]).through_ref("alpine"), None);
     }
 
+    /// kiln's server where a leg's containers find it: where the host is when it's on the host,
+    /// its own address when it's elsewhere.
+    #[test]
+    fn a_legs_containers_find_the_server() {
+        assert_eq!(container_hosts(false, None), ["host.docker.internal:host-gateway", "kiln.localhost:host-gateway"]);
+        assert_eq!(container_hosts(true, None), ["host.docker.internal:127.0.0.1", "kiln.localhost:127.0.0.1"]);
+        assert_eq!(container_hosts(false, Some("10.0.0.5")), ["host.docker.internal:host-gateway", "kiln.localhost:10.0.0.5"]);
+        for on_host in ["http://127.0.0.1:42511", "http://localhost:7070/", "http://[::1]:7070", "https://LOCALHOST"] {
+            assert_eq!(server_address(on_host), None, "{on_host}");
+        }
+        assert_eq!(server_address("http://192.168.49.2:30070/api"), Some("192.168.49.2".to_owned()));
+        assert_eq!(server_address("https://user@10.1.2.3"), Some("10.1.2.3".to_owned()));
+        assert_eq!(server_address("http://[2001:db8::1]:8080"), None, "an IPv6 server isn't mapped");
+        assert_eq!(PathMap::new(Vec::new()).with_server(Some("10.0.0.5".to_owned())).server(), Some("10.0.0.5"));
+    }
+
     #[test]
     fn runner_images_have_a_dockerfile() {
         let d = runner_dockerfile("kiln/runner-ubuntu-24.04-slim", None).unwrap_or_default();
@@ -1253,6 +1376,7 @@ mod tests {
             "https://go.dev/dl/$f",
             "PATH=/usr/local/go/bin:",
             "break-system-packages",
+            "podman buildah skopeo",
         ] {
             assert!(full.contains(tool) && !d.contains(tool), "{tool}");
         }
@@ -1271,6 +1395,25 @@ mod tests {
         assert!(u.contains("install -d -o 1000 -g 1000 /home/runner/work"), "{u}");
         assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet /usr/share/miniconda"), "{u}");
         assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
+        // `-android` (opt-in): the full image, then Android's SDK where GitHub's images have it,
+        // its licence's acceptance on the image; never a slim one (sdkmanager needs the JDK).
+        let android = runner_dockerfile("kiln/runner-ubuntu-24.04-android", None).unwrap_or_default();
+        assert!(android.starts_with(&full), "the full image, and more");
+        for want in [
+            "ANDROID_HOME=/usr/local/lib/android/sdk ANDROID_SDK_ROOT=/usr/local/lib/android/sdk\n",
+            "LABEL kiln.android-sdk-license=accepted\n",
+            "https://dl.google.com/android/repository/$f",
+            "echo \"e025545c62a8e64c7559119566a569fb1dec5f60  /tmp/$f\" | sha1sum -c -",
+            "sdkmanager\" --licenses",
+            "--install 'ndk;27.3.13750724' platform-tools",
+            "ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.3.13750724",
+            "PATH=$PATH:/usr/local/lib/android/sdk/cmdline-tools/latest/bin:",
+        ] {
+            assert!(android.contains(want) && !full.contains(want), "{want}: {android}");
+        }
+        assert!(android.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {android}");
+        assert!(runner_dockerfile("kiln/runner-ubuntu-24.04-android", Some((1000, 1000))).is_some_and(|d| d.trim_end().ends_with("chown -R 1000:1000 /usr/local/lib/android")));
+        assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04-slim-android", None), None);
     }
 
     #[test]

@@ -765,26 +765,16 @@ a.plan-row-main:hover {
 .ptree-lines path[data-s="live"] {
   stroke-dasharray: none;
 }
+/* Down, a step a row at every width: the rounds one under another, and a round's steps too. */
 .ptree-rounds {
   position: relative;
   display: grid;
-  grid-auto-columns: minmax(0, 1fr);
-  grid-auto-flow: column;
-  align-items: center;
-  gap: 34px;
+  grid-auto-flow: row;
+  gap: 18px;
 }
 .ptree-round {
   display: grid;
-  gap: 10px;
-}
-@container (max-width: 560px) {
-  .ptree-rounds {
-    grid-auto-flow: row;
-    gap: 18px;
-  }
-  .ptree-round {
-    gap: 6px;
-  }
+  gap: 6px;
 }
 .ptree-node {
   position: relative;

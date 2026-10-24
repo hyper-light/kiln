@@ -2,10 +2,11 @@
  * An app in one environment, as its provider sees it (docs/deploy-api.md §8.1): its objects with
  * their sync and health, the manifests it renders, what a sync would change, and its workloads'
  * logs, from KilnCD or Argo CD alike; and another version previewed: what it would render, and
- * what deploying it would change. Its secrets there (§3.5): set, never shown again.
+ * what deploying it would change. Its secrets there (§3.5): set, never shown again. The versions
+ * it has run there, what a linked server is told of it (§11), and its deregistration.
  */
 import * as React from "react";
-import { Link, useParams } from "@/lib/router";
+import { Link, useNavigate, useParams } from "@/lib/router";
 
 import { appHref } from "@/api/cd";
 import { boardHref, deployApi, describe, releaseAppHref, releaseHref, type ObjectAction, type RunningObject, type SecretMeta } from "@/api/deploy";
@@ -20,11 +21,12 @@ import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { HealthPair, KindBadge, objectKey, objectLabel, SyncPair } from "@/views/deployments/parts";
 import { FileDiffView } from "@/views/harness/diff";
+import { RelTime } from "@/views/shared";
 import { DEPLOY_EVENTS } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 
-type Tab = "resources" | "manifests" | "diff" | "logs" | "secrets";
+type Tab = "resources" | "manifests" | "diff" | "logs" | "secrets" | "versions" | "linked";
 
 /** The kinds whose pods have logs. */
 const RUNS_PODS = new Set(["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "Pod"]);
@@ -402,6 +404,144 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
   );
 }
 
+/** The versions it has run here, newest first: when each first and last landed, how often, and whether it runs now. */
+function Versions({ app, env }: { app: string; env: string }) {
+  const list = useSuspenseResource(`deploy/versions/${app}/${env}`, (s) => deployApi.versions(app, env, s), { on: DEPLOY_EVENTS }).data;
+  if (!list.length) return <p className="rel-quiet">No version has landed here yet.</p>;
+  return (
+    <ol className="rel-history">
+      {list.map((v) => (
+        <li key={v.version}>
+          <code>{v.version}</code>
+          {v.runs_now && <span className="rel-tag">runs now</span>}
+          <span className="rel-who">
+            {v.releases} {v.releases === 1 ? "release" : "releases"}
+            {v.last_release !== null && (
+              <>
+                {", the last "}
+                <Link to={releaseHref(v.last_release)}>#{v.last_release}</Link>
+              </>
+            )}
+          </span>
+          {v.first_landed !== null && (
+            <span className="rel-who">
+              landed first <RelTime ts={v.first_landed} />
+              {v.last_landed !== null && v.last_landed !== v.first_landed && (
+                <>
+                  {", last "}
+                  <RelTime ts={v.last_landed} />
+                </>
+              )}
+            </span>
+          )}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** A JWT's claims, as JSON; `null` when they don't read. */
+function claimsOf(jwt: string): unknown {
+  const part = jwt.split(".")[1];
+  if (!part) return null;
+  try {
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const bytes = Uint8Array.from(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)), (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** What a linked server is told of it here (§11): what runs and what's on its way, signed for that server alone. */
+function Linked({ app, env }: { app: string; env: string }) {
+  const [audience, setAudience] = React.useState("");
+  const [jwt, setJwt] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const ask = async () => {
+    setBusy(true);
+    try {
+      setJwt(await deployApi.statement(app, env, audience.trim()));
+    } catch (err) {
+      setJwt(null);
+      toast({ title: "No statement", description: errorMessage(err), tone: "failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <p className="rel-msg">
+        A server linked to this one asks for this when an environment of its waits on {env} here (<code>after: {env}@…</code>): what runs of {app} and what's on its way, signed for that server, which
+        checks it against this server's issuer.
+      </p>
+      <form
+        className="rel-register"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void ask();
+        }}
+      >
+        <TextField label="The server asking: its issuer" placeholder="https://kiln.eu.example" value={audience} spellCheck={false} onChange={(e) => setAudience(e.target.value)} />
+        <Button size="sm" type="submit" variant="secondary" disabled={busy || !audience.trim()}>
+          Sign it for that server
+        </Button>
+      </form>
+      {jwt && (
+        <div className="cd-manifest">
+          <div className="cd-manifest-bar">
+            <span className="cd-meta">What it says</span>
+            <CopyButton text={jwt} label="Copy the statement" className="cd-copy" />
+          </div>
+          <pre className="cd-yaml">{JSON.stringify(claimsOf(jwt), null, 2)}</pre>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** It taken out of the environment: what it runs there goes with it, unless kept. */
+function Deregister({ app, env, runs }: { app: string; env: string; runs: boolean }) {
+  const navigate = useNavigate();
+  const [asking, setAsking] = React.useState(false);
+  const [keep, setKeep] = React.useState(false);
+  const go = async () => {
+    try {
+      await deployApi.deregister(app, env, keep);
+      toast({ title: `${app} is out of ${env}`, description: runs ? (keep ? "What it runs there is left in place." : "What it ran there is gone with it.") : undefined, tone: "succeeded" });
+      invalidate("deploy/");
+      navigate(releaseAppHref(app));
+    } catch (err) {
+      toast({ title: "Not deregistered", description: errorMessage(err), tone: "failed" });
+    }
+  };
+  return (
+    <>
+      <Button size="sm" variant="ghost-danger" onClick={() => setAsking(true)}>
+        Deregister
+      </Button>
+      <ConfirmDialog
+        open={asking}
+        onOpenChange={setAsking}
+        title={`Deregister ${app} from ${env}?`}
+        description={
+          <>
+            Its releases there stay in the history; it can be registered again.
+            {runs && (
+              <label className="rel-keep">
+                <input type="checkbox" className="check" checked={keep} onChange={(e) => setKeep(e.target.checked)} /> Leave what it runs in place
+              </label>
+            )}
+          </>
+        }
+        confirmLabel="Deregister it"
+        danger
+        onConfirm={go}
+      />
+    </>
+  );
+}
+
 function RegistrationView({ app, env }: { app: string; env: string }) {
   const d = useSuspenseResource(`deploy/reg/${app}/${env}`, (s) => deployApi.registration(app, env, s), { on: DEPLOY_EVENTS }).data;
   const [tab, setTab] = React.useState<Tab>("resources");
@@ -412,9 +552,14 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
     <>
       <header className="cd-head">
         <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Releases", to: boardHref }, { label: app, to: releaseAppHref(app) }, { label: env }]} />
-        <h1 className="cd-title">
-          {app} <span className="rel-title-in">in</span> {env}
-        </h1>
+        <div className="rel-head-row">
+          <h1 className="cd-title">
+            {app} <span className="rel-title-in">in</span> {env}
+          </h1>
+          <div className="rel-head-actions">
+            <Deregister app={app} env={env} runs={!!d.running} />
+          </div>
+        </div>
         <p className="cd-note">
           {argo ? (
             <>
@@ -440,6 +585,8 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
           { value: "diff", label: "Diff" },
           { value: "logs", label: "Logs" },
           { value: "secrets", label: "Secrets" },
+          { value: "versions", label: "Versions" },
+          { value: "linked", label: "Linked servers" },
         ]}
       />
       {d.running && (tab === "manifests" || tab === "diff") && (
@@ -463,12 +610,14 @@ function RegistrationView({ app, env }: { app: string; env: string }) {
         </div>
       )}
       <div className="rel-reads">
-        <Loadable label={tab === "resources" ? "its objects" : tab}>
+        <Loadable label={tab === "resources" ? "its objects" : tab === "linked" ? "what linked servers are told" : tab}>
           {tab === "resources" && <Objects app={app} env={env} />}
           {tab === "manifests" && <Manifests app={app} env={env} version={preview} />}
           {tab === "diff" && <Diffs app={app} env={env} version={preview} />}
           {tab === "logs" && <Logs app={app} env={env} />}
           {tab === "secrets" && <Secrets app={app} env={env} argo={argo} />}
+          {tab === "versions" && <Versions app={app} env={env} />}
+          {tab === "linked" && <Linked app={app} env={env} />}
         </Loadable>
       </div>
     </>

@@ -11,7 +11,7 @@
 import * as React from "react";
 import { Link, useSearchParams } from "@/lib/router";
 import { AlertTriangle, ArrowUpRight, FolderSync, HardDriveDownload, Play, Plus, RefreshCw, ScanSearch, GitBranch, Trash2 } from "lucide-react";
-import { attachHref } from "@/api/attach";
+import { WatchedBy } from "@/views/attach/here";
 import { api } from "@/api/client";
 import type { PlaceMachine, PlacesView, PlaceTask, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -548,23 +548,20 @@ function Details({
           <p className="repo-details-origin">{e.origin ?? (e.key.startsWith("here:") ? "no remote: it is on one machine alone" : e.key)}</p>
         </div>
         <div className="repo-actions">
-          <Button size="xs" variant={panel === "clone" ? "secondary" : "ghost"} onClick={() => onPanel(panel === "clone" ? "details" : "clone")}>
-            Clone to machines
+          <Button size="xs" variant="secondary" aria-pressed={panel === "clone"} title="Clone it to machines" onClick={() => onPanel(panel === "clone" ? "details" : "clone")}>
+            Clone
           </Button>
-          <Button size="xs" variant={panel === "sync" ? "secondary" : "ghost"} onClick={() => onPanel(panel === "sync" ? "details" : "sync")}>
-            Sync to machines
+          <Button size="xs" variant="secondary" aria-pressed={panel === "sync"} title="Keep it in sync on machines" onClick={() => onPanel(panel === "sync" ? "details" : "sync")}>
+            Sync
           </Button>
           {r && (
-            <Button size="xs" variant="ghost" asChild>
-              <Link to={`/runs?repo=${encodeURIComponent(r.id)}`}>Its runs</Link>
+            <Button size="xs" variant="secondary" asChild>
+              <Link to={`/runs?repo=${encodeURIComponent(r.id)}`} title="Its runs">
+                Runs
+              </Link>
             </Button>
           )}
-          {r && (
-            <Button size="xs" variant="ghost" asChild>
-              <Link to={attachHref(`repo:${r.name}`)}>Attach agent</Link>
-            </Button>
-          )}
-          <Button size="xs" variant="ghost" onClick={onClose}>
+          <Button size="xs" variant="secondary" onClick={onClose}>
             Close
           </Button>
         </div>
@@ -573,6 +570,7 @@ function Details({
       {panel === "run" && r && <RunForm repo={r} onCancel={() => onPanel("details")} onNotice={onNotice} />}
       {panel === "delete" && r && <DeleteRepo repo={r} onCancel={() => onPanel("details")} onDeleted={onDeleted} />}
       <TaskList tasks={e.tasks} machines={machines} onChange={onChange} />
+      {r && <WatchedBy on={`repo:${r.name}`} watches={(on) => on === `repo:${r.name}` || on.startsWith(`workflow:${r.name}:`) || on.startsWith(`environment:${r.name}:`)} />}
       <section className="repo-section" aria-label="On machines">
         <h4 className="field-label">On machines</h4>
         <PlaceList entry={e} machines={machines} synced={e.synced} onStarted={onStarted} />

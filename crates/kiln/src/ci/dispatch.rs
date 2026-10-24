@@ -124,6 +124,11 @@ fn machine_label(l: &str) -> bool {
     matches!(l.to_ascii_lowercase().as_str(), "self-hosted" | "linux" | "windows" | "macos" | "x64" | "arm64" | "arm") || kiln_ci::sched::routing::github_label_rules().iter().any(|r| r.matches.labels.iter().any(|x| x.eq_ignore_ascii_case(l)))
 }
 
+/// Whether any of `steps` runs containers itself (`podman`, `buildah`), as routing asks.
+fn nests_containers(steps: &[kiln_ci::wf::ir::Step]) -> bool {
+    steps.iter().any(|s| s.run.as_ref().is_some_and(|r| kiln_ci::sched::routing::runs_containers(&r.src)) || nests_containers(&s.parallel))
+}
+
 /// A leg's route. On `kiln workflow run`'s own server (`local`, W17-R06) a leg keeps only the labels
 /// that say what machine it needs: the rest name the user's runners, and it runs on this one.
 fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool, untrusted: Option<kiln_ci::sched::routing::Untrusted>) -> LegRoute {
@@ -142,6 +147,7 @@ fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool
         requires: spec.requires.clone(),
         caps,
         untrusted,
+        nests_containers: job.is_some_and(|j| nests_containers(&j.steps)),
     }
 }
 
@@ -984,7 +990,7 @@ impl Dispatch {
         let stale: Vec<String> = running.iter().filter(|id| self.hub.ci.is_leg(id) && !self.legs.get(*id).is_some_and(|l| l.agent.as_deref() == Some(agent))).cloned().collect();
         for leg in stale {
             self.hub.release_slot(agent, &leg);
-            self.hub.send_to_agent(agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await;
+            self.hub.command_start(agent, &ServerMsg::Cancel { job: leg, reason: "the leg was given up while this runner was away".into() }).await.log_when_answered(crate::hub::LOG_WITHIN);
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
         let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
@@ -1787,7 +1793,7 @@ impl Dispatch {
                 }
                 Command::Cancel { leg, reason, .. } => {
                     if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
-                        self.hub.send_to_agent(&agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason }).await;
+                        self.hub.command_start(&agent, &ServerMsg::Cancel { job: leg, reason }).await.log_when_answered(crate::hub::LOG_WITHIN);
                     }
                     Ok(())
                 }
@@ -2013,14 +2019,20 @@ impl Dispatch {
         }
         let _rx = self.hub.logs.subscribe(leg);
         tracing::info!(leg, runner, attempt, "leg assigned");
-        if !self.hub.send_to_agent(runner, LANE_CONTROL, &ServerMsg::AssignV2 { json }).await {
-            self.hub.release_slot(runner, leg);
-            if let Some(l) = self.legs.get_mut(leg) {
-                l.agent = None;
+        // A live command: refused at once while its runner is away. Once taken, the leg's own
+        // answer (JobStarted or Reject) says what came of it.
+        let pending = self.hub.command_start(runner, &ServerMsg::AssignV2 { json }).await;
+        match pending.at_once().filter(|a| **a != crate::wire::commands::Answer::Sent).cloned() {
+            Some(a) => {
+                self.hub.release_slot(runner, leg);
+                if let Some(l) = self.legs.get_mut(leg) {
+                    l.agent = None;
+                }
+                runs::requeue(&self.hub, leg, attempt, Some(format!("the assignment could not be delivered: {}", a.words()))).await?;
+                let cmds = self.sched.handle(Input::Rejected { leg: leg.to_owned() }, now_ms());
+                Box::pin(self.commands(cmds)).await;
             }
-            runs::requeue(&self.hub, leg, attempt, Some("the assignment could not be delivered".into())).await?;
-            let cmds = self.sched.handle(Input::Rejected { leg: leg.to_owned() }, now_ms());
-            Box::pin(self.commands(cmds)).await;
+            None => pending.log_when_answered(crate::hub::LOG_WITHIN),
         }
         self.hub.emit_job(leg).await;
         Ok(())

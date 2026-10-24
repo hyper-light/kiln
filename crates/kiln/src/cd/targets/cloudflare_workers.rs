@@ -6,6 +6,11 @@
 //! 100%: a version with a migration is never split. A Worker that already runs what kiln wants is
 //! left alone (an upload is a new version). The live Worker reads its bundle as what kiln
 //! uploaded while the version kiln deployed is the one serving; another version is drift.
+//!
+//! An app's secrets (docs/deploy-api.md §3.5) are `secret_text` bindings of the upload, their
+//! values read from kiln's secrets service as it uploads; they read back as kiln's references
+//! while the version kiln deployed serves (Cloudflare never answers their text), and one the app
+//! no longer has is deleted. Secrets set outside kiln are kept across uploads.
 
 use anyhow::{Context as _, Result, bail};
 use kiln_cd::obj::{self, ResKey};
@@ -13,6 +18,7 @@ use kiln_cd::providers::cloudflare_workers::{self as p, GROUP};
 use serde_json::{Map, Value, json};
 
 use super::{Cx, applied};
+use kiln_cd::apps::{SECRET_CHANGED, SECRET_REF};
 use crate::ci::integrations::aws::encode;
 use crate::ci::integrations::cloudflare::{Cf, CfError, Part};
 use crate::http::client::Method;
@@ -77,8 +83,17 @@ async fn worker(cx: &Cx<'_>, name: &str, script: &Value) -> Result<Value> {
             spec.insert(k.into(), v.clone());
         }
     }
-    // Secrets are set apart from the bundle, and kept across uploads: not kiln's to compare.
-    let mut bindings: Vec<Value> = settings.get("bindings").and_then(Value::as_array).into_iter().flatten().filter(|b| !matches!(b.get("type").and_then(Value::as_str), Some("secret_text" | "secret_key"))).cloned().collect();
+    // Secrets are set apart from the bundle, and kept across uploads: not kiln's to compare, but
+    // for the app's own, which read as kiln uploaded them while its version serves.
+    let all: Vec<Value> = settings.get("bindings").and_then(Value::as_array).cloned().unwrap_or_default();
+    let secret = |b: &Value| matches!(b.get("type").and_then(Value::as_str), Some("secret_text" | "secret_key"));
+    let mut bindings: Vec<Value> = all.iter().filter(|b| !secret(b)).cloned().collect();
+    for b in kiln_secrets(rec.as_ref().map(|r| &r.object)) {
+        let name = b.get("name").and_then(Value::as_str);
+        if all.iter().any(|l| secret(l) && l.get("name").and_then(Value::as_str) == name) {
+            bindings.push(if ours.is_some() { b.clone() } else { json!({ "type": "secret_text", "name": name, "text": SECRET_CHANGED }) });
+        }
+    }
     p::sort_bindings(&mut bindings);
     spec.insert("bindings".into(), Value::Array(bindings));
     // Migrations read as kiln applied them while the Worker is at the tag they end at.
@@ -106,6 +121,11 @@ async fn worker(cx: &Cx<'_>, name: &str, script: &Value) -> Result<Value> {
         labels.insert(kiln_cd::engine::APP_LABEL.into(), Value::String(l));
     }
     Ok(o)
+}
+
+/// The app's secrets among a Worker object's bindings: kiln's references.
+fn kiln_secrets(o: Option<&Value>) -> Vec<Value> {
+    o.and_then(|o| o.pointer("/spec/bindings")).and_then(Value::as_array).into_iter().flatten().filter(|b| b.get("text").and_then(Value::as_str).is_some_and(|t| t.starts_with(SECRET_REF))).cloned().collect()
 }
 
 async fn zone_id(cx: &Cx<'_>, zone: &str) -> Result<String> {
@@ -198,7 +218,11 @@ async fn apply_worker(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     // What the upload's metadata says, and whether the Worker already has all of it.
     let upload_fields = ["bundle", "main_module", "compatibility_date", "compatibility_flags", "bindings", "migrations", "observability", "placement", "limits", "logpush", "tail_consumers"];
     let wanted: Map<String, Value> = upload_fields.iter().filter_map(|k| spec.get(*k).map(|v| ((*k).to_owned(), v.clone()))).collect();
-    let current = live.as_ref().is_some_and(|l| l.get("spec").is_some_and(|ls| kiln_cd::providers::aws_lambda::covers(&Value::Object(wanted.clone()), ls)));
+    // A secret kiln put there that the app no longer has is an upload too (which deletes it).
+    let names = |o: Option<&Value>| kiln_secrets(o).iter().filter_map(|b| b.get("name").and_then(Value::as_str).map(str::to_owned)).collect::<Vec<_>>();
+    let now = names(Some(desired));
+    let stale = names(cx.applied(GROUP, "Worker", "", name).as_ref().map(|r| &r.object)).iter().any(|n| !now.contains(n));
+    let current = !stale && live.as_ref().is_some_and(|l| l.get("spec").is_some_and(|ls| kiln_cd::providers::aws_lambda::covers(&Value::Object(wanted.clone()), ls)));
     let tagged = live.as_ref().is_some_and(|l| obj::label(l, kiln_cd::engine::APP_LABEL) == obj::label(desired, kiln_cd::engine::APP_LABEL));
     let mut made = cx.applied(GROUP, "Worker", "", name).map(|r| r.made).unwrap_or(Value::Null);
     if !current || !tagged {
@@ -229,12 +253,25 @@ async fn apply_worker(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
             metadata.insert("migrations".into(), m);
             new_tag = Some(to);
         }
+        // The app's secrets' values, only in what goes to Cloudflare.
+        let metadata = super::resolve_secrets(cx, desired, Value::Object(metadata)).await?;
         let mut parts = vec![Part { name: "metadata".into(), filename: None, content_type: "application/json".into(), data: serde_json::to_vec(&metadata)? }];
         for m in modules {
             parts.push(Part { name: m.name.clone(), filename: Some(m.name.clone()), content_type: p::module_type(&m.name).into(), data: m.data });
         }
         cx.conn.budget().await;
         cf.upload(Method::Put, &base, &parts).await.with_context(|| format!("uploading Worker {name}"))?;
+        // The app's secrets it no longer has: kept across the upload, so deleted.
+        let now: Vec<Value> = kiln_secrets(Some(desired)).iter().filter_map(|b| b.get("name").cloned()).collect();
+        for b in kiln_secrets(cx.applied(GROUP, "Worker", "", name).as_ref().map(|r| &r.object)) {
+            let Some(gone) = b.get("name").and_then(Value::as_str).filter(|n| !now.iter().any(|x| x.as_str() == Some(n))) else { continue };
+            cx.conn.budget().await;
+            match cf.call(Method::Delete, &format!("{base}/secrets/{}", encode(gone, false)), None).await {
+                Ok(_) => {}
+                Err(e) if CfError::is_not_found(&e) => {}
+                Err(e) => return Err(e.context(format!("deleting secret {gone} of Worker {name}"))),
+            }
+        }
         cx.conn.budget().await;
         let deployments = cf.call(Method::Get, &format!("{base}/deployments"), None).await?;
         let version = deployments.pointer("/deployments/0/versions/0/version_id").and_then(Value::as_str).map(str::to_owned);
@@ -381,6 +418,7 @@ mod tests {
     /// change; a version deployed outside kiln read as drift; then deleted.
     #[test]
     fn workers_upload_route_and_migrate() -> anyhow::Result<()> {
+        let _one = fake::CLOUDFLARE.lock();
         crate::rt::block_on(async {
             let cf = Arc::new(fake::FakeCf::default());
             let base = fake::start_cf(cf.clone()).await?;
@@ -424,6 +462,28 @@ mod tests {
                 assert_eq!(st.uploads.len(), 2);
                 assert_eq!(st.uploads.last().and_then(|u| u.pointer("/metadata/migrations")), None);
             }
+
+            // The app's secrets (docs/deploy-api.md §3.5): secret_text bindings of an upload, their
+            // text Cloudflare's alone; the Worker, its record and what views show hold kiln's
+            // reference. The same again uploads nothing; one taken out of the app is deleted.
+            files.1.lock().insert("kiln-secret:app/edge/production/API_KEY@1".into(), b"s3cret".to_vec());
+            let mut objs = desired(CONFIG, &hex2)?;
+            kiln_cd::apps::platform_secrets(&mut objs, "app/edge/production", &[("API_KEY".into(), 1)]).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let w4 = objs.first().cloned().unwrap_or_default();
+            let live = apply(&cx, &w4).await?;
+            assert_eq!(cf.state.lock().scripts.get("edge").and_then(|s| s.secrets.get("API_KEY").cloned()).as_deref(), Some("s3cret"), "the text is Cloudflare's");
+            assert!(live.pointer("/spec/bindings").and_then(Value::as_array).is_some_and(|b| b.contains(&json!({ "type": "secret_text", "name": "API_KEY", "text": "kiln-secret:app/edge/production/API_KEY@1" }))), "{live}");
+            assert!(!live.to_string().contains("s3cret") && !format!("{:?}", records.0.lock()).contains("s3cret"), "no value in what kiln shows or keeps");
+            apply(&cx, &w4).await?;
+            assert_eq!(cf.state.lock().uploads.len(), 3);
+            apply(&cx, &w2).await?;
+            {
+                let st = cf.state.lock();
+                assert_eq!(st.uploads.len(), 4);
+                assert!(st.scripts.get("edge").is_some_and(|s| s.secrets.is_empty()), "the secret the app no longer has is gone");
+            }
+            let back = list(&cx, "Worker", &[(String::new(), "edge".to_owned())]).await?;
+            assert!(back.first().and_then(|o| o.pointer("/spec/bundle")).is_some_and(|b| b == &json!(format!("sha256:{hex2}"))), "kiln's version still serves after the delete: {back:?}");
 
             // Someone deploys another version: drift.
             cf.state.lock().foreign_deploy("edge");

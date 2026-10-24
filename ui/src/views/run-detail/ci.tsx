@@ -2,7 +2,6 @@
  * leaves behind (summaries, annotations, artifacts, the actions it pinned). */
 import * as React from "react";
 import { RotateCcw, Square } from "lucide-react";
-import { attachHref } from "@/api/attach";
 import { ci, reviewOf, waitSentence, type CiAnnotation, type CiMetric, type CiRunDetail, type CiTest, type RerunMode } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
@@ -65,16 +64,6 @@ export function CompareLink({ detail }: { detail: CiRunDetail }) {
   return (
     <Link to={`/runs/${encodeURIComponent(detail.run.id)}/compare`} className="text-link font-mono text-[11px]">
       Compare with last green
-    </Link>
-  );
-}
-
-/** An agent attached to the run's workflow, woken when its runs fail, slow down, … (W20-R08). */
-export function AttachAgentLink({ detail }: { detail: CiRunDetail }) {
-  const { run } = detail;
-  return (
-    <Link to={attachHref(run.workflow ? `workflow:${run.repo}:${run.workflow}` : `repo:${run.repo}`)} className="text-link font-mono text-[11px]">
-      Attach agent
     </Link>
   );
 }
