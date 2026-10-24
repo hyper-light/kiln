@@ -1,5 +1,6 @@
-//! Plan step 4 of "Nothing kiln sends between its processes is fire-and-forget" (docs/wire.md):
-//! an agent session's updates go over the channel, and survive a cut link.
+//! Plan steps 4 and 8 of "Nothing kiln sends between its processes is fire-and-forget"
+//! (docs/wire.md): an agent session's updates go over the channel, and survive a cut link and
+//! frames lost below the channel.
 //!
 //! A runner's link to the server is cut for 30 seconds at a time (`KILN_WIRE_CUT`) while its
 //! session streams. Every update still reaches the server's copy of the session once, in order,
@@ -35,6 +36,11 @@ impl Drop for Runner {
 /// A runner of the server at `port`, its link cut for `down` every `every`, the stand-in harness
 /// first on its PATH; its log at `log`.
 fn runner(dir: &std::path::Path, port: u16, name: &str, every: &str, down: &str, lines: usize) -> anyhow::Result<(Runner, std::path::PathBuf)> {
+    runner_with(dir, port, name, &format!("drop={every},down={down}"), lines)
+}
+
+/// A runner of the server at `port` with the faults `chaos` says (a `kiln agent --chaos` spec).
+fn runner_with(dir: &std::path::Path, port: u16, name: &str, chaos: &str, lines: usize) -> anyhow::Result<(Runner, std::path::PathBuf)> {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin)?;
     let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude/claude");
@@ -47,7 +53,7 @@ fn runner(dir: &std::path::Path, port: u16, name: &str, every: &str, down: &str,
     let log = std::fs::File::create(&log_path)?;
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
     let child = Command::new(env!("CARGO_BIN_EXE_kiln"))
-        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--chaos", &format!("drop={every},down={down}")])
+        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--chaos", chaos])
         .arg("--work-dir")
         .arg(dir.join("runner-work"))
         .arg("--state-dir")
@@ -287,5 +293,88 @@ fn a_terminal_reaches_its_viewer_whole_through_cut_links() -> anyhow::Result<()>
     assert_eq!(seen, want, "the viewer's lines aren't the terminal's, each once in order\nthe socket said: {said:?}\n{}", runner_log());
     let cuts = runner_log().matches("chaos: dropping the connection to the server").count();
     assert!(cuts >= 1, "the link was never cut while the terminal printed");
+    Ok(())
+}
+
+/// A series' value in the server's metrics (0 when it has none).
+fn metric(port: u16, admin: &str, series: &str) -> u64 {
+    let (_, text) = http(port, "GET", "/metrics", admin, None).unwrap_or_default();
+    text.lines().find_map(|l| l.strip_prefix(series).and_then(|v| v.trim().parse().ok())).unwrap_or(0)
+}
+
+/// Step 8: frames lost below the channel inside a live connection. About one in 7 of the runner's channel
+/// frames (`AgentMsg::Wire`, variant 46) and one in 4 of the server's (`ServerMsg::Wire`, 54) never
+/// reach the wire. The channel makes up for each: every line reaches the server's copy once, in
+/// order, the session never goes whole, and both sides count what they dropped.
+#[test]
+fn frames_lost_below_the_channel_are_made_up_for() -> anyhow::Result<()> {
+    const LINES: usize = 120;
+    let dir = tempfile::tempdir()?;
+    let s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[("KILN_CHAOS", "shed=control/54:4")])?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    let (_runner, log_path) = runner_with(dir.path(), s.port, "shed-runner", "shed=term/46:7", LINES)?;
+    let runner_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let open = json!({"target": "agent:shed-runner", "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let id = loop {
+        let (code, body) = http(s.port, "POST", "/api/harness/sessions", &s.admin, Some(&open))?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        if code == 200
+            && let Some(id) = v.pointer("/0/id").and_then(Value::as_str)
+        {
+            break id.to_owned();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "couldn't open a session: {code} {body}\n{}", runner_log());
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let lines = loop {
+        let (_, info) = http(s.port, "GET", &format!("/api/harness/sessions/{id}"), &s.admin, None)?;
+        let info: Value = serde_json::from_str(&info).unwrap_or_default();
+        if info.pointer("/last_turn/how").and_then(Value::as_str) == Some("done") {
+            let frames = snapshot(s.port, &s.admin, &id)?;
+            let events: Vec<String> = frames
+                .iter()
+                .filter(|f| f.get("t").and_then(Value::as_str) == Some("events"))
+                .flat_map(|f| f.get("events").and_then(Value::as_array).cloned().unwrap_or_default())
+                .map(|e| e.to_string())
+                .collect();
+            let lines: Vec<Vec<usize>> = (0..LINES).map(|n| events.iter().enumerate().filter(|(_, e)| e.contains(&format!("line {n:05}"))).map(|(i, _)| i).collect()).collect();
+            if lines.iter().all(|at| !at.is_empty()) {
+                break lines;
+            }
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the session's copy never held every line\nsession: {info}\nrunner:\n{}\nserver:\n{}", runner_log(), s.log());
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    let doubled: Vec<usize> = lines.iter().enumerate().filter(|(_, at)| at.len() > 1).map(|(n, _)| n).collect();
+    assert!(doubled.is_empty(), "lines in more than one event of the server's copy: {doubled:?}");
+    let order: Vec<usize> = lines.iter().filter_map(|at| at.first().copied()).collect();
+    assert!(order.windows(2).all(|w| w.first() < w.get(1)), "lines out of order in the server's copy: {order:?}");
+    let log = runner_log();
+    let whole = log.lines().filter(|l| l.contains("updates start on the channel, whole") && l.contains(&id)).count();
+    assert_eq!(whole, 0, "the session went whole {whole} times:\n{log}");
+    // Both sides counted what they dropped: the server in its metrics, the runner on its page (and
+    // the server's metrics of it), both of them by lane and reason.
+    let here = metric(s.port, &s.admin, r#"kiln_net_frames_dropped_total{lane="control",reason="chaos"}"#);
+    assert!(here > 0, "the server counted none of the frames it dropped");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
+        let me = list.iter().find(|a| a.get("name").and_then(Value::as_str) == Some("shed-runner")).cloned().unwrap_or_default();
+        let count = |field: &str, lane: &str| {
+            me.get(field).and_then(Value::as_array).into_iter().flatten().filter(|d| d.get("lane").and_then(Value::as_str) == Some(lane) && d.get("reason").and_then(Value::as_str) == Some("chaos")).filter_map(|d| d.get("frames").and_then(Value::as_u64)).sum::<u64>()
+        };
+        let (theirs, toward) = (count("dropped", "term"), count("dropped_toward", "control"));
+        let gauge = metric(s.port, &s.admin, r#"kiln_runner_net_frames_dropped{runner="shed-runner",lane="term",reason="chaos"}"#);
+        if theirs > 0 && toward > 0 && gauge > 0 {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the runner's page never said what was dropped: {me}");
+        std::thread::sleep(Duration::from_secs(1));
+    }
     Ok(())
 }

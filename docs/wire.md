@@ -56,6 +56,34 @@ its processes is fire-and-forget"):
 
 Messages to agents ride the same channel, and their answers are T3's inbox answers.
 
+## Loss below the channel
+
+kiln's QUIC layer (`crate::net`) holds frames a lane can't take yet in a queue of 8,192 frames per
+peer and lane. It counts every frame it lets go before the wire, by lane and reason, in
+`kiln_net_frames_dropped_total{lane,reason}`:
+
+| Reason | When |
+|---|---|
+| `shed` | A lane that may lose frames (every lane but control and sync: the channel's own items among them, which it sends again) had its queue full: its oldest frame went. |
+| `stuck` | The control or sync lane had its queue full. Its peer is stuck, so the connection is closed rather than a control frame lost, and what it held goes with it. |
+| `refused` | The transport wouldn't take the frame. |
+| `closed` | Its connection closed, or its peer wasn't connected, with the frame queued. |
+| `ended` | The net loop started over (a rebuild), or stopped, with the frame queued. |
+| `chaos` | A test build's fault (`shed=`, `crate::runner::chaos`). |
+
+The channel makes up for what of these it carried, without waiting for a reconnect:
+- A receiver that sees an item past a gap drops it and asks for the stream again from the gap
+  (`Want`).
+- An item whose answer doesn't come within the stream's patience (15 s for session updates and
+  terminal output) is sent again, and the receiver takes it once.
+- A closed connection resumes as every reconnect does (`Have`).
+
+What a runner's QUIC layer drops it tells the server with its samples (`NetDrops`), once that
+changes. The runner's page shows both sides' counts, and the server exports what each runner last
+said as `kiln_runner_net_frames_dropped{runner,lane,reason}`. A frame QUIC took and lost with its
+connection isn't counted here: the channel resends it after the reconnect, as it does what the
+queue let go.
+
 ## Runner to server: `AgentMsg`
 
 | Message | Class | Why | Today |
@@ -108,6 +136,7 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
 | `Caps` | handshake | What the runner can do, in 64 bits (`Build`'s 32 ran out): `CAP_WIRE` says it keeps the channel. | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel: numbered items carrying other messages, their ACKs and NACKs, wants, and what each side has after a reconnect. | New: `crate::wire::channel`. |
 | `Cluster` | carried (the cluster group) | The runner's learner of the cluster group (docs/p2p.md, P2): hyper-raft's messages, which it acknowledges and resends, and asks for where the server's records are before a read. | As its class says: a read whose ask goes unanswered in 2 s goes to the server. |
+| `NetDrops` | telemetry | What the runner's QUIC layer let go before it reached the wire, by lane and reason, counted from its start: each supersedes the last ("Loss below the channel"). | Sent with its samples once it changed, to a server announcing `CAP_NET_DROPS`. |
 
 ## Server to runner: `ServerMsg`
 
