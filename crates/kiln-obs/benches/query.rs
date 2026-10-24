@@ -125,8 +125,9 @@ fn long_ranges(series: &[corpus::Series]) {
     let mut cursors = vec![0usize; keep.len()];
     let started = Instant::now();
     let mut merging = std::time::Duration::ZERO;
-    // The most heap a merge held over what was live before it.
+    // The most heap a merge held over what was live before it; what the merges did.
     let mut merge_peak = 0i64;
+    let mut maintained = kiln_obs::store::Maintained::default();
     for d in 0..days {
         cursors.iter_mut().for_each(|c| *c = 0);
         for part in 0..4 {
@@ -147,14 +148,14 @@ fn long_ranges(series: &[corpus::Series]) {
             store.cut(Point { index: cuts, term: 1 }).unwrap();
             let m = Instant::now();
             alloc::begin();
-            store.compact().unwrap();
+            maintained += store.compact().unwrap();
             merge_peak = merge_peak.max(alloc::end().peak);
             merging += m.elapsed();
         }
     }
     let (bytes, rolled) = store.block_bytes();
     println!(
-        "long ranges: {} series, {samples} samples over {days} days, {cuts} cuts; {} blocks, {:.1} MB ({:.2} bytes a sample), rollups {:.1}% of them; written in {:.1} s, merges {:.1} s, a merge's heap {:.1} MB at the most",
+        "long ranges: {} series, {samples} samples over {days} days, {cuts} cuts; {} blocks, {:.1} MB ({:.2} bytes a sample), rollups {:.1}% of them; written in {:.1} s, merges {:.1} s, a merge's heap {:.1} MB at the most; a series' rollups joined {} times, made {}",
         keep.len(),
         store.block_count(),
         bytes as f64 / 1e6,
@@ -162,7 +163,9 @@ fn long_ranges(series: &[corpus::Series]) {
         100.0 * rolled as f64 / bytes as f64,
         started.elapsed().as_secs_f64(),
         merging.as_secs_f64(),
-        merge_peak as f64 / 1e6
+        merge_peak as f64 / 1e6,
+        maintained.rollups_joined,
+        maintained.rollups_made
     );
     let end = t0 + days * day;
     // `KOBS_PROFILE=<query>`: that query alone, over the month at 240 points, rollups read, again

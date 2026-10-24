@@ -3597,6 +3597,7 @@ mod tests {
         let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
         let mut stores: Vec<Store> = dirs.iter().map(|d| Store::open(d.path(), Keyed::with_keys(1, 2)).unwrap()).collect();
         stores.push(Store::new(Keyed::with_keys(1, 2)));
+        let mut maintained = crate::store::Maintained::default();
         for (i, batch) in batches.iter().enumerate() {
             for (si, st) in stores.iter_mut().enumerate() {
                 st.apply(batch).unwrap();
@@ -3607,10 +3608,26 @@ mod tests {
                     && i + 1 < batches.len()
                 {
                     st.cut(crate::manifest::Point { index: i as u64 + 1, term: 1 }).unwrap();
-                    st.compact().unwrap();
+                    maintained += st.compact().unwrap();
                 }
             }
         }
+        // Merges both joined their inputs' rollups and made them anew (a cut's block has none).
+        assert!(maintained.rollups_joined > 0 && maintained.rollups_made > 0, "{maintained:?}");
+        // Every block the replicas cut and merged (rollups joined from their inputs' where a merge
+        // appended them) is what its samples make of every window, to the bit: a block's check, as
+        // one fetched from another replica is checked.
+        let mut blocks = 0usize;
+        for d in &dirs {
+            for e in std::fs::read_dir(d.path()).unwrap() {
+                let path = e.unwrap().path();
+                if path.extension().is_some_and(|x| x == "block") {
+                    crate::block::Block::open(&path).unwrap().verify().unwrap();
+                    blocks += 1;
+                }
+            }
+        }
+        assert!(blocks > 0);
         // Rollups are there to be read: some blocks hold each tier of the gauges, and some tier
         // of every kind.
         for (metric, kind) in [("noise", Kind::Gauge), ("frac", Kind::Count), ("req", Kind::Counter), ("lat.dist", Kind::Count)] {

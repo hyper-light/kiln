@@ -243,6 +243,130 @@ impl Builder {
     }
 }
 
+/// A series' rollups joined at a merge from its inputs' (`docs/observe.md` §4.7), each input's span
+/// after the one before, rather than made anew from every sample: each input's tiers' windows read
+/// and appended; a window a cut fell inside (the last input's last and this one's first the same
+/// window) carried on with this input's samples in it, its fold continued in time order, so every
+/// window is what its samples make of it, to the bit, as [`Builder`] makes it. Joined only where
+/// every input keeps the same tiers ([`Joiner::add`] says when not: the merge builds them anew).
+/// Its room is kept from series to series.
+#[derive(Debug, Default)]
+pub struct Joiner {
+    widths: Vec<i64>,
+    tiers: [Vec<(i64, Option<Agg>)>; TIERS.len()],
+    inputs: usize,
+    rolled: Rolled,
+    tier: Vec<u8>,
+    col: BitWriter,
+    list: Vec<u8>,
+    body: Vec<u8>,
+}
+
+impl Joiner {
+    /// A series begun: what the last one left, forgotten.
+    pub fn begin(&mut self) {
+        self.widths.clear();
+        for t in &mut self.tiers {
+            t.clear();
+        }
+        self.inputs = 0;
+    }
+
+    /// The series' next input's rollups (`rollups`, of `kind`, as its block keeps them), and its
+    /// samples in time order (`next`), read only as far as a window a cut fell inside needs: false
+    /// where the input keeps none, or other tiers than the inputs before it.
+    pub fn add(&mut self, kind: Kind, rollups: &[u8], next: &mut dyn FnMut() -> Option<(i64, f64)>) -> Result<bool, Damaged> {
+        let Some((&count, mut at)) = rollups.split_first() else { return Ok(false) };
+        let n = usize::from(count);
+        if n == 0 {
+            return Ok(false);
+        }
+        if n > TIERS.len() {
+            return Err(Damaged);
+        }
+        let mut found: [(i64, &[u8]); TIERS.len()] = [(0, &[]); TIERS.len()];
+        for slot in found.iter_mut().take(n) {
+            let len = varint::get(&mut at).and_then(|n| usize::try_from(n).ok()).ok_or(Damaged)?;
+            let (mut body, rest) = at.split_at_checked(len).ok_or(Damaged)?;
+            at = rest;
+            let width = varint::get(&mut body).and_then(|w| i64::try_from(w).ok()).ok_or(Damaged)?;
+            *slot = (width, body);
+        }
+        if !at.is_empty() {
+            return Err(Damaged);
+        }
+        let found = found.get(..n).unwrap_or_default();
+        if self.inputs == 0 {
+            self.widths.extend(found.iter().map(|&(w, _)| w));
+        } else if !self.widths.iter().copied().eq(found.iter().map(|&(w, _)| w)) {
+            return Ok(false);
+        }
+        // Each tier's windows appended; where this input's first is the window the last ended
+        // inside, that window's place, to carry on with this input's samples in it.
+        let mut carried: [Option<usize>; TIERS.len()] = [None; TIERS.len()];
+        let mut until = i64::MIN;
+        for ((&(width, body), out), carry) in found.iter().zip(self.tiers.iter_mut()).zip(carried.iter_mut()) {
+            let tier = Tier::parse(width, body, kind)?;
+            self.rolled.clear();
+            tier.read(i64::MIN, i64::MAX, columns(kind), &mut self.rolled)?;
+            for i in 0..self.rolled.len() {
+                let k = self.rolled.start.get(i).copied().ok_or(Damaged)?.div_euclid(width);
+                if i == 0 && out.last().is_some_and(|l| l.0 == k) {
+                    *carry = Some(out.len() - 1);
+                    until = until.max(k.saturating_add(1).saturating_mul(width));
+                    continue;
+                }
+                out.push((k, self.rolled.agg(i)));
+            }
+        }
+        // The carried windows' folds continued with this input's samples in them.
+        if until > i64::MIN {
+            while let Some((t, v)) = next() {
+                if t >= until {
+                    break;
+                }
+                for ((&(width, _), out), carry) in found.iter().zip(self.tiers.iter_mut()).zip(&carried) {
+                    let Some((k, agg)) = carry.and_then(|c| out.get_mut(c)) else { continue };
+                    if t.div_euclid(width) != *k {
+                        continue;
+                    }
+                    if let Some(a) = agg {
+                        if v.is_finite() {
+                            a.push(v);
+                        } else {
+                            *agg = None;
+                        }
+                    }
+                }
+            }
+        }
+        self.inputs += 1;
+        Ok(true)
+    }
+
+    /// The joined rollups into `out`, cleared: each tier the inputs keep, where it takes at most
+    /// `raw_bytes / KEEP_RATIO` (the bytes its samples take); nothing when none does.
+    pub fn finish(&mut self, kind: Kind, raw_bytes: usize, out: &mut Vec<u8>) {
+        out.clear();
+        out.push(0);
+        let mut kept = 0u8;
+        let Self { widths, tiers, tier, col, list, body, .. } = self;
+        for (&width, done) in widths.iter().zip(tiers.iter()) {
+            encode_tier(kind, width, done, col, list, body, tier);
+            if done.is_empty() || tier.len().saturating_mul(KEEP_RATIO) > raw_bytes {
+                continue;
+            }
+            out.extend_from_slice(tier);
+            kept += 1;
+        }
+        if kept == 0 {
+            out.clear();
+        } else if let Some(n) = out.first_mut() {
+            *n = kept;
+        }
+    }
+}
+
 /// `kind`'s rollups of samples `ts` and `vs` (in time order, each time once) into `out`, cleared
 /// ([`Builder::finish`]).
 pub fn build(kind: Kind, ts: &[i64], vs: &[f64], raw_bytes: usize, b: &mut Builder, out: &mut Vec<u8>) {
@@ -634,6 +758,79 @@ mod tests {
         build(Kind::Gauge, &[0, 86_400_000], &[1.0, 2.0], 20, &mut b, &mut out);
         assert!(out.is_empty());
         assert!(tier(&out, 300_000, Kind::Gauge).unwrap().is_none());
+    }
+
+    /// Rollups joined from a series' inputs are, byte for byte, what its samples make of them
+    /// whole: each kind, cut into parts at random times (inside windows, on their edges, parts
+    /// lying inside one window), samples that are not finite among them, counters that reset; each
+    /// part's samples read only as far as a window a cut fell inside. Inputs of other tiers, or
+    /// none, are not joined.
+    #[test]
+    fn rollups_joined_from_a_series_parts_are_its_samples_rollups() {
+        let mut rng = Rng::new(17);
+        let (mut b, mut j) = (Builder::default(), Joiner::default());
+        let (mut whole, mut joined, mut part) = (Vec::new(), Vec::new(), Vec::new());
+        for round in 0..200 {
+            let kind = [Kind::Gauge, Kind::Count, Kind::Counter][round % 3];
+            let every = [1_000, 10_000, 30_000, 299_999][rng.below(4) as usize];
+            let (start, n) = (1_700_006_400_000 + rng.below(3_600_000) as i64, 50 + rng.below(3_000) as usize);
+            let (ts, mut vs) = series(&mut rng, kind, start, every, n);
+            for v in &mut vs {
+                if rng.below(400) == 0 {
+                    *v = if rng.below(2) == 0 { f64::NAN } else { f64::INFINITY };
+                }
+            }
+            // Cuts: random places, some a part of one sample or of a window's few.
+            let mut cuts: Vec<usize> = (0..1 + rng.below(5)).map(|_| 1 + rng.below(ts.len() as u64 - 1) as usize).collect();
+            if rng.below(3) == 0 {
+                let c = 1 + rng.below(ts.len() as u64 - 2) as usize;
+                cuts.extend([c, c + 1]);
+            }
+            cuts.sort_unstable();
+            cuts.dedup();
+            build(kind, &ts, &vs, usize::MAX, &mut b, &mut whole);
+            j.begin();
+            let mut from = 0;
+            for &to in cuts.iter().chain([&ts.len()]) {
+                build(kind, &ts[from..to], &vs[from..to], usize::MAX, &mut b, &mut part);
+                let mut i = from;
+                let mut next = || {
+                    let s = (i < to).then(|| (ts[i], vs[i]));
+                    i += 1;
+                    s
+                };
+                assert!(j.add(kind, &part, &mut next).unwrap(), "round {round}");
+                // Read only through the windows a cut fell inside (the last one's end), and the
+                // sample that ends the reading.
+                let until = TIERS.iter().filter(|&&w| from > 0 && ts[from - 1].div_euclid(w) == ts[from].div_euclid(w)).map(|&w| (ts[from].div_euclid(w) + 1) * w).max();
+                let calls = i - from;
+                match until {
+                    None => assert_eq!(calls, 0, "round {round}: nothing read where no window was cut"),
+                    Some(u) => assert!(calls <= ts[from..to].iter().filter(|&&t| t < u).count() + 1, "round {round}: {calls} read"),
+                }
+                from = to;
+            }
+            j.finish(kind, usize::MAX, &mut joined);
+            assert_eq!(joined, whole, "round {round}: {kind:?} every {every} ms, cut at {cuts:?}");
+        }
+        // Other tiers than the inputs' before, or none: not joined.
+        let (ts, vs) = series(&mut rng, Kind::Gauge, 1_700_006_400_000, 10_000, 2_000);
+        let mut fine = Vec::new();
+        build(Kind::Gauge, &ts[..1_000], &vs[..1_000], usize::MAX, &mut b, &mut fine);
+        let mut coarse = Vec::new();
+        b.begin();
+        for (&t, &v) in ts[1_000..].iter().zip(&vs[1_000..]) {
+            b.push(t, v);
+        }
+        // Its five minutes' tier left out: a quarter of its samples' bytes is too few for it.
+        let five = sizes(Kind::Gauge, &ts[1_000..], &vs[1_000..], &mut Builder::default())[0].1;
+        b.finish(Kind::Gauge, five * KEEP_RATIO - 1, &mut coarse);
+        let mut none = || None;
+        j.begin();
+        assert!(j.add(Kind::Gauge, &fine, &mut none).unwrap());
+        assert!(!j.add(Kind::Gauge, &coarse, &mut none).unwrap(), "other tiers");
+        j.begin();
+        assert!(!j.add(Kind::Gauge, &[], &mut none).unwrap(), "none");
     }
 
     #[test]

@@ -408,6 +408,9 @@ pub struct Maintained {
     pub blocks_removed: u64,
     pub bytes_written: u64,
     pub series_dropped: u64,
+    /// Series whose rollups a merge joined from its inputs', and made anew from their samples.
+    pub rollups_joined: u64,
+    pub rollups_made: u64,
 }
 
 impl std::ops::AddAssign for Maintained {
@@ -416,6 +419,8 @@ impl std::ops::AddAssign for Maintained {
         self.blocks_removed += o.blocks_removed;
         self.bytes_written += o.bytes_written;
         self.series_dropped += o.series_dropped;
+        self.rollups_joined += o.rollups_joined;
+        self.rollups_made += o.rollups_made;
     }
 }
 
@@ -441,6 +446,8 @@ pub struct Rewrite {
 pub struct Built {
     rewrite: Rewrite,
     block: Block,
+    /// Series whose rollups were joined, and made anew.
+    rollups: (u64, u64),
 }
 
 impl Rewrite {
@@ -452,7 +459,7 @@ impl Rewrite {
     pub fn build(self) -> Result<Built, StoreError> {
         let out = self.dir.join(&self.file);
         match self.build_inner() {
-            Ok(block) => Ok(Built { rewrite: self, block }),
+            Ok((block, rollups)) => Ok(Built { rewrite: self, block, rollups }),
             Err(e) => {
                 let _ = std::fs::remove_file(&out);
                 Err(e)
@@ -460,7 +467,7 @@ impl Rewrite {
         }
     }
 
-    fn build_inner(&self) -> Result<Block, StoreError> {
+    fn build_inner(&self) -> Result<(Block, (u64, u64)), StoreError> {
         let blocks: Vec<Block> = self.from.iter().map(|(_, f)| Block::open(&self.dir.join(f))).collect::<Result<_, _>>()?;
         // Every series of every input, by fingerprint; of one, the newest input's kind and key.
         let mut keys: Vec<(u64, Kind, Vec<u8>)> = Vec::new();
@@ -476,12 +483,15 @@ impl Rewrite {
         keys.dedup_by_key(|k| k.0);
         // Written as it is read, a series at a time: what a merge holds is a series, not a block.
         // Each series' rollups (`crate::rollup`) are its input's when it is copied whole and its
-        // input has them; else made here, from its samples.
+        // input has them; its inputs' joined when their chunks are appended and every input keeps
+        // the same tiers; else made here, from its samples.
         let mut w = block::Writer::create(&self.dir.join(&self.file))?;
         let mut buf = Vec::new();
         let mut regions: Vec<Vec<u8>> = blocks.iter().map(|_| Vec::new()).collect();
         let (mut ts, mut vs) = (Vec::new(), Vec::new());
         let (mut builder, mut rollups, mut held) = (rollup::Builder::default(), Vec::new(), Vec::new());
+        let mut joiner = rollup::Joiner::default();
+        let (mut joined, mut made) = (0u64, 0u64);
         let mut holders: Vec<(&Block, usize, (i64, i64))> = Vec::with_capacity(blocks.len());
         for (fp, kind, key) in &keys {
             holders.clear();
@@ -510,6 +520,7 @@ impl Rewrite {
                     bytes += chunk.len();
                 }
                 builder.finish(*kind, bytes, &mut rollups);
+                made += 1;
                 w.region(*fp, *kind, key, &buf, crc, *span, &rollups)?;
                 continue;
             }
@@ -528,15 +539,20 @@ impl Rewrite {
                 }
                 let samples: u64 = chunks.iter().map(|c| u64::from(c.2)).sum();
                 if !chunks.is_empty() && samples / chunks.len() as u64 >= u64::from(CHUNK_SAMPLES / 2) {
-                    builder.begin();
-                    for ((blk, i, _), region) in holders.iter().zip(&regions) {
-                        for c in blk.chunks_in(*i, region, i64::MIN, i64::MAX)? {
-                            let (_, _, count, chunk) = c?;
-                            stream(&mut builder, chunk, count, blk.path())?;
-                        }
-                    }
                     let bytes = chunks.iter().map(|c| c.3.len()).sum();
-                    builder.finish(*kind, bytes, &mut rollups);
+                    if join_rollups(&holders, &regions, *kind, bytes, &mut joiner, &mut held, &mut rollups)? {
+                        joined += 1;
+                    } else {
+                        made += 1;
+                        builder.begin();
+                        for ((blk, i, _), region) in holders.iter().zip(&regions) {
+                            for c in blk.chunks_in(*i, region, i64::MIN, i64::MAX)? {
+                                let (_, _, count, chunk) = c?;
+                                stream(&mut builder, chunk, count, blk.path())?;
+                            }
+                        }
+                        builder.finish(*kind, bytes, &mut rollups);
+                    }
                     w.series(*fp, *kind, key, &chunks, &rollups)?;
                     continue;
                 }
@@ -557,15 +573,66 @@ impl Rewrite {
             let chunks = rechunk(&ts, &vs);
             let refs: Vec<(i64, i64, u32, &[u8])> = chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect();
             rollup::build(*kind, &ts, &vs, chunks.iter().map(|c| c.bytes.len()).sum(), &mut builder, &mut rollups);
+            made += 1;
             w.series(*fp, *kind, key, &refs, &rollups)?;
         }
-        Ok(w.finish()?)
+        Ok((w.finish()?, (joined, made)))
     }
 
     /// Bytes its inputs hold.
     pub fn input_bytes(&self) -> u64 {
         self.from.iter().filter_map(|(_, f)| std::fs::metadata(self.dir.join(f)).ok()).map(|m| m.len()).sum()
     }
+}
+
+/// A series' rollups, its chunks appended from `holders` (each after the one before; their regions
+/// `regions`), joined from theirs (`rollup::Joiner`) into `out`: true where each keeps rollups of
+/// `kind`, the same tiers; false where the merge makes them anew (`out` then not theirs). Each
+/// input's samples are decoded only as far as a window a cut fell inside needs.
+fn join_rollups(holders: &[(&Block, usize, (i64, i64))], regions: &[Vec<u8>], kind: Kind, bytes: usize, j: &mut rollup::Joiner, held: &mut Vec<u8>, out: &mut Vec<u8>) -> Result<bool, StoreError> {
+    j.begin();
+    for ((blk, i, _), region) in holders.iter().zip(regions) {
+        if blk.kind(*i) != Some(kind) {
+            return Ok(false);
+        }
+        let had = blk.rollups(*i, held)?;
+        if had.is_empty() {
+            return Ok(false);
+        }
+        let mut chunks = blk.chunks_in(*i, region, i64::MIN, i64::MAX)?;
+        let mut samples: Option<crate::gorilla::Decoder<'_>> = None;
+        let mut failed: Option<StoreError> = None;
+        let mut next = || -> Option<(i64, f64)> {
+            loop {
+                if let Some(d) = samples.as_mut() {
+                    match d.next_sample() {
+                        Ok(Some(s)) => return Some(s),
+                        Ok(None) => samples = None,
+                        Err(e) => {
+                            failed = Some(BlockError::Decode(blk.path().to_owned(), e).into());
+                            return None;
+                        }
+                    }
+                }
+                match chunks.next()? {
+                    Ok((_, _, count, chunk)) => samples = Some(ChunkRef::new(chunk, count).iter()),
+                    Err(e) => {
+                        failed = Some(e.into());
+                        return None;
+                    }
+                }
+            }
+        };
+        let joined = j.add(kind, had, &mut next).map_err(|_| BlockError::Damaged(blk.path().to_owned(), "a series' rollups"))?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        if !joined {
+            return Ok(false);
+        }
+    }
+    j.finish(kind, bytes, out);
+    Ok(true)
 }
 
 /// A chunk's samples into a rollups' builder, as they decode: nothing of them held.
@@ -1340,7 +1407,7 @@ impl Store {
     /// A rewrite taken in, `saved` (its manifest) durable already: the files to delete after (its
     /// inputs', and its own if it holds nothing).
     fn take_commit(&mut self, built: Built, saved: Manifest) -> Result<(Maintained, Vec<PathBuf>), StoreError> {
-        let Built { rewrite: r, block } = built;
+        let Built { rewrite: r, block, rollups } = built;
         let held = r.epoch == self.epoch && r.from.iter().all(|(seq, f)| self.blocks.iter().any(|b| b.seq == *seq && b.file == *f));
         if !held {
             return Err(StoreError::Moved);
@@ -1360,7 +1427,15 @@ impl Store {
             let at = self.blocks.partition_point(|x| x.seq < r.seq);
             self.blocks.insert(at, OpenBlock { seq: r.seq, file: r.file.clone(), block });
         }
-        Ok((Maintained { blocks_written: u64::from(!empty), blocks_removed: r.from.len() as u64, bytes_written: if empty { 0 } else { bytes }, series_dropped: 0 }, gone))
+        let maintained = Maintained {
+            blocks_written: u64::from(!empty),
+            blocks_removed: r.from.len() as u64,
+            bytes_written: if empty { 0 } else { bytes },
+            rollups_joined: rollups.0,
+            rollups_made: rollups.1,
+            ..Maintained::default()
+        };
+        Ok((maintained, gone))
     }
 
     /// Deletes the files wholly older than the durable cutoff (quick: no file is rewritten). The

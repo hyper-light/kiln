@@ -46,7 +46,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-32 | OpenTelemetry's containers (§10.11): Docker's, the kubelet's and the cluster's receivers' container metrics and the semantic conventions', read in their own names and units (cumulative time a rate, a working set for what Docker calls usage, limits in cores and bytes, devices and modes summed), a container kiln's check also sees one container, the kubelet's series joined by pod and name; each chart of its page drawn by the source that reported it; checked live against a real Collector and in browsers (§13), measured against O-30 (§12.34) | done |
 | O-33 | Continuous profiles (§8.11), Datadog's Continuous Profiler: what tracers' profilers upload (pprof in `multipart/form-data`, gzip'd, zstd'd or in LZ4's frames) taken where they send it (a runner's tracer port, sent on over the observe lane; the server's intake), kept by the server (segments of blobs and headers, an index of 40 bytes an upload), searched by tags, summed into flame graphs over a time (a snapshot's type averaged), compared path by path; its page (canvas flame graph, functions by self or by change, uploads); checked against Go's own profiles and live against dd-trace-go and ddtrace through a runner and Datadog's Agent; measured (§12.36) | done |
 | O-34 | Java's profiles (§8.11): JFR recordings (dd-trace-java's `main.jfr`: the JDK's chunks and ddprof's, zstd'd, gzip'd, LZ4'd or not) read where they are taken into pprof profiles in Go's names: CPU (ddprof's or the JDK's), wall time, allocations, the live heap, lock waits, exceptions, file and socket I/O; a runner sends the profiles on, not the recording; frames named as Datadog's pages name them; checked against a reader written apart on dd-trace-java's own recordings (to the nanosecond), live against dd-trace-java 1.67.1 through a runner and in a browser; measured and profiled, rewritten (§12.37) | done |
-| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Next: merges that join their inputs' rollups rather than make them anew | continuous |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Two hours' soak passing (§13): every point and record stored once, the replicas agreeing, memory level. A dashboard's widest query (§12.19): its time its own reading, not a wait; a run of repeated samples decoded a word at a time, series read on helper threads in rounds, added in their fingerprints' order (the same bits): 1,527 ms to 74 ms. The store's files written beside queries (§4.5). Merges join their inputs' rollups rather than make them anew: 38% less merging time (§4.7, §12.16) | continuous |
 
 ## 1. Rules
 
@@ -223,7 +223,7 @@ O(log n) blocks and a sample is rewritten O(log n) times. (Merging only the newe
 busy group cuts a big block and then a small one, a compaction's and a snapshot's, and a small cut
 always sat at the newest end.) A merge is written as it is read, a series at a time: a series one
 input holds is copied whole, its rollups with it; inputs whose spans of a series follow one another
-have their chunks appended (a Gorilla chunk stands alone; their rollups are made from the samples,
+have their chunks appended (a Gorilla chunk stands alone; their rollups joined from the inputs',
 §4.7); only overlap (late writes), retention, chunks under half full and format 2's regions are
 decoded and packed anew. Maintenance runs on a thread of its own, told of every cut, and
 takes a merge in only if its inputs are still there. A manifest (rewritten by rename) lists the live
@@ -328,11 +328,20 @@ chunks' own coding): a series that holds its level writes a bit a window. Each t
 list lead with their byte lengths, so a reader finds its tier and the columns it wants (an average
 its sums, a counter its first, last and increases) without reading the rest.
 
-**Made at merges, checked when fetched.** A cut writes none (it decodes nothing, under the store's
-hold); the first merge to take its block makes them. A merge that copies a series' region whole
-copies its rollups; one that appends builds them as it reads the chunks, every tier in one pass,
-holding a series' windows and not its samples (a week's are 2,016 and 168); one that packs anew,
-from the samples it holds to pack (17% more merging time, measured). A block fetched from another replica (§5) is verified with every series'
+**Made at merges, joined at later ones, checked when fetched.** A cut writes none (it decodes
+nothing, under the store's hold); the first merge to take its block makes them. A merge that copies
+a series' region whole copies its rollups; one that appends joins its inputs' (`rollup::Joiner`):
+each input's windows read and appended, and a window a cut fell inside carried on with the next
+input's samples in it, its fold continued in time order, so the window is what its samples make of
+it to the bit, as made from the samples (only those samples are decoded: the rest of the input is
+copied as it is). Inputs that keep other tiers than each other, or none (a cut's block), have them
+made instead, as the chunks are read, every tier in one pass, holding a series' windows and not
+its samples (a week's are 2,016 and 168); one that packs anew, from the samples it holds to pack.
+Making them cost merges 17% more time (measured); joining them takes it back (§12.16). A test cuts
+200 series of each kind at random times (inside windows, on their edges, parts inside one window;
+samples that are not finite; counters that reset) and holds the joined rollups to the bytes made
+from the whole; the replicas' scenario (§13) checks every block its merges wrote, rollups recomputed
+from its samples. A block fetched from another replica (§5) is verified with every series'
 rollups recomputed from its samples, window by window, to the bit (which tiers it keeps is its
 writer's to choose): a replica's rollups are what keeps its answers its peers', so they are
 recomputed, not trusted. Measured on 30 days of kiln's cluster (§12.16): a month at a chart's 240
@@ -3538,7 +3547,12 @@ out):
 **Merging.** Making rollups at merges, the same binary with and without (an environment switch in
 a copy of the tree, in turn, load average 58–76): merges 7.6 s and 8.9 s of the 30 days' writing
 (+17%), all of it 12.0 and 12.2 s. Joining inputs' rollups instead of making them anew from the
-samples is what would take that back. The rollups first came from a series' samples decoded whole
+samples took that back and more (2026-10-23, the bench's two builds in turn, three rounds each, load
+average 19–27): merges 12.0–12.9 s making them, 7.4–7.9 s joining them where the inputs keep them
+(42,116 series' joined, 77,335 made: a cut's block keeps none), all of the writing 18.6–19.5 s and
+13.2–14.5 s; the same store either way (4 blocks, 139.1 MB, rollups 4.2% of them). An appending
+merge decoded every sample for its rollups; it now decodes those of the windows a cut fell inside
+alone. The rollups first came from a series' samples decoded whole
 (16 bytes a sample); built as the chunks are read instead, the most heap a merge holds over the 30
 days' writing fell from 6.1 MB to 4.2 MB (counted by hyper-measure, the same either run).
 
