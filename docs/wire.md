@@ -146,7 +146,9 @@ Every frame a viewer gets carries the copy's revision, and an attach starts with
 It gets the whole session (`open`) only when the copy can't resume it: another incarnation, an
 `Open` or `Reset` since, or a revision past what the copy has. A viewer that falls behind is caught
 up the same way, from the last revision it was sent, and the live frames that catch-up already
-holds are skipped.
+holds are skipped. Its socket holds at most 128 KiB the kernel hasn't sent yet
+(`TCP_NOTSENT_LOWAT`, where the platform has it): past that, the server's writer waits and the
+viewer falls behind, rather than reading megabytes of frames that are stale by then.
 
 ## Restarts
 
@@ -154,8 +156,9 @@ A runner that starts again starts each session's stream anew (its streams' names
 Each new stream sends the server only what its copy of the session lacks, not the session whole:
 
 - Before `Welcome`, the server says what each of its copies of the runner's sessions has (`Kept`):
-  the copy's epoch, its oldest and newest events' numbers, a digest of each run of 64 events from
-  its oldest on, and a digest of each of its newest 64 events. A digest is of an event as the copy
+  the copy's epoch, where its first run begins and its newest event's number, a digest of each run
+  of 64 events from there on, and a digest of each of its newest 64 events. Runs begin at the same
+  numbers whoever counts them (1, 65, 129 …). A digest is of an event as the copy
   keeps it: its JSON as it went over the wire (cut to fit), read back. The copy keeps each event's
   digest and makes it again once the event changes.
 - The runner works out the same of its own timeline. It sends an `Open` whose `since` says through
@@ -168,9 +171,18 @@ Each new stream sends the server only what its copy of the session lacks, not th
 - An event sent again under a number the copy has under another id takes that one's place (the
   timeline went another way). The copy's viewers start over from it then, as they do when it lets
   go of events. Otherwise an `Open` with `since` isn't one to them: they go on with what they have.
+- A timeline lets go of its oldest events a whole run at a time: the runner's past 4,000 events,
+  the server's copies past 5,000. A timeline taken up again from a store that was cut at its bound
+  begins where a run does. So a copy that has more of a session than its runner still compares run
+  for run with it, and the runner doesn't send the part of a run it has again.
 - The session goes whole when there's no copy, when the copy is of another epoch, or when there's a
-  gap between the copy's newest and the runner's oldest. It also goes whole when its announcement
-  comes after the runner's `Welcome`: its stream starts with the announcement then.
+  gap between the copy's newest and the runner's oldest. A session announced after the runner's
+  `Welcome` whose copy the server has, of its epoch, starts its stream as the `Welcome` starts one.
+  A new one, or one that moved here, starts with its announcement.
+- A session the runner takes up again from its conversation store isn't written to that store
+  again: the store has its timeline as it was. Its events go again only when their numbers had to
+  change, the store having lost some of them. So the store's feed to the server carries only
+  what's new.
 
 Before its `Welcome`, a runner sends no session's updates outside the channel: the `Welcome` brings
 the server what it lacks of each (or, to a server from before the channel, all of each).
@@ -181,6 +193,16 @@ copy keeps; an older one gets its last 200, to show. The server has none of its 
 any more, and the first `Have` it sends says so. Each stream then starts again as above, sending
 only what the rebuilt copy lacks. A viewer attaches to the rebuilt copy at once, and gets it whole:
 the server's incarnation is new.
+
+`tests/resume_lab.rs` puts this together. Three sessions stream on a runner whose link is cut
+every few seconds, watched by four viewers. The lab then:
+- holds one viewer's reading still until it falls behind (a test build's live feeds keep 64
+  frames, `fanout=`) and is caught up in-band;
+- has another drop its socket and resume;
+- kills the runner and then the server with `kill -9`, starting each again.
+
+It holds the copies and every viewer to each line once, in order, and prints each fault's
+bytes.
 
 ## Runner to server: `AgentMsg`
 

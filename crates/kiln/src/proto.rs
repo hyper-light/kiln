@@ -588,11 +588,14 @@ pub struct KeptSession {
     pub epoch: u64,
     /// Its newest event's number in the copy (0: it has none).
     pub seq: u64,
-    /// Its oldest event's number in the copy.
+    /// Where its first run begins: its oldest event's number in the copy, or before it where a run
+    /// of `run` begins (1, 1 + `run` …; an older server says its oldest event's number, and the
+    /// runs begin there).
     pub from: u64,
     /// How many events a digest in `runs` covers.
     pub run: u64,
-    /// A digest of each run of `run` events from `from` on, up to the events `last` has one of each.
+    /// A digest of each run of `run` events from `from` on (each of the copy's events numbered
+    /// within it), up to the events `last` has one of each.
     pub runs: Vec<u64>,
     /// A digest of each of its newest events, through `seq` (0: the copy lacks that one).
     pub last: Vec<u64>,
