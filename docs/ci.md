@@ -5468,8 +5468,8 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
 
 **Requirements: attachments and incidents** (adapted from ci-agents.md)
 
-- **W20-R08 Attaching.** In the UI ("Attach agent" on a repository, workflow, run, environment or
-  runner pool) or in trunk's `.kiln/agents.yaml`, an attachment names:
+- **W20-R08 Attaching.** In the UI (**Watched by** on a repository's panel or a runner's details)
+  or in trunk's `.kiln/agents.yaml`, an attachment names:
   - a harness (Claude Code, Codex, any ACP agent, or Devin through W11-R08), or a live session;
   - what wakes it: `failure`, `ejected`, `flaky`, `stuck`, `slow`, `schedule`, `mention`, `degraded`
     (W15), `unroutable` (W05);
@@ -5636,17 +5636,18 @@ R04, R05's skills, and R06's rights.
   that doesn't name it refuses it (403). Checked with W03-R09's events
   (`w03_r09_native_activity_and_kiln_events`).
 - *R08 to R10* (`crate::ci::attach`; docs/agents.md, "Attached agents"): attachments and
-  incidents, by API, on Agents → Attached and in trunk's `.kiln/agents.yaml`. Since:
+  incidents, by API, under Watched by (a repository's panel, a runner's details) and in trunk's
+  `.kiln/agents.yaml`. Since:
   - the rest of R08's wakes:
     - `slow`: a green run whose critical path took longer than the median of its workflow's last
       ten green runs on its branch (three at least) by more than `limits.slow_percent` (25%);
     - `unroutable`: a job no runner meets what it asks for, a minute on, one incident for each
       set of unmet requirements;
     - `degraded`: an app kiln CD deploys turning degraded wakes what looks after its environment.
-  - "Attach agent" on a repository (its details), a workflow (its file in the editor), a run (its
-    header: its workflow), an environment (its page) and a runner pool (its detail). Each opens
-    Agents → Attached with the form filled in for it, offering what can wake an agent there (an
-    environment's: its deployments failing, its apps degrading, mentions, a schedule).
+  - **Watched by** on a repository's panel (its own, its workflows' and its environments'
+    attachments) and on a runner's details (its own and every runner's): each one's chip, its
+    line opened from it (Pause, Remove), and Attach (its name, its agent and what can wake an
+    agent there), the rest kiln's defaults.
   - R10's other daily limits:
     - tokens (`tokens_per_day`, 5,000,000: its incidents' sessions together);
     - runner minutes (`runner_minutes_per_day`, 300): the runs its agents asked for, and the
@@ -5659,8 +5660,8 @@ R04, R05's skills, and R06's rights.
   Checked by `w20_r08_unroutable_is_what_no_runner_meets`,
   `w20_r08_slow_is_its_critical_path_past_the_median`, `w20_r10_runner_minutes_a_day` and
   `w05_r17_triggering_actor_is_who_reran_it`. The end-to-end
-  `w20_r08_what_happens_wakes_the_agent_attached_to_it` now has a degraded app too. The run
-  page's Attach agent is checked in Chromium and WebKit (`ci/ui/pages_check.mjs`).
+  `w20_r08_what_happens_wakes_the_agent_attached_to_it` now has a degraded app too. A
+  repository's Watched by is checked in Chromium and WebKit (`ci/ui/pages_check.mjs`).
 - *AC03* (`tests/ops.rs`, `w20_ac03_authority`), on a server with a failed run. Two agents are
   refused its rerun through every surface: the route, the operation over HTTP, its MCP tool,
   code mode, `kiln rerun` and `kiln op`, each refusal naming `runs.rerun`:
@@ -5715,7 +5716,7 @@ R04, R05's skills, and R06's rights.
   - The diagnose skill says how. Checked by `tests/bisect.rs`: four commits after the last green
     run, the second broke it, found in two tries.
 - *R11* (`kiln_ci::experiments`, `crates/kiln/src/ci/experiments.rs`; `experiments.*`,
-  `/api/experiments`, `kiln experiment`; Agents → Experiments):
+  `/api/experiments`, `kiln experiment`):
   - **Options** are changes on a base commit (the default branch's head unless said): a commit, a
     branch, a diff (its latest version), each applied as the commits it adds. An option can
     also be implemented by an agent (`implement`: what it is), in the asking agent's harness, on

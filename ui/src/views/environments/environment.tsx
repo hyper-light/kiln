@@ -8,7 +8,6 @@
 import * as React from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 
-import { attachHref } from "@/api/attach";
 import { api } from "@/api/client";
 import { cdApi } from "@/api/cd";
 import { ci, type CiEnvironment, type CiEnvKind, type CiEnvTargets } from "@/api/ci";
@@ -377,10 +376,7 @@ export default function EnvironmentPage() {
         <p className="cd-note">
           {repo ? (
             <>
-              An environment of <Link to={`/runs?repo=${encodeURIComponent(repo)}`}>{repo}</Link>.{" "}
-              <Link to={attachHref(`environment:${repo}:${name}`)} className="text-link">
-                Attach an agent
-              </Link>
+              An environment of <Link to={`/runs?repo=${encodeURIComponent(repo)}`}>{repo}</Link>.
             </>
           ) : (
             "Which repository's? Open it from the environments board."

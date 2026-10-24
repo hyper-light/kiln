@@ -21,9 +21,7 @@ function Cards({ run }: { run: string }) {
       {list.map((i) => (
         <div key={i.id} className="attach-card" data-state={i.state}>
           <div className="attach-row-head">
-            <Link to="/agents/attached" className="attach-name">
-              {i.name}
-            </Link>
+            <span className="attach-name">{i.name}</span>
             <span className="attach-state">
               {STATE[i.state]}
               {i.class ? ` · ${i.class}` : ""}

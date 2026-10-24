@@ -1,5 +1,5 @@
-//! Programs: multi-stack programs kiln runs, as the Programs view shows them (Mission control,
-//! `/agents/programs`; docs/programs.md). A program is a master plan (tagged `master`) and the
+//! Programs: multi-stack programs kiln runs, as `/api/programs` gives them (docs/programs.md).
+//! A program is a master plan (tagged `master`) and the
 //! track plans that share its tag, each tagged `t<n>`: the critical path (master plan
 //! 01a157fddb8276a2996246ea931c4808) first. It's run as goals on a coordinating agent (the master
 //! plan's latest goals run): its goal stack is the list of record, its goals matched to tracks by

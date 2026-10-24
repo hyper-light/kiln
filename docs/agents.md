@@ -110,10 +110,6 @@ counted.
 
 ## Mission control
 
-Its **Programs** follow multi-stack programs (the critical path first), a row per track: its
-worker and how it stands, the goal under way, goals met, change requests, pass, threshold and
-usage, with the workers, slots and weights the person sets there ([programs.md](programs.md)).
-
 - **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
   paused for you) come first, longest waiting first, then those stopped, paused, finished since
   you last looked, working, ready, offline and ended. The list follows the agents as they change:
@@ -647,8 +643,9 @@ otherwise it answers a comment with a new version.
 ## Attached agents
 
 An agent attached to what it looks after wakes when something happens there (docs/ci.md W20-R08 to
-R10; docs/agentic.md K2 and R4). **Agents → Attached** lists them and their incidents, and attaches
-one; `attachments.*` and `incidents.*` do the same for agents and code mode. An attachment names:
+R10; docs/agentic.md K2 and R4). **Watched by**, on a repository's panel (its workflows' and
+environments' too) and on a runner's details (every runner's too), lists them and attaches one;
+`attachments.*` and `incidents.*` do the same for agents and code mode. An attachment names:
 
 - **What it looks after** (`on`, written as access scopes are): `repo:acme/app`,
   `workflow:acme/app:.github/workflows/ci.yml`, `environment:acme/app:production`, `pool:gpu`,
@@ -704,9 +701,12 @@ open incident shows in the runner's row in System → Updates.
 | `incidents.report` | `POST /api/incidents/:id/report` | `{class?, summary?, links?, state?}`: its agent, or a person who may attach there |
 
 A run that woke an attached agent shows the incident on its page: who looks after it, where it
-stands, what its agent found and opened, and a link to the agent. **Attach agent** on a
-repository, a workflow, a run, an environment or a runner pool opens Agents → Attached with the
-form filled in for it.
+stands, what its agent found and opened, and a link to the agent. Under **Watched by** each one
+attached is a chip saying how it stands in a word (watching, on it, waiting for you, paused); a
+chip opens its line (what wakes it, its agent, its latest incident; Pause, Remove), and **Attach**
+asks three things: its name, its agent and what wakes it. The rest is kiln's defaults (ten
+incidents, 5,000,000 tokens and 300 runner minutes a day; it may read), or what trunk's
+`.kiln/agents.yaml` says.
 
 **In the repository.** A repository can keep its attachments in trunk's `.kiln/agents.yaml`, read
 like the rest of its policy (from trunk, never from a change, within a minute of landing):
