@@ -4778,28 +4778,28 @@ resolve, not at all (it advertises its listener now; a runner that cannot resolv
 address never trying the tunnel is kiln's own, said, not changed here); and two tests' own
 assumptions (an `openssl` that binds one address; a metric read before its write landed).
 
-**On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own `core.autocrlf`):
-40 of the scenarios below pass there, at 7f607f14 and ef10dc30 (the same kiln): `observe_live` (17:
-CI through a Windows runner, every integration a monitor names, the group through kills and an
-image, OTLP over gRPC, GitHub's webhooks, the API against its OpenAPI document, ...), the clouds' (6),
-the tail (4), the logs collected (4: pipelines on every machine, containers' logs, files through
-rotation, truncation, a stop and a kill, syslog over UDP and TCP), the catalog, DORA, incidents,
-indexes, infrastructure, metrics from logs, notebooks, the scanner and synthetic tests; and at
-c1d7efd9, kiln-obs's tests (351, its group's 4) and kiln's observe and CD tests (274). Running them
-there found four things. kiln's server overflowed its main
+**On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own
+`core.autocrlf`): 42 of the scenarios below pass there, at 7f607f14, ef10dc30 and 4747aca3 (the same
+kiln): `observe_live` (17: CI through a Windows runner, every integration a monitor names, the group
+through kills and an image, OTLP over gRPC, GitHub's webhooks, the API against its OpenAPI document,
+...), the clouds' (6), the tail (4), the logs collected (4: pipelines on every machine, containers'
+logs, files through rotation, truncation, a stop and a kill, syslog over UDP and TCP), DogStatsD (2,
+over UDP), the catalog, DORA, incidents, indexes, infrastructure, metrics from logs, notebooks, the
+scanner and synthetic tests; and at c1d7efd9, kiln-obs's tests (351, its group's 4) and kiln's
+observe and CD tests (274). Running them there found four things. kiln's server overflowed its main
 thread's stack as it started (Windows gives it 1 MiB, Linux and macOS 8; the binary is linked with 8
 there now). The log collector, which knew a file off Unix by its creation time, lost the first lines
-of a rotated log's new file: NTFS gives a file made at a name another was renamed from moments before
-that one's creation time (its "tunneling", 15 s by default), so the new file passed for the old; a
-file there is now its volume's serial number and its file index (`GetFileInformationByHandle`,
-through `winapi-util`), as a device and an inode are on Unix. Git turned a recorded Python
-traceback's lines into CRLF as it checked it out, and the test reading it failed (fixtures and test
-data are now `-text`). And the test fleet itself was Unix's: it stops a node there by closing its
-stdin, as kiln's supervisor does (`KILN_SUPERVISED`), passes Windows its own variables, and writes
-paths into TOML and `file:` URLs as Windows needs them. Not run there: DogStatsD's (it sends over a
-Unix socket too), the Event Log's through Windows's own `wevtutil` (a channel of the test's own needs
-an administrator; its stand-in is a shell script, run on Unix), macOS's unified log, kiln CD's (it
-needs a cluster), and those that need Docker.
+of a rotated log's new file: NTFS gives a file made at a name another was renamed from moments
+before that one's creation time (its "tunneling", 15 s by default), so the new file passed for the
+old; a file there is now its volume's serial number and its file index
+(`GetFileInformationByHandle`, through `winapi-util`), as a device and an inode are on Unix. Git
+turned a recorded Python traceback's lines into CRLF as it checked it out, and the test reading it
+failed (fixtures and test data are now `-text`). And the test fleet itself was Unix's: it stops a
+node there by closing its stdin, as kiln's supervisor does (`KILN_SUPERVISED`), passes Windows its
+own variables, and writes paths into TOML and `file:` URLs as Windows needs them. Not run there:
+DogStatsD's Unix socket (Windows has no Unix datagram sockets), the Event Log's through Windows's
+own `wevtutil` (a channel of the test's own needs an administrator; its stand-in is a shell script,
+run on Unix), macOS's unified log, kiln CD's (it needs a cluster), and those that need Docker.
 
 **Live** (`crates/kiln/tests/observe_live.rs`, `cargo test -p kiln --test observe_live -- --ignored`):
 a kiln server and two runners as processes of their own, each with a home of its own and a clean
