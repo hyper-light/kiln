@@ -4,10 +4,30 @@ CP-T2.1's part of a merge train (the critical path's CP-M4; its master plan's §
 delivers, what deploying it does and how to watch it, its risks and its rollback, and what's still
 open: the metric names Kiln Metrics hasn't answered and the decisions that are Ada's.
 
-**Where it stands (2026-10-23):**
-- **Not merged.** Branch `cp/t2-quiver`, local, has merged main at 8adeadb (ccf213c). Main's
-  kiln-http took hyper-rt from git at 767627f; it takes the vendored copy, so kiln holds one
-  hyper-raft. Main's kiln.db Raft group (`store/group.rs`) builds and passes on 25cf889 too.
+**Where it stands (2026-10-24):**
+- **Landed** on kiln's main at 545e9967 (2026-10-24 08:20 PDT, a fast-forward from cc1de07a), on
+  Ada's word, Kiln Distro holding main for the train. Not deployed yet: production ran 8adeadba then.
+- **Gated** on fedora, on Ada's go: cp/t2-quiver at 359c8949, main 264d8cc6 merged: clippy for
+  Linux, macOS and Windows, every target, `-D warnings`, clean; the workspace's tests, 2,219 passed
+  and 1 failed, `w20_ac05_the_ci_skills_programs`, main's own runner-channel race ("AssignV2 ...
+  unreachable: its runner is away" 60 ms after the runner connected), which passed 3 of 3 alone and
+  went to its owner. Main's 4 later commits, in files the branch doesn't touch, were merged as
+  545e9967 and re-checked: clippy for the three platforms clean, their modules' tests 46 passed.
+  kiln's vendor check (`scripts/vendor.py check quiver focal-bus hyper-raft`): 0 differences. The
+  first gate (3da6accd, 2026-10-23) failed two tests, both fixed since:
+  - P2's learner test raced its compaction, and with kiln's stores on hyper-raft 25cf889 it failed
+    19 of 30 runs; its owner's fix (40e54477, on main as 264d8cc6) passed 30 of 30 on 25cf889;
+  - the full-bus lab's 256 KiB bus was under the 2,166,784 bytes a Quiver node takes, so its
+    server didn't start; at 3 MiB its filler emptied the bus a segment at a time, so the second
+    feed's frames fit. It now reads what the filler leaves free and sizes the second feed's frames
+    past it.
+- **Merged with the wire owner's viewer resume** (07d06775, 873d40c9, c3afe70a; docs/wire.md
+  "Revisions"): each frame on a session's feed carries the copy's revision; a viewer attaches with
+  `?after=` and gets only what changed, or the session whole when the copy can't tell; one that
+  falls behind, is sent back by the resync marker, or sees its feed's refusals move catches up from
+  the last revision it was sent; a copy whose events went another way publishes the marker, and its
+  viewers take it whole. Both catch-ups are taken as parts under the mirrors' lock and made into
+  frames after it. The wire owner's resume tests (3) and wire_updates with chaos (3) pass on it.
 - **Reviewed.** An adversarial review found, and this branch fixed:
   - a viewer could wait on silently once a full bus refused its feed's frames and the resync marker
     after them: each viewer now counts its feed's refusals and starts over when there were more;
@@ -22,27 +42,24 @@ open: the metric names Kiln Metrics hasn't answered and the decisions that are A
   - the labs passed even if viewers only ever caught up by starting over: they now require one
     snapshot each, and no lag notice or refusal on the server.
   Since then, CP-T2.1's test 4 has a lab of its own: a 3 MiB bus, filled by one watched
-  session's feed, refuses a second session's frames and its resync marker, and both of that
-  session's viewers must start over within 5 s. A viewer with nothing to read looked again after
+  session's feed, refuses a second session's frames, each sized past what the filler leaves free,
+  and both of that session's viewers must start over within 5 s (a feed whose resync marker is
+  refused too is harness::live's a_viewer_learns_its_feed_broke_without_a_frame_saying_so). A viewer with nothing to read looked again after
   5 s, so one whose wait began just after the refusal started over a little past it; it looks
   after 4 s now.
-- **Not gated.** kiln's gate waits for a slot from the coordinator. What ran on fedora on the tree
-  merged with main at 243c2aa, as development checks (the tree merged at 8adeadb waits for its
-  slot):
-  - clippy on kiln, kiln-cd, kiln-seams and kiln-http, every target;
-  - kiln's unit tests: 1,383 passed, none failed;
-  - the live-feed labs (2) and the vendored test (9);
-  - kiln-http's tests (39) and kiln-cd's (153).
 - **Measuring** (Quiver's bench/records/):
   - The comparison with NATS, Redis and Kafka ran on adacachy on Ada's word, beside production, its
     systems interleaved load by load: 180 runs at a load average of 21 to 143, so no record of
     any bar. Under that load Quiver led the best competitor tenfold in 8 of 12 loads.
-  - The hour's soak on adacachy (load 36 to 62) lost no frame: 360 billion deliveries to 1,000
-    subscribers that all kept up (AC-T2.1.4), at Quiver 08d3dc9; it's running again at 88409dd,
-    the commit kiln now vendors.
+  - The hour's soak lost no frame, twice, on adacachy beside production: at Quiver 08d3dc9 (load
+    36 to 62) and at 88409dd, the commit kiln vendors (load 39 to 58): each 360,529,149 published,
+    359,979,959,000 deliveries measured, none lost, doubled or undelivered, all 1,000 subscribers
+    kept up, no lag notice (AC-T2.1.4). At 88409dd the subscribers' threads allocated nothing in
+    the hour, and a publish 2.010 times.
   - AC-T2.1.2 and AC-T2.1.3's records (p99 at most 300 µs at 100,000 messages a second to 1,000
     subscribers) and the comparison's want a quiet machine: asked of the coordinator.
-- **Quiver** is at 88409dd, hyper-light/quiver's main, its gate passed in kiln CI (run 16: fmt,
+- **Quiver** is at 88409dd, hyper-light/quiver's main, its gate passed in kiln CI (run 16 on the
+  branch, run 17 on Quiver's main: fmt,
   clippy on Linux, macOS and Windows, the production check, the tests, the vendor check). Since
   d8e5d54: every bench run's profile (allocations, page faults, switches, the CPU's counters,
   memory, and each competitor's own); a subscriber's take and wait allocate nothing and a publish
@@ -181,6 +198,8 @@ A rename Kiln Metrics asks for is one change: crates/kiln/src/metrics.rs, docs/b
 
 ## Open with others
 
-- **The coordinator:** the bench window and kiln's gate slot (Quiver's gate passed in kiln CI).
+- **The coordinator:** the bench window (about 2.3 hours of fedora with nothing beside it).
+- **The wire owner:** its read of the merge's resync choice (a marker each viewer pulls the copy
+  whole on, not the copy pushed on the feed), and the runner-channel race above.
 - **Mantle's agent:** re-vendors Mantle at hyper-raft 25cf889 after its current change. kiln's
   T10 agent takes it from there (CP-T10.2), against this branch's copy.
