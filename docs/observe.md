@@ -4764,6 +4764,18 @@ A runner reads a recording once and the server what it became: the lane carries 
 
 What a user would see, checked end to end; not the code's internals.
 
+**On macOS** too (2026-10-24, aarch64, at 28e01fba): every scenario below that needs no Docker passes
+on a Mac, 38 in all: `observe_live` (17), the clouds' (6), the tail (4), statsd (2), the catalog,
+DORA, incidents, indexes, infrastructure, metrics from logs, notebooks, the scanner, synthetic tests
+and macOS's own unified log; with kiln-obs's tests (351, and its replication's 4) and kiln's observe
+tests (254). Running them there found three things Linux hid: std's read-write lock on macOS let
+a reader that takes it again at once hold a writer off for good (now `kiln_obs::lock`, §4); the
+test fleet's server advertised kiln's default QUIC address, `<hostname>:7071`, so on Linux its
+runners reached it only through the HTTP tunnel, and on macOS, where a bare hostname does not
+resolve, not at all (it advertises its listener now; a runner that cannot resolve the server's
+address never trying the tunnel is kiln's own, said, not changed here); and two tests' own
+assumptions (an `openssl` that binds one address; a metric read before its write landed).
+
 **Live** (`crates/kiln/tests/observe_live.rs`, `cargo test -p kiln --test observe_live -- --ignored`):
 a kiln server and two runners as processes of their own, each with a home of its own and a clean
 environment, on real sockets and disks. Points and log records are written through the API and read
