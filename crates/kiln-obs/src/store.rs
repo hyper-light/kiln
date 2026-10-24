@@ -36,7 +36,7 @@ use crate::block::{self, Block, BlockError, SeriesData};
 use crate::command::{self, Command, CommandError};
 use crate::gorilla::{Chunk, ChunkRef, DecodeError, Encoder};
 use crate::hash::Keyed;
-use crate::head::{Appended, CHUNK_SAMPLES, HeadSeries};
+use crate::head::{Appended, CHUNK_SAMPLES, HeadSeries, Heads};
 use crate::image::{FileKind, Image, ImageFile};
 use crate::index::{Defined, Index, IndexError, Selector, SeriesInfo};
 use crate::logs::file::LogFile;
@@ -234,7 +234,9 @@ pub struct Store {
     /// costs, as a summary says it ([`Store::metric_summaries`]). This process's alone, not
     /// replicated state.
     metric_samples: Vec<u64>,
-    blocks: Vec<OpenBlock>,
+    /// Shared: a query's snapshot ([`MetricsAt`]) holds them open however the store merges or
+    /// drops them meanwhile.
+    blocks: Vec<Arc<OpenBlock>>,
     logs: LogStore,
     /// Spans: records of a store of their own (`crate::otlp::traces`), kept for their own time.
     spans: LogStore,
@@ -742,7 +744,7 @@ impl Store {
         store.dir = Some(dir.to_owned());
         for e in &manifest.blocks {
             let block = Block::open(&dir.join(&e.file))?;
-            store.blocks.push(OpenBlock { seq: e.seq, file: e.file.clone(), block });
+            store.blocks.push(Arc::new(OpenBlock { seq: e.seq, file: e.file.clone(), block }));
         }
         store.blocks.sort_by_key(|b| b.seq);
         for e in &manifest.logs {
@@ -1304,7 +1306,7 @@ impl Store {
         }
         self.manifest = w.manifest;
         if let Some(b) = w.block {
-            self.blocks.push(b);
+            self.blocks.push(Arc::new(b));
         }
         for l in w.logs {
             self.logs.written(l);
@@ -1425,7 +1427,7 @@ impl Store {
             gone.push(r.dir.join(&r.file));
         } else {
             let at = self.blocks.partition_point(|x| x.seq < r.seq);
-            self.blocks.insert(at, OpenBlock { seq: r.seq, file: r.file.clone(), block });
+            self.blocks.insert(at, Arc::new(OpenBlock { seq: r.seq, file: r.file.clone(), block }));
         }
         let maintained = Maintained {
             blocks_written: u64::from(!empty),
@@ -1640,64 +1642,40 @@ impl Store {
     /// [`Store::read`] with buffers kept across calls: a query reading many series allocates
     /// nothing a series once they have grown.
     pub fn read_with(&self, id: u32, from: i64, to: i64, scratch: &mut Scratch, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), StoreError> {
-        let from = from.max(self.cutoff);
-        if to < from {
-            return Ok(());
+        match self.src(id) {
+            Some(src) => read_src(&src, from, to, scratch, ts, values),
+            None => Ok(()),
         }
-        let Some(fp) = self.index.fp(id) else { return Ok(()) };
-        let head = self.head.get(id as usize);
-        // The sources that hold the series in range, in write order, with their spans.
-        let sources = &mut scratch.sources;
-        sources.clear();
-        for (bi, b) in self.blocks.iter().enumerate() {
-            if let Some(i) = b.block.find(fp)
-                && let Some((f, l)) = b.block.span(i)
-                && l >= from
-                && f <= to
-            {
-                sources.push((Some(bi), f, l));
+    }
+
+    /// What series `id` is read from: the store's blocks and its head.
+    fn src(&self, id: u32) -> Option<Src<'_>> {
+        let fp = self.index.fp(id)?;
+        Some(Src { blocks: &self.blocks, head: self.head.get(id as usize).map(HeadOf::Live), fp, cutoff: self.cutoff, rollups: self.read_rollups })
+    }
+
+    /// [`MetricsAt`] of the series `ids`, into `at` (its room reused): as many of them as fit
+    /// `budget` bytes of heads copied, one at the least; how many it holds. Under the caller's
+    /// hold of the store: what a query's series are, read with the store let go.
+    pub fn metrics_into(&self, ids: &[u32], budget: usize, at: &mut MetricsAt) -> usize {
+        at.blocks.clear();
+        at.blocks.extend(self.blocks.iter().cloned());
+        at.cutoff = self.cutoff;
+        at.rollups = self.read_rollups;
+        at.series.clear();
+        at.heads.clear();
+        let mut taken = 0;
+        for &id in ids {
+            if taken > 0 && at.heads.bytes() >= budget {
+                break;
             }
+            taken += 1;
+            let (Some(fp), Some(info)) = (self.index.fp(id), self.series(id)) else { continue };
+            let head = self.head.get(id as usize).filter(|h| h.span().is_some()).map(|h| at.heads.copy(h));
+            at.series.push((id, fp, info.kind(), head));
         }
-        if let Some((f, l)) = head.and_then(HeadSeries::span)
-            && l >= from
-            && f <= to
-        {
-            sources.push((None, f, l));
-        }
-        let buf = &mut scratch.buf;
-        let read_one = |src: Option<usize>, buf: &mut Vec<u8>, ts: &mut Vec<i64>, vs: &mut Vec<f64>| -> Result<(), StoreError> {
-            match src {
-                Some(bi) => {
-                    if let Some(b) = self.blocks.get(bi)
-                        && let Some(i) = b.block.find(fp)
-                    {
-                        b.block.read(i, from, to, buf, ts, vs)?;
-                    }
-                }
-                None => {
-                    if let Some(h) = head {
-                        h.read(from, to, ts, vs)?;
-                    }
-                }
-            }
-            Ok(())
-        };
-        // In write order and disjoint in time, oldest first: appended as they are.
-        let disjoint = sources.windows(2).all(|w| matches!(w, [a, b] if a.2 < b.1));
-        if disjoint {
-            for &(src, _, _) in sources.iter() {
-                read_one(src, buf, ts, values)?;
-            }
-            return Ok(());
-        }
-        let mut parts = Vec::with_capacity(sources.len());
-        for &(src, _, _) in sources.iter() {
-            let (mut t, mut v) = (Vec::new(), Vec::new());
-            read_one(src, buf, &mut t, &mut v)?;
-            parts.push((t, v));
-        }
-        merge_parts(parts, ts, values);
-        Ok(())
+        at.series.sort_unstable_by_key(|s| s.0);
+        taken
     }
 
     /// Whether [`Store::read_rolled`] reads rollups or every sample: the same answers either way
@@ -1714,82 +1692,10 @@ impl Store {
     /// writes not yet merged) are read as samples.
     #[allow(clippy::too_many_arguments)]
     pub fn read_rolled(&self, id: u32, from: i64, to: i64, roll: &Roll<'_>, scratch: &mut Scratch, ts: &mut Vec<i64>, values: &mut Vec<f64>, rolled: &mut Rolled) -> Result<(), StoreError> {
-        let from = from.max(self.cutoff);
-        if to < from {
-            return Ok(());
+        match self.src(id) {
+            Some(src) => read_rolled_src(&src, from, to, roll, scratch, ts, values, rolled),
+            None => Ok(()),
         }
-        let Some(fp) = self.index.fp(id) else { return Ok(()) };
-        if !self.read_rollups {
-            return self.read_with(id, from, to, scratch, ts, values);
-        }
-        let head = self.head.get(id as usize);
-        let sources = &mut scratch.sources;
-        sources.clear();
-        for (bi, b) in self.blocks.iter().enumerate() {
-            if let Some(i) = b.block.find(fp)
-                && let Some((f, l)) = b.block.span(i)
-                && l >= from
-                && f <= to
-            {
-                sources.push((Some(bi), f, l));
-            }
-        }
-        if let Some((f, l)) = head.and_then(HeadSeries::span)
-            && l >= from
-            && f <= to
-        {
-            sources.push((None, f, l));
-        }
-        if !sources.windows(2).all(|w| matches!(w, [a, b] if a.2 < b.1)) {
-            return self.read_with(id, from, to, scratch, ts, values);
-        }
-        let width = roll.width;
-        for (si, &(src, f, l)) in sources.iter().enumerate() {
-            let block = src.and_then(|bi| self.blocks.get(bi)).and_then(|b| Some((&b.block, b.block.find(fp)?)));
-            let Some((blk, i)) = block else {
-                if let Some(h) = head {
-                    h.read(from, to, ts, values)?;
-                }
-                continue;
-            };
-            let rollups = blk.rollups(i, &mut scratch.rollups)?;
-            let damaged = |_| BlockError::Damaged(blk.path().to_owned(), "series rollups");
-            let tier = if blk.kind(i) == Some(roll.kind) { rollup::tier(rollups, width, roll.kind).map_err(damaged)? } else { None };
-            let Some(tier) = tier else {
-                blk.read(i, from, to, &mut scratch.buf, ts, values)?;
-                continue;
-            };
-            // Its neighbours' spans: a window either reaches is not this block's alone.
-            let before = si.checked_sub(1).and_then(|p| sources.get(p)).map(|s| s.2);
-            let after = sources.get(si + 1).map(|s| s.1);
-            let base = rolled.len();
-            tier.read(from.max(f), to.min(l), roll.cols, rolled).map_err(damaged)?;
-            // Each window kept, or what of the range it covers read as samples: every sample of
-            // the block lies in a window it lists.
-            let ranges = &mut scratch.ranges;
-            ranges.clear();
-            let mut kept = base;
-            for j in base..rolled.len() {
-                let (Some(&start), Some(&n)) = (rolled.start.get(j), rolled.n.get(j)) else { continue };
-                let end = start.saturating_add(width);
-                let alone = before.is_none_or(|b| b < start) && after.is_none_or(|a| a >= end);
-                if n > 0 && alone && start >= roll.from && end <= roll.to && start >= from {
-                    rolled.keep(j, kept);
-                    kept += 1;
-                    continue;
-                }
-                let (a, b) = (start.max(from), end.saturating_sub(1).min(to));
-                match ranges.last_mut() {
-                    Some(last) if last.1.saturating_add(1) >= a => last.1 = b,
-                    _ => ranges.push((a, b)),
-                }
-            }
-            rolled.truncate(kept);
-            if !ranges.is_empty() {
-                blk.read_ranges(i, ranges, &mut scratch.buf, ts, values)?;
-            }
-        }
-        Ok(())
     }
 
     /// A part's cutoff (ms): its own retention's, else the logs'.
@@ -2300,6 +2206,239 @@ pub struct Reads<'q, const N: usize> {
     pub any_of: &'q [&'q str],
     pub reading: Reading,
     pub since_ms: i64,
+}
+
+/// A series' head as a read takes it: the store's own, or a copy of it ([`MetricsAt`]).
+#[derive(Clone, Copy)]
+enum HeadOf<'a> {
+    Live(&'a HeadSeries),
+    Copied(&'a Heads, u32),
+}
+
+impl HeadOf<'_> {
+    fn span(&self) -> Option<(i64, i64)> {
+        match *self {
+            Self::Live(h) => h.span(),
+            Self::Copied(heads, at) => heads.span(at),
+        }
+    }
+
+    fn read(&self, from: i64, to: i64, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), DecodeError> {
+        match *self {
+            Self::Live(h) => h.read(from, to, ts, values),
+            Self::Copied(heads, at) => heads.read(at, from, to, ts, values),
+        }
+    }
+}
+
+/// What a series is read from: the blocks in write order, its head and fingerprint, and the
+/// store's cutoff and whether its rollups are read.
+#[derive(Clone, Copy)]
+struct Src<'a> {
+    blocks: &'a [Arc<OpenBlock>],
+    head: Option<HeadOf<'a>>,
+    fp: u64,
+    cutoff: i64,
+    rollups: bool,
+}
+
+/// A query's series as they were under one hold of the store ([`Store::metrics_into`]), read with
+/// the store let go (`crate::query::eval::Lease`): the store's blocks, held open however the store
+/// merges or drops them meanwhile; each series' fingerprint and kind; and its head, copied. A read
+/// of it is a read of the store as it was then, to the bit.
+#[derive(Debug, Default)]
+pub struct MetricsAt {
+    blocks: Vec<Arc<OpenBlock>>,
+    cutoff: i64,
+    rollups: bool,
+    /// Its series, sorted by id: each one's id, fingerprint, kind, and head (its place in `heads`).
+    series: Vec<(u32, u64, Kind, Option<u32>)>,
+    heads: Heads,
+}
+
+impl MetricsAt {
+    fn src(&self, id: u32) -> Option<(Src<'_>, Kind)> {
+        let i = self.series.binary_search_by_key(&id, |s| s.0).ok()?;
+        let &(_, fp, kind, head) = self.series.get(i)?;
+        Some((Src { blocks: &self.blocks, head: head.map(|at| HeadOf::Copied(&self.heads, at)), fp, cutoff: self.cutoff, rollups: self.rollups }, kind))
+    }
+
+    /// Series `id`'s kind, where it holds the series.
+    pub fn kind(&self, id: u32) -> Option<Kind> {
+        self.src(id).map(|(_, k)| k)
+    }
+
+    /// [`Store::read_with`], as the store was.
+    pub fn read_with(&self, id: u32, from: i64, to: i64, scratch: &mut Scratch, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), StoreError> {
+        match self.src(id) {
+            Some((src, _)) => read_src(&src, from, to, scratch, ts, values),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Store::read_rolled`], as the store was.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_rolled(&self, id: u32, from: i64, to: i64, roll: &Roll<'_>, scratch: &mut Scratch, ts: &mut Vec<i64>, values: &mut Vec<f64>, rolled: &mut Rolled) -> Result<(), StoreError> {
+        match self.src(id) {
+            Some((src, _)) => read_rolled_src(&src, from, to, roll, scratch, ts, values, rolled),
+            None => Ok(()),
+        }
+    }
+
+    /// Series it holds.
+    pub fn len(&self) -> usize {
+        self.series.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.series.is_empty()
+    }
+
+    /// Bytes it holds beside its blocks: the heads copied, and its series.
+    pub fn bytes(&self) -> usize {
+        self.heads.bytes() + self.series.len() * std::mem::size_of::<(u32, u64, Kind, Option<u32>)>()
+    }
+}
+
+/// A series' samples in `[from, to]` from what it is read from ([`Store::read_with`]).
+fn read_src(src: &Src<'_>, from: i64, to: i64, scratch: &mut Scratch, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), StoreError> {
+    let from = from.max(src.cutoff);
+    if to < from {
+        return Ok(());
+    }
+    let (fp, head) = (src.fp, src.head);
+    // The sources that hold the series in range, in write order, with their spans.
+    let sources = &mut scratch.sources;
+    sources.clear();
+    for (bi, b) in src.blocks.iter().enumerate() {
+        if let Some(i) = b.block.find(fp)
+            && let Some((f, l)) = b.block.span(i)
+            && l >= from
+            && f <= to
+        {
+            sources.push((Some(bi), f, l));
+        }
+    }
+    if let Some((f, l)) = head.and_then(|h| h.span())
+        && l >= from
+        && f <= to
+    {
+        sources.push((None, f, l));
+    }
+    let buf = &mut scratch.buf;
+    let read_one = |which: Option<usize>, buf: &mut Vec<u8>, ts: &mut Vec<i64>, vs: &mut Vec<f64>| -> Result<(), StoreError> {
+        match which {
+            Some(bi) => {
+                if let Some(b) = src.blocks.get(bi)
+                    && let Some(i) = b.block.find(fp)
+                {
+                    b.block.read(i, from, to, buf, ts, vs)?;
+                }
+            }
+            None => {
+                if let Some(h) = head {
+                    h.read(from, to, ts, vs)?;
+                }
+            }
+        }
+        Ok(())
+    };
+    // In write order and disjoint in time, oldest first: appended as they are.
+    let disjoint = sources.windows(2).all(|w| matches!(w, [a, b] if a.2 < b.1));
+    if disjoint {
+        for &(which, _, _) in sources.iter() {
+            read_one(which, buf, ts, values)?;
+        }
+        return Ok(());
+    }
+    let mut parts = Vec::with_capacity(sources.len());
+    for &(which, _, _) in sources.iter() {
+        let (mut t, mut v) = (Vec::new(), Vec::new());
+        read_one(which, buf, &mut t, &mut v)?;
+        parts.push((t, v));
+    }
+    merge_parts(parts, ts, values);
+    Ok(())
+}
+
+/// [`Store::read_rolled`] from what a series is read from.
+#[allow(clippy::too_many_arguments)]
+fn read_rolled_src(src: &Src<'_>, from: i64, to: i64, roll: &Roll<'_>, scratch: &mut Scratch, ts: &mut Vec<i64>, values: &mut Vec<f64>, rolled: &mut Rolled) -> Result<(), StoreError> {
+    let from = from.max(src.cutoff);
+    if to < from {
+        return Ok(());
+    }
+    if !src.rollups {
+        return read_src(src, from, to, scratch, ts, values);
+    }
+    let (fp, head) = (src.fp, src.head);
+    let sources = &mut scratch.sources;
+    sources.clear();
+    for (bi, b) in src.blocks.iter().enumerate() {
+        if let Some(i) = b.block.find(fp)
+            && let Some((f, l)) = b.block.span(i)
+            && l >= from
+            && f <= to
+        {
+            sources.push((Some(bi), f, l));
+        }
+    }
+    if let Some((f, l)) = head.and_then(|h| h.span())
+        && l >= from
+        && f <= to
+    {
+        sources.push((None, f, l));
+    }
+    if !sources.windows(2).all(|w| matches!(w, [a, b] if a.2 < b.1)) {
+        return read_src(src, from, to, scratch, ts, values);
+    }
+    let width = roll.width;
+    for (si, &(at, f, l)) in sources.iter().enumerate() {
+        let block = at.and_then(|bi| src.blocks.get(bi)).and_then(|b| Some((&b.block, b.block.find(fp)?)));
+        let Some((blk, i)) = block else {
+            if let Some(h) = head {
+                h.read(from, to, ts, values)?;
+            }
+            continue;
+        };
+        let rollups = blk.rollups(i, &mut scratch.rollups)?;
+        let damaged = |_| BlockError::Damaged(blk.path().to_owned(), "series rollups");
+        let tier = if blk.kind(i) == Some(roll.kind) { rollup::tier(rollups, width, roll.kind).map_err(damaged)? } else { None };
+        let Some(tier) = tier else {
+            blk.read(i, from, to, &mut scratch.buf, ts, values)?;
+            continue;
+        };
+        // Its neighbours' spans: a window either reaches is not this block's alone.
+        let before = si.checked_sub(1).and_then(|p| sources.get(p)).map(|s| s.2);
+        let after = sources.get(si + 1).map(|s| s.1);
+        let base = rolled.len();
+        tier.read(from.max(f), to.min(l), roll.cols, rolled).map_err(damaged)?;
+        // Each window kept, or what of the range it covers read as samples: every sample of
+        // the block lies in a window it lists.
+        let ranges = &mut scratch.ranges;
+        ranges.clear();
+        let mut kept = base;
+        for j in base..rolled.len() {
+            let (Some(&start), Some(&n)) = (rolled.start.get(j), rolled.n.get(j)) else { continue };
+            let end = start.saturating_add(width);
+            let alone = before.is_none_or(|b| b < start) && after.is_none_or(|a| a >= end);
+            if n > 0 && alone && start >= roll.from && end <= roll.to && start >= from {
+                rolled.keep(j, kept);
+                kept += 1;
+                continue;
+            }
+            let (a, b) = (start.max(from), end.saturating_sub(1).min(to));
+            match ranges.last_mut() {
+                Some(last) if last.1.saturating_add(1) >= a => last.1 = b,
+                _ => ranges.push((a, b)),
+            }
+        }
+        rolled.truncate(kept);
+        if !ranges.is_empty() {
+            blk.read_ranges(i, ranges, &mut scratch.buf, ts, values)?;
+        }
+    }
+    Ok(())
 }
 
 /// Buffers a reader keeps across [`Store::read_with`] calls.

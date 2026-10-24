@@ -80,6 +80,13 @@ impl BitWriter {
         Bits { head: &self.bytes, tail: self.acc, tail_bits: self.used }
     }
 
+    /// What is written so far, as [`BitWriter::finish`] would leave it, appended to `out`; the
+    /// writer left as it is.
+    pub fn copy_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes);
+        out.extend(self.acc.to_be_bytes().iter().take(self.used.div_ceil(8) as usize));
+    }
+
     /// Forgets what was written, keeping the allocation.
     pub fn clear(&mut self) {
         self.bytes.clear();

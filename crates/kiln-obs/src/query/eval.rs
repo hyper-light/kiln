@@ -8,6 +8,7 @@
 //! nodes in order, children before parents: no recursion.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::calendar::{self, Calendar};
 use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, RecordQuery, RecordSource, Rollup, SpaceAgg, Threshold, parse};
@@ -15,7 +16,7 @@ use crate::anomaly::{Algorithm, Scorer};
 use crate::batch::Kind;
 use crate::index::{NameMatch, Selector};
 use crate::rollup::{self, Agg, Col, Rolled};
-use crate::store::{Roll, Scratch, Store, StoreError};
+use crate::store::{MetricsAt, Roll, Scratch, Store, StoreError};
 
 /// The most buckets a series: Prometheus's cap on a range query's resolution (11,000 points a
 /// series, `promql` engine, "exceeded maximum resolution of 11,000 points per timeseries").
@@ -56,12 +57,13 @@ pub enum QueryError {
 }
 
 /// How a query holds the store. `Held`: its caller holds it throughout. `Shared`: taken a part at
-/// a time (finding its series, then a round of them a thread, `ROUND`), each part under a shared
-/// hold of its own, so a write waits for one part at the most, and no reader waits behind that
-/// write for the whole query (the lock lets a waiting writer in before new readers). A part that
-/// finds the series numbered anew since the query began (`Store::generation`: retention, an
-/// install) ends the query with [`QueryError::Moved`], to be asked again. Each series is read whole
-/// within one part: what it holds as of that part.
+/// a time (finding its series; then a snapshot of them, [`Lease::snapshot`], as many as
+/// [`SNAPSHOT_BYTES`] of their heads, read with the store let go), each part under a shared hold of
+/// its own, so a write waits for one part at the most, no reader waits behind that write for the
+/// whole query (the lock lets a waiting writer in before new readers), and the reading waits for
+/// no write at all. A part that finds the series numbered anew since the query began
+/// (`Store::generation`: retention, an install) ends the query with [`QueryError::Moved`], to be
+/// asked again. Each series is read whole as of the snapshot that holds it.
 pub enum Lease<'a> {
     Held(&'a Store),
     Shared { store: &'a std::sync::RwLock<Store>, generation: u64, waited_ns: std::sync::atomic::AtomicU64 },
@@ -123,6 +125,19 @@ impl<'a> Lease<'a> {
                     return Err(QueryError::Moved);
                 }
                 Ok(g)
+            }
+        }
+    }
+
+    /// A snapshot of the series `ids` into `at` (as many as fit [`SNAPSHOT_BYTES`] of their heads,
+    /// one at the least), taken under one hold of the store: how many it holds. A held lease's
+    /// caller holds the store throughout, read as it is: none taken.
+    pub(crate) fn snapshot(&self, ids: &[u32], at: &mut MetricsAt) -> Result<Option<usize>, QueryError> {
+        match self {
+            Self::Held(_) => Ok(None),
+            Self::Shared { .. } => {
+                let store = self.hold()?;
+                Ok(Some(store.metrics_into(ids, snapshot_bytes(), at)))
             }
         }
     }
@@ -1540,40 +1555,36 @@ fn dist_counts(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>,
     each.resize(grid.n, f64::NAN);
     let tier = tier_for(spans);
     let (mut rolled, mut window_n) = (rolled_for(tier, from, end, &counted), Vec::new());
-    let mut held: Option<Hold<'_>> = None;
+    // Read from snapshots of them, as a query's series are ([`Snapshots`]).
+    let ids: Vec<u32> = members.iter().map(|m| m.0).collect();
+    let mut snaps = Snapshots::default();
     for (i, &(id, at, b)) in members.iter().enumerate() {
-        // A hold a round of series.
-        if i % ROUND == 0 {
-            drop(held.take());
-            held = Some(lease.hold()?);
-        }
-        let Some(store) = held.as_deref() else { break };
-        let Some(s) = store.series(id) else { continue };
+        let src = snaps.src(lease, &ids, i)?;
+        let Some(kind) = src.kind(id) else { continue };
         ts.clear();
         vs.clear();
-        let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
+        let lookback = if kind == Kind::Counter { grid.step } else { 0 };
         let row = table.row(b.coarser(u32::try_from(at - scale).unwrap_or(0)));
         if let Some(width) = tier {
             rolled.clear();
-            let roll = Roll { width, from, to: end, kind: s.kind(), cols: columns_for(s.kind(), &counted) };
-            store.read_rolled(id, from.saturating_sub(lookback), end.saturating_sub(1), &roll, scratch, &mut ts, &mut vs, &mut rolled)?;
+            let roll = Roll { width, from, to: end, kind, cols: columns_for(kind, &counted) };
+            src.read_rolled(id, from.saturating_sub(lookback), end.saturating_sub(1), &roll, scratch, &mut ts, &mut vs, &mut rolled)?;
             scanned.0 += 1;
             scanned.1 += ts.len() as u64 + rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>();
-            rollup_windows(s.kind(), &counted, spans, width, &ts, &vs, &rolled, &mut each, &mut window_n);
+            rollup_windows(kind, &counted, spans, width, &ts, &vs, &rolled, &mut each, &mut window_n);
             table.add(row, &each);
             continue;
         }
-        store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
+        src.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
         scanned.0 += 1;
         scanned.1 += ts.len() as u64;
-        if s.kind() == Kind::Count {
+        if kind == Kind::Count {
             table.add_samples(row, spans, &ts, &vs);
         } else {
-            rollup(s.kind(), &counted, spans, &ts, &vs, &mut each, None);
+            rollup(kind, &counted, spans, &ts, &vs, &mut each, None);
             table.add(row, &each);
         }
     }
-    drop(held);
     (table.ts, table.vs, table.each) = (ts, vs, each);
     table.sort();
     Ok(scale)
@@ -1818,24 +1829,20 @@ fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_
         intervals.reserve(ids.len());
         let (mut ts, mut vs) = (Vec::new(), Vec::new());
         let mut buckets = vec![f64::NAN; grid.n];
-        let mut held: Option<Hold<'_>> = None;
+        // Read from snapshots of them, as a query's series are ([`Snapshots`]).
+        let mut snaps = Snapshots::default();
         for (i, (&id, &g)) in ids.iter().zip(&group_of).enumerate() {
-            // A hold a round of series.
-            if i % ROUND == 0 {
-                drop(held.take());
-                held = Some(lease.hold()?);
-            }
-            let Some(store) = held.as_deref() else { break };
-            let Some(s) = store.series(id) else { continue };
+            let src = snaps.src(lease, &ids, i)?;
+            let Some(kind) = src.kind(id) else { continue };
             ts.clear();
             vs.clear();
             // A counter's increase into the first bucket needs the sample before it.
-            let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
-            let weighted = s.kind() == Kind::Gauge;
-            store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
+            let lookback = if kind == Kind::Counter { grid.step } else { 0 };
+            let weighted = kind == Kind::Gauge;
+            src.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
             scanned.0 += 1;
             scanned.1 += ts.len() as u64;
-            rollup(s.kind(), q, spans, &ts, &vs, &mut buckets, if weighted { Some(&mut counts) } else { None });
+            rollup(kind, q, spans, &ts, &vs, &mut buckets, if weighted { Some(&mut counts) } else { None });
             let Some(a) = acc.get_mut(g) else { continue };
             if !weighted {
                 a.add(&buckets, None);
@@ -1898,6 +1905,67 @@ struct Reading<'a> {
     end: i64,
 }
 
+/// Bytes of heads a snapshot of a query's series copies at the most ([`Lease::snapshot`]), under its
+/// one hold of the store: some milliseconds at memory's speed, what a write waits for it; the soak's
+/// widest query (4,000 series of a minute's head each, some 14 MB, `docs/observe.md` §12.19) is one
+/// snapshot. More series are read a snapshot of this many bytes at a time.
+pub(crate) const SNAPSHOT_BYTES: usize = 32 << 20;
+
+/// What a query reads its series from: the store its caller holds throughout, or a snapshot of them.
+#[derive(Clone, Copy)]
+enum Src<'a> {
+    Store(&'a Store),
+    At(&'a MetricsAt),
+}
+
+impl Src<'_> {
+    fn kind(&self, id: u32) -> Option<Kind> {
+        match *self {
+            Self::Store(s) => s.series(id).map(|r| r.kind()),
+            Self::At(a) => a.kind(id),
+        }
+    }
+
+    fn read_with(&self, id: u32, from: i64, to: i64, scratch: &mut Scratch, ts: &mut Vec<i64>, vs: &mut Vec<f64>) -> Result<(), StoreError> {
+        match *self {
+            Self::Store(s) => s.read_with(id, from, to, scratch, ts, vs),
+            Self::At(a) => a.read_with(id, from, to, scratch, ts, vs),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_rolled(&self, id: u32, from: i64, to: i64, roll: &Roll<'_>, scratch: &mut Scratch, ts: &mut Vec<i64>, vs: &mut Vec<f64>, rolled: &mut Rolled) -> Result<(), StoreError> {
+        match *self {
+            Self::Store(s) => s.read_rolled(id, from, to, roll, scratch, ts, vs, rolled),
+            Self::At(a) => a.read_rolled(id, from, to, roll, scratch, ts, vs, rolled),
+        }
+    }
+}
+
+/// A reader's series, one after another (`ids`): from the store its lease's caller holds, or from
+/// snapshots of them, each taken under one hold of the store as the reading passes the last one's.
+#[derive(Default)]
+struct Snapshots {
+    snap: MetricsAt,
+    end: usize,
+}
+
+impl Snapshots {
+    /// What the `i`th of `ids` is read from.
+    fn src<'s>(&'s mut self, lease: &'s Lease<'_>, ids: &[u32], i: usize) -> Result<Src<'s>, QueryError> {
+        match lease {
+            Lease::Held(store) => Ok(Src::Store(store)),
+            Lease::Shared { .. } => {
+                if i >= self.end {
+                    let rest = ids.get(i..).unwrap_or_default();
+                    self.end = i + lease.snapshot(rest, &mut self.snap)?.unwrap_or(rest.len()).max(1);
+                }
+                Ok(Src::At(&self.snap))
+            }
+        }
+    }
+}
+
 /// What a thread reading series holds, reused series to series.
 struct Reader {
     scratch: Scratch,
@@ -1914,22 +1982,22 @@ impl Reader {
     }
 
     /// Series `id`'s values on the grid, into `self.buckets`: the samples it read, or none if the
-    /// store holds no such series (`store`: the part's hold of it).
-    fn read(&mut self, at: &Reading<'_>, store: &Store, id: u32) -> Result<Option<u64>, QueryError> {
-        let Some(s) = store.series(id) else { return Ok(None) };
+    /// store holds no such series (`src`: the store held, or a snapshot of the part's series).
+    fn read(&mut self, at: &Reading<'_>, src: Src<'_>, id: u32) -> Result<Option<u64>, QueryError> {
+        let Some(kind) = src.kind(id) else { return Ok(None) };
         self.ts.clear();
         self.vs.clear();
         // A counter's increase into the first bucket needs the sample before it.
-        let lookback = if s.kind() == Kind::Counter { at.grid.step } else { 0 };
+        let lookback = if kind == Kind::Counter { at.grid.step } else { 0 };
         if let Some(width) = at.tier {
             self.rolled.clear();
-            let roll = Roll { width, from: at.from, to: at.end, kind: s.kind(), cols: columns_for(s.kind(), at.q) };
-            store.read_rolled(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &roll, &mut self.scratch, &mut self.ts, &mut self.vs, &mut self.rolled)?;
-            rollup_windows(s.kind(), at.q, at.spans, width, &self.ts, &self.vs, &self.rolled, &mut self.buckets, &mut self.window_n);
+            let roll = Roll { width, from: at.from, to: at.end, kind, cols: columns_for(kind, at.q) };
+            src.read_rolled(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &roll, &mut self.scratch, &mut self.ts, &mut self.vs, &mut self.rolled)?;
+            rollup_windows(kind, at.q, at.spans, width, &self.ts, &self.vs, &self.rolled, &mut self.buckets, &mut self.window_n);
             Ok(Some(self.ts.len() as u64 + self.rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>()))
         } else {
-            store.read_with(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &mut self.scratch, &mut self.ts, &mut self.vs)?;
-            rollup(s.kind(), at.q, at.spans, &self.ts, &self.vs, &mut self.buckets, None);
+            src.read_with(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &mut self.scratch, &mut self.ts, &mut self.vs)?;
+            rollup(kind, at.q, at.spans, &self.ts, &self.vs, &mut self.buckets, None);
             Ok(Some(self.ts.len() as u64))
         }
     }
@@ -2041,6 +2109,17 @@ pub(crate) fn helper_started() {
     }
 }
 
+/// Bytes a snapshot of a query's series copies at the most: [`SNAPSHOT_BYTES`], or a test's.
+#[cfg(test)]
+fn snapshot_bytes() -> usize {
+    tests::snapshot_bytes()
+}
+
+#[cfg(not(test))]
+fn snapshot_bytes() -> usize {
+    SNAPSHOT_BYTES
+}
+
 /// The threads every query reads on, when a test says so.
 #[cfg(test)]
 fn forced_threads() -> Option<usize> {
@@ -2060,7 +2139,10 @@ fn read_groups(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [Acc
     let started = std::time::Instant::now();
     let forced = forced_threads();
     let mut asked = false;
-    let mut held: Option<Hold<'_>> = None;
+    // The series read from a snapshot of them taken under one hold of the store (as many as fit
+    // it), so a write waits for that hold alone and no series waits for writes; a lease held
+    // throughout reads the store itself.
+    let mut snaps = Snapshots::default();
     let mut i = 0;
     while i < ids.len() {
         let left = ids.len() - i;
@@ -2072,19 +2154,12 @@ fn read_groups(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [Acc
             };
             if helpers.0 > 0 {
                 let (Some(rest), Some(groups)) = (ids.get(i..), group_of.get(i..)) else { break };
-                // Each part takes a hold of its own.
-                drop(held);
                 return read_together(at, rest, groups, acc, reader, scanned, helpers.0 + 1);
             }
         }
-        // A hold a round of series, so a write waits for one round at the most.
-        if i % ROUND == 0 {
-            drop(held.take());
-            held = Some(at.lease.hold()?);
-        }
-        let Some(store) = held.as_deref() else { break };
+        let src = snaps.src(at.lease, ids, i)?;
         let (Some(&id), Some(&g)) = (ids.get(i), group_of.get(i)) else { break };
-        if let Some(samples) = reader.read(at, store, id)? {
+        if let Some(samples) = reader.read(at, src, id)? {
             scanned.0 += 1;
             scanned.1 += samples;
             if let Some(a) = acc.get_mut(g) {
@@ -2105,16 +2180,23 @@ struct Part {
     samples: u64,
 }
 
-/// Reads `ids` into `part` (cleared first).
-fn read_part(r: &mut Reader, at: &Reading<'_>, ids: &[u32], part: &mut Part) -> Result<(), QueryError> {
+/// Reads `ids` into `part` (cleared first): from `snap`, the round's snapshot of them, else the
+/// store its lease's caller holds.
+fn read_part(r: &mut Reader, at: &Reading<'_>, snap: Option<&MetricsAt>, ids: &[u32], part: &mut Part) -> Result<(), QueryError> {
     let n = at.grid.n;
     part.values.clear();
     part.there.clear();
     part.samples = 0;
-    // A part's series (a round's share, `ROUND` at the most) under one hold of the store.
-    let store = at.lease.hold()?;
+    let held;
+    let src = match snap {
+        Some(s) => Src::At(s),
+        None => {
+            held = at.lease.hold()?;
+            Src::Store(&held)
+        }
+    };
     for &id in ids {
-        match r.read(at, &store, id)? {
+        match r.read(at, src, id)? {
             Some(k) => {
                 part.samples += k;
                 part.values.extend_from_slice(&r.buckets);
@@ -2139,9 +2221,9 @@ fn read_together(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [A
     let failed = || QueryError::Invalid("a thread reading series failed".into());
     std::thread::scope(|scope| {
         let (done_tx, done_rx) = mpsc::channel::<(usize, Result<Part, QueryError>)>();
-        let mut jobs: Vec<mpsc::Sender<(std::ops::Range<usize>, Part)>> = Vec::with_capacity(workers - 1);
+        let mut jobs: Vec<mpsc::Sender<(std::ops::Range<usize>, Part, Option<Arc<MetricsAt>>)>> = Vec::with_capacity(workers - 1);
         for w in 1..workers {
-            let (tx, rx) = mpsc::channel::<(std::ops::Range<usize>, Part)>();
+            let (tx, rx) = mpsc::channel::<(std::ops::Range<usize>, Part, Option<Arc<MetricsAt>>)>();
             let done = done_tx.clone();
             let spawned = std::thread::Builder::new().name("kiln-query".into()).spawn_scoped(scope, move || {
                 if let Some(f) = HELPER_START.get() {
@@ -2149,8 +2231,10 @@ fn read_together(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [A
                 }
                 let mut r = Reader::new(at, Scratch::default());
                 // Until this round's jobs stop coming: the query is done, or failed.
-                while let Ok((range, mut part)) = rx.recv() {
-                    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_part(&mut r, at, ids.get(range).unwrap_or(&[]), &mut part)));
+                while let Ok((range, mut part, snap)) = rx.recv() {
+                    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_part(&mut r, at, snap.as_deref(), ids.get(range).unwrap_or(&[]), &mut part)));
+                    // Let go before it is answered: the snapshot's room is reused for the next.
+                    drop(snap);
                     let outcome = match read {
                         Ok(Ok(())) => Ok(part),
                         Ok(Err(e)) => Err(e),
@@ -2170,9 +2254,24 @@ fn read_together(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [A
         let threads = jobs.len() + 1;
         let mut parts: Vec<Option<Part>> = (0..threads).map(|_| Some(Part::default())).collect();
         let mut got: Vec<Option<Result<Part, QueryError>>> = (0..threads).map(|_| None).collect();
+        // A shared lease's rounds read a snapshot of their series, taken under one hold of the store
+        // as a round passes the last one's, its room reused once the helpers let go of it.
+        let shared = matches!(at.lease, Lease::Shared { .. });
+        let (mut snap, mut snap_end): (Arc<MetricsAt>, usize) = (Arc::default(), 0);
         let mut i = 0;
         while i < ids.len() {
-            let round = (ids.len() - i).min(threads * ROUND);
+            if shared && i >= snap_end {
+                if Arc::get_mut(&mut snap).is_none() {
+                    snap = Arc::default();
+                }
+                let rest = ids.get(i..).unwrap_or_default();
+                let taken = match Arc::get_mut(&mut snap) {
+                    Some(s) => at.lease.snapshot(rest, s)?.unwrap_or(rest.len()),
+                    None => rest.len(),
+                };
+                snap_end = i + taken.max(1);
+            }
+            let round = (ids.len() - i).min(threads * ROUND).min(if shared { snap_end - i } else { usize::MAX });
             let per = round.div_ceil(threads);
             let span = |w: usize| (i + w * per).min(i + round)..(i + (w + 1) * per).min(i + round);
             let mut sent = 0;
@@ -2182,11 +2281,11 @@ fn read_together(at: &Reading<'_>, ids: &[u32], group_of: &[usize], acc: &mut [A
                     continue;
                 }
                 let part = parts.get_mut(k + 1).and_then(Option::take).unwrap_or_default();
-                job.send((range, part)).map_err(|_| failed())?;
+                job.send((range, part, shared.then(|| snap.clone()))).map_err(|_| failed())?;
                 sent += 1;
             }
             let mut mine = parts.first_mut().and_then(Option::take).unwrap_or_default();
-            let own = read_part(reader, at, ids.get(span(0)).unwrap_or(&[]), &mut mine);
+            let own = read_part(reader, at, shared.then_some(&*snap), ids.get(span(0)).unwrap_or(&[]), &mut mine);
             if let Some(slot) = got.first_mut() {
                 *slot = Some(own.map(|()| mine));
             }
@@ -3148,6 +3247,16 @@ mod tests {
     }
 
     thread_local! {
+        /// A test's: the bytes of heads a snapshot of a query's series copies at the most, on this
+        /// thread (where a query takes its snapshots).
+        static SNAPSHOT: std::cell::Cell<usize> = const { std::cell::Cell::new(super::SNAPSHOT_BYTES) };
+    }
+
+    pub(super) fn snapshot_bytes() -> usize {
+        SNAPSHOT.with(std::cell::Cell::get)
+    }
+
+    thread_local! {
         /// A test's: what runs before each part of a shared query on this thread takes its hold
         /// (the store let go), told how many such parts came before it.
         static BEFORE_HOLD: std::cell::RefCell<Option<(usize, Box<dyn FnMut(usize)>)>> = const { std::cell::RefCell::new(None) };
@@ -3396,6 +3505,59 @@ mod tests {
             at(&held, 50)
         );
         assert!(at(&apart, 90) * 2 < at(&held, 90), "a write waited {:?} at p90 beside a query read a part at a time, {:?} beside it held (the query alone: {alone:?})", at(&apart, 90), at(&held, 90));
+    }
+
+    /// A query read from snapshots of its series (a part at a time: here as small as one series'
+    /// head, or a few, so many parts) answers as one that holds the store throughout, to the bit:
+    /// blocks cut each hour, late writes over them in the head, the head's own; samples and
+    /// rollups read; on one thread and on several.
+    #[test]
+    fn a_query_read_from_snapshots_answers_as_one_held_to_the_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+        let mut rng = crate::testkit::Rng::new(31);
+        let keys: Vec<SeriesKey> = (0..300u32)
+            .map(|i| {
+                let host = format!("h{}", i % 5);
+                SeriesKey::new(["a", "b", "c"][i as usize % 3], [("host", host.as_str()), ("s", i.to_string().as_str())], [Kind::Gauge, Kind::Count, Kind::Counter][i as usize % 3]).unwrap()
+            })
+            .collect();
+        let start = 1_700_000_000_000i64;
+        for hour in 0..3i64 {
+            let mut b = Builder::new();
+            for k in &keys {
+                b.define(k);
+                b.run(k.fp, (0..60).map(|m| (start + hour * 3_600_000 + m * 60_000, rng.f64())));
+            }
+            s.apply(&b.finish()).unwrap();
+            s.cut(crate::manifest::Point { index: hour as u64 + 1, term: 1 }).unwrap();
+        }
+        let mut b = Builder::new();
+        for k in keys.iter().step_by(7) {
+            b.define(k);
+            b.run(k.fp, (0..20).map(|m| (start + 3_600_000 + m * 90_000 + 13, rng.f64())));
+        }
+        for k in &keys {
+            b.define(k);
+            b.run(k.fp, (0..30).map(|m| (start + 3 * 3_600_000 + m * 60_000, rng.f64())));
+        }
+        s.apply(&b.finish()).unwrap();
+        let store = std::sync::RwLock::new(s);
+        for q in ["sum:a{*} by {host}", "avg:b{*} by {s}", "sum:c{*}.as_count()", "max:a{host:h1}"] {
+            for step in [60_000, 3_600_000] {
+                let mut r = Request::new(q, start, start + 4 * 3_600_000);
+                r.step = Some(step);
+                let held = bits(&eval(&store.read().unwrap(), &r).unwrap());
+                for (threads, budget) in [(1, 1), (1, 2_000), (4, 1), (4, super::SNAPSHOT_BYTES)] {
+                    THREADS.store(threads, std::sync::atomic::Ordering::SeqCst);
+                    SNAPSHOT.with(|c| c.set(budget));
+                    let shared = bits(&eval_shared(&store, &r).unwrap().0);
+                    assert_eq!(shared, held, "{q} by {step} ms, on {threads} threads, snapshots of {budget} bytes");
+                }
+            }
+        }
+        THREADS.store(0, std::sync::atomic::Ordering::SeqCst);
+        SNAPSHOT.with(|c| c.set(super::SNAPSHOT_BYTES));
     }
 
     /// Queries over many series read on one thread and on several (as many as a round holds, and

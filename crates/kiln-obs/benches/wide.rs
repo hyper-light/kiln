@@ -1,18 +1,22 @@
 //! A dashboard's widest query on the soak's data (`docs/observe.md` §12.19): `sum:load.v{*} by
 //! {host}` over the last 15 minutes of 4,000 series written 50 times a second (the soak's 200,000
 //! points a second), the store cut each minute and merged as maintenance merges; the query's
-//! median time, the samples it reads, and nanoseconds a sample.
+//! median time, the samples it reads, and nanoseconds a sample. Then the same query read a part at
+//! a time as the server asks it (`eval_shared`), the head holding a minute more, beside writes (a
+//! point a series each 20 ms): its time, what it waited for the store, and what the writes waited
+//! for it.
 //!
 //! `cargo bench -p kiln-obs --bench wide` (`KOBS_SERIES`, 4,000; `KOBS_MINUTES`, 15;
 //! `KOBS_ROUNDS`, 9)
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use kiln_obs::batch::{Builder, Kind, SeriesKey};
 use kiln_obs::hash::Keyed;
 use kiln_obs::manifest::Point;
-use kiln_obs::query::eval::{Request, eval};
+use kiln_obs::query::eval::{Request, eval, eval_shared};
 use kiln_obs::store::Store;
 
 fn env(k: &str, d: usize) -> usize {
@@ -62,4 +66,77 @@ fn main() {
     times.sort_by(f64::total_cmp);
     let med = times[times.len() / 2];
     println!("{q} over 15 minutes: median {:.1} ms (least {:.1}, most {:.1}), {:.0} M samples read, {:.2} ns a sample", med * 1e3, times[0] * 1e3, times[times.len() - 1] * 1e3, scanned as f64 / 1e6, med * 1e9 / scanned.max(1) as f64);
+
+    // The head holding a minute more (a cut's cadence at this load), then the query beside writes.
+    for second in 0..60 {
+        let mut b = Builder::new();
+        for k in &keys {
+            let at = to + second * 1000;
+            b.run(k.fp, (0..50).map(|j| (at + j * 20, 1.0)));
+        }
+        s.apply(&b.finish()).unwrap();
+    }
+    // A snapshot of every series the query reads (`Store::metrics_into`), its heads a minute each:
+    // what a query's one hold of the store costs a write waiting for it.
+    let mut ids = Vec::new();
+    s.select(&kiln_obs::index::Selector::metric("load.v"), &mut ids);
+    let mut at = kiln_obs::store::MetricsAt::default();
+    let mut snaps = Vec::new();
+    for _ in 0..rounds {
+        let t = Instant::now();
+        let n = s.metrics_into(&ids, usize::MAX, &mut at);
+        snaps.push(t.elapsed().as_secs_f64());
+        assert_eq!(n, ids.len());
+    }
+    snaps.sort_by(f64::total_cmp);
+    println!("a snapshot of its {} series: median {:.2} ms (most {:.2}), {:.1} MB copied", ids.len(), snaps[snaps.len() / 2] * 1e3, snaps[snaps.len() - 1] * 1e3, at.bytes() as f64 / 1e6);
+    let store = std::sync::RwLock::new(s);
+    let stop = AtomicBool::new(false);
+    let (asked, waits) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let mut waits = Vec::new();
+            let mut at = to + 60_000;
+            while !stop.load(Ordering::Relaxed) {
+                let mut b = Builder::new();
+                for k in &keys {
+                    b.run(k.fp, std::iter::once((at, 1.0)));
+                }
+                let batch = b.finish();
+                let t = Instant::now();
+                let mut g = store.write().unwrap();
+                waits.push(t.elapsed().as_secs_f64());
+                g.apply(&batch).unwrap();
+                drop(g);
+                at += 20;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            waits
+        });
+        let mut asked = Vec::new();
+        for _ in 0..rounds.max(25) {
+            let t = Instant::now();
+            let (a, waited_ms) = eval_shared(&store, &Request::new(q, to - 15 * 60_000, to)).unwrap();
+            asked.push((t.elapsed().as_secs_f64(), waited_ms));
+            assert_eq!(a.series.len(), 4.min(series));
+        }
+        stop.store(true, Ordering::Relaxed);
+        (asked, writer.join().unwrap())
+    });
+    let pct = |v: &mut Vec<f64>, p: f64| {
+        v.sort_by(f64::total_cmp);
+        v[((v.len() - 1) as f64 * p).round() as usize]
+    };
+    let (mut took, mut waited): (Vec<f64>, Vec<f64>) = asked.iter().map(|&(t, w)| (t * 1e3, w)).unzip();
+    let mut writes: Vec<f64> = waits.iter().map(|w| w * 1e3).collect();
+    println!(
+        "beside writes, read a part at a time: median {:.1} ms (most {:.1}); waited for the store median {:.2} ms (most {:.2}); writes waited p50 {:.3} ms, p99 {:.2}, most {:.2} ({} writes)",
+        pct(&mut took, 0.5),
+        pct(&mut took, 1.0),
+        pct(&mut waited, 0.5),
+        pct(&mut waited, 1.0),
+        pct(&mut writes, 0.5),
+        pct(&mut writes, 0.99),
+        pct(&mut writes, 1.0),
+        writes.len()
+    );
 }

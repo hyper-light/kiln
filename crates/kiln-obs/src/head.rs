@@ -266,15 +266,29 @@ fn find(c: ChunkRef<'_>, ts: i64) -> Result<Option<f64>, DecodeError> {
 /// Merges a series' late writes in `[from, to]` into the in-order run `ts[start..]`: at a time the
 /// latest write wins (the buffer, then the late chunks newest first, then the run).
 fn merge_late(late: &Late, start: usize, from: i64, to: i64, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), DecodeError> {
+    merge_late_parts(late.chunks.iter().map(|c| (c.first, c.last, c.as_ref())), &late.buffer, start, from, to, ts, values)
+}
+
+/// [`merge_late`] of late chunks (each its first and last times, oldest first) and a buffer of
+/// late writes, wherever they are kept (a series' own, or a copy of them: [`Heads`]).
+fn merge_late_parts<'c>(
+    chunks: impl Iterator<Item = (i64, i64, ChunkRef<'c>)>,
+    buffer: &[(i64, f64)],
+    start: usize,
+    from: i64,
+    to: i64,
+    ts: &mut Vec<i64>,
+    values: &mut Vec<f64>,
+) -> Result<(), DecodeError> {
     // (time, rank, value): rank 0 the run, 1.. the chunks oldest first, the buffer last.
     let mut all: Vec<(i64, u32, f64)> = Vec::new();
     for (&t, &v) in ts.get(start..).unwrap_or(&[]).iter().zip(values.get(start..).unwrap_or(&[])) {
         all.push((t, 0, v));
     }
     let mut rank = 1u32;
-    for c in &late.chunks {
-        if c.last >= from && c.first <= to {
-            let mut d = c.as_ref().iter();
+    for (first, last, c) in chunks {
+        if last >= from && first <= to {
+            let mut d = c.iter();
             while let Some((t, v)) = d.next_sample()? {
                 if (from..=to).contains(&t) {
                     all.push((t, rank, v));
@@ -283,7 +297,7 @@ fn merge_late(late: &Late, start: usize, from: i64, to: i64, ts: &mut Vec<i64>, 
         }
         rank += 1;
     }
-    for &(t, v) in &late.buffer {
+    for &(t, v) in buffer {
         if (from..=to).contains(&t) {
             all.push((t, rank, v));
         }
@@ -306,10 +320,156 @@ fn merge_late(late: &Late, start: usize, from: i64, to: i64, ts: &mut Vec<i64>, 
     Ok(())
 }
 
+/// A chunk copied into [`Heads`]: its first and last times, its samples, its bytes' place.
+#[derive(Debug, Clone, Copy)]
+struct Copied {
+    first: i64,
+    last: i64,
+    count: u32,
+    start: usize,
+    end: usize,
+}
+
+/// A series copied into [`Heads`]: its in-order chunks (the open one last), its late chunks and its
+/// buffered late writes, each a range of [`Heads`]' lists.
+#[derive(Debug, Clone)]
+struct CopiedSeries {
+    in_order: std::ops::Range<usize>,
+    late: std::ops::Range<usize>,
+    buffer: std::ops::Range<usize>,
+}
+
+/// Heads of many series copied into one arena (a query's snapshot of the store,
+/// `crate::store::MetricsAt`): their chunks' bytes one after another, their late writes beside, so
+/// a copy costs a few allocations, not one a chunk, and reads as the series did as it was copied.
+#[derive(Debug, Default)]
+pub struct Heads {
+    bytes: Vec<u8>,
+    chunks: Vec<Copied>,
+    buffer: Vec<(i64, f64)>,
+    series: Vec<CopiedSeries>,
+}
+
+impl Heads {
+    /// Forgets every series copied, keeping the room.
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+        self.chunks.clear();
+        self.buffer.clear();
+        self.series.clear();
+    }
+
+    /// Bytes copied: the chunks', the late writes' and the lists'.
+    pub fn bytes(&self) -> usize {
+        self.bytes.len() + self.chunks.len() * std::mem::size_of::<Copied>() + self.buffer.len() * 16 + self.series.len() * std::mem::size_of::<CopiedSeries>()
+    }
+
+    fn push_chunk(&mut self, first: i64, last: i64, count: u32, copy: impl FnOnce(&mut Vec<u8>)) {
+        let start = self.bytes.len();
+        copy(&mut self.bytes);
+        self.chunks.push(Copied { first, last, count, start, end: self.bytes.len() });
+    }
+
+    /// `h` copied whole; its place, to read it by.
+    pub fn copy(&mut self, h: &HeadSeries) -> u32 {
+        let at = u32::try_from(self.series.len()).unwrap_or(u32::MAX);
+        let first = self.chunks.len();
+        for c in &h.closed {
+            self.push_chunk(c.first, c.last, c.count, |out| out.extend_from_slice(&c.bytes));
+        }
+        if let Some((f, l)) = h.open.span() {
+            self.push_chunk(f, l, h.open.count(), |out| h.open.copy_bytes_into(out));
+        }
+        let in_order = first..self.chunks.len();
+        let (late_first, buffer_first) = (self.chunks.len(), self.buffer.len());
+        if let Some(late) = &h.late {
+            for c in &late.chunks {
+                self.push_chunk(c.first, c.last, c.count, |out| out.extend_from_slice(&c.bytes));
+            }
+            self.buffer.extend_from_slice(&late.buffer);
+        }
+        self.series.push(CopiedSeries { in_order, late: late_first..self.chunks.len(), buffer: buffer_first..self.buffer.len() });
+        at
+    }
+
+    fn chunk(&self, c: &Copied) -> ChunkRef<'_> {
+        ChunkRef::new(self.bytes.get(c.start..c.end).unwrap_or_default(), c.count)
+    }
+
+    /// The first and last times series `at` held, as [`HeadSeries::span`] says them.
+    pub fn span(&self, at: u32) -> Option<(i64, i64)> {
+        let s = self.series.get(at as usize)?;
+        let in_order = self.chunks.get(s.in_order.clone()).unwrap_or_default();
+        let mut first = in_order.first().map(|c| c.first);
+        let mut last = in_order.last().map(|c| c.last);
+        let late = self.chunks.get(s.late.clone()).unwrap_or_default().iter().map(|c| (c.first, c.last));
+        let buffer = self.buffer.get(s.buffer.clone()).unwrap_or_default();
+        for (f, l) in late.chain(buffer.first().zip(buffer.last()).map(|(a, b)| (a.0, b.0))) {
+            first = Some(first.map_or(f, |x| x.min(f)));
+            last = Some(last.map_or(l, |x| x.max(l)));
+        }
+        first.zip(last)
+    }
+
+    /// Series `at`'s samples in `[from, to]`, as [`HeadSeries::read`] reads them.
+    pub fn read(&self, at: u32, from: i64, to: i64, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), DecodeError> {
+        let Some(s) = self.series.get(at as usize) else { return Ok(()) };
+        let start = ts.len();
+        let in_order = self.chunks.get(s.in_order.clone()).unwrap_or_default();
+        let first = in_order.partition_point(|c| c.last < from);
+        for c in in_order.iter().skip(first) {
+            if c.first > to {
+                break;
+            }
+            self.chunk(c).decode_range_into((c.first, c.last), from, to, ts, values)?;
+        }
+        if !s.late.is_empty() || !s.buffer.is_empty() {
+            let late = self.chunks.get(s.late.clone()).unwrap_or_default().iter().map(|c| (c.first, c.last, self.chunk(c)));
+            merge_late_parts(late, self.buffer.get(s.buffer.clone()).unwrap_or_default(), start, from, to, ts, values)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testkit::Rng;
+
+    /// A series copied reads as the series did, to the bit, over any range, its late writes and
+    /// its open chunk among them; its span the series'.
+    #[test]
+    fn a_copied_head_reads_as_the_series() {
+        let mut rng = Rng::new(23);
+        let mut heads = Heads::default();
+        for round in 0..200 {
+            let mut s = HeadSeries::default();
+            let mut t = 0i64;
+            for _ in 0..rng.below(1500) {
+                if rng.below(4) == 0 && t > 0 {
+                    let _ = s.append(rng.below(t as u64 + 1) as i64, rng.f64());
+                } else {
+                    t += 1 + rng.below(50) as i64;
+                    let _ = s.append(t, rng.f64());
+                }
+            }
+            // Many series into one arena, as a snapshot copies them.
+            if round % 10 == 0 {
+                heads.clear();
+            }
+            let at = heads.copy(&s);
+            assert_eq!(heads.span(at), s.span());
+            for _ in 0..8 {
+                let from = rng.below(t.max(1) as u64) as i64 - 50;
+                let to = from + rng.below(30_000) as i64;
+                let (mut ts, mut vs, mut ts2, mut vs2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                s.read(from, to, &mut ts, &mut vs).unwrap();
+                heads.read(at, from, to, &mut ts2, &mut vs2).unwrap();
+                assert_eq!(ts, ts2);
+                assert_eq!(vs.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), vs2.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+            }
+        }
+    }
 
     #[test]
     fn a_series_reads_back_what_was_written_across_chunks_and_ranges() {

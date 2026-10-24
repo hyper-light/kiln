@@ -1558,3 +1558,97 @@ fn a_batch_with_a_row_that_is_not_utf_8_is_refused_as_it_is_applied() {
         assert!(within_logs(bad, 3, records[0].ts, None).is_err(), "{what}: taken past the horizon");
     }
 }
+
+/// A snapshot of series (`Store::metrics_into`) reads as the store did when it was taken, to the bit,
+/// whatever the store does after: more writes (in order and late), a cut, merges and blocks dropped
+/// past retention; its samples and its rollups alike. A budget of bytes holds it to a part of the
+/// series asked, one at the least.
+#[test]
+fn a_snapshot_reads_as_the_store_did_whatever_it_does_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let mut rng = Rng::new(41);
+    let keys: Vec<SeriesKey> = (0..60u32).map(|i| SeriesKey::new("snap", [("s", i.to_string().as_str())], [Kind::Gauge, Kind::Count, Kind::Counter][i as usize % 3]).unwrap()).collect();
+    let hour = 3_600_000i64;
+    let start = 1_700_000_000_000i64;
+    for h in 0..4i64 {
+        let mut b = Builder::new();
+        for k in &keys {
+            b.define(k);
+            b.run(k.fp, (0..60).map(|m| (start + h * hour + m * 60_000, rng.f64())));
+        }
+        s.apply(&b.finish()).unwrap();
+        s.cut(Point { index: h as u64 + 1, term: 1 }).unwrap();
+    }
+    // The head: its own samples, and late writes over the blocks' times.
+    let mut b = Builder::new();
+    for k in &keys {
+        b.define(k);
+        b.run(k.fp, (0..40).map(|m| (start + 4 * hour + m * 60_000, rng.f64())));
+    }
+    for k in keys.iter().step_by(5) {
+        b.define(k);
+        b.run(k.fp, (0..10).map(|m| (start + 2 * hour + m * 77_000 + 5, rng.f64())));
+    }
+    s.apply(&b.finish()).unwrap();
+    let mut ids = Vec::new();
+    s.select(&Selector::metric("snap"), &mut ids);
+    let (from, to) = (start + hour / 2, start + 5 * hour);
+    let roll_of = |kind: Kind| Roll { width: 300_000, from, to, kind, cols: &[] };
+    let read = |src: &dyn Fn(u32, &mut Scratch, &mut Vec<i64>, &mut Vec<f64>, &mut Rolled, bool) -> Result<(), StoreError>| -> Vec<(u32, Vec<(i64, u64)>, Vec<(i64, u32)>)> {
+        let mut scratch = Scratch::default();
+        let mut out = Vec::new();
+        for &id in &ids {
+            for rolled_read in [false, true] {
+                let (mut ts, mut vs, mut rolled) = (Vec::new(), Vec::new(), Rolled::default());
+                src(id, &mut scratch, &mut ts, &mut vs, &mut rolled, rolled_read).unwrap();
+                let windows = rolled.start.iter().zip(&rolled.n).map(|(&s, &n)| (s, n)).collect();
+                out.push((id, ts.into_iter().zip(vs.into_iter().map(f64::to_bits)).collect(), windows));
+            }
+        }
+        out
+    };
+    let kinds: std::collections::HashMap<u32, Kind> = ids.iter().map(|&id| (id, s.series(id).unwrap().kind())).collect();
+    let before = read(&|id, scratch, ts, vs, rolled, r| if r { s.read_rolled(id, from, to, &roll_of(kinds[&id]), scratch, ts, vs, rolled) } else { s.read_with(id, from, to, scratch, ts, vs) });
+    // Every series in one snapshot; and parts of a small budget, together every series.
+    let mut whole = MetricsAt::default();
+    assert_eq!(s.metrics_into(&ids, usize::MAX, &mut whole), ids.len());
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < ids.len() {
+        let mut at = MetricsAt::default();
+        let n = s.metrics_into(&ids[i..], 1, &mut at);
+        assert!(n >= 1 && at.len() == n);
+        parts.push((i..i + n, at));
+        i += n;
+    }
+    assert!(parts.len() > 1);
+    // What the store does after.
+    let mut b = Builder::new();
+    for k in &keys {
+        b.define(k);
+        b.run(k.fp, (0..20).map(|m| (start + 2 * hour + m * 61_000 + 7, rng.f64())));
+        b.run(k.fp, (40..60).map(|m| (start + 4 * hour + m * 60_000, rng.f64())));
+    }
+    s.apply(&b.finish()).unwrap();
+    s.cut(Point { index: 10, term: 1 }).unwrap();
+    s.compact().unwrap();
+    s.retain_logical(start + hour, start + hour);
+    s.drop_expired().unwrap();
+    for &id in &ids {
+        assert_eq!(whole.kind(id), Some(kinds[&id]));
+    }
+    let snap = |at: &MetricsAt| read(&|id, scratch, ts, vs, rolled, r| if r { at.read_rolled(id, from, to, &roll_of(kinds[&id]), scratch, ts, vs, rolled) } else { at.read_with(id, from, to, scratch, ts, vs) });
+    assert_eq!(snap(&whole), before, "a snapshot of every series");
+    let mut joined = Vec::new();
+    for (range, at) in &parts {
+        let mut got = snap(at);
+        // A part holds its own series alone: the others read as none.
+        got.retain(|(id, ..)| ids[range.clone()].contains(id));
+        joined.extend(got);
+    }
+    assert_eq!(joined, before, "snapshots of parts");
+    // And the store itself has moved on.
+    let after = read(&|id, scratch, ts, vs, rolled, r| if r { s.read_rolled(id, from, to, &roll_of(kinds[&id]), scratch, ts, vs, rolled) } else { s.read_with(id, from, to, scratch, ts, vs) });
+    assert_ne!(after, before);
+}

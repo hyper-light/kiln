@@ -166,6 +166,12 @@ impl Encoder {
         ChunkRef { bits: self.w.view(), count: self.count }
     }
 
+    /// Its bytes as [`Encoder::finish`] would leave them, appended to `out`: a chunk of them reads
+    /// as [`Encoder::view`] does. The encoder is left as it is.
+    pub fn copy_bytes_into(&self, out: &mut Vec<u8>) {
+        self.w.copy_into(out);
+    }
+
     /// Forgets its samples, keeping its allocation.
     pub fn clear(&mut self) {
         self.w.clear();
