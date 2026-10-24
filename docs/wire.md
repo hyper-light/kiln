@@ -126,6 +126,21 @@ said as `kiln_runner_net_frames_dropped{runner,lane,reason}`. A frame QUIC took 
 connection isn't counted here: the channel resends it after the reconnect, as it does what the
 queue let go.
 
+## Revisions
+
+Each of the server's copies of a session counts the updates it takes: its revision (`rev`). The
+numbers belong to one server process, so they're said with that process's incarnation (`born`).
+Every frame a viewer gets carries the copy's revision, and an attach starts with it (`open` or
+`resumed`). A viewer that reconnects says what it has (`?after=<born>.<rev>`). It then gets:
+- `resumed`;
+- the newest meta, state, changes and files;
+- only the events changed since that revision.
+
+It gets the whole session (`open`) only when the copy can't resume it: another incarnation, an
+`Open` or `Reset` since, or a revision past what the copy has. A viewer that falls behind is caught
+up the same way, from the last revision it was sent, and the live frames that catch-up already
+holds are skipped.
+
 ## Runner to server: `AgentMsg`
 
 | Message | Class | Why | Today |
@@ -306,7 +321,8 @@ The session socket's commands up are `Command`s, each classed in its own table.
 
 | Socket | Way | Message | Class | Why | Today |
 |---|---|---|---|---|---|
-| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent. | Every attach sends the whole session. |
+| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`). | Sent on an attach without `after=`, or when the copy can't resume it. |
+| `/api/harness/sessions/:id/ws` | down | `resumed` | stream | Starts a resume (`?after=<born>.<rev>`): the newest meta, state, changes and files, then only the events changed since. | Sent when the copy can resume the viewer. |
 | `/api/harness/sessions/:id/ws` | down | `meta` | state | The newest wins. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `state` | state | The newest wins. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `state_patch` | state | What changed since the last state. | As its class says. |

@@ -57,6 +57,21 @@ struct Mirror {
     events: Vec<Value>,
     index: HashMap<String, usize>,
     out: Broadcast<Frame>,
+    /// Every update this copy has taken, counted: its revision, what a viewer resumes from
+    /// (docs/wire.md, "Revisions"). Under [`born`]: another server process's numbers aren't these.
+    rev: u64,
+    /// The revision it last started over at (an Open, a Reset): a viewer that had it from before
+    /// that starts over too.
+    reset_at: u64,
+    /// The revision each event last changed at, by its id.
+    changed: HashMap<String, u64>,
+}
+
+/// This server process's incarnation: viewers resume from a copy's revision only under it. 53
+/// bits: it travels as a JSON number, which a browser reads exactly only up to 2^53.
+pub fn born() -> u64 {
+    static BORN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BORN.get_or_init(|| rand::random::<u64>() >> 11)
 }
 
 impl Mirror {
@@ -72,7 +87,15 @@ impl Mirror {
             events: Vec::new(),
             index: HashMap::new(),
             out: Broadcast::new(FANOUT),
+            rev: 0,
+            reset_at: 0,
+            changed: HashMap::new(),
         }
+    }
+
+    /// A frame to this copy's viewers, its revision in it.
+    fn send(&self, frame: Frame) {
+        self.out.send(frame.stamped(self.rev));
     }
 
     /// The state as a frame for its viewers, with what changed in it since the last one.
@@ -85,15 +108,18 @@ impl Mirror {
         let text = json!({"t": "state", "state": self.state}).to_string();
         let patch = state_patch(&self.sent, &self.state);
         self.sent.clone_from(&self.state);
-        Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from) })
+        Some(Frame { text: Arc::from(text), patch: patch.map(Arc::from), rev: self.rev })
     }
 
     fn reindex(&mut self) {
         self.index = self.events.iter().enumerate().filter_map(|(i, e)| Some((e.get("id")?.as_str()?.to_owned(), i))).collect();
+        let index = &self.index;
+        self.changed.retain(|id, _| index.contains_key(id));
     }
 
     fn upsert(&mut self, e: Value) {
         let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_owned) else { return };
+        self.changed.insert(id.clone(), self.rev);
         if let Some(slot) = self.index.get(&id).and_then(|i| self.events.get_mut(*i)) {
             *slot = e;
             return;
@@ -112,13 +138,20 @@ impl Mirror {
             && let Some(Value::String(s)) = e.get_mut("text")
         {
             s.push_str(text);
+            self.changed.insert(id.to_owned(), self.rev);
         }
+    }
+
+    /// The copy starts over (an Open, a Reset): a viewer from before it can't resume.
+    fn started_over(&mut self) {
+        self.reset_at = self.rev;
+        self.changed.clear();
     }
 
     /// The frames that bring a new viewer to the current state; `files`, what's kept of the files
     /// its messages mention (`Keeper::frame`), goes ahead of the events.
     fn snapshot(&self, files: Option<String>) -> Vec<String> {
-        let mut out = vec![json!({"t": "open", "info": self.info}).to_string()];
+        let mut out = vec![json!({"t": "open", "info": self.info, "rev": self.rev, "born": born()}).to_string()];
         if !self.meta.is_null() {
             out.push(json!({"t": "meta", "meta": self.meta}).to_string());
         }
@@ -146,6 +179,47 @@ impl Mirror {
         }
         out
     }
+
+    /// What brings a viewer that has this copy through revision `after` up to now: `resumed` (its
+    /// info and revision), the newest meta, state and changes, `files`, then only the events changed
+    /// since. None when it can't be resumed: it started over since (an Open, a Reset), or `after` is
+    /// past what it has (another process's number).
+    fn resume(&self, after: u64, files: Option<String>) -> Option<Vec<String>> {
+        if after < self.reset_at || after > self.rev {
+            return None;
+        }
+        let mut out = vec![json!({"t": "resumed", "info": self.info, "rev": self.rev, "born": born()}).to_string()];
+        if !self.meta.is_null() {
+            out.push(json!({"t": "meta", "meta": self.meta}).to_string());
+        }
+        if !self.state.is_null() {
+            out.push(json!({"t": "state", "state": self.state}).to_string());
+        }
+        if !self.changes.is_null() {
+            out.push(json!({"t": "changes", "files": self.changes}).to_string());
+        }
+        out.extend(files);
+        let mut batch: Vec<&Value> = Vec::new();
+        let mut size = 0usize;
+        for e in &self.events {
+            let since = e.get("id").and_then(Value::as_str).and_then(|id| self.changed.get(id)).is_some_and(|r| *r > after);
+            if !since {
+                continue;
+            }
+            let n = e.to_string().len();
+            if size + n > 256 * 1024 && !batch.is_empty() {
+                out.push(json!({"t": "events", "events": batch}).to_string());
+                batch = Vec::new();
+                size = 0;
+            }
+            size += n;
+            batch.push(e);
+        }
+        if !batch.is_empty() {
+            out.push(json!({"t": "events", "events": batch}).to_string());
+        }
+        Some(out)
+    }
 }
 
 /// How a command fared.
@@ -161,6 +235,8 @@ pub enum Sent {
 pub struct Attachment {
     pub frames: Vec<String>,
     pub live: async_broadcast::Receiver<Frame>,
+    /// The copy's revision as of `frames`.
+    pub rev: u64,
 }
 
 /// A live frame for a session's viewers. A state comes as well as only what changed since the
@@ -170,11 +246,24 @@ pub struct Attachment {
 pub struct Frame {
     pub text: Arc<str>,
     pub patch: Option<Arc<str>>,
+    /// The copy's revision as it went (`"rev"` in its JSON): what its viewer resumes from.
+    pub rev: u64,
 }
 
 impl Frame {
     pub fn of(text: String) -> Self {
-        Self { text: Arc::from(text), patch: None }
+        Self { text: Arc::from(text), patch: None, rev: 0 }
+    }
+
+    /// The frame with its copy's revision in it, as `"rev"`.
+    fn stamped(self, rev: u64) -> Self {
+        let stamp = |t: &str| -> Arc<str> {
+            match t.strip_suffix('}') {
+                Some(head) if head.len() > 1 => Arc::from(format!("{head},\"rev\":{rev}}}")),
+                _ => Arc::from(t),
+            }
+        };
+        Self { text: stamp(&self.text), patch: self.patch.as_deref().map(stamp), rev }
     }
 
     /// The frame for a viewer that takes state patches, or one that doesn't.
@@ -575,7 +664,7 @@ impl Registry {
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
                 if let Some(frame) = m.state_frame() {
-                    m.out.send(frame);
+                    m.send(frame);
                 }
             }
             m.info.clone()
@@ -901,12 +990,15 @@ impl Registry {
                 }
                 return;
             };
+            m.rev = m.rev.saturating_add(1);
             match &u {
-                Update::Open { .. } | Update::Reply { .. } => {}
+                Update::Open { .. } => m.started_over(),
+                Update::Reply { .. } => {}
                 Update::Closed => gone = true,
                 Update::Reset { .. } => {
                     m.events.clear();
                     m.index.clear();
+                    m.started_over();
                 }
                 Update::State { state } => {
                     m.state = serde_json::to_value(state).unwrap_or(Value::Null);
@@ -969,7 +1061,7 @@ impl Registry {
                 _ => None,
             };
             if let Some(frame) = frame {
-                m.out.send(frame);
+                m.send(frame);
             }
             if gone {
                 g.remove(id);
@@ -1058,7 +1150,7 @@ impl Registry {
                 .collect();
             for id in &gone {
                 if let Some(m) = g.remove(id) {
-                    m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
+                    m.send(Frame::of(json!({"t": "closed"}).to_string()));
                 }
             }
             gone
@@ -1083,7 +1175,7 @@ impl Registry {
                     o.insert("status".into(), json!("disconnected"));
                 }
                 if let Some(frame) = m.state_frame() {
-                    m.out.send(frame);
+                    m.send(frame);
                 }
                 infos.push(m.info.clone());
             }
@@ -1107,7 +1199,7 @@ impl Registry {
                     o.insert("status".into(), json!("disconnected"));
                 }
                 if let Some(frame) = m.state_frame() {
-                    m.out.send(frame);
+                    m.send(frame);
                 }
                 infos.push(m.info.clone());
             }
@@ -1119,11 +1211,22 @@ impl Registry {
 
     /// Join a session's stream. None when there is no such session.
     pub fn attach(&self, id: &str) -> Option<Attachment> {
+        self.attach_from(id, None)
+    }
+
+    /// Join a session's stream as a viewer that had it through revision `after` (`(born, rev)`):
+    /// what it lacks if the copy can resume it (the same process, nothing started over since),
+    /// else all of it. None when there is no such session.
+    pub fn attach_from(&self, id: &str, after: Option<(u64, u64)>) -> Option<Attachment> {
         // What's kept is read before the mirrors are locked: the first time, off disk.
         let files = self.keeper.frame(id);
         let g = self.mirrors.lock();
         let m = g.get(id)?;
-        Some(Attachment { frames: m.snapshot(files), live: m.out.subscribe() })
+        let frames = match after.filter(|(b, _)| *b == born()) {
+            Some((_, rev)) => m.resume(rev, files.clone()).unwrap_or_else(|| m.snapshot(files)),
+            None => m.snapshot(files),
+        };
+        Some(Attachment { frames, live: m.out.subscribe(), rev: m.rev })
     }
 
     /// Catch-up frames for a viewer that fell behind.
@@ -1132,10 +1235,17 @@ impl Registry {
         self.mirrors.lock().get(id).map(|m| m.snapshot(files))
     }
 
+    /// Catch-up frames for a viewer that fell behind having had revision `rev`: what it missed, or
+    /// all of it when that can't be told apart.
+    pub fn frames_since(&self, id: &str, rev: u64) -> Option<(Vec<String>, u64)> {
+        let files = self.keeper.frame(id);
+        self.mirrors.lock().get(id).map(|m| (m.resume(rev, files.clone()).unwrap_or_else(|| m.snapshot(files)), m.rev))
+    }
+
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
     pub fn files_added(&self, id: &str, added: &[Kept]) {
         if let Some(m) = self.mirrors.lock().get(id) {
-            m.out.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
+            m.send(Frame::of(json!({"t": "files", "files": added}).to_string()));
         }
     }
 
@@ -1496,7 +1606,7 @@ impl Registry {
         // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(m) = self.mirrors.lock().remove(id) {
-                m.out.send(Frame::of(json!({"t": "closed"}).to_string()));
+                m.send(Frame::of(json!({"t": "closed"}).to_string()));
             }
             self.keeper.forget(id);
             self.visuals.forget(id);
@@ -1570,6 +1680,69 @@ fn proposed_in(e: &super::model::Event) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One update taken by a copy, as `Registry::ingest_from` takes it: its revision first.
+    fn took(m: &mut Mirror, f: impl FnOnce(&mut Mirror)) {
+        m.rev += 1;
+        f(m);
+    }
+
+    fn event(id: &str, text: &str) -> Value {
+        json!({"id": id, "kind": "assistant", "text": text})
+    }
+
+    /// The ids of the events in a viewer's frames, in order.
+    fn ids(frames: &[String]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+            .filter(|f| f.get("t").and_then(Value::as_str) == Some("events"))
+            .flat_map(|f| f.get("events").and_then(Value::as_array).cloned().unwrap_or_default())
+            .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn a_viewer_resumes_with_only_what_changed() {
+        let mut m = Mirror::new(Info::default(), Location::Local);
+        for id in ["e1", "e2", "e3"] {
+            took(&mut m, |m| m.upsert(event(id, "x")));
+        }
+        let had = m.rev;
+        took(&mut m, |m| m.upsert(event("e4", "new")));
+        took(&mut m, |m| m.append("e2", " more"));
+        let frames = m.resume(had, None).unwrap_or_default();
+        assert!(frames.first().is_some_and(|f| f.contains("\"t\":\"resumed\"")), "it resumes: {frames:?}");
+        assert_eq!(ids(&frames), vec!["e2".to_owned(), "e4".to_owned()], "only what changed since, in the timeline's order");
+        // Nothing changed since now: only the copy's newest state and its revision.
+        assert_eq!(m.resume(m.rev, None).map(|f| ids(&f)), Some(Vec::new()));
+        // A revision past what it has is another process's: not resumed.
+        assert!(m.resume(m.rev + 1, None).is_none());
+    }
+
+    #[test]
+    fn a_copy_that_started_over_is_sent_whole() {
+        let mut m = Mirror::new(Info::default(), Location::Local);
+        took(&mut m, |m| m.upsert(event("e1", "x")));
+        let had = m.rev;
+        took(&mut m, |m| {
+            m.events.clear();
+            m.index.clear();
+            m.started_over();
+        });
+        took(&mut m, |m| m.upsert(event("e9", "after")));
+        assert!(m.resume(had, None).is_none(), "a viewer from before the reset starts over");
+        assert_eq!(m.resume(m.reset_at, None).map(|f| ids(&f)), Some(vec!["e9".to_owned()]));
+    }
+
+    #[test]
+    fn a_frame_says_its_copys_revision() -> anyhow::Result<()> {
+        let f = Frame::of(json!({"t": "events", "events": []}).to_string()).stamped(7);
+        let v: Value = serde_json::from_str(&f.text)?;
+        assert_eq!(v.get("rev").and_then(Value::as_u64), Some(7));
+        assert_eq!(f.rev, 7);
+        Ok(())
+    }
 
     /// A plan its main thread proposes (plan mode) is one to keep; a subagent's, another tool's,
     /// or one without words isn't.

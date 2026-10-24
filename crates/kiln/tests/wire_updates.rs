@@ -15,59 +15,22 @@
 
 mod common;
 
-use std::io::{Read as _, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::agents::{self, Talk, frame, just_connected, socket};
 use common::{Options, http, start};
 use serde_json::{Value, json};
 
-/// The runner, stopped when the test ends.
-struct Runner(Child);
-
-impl Drop for Runner {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// A runner of the server at `port`, its link cut for `down` every `every`, the stand-in harness
-/// first on its PATH; its log at `log`.
-fn runner(dir: &std::path::Path, port: u16, name: &str, every: &str, down: &str, lines: usize) -> anyhow::Result<(Runner, std::path::PathBuf)> {
+/// A runner of the server at `port` whose link is cut for `down` every `every`, the stand-in
+/// harness saying `lines` a turn, a tenth of a second apart; its log.
+fn runner(dir: &std::path::Path, port: u16, name: &str, every: &str, down: &str, lines: usize) -> anyhow::Result<(agents::Runner, std::path::PathBuf)> {
     runner_with(dir, port, name, &format!("drop={every},down={down}"), lines)
 }
 
-/// A runner of the server at `port` with the faults `chaos` says (a `kiln agent --chaos` spec).
-fn runner_with(dir: &std::path::Path, port: u16, name: &str, chaos: &str, lines: usize) -> anyhow::Result<(Runner, std::path::PathBuf)> {
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin)?;
-    let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude/claude");
-    std::fs::copy(&fake, bin.join("claude"))?;
-    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))?;
-    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
-    let home = dir.join("home");
-    std::fs::create_dir_all(&home)?;
-    let log_path = dir.join("runner.log");
-    let log = std::fs::File::create(&log_path)?;
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let child = Command::new(env!("CARGO_BIN_EXE_kiln"))
-        .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name, "--chaos", chaos])
-        .arg("--work-dir")
-        .arg(dir.join("runner-work"))
-        .arg("--state-dir")
-        .arg(dir.join("runner-state"))
-        .env("HOME", &home)
-        .env("PATH", &path)
-        .env("NO_COLOR", "1")
-        .env("FAKE_CLAUDE_LINES", lines.to_string())
-        .env("FAKE_CLAUDE_EVERY_MS", "100")
-        .env_remove("KILN_REACH_SOCK")
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .spawn()?;
-    Ok((Runner(child), log_path))
+/// A runner of the server at `port` with the faults `chaos` says (a `kiln agent --chaos` spec),
+/// the stand-in harness saying `lines` a turn, a tenth of a second apart; its log.
+fn runner_with(dir: &std::path::Path, port: u16, name: &str, chaos: &str, lines: usize) -> anyhow::Result<(agents::Runner, std::path::PathBuf)> {
+    agents::runner(dir, port, name, Some(chaos), Talk { lines, every_ms: 100 })
 }
 
 /// How long each cut lasts: 30 seconds, or `KILN_WIRE_CUT` (`60s` shows a minute's cut holds).
@@ -75,69 +38,9 @@ fn cut() -> String {
     std::env::var("KILN_WIRE_CUT").unwrap_or_else(|_| "30s".to_owned())
 }
 
-/// Waits for the runner's next connection to begin, then a moment more.
-fn just_connected(log: &std::path::Path, deadline: Instant) {
-    let count = || std::fs::read_to_string(log).unwrap_or_default().matches("connected to server").count();
-    let seen = count();
-    while count() == seen && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    std::thread::sleep(Duration::from_millis(500));
-}
-
-/// One WebSocket frame from the server (unmasked): its opcode and payload.
-fn frame(s: &mut std::net::TcpStream) -> anyhow::Result<(u8, Vec<u8>)> {
-    let h = take(s, 2)?;
-    let (b0, b1) = (h.first().copied().unwrap_or(0), h.get(1).copied().unwrap_or(0));
-    let len = match b1 & 0x7f {
-        126 => take(s, 2)?.iter().fold(0usize, |a, b| (a << 8) | usize::from(*b)),
-        127 => take(s, 8)?.iter().fold(0usize, |a, b| (a << 8) | usize::from(*b)),
-        n => usize::from(n),
-    };
-    Ok((b0 & 0x0f, take(s, len)?))
-}
-
-/// A WebSocket to `path` on the server at `port`, upgraded.
-fn socket(port: u16, token: &str, path: &str) -> anyhow::Result<std::net::TcpStream> {
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
-    s.set_read_timeout(Some(Duration::from_secs(60)))?;
-    write!(
-        s,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    )?;
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        head.extend(take(&mut s, 1)?);
-        anyhow::ensure!(head.len() < 16 << 10, "no handshake answer: {}", String::from_utf8_lossy(&head));
-    }
-    anyhow::ensure!(head.starts_with(b"HTTP/1.1 101"), "not upgraded: {}", String::from_utf8_lossy(&head));
-    Ok(s)
-}
-
-/// Reads exactly `n` bytes.
-fn take(s: &mut std::net::TcpStream, n: usize) -> anyhow::Result<Vec<u8>> {
-    let mut b = vec![0u8; n];
-    s.read_exact(&mut b)?;
-    Ok(b)
-}
-
-/// What a viewer gets on attaching to session `id`: the server's text frames (unmasked), up to
-/// the `synced` that ends the snapshot.
+/// What a viewer gets on attaching to session `id`: its text frames up to `synced`.
 fn snapshot(port: u16, token: &str, id: &str) -> anyhow::Result<Vec<Value>> {
-    let mut s = socket(port, token, &format!("/api/harness/sessions/{id}/ws"))?;
-    let mut frames = Vec::new();
-    loop {
-        let (op, payload) = frame(&mut s)?;
-        if op != 1 {
-            continue;
-        }
-        let v: Value = serde_json::from_slice(&payload)?;
-        let synced = v.get("t").and_then(Value::as_str) == Some("synced");
-        frames.push(v);
-        if synced {
-            return Ok(frames);
-        }
-    }
+    agents::attach(port, token, id, "").map(|(frames, _)| frames)
 }
 
 #[test]

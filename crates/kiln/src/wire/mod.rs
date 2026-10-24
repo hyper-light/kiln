@@ -376,6 +376,7 @@ const LEG_TERMINAL: &str = "/api/ci/legs/:id/terminal";
 /// each classed by [`command_class`].
 pub const SOCKETS: &[SocketMsg] = &[
     msg(SESSION, Way::Down, "open", Class::Stream),
+    msg(SESSION, Way::Down, "resumed", Class::Stream),
     msg(SESSION, Way::Down, "meta", Class::State),
     msg(SESSION, Way::Down, "state", Class::State),
     msg(SESSION, Way::Down, "state_patch", Class::State),

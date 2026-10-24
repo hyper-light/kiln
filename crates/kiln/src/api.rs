@@ -4637,12 +4637,19 @@ struct Takes {
     packed: bool,
     /// `patch=state`: a state as only what changed in it (`state_patch`), after the snapshot's.
     patches: bool,
+    /// `after=<born>.<rev>`: it had the session through that revision of this server's copy
+    /// (docs/wire.md, "Revisions"), and gets only what it lacks when the copy can say.
+    after: Option<(u64, u64)>,
 }
 
 impl Takes {
     fn of(query: Option<&str>) -> Self {
         let has = |p: &str| query.is_some_and(|q| q.split('&').any(|x| x == p));
-        Self { packed: has("z=gzip"), patches: has("patch=state") }
+        let after = query
+            .and_then(|q| q.split('&').find_map(|x| x.strip_prefix("after=")))
+            .and_then(|v| v.split_once('.'))
+            .and_then(|(b, r)| Some((b.parse().ok()?, r.parse().ok()?)));
+        Self { packed: has("z=gzip"), patches: has("patch=state"), after }
     }
 }
 
@@ -4693,19 +4700,29 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
-    let Some(att) = hub.harness.attach(&id) else {
+    let Some(att) = hub.harness.attach_from(&id, takes.after) else {
         tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
         return Ok(());
     };
     send_snapshot(&mut tx, att.frames, takes.packed).await?;
     let mut live = att.live;
+    // The newest revision of the copy this viewer has: what it resumes from if it falls behind,
+    // and what live frames it already has (a catch-up holds them) are told by.
+    let mut have = att.rev;
     loop {
         futures::select_biased! {
             f = live.recv().fuse() => match f {
-                Ok(frame) => tx.send(ws::text(frame.for_viewer(takes.patches))).await?,
+                Ok(frame) if frame.rev != 0 && frame.rev <= have => {}
+                Ok(frame) => {
+                    have = have.max(frame.rev);
+                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+                }
                 Err(async_broadcast::RecvError::Overflowed(_)) => {
-                    // Fell behind: start over from the current state (it begins with "open").
-                    send_snapshot(&mut tx, hub.harness.frames(&id).unwrap_or_default(), takes.packed).await?;
+                    // Fell behind: what it missed since what it has (it begins with "resumed"),
+                    // or all of it when the copy can't tell (it begins with "open").
+                    let (frames, now) = hub.harness.frames_since(&id, have).unwrap_or_default();
+                    have = have.max(now);
+                    send_snapshot(&mut tx, frames, takes.packed).await?;
                 }
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },
