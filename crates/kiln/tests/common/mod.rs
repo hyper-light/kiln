@@ -36,6 +36,22 @@ impl Proc {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// Asks it to stop as an operator's stop does: SIGTERM on Unix; on Windows, which has no
+    /// SIGTERM, its stdin closed, as kiln's supervisor asks there.
+    pub fn ask_to_stop(&mut self) {
+        #[cfg(unix)]
+        {
+            // kiln itself: the process, or under samply (`KOBS_PROFILE`) its child. Not a child of
+            // kiln's own (a `journalctl` it reads, a `git` it runs) when kiln is the process.
+            let pid = self.child.id();
+            let profiled = std::env::var("KOBS_PROFILE").is_ok_and(|d| !d.is_empty());
+            let kid = profiled.then(|| std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()).flatten().and_then(|k| k.split_whitespace().next().map(str::to_owned));
+            let _ = Command::new("kill").args(["-TERM", &kid.unwrap_or_else(|| pid.to_string())]).status();
+        }
+        #[cfg(windows)]
+        drop(self.child.stdin.take());
+    }
 }
 
 impl Drop for Proc {
@@ -161,7 +177,21 @@ host_seconds = {host_seconds}
             _ => Command::new(BIN),
         };
         // A clean environment and a home of its own: nothing of this machine's leaks in.
-        c.env_clear().env("HOME", home).env("PATH", "/usr/local/bin:/usr/bin:/bin").env("LANG", "C.UTF-8").env("RUST_LOG", "info,kiln::observe=debug").env("KILN_LOG", "info,kiln::observe=debug");
+        c.env_clear().env("HOME", home).env("LANG", "C.UTF-8").env("RUST_LOG", "info,kiln::observe=debug").env("KILN_LOG", "info,kiln::observe=debug");
+        #[cfg(not(windows))]
+        c.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        // Windows: the profile is the home kiln reads first, a process needs its system's folders,
+        // and kiln is asked to stop by its stdin closing ([`Proc::ask_to_stop`]).
+        #[cfg(windows)]
+        {
+            c.env("USERPROFILE", home).env("APPDATA", home.join("AppData").join("Roaming")).env("LOCALAPPDATA", home.join("AppData").join("Local"));
+            for k in ["SystemRoot", "SystemDrive", "windir", "PATH", "PATHEXT", "TEMP", "TMP", "ComSpec"] {
+                if let Some(v) = std::env::var_os(k) {
+                    c.env(k, v);
+                }
+            }
+            c.env("KILN_SUPERVISED", "1").stdin(Stdio::piped());
+        }
         // The C library's allocator tuned from outside, for a test that measures it.
         if let Ok(t) = std::env::var("GLIBC_TUNABLES") {
             c.env("GLIBC_TUNABLES", t);
@@ -226,10 +256,11 @@ host_seconds = {host_seconds}
         Ok(())
     }
 
-    /// Stops runner `name` as an operator's stop does (SIGTERM), waiting for it to be gone.
+    /// Stops runner `name` as an operator's stop does ([`Proc::ask_to_stop`]), waiting for it to be
+    /// gone.
     pub fn stop_runner(&mut self, name: &str) {
         if let Some(Some(mut p)) = self.runners.insert(name.to_owned(), None) {
-            let _ = Command::new("kill").args(["-TERM", &p.child.id().to_string()]).status();
+            p.ask_to_stop();
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(60) {
                 if matches!(p.child.try_wait(), Ok(Some(_))) {
@@ -252,12 +283,8 @@ host_seconds = {host_seconds}
     pub fn stop_gently(&mut self) {
         let mut procs: Vec<Proc> = self.runners.values_mut().filter_map(Option::take).collect();
         procs.extend(self.server.take());
-        for p in &procs {
-            // kiln itself: the process, or under samply its child.
-            let pid = p.child.id();
-            let kids = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
-            let target = kids.split_whitespace().next().map_or_else(|| pid.to_string(), str::to_owned);
-            let _ = Command::new("kill").args(["-TERM", &target]).status();
+        for p in &mut procs {
+            p.ask_to_stop();
         }
         for mut p in procs {
             let start = Instant::now();
