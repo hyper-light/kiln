@@ -783,6 +783,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     });
     let uplink = Uplink(up_tx);
+    // Agent sessions handed to this machine's newer runner process go by way of the server.
+    crate::harness::handing::install(uplink.0.clone());
     // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
     let probing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if !o.ephemeral && !o.outpost {
@@ -1585,7 +1587,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // What it can do past Build's 32 bits: it keeps the channel (docs/wire.md).
                 if !o.ephemeral {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -1644,6 +1646,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     tracing::warn!(%reason, "disconnected from server");
                     paths.disconnected();
+                    // No word comes for agent sessions on their way to a newer process: they go on here.
+                    crate::harness::handing::link_lost();
                 } else {
                     tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
                     // The path changed (to the tunnel, or back): dial that way now.
@@ -1949,8 +1953,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // the service this instance replaces (it checks for terminals itself).
                         let state_dir = o.state_dir.clone();
                         let me = instance_id.clone();
+                        let older = instance.clone();
                         crate::rt::spawn(async move {
-                            match crate::rt::blocking(move || crate::upgrade::retire(&state_dir, &me)).await {
+                            match crate::rt::blocking(move || crate::upgrade::retire(&state_dir, &me, &older)).await {
                                 Ok(Ok(crate::upgrade::Retired::Stopped(unit))) => {
                                     tracing::info!(%instance, %unit, "retired the older runner process: its service is stopped and disabled");
                                 }
@@ -1958,7 +1963,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     tracing::warn!(%instance, terminals = n, "the older runner process still holds terminals; leaving it running");
                                 }
                                 Ok(Ok(crate::upgrade::Retired::Nothing)) => {
-                                    tracing::info!(%instance, "an older runner process of this machine can be stopped; no instance here started its service, so it is left to whoever did");
+                                    tracing::info!(%instance, "an older runner process of this machine can be stopped, but not from here (it isn't running here, or it shares this runner's service)");
                                 }
                                 Ok(Err(e)) | Err(e) => tracing::warn!(%instance, error = %format!("{e:#}"), "could not retire the older runner process"),
                             }
@@ -2099,6 +2104,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::HarnessCmd { session, json } => {
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
                         match serde_json::from_str::<crate::harness::model::Command>(&json) {
+                            // The server's word on a hand-over to this machine's newer runner
+                            // process: never "gone here", even once this process has let go.
+                            Ok(crate::harness::model::Command::HandedOver { error }) => {
+                                if let Some(h) = &harness {
+                                    h.handed_over(&session, error);
+                                }
+                            }
                             Ok(c) if known => {
                                 if let Some(h) = &harness {
                                     h.command(&session, c);
@@ -2143,8 +2155,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let up = uplink.0.clone();
                                 crate::rt::spawn(async move {
                                     let h2 = h.clone();
-                                    let taken = crate::rt::blocking(move || h2.adopt_package(&path)).await.unwrap_or_else(|e| Err(format!("{e:#}")));
-                                    if let Err(why) = taken {
+                                    let (handover, taken) = crate::rt::blocking(move || h2.adopt_package(&path)).await.unwrap_or_else(|e| (false, Err(format!("{e:#}"))));
+                                    // Handed over by an older process of this machine: that one
+                                    // goes on with it unless this one took it, so it's told either
+                                    // way, and nothing else is said here.
+                                    if handover {
+                                        if let Err(why) = &taken {
+                                            tracing::warn!(%session, %why, "couldn't take over an agent session from this machine's older runner process");
+                                        } else {
+                                            tracing::info!(%session, "took over an agent session from this machine's older runner process");
+                                        }
+                                        crate::harness::handing::adopted(&session, taken.err()).await;
+                                    } else if let Err(why) = taken {
                                         tracing::warn!(%session, %why, "an agent session couldn't go on here");
                                         let spec = serde_json::json!({ "kind": "claude" }).to_string();
                                         for u in crate::harness::host::refusal(&session, &spec, &format!("Couldn't go on here: {why}")) {

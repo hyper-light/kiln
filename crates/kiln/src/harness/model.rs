@@ -1396,10 +1396,23 @@ pub enum Command {
         kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// `to` is this machine itself: the session goes to its newer runner process, which takes
+        /// this one's place (a take-over, `harness::handover`). Same disk, same home: nothing of
+        /// its folder or its harness's record travels, and it goes by way of the server.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        local: bool,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {
         text: String,
+    },
+    /// The server's word on a hand-over to the machine's newer runner process (a local
+    /// [`Command::MoveTo`]): taken over there (no `error`: this process lets go of the session),
+    /// or not (it goes on here). Never a person's; only to runners announcing
+    /// `proto::CAP_HANDOVER`.
+    HandedOver {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Set a control's value, or run an action (its argument, if any, in `value`).
     Control {

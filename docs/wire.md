@@ -237,8 +237,9 @@ takes a new bit, never one that means something already, even in the other direc
 | 32 | `CAP_WIRE` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side keeps the channel |
 | 33 | `CAP_NET_DROPS` | `ServerMsg::Caps` | the server takes what a runner's QUIC layer dropped (`NetDrops`) |
 | 34 | `CAP_INBOX` | `AgentMsg::Caps` | the runner's inbox takes `HarnessSend` (T3, CP-T3.2) |
+| 35 | `CAP_HANDOVER` | `AgentMsg::Caps`, `ServerMsg::Caps` | hand-overs between a machine's runner processes: an older one hands its sessions to the newest (`HarnessHandOver`, `HarnessAdopted`, `HandedOver`; releases.md, "One runner a machine") |
 
-Bits from 35 are free. Take the next one, and add its row here in the same change.
+Bits from 36 are free. Take the next one, and add its row here in the same change.
 
 ## Runner to server: `AgentMsg`
 
@@ -293,6 +294,8 @@ Bits from 35 are free. Take the next one, and add its row here in the same chang
 | `Wire` | carried (the channel) | A frame of the channel: numbered items carrying other messages, their ACKs and NACKs, wants, and what each side has after a reconnect. | New: `crate::wire::channel`. |
 | `Cluster` | carried (the cluster group) | The runner's learner of the cluster group (docs/p2p.md, P2): hyper-raft's messages, which it acknowledges and resends, and asks for where the server's records are before a read. | As its class says: a read whose ask goes unanswered in 2 s goes to the server. |
 | `NetDrops` | telemetry | What the runner's QUIC layer let go before it reached the wire, by lane and reason, counted from its start: each supersedes the last ("Loss below the channel"). | Sent with its samples once it changed, to a server announcing `CAP_NET_DROPS`. |
+| `HarnessHandOver` | stream | An agent session packed for the machine's newest runner process, in pieces: the server passes it on as `HarnessPackage`. | New: to a server announcing `CAP_HANDOVER`, on the conversation lane. |
+| `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -377,6 +380,7 @@ travels in `HarnessCmd`.
 | `SetEffort` | command, refused while away | As `SetMode`. | Fire-and-forget. |
 | `MoveTo` | command, refused while away | A move starts from a machine that's up. | Fire-and-forget. |
 | `Moving` | command, refused while away | A move's progress note. | Fire-and-forget. |
+| `HandedOver` | command, parked | How handing a session to the machine's newest runner process went: let go of it, or go on with it. Parked, so a process whose link dropped hears it once back, and never runs a session the newest took. | New: only to runners announcing `CAP_HANDOVER`. |
 | `Control` | command, refused while away | A control's value, or an action. | Fire-and-forget. |
 | `StopTask` | command, refused while away | Stops one task now. | Fire-and-forget. |
 | `Restart` | command, refused while away | Starts the harness again now. | Fire-and-forget. |

@@ -434,6 +434,9 @@ pub struct Seed {
     /// Where its folder stood in the sync log on the machine it left: it goes on once the folder
     /// here has taken the log that far.
     pub synced: Option<crate::sync::runner::Mark>,
+    /// Not from another machine: an older runner process of this one handed it over, taking its
+    /// leave (`super::handing`). Same folder, same record: only the process holding it changed.
+    pub local: bool,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -819,7 +822,11 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
         let folder = if core.state.cwd == sd.from_cwd { String::new() } else { format!(" (it works in {} here; it was in {})", core.state.cwd, sd.from_cwd) };
-        let mut text = format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from);
+        let mut text = if sd.local {
+            "Taken over by this machine's newer kiln runner, which replaces the older one — the conversation, its timeline and queue came along".to_owned()
+        } else {
+            format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from)
+        };
         // Interrupted to move: the turn goes on here, first thing.
         if sd.picks_up {
             text.push_str(", and the turn it was in the middle of goes on here");
@@ -1744,17 +1751,22 @@ struct Move {
     /// It goes on there in this harness (its conversation carried over), with this model.
     kind: Option<&'static Kind>,
     model: Option<String>,
+    /// To this machine's newer runner process, which takes this one's place (`super::handing`).
+    local: bool,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
 /// `now`: the turn under way isn't waited for (the caller interrupts it).
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>) -> Move {
+#[allow(clippy::too_many_arguments)]
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool) -> Move {
     let mut core = s.core.lock();
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
     let into = kind.map(|k| format!(", to go on in {}", k.name)).unwrap_or_default();
-    let text = if picks_up {
+    let text = if local {
+        if busy { "This machine's newer kiln runner takes this agent over when this turn ends".to_owned() } else { "This machine's newer kiln runner takes this agent over…".to_owned() }
+    } else if picks_up {
         format!("Moving to {to}{into} now: this turn stops here and goes on there")
     } else if busy {
         format!("Moving to {to}{into} when this turn ends")
@@ -1763,7 +1775,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note, picks_up, kind, model }
+    Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
 }
 
 /// How a move is getting on before it starts (its repository being copied there).
@@ -2083,13 +2095,57 @@ fn move_failed(s: &Session, mv: &Move, why: &str) {
     let mut core = s.core.lock();
     core.hold = false;
     core.touch_state();
-    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text: format!("Couldn't move to {}: {why} — it goes on here", mv.to) });
+    let text = if mv.local {
+        format!("This machine's newer kiln runner couldn't take this agent over: {why} — it goes on here")
+    } else {
+        format!("Couldn't move to {}: {why} — it goes on here", mv.to)
+    };
+    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+}
+
+/// Hand the session to this machine's newer runner process (its turn is over, its harness down),
+/// which takes this one's place: its timeline, state and queue, by way of the server. Same disk,
+/// same home: its folder and its harness's own record stay where they are, and it resumes from
+/// them there under the same harness session, as it would after a restart. A harness whose own
+/// record kiln doesn't keep (ACP agents, Antigravity) may not load it again: its conversation
+/// goes in words, as a move carries it. Ok once that process has taken it over.
+async fn hand_to_newer(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
+    use super::moving::Carry;
+    let spec = s.resume_spec();
+    let (resume, program) = (spec.resume.clone(), spec.program.clone());
+    let (events, state, cwd) = {
+        let core = s.core.lock();
+        // The note that it was about to go is this process's alone.
+        (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone())
+    };
+    let carry = match kind.protocol {
+        super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
+            super::moving::words(&events, "This conversation went on in this machine's newer kiln runner, which took the older one's place.")
+        }
+        _ => Carry::Nothing,
+    };
+    let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Its harness's own record is here already: it goes on from it, nothing started anew.
+    if matches!(pkg.carry, Carry::Nothing) {
+        pkg.spec.resume = resume;
+    }
+    pkg.spec.program = program;
+    pkg.handover = true;
+    let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
+    super::handing::send(&s.id, bytes).await
 }
 
 /// Hand the session to runner `mv.to` (its turn is over, its harness down): its record, timeline
 /// and queue, over reach. Ok once that runner has taken it over and runs it.
 async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(), String> {
     use super::moving::Carry;
+    if mv.local {
+        // Its process is a terminal's: it stays with the process it runs in until it ends.
+        if matches!(kind.protocol, super::kinds::Protocol::Terminal) {
+            return Err("an agent in a terminal stays where it runs until it ends".into());
+        }
+        return hand_to_newer(s, kind, mv).await;
+    }
     let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
     let me = reach.name().to_owned();
     let mut spec = s.resume_spec();
@@ -2584,8 +2640,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note, now, kind: into, model } => {
-                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model);
+                            Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                                let mv = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local);
                                 // Not waiting for the turn: it stops here, and goes on there.
                                 if mv.picks_up {
                                     adapter.command(&mut s.core.lock(), Command::Interrupt);
@@ -2922,8 +2978,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note, now, kind: into, model } => {
-                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model));
+                    Command::MoveTo { to, cwd, note, now, kind: into, model, local } => {
+                        moving = Some(move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local));
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),

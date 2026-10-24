@@ -82,6 +82,15 @@ pub fn machine_credentials(state_dir: &Path) -> anyhow::Result<(String, String)>
 /// Ask the server for this instance's own certificate, proving the machine's identity with a
 /// current certificate (the machine's, or this instance's own one being renewed) and its key.
 pub async fn fetch_certificate(server_url: &str, ca_pem: Option<&str>, name: &str, current_cert: &str, key_pem: &str) -> anyhow::Result<crate::agent::EnrollResponse> {
+    match ask_certificate(server_url, ca_pem, name, current_cert, key_pem).await? {
+        Ok(e) => Ok(e),
+        Err((status, body)) => anyhow::bail!("the server refused a certificate for a new runner process ({status}): {body}"),
+    }
+}
+
+/// [`fetch_certificate`], a refusal (its HTTP status and what it said) told apart from not
+/// reaching the server.
+async fn ask_certificate(server_url: &str, ca_pem: Option<&str>, name: &str, current_cert: &str, key_pem: &str) -> anyhow::Result<Result<crate::agent::EnrollResponse, (u16, String)>> {
     use crate::http::client::{Client, Roots};
     let csr = crate::pki::make_csr_with_key(name, key_pem)?;
     let roots = match ca_pem {
@@ -99,9 +108,24 @@ pub async fn fetch_certificate(server_url: &str, ca_pem: Option<&str>, name: &st
     if !resp.is_success() {
         let status = resp.status();
         let body = resp.bytes(1 << 16).await.unwrap_or_default();
-        anyhow::bail!("the server refused a certificate for a new runner process ({status}): {}", String::from_utf8_lossy(&body).trim());
+        return Ok(Err((status, String::from_utf8_lossy(&body).trim().to_owned())));
     }
-    resp.json(1 << 20).await.context("instance certificate response")
+    Ok(Ok(resp.json(1 << 20).await.context("instance certificate response")?))
+}
+
+/// Whether `server` is the kiln server this machine is enrolled with, by its URL there or any
+/// other: it vouches for the machine's own certificate (a server issues a runner process's
+/// certificate only to a machine it enrolled). An error when it couldn't be asked.
+pub async fn knows_machine(server: &str, state_dir: &Path) -> anyhow::Result<bool> {
+    let (cert, key) = machine_credentials(state_dir)?;
+    let name = crate::pki::leaf_name(&crate::pki::Leaf { cert_pem: cert.clone(), key_pem: String::new() }).ok_or_else(|| anyhow::anyhow!("the machine's certificate names no machine"))?;
+    let ca = std::fs::read_to_string(state_dir.join("ca.pem")).ok();
+    match ask_certificate(server, ca.as_deref(), &name, &cert, &key).await? {
+        Ok(_) => Ok(true),
+        // It answered, and doesn't know this machine (a server error says nothing either way).
+        Err((status, _)) if (400..500).contains(&status) => Ok(false),
+        Err((status, body)) => anyhow::bail!("{server} answered {status}: {body}"),
+    }
 }
 
 // ------------------------------------------------------------------ retiring the old runner
@@ -117,18 +141,39 @@ pub enum Retired {
     Busy(usize),
 }
 
-/// The old service was told about by `<instance dir>/replaces.json`: stop and disable it, once its
-/// processes hold no terminal (checked here as well as by the server). Its own, else one an
-/// earlier instance of this machine took on and never carried out ([`duties`]). Blocking: runs the
-/// platform's service manager.
-pub fn retire(state_dir: &Path, me: &str) -> anyhow::Result<Retired> {
-    for (i, path) in duties(state_dir, me).into_iter().enumerate() {
-        match retire_from(&path, i == 0)? {
-            Retired::Nothing => {}
-            done => return Ok(done),
+/// Runner process `instance` of this machine holds nothing (the server says): the service it runs
+/// in is stopped and disabled once its processes hold no terminal (checked here as well as by the
+/// server), and never another one ([`retire_instance`]: a machine may have more than one older
+/// process, and one may hold agent sessions still). An instance here set up to replace that service
+/// ([`duties`]) notes it was, and when it's this one's, the `kiln` command is brought up to date.
+/// Blocking: runs the platform's service manager.
+pub fn retire(state_dir: &Path, me: &str, instance: &str) -> anyhow::Result<Retired> {
+    let done = retire_instance(state_dir, instance)?;
+    if let Retired::Stopped(unit) = &done {
+        for (i, path) in duties(state_dir, me).into_iter().enumerate() {
+            note_retired(&path, unit, i == 0);
         }
     }
-    Ok(Retired::Nothing)
+    Ok(done)
+}
+
+/// Service `unit` was retired: the `replaces.json` at `path` naming it says so. `own`: the duty
+/// was this instance's (it replaced that service itself).
+fn note_retired(path: &Path, unit: &str, own: bool) {
+    let Some(mut r) = read_json::<Replaces>(path).filter(|r| r.unit == unit) else { return };
+    // The old supervisor no longer watches its binary: bring the `kiln` command up to date. Not for
+    // another instance's duty: that binary may be the one this runner's own supervisor runs, and
+    // replacing it would start an upgrade nobody asked for.
+    if let Some(bin) = r.cli_bin.as_ref().filter(|_| own) {
+        match std::env::current_exe().and_then(|exe| copy_atomic(&exe, bin)) {
+            Ok(()) => tracing::info!(path = %bin.display(), "updated the kiln command to this runner's version"),
+            Err(e) => tracing::warn!(error = %e, path = %bin.display(), "could not update the kiln command"),
+        }
+    }
+    r.retired_at = Some(crate::util::now_unix());
+    if let Err(e) = write_json(path, &r) {
+        tracing::warn!(error = %format!("{e:#}"), path = %path.display(), "could not note the retired service");
+    }
 }
 
 /// The services this instance may stop, as the `replaces.json` naming each: its own first, then
@@ -150,35 +195,59 @@ pub fn duties(state_dir: &Path, me: &str) -> Vec<PathBuf> {
     std::iter::once(own).chain(others.into_iter().map(|(_, p)| p)).collect()
 }
 
-/// `own`: the duty is this instance's (it replaced that service itself).
-fn retire_from(path: &Path, own: bool) -> anyhow::Result<Retired> {
-    let Some(mut r) = read_json::<Replaces>(path) else { return Ok(Retired::Nothing) };
-    // Retired before and not running again (someone may have started it again: stop it again).
-    if r.retired_at.is_some() && !service_active(&r.boot, r.system, &r.unit) {
+/// Runner process `instance` of this machine (its `--instance`; `main` or `legacy`: none), which
+/// the server says holds nothing: whether an instance here was set up to replace it, a second
+/// runner was started beside the first by hand, or an upgrade made it the older one. The service
+/// its process runs in (its cgroup's) is stopped and disabled, unless it's the one this runner
+/// runs in too (a blue/green upgrade's two builds share one), or it holds terminals. Blocking;
+/// Linux (systemd) alone.
+pub fn retire_instance(state_dir: &Path, instance: &str) -> anyhow::Result<Retired> {
+    let procs = crate::install::processes();
+    let pids = pids_of_instance(&procs, state_dir, instance);
+    if pids.is_empty() || pids.contains(&std::process::id()) {
         return Ok(Retired::Nothing);
     }
-    let pids = service_pids(&r);
-    // Never the service this runner runs in (its own duty can't name it; another's might).
-    if pids.contains(&std::process::id()) {
+    let cgroup = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok().and_then(|c| unit_in_cgroup(&c));
+    let Some((unit, system)) = pids.iter().find_map(|p| cgroup(*p)) else { return Ok(Retired::Nothing) };
+    if cgroup(std::process::id()).is_some_and(|(mine, _)| mine == unit) {
         return Ok(Retired::Nothing);
     }
-    let held: usize = pids.iter().map(|p| crate::os::pty_masters(*p).unwrap_or(0)).sum();
+    let r = Replaces { boot: "systemd".into(), system, unit, cli_bin: None, retired_at: None };
+    let held: usize = service_pids(&r).iter().map(|p| crate::os::pty_masters(*p).unwrap_or(0)).sum();
     if held > 0 {
         return Ok(Retired::Busy(held));
     }
     stop_service(&r)?;
-    // The old supervisor no longer watches its binary: bring the `kiln` command up to date. Not for
-    // another instance's duty: that binary may be the one this runner's own supervisor runs, and
-    // replacing it would start an upgrade nobody asked for.
-    if let Some(bin) = r.cli_bin.as_ref().filter(|_| own) {
-        match std::env::current_exe().and_then(|exe| copy_atomic(&exe, bin)) {
-            Ok(()) => tracing::info!(path = %bin.display(), "updated the kiln command to this runner's version"),
-            Err(e) => tracing::warn!(error = %e, path = %bin.display(), "could not update the kiln command"),
-        }
-    }
-    r.retired_at = Some(crate::util::now_unix());
-    write_json(path, &r)?;
     Ok(Retired::Stopped(r.unit))
+}
+
+/// Of `procs` (`(pid, command line)`), the kiln runner processes on `state_dir` that are runner
+/// process `instance` of the machine: their `--instance`, or none for `main` (and `legacy`, a
+/// runner from before instances).
+fn pids_of_instance(procs: &[(u32, Vec<String>)], state_dir: &Path, instance: &str) -> Vec<u32> {
+    let default_state = crate::config::default_data_dir().join("agent");
+    let dir = |args: &[String]| arg_value(args, "--state-dir").map_or_else(|| default_state.clone(), PathBuf::from);
+    let kiln = |exe: &String| Path::new(exe).file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "kiln" || n == "kiln.exe");
+    procs
+        .iter()
+        .filter_map(|(pid, argv)| {
+            let at = argv.iter().position(|w| w == "agent").filter(|_| argv.first().is_some_and(kiln))?;
+            let args = argv.get(at..)?;
+            let ours = match arg_value(args, "--instance") {
+                Some(id) => id == instance,
+                None => instance == MAIN || instance == "legacy",
+            };
+            (ours && dir(args) == state_dir).then_some(*pid)
+        })
+        .collect()
+}
+
+/// The systemd service a process's cgroup (`/proc/<pid>/cgroup`) puts it in, and whether it is a
+/// system one: the innermost `*.service` of its path, never the user manager's own.
+fn unit_in_cgroup(cgroup: &str) -> Option<(String, bool)> {
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let unit = path.split('/').filter(|c| c.ends_with(".service") && !c.starts_with("user@")).last()?;
+    Some((unit.trim_end_matches(".service").to_owned(), path.starts_with("/system.slice/")))
 }
 
 fn copy_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -534,10 +603,13 @@ fn service_active(boot: &str, system: bool, unit: &str) -> bool {
 
 /// `kiln install --agent --upgrade`: run this binary as a new runner beside the installed one.
 /// Safe to re-run: an instance already set up is brought up to this binary (in place) instead.
-pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
+/// `server`: the URL the new runner reaches its server at, when not the one the installed runner
+/// does (`kiln join` names the server it was given: [`take_over`]).
+pub async fn install_alongside(unit: &str, server: Option<&str>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
     let existing = find_existing(unit).ok_or_else(|| {
         anyhow::anyhow!("no installed kiln agent service ({unit}) found to upgrade beside; install one with `kiln install --agent` first")
     })?;
+    let to = server;
     // launchd (macOS): the binary the job's runner runs is replaced (never its launcher, which
     // macOS knows the job by), and the runner takes it up as a fresh process once its jobs are
     // done, keeping its terminals; a runner from before launchers has launchd start it afresh,
@@ -557,7 +629,7 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
     }
     let state_dir = arg_value(&existing.args, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);
     let (machine_cert, key) = machine_credentials(&state_dir)?;
-    let server = arg_value(&existing.args, "--server").or_else(|| crate::join::stored(&state_dir, "server")).ok_or_else(|| {
+    let server = to.map(str::to_owned).or_else(|| arg_value(&existing.args, "--server")).or_else(|| crate::join::stored(&state_dir, "server")).ok_or_else(|| {
         anyhow::anyhow!("cannot tell which server the installed agent uses (no --server in {unit})")
     })?;
     let name = crate::pki::leaf_name(&crate::pki::Leaf { cert_pem: machine_cert.clone(), key_pem: String::new() })
@@ -609,11 +681,16 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
         &Replaces { boot: existing.boot.clone(), system: existing.system, unit: unit.to_owned(), cli_bin: Some(existing.bin.clone()), retired_at: None },
     )?;
 
-    let new_unit = instance_unit(unit, &id);
+    // Named for the machine's usual service, whatever the one it's beside is (itself an instance's).
+    let new_unit = instance_unit(base_unit(unit), &id);
     // Its own instance, in place of the one the runner it's beside may have (itself set up by an
     // upgrade before): `agent` takes `--instance` once.
     let mut args = vec!["supervise".to_owned(), "--".to_owned()];
-    args.extend(with_instance(&existing.args, &id));
+    let run = with_instance(&existing.args, &id);
+    args.extend(match to {
+        Some(url) => with_server(&run, url, &quic_for(url, &e.quic)),
+        None => run,
+    });
     crate::install::start_service(existing.system, &new_unit, &stable_bin, &args, &state_dir, &existing.env)?;
     say(format!("service     {new_unit} started beside {unit}"));
     // Wait until the new runner reached the server (its certificate and connection work).
@@ -649,6 +726,92 @@ pub fn with_instance(args: &[String], id: &str) -> Vec<String> {
     out
 }
 
+/// A runner's arguments reaching its server at `server` (QUIC at `quic`) instead.
+pub fn with_server(args: &[String], server: &str, quic: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 4);
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if a == "--server" || a == "--quic" {
+            skip = true;
+            continue;
+        }
+        if a.starts_with("--server=") || a.starts_with("--quic=") {
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out.extend(["--server".to_owned(), server.to_owned(), "--quic".to_owned(), quic.to_owned()]);
+    out
+}
+
+/// Where a runner reaching its server's HTTP at `server` dials QUIC: the address the server says
+/// (`advertised`) at the host it is reached at, when that host is an address (as `kiln join` has it).
+fn quic_for(server: &str, advertised: &str) -> String {
+    let port = advertised.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+    match (crate::join::host_of(server), port) {
+        (Some(host), Some(port)) if host.parse::<std::net::IpAddr>().is_ok() => crate::join::host_port(&host, port),
+        _ => advertised.to_owned(),
+    }
+}
+
+/// The machine's usual service a unit is, or is an instance of (`kiln-agent-01a14794`:
+/// `kiln-agent`).
+fn base_unit(unit: &str) -> &str {
+    match unit.rsplit_once('-') {
+        Some((base, id)) if id.len() == 8 && id.chars().all(|c| c.is_ascii_alphanumeric()) && base.starts_with("kiln-agent") => base,
+        _ => unit,
+    }
+}
+
+/// One of this machine's kiln agent services, and whether it runs now.
+#[derive(Debug, Clone)]
+pub struct Here {
+    pub existing: Existing,
+    pub running: bool,
+    /// When its instance was set up (0: the machine's usual runner).
+    pub created_at: i64,
+}
+
+/// This machine's agent services on `state_dir`: its usual one (`unit`) and those of the instances
+/// set up beside it, newest first.
+pub fn services_here(state_dir: &Path, unit: &str) -> Vec<Here> {
+    let ids: Vec<String> = std::fs::read_dir(state_dir.join("instances")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str().map(str::to_owned)).collect();
+    let mut here: Vec<Here> = std::iter::once((unit.to_owned(), 0))
+        .chain(ids.iter().map(|id| (instance_unit(unit, id), created_at(state_dir, id))))
+        .filter_map(|(u, at)| find_existing(&u).map(|e| (e, at)))
+        .filter(|(e, _)| arg_value(&e.args, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from) == state_dir)
+        .map(|(e, at)| Here { running: e.boot != "systemd" || service_active(&e.boot, e.system, &e.unit), existing: e, created_at: at })
+        .collect();
+    here.sort_by_key(|h| std::cmp::Reverse(h.created_at));
+    here
+}
+
+/// `kiln join` on a machine whose runner works for that very server (reached at `server`): no
+/// second enrollment and no second runner beside it. The new kiln starts beside the runner as the
+/// machine's newest process ([`install_alongside`]); the runner hands it each agent session as
+/// its turn ends and retires once it holds nothing (`crate::handovers`).
+pub async fn take_over(state_dir: &Path, server: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
+    let here = services_here(state_dir, "kiln-agent");
+    let current = here.iter().find(|h| h.running).or_else(|| here.first()).ok_or_else(|| anyhow::anyhow!("no kiln agent service is installed on this machine to take over from"))?;
+    say(format!("taking over {} (its agents come along as their turns end; it retires once it holds nothing)", current.existing.unit));
+    install_alongside(&current.existing.unit, Some(server), say).await
+}
+
+/// Stop and disable this machine's agent services on `state_dir` (joining another server: the
+/// runner that works for this one doesn't go on beside the new one). What each was.
+pub fn stop_here(state_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut stopped = Vec::new();
+    for h in services_here(state_dir, "kiln-agent").into_iter().filter(|h| h.running) {
+        let e = h.existing;
+        stop_service(&Replaces { boot: e.boot.clone(), system: e.system, unit: e.unit.clone(), cli_bin: None, retired_at: None })?;
+        stopped.push(e.unit);
+    }
+    Ok(stopped)
+}
+
 /// The new runner writes `connected` into its instance directory once the server welcomed it.
 async fn wait_for_connect(dir: &Path, timeout: Duration) -> bool {
     let marker = dir.join("connected");
@@ -665,6 +828,49 @@ async fn wait_for_connect(dir: &Path, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_runner_process_is_found_by_its_instance_and_its_service_by_its_cgroup() {
+        // Runners not given one are on the default state directory.
+        let state = crate::config::default_data_dir().join("agent");
+        let argv = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let procs = vec![
+            // adacachy's two runners on one state directory: the usual one, and an instance.
+            (11, argv("/home/u/.local/bin/kiln supervise -- agent --server http://192.168.1.77:7070 --name box")),
+            (12, argv("/home/u/.local/bin/kiln --config=/c.toml agent --server http://192.168.1.77:7070 --name box")),
+            (21, argv("/home/u/.local/share/kiln/runner/kiln supervise -- agent --server http://n:30070 --name box --instance 01a14794-88b6")),
+            (22, argv("/home/u/.local/share/kiln/runner/kiln --config=/c.toml agent --server http://n:30070 --name box --instance 01a14794-88b6")),
+            // Another machine's runner here (a lab), and what merely says "agent".
+            (31, argv("/lab/kiln agent --name lab --state-dir /lab/state")),
+            (41, argv("/usr/bin/ssh agent box")),
+            (51, argv("/home/u/.local/bin/kiln server")),
+        ];
+        assert_eq!(pids_of_instance(&procs, &state, MAIN), vec![11, 12]);
+        assert_eq!(pids_of_instance(&procs, &state, "legacy"), vec![11, 12]);
+        assert_eq!(pids_of_instance(&procs, &state, "01a14794-88b6"), vec![21, 22]);
+        assert!(pids_of_instance(&procs, &state, "someone-else").is_empty());
+        assert_eq!(pids_of_instance(&procs, Path::new("/lab/state"), MAIN), vec![31]);
+
+        let user = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kiln-agent-01a14794.service\n";
+        assert_eq!(unit_in_cgroup(user), Some(("kiln-agent-01a14794".to_owned(), false)));
+        let agent_in_it = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kiln-agent.service/kiln-agents/s1\n";
+        assert_eq!(unit_in_cgroup(agent_in_it), Some(("kiln-agent".to_owned(), false)));
+        assert_eq!(unit_in_cgroup("0::/system.slice/kiln-agent.service\n"), Some(("kiln-agent".to_owned(), true)));
+        assert_eq!(unit_in_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-surface-transient-1.scope\n"), None);
+        assert_eq!(unit_in_cgroup("12:pids:/\n"), None);
+    }
+
+    #[test]
+    fn a_take_over_reaches_the_server_where_it_was_joined() {
+        let args: Vec<String> = ["agent", "--server", "http://192.168.49.2:30070", "--name", "box", "--quic", "192.168.49.2:30071", "--instance", "a"].map(str::to_owned).to_vec();
+        let moved = with_server(&with_instance(&args, "b"), "http://192.168.1.77:7070", &quic_for("http://192.168.1.77:7070", "kiln.local:7071"));
+        assert_eq!(moved, ["agent", "--name", "box", "--instance", "b", "--server", "http://192.168.1.77:7070", "--quic", "192.168.1.77:7071"]);
+        // By name, the address the server says.
+        assert_eq!(quic_for("https://kiln.example", "kiln.example:7071"), "kiln.example:7071");
+        assert_eq!(base_unit("kiln-agent-01a14794"), "kiln-agent");
+        assert_eq!(base_unit("kiln-agent"), "kiln-agent");
+        assert_eq!(base_unit("kiln-agent-ci"), "kiln-agent-ci");
+    }
 
     #[test]
     fn reads_the_installed_agent_unit() -> anyhow::Result<()> {

@@ -313,6 +313,9 @@ pub struct Hub {
     /// Runner processes that went away while their machine stayed connected through another
     /// one, with when and the jobs they held (requeued if they do not come back in time).
     lost_instances: Mutex<HashMap<PeerId, (String, Instant, Vec<String>)>>,
+    /// Agent sessions on their way from a machine's older runner processes to its newest
+    /// (`crate::handovers`).
+    pub(crate) handovers: Mutex<crate::handovers::Handovers>,
     /// Upgrades of runners and of this server, started from System → Updates.
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
@@ -430,6 +433,7 @@ impl Hub {
             joins: crate::join::Requests::default(),
             instances: Mutex::new(crate::instances::Instances::default()),
             lost_instances: Mutex::new(HashMap::new()),
+            handovers: Mutex::new(crate::handovers::Handovers::default()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
             peered: crate::peers::Peers::default(),
@@ -1151,6 +1155,7 @@ impl Hub {
                 }
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
+                self.handovers_lost(peer).await;
                 let lost = self.instances.lock().lost(peer);
                 if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
                     m.disconnected(name, peer);
@@ -1566,6 +1571,10 @@ impl Hub {
             // server has of its streams, and sends from there (docs/wire.md).
             AgentMsg::Caps { caps } => {
                 self.instances.lock().set_wide(peer, caps);
+                // One that takes hand-overs: its machine's older processes hand their sessions on.
+                if caps & proto::CAP_HANDOVER != 0 {
+                    self.check_handover().await;
+                }
                 self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
                 if caps & proto::CAP_WIRE != 0 {
                     self.cmds.lock().connected(peer);
@@ -1654,6 +1663,9 @@ impl Hub {
                     a.dropped = dropped;
                 }
             }
+            // Hand-overs between a machine's runner processes (`crate::handovers`).
+            AgentMsg::HarnessHandOver { session, offset, data, done } => self.handover_piece(&agent, peer, session, offset, data, done).await,
+            AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -1675,18 +1687,39 @@ impl Hub {
                     // A runner process that sends its conversation store: the server keeps its
                     // sessions from that.
                     let shipped = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
-                    {
+                    // Two processes of one machine never both run a session: of two that say they
+                    // hold it, the newer keeps it and the older lets go (a hand-over whose word
+                    // came late, `crate::handovers`).
+                    let (holder, older) = {
                         let mut inst = self.instances.lock();
                         let what = crate::instances::Owned::Agent(session.clone());
-                        if closed {
-                            inst.disown(&what);
-                        } else if inst.owner(&what) != Some(peer) {
-                            inst.own(what, peer);
+                        let other = inst.owner(&what).filter(|q| *q != peer && inst.hands_over(*q) && inst.hands_over(peer));
+                        match other.and_then(|q| inst.newer_of(q, peer).map(|newer| (q, newer))) {
+                            Some((q, newer)) if newer == q => (None, Some(peer)),
+                            pair => {
+                                if closed {
+                                    inst.disown(&what);
+                                } else if inst.owner(&what) != Some(peer) {
+                                    inst.own(what, peer);
+                                }
+                                (inst.get(peer).map(crate::instances::Instance::label).filter(|_| !closed), pair.map(|(q, _)| q))
+                            }
                         }
+                    };
+                    // Not one a hand-over is taking there now: the newer says so once it took it.
+                    if let Some(older) = older.filter(|_| !self.handovers.lock().going_to(&session, peer)) {
+                        self.let_go_of(&agent, older, &session).await;
+                    }
+                    if older == Some(peer) {
+                        return Ok(());
+                    }
+                    if let Some(label) = holder {
+                        self.harness.held_by(&session, &label);
                     }
                     self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u, shipped);
                     if closed {
                         self.check_retire().await;
+                        self.check_handover().await;
                     }
                 }
                 Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session update"),
@@ -1697,13 +1730,15 @@ impl Hub {
                     // lets go of it once it announces it).
                     inv.sessions.retain(|id| self.harness.runs_on(id, &agent));
                     // This process's sessions are its own; another process of the machine keeps
-                    // the ones it holds (the registry forgets sessions a report leaves out).
-                    let others: Vec<String> = {
+                    // the ones it holds (the registry forgets sessions a report leaves out), and
+                    // so does one that isn't connected now (`Registry::holder`).
+                    let (me, present, others) = {
                         let mut inst = self.instances.lock();
                         for id in &inv.sessions {
                             inst.own(crate::instances::Owned::Agent(id.clone()), peer);
                         }
-                        inst.of(&agent)
+                        let others: Vec<String> = inst
+                            .of(&agent)
                             .into_iter()
                             .filter(|p| *p != peer)
                             .flat_map(|p| inst.owned_by(p))
@@ -1711,10 +1746,17 @@ impl Hub {
                                 crate::instances::Owned::Agent(id) => Some(id),
                                 _ => None,
                             })
-                            .collect()
+                            .collect();
+                        let present: Vec<String> = inst.of(&agent).into_iter().filter_map(|p| inst.get(p).map(crate::instances::Instance::label)).collect();
+                        (inst.get(peer).map(crate::instances::Instance::label), present, others)
                     };
+                    if let Some(me) = &me {
+                        for id in &inv.sessions {
+                            self.harness.held_by(id, me);
+                        }
+                    }
                     inv.sessions.extend(others);
-                    self.harness.inventory(self, &agent, inv);
+                    self.harness.inventory(self, &agent, me.as_deref(), &present, inv);
                 }
                 Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session inventory"),
             },
@@ -1899,7 +1941,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -1924,6 +1966,7 @@ impl Hub {
         self.emit_agent(&live);
         self.wake.notify();
         self.check_retire().await;
+        self.check_handover().await;
         Ok(())
     }
 
@@ -1992,6 +2035,7 @@ impl Hub {
         self.emit_terminals();
         self.update_slot_gauges();
         self.check_retire().await;
+        self.check_handover().await;
         // The front door moves to the process that is newest now.
         crate::frontdoor::control::on_instance_lost(self, name).await;
     }
@@ -2043,7 +2087,7 @@ impl Hub {
     /// terminal, agent session or job of the machine is held by any process but the newest.
     /// Anything whose holder is unknown counts as held by the older ones, so nothing is retired
     /// early (and the newest checks the old process itself before stopping it).
-    async fn check_retire(&self) {
+    pub(crate) async fn check_retire(&self) {
         use crate::instances::Owned;
         let crowded = self.instances.lock().crowded();
         if crowded.is_empty() {

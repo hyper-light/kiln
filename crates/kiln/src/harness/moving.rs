@@ -44,6 +44,17 @@ pub fn takes(version: u32) -> bool {
     (1..=VERSION).contains(&version)
 }
 
+/// Whether package `bytes` was handed over by an older runner process of the same machine
+/// ([`Package::handover`]), read before it is taken over.
+pub fn handed_over(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(default)]
+        handover: bool,
+    }
+    serde_json::from_slice::<Head>(bytes).is_ok_and(|h| h.handover)
+}
+
 /// The harness's record of the conversation, as the harness there takes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -94,6 +105,11 @@ pub struct Package {
     /// checkpoints, its goal (`super::homes`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<super::homes::Home>,
+    /// Handed over by an older runner process of the same machine, by way of the server
+    /// (`super::handing`): nothing of its folder or record travels, and the process taking it
+    /// says whether it did ([`crate::proto::AgentMsg::HarnessAdopted`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handover: bool,
 }
 
 impl Package {
@@ -215,6 +231,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         ignored: None,
         worktree: None,
         home: None,
+        handover: false,
     }
 }
 

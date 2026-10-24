@@ -238,11 +238,28 @@ impl Host {
         Ok(done.then_some(path))
     }
 
-    /// Take over the session in the package the server sent (`receive_package`). Blocking.
-    pub fn adopt_package(&self, path: &std::path::Path) -> Result<(), String> {
+    /// Take over the session in the package the server sent (`receive_package`). Blocking. Whether
+    /// an older runner process of this machine handed it over (`super::handing`: this one says how
+    /// it went), and how it went.
+    pub fn adopt_package(&self, path: &std::path::Path) -> (bool, Result<(), String>) {
         let bytes = std::fs::read(path).map_err(|e| format!("the session's package: {e}"));
         let _ = std::fs::remove_file(path);
-        self.adopt("the kiln server", &bytes?)
+        let Ok(bytes) = bytes else { return (false, bytes.map(|_| ())) };
+        let handover = super::moving::handed_over(&bytes);
+        (handover, self.adopt(if handover { "an older kiln runner of this machine" } else { "the kiln server" }, &bytes))
+    }
+
+    /// The server's word on a hand-over of session `id` to this machine's newer runner process
+    /// (`Command::HandedOver`). The session waiting on it goes on, or lets go; one that gave up
+    /// waiting and went on here lets go once it hears the newer process has it after all, so the
+    /// two never both run it.
+    pub fn handed_over(&self, id: &str, error: Option<String>) {
+        if super::handing::answered(id, error.clone()) {
+            return;
+        }
+        if error.is_none() && self.let_go(id) {
+            tracing::info!(session = %id, "this machine's newer runner process took the agent session over after all: let go of it here");
+        }
     }
 
     /// Session `id` went on on another machine since: its harness here stops, and this machine
@@ -337,7 +354,7 @@ impl Host {
             let kept = super::moving::MovedGit { from: pkg.from.clone(), state: g, ignored: pkg.ignored.take(), worktree: pkg.worktree.take() };
             std::fs::create_dir_all(&dir).and_then(|()| super::moving::keep_private(&super::moving::moved_git(&dir), &serde_json::to_vec(&kept).unwrap_or_default())).map_err(|e| format!("keeping its repository's state: {e}"))?;
         }
-        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced };
+        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None).map(|_| ()).map_err(|e| format!("{e:#}"))
     }
 
@@ -872,7 +889,7 @@ fn kept_seed(store: &crate::convo::store::Store, id: &str) -> Option<session::Se
     if events.is_empty() {
         return None;
     }
-    Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None })
+    Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false })
 }
 
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
