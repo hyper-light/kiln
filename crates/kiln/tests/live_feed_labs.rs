@@ -15,6 +15,9 @@
 //! it says, is what a viewer that attaches then is shown: the same state, the same meta, the same
 //! timeline, message for message (the session's every message in it); the session's end reaches
 //! them both. And the frames went over the bus: its counters say so.
+//!
+//! A third lab fills a small bus with one session's feed, so another's frames and its resync marker
+//! are refused, and holds every viewer of that feed to starting over within 5 s.
 
 #![cfg(unix)]
 
@@ -38,8 +41,15 @@ const MESSAGES: usize = 30;
 /// beside it, so every message comes while the lab's viewers watch); then it waits for kiln to
 /// close it.
 fn stand_in(dir: &Path) -> anyhow::Result<String> {
-    let path = dir.join("claude");
-    let go = dir.join("go").to_string_lossy().into_owned();
+    stand_in_as(dir, "claude", "go", MESSAGES, 0)
+}
+
+/// A stand-in named `name` that streams `messages` messages once `go`, a file beside it, exists,
+/// each message's text `message number i` and `pad` more characters.
+fn stand_in_as(dir: &Path, name: &str, go: &str, messages: usize, pad: usize) -> anyhow::Result<String> {
+    let path = dir.join(name);
+    let go = dir.join(go).to_string_lossy().into_owned();
+    let pad = "x".repeat(pad);
     let script = format!(
         r#"#!/bin/sh
 # kiln's live-feed labs: a stand-in for Claude Code (crates/kiln/tests/live_feed_labs.rs).
@@ -48,13 +58,13 @@ emit '{{"type":"control_response","response":{{"subtype":"success","request_id":
 emit '{{"type":"system","subtype":"init","cwd":"/work","session_id":"lab","tools":[],"mcp_servers":[],"model":"claude-opus-5-5","permissionMode":"default","claude_code_version":"2.1.296","agents":[]}}'
 while [ ! -e '{go}' ]; do sleep 0.05; done
 i=1
-while [ "$i" -le {MESSAGES} ]; do
+while [ "$i" -le {messages} ]; do
   emit '{{"type":"stream_event","event":{{"type":"message_start","message":{{"id":"msg_'$i'","type":"message","role":"assistant","model":"claude-opus-5-5","content":[]}}}},"parent_tool_use_id":null,"uuid":"s'$i'a"}}'
   emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}},"parent_tool_use_id":null,"uuid":"s'$i'b","api_message_id":"msg_'$i'"}}'
   emit '{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"message "}}}},"parent_tool_use_id":null,"uuid":"s'$i'c","api_message_id":"msg_'$i'"}}'
   sleep 0.02
-  emit '{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"number '$i'"}}}},"parent_tool_use_id":null,"uuid":"s'$i'd","api_message_id":"msg_'$i'"}}'
-  emit '{{"type":"assistant","message":{{"id":"msg_'$i'","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{{"type":"text","text":"message number '$i'"}}]}},"parent_tool_use_id":null,"session_id":"lab","uuid":"a'$i'"}}'
+  emit '{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"number '$i'{pad}"}}}},"parent_tool_use_id":null,"uuid":"s'$i'd","api_message_id":"msg_'$i'"}}'
+  emit '{{"type":"assistant","message":{{"id":"msg_'$i'","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{{"type":"text","text":"message number '$i'{pad}"}}]}},"parent_tool_use_id":null,"session_id":"lab","uuid":"a'$i'"}}'
   i=$((i + 1))
 done
 emit '{{"type":"result","subtype":"success","is_error":false,"duration_ms":35,"num_turns":1,"result":"done","stop_reason":"end_turn","session_id":"lab","total_cost_usd":0,"modelUsage":{{}}}}'
@@ -325,6 +335,23 @@ fn total(port: u16, token: &str, name: &str) -> anyhow::Result<f64> {
         .sum()
 }
 
+/// A session of `program` started on `target` (`local`, or `agent:<name>`), once it runs on its
+/// machine (its harness answered kiln's initialize, so the server's mirror of it is the machine's).
+fn session(port: u16, admin: &str, target: &str, work: &Path, program: &str, name: &str) -> anyhow::Result<String> {
+    let ask = json!({"target": target, "spec": {"kind": "claude", "cwd": work.to_string_lossy(), "program": program, "name": name}, "count": 1});
+    let (st, body) = common::http(port, "POST", "/api/harness/sessions", admin, Some(&ask))?;
+    anyhow::ensure!(st == 200, "the session: {st} {body}");
+    let infos: Value = serde_json::from_str(&body)?;
+    let id = infos.as_array().and_then(|a| a.first()).and_then(|i| i.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    anyhow::ensure!(!id.is_empty(), "no session id in {body}");
+    wait_for("the session, running on its machine", Duration::from_secs(90), || {
+        let (st, body) = common::http(port, "GET", &format!("/api/harness/sessions/{id}"), admin, None)?;
+        let status = serde_json::from_str::<Value>(&body).ok().and_then(|v| v.get("status").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+        Ok(st == 200 && matches!(status.as_str(), "idle" | "running" | "waiting"))
+    })?;
+    Ok(id)
+}
+
 // ----------------------------------------------------------------------------------------- a lab
 
 /// A runner of the lab's own, joined to its server, hosting agent sessions; stopped as it's dropped.
@@ -388,19 +415,8 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
             (format!("agent:{name}"), Some(r))
         }
     };
-    let ask = json!({"target": target, "spec": {"kind": "claude", "cwd": work.to_string_lossy(), "program": program, "name": "live-feed lab"}, "count": 1});
-    let (st, body) = common::http(port, "POST", "/api/harness/sessions", &admin, Some(&ask))?;
-    anyhow::ensure!(st == 200, "the session: {st} {body}");
-    let infos: Value = serde_json::from_str(&body)?;
-    let id = infos.as_array().and_then(|a| a.first()).and_then(|i| i.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
-    anyhow::ensure!(!id.is_empty(), "no session id in {body}");
-    // Viewers attach once the session runs where it was started: its machine has reported it (its
-    // harness answered kiln's initialize), so the server's mirror of it is the machine's.
-    wait_for("the session, running on its machine", Duration::from_secs(90), || {
-        let (st, body) = common::http(port, "GET", &format!("/api/harness/sessions/{id}"), &admin, None)?;
-        let status = serde_json::from_str::<Value>(&body).ok().and_then(|v| v.get("status").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
-        Ok(st == 200 && matches!(status.as_str(), "idle" | "running" | "waiting"))
-    })?;
+    // Viewers attach once the session runs where it was started.
+    let id = session(port, &admin, &target, &work, &program, "live-feed lab")?;
     let published_before = metric(port, &admin, "kiln_bus_published_total")?;
 
     // Two viewers from the start: one takes states whole, one as what changed in them.
@@ -475,4 +491,61 @@ fn the_live_feed_in_the_session_lab_shows_what_a_fresh_viewer_is_shown() -> anyh
 #[test]
 fn the_live_feed_in_the_sync_lab_shows_what_a_fresh_viewer_is_shown() -> anyhow::Result<()> {
     lab(Some("lab-runner"))
+}
+
+/// CP-T2.1, test 4: a full bus refuses a feed's frames and the resync marker after them, and every
+/// viewer of that feed starts over within 5 s of the refusal, none waiting on silently. The bus is
+/// small (256 KiB) and a first session, watched so its feed is kept, fills it with large frames; a
+/// topic makes room for a message by letting its own oldest go, never another topic's, so the
+/// second session's frames, and its resync marker, find no room and are refused.
+#[test]
+fn a_full_bus_refusing_a_feed_sends_every_viewer_of_it_back_within_5_s() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    // 60 messages of 8 KiB of text: more than the bus holds, so the filler's feed takes all of it.
+    let filler = stand_in_as(dir.path(), "filler", "filler.go", 60, 8192)?;
+    let starved = stand_in_as(dir.path(), "starved", "starved.go", MESSAGES, 0)?;
+    let s = common::start(dir.path(), &Options { extra: "[terminal]\nenabled = true\n\n[bus]\nmemory = 262144\n", ..Options::default() })?;
+    let (port, admin) = (s.port, s.admin.clone());
+
+    let filling = session(port, &admin, "local", &work, &filler, "filler")?;
+    let keeper = Viewer::watch(port, &filling, &admin, false)?;
+    wait_for("the filler's viewer sent its snapshot", Duration::from_secs(30), || Ok(keeper.shown()?.synced))?;
+    std::fs::write(dir.path().join("filler.go"), b"")?;
+    wait_for("the bus full", Duration::from_secs(60), || {
+        let (used, limit) = (metric(port, &admin, "kiln_bus_memory_bytes")?, metric(port, &admin, "kiln_bus_memory_limit_bytes")?);
+        Ok(limit > 0.0 && used >= limit * 0.9)
+    })?;
+
+    let starving = session(port, &admin, "local", &work, &starved, "starved")?;
+    let viewers = [Viewer::watch(port, &starving, &admin, false)?, Viewer::watch(port, &starving, &admin, true)?];
+    wait_for("the starved session's viewers sent their snapshots", Duration::from_secs(30), || {
+        for v in &viewers {
+            if !v.shown()?.synced {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })?;
+    let refused = total(port, &admin, "kiln_bus_refused_total")?;
+    let opens = viewers.iter().map(|v| v.shown().map(|s| s.opens)).collect::<anyhow::Result<Vec<_>>>()?;
+    std::fs::write(dir.path().join("starved.go"), b"")?;
+    wait_for("the starved session's frames refused", Duration::from_secs(60), || Ok(total(port, &admin, "kiln_bus_refused_total")? > refused))?;
+    // Seen refused now, and refused no later: every viewer of it starts over (a snapshot more than
+    // it had) within 5 s.
+    wait_for("every viewer of the starved feed starting over", Duration::from_secs(5), || {
+        for (v, before) in viewers.iter().zip(&opens) {
+            if v.shown()?.opens <= *before {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .map_err(|e| anyhow::anyhow!("{e:#}\nthe viewers' snapshots: {:?}, before: {opens:?}\nthe server's log:\n{}", viewers.iter().map(|v| v.shown().map(|s| s.opens).unwrap_or(0)).collect::<Vec<_>>(), s.log()))?;
+    for v in viewers {
+        v.end()?;
+    }
+    keeper.end()?;
+    Ok(())
 }

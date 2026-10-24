@@ -4678,8 +4678,11 @@ async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -
 /// largest messages (1 MiB) held for it at a time.
 const FEED_READ: usize = 16;
 
-/// How long a viewer of a session whose feed the bus can't hold waits between snapshots.
-const FEEDLESS: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a viewer with nothing to read waits before it looks whether its feed broke (a full bus
+/// may refuse the resync marker as well as its frames), and how long a viewer of a session whose
+/// feed the bus can't hold waits between snapshots. Under 5 s, so a viewer whose feed broke starts
+/// over within 5 s of it, its wait having begun at most a frame's handling after.
+const FEEDLESS: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// What a viewer's wait on its session's feed came to.
 enum Live {

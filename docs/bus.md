@@ -35,8 +35,9 @@ on any device (`crate::harness::live`):
   marks the feed broken: its next frame goes after a resync marker, which sends every viewer reading
   it back to a snapshot, and the refusal is counted (`kiln_bus_refused_total`). A full bus may
   refuse the marker too, so no viewer relies on it: each counts its feed's refusals and, with
-  nothing to read for 5 seconds, starts over if there were more since its snapshot. While the bus
-  can't make a session's feed at all, its viewers are sent a snapshot every 5 seconds.
+  nothing to read for 4 seconds, starts over if there were more since its snapshot, so every viewer
+  of a broken feed starts over within 5 seconds of the refusal. While the bus can't make a session's
+  feed at all, its viewers are sent a snapshot every 4 seconds.
 - **The end.** When the session ends its last frame is `closed`, and each viewer ends with it,
   having read whatever it hadn't yet. The topic goes with the last of them (at once if none
   watches); a viewer that finds it gone is told `closed` too.
