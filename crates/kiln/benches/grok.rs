@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use hyper_measure::alloc;
-use kiln::observe::pipeline::grok::{self, Grok, Reading};
+use kiln::observe::pipeline::grok::{Grok, Reading};
 use kiln::observe::pipeline::{KindDef, builtin};
 
 #[global_allocator]
@@ -71,7 +71,7 @@ fn main() {
                 continue;
             }
             let mut reading = Reading::default();
-            let mut out = Vec::new();
+            let mut out = kiln_obs::logs::buf::Attrs::default();
             let mut times = Vec::new();
             let mut counted = alloc::Counts::default();
             let mut hits = 0u64;
@@ -82,7 +82,7 @@ fn main() {
                 let t0 = Instant::now();
                 for l in &lines {
                     hits += u64::from(g.parse_with(l, now_ns, &mut reading, &mut out).is_some());
-                    grok::hand_back(&mut out);
+                    out.clear();
                 }
                 times.push(t0.elapsed());
                 if rep == 1 {

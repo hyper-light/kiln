@@ -11,14 +11,14 @@ pub mod kept;
 mod matcher;
 pub(crate) mod spare;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
+use kiln_obs::logs::buf::{Attrs, RecordBuf};
 use kiln_obs::logs::record::{Record, severities};
-use kiln_obs::logs::search::{RowScratch, Search};
+use kiln_obs::logs::search::{Fields, RowScratch, Search};
 
 /// Processors a pipeline holds at the most (Datadog's 20, and its nesting one deep: so here).
 pub const PROCESSORS: usize = 50;
@@ -312,61 +312,179 @@ fn compile(name: &str, filter: &FilterDef, processors: &[ProcessorDef], depth: u
     Ok(Pipeline { name: name.to_owned(), filter: filter_of(filter)?, procs })
 }
 
-/// An attribute's value: a record's own fields by their names, else its attributes.
-fn get<'a>(r: &'a Record, key: &str) -> Option<&'a str> {
-    match key {
-        "message" => Some(&r.message),
-        "service" => Some(&r.service),
-        "host" => Some(&r.host),
-        "source" => Some(&r.source),
-        _ => r.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
+/// What a pipeline's processors read and change (`docs/observe.md` §8.2, §12.17): a record an
+/// exporter sent, its strings its own ([`Record`]), or a line's, of one buffer ([`RecordBuf`]). An
+/// attribute is named as Datadog names it: `message`, `service`, `host` and `source` are the
+/// record's own fields.
+pub trait Target: Fields {
+    /// An attribute's value: a record's own fields by their names, else its attributes.
+    fn get(&self, key: &str) -> Option<&str>;
+    /// An attribute set: the first of its name given `value`, or one added.
+    fn set(&mut self, key: &str, value: &str);
+    /// The first attribute of the name taken out, the rest in their order.
+    fn remove(&mut self, key: &str);
+    /// Each of `a` set as [`Target::set`] sets it, in its order.
+    fn put(&mut self, a: &Attrs);
+    /// An attribute added after the rest, whatever its name (one of it may be there already).
+    fn push(&mut self, key: &str, value: &str);
+    fn attr_count(&self) -> usize;
+    fn attr_at(&self, i: usize) -> Option<(&str, &str)>;
+    /// The `i`th attribute's value: `with`'s (its string taken where a record's are its own).
+    fn replace_at(&mut self, i: usize, with: &mut String);
+    /// Its message: `with`'s (taken where a record's strings are its own).
+    fn replace_message(&mut self, with: &mut String);
+    fn ts_mut(&mut self) -> &mut i64;
+    fn severity_mut(&mut self) -> &mut u8;
+    fn trace_id_mut(&mut self) -> &mut Option<[u8; 16]>;
+}
+
+impl Target for Record {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            "message" => Some(&self.message),
+            "service" => Some(&self.service),
+            "host" => Some(&self.host),
+            "source" => Some(&self.source),
+            _ => self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
+        }
     }
-}
 
-fn first<'a>(r: &'a Record, sources: &[String]) -> Option<(usize, &'a str)> {
-    sources.iter().enumerate().find_map(|(i, s)| get(r, s).filter(|v| !v.is_empty()).map(|v| (i, v)))
-}
-
-/// An attribute set: the first of its name replaced, or added.
-fn set(r: &mut Record, key: &str, value: String) {
-    put(r, Cow::Borrowed(key), value);
-}
-
-/// [`set`], its name moved in when it comes owned (copied only when it is borrowed and new). What
-/// it replaces, and a name it does not keep, are handed back (`spare`).
-fn put(r: &mut Record, key: Cow<'_, str>, value: String) {
-    let slot = match key.as_ref() {
-        "message" => &mut r.message,
-        "service" => &mut r.service,
-        "host" => &mut r.host,
-        "source" => &mut r.source,
-        k => match r.attrs.iter().position(|(a, _)| a == k) {
-            Some(i) => match r.attrs.get_mut(i) {
-                Some(slot) => &mut slot.1,
-                None => return,
+    /// Its strings taken where room was handed back, what it replaces handed back (`spare`).
+    fn set(&mut self, key: &str, value: &str) {
+        let slot = match key {
+            "message" => &mut self.message,
+            "service" => &mut self.service,
+            "host" => &mut self.host,
+            "source" => &mut self.source,
+            k => match self.attrs.iter().position(|(a, _)| a == k) {
+                Some(i) => match self.attrs.get_mut(i) {
+                    Some(slot) => &mut slot.1,
+                    None => return,
+                },
+                None => {
+                    self.attrs.push((spare::copy(k), spare::copy(value)));
+                    return;
+                }
             },
-            None => {
-                let key = match key {
-                    Cow::Owned(k) => k,
-                    Cow::Borrowed(k) => spare::copy(k),
-                };
-                r.attrs.push((key, value));
-                return;
-            }
-        },
-    };
-    spare::give(std::mem::replace(slot, value));
-    if let Cow::Owned(k) = key {
-        spare::give(k);
+        };
+        spare::give(std::mem::replace(slot, spare::copy(value)));
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(i) = self.attrs.iter().position(|(k, _)| k == key) {
+            let (k, v) = self.attrs.remove(i);
+            spare::give(k);
+            spare::give(v);
+        }
+    }
+
+    fn put(&mut self, a: &Attrs) {
+        self.attrs.reserve(a.len());
+        for (k, v) in a.iter() {
+            self.set(k, v);
+        }
+    }
+
+    fn push(&mut self, key: &str, value: &str) {
+        self.attrs.push((spare::copy(key), spare::copy(value)));
+    }
+
+    fn attr_count(&self) -> usize {
+        self.attrs.len()
+    }
+
+    fn attr_at(&self, i: usize) -> Option<(&str, &str)> {
+        self.attrs.get(i).map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    fn replace_at(&mut self, i: usize, with: &mut String) {
+        if let Some(slot) = self.attrs.get_mut(i) {
+            std::mem::swap(&mut slot.1, with);
+        }
+    }
+
+    fn replace_message(&mut self, with: &mut String) {
+        std::mem::swap(&mut self.message, with);
+    }
+
+    fn ts_mut(&mut self) -> &mut i64 {
+        &mut self.ts
+    }
+
+    fn severity_mut(&mut self) -> &mut u8 {
+        &mut self.severity
+    }
+
+    fn trace_id_mut(&mut self) -> &mut Option<[u8; 16]> {
+        &mut self.trace_id
     }
 }
 
-fn remove(r: &mut Record, key: &str) {
-    if let Some(i) = r.attrs.iter().position(|(k, _)| k == key) {
-        let (k, v) = r.attrs.remove(i);
-        spare::give(k);
-        spare::give(v);
+impl Target for RecordBuf {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            "message" => Some(self.message()),
+            "service" => Some(self.service()),
+            "host" => Some(self.host()),
+            "source" => Some(self.source()),
+            _ => self.attr(key),
+        }
     }
+
+    fn set(&mut self, key: &str, value: &str) {
+        match key {
+            "message" => self.set_message(value),
+            "service" => self.set_service(value),
+            "host" => self.set_host(value),
+            "source" => self.set_source(value),
+            _ => self.set_attr(key, value),
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.remove_attr(key);
+    }
+
+    fn put(&mut self, a: &Attrs) {
+        self.put_attrs(a);
+    }
+
+    fn push(&mut self, key: &str, value: &str) {
+        self.push_attr(key, value);
+    }
+
+    fn attr_count(&self) -> usize {
+        RecordBuf::attr_count(self)
+    }
+
+    fn attr_at(&self, i: usize) -> Option<(&str, &str)> {
+        RecordBuf::attr_at(self, i)
+    }
+
+    fn replace_at(&mut self, i: usize, with: &mut String) {
+        self.set_value_at(i, with);
+    }
+
+    fn replace_message(&mut self, with: &mut String) {
+        self.set_message(with);
+    }
+
+    fn ts_mut(&mut self) -> &mut i64 {
+        &mut self.ts
+    }
+
+    fn severity_mut(&mut self) -> &mut u8 {
+        &mut self.severity
+    }
+
+    fn trace_id_mut(&mut self) -> &mut Option<[u8; 16]> {
+        &mut self.trace_id
+    }
+}
+
+/// The first of `sources` a record holds, not empty: which, and its value.
+fn first<'a, R: Target>(r: &'a R, sources: &[String]) -> Option<(usize, &'a str)> {
+    sources.iter().enumerate().find_map(|(i, s)| r.get(s).filter(|v| !v.is_empty()).map(|v| (i, v)))
 }
 
 /// A status as Datadog's status remapper reads it: syslog's 0–7, or a word by its start
@@ -478,24 +596,26 @@ fn hex_into(s: &str, out: &mut [u8]) -> bool {
 #[derive(Default)]
 pub struct Scratch {
     search: RowScratch,
-    attrs: Vec<(String, String)>,
     grok: grok::Reading,
-    /// A URL's parts, and a user agent's, as each parser reads them.
-    url: Vec<(Cow<'static, str>, String)>,
-    agent: Vec<(&'static str, String)>,
+    /// What a processor makes (a grok rule's attributes, a URL's parts, a user agent's), before the
+    /// record takes it.
+    out: Attrs,
+    /// A value made of the record's own (taken by it after: a record of one buffer is written as
+    /// it is read).
+    val: String,
 }
 
 impl Pipeline {
     /// Whether it would read what has these fields (a line's, before a record is made of it): its
     /// filter matches them, or it has none.
-    pub fn reads<F: kiln_obs::logs::search::Fields>(&self, r: &F, s: &mut Scratch) -> bool {
+    pub fn reads<F: Fields>(&self, r: &F, s: &mut Scratch) -> bool {
         self.filter.as_ref().is_none_or(|f| f.fields(r, &mut s.search))
     }
 
     /// Its processors run on `r` if its filter matches it: whether it did.
-    pub fn apply(&self, r: &mut Record, now_ns: i64, s: &mut Scratch) -> bool {
+    pub fn apply<R: Target>(&self, r: &mut R, now_ns: i64, s: &mut Scratch) -> bool {
         if let Some(f) = &self.filter
-            && !f.record(r, &mut s.search)
+            && !f.fields(r, &mut s.search)
         {
             return false;
         }
@@ -506,144 +626,130 @@ impl Pipeline {
     }
 }
 
-fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
+/// `v` as a number's text, as Datadog's remapper and arithmetic processor write one: a whole number
+/// as an integer, else as it is.
+fn number_into(v: f64, out: &mut String) {
+    if v.fract() == 0.0 && v.abs() < 9.0e15 {
+        grok::int_into(v as i64, out);
+    } else {
+        let _ = write!(out, "{v}");
+    }
+}
+
+fn run<R: Target>(p: &Proc, r: &mut R, now_ns: i64, s: &mut Scratch) {
     match p {
         Proc::Grok { source, grok } => {
-            s.attrs.clear();
+            s.out.clear();
             // Read where it is: what a rule extracts is its own, every attribute of it read before
             // any is set (one may be the attribute it read).
-            let Some(value) = get(r, source) else { return };
-            if grok.parse_with(value, now_ns, &mut s.grok, &mut s.attrs).is_some() {
-                r.attrs.reserve(s.attrs.len());
-                for (k, v) in s.attrs.drain(..) {
-                    put(r, Cow::Owned(k), v);
-                }
+            let Some(value) = r.get(source) else { return };
+            if grok.parse_with(value, now_ns, &mut s.grok, &mut s.out).is_some() {
+                r.put(&s.out);
             }
         }
         Proc::Date(sources) => {
             if let Some(ts) = first(r, sources).and_then(|(_, v)| time_of(v)) {
-                r.ts = ts;
+                *r.ts_mut() = ts;
             }
         }
         Proc::Status(sources) => {
             if let Some((_, v)) = first(r, sources) {
-                r.severity = status_of(v);
+                *r.severity_mut() = status_of(v);
             }
         }
         Proc::Service(sources) => {
             if let Some((_, v)) = first(r, sources) {
-                let v = spare::copy(v);
-                spare::give(std::mem::replace(&mut r.service, v));
+                s.val.clear();
+                s.val.push_str(v);
+                r.set("service", &s.val);
             }
         }
         Proc::Message(sources) => {
             if let Some((_, v)) = first(r, sources) {
-                let v = spare::copy(v);
-                spare::give(std::mem::replace(&mut r.message, v));
+                s.val.clear();
+                s.val.push_str(v);
+                r.set("message", &s.val);
             }
         }
         Proc::TraceId(sources) => {
             if let Some(id) = first(r, sources).and_then(|(_, v)| trace_id_of(v)) {
-                r.trace_id = Some(id);
+                *r.trace_id_mut() = Some(id);
             }
         }
         Proc::Attr { sources, target, format, preserve, overwrite } => {
             let Some((i, v)) = first(r, sources) else { return };
-            if !overwrite && get(r, target).is_some() {
+            if !overwrite && r.get(target).is_some() {
                 return;
             }
-            let value = match format {
-                Format::Auto | Format::String => Some(spare::copy(v)),
-                Format::Integer => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| grok::int_text(f as i64)),
-                Format::Double => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| {
-                    let mut s = spare::take();
-                    let _ = write!(s, "{f}");
-                    s
-                }),
+            s.val.clear();
+            let made = match format {
+                Format::Auto | Format::String => {
+                    s.val.push_str(v);
+                    true
+                }
+                Format::Integer => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| grok::int_into(f as i64, &mut s.val)).is_some(),
+                Format::Double => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| write!(s.val, "{f}")).is_some(),
             };
             let source = sources.get(i).map_or("", String::as_str);
-            if let Some(value) = value {
-                set(r, target, value);
+            if made {
+                r.set(target, &s.val);
                 if !preserve && source != target {
-                    remove(r, source);
+                    r.remove(source);
                 }
             }
         }
         Proc::Url { sources, target, trim_slashes } => {
             let Some((_, v)) = first(r, sources) else { return };
-            s.url.clear();
-            grok::url_parts(v, &mut s.url);
-            if *trim_slashes {
-                for (k, v) in &mut s.url {
-                    if k == "path" && v.len() > 1 {
-                        let kept = v.trim_end_matches('/').len();
-                        v.truncate(kept);
-                    }
-                }
-            }
-            r.attrs.reserve(s.url.len());
-            for (k, v) in s.url.drain(..) {
-                put(r, Cow::Owned(grok::dotted(target, &k)), v);
-                if let Cow::Owned(k) = k {
-                    spare::give(k);
-                }
-            }
+            s.out.clear();
+            grok::url_parts(v, Some(target), *trim_slashes, &mut s.out);
+            r.put(&s.out);
         }
         Proc::UserAgent { sources, target, encoded } => {
-            // Read where it is (decoded first when it says): its parts are their own strings.
-            s.agent.clear();
+            // Read where it is (decoded first when it says).
+            s.out.clear();
             match first(r, sources) {
                 Some((_, v)) if *encoded => {
-                    let decoded = grok::decode_uri(v);
-                    grok::user_agent(&decoded, &mut s.agent);
-                    spare::give(decoded);
+                    s.val.clear();
+                    grok::decode_uri_into(v, &mut s.val);
+                    grok::user_agent(&s.val, Some(target), &mut s.out);
                 }
-                Some((_, v)) => grok::user_agent(v, &mut s.agent),
+                Some((_, v)) => grok::user_agent(v, Some(target), &mut s.out),
                 None => return,
             }
-            r.attrs.reserve(s.agent.len());
-            for (k, v) in s.agent.drain(..) {
-                put(r, Cow::Owned(grok::dotted(target, k)), v);
-            }
+            r.put(&s.out);
         }
         Proc::Category { target, categories } => {
-            if let Some((_, name)) = categories.iter().find(|(f, _)| f.record(r, &mut s.search)) {
-                set(r, target, spare::copy(name));
+            if let Some((_, name)) = categories.iter().find(|(f, _)| f.fields(r, &mut s.search)) {
+                r.set(target, name);
             }
         }
         Proc::Arithmetic { expr, target, replace_missing } => {
-            if let Some(v) = expr.eval(&|k| get(r, k).and_then(|v| v.trim().parse::<f64>().ok()), *replace_missing)
+            if let Some(v) = expr.eval(&|k| r.get(k).and_then(|v| v.trim().parse::<f64>().ok()), *replace_missing)
                 && v.is_finite()
             {
-                let text = if v.fract() == 0.0 && v.abs() < 9.0e15 {
-                    grok::int_text(v as i64)
-                } else {
-                    let mut s = spare::take();
-                    let _ = write!(s, "{v}");
-                    s
-                };
-                set(r, target, text);
+                s.val.clear();
+                number_into(v, &mut s.val);
+                r.set(target, &s.val);
             }
         }
         Proc::Builder { template, target, replace_missing } => {
-            let mut out = spare::take();
+            s.val.clear();
             for piece in template {
                 match piece {
-                    Piece::Text(t) => out.push_str(t),
-                    Piece::Attr(k) => match get(r, k) {
-                        Some(v) => out.push_str(v),
+                    Piece::Text(t) => s.val.push_str(t),
+                    Piece::Attr(k) => match r.get(k) {
+                        Some(v) => s.val.push_str(v),
                         None if *replace_missing => {}
-                        None => return spare::give(out),
+                        None => return,
                     },
                 }
             }
-            set(r, target, out);
+            r.set(target, &s.val);
         }
         Proc::Lookup { source, target, table, default } => {
-            let Some(v) = get(r, source) else { return };
+            let Some(v) = r.get(source) else { return };
             if let Some(found) = table.get(v.trim()).or(default.as_ref()) {
-                let found = spare::copy(found);
-                set(r, target, found);
+                r.set(target, found);
             }
         }
         Proc::Nested(p) => {
@@ -653,7 +759,7 @@ fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
 }
 
 /// Every enabled pipeline, in order, on `r`.
-pub fn apply_all(pipelines: &[Pipeline], r: &mut Record, now_ns: i64, s: &mut Scratch) {
+pub fn apply_all<R: Target>(pipelines: &[Pipeline], r: &mut R, now_ns: i64, s: &mut Scratch) {
     for p in pipelines {
         p.apply(r, now_ns, s);
     }
@@ -664,19 +770,9 @@ pub fn apply_all(pipelines: &[Pipeline], r: &mut Record, now_ns: i64, s: &mut Sc
 mod tests {
     use super::*;
 
-    fn rec(message: &str) -> Record {
-        Record { ts: 1, severity: 9, service: "web".into(), host: "h".into(), source: "nginx".into(), message: message.into(), ..Record::default() }
-    }
-
-    fn attr<'a>(r: &'a Record, k: &str) -> Option<&'a str> {
-        get(r, k)
-    }
-
-    /// A pipeline as Datadog exports one reads here, and does what it says: its parser's
-    /// attributes, then its remappers, category, arithmetic, builder and lookup.
-    #[test]
-    fn a_pipeline_exported_from_datadog_reads_and_runs() {
-        let json = r#"{
+    /// A pipeline as Datadog exports one: a parser, then remappers, a category, arithmetic, builders, a
+    /// lookup and a pipeline in it.
+    const EXPORTED: &str = r#"{
           "name": "nginx", "is_enabled": true, "filter": {"query": "source:nginx"},
           "processors": [
             {"type": "grok-parser", "name": "access", "is_enabled": true, "source": "message", "samples": [],
@@ -699,6 +795,286 @@ mod tests {
                {"type": "string-builder-processor", "template": "page", "target": "alert"}]}
           ]
         }"#;
+
+    /// A pipeline of every processor and every grok filter, its parsers' attributes read by the rest.
+    const EVERY: &str = r#"{
+      "name": "every", "filter": {"query": "source:every"},
+      "processors": [
+        {"type": "grok-parser", "source": "message", "grok": {"support_rules": "", "match_rules": "kv %{data:kv:keyvalue} ;; %{data:js:json} ;; %{notSpace:u} ;; %{data:ua}\nplain %{word:w} %{integer:n} %{number:f} %{notSpace:q:querystring} %{data:rest}\nother %{data:all:lowercase}"}},
+        {"type": "service-remapper", "sources": ["kv.svc", "w"]},
+        {"type": "status-remapper", "sources": ["kv.level"]},
+        {"type": "date-remapper", "sources": ["kv.ts"]},
+        {"type": "trace-id-remapper", "sources": ["kv.trace"]},
+        {"type": "message-remapper", "sources": ["js.msg", "rest"]},
+        {"type": "attribute-remapper", "sources": ["n"], "target": "n.int", "target_format": "integer", "preserve_source": true},
+        {"type": "attribute-remapper", "sources": ["f"], "target": "f.double", "target_format": "double", "override_on_conflict": true},
+        {"type": "attribute-remapper", "sources": ["kv.host"], "target": "host", "override_on_conflict": true},
+        {"type": "attribute-remapper", "sources": ["kv.dup"], "target": "kv.k", "preserve_source": false, "override_on_conflict": false},
+        {"type": "url-parser", "sources": ["u"], "target": "u.parts", "normalize_ending_slashes": true},
+        {"type": "user-agent-parser", "sources": ["ua"], "target": "ua.parts", "is_encoded": true},
+        {"type": "category-processor", "target": "cat", "categories": [{"filter": {"query": "@n:>10"}, "name": "big"}, {"filter": {"query": "*"}, "name": "small"}]},
+        {"type": "arithmetic-processor", "expression": "n * 2 + f", "target": "calc", "is_replace_missing": true},
+        {"type": "arithmetic-processor", "expression": "f / 3", "target": "third"},
+        {"type": "string-builder-processor", "template": "%{w}-%{kv.svc}", "target": "built", "is_replace_missing": false},
+        {"type": "string-builder-processor", "template": "%{w}-%{kv.svc}", "target": "built2", "is_replace_missing": true},
+        {"type": "lookup-processor", "source": "w", "target": "team", "lookup_table": ["go,golang", "py,python"], "default_lookup": "other"},
+        {"type": "grok-parser", "source": "rest", "grok": {"support_rules": "", "match_rules": "rr %{word:first} %{data:second:uppercase}"}},
+        {"type": "pipeline", "filter": {"query": "@cat:big"}, "processors": [
+          {"type": "string-builder-processor", "template": "big %{n}", "target": "note"},
+          {"type": "attribute-remapper", "sources": ["note"], "target": "message", "override_on_conflict": true, "preserve_source": true}]}
+      ]
+    }"#;
+
+    fn rec(message: &str) -> Record {
+        Record { ts: 1, severity: 9, service: "web".into(), host: "h".into(), source: "nginx".into(), message: message.into(), ..Record::default() }
+    }
+
+    fn attr<'a>(r: &'a Record, k: &str) -> Option<&'a str> {
+        r.get(k)
+    }
+
+    /// The processors the ones of today replaced (`docs/observe.md` §12.17), on a record of strings of
+    /// its own: what today's are held to.
+    mod before {
+        use std::borrow::Cow;
+        use std::fmt::Write as _;
+
+        use kiln_obs::logs::record::Record;
+        use kiln_obs::logs::search::RowScratch;
+
+        use super::super::{Format, Piece, Pipeline, Proc, grok, spare, status_of, time_of, trace_id_of};
+
+        #[derive(Default)]
+        pub(super) struct Scratch {
+            search: RowScratch,
+            attrs: Vec<(String, String)>,
+            grok: grok::Reading,
+            url: Vec<(Cow<'static, str>, String)>,
+            agent: Vec<(&'static str, String)>,
+        }
+
+        /// An attribute's value: a record's own fields by their names, else its attributes.
+        fn get<'a>(r: &'a Record, key: &str) -> Option<&'a str> {
+            match key {
+                "message" => Some(&r.message),
+                "service" => Some(&r.service),
+                "host" => Some(&r.host),
+                "source" => Some(&r.source),
+                _ => r.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
+            }
+        }
+
+        fn first<'a>(r: &'a Record, sources: &[String]) -> Option<(usize, &'a str)> {
+            sources.iter().enumerate().find_map(|(i, s)| get(r, s).filter(|v| !v.is_empty()).map(|v| (i, v)))
+        }
+
+        /// An attribute set: the first of its name replaced, or added.
+        fn set(r: &mut Record, key: &str, value: String) {
+            put(r, Cow::Borrowed(key), value);
+        }
+
+        /// [`set`], its name moved in when it comes owned (copied only when it is borrowed and new). What
+        /// it replaces, and a name it does not keep, are handed back (`spare`).
+        fn put(r: &mut Record, key: Cow<'_, str>, value: String) {
+            let slot = match key.as_ref() {
+                "message" => &mut r.message,
+                "service" => &mut r.service,
+                "host" => &mut r.host,
+                "source" => &mut r.source,
+                k => match r.attrs.iter().position(|(a, _)| a == k) {
+                    Some(i) => match r.attrs.get_mut(i) {
+                        Some(slot) => &mut slot.1,
+                        None => return,
+                    },
+                    None => {
+                        let key = match key {
+                            Cow::Owned(k) => k,
+                            Cow::Borrowed(k) => spare::copy(k),
+                        };
+                        r.attrs.push((key, value));
+                        return;
+                    }
+                },
+            };
+            spare::give(std::mem::replace(slot, value));
+            if let Cow::Owned(k) = key {
+                spare::give(k);
+            }
+        }
+
+        fn remove(r: &mut Record, key: &str) {
+            if let Some(i) = r.attrs.iter().position(|(k, _)| k == key) {
+                let (k, v) = r.attrs.remove(i);
+                spare::give(k);
+                spare::give(v);
+            }
+        }
+
+        /// A pipeline's processors run as they ran.
+        pub(super) fn apply(p: &Pipeline, r: &mut Record, now_ns: i64, s: &mut Scratch) -> bool {
+            if let Some(f) = &p.filter
+                && !f.record(r, &mut s.search)
+            {
+                return false;
+            }
+            for q in &p.procs {
+                run(q, r, now_ns, s);
+            }
+            true
+        }
+
+        fn run(p: &Proc, r: &mut Record, now_ns: i64, s: &mut Scratch) {
+            match p {
+                Proc::Grok { source, grok } => {
+                    s.attrs.clear();
+                    // Read where it is: what a rule extracts is its own, every attribute of it read before
+                    // any is set (one may be the attribute it read).
+                    let Some(value) = get(r, source) else { return };
+                    if grok::before::parse(grok, value, now_ns, &mut s.grok, &mut s.attrs).is_some() {
+                        r.attrs.reserve(s.attrs.len());
+                        for (k, v) in s.attrs.drain(..) {
+                            put(r, Cow::Owned(k), v);
+                        }
+                    }
+                }
+                Proc::Date(sources) => {
+                    if let Some(ts) = first(r, sources).and_then(|(_, v)| time_of(v)) {
+                        r.ts = ts;
+                    }
+                }
+                Proc::Status(sources) => {
+                    if let Some((_, v)) = first(r, sources) {
+                        r.severity = status_of(v);
+                    }
+                }
+                Proc::Service(sources) => {
+                    if let Some((_, v)) = first(r, sources) {
+                        let v = spare::copy(v);
+                        spare::give(std::mem::replace(&mut r.service, v));
+                    }
+                }
+                Proc::Message(sources) => {
+                    if let Some((_, v)) = first(r, sources) {
+                        let v = spare::copy(v);
+                        spare::give(std::mem::replace(&mut r.message, v));
+                    }
+                }
+                Proc::TraceId(sources) => {
+                    if let Some(id) = first(r, sources).and_then(|(_, v)| trace_id_of(v)) {
+                        r.trace_id = Some(id);
+                    }
+                }
+                Proc::Attr { sources, target, format, preserve, overwrite } => {
+                    let Some((i, v)) = first(r, sources) else { return };
+                    if !overwrite && get(r, target).is_some() {
+                        return;
+                    }
+                    let value = match format {
+                        Format::Auto | Format::String => Some(spare::copy(v)),
+                        Format::Integer => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| grok::before::int_text(f as i64)),
+                        Format::Double => v.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| {
+                            let mut s = spare::take();
+                            let _ = write!(s, "{f}");
+                            s
+                        }),
+                    };
+                    let source = sources.get(i).map_or("", String::as_str);
+                    if let Some(value) = value {
+                        set(r, target, value);
+                        if !preserve && source != target {
+                            remove(r, source);
+                        }
+                    }
+                }
+                Proc::Url { sources, target, trim_slashes } => {
+                    let Some((_, v)) = first(r, sources) else { return };
+                    s.url.clear();
+                    grok::before::url_parts(v, &mut s.url);
+                    if *trim_slashes {
+                        for (k, v) in &mut s.url {
+                            if k == "path" && v.len() > 1 {
+                                let kept = v.trim_end_matches('/').len();
+                                v.truncate(kept);
+                            }
+                        }
+                    }
+                    r.attrs.reserve(s.url.len());
+                    for (k, v) in s.url.drain(..) {
+                        put(r, Cow::Owned(grok::before::dotted(target, &k)), v);
+                        if let Cow::Owned(k) = k {
+                            spare::give(k);
+                        }
+                    }
+                }
+                Proc::UserAgent { sources, target, encoded } => {
+                    // Read where it is (decoded first when it says): its parts are their own strings.
+                    s.agent.clear();
+                    match first(r, sources) {
+                        Some((_, v)) if *encoded => {
+                            let decoded = grok::before::decode_uri(v);
+                            grok::before::user_agent(&decoded, &mut s.agent);
+                            spare::give(decoded);
+                        }
+                        Some((_, v)) => grok::before::user_agent(v, &mut s.agent),
+                        None => return,
+                    }
+                    r.attrs.reserve(s.agent.len());
+                    for (k, v) in s.agent.drain(..) {
+                        put(r, Cow::Owned(grok::before::dotted(target, k)), v);
+                    }
+                }
+                Proc::Category { target, categories } => {
+                    if let Some((_, name)) = categories.iter().find(|(f, _)| f.record(r, &mut s.search)) {
+                        set(r, target, spare::copy(name));
+                    }
+                }
+                Proc::Arithmetic { expr, target, replace_missing } => {
+                    if let Some(v) = expr.eval(&|k| get(r, k).and_then(|v| v.trim().parse::<f64>().ok()), *replace_missing)
+                        && v.is_finite()
+                    {
+                        let text = if v.fract() == 0.0 && v.abs() < 9.0e15 {
+                            grok::before::int_text(v as i64)
+                        } else {
+                            let mut s = spare::take();
+                            let _ = write!(s, "{v}");
+                            s
+                        };
+                        set(r, target, text);
+                    }
+                }
+                Proc::Builder { template, target, replace_missing } => {
+                    let mut out = spare::take();
+                    for piece in template {
+                        match piece {
+                            Piece::Text(t) => out.push_str(t),
+                            Piece::Attr(k) => match get(r, k) {
+                                Some(v) => out.push_str(v),
+                                None if *replace_missing => {}
+                                None => return spare::give(out),
+                            },
+                        }
+                    }
+                    set(r, target, out);
+                }
+                Proc::Lookup { source, target, table, default } => {
+                    let Some(v) = get(r, source) else { return };
+                    if let Some(found) = table.get(v.trim()).or(default.as_ref()) {
+                        let found = spare::copy(found);
+                        set(r, target, found);
+                    }
+                }
+                Proc::Nested(p) => {
+                    apply(p, r, now_ns, s);
+                }
+            }
+        }
+    }
+
+    /// A pipeline as Datadog exports one reads here, and does what it says: its parser's
+    /// attributes, then its remappers, category, arithmetic, builder and lookup.
+    #[test]
+    fn a_pipeline_exported_from_datadog_reads_and_runs() {
+        let json = EXPORTED;
         let def: PipelineDef = serde_json::from_str(json).unwrap();
         assert_eq!(serde_json::from_str::<PipelineDef>(&serde_json::to_string(&def).unwrap()).unwrap(), def, "it writes back as it read");
         let p = def.compile().unwrap();
@@ -743,5 +1119,81 @@ mod tests {
         // A disabled processor is not compiled, so not checked either: it does nothing.
         let def: PipelineDef = serde_json::from_str(r#"{"name":"x","processors":[{"type":"arithmetic-processor","is_enabled":false,"expression":"(","target":"t"}]}"#).unwrap();
         assert!(def.compile().is_ok());
+    }
+
+    /// Every pipeline runs on a line's record of one buffer as on a record of strings of its own,
+    /// and as the processors before ran (`before`): kiln's own, Datadog's export above and one of
+    /// every processor and grok filter, on lines of every kind they read and cuts of them; each
+    /// record, and its row, the same to the byte.
+    #[test]
+    fn a_record_of_one_buffer_comes_out_as_a_record_does() {
+        let mut defs: Vec<PipelineDef> = builtin::all().into_iter().map(|(_, d)| d).collect();
+        defs.push(serde_json::from_str(EXPORTED).unwrap());
+        defs.push(serde_json::from_str(EVERY).unwrap());
+        let pipelines: Vec<Pipeline> = defs.iter().map(|d| d.compile().unwrap()).collect();
+        let fixed = [
+            r#"10.0.0.7 [06/Jan/2017:16:16:37 +0000] "GET /pay?x=1" 503 0.25 lvl=ERROR trace=0af7651916cd43dd8448eb211c80319c"#,
+            r#"192.0.2.10 - - [18/Oct/2026:12:00:00 +0000] "POST /api/v1/orders?id=7 HTTP/1.1" 502 157 "-" "curl/8.5.0""#,
+            r#"10.1.2.3 - - [18/Oct/2026:12:01:02 +0000] "GET /api/v1/orders/9 HTTP/1.1" 200 5123 "-" "Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0""#,
+            r#"2026/10/18 12:00:00 [error] 8409#8409: *317058 open() "/usr/share/nginx/html/favicon.ico" failed (2: No such file or directory), client: 192.0.2.10, server: localhost, request: "GET /favicon.ico HTTP/1.1", host: "example.com""#,
+            r#"203.0.113.5 - frank [18/Oct/2026:12:00:00 +0000] "GET /index.html HTTP/1.0" 200 2326"#,
+            "[Sun Oct 18 12:00:00.123456 2026] [core:error] [pid 1234:tid 5678] [client 203.0.113.5:51234] AH00128: File does not exist: /var/www/html/favicon.ico",
+            r#"level=error svc=pay trace=0af7651916cd43dd8448eb211c80319c ts=1792324800 host=web-9 dup=x k=y ;; {"a":{"b":1},"msg":"hello","n":[1,2]} ;; https://x.com/a//?b=1&c=%FF ;; Mozilla%2F5.0%20(iPhone%3B%20CPU%20iPhone%20OS)%20Mobile"#,
+            r#"level=warn svc="quoted svc" ts=2026-10-18T12:00:00.5Z ;; {"msg":"m","deep":{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}} ;; /p/ ;; curl%2F8.5.0"#,
+            "go 42 3.5 ?a=1&b=%20two&a=3 the rest of it",
+            "py 7 0.1 ?x the rest",
+            "zz -3 1e2 &&& tail",
+            "OTHER Line ΣΑΣ",
+        ];
+        let mut rng = kiln_obs::testkit::Rng::new(11);
+        let mut lines: Vec<String> = fixed.iter().map(|l| (*l).to_owned()).collect();
+        for l in fixed {
+            for _ in 0..40 {
+                let mut i = rng.below(l.len() as u64 + 1) as usize;
+                while !l.is_char_boundary(i) {
+                    i -= 1;
+                }
+                let mut j = rng.below(l.len() as u64 + 1) as usize;
+                while !l.is_char_boundary(j) {
+                    j -= 1;
+                }
+                let (a, b) = (i.min(j), i.max(j));
+                lines.push(format!("{}{}", &l[..a], &l[b..]));
+                lines.push(l[..b].to_owned());
+            }
+        }
+        let now_ns = 1_792_324_800_000_000_000;
+        let (mut ours, mut buf, mut theirs) = (Scratch::default(), Scratch::default(), before::Scratch::default());
+        let mut b = RecordBuf::default();
+        let mut parsed = 0;
+        for line in &lines {
+            for source in ["nginx", "apache", "every", "x"] {
+                let r0 = Record {
+                    ts: 1,
+                    severity: 9,
+                    service: "web".into(),
+                    host: "h".into(),
+                    source: source.into(),
+                    message: line.clone(),
+                    attrs: vec![("log.iostream".into(), "stdout".into()), ("kv.k".into(), "held".into())],
+                    ..Record::default()
+                };
+                let (mut r, mut was) = (r0.clone(), r0.clone());
+                b.set_from(&r0);
+                apply_all(&pipelines, &mut r, now_ns, &mut ours);
+                apply_all(&pipelines, &mut b, now_ns, &mut buf);
+                for p in &pipelines {
+                    before::apply(p, &mut was, now_ns, &mut theirs);
+                }
+                assert_eq!(r, was, "{source}: {line}");
+                assert_eq!(b.to_record(), was, "{source}: {line} (of one buffer)");
+                let (mut row, mut row_b) = (Vec::new(), Vec::new());
+                kiln_obs::logs::record::put_row(&mut row, &r, 0);
+                b.put_row(&mut row_b, 0);
+                assert_eq!(row_b, row, "{source}: {line}'s row");
+                parsed += usize::from(r.attrs.len() > 2);
+            }
+        }
+        assert!(parsed > lines.len(), "{parsed} records a pipeline parsed, of {} lines", lines.len());
     }
 }

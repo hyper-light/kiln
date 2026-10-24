@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod block;
 pub mod bloom;
+pub mod buf;
 pub mod file;
 pub mod metrics;
 pub mod patterns;

@@ -363,6 +363,24 @@ pub fn put_log_issue(r: &mut crate::logs::record::Record) {
     }
 }
 
+/// [`put_log_issue`] of a record of one buffer (`crate::logs::buf::RecordBuf`): its id written
+/// without a string of its own.
+pub fn put_log_issue_buf(r: &mut crate::logs::buf::RecordBuf) {
+    if r.severity < 17 {
+        return;
+    }
+    r.retain_attrs(|k, _| k != "issue.id");
+    let id = log_issue(r.service(), r.severity, &Error::of(r.attrs()));
+    if let Some(id) = id {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut h = [b'0'; 16];
+        for (i, d) in h.iter_mut().enumerate() {
+            *d = HEX.get(((id >> (60 - 4 * i)) & 15) as usize).copied().unwrap_or(b'0');
+        }
+        r.push_attr("issue.id", std::str::from_utf8(&h).unwrap_or(""));
+    }
+}
+
 /// An issue's id from its parts, each hashed as it is read (its words, its frame's file and
 /// function never made whole): the id [`stable`] gives of them whole.
 fn grouped(source: Source, service: &str, kind: &str, message: &str, frame: Option<Frame<'_>>) -> u64 {
@@ -1474,6 +1492,28 @@ mod tests {
         assert_eq!(monitor_query("@version:2.0 AND service:shop").as_deref(), Some("sum:error_tracking.errors{service:shop,version:2.0} by {issue.id}.as_count()"));
         for more in ["service:shop OR service:cart", "-env:dev", "service:shop ValueError", "@error.type:ValueError", "service:shop*", "\"bad item\"", "(x"] {
             assert_eq!(monitor_query(more), None, "{more}");
+        }
+    }
+
+    /// A record of one buffer is given the issue a record is given: the same id, one it came with
+    /// left out, none below an error's status or without an error's parts.
+    #[test]
+    fn a_record_of_one_buffer_is_given_a_record_s_issue() {
+        use crate::logs::buf::RecordBuf;
+        use crate::logs::record::Record;
+        let cases: [(u8, &[(&str, &str)]); 4] = [
+            (17, &[("error.kind", "TypeError"), ("error.message", "x is undefined"), ("error.stack", "TypeError: x is undefined\n    at f (/app/a.js:1:2)")]),
+            (21, &[("issue.id", "0000000000000000"), ("error.message", "boom"), ("issue.id", "1")]),
+            (9, &[("error.message", "boom")]),
+            (17, &[]),
+        ];
+        for (severity, attrs) in cases {
+            let mut r = Record { severity, service: "web".into(), attrs: attrs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect(), ..Record::default() };
+            let mut b = RecordBuf::default();
+            b.set_from(&r);
+            put_log_issue(&mut r);
+            put_log_issue_buf(&mut b);
+            assert_eq!(b.to_record(), r, "{severity} {attrs:?}");
         }
     }
 }

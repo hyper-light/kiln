@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use kiln_obs::logs::buf::RecordBuf;
 use kiln_obs::logs::record::Record;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -400,18 +401,6 @@ pub(crate) struct Line {
     pub truncated: bool,
 }
 
-/// A record written as its row, its strings handed back (`pipeline::spare`): its message's string,
-/// emptied, for the next line's text.
-fn recycle(r: Record) -> String {
-    let Record { service, host, source, mut message, attrs, .. } = r;
-    for s in [service, host, source] {
-        spare::give(s);
-    }
-    spare::give_list(attrs);
-    message.clear();
-    message
-}
-
 /// What a file's records say of where they came from: its path, and its container's or pod's
 /// names.
 #[derive(Debug, Default, Clone)]
@@ -429,6 +418,8 @@ pub(crate) struct PipelineFilters {
     /// The sensitive data scanner, and its room: a line it may find something in is made a record.
     pub scanner: Arc<super::scanner::Scanner>,
     pub scan: super::scanner::Scratch,
+    /// The record a line they read is made, of one buffer, kept from line to line.
+    pub line: RecordBuf,
 }
 
 /// A line's fields as its record would hold them ([`Compiled::record`]), borrowed (a JSON line's
@@ -538,9 +529,9 @@ impl Compiled {
     /// A line into `b`: one no active pipeline reads as its row, written from the line as it was
     /// read (a JSON line's fields from the room its reading keeps), nothing else made of it (the
     /// row its record would write: a test holds them alike), and its text back for the next
-    /// line's. One a pipeline (or the scanner) reads, as its record read here by every pipeline
-    /// and the scanner, written as its row and its strings handed back (`pipeline::spare`), its
-    /// text back too: the row the record would have written, read where it was offered (a test
+    /// line's. One a pipeline (or the scanner) reads, as its record of one buffer (`RecordBuf`,
+    /// kept from line to line) read here by every pipeline and the scanner and written as its row,
+    /// its text back too: the row the record would have written, read where it was offered (a test
     /// holds them alike). A service check's run, as its record ([`Compiled::record`]).
     pub(crate) fn write<M>(&self, line: Line, origin: &Origin, now_ns: i64, b: &mut Batch<M>, filters: &mut PipelineFilters) -> Option<String> {
         if self.source == kiln_obs::monitor::checks::SOURCE {
@@ -568,19 +559,18 @@ impl Compiled {
                 trace_id: read.as_ref().and_then(|j| j.trace_id),
                 span_id: read.as_ref().and_then(|j| j.span_id),
             };
-            let PipelineFilters { pipelines, scratch, scanner, scan } = filters;
+            let PipelineFilters { pipelines, scratch, scanner, scan, line: r } = filters;
             if pipelines.iter().any(|p| p.reads(&view, scratch)) || (!scanner.is_empty() && scanner.reads(&view, || view.attrs(), scan)) {
-                let mut r = self.record_of(text, &line, read.as_ref(), room, origin, now_ns);
+                self.record_into(r, &text, &line, read.as_ref(), room, origin, now_ns);
                 for p in pipelines.iter() {
-                    p.apply(&mut r, now_ns, scratch);
+                    p.apply(r, now_ns, scratch);
                 }
                 if !scanner.is_empty() {
-                    scanner.scan(&mut r, scan);
+                    scanner.scan(r, scan);
                 }
-                kiln_obs::errors::put_log_issue(&mut r);
-                let attrs = r.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-                b.push_row(r.ts, r.severity, [&r.service, &r.host, &r.source], &r.message, attrs, r.attrs.len(), (r.trace_id, r.span_id));
-                return Some(recycle(r));
+                kiln_obs::errors::put_log_issue_buf(r);
+                b.push_row(r.ts, r.severity, [r.service(), r.host(), r.source()], r.message(), r.attrs(), r.attr_count(), (r.trace_id, r.span_id));
+                return Some(text);
             }
             let ts = read.as_ref().and_then(|j| j.ts).or(line.ts).unwrap_or(now_ns);
             let ts = if ts > now_ns + AHEAD_MS * 1_000_000 { now_ns } else { ts };
@@ -621,6 +611,43 @@ impl Compiled {
         }
     }
 
+    /// [`Compiled::record_of`] into a record of one buffer (`r`, emptied first): the same record, its
+    /// strings written side by side, none of its own.
+    #[allow(clippy::too_many_arguments)]
+    fn record_into(&self, r: &mut RecordBuf, text: &str, line: &Line, read: Option<&JsonRead>, room: &JsonRoom, origin: &Origin, now_ns: i64) {
+        r.clear();
+        r.ts = read.and_then(|j| j.ts).or(line.ts).unwrap_or(now_ns);
+        if r.ts > now_ns + AHEAD_MS * 1_000_000 {
+            r.ts = now_ns;
+        }
+        r.severity = severity(read, text);
+        r.trace_id = read.and_then(|j| j.trace_id);
+        r.span_id = read.and_then(|j| j.span_id);
+        r.set_service(self.service_of(read, &room.service, origin));
+        r.set_host(&self.host);
+        r.set_source(&self.source);
+        let fields = read.map_or(0, |_| room.attrs.len());
+        r.reserve_attrs(fields + origin.attrs.len() + self.tags.len() + 2);
+        if read.is_some() {
+            for (k, v) in room.attrs.iter() {
+                r.push_attr(k, v);
+            }
+        }
+        for (k, v) in &origin.attrs {
+            r.push_attr(k, v);
+        }
+        if let Some(s) = line.stream {
+            r.push_attr("log.iostream", s);
+        }
+        if line.truncated {
+            r.push_attr("truncated", "true");
+        }
+        for (k, v) in &self.tags {
+            r.push_attr(k, v);
+        }
+        r.set_message(kiln_obs::logs::record::cut(text, kiln_obs::logs::record::MAX_MESSAGE_BYTES));
+    }
+
     /// A line's record of what its reading found (`read`, its fields in `room`; none, a text
     /// line's), `text` its message, `line` the rest of it.
     fn record_of(&self, text: String, line: &Line, read: Option<&JsonRead>, room: &JsonRoom, origin: &Origin, now_ns: i64) -> Record {
@@ -632,7 +659,7 @@ impl Compiled {
             service: spare::copy(self.service_of(read, &room.service, origin)),
             host: spare::copy(&self.host),
             source: spare::copy(&self.source),
-            attrs: spare::take_list(),
+            attrs: Vec::new(),
             trace_id: read.and_then(|j| j.trace_id),
             span_id: read.and_then(|j| j.span_id),
             ..Record::default()

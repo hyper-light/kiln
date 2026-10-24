@@ -834,8 +834,8 @@ as it is (its message, the source's names, its file's or container's attributes,
 error's issue), a JSON line from its fields as its reading flattens them into room kept from line
 to line. No record is made of it, and a test holds the row and the record's alike over every kind
 of line, JSON lines of every shape among them. A line a pipeline (or the scanner) reads is made its
-record where it is read, run through them, and written as its row there too, the record's strings
-handed back for the next line's (§8.2); a service check's run goes as a record. What a machine reads
+record where it is read, a record of one buffer kept from line to line, run through them, and
+written as its row there too (§8.2); a service check's run goes as a record. What a machine reads
 goes in the order it was read, rows beside records, and the batcher writes it so: a write's records
 and rows one item, compressed whole (§12.17).
 
@@ -929,10 +929,14 @@ record) and processors run in order on each record it matches, the pipelines in 
 what those before it made. The server keeps them (`<observe>/pipelines.json`) and tells every runner
 the list; each node applies it where it takes a record (a request's, a log source's, a cloud's), so
 what is stored is read already, on the machine that took it. A log source's line a pipeline (or the
-scanner, §8.9) reads is run through where it is read and written as its row then, the strings its
-record took handed back for the next line's (`pipeline::spare`: a line costs no allocation once a
-few are read); the row is the one its record wrote when records were run through as they were
-offered (a test holds 6,000 lines of every kind to it, byte for byte). Other records are run
+scanner, §8.9) reads is run through where it is read and written as its row then, its record one
+buffer (`kiln_obs::logs::buf::RecordBuf`: its fields and attributes side by side, kept from line to
+line), what a processor makes written side by side too and taken in one copy (`Attrs`: a grok
+rule's values, a URL's parts, a user agent's), so a line costs no string of its own; the row is
+the one its record wrote when records were run through as they were offered (a test holds 6,000
+lines of every kind to it, byte for byte), and the processors make what they made before, held to
+that code by tests (every grok conversion and filter, every processor, on a record of strings and
+on one of one buffer). Other records are run
 through once, as they are gathered: an offer refused comes back and is not run again.
 
 The processors are Datadog's: the **grok parser** (rules of literal text, a regular expression, and

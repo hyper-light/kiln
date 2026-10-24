@@ -22,6 +22,8 @@ use serde_json::Value;
 
 use super::{matcher, spare};
 
+use kiln_obs::logs::buf::Attrs;
+
 use kiln_obs::query::calendar::Zone;
 
 /// How deep helper rules may nest (a rule that names itself stops here).
@@ -99,6 +101,8 @@ struct Rule {
 pub struct Reading {
     locs: HashMap<u64, regex::CaptureLocations>,
     matcher: matcher::Scratch,
+    /// A value as its rule converts it, before a filter reads it.
+    val: String,
 }
 
 /// Rules compiled.
@@ -423,11 +427,15 @@ impl Grok {
 
     /// The first rule that matches `value` whole: its name, and its attributes appended to `out`.
     pub fn parse(&self, value: &str, now_ns: i64, out: &mut Vec<(String, String)>) -> Option<&str> {
-        self.parse_with(value, now_ns, &mut Reading::default(), out)
+        let mut made = Attrs::default();
+        let name = self.parse_with(value, now_ns, &mut Reading::default(), &mut made);
+        out.extend(made.iter().map(|(k, v)| (k.to_owned(), v.to_owned())));
+        name
     }
 
-    /// [`Grok::parse`], with what this thread keeps of the rules it reads.
-    pub fn parse_with(&self, value: &str, now_ns: i64, reading: &mut Reading, out: &mut Vec<(String, String)>) -> Option<&str> {
+    /// [`Grok::parse`], with what this thread keeps of the rules it reads: its attributes written
+    /// side by side into `out` (no string a value).
+    pub fn parse_with(&self, value: &str, now_ns: i64, reading: &mut Reading, out: &mut Attrs) -> Option<&str> {
         if reading.locs.len() > READING {
             reading.locs.clear();
         }
@@ -447,7 +455,7 @@ impl Grok {
                         if out.len() >= ATTRS {
                             break;
                         }
-                        extract(cap, text, now_ns, out);
+                        extract(cap, text, now_ns, out, &mut reading.val);
                     }
                 }
                 matcher::Found::Unsure => {
@@ -460,7 +468,7 @@ impl Grok {
                         if out.len() >= ATTRS {
                             break;
                         }
-                        extract(cap, text, now_ns, out);
+                        extract(cap, text, now_ns, out, &mut reading.val);
                     }
                 }
             }
@@ -470,117 +478,122 @@ impl Grok {
     }
 }
 
-/// Attributes read and not kept: their strings handed back, their room kept for the next value's
-/// (`spare`).
-pub fn hand_back(out: &mut Vec<(String, String)>) {
-    for (k, v) in out.drain(..) {
-        spare::give(k);
-        spare::give(v);
-    }
-}
-
-fn number_text(f: f64) -> Option<String> {
+/// A number's text as grok writes one onto `out`: a whole one an integer, else as it is; none (false)
+/// for one not finite.
+fn number_into(f: f64, out: &mut String) -> bool {
     if !f.is_finite() {
-        return None;
+        return false;
     }
     if f.fract() == 0.0 && f.abs() < 9.0e15 {
-        return Some(int_text(f as i64));
+        int_into(f as i64, out);
+    } else {
+        let _ = write!(out, "{f}");
     }
-    let mut s = spare::take();
-    let _ = write!(s, "{f}");
-    Some(s)
+    true
+}
+
+/// `{prefix}.{key}` onto `t` (`key` alone without a prefix).
+fn key_into(t: &mut String, prefix: Option<&str>, key: &str) {
+    if let Some(p) = prefix {
+        t.push_str(p);
+        t.push('.');
+    }
+    t.push_str(key);
 }
 
 /// A token's value, read and filtered, into `out` (under its name; a filter that makes fields,
-/// under the name too, or at the root without one).
-fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
+/// under the name too, or at the root without one): written where it is kept, a value converted
+/// first into `val` where a filter reads it.
+fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Attrs, val: &mut String) {
     // A text the filter drops (`nullIf("-")`): nothing made of it.
     if let (Conv::Str, Some(Filter::NullIf(x))) = (&cap.conv, &cap.filter)
         && raw == x
     {
         return;
     }
-    // Its strings taken where room was handed back (`spare`), and handed back when a filter makes
-    // another of them.
-    let value: Option<String> = match &cap.conv {
-        Conv::Str => Some(spare::copy(raw)),
-        Conv::Int => int_canonical(raw),
-        Conv::Num => raw.parse::<f64>().ok().and_then(number_text),
-        Conv::Bool(t) => Some(spare::copy(if t.iter().any(|x| x.eq_ignore_ascii_case(raw)) { "true" } else { "false" })),
-        Conv::Date(d) => d.read(raw, now_ns).map(int_text),
+    // The commonest, a text kept as it is: written once, where it is kept.
+    if let (Conv::Str, None) = (&cap.conv, &cap.filter) {
+        if let Some(n) = &cap.name {
+            out.push(n, raw);
+        }
+        return;
+    }
+    val.clear();
+    let converted = match &cap.conv {
+        Conv::Str => {
+            val.push_str(raw);
+            true
+        }
+        Conv::Int => int_canonical_into(raw, val),
+        Conv::Num => raw.parse::<f64>().ok().is_some_and(|f| number_into(f, val)),
+        Conv::Bool(t) => {
+            val.push_str(if t.iter().any(|x| x.eq_ignore_ascii_case(raw)) { "true" } else { "false" });
+            true
+        }
+        Conv::Date(d) => d.read(raw, now_ns).map(|ns| int_into(ns, val)).is_some(),
         Conv::Quoted => {
             let inner = raw.get(1..raw.len().saturating_sub(1)).unwrap_or_default();
-            Some(if inner.contains('\\') { inner.replace("\\\"", "\"").replace("\\'", "'") } else { spare::copy(inner) })
+            if inner.contains('\\') {
+                val.push_str(&inner.replace("\\\"", "\"").replace("\\'", "'"));
+            } else {
+                val.push_str(inner);
+            }
+            true
         }
     };
-    let Some(value) = value else { return };
-    let key = |k: &str| match &cap.name {
-        Some(n) => dotted(n, k),
-        None => spare::copy(k),
-    };
-    let named = |v: String, out: &mut Vec<(String, String)>| match &cap.name {
-        Some(n) => out.push((spare::copy(n), v)),
-        None => spare::give(v),
+    if !converted {
+        return;
+    }
+    let value = val.as_str();
+    let name = cap.name.as_deref();
+    // The value under its name, as `write` writes it (false: none).
+    let named = |out: &mut Attrs, write: &dyn Fn(&mut String) -> bool| {
+        if let Some(n) = name {
+            out.push_with(|t| t.push_str(n), write);
+        }
     };
     match &cap.filter {
-        None => return named(value, out),
-        Some(Filter::Number) => {
-            if let Some(v) = value.parse::<f64>().ok().and_then(number_text) {
-                named(v, out);
-            }
-        }
-        Some(Filter::Integer) => {
-            if let Some(v) = value.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| int_text(f as i64)) {
-                named(v, out);
-            }
-        }
-        Some(Filter::Scale(k)) => {
-            if let Some(v) = value.parse::<f64>().ok().and_then(|f| number_text(f * k)) {
-                named(v, out);
-            }
-        }
-        Some(Filter::Boolean) => named(spare::copy(if value.eq_ignore_ascii_case("true") { "true" } else { "false" }), out),
+        None => named(out, &|t| {
+            t.push_str(value);
+            true
+        }),
+        Some(Filter::Number) => named(out, &|t| value.parse::<f64>().ok().is_some_and(|f| number_into(f, t))),
+        Some(Filter::Integer) => named(out, &|t| value.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| int_into(f as i64, t)).is_some()),
+        Some(Filter::Scale(k)) => named(out, &|t| value.parse::<f64>().ok().is_some_and(|f| number_into(f * k, t))),
+        Some(Filter::Boolean) => named(out, &|t| {
+            t.push_str(if value.eq_ignore_ascii_case("true") { "true" } else { "false" });
+            true
+        }),
         Some(Filter::NullIf(x)) => {
             if value != *x {
-                return named(value, out);
+                named(out, &|t| {
+                    t.push_str(value);
+                    true
+                });
             }
         }
-        Some(Filter::Lowercase) => named(value.to_lowercase(), out),
-        Some(Filter::Uppercase) => named(value.to_uppercase(), out),
-        Some(Filter::DecodeUri) => named(decode_uri(&value), out),
+        Some(Filter::Lowercase) => named(out, &|t| {
+            t.push_str(&value.to_lowercase());
+            true
+        }),
+        Some(Filter::Uppercase) => named(out, &|t| {
+            t.push_str(&value.to_uppercase());
+            true
+        }),
+        Some(Filter::DecodeUri) => named(out, &|t| {
+            decode_uri_into(value, t);
+            true
+        }),
         Some(Filter::Json) => {
-            if let Ok(v) = serde_json::from_str::<Value>(&value) {
-                flatten(cap.name.as_deref(), v, 0, out);
+            if let Ok(v) = serde_json::from_str::<Value>(value) {
+                flatten_into(name, &v, out);
             }
         }
-        Some(Filter::KeyValue { sep }) => key_values(&value, sep, cap.name.as_deref(), out),
-        Some(Filter::QueryString) => {
-            let mut pairs = Vec::new();
-            query_pairs(value.trim_start_matches('?'), &mut pairs);
-            for (k, v) in pairs {
-                out.push((key(&k), v));
-                spare::give(k);
-            }
-        }
-        Some(Filter::Url) => {
-            let mut parts = Vec::new();
-            url_parts(&value, &mut parts);
-            for (k, v) in parts {
-                out.push((key(&k), v));
-                if let Cow::Owned(k) = k {
-                    spare::give(k);
-                }
-            }
-        }
-        Some(Filter::UserAgent) => {
-            let mut parts = Vec::new();
-            user_agent(&value, &mut parts);
-            for (k, v) in parts {
-                out.push((key(k), v));
-            }
-        }
+        Some(Filter::KeyValue { sep }) => key_values(value, sep, name, out),
+        Some(Filter::QueryString) => query_pairs(value.trim_start_matches('?'), name, out),
+        Some(Filter::Url) => url_parts(value, name, false, out),
+        Some(Filter::UserAgent) => user_agent(value, name, out),
     }
-    spare::give(value);
 }
 
 /// JSON's fields as attributes, nested keys joined by dots, arrays as JSON.
@@ -612,9 +625,56 @@ pub(crate) fn flatten(prefix: Option<&str>, v: Value, depth: usize, out: &mut Ve
     }
 }
 
+/// [`flatten`] into attributes side by side, under `prefix` where there is one.
+fn flatten_into(prefix: Option<&str>, v: &Value, out: &mut Attrs) {
+    let mut key = spare::take();
+    if let Some(p) = prefix {
+        key.push_str(p);
+    }
+    flatten_at(&mut key, prefix.is_some(), v, 0, out);
+    spare::give(key);
+}
+
+/// [`flatten_into`]'s value at `key` (named: it is not the root).
+fn flatten_at(key: &mut String, named: bool, v: &Value, depth: usize, out: &mut Attrs) {
+    if out.len() >= ATTRS {
+        return;
+    }
+    match v {
+        Value::Object(o) if depth < 6 => {
+            for (k, v) in o {
+                let at = key.len();
+                if named {
+                    key.push('.');
+                }
+                key.push_str(k);
+                flatten_at(key, true, v, depth + 1, out);
+                key.truncate(at);
+            }
+        }
+        Value::Null => {}
+        Value::String(s) => {
+            if named {
+                out.push(key, s);
+            }
+        }
+        other => {
+            if named {
+                out.push_with(
+                    |t| t.push_str(key),
+                    |t| {
+                        let _ = write!(t, "{other}");
+                        true
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// `key<sep>value` pairs (a value quoted, or up to a space, a comma or a semicolon) into `out`, each
 /// key under `prefix` where there is one.
-fn key_values(s: &str, sep: &str, prefix: Option<&str>, out: &mut Vec<(String, String)>) {
+fn key_values(s: &str, sep: &str, prefix: Option<&str>, out: &mut Attrs) {
     let mut rest = s;
     let mut n = 0;
     while let Some(at) = rest.find(sep) {
@@ -633,11 +693,13 @@ fn key_values(s: &str, sep: &str, prefix: Option<&str>, out: &mut Vec<(String, S
             }
         };
         if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || "_.@-".contains(c)) && n < ATTRS {
-            let key = match prefix {
-                Some(p) => dotted(p, key),
-                None => spare::copy(key),
-            };
-            out.push((key, spare::copy(value)));
+            out.push_with(
+                |t| key_into(t, prefix, key),
+                |t| {
+                    t.push_str(value);
+                    true
+                },
+            );
             n += 1;
         }
         rest = after.get(used..).unwrap_or_default();
@@ -647,13 +709,16 @@ fn key_values(s: &str, sep: &str, prefix: Option<&str>, out: &mut Vec<(String, S
     }
 }
 
-/// `s` with its `%XX` escapes and `+`s decoded.
-pub(crate) fn decode_uri(s: &str) -> String {
+/// `s` with its `%XX` escapes and `+`s decoded, onto `t`: what decodes to no UTF-8 written as
+/// `from_utf8_lossy` writes it.
+pub(crate) fn decode_uri_into(s: &str, t: &mut String) {
     if !s.bytes().any(|b| b == b'%' || b == b'+') {
-        return spare::copy(s);
+        t.push_str(s);
+        return;
     }
     let b = s.as_bytes();
-    let mut out = spare::take().into_bytes();
+    let start = t.len();
+    let mut out = std::mem::take(t).into_bytes();
     out.reserve(b.len());
     let mut i = 0;
     while let Some(&c) = b.get(i) {
@@ -678,29 +743,58 @@ pub(crate) fn decode_uri(s: &str) -> String {
             }
         }
     }
-    match String::from_utf8(out) {
+    *t = match String::from_utf8(out) {
         Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    }
+        // What was there before was text: the rest made text as `from_utf8_lossy` makes it.
+        Err(e) => {
+            let mut bytes = e.into_bytes();
+            let decoded = bytes.split_off(start.min(bytes.len()));
+            let mut s = String::from_utf8(bytes).unwrap_or_default();
+            s.push_str(&String::from_utf8_lossy(&decoded));
+            s
+        }
+    };
 }
 
-/// A query string's pairs, decoded, into `out`.
-pub(crate) fn query_pairs(q: &str, out: &mut Vec<(String, String)>) {
+/// A query string's pairs, decoded, into `out` (under `prefix` where there is one).
+pub(crate) fn query_pairs(q: &str, prefix: Option<&str>, out: &mut Attrs) {
     for p in q.split('&').filter(|p| !p.is_empty()).take(ATTRS) {
         let (k, v) = p.split_once('=').unwrap_or((p, ""));
-        out.push((decode_uri(k), decode_uri(v)));
+        out.push_with(
+            |t| {
+                if let Some(p) = prefix {
+                    t.push_str(p);
+                    t.push('.');
+                }
+                decode_uri_into(k, t);
+            },
+            |t| {
+                decode_uri_into(v, t);
+                true
+            },
+        );
     }
 }
 
-/// A URL's parts, as Datadog's URL parser names them, into `out`: `scheme`, `host`, `port`, `path`,
-/// `queryString.<key>` (the names but a query's key, written in once).
-pub(crate) fn url_parts(url: &str, out: &mut Vec<(Cow<'static, str>, String)>) {
+/// A URL's parts, as Datadog's URL parser names them, into `out` (under `prefix` where there is
+/// one): `scheme`, `host`, `port`, `path` (its ending slashes trimmed where `trim_path` says, as the
+/// parser's `normalize_ending_slashes` does), `queryString.<key>`.
+pub(crate) fn url_parts(url: &str, prefix: Option<&str>, trim_path: bool, out: &mut Attrs) {
+    let put = |out: &mut Attrs, k: &str, v: &str| {
+        out.push_with(
+            |t| key_into(t, prefix, k),
+            |t| {
+                t.push_str(v);
+                true
+            },
+        );
+    };
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) => (Some(s), r),
         _ => (None, url),
     };
     if let Some(s) = scheme {
-        out.push((Cow::Borrowed("scheme"), spare::copy(s)));
+        put(out, "scheme", s);
     }
     let (authority, path_query) = if scheme.is_some() {
         match rest.find(['/', '?', '#']) {
@@ -714,22 +808,30 @@ pub(crate) fn url_parts(url: &str, out: &mut Vec<(Cow<'static, str>, String)>) {
         let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
         match host_port.rsplit_once(':').filter(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
             Some((h, p)) => {
-                out.push((Cow::Borrowed("host"), spare::copy(h.trim_start_matches('[').trim_end_matches(']'))));
-                out.push((Cow::Borrowed("port"), spare::copy(p)));
+                put(out, "host", h.trim_start_matches('[').trim_end_matches(']'));
+                put(out, "port", p);
             }
-            None => out.push((Cow::Borrowed("host"), spare::copy(host_port))),
+            None => put(out, "host", host_port),
         }
     }
     let path_query = path_query.split('#').next().unwrap_or_default();
     let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
     if !path.is_empty() {
-        out.push((Cow::Borrowed("path"), spare::copy(path)));
+        let kept = if trim_path && path.len() > 1 { path.get(..path.trim_end_matches('/').len()).unwrap_or(path) } else { path };
+        put(out, "path", kept);
     }
     for p in query.split('&').filter(|p| !p.is_empty()).take(ATTRS) {
         let (k, v) = p.split_once('=').unwrap_or((p, ""));
-        let k = decode_uri(k);
-        out.push((Cow::Owned(dotted("queryString", &k)), decode_uri(v)));
-        spare::give(k);
+        out.push_with(
+            |t| {
+                key_into(t, prefix, "queryString.");
+                decode_uri_into(k, t);
+            },
+            |t| {
+                decode_uri_into(v, t);
+                true
+            },
+        );
     }
 }
 
@@ -766,7 +868,16 @@ static UA_STARTS: [u32; 256] = ua_starts();
 /// A user agent's browser, operating system and device, as far as its words tell (the families
 /// Datadog's parser names, not its full database). Its words found in one pass: at each byte, the
 /// words that may begin with it (a word found is not looked for again).
-pub(crate) fn user_agent(ua: &str, out: &mut Vec<(&'static str, String)>) {
+pub(crate) fn user_agent(ua: &str, prefix: Option<&str>, out: &mut Attrs) {
+    let put = |out: &mut Attrs, k: &str, v: &str| {
+        out.push_with(
+            |t| key_into(t, prefix, k),
+            |t| {
+                t.push_str(v);
+                true
+            },
+        );
+    };
     let b = ua.as_bytes();
     let mut found = 0u32;
     let mut first = [0usize; UA_KEYS];
@@ -818,9 +929,9 @@ pub(crate) fn user_agent(ua: &str, out: &mut Vec<(&'static str, String)>) {
         None
     };
     if let Some((family, v)) = browser {
-        out.push(("browser.family", spare::copy(family)));
+        put(out, "browser.family", family);
         if let Some(v) = v {
-            out.push(("browser.major", spare::copy(v)));
+            put(out, "browser.major", v);
         }
     }
     let os = if has("Windows") {
@@ -837,7 +948,7 @@ pub(crate) fn user_agent(ua: &str, out: &mut Vec<(&'static str, String)>) {
         None
     };
     if let Some(os) = os {
-        out.push(("os.family", spare::copy(os)));
+        put(out, "os.family", os);
     }
     let device = if bot {
         "Bot"
@@ -848,21 +959,11 @@ pub(crate) fn user_agent(ua: &str, out: &mut Vec<(&'static str, String)>) {
     } else {
         "Desktop"
     };
-    out.push(("device.category", spare::copy(device)));
+    put(out, "device.category", device);
 }
 
-/// `{prefix}.{key}`, made with its room once.
-pub(crate) fn dotted(prefix: &str, key: &str) -> String {
-    let mut s = spare::take();
-    s.reserve(prefix.len() + 1 + key.len());
-    s.push_str(prefix);
-    s.push('.');
-    s.push_str(key);
-    s
-}
-
-/// An integer's decimal text, without the formatter's machinery.
-pub(crate) fn int_text(n: i64) -> String {
+/// An integer's decimal text onto `out`, without the formatter's machinery.
+pub(crate) fn int_into(n: i64, out: &mut String) {
     let mut buf = [0u8; 20];
     let mut at = buf.len();
     let mut m = n.unsigned_abs();
@@ -877,23 +978,22 @@ pub(crate) fn int_text(n: i64) -> String {
         }
     }
     let digits = buf.get(at..).unwrap_or_default();
-    let mut s = spare::take();
     if n < 0 {
-        s.push('-');
+        out.push('-');
     }
-    s.extend(digits.iter().map(|&d| char::from(d)));
-    s
+    out.extend(digits.iter().map(|&d| char::from(d)));
 }
 
-/// An integer's text as `i64`'s parse and its text say it (a `+` and leading zeros gone): the text
-/// as it is when that is already it.
-fn int_canonical(raw: &str) -> Option<String> {
+/// An integer's text as `i64`'s parse and its text say it (a `+` and leading zeros gone) onto
+/// `out`: the text as it is when that is already it; none (false) where it is no integer.
+fn int_canonical_into(raw: &str, out: &mut String) -> bool {
     let digits = raw.strip_prefix('-').unwrap_or(raw);
     let plain = !digits.is_empty() && digits.len() <= 18 && digits.bytes().all(|b| b.is_ascii_digit()) && (digits.len() == 1 || !digits.starts_with('0')) && raw != "-0";
     if plain {
-        return Some(spare::copy(raw));
+        out.push_str(raw);
+        return true;
     }
-    raw.trim_start_matches('+').parse::<i64>().ok().map(int_text)
+    raw.trim_start_matches('+').parse::<i64>().ok().map(|n| int_into(n, out)).is_some()
 }
 
 // ------------------------------------------------------------------------------------- dates
@@ -1225,6 +1325,340 @@ impl DateFmt {
     }
 }
 
+/// The code the extraction side by side replaced (`docs/observe.md` §12.17), each value a string of
+/// its own: what it is held to.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+pub(crate) mod before {
+    use std::borrow::Cow;
+    use std::fmt::Write as _;
+
+    use serde_json::Value;
+
+    use super::{ATTRS, Attrs, Cap, Conv, Filter, Grok, READING, Reading, flatten, matcher, spare};
+
+    /// [`Grok::parse_with`] as it was: each value extracted as a string of its own.
+    pub(crate) fn parse<'g>(g: &'g Grok, value: &str, now_ns: i64, reading: &mut Reading, out: &mut Vec<(String, String)>) -> Option<&'g str> {
+        if reading.locs.len() > READING {
+            reading.locs.clear();
+        }
+        for rule in &g.rules {
+            let found = match &rule.prog {
+                Some(p) => p.search(value, &mut reading.matcher),
+                None => matcher::Found::Unsure,
+            };
+            match found {
+                matcher::Found::No => continue,
+                matcher::Found::Yes => {
+                    for cap in &rule.caps {
+                        let Some(text) = reading.matcher.group(cap.index).and_then(|(a, b)| value.get(a..b)) else { continue };
+                        if out.len() >= ATTRS {
+                            break;
+                        }
+                        extract(cap, text, now_ns, out);
+                    }
+                }
+                matcher::Found::Unsure => {
+                    let locs = reading.locs.entry(rule.id).or_insert_with(|| rule.re.capture_locations());
+                    if rule.re.captures_read(locs, value).is_none() {
+                        continue;
+                    }
+                    for cap in &rule.caps {
+                        let Some(text) = locs.get(cap.index).and_then(|(a, b)| value.get(a..b)) else { continue };
+                        if out.len() >= ATTRS {
+                            break;
+                        }
+                        extract(cap, text, now_ns, out);
+                    }
+                }
+            }
+            return Some(&rule.name);
+        }
+        None
+    }
+
+    fn number_text(f: f64) -> Option<String> {
+        if !f.is_finite() {
+            return None;
+        }
+        if f.fract() == 0.0 && f.abs() < 9.0e15 {
+            return Some(int_text(f as i64));
+        }
+        let mut s = spare::take();
+        let _ = write!(s, "{f}");
+        Some(s)
+    }
+
+    /// A token's value, read and filtered, into `out` (under its name; a filter that makes fields,
+    /// under the name too, or at the root without one).
+    fn extract(cap: &Cap, raw: &str, now_ns: i64, out: &mut Vec<(String, String)>) {
+        // A text the filter drops (`nullIf("-")`): nothing made of it.
+        if let (Conv::Str, Some(Filter::NullIf(x))) = (&cap.conv, &cap.filter)
+            && raw == x
+        {
+            return;
+        }
+        // Its strings taken where room was handed back (`spare`), and handed back when a filter makes
+        // another of them.
+        let value: Option<String> = match &cap.conv {
+            Conv::Str => Some(spare::copy(raw)),
+            Conv::Int => int_canonical(raw),
+            Conv::Num => raw.parse::<f64>().ok().and_then(number_text),
+            Conv::Bool(t) => Some(spare::copy(if t.iter().any(|x| x.eq_ignore_ascii_case(raw)) { "true" } else { "false" })),
+            Conv::Date(d) => d.read(raw, now_ns).map(int_text),
+            Conv::Quoted => {
+                let inner = raw.get(1..raw.len().saturating_sub(1)).unwrap_or_default();
+                Some(if inner.contains('\\') { inner.replace("\\\"", "\"").replace("\\'", "'") } else { spare::copy(inner) })
+            }
+        };
+        let Some(value) = value else { return };
+        let key = |k: &str| match &cap.name {
+            Some(n) => dotted(n, k),
+            None => spare::copy(k),
+        };
+        let named = |v: String, out: &mut Vec<(String, String)>| match &cap.name {
+            Some(n) => out.push((spare::copy(n), v)),
+            None => spare::give(v),
+        };
+        match &cap.filter {
+            None => return named(value, out),
+            Some(Filter::Number) => {
+                if let Some(v) = value.parse::<f64>().ok().and_then(number_text) {
+                    named(v, out);
+                }
+            }
+            Some(Filter::Integer) => {
+                if let Some(v) = value.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| int_text(f as i64)) {
+                    named(v, out);
+                }
+            }
+            Some(Filter::Scale(k)) => {
+                if let Some(v) = value.parse::<f64>().ok().and_then(|f| number_text(f * k)) {
+                    named(v, out);
+                }
+            }
+            Some(Filter::Boolean) => named(spare::copy(if value.eq_ignore_ascii_case("true") { "true" } else { "false" }), out),
+            Some(Filter::NullIf(x)) => {
+                if value != *x {
+                    return named(value, out);
+                }
+            }
+            Some(Filter::Lowercase) => named(value.to_lowercase(), out),
+            Some(Filter::Uppercase) => named(value.to_uppercase(), out),
+            Some(Filter::DecodeUri) => named(decode_uri(&value), out),
+            Some(Filter::Json) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&value) {
+                    flatten(cap.name.as_deref(), v, 0, out);
+                }
+            }
+            Some(Filter::KeyValue { sep }) => key_values(&value, sep, cap.name.as_deref(), out),
+            Some(Filter::QueryString) => {
+                let mut pairs = Vec::new();
+                query_pairs(value.trim_start_matches('?'), &mut pairs);
+                for (k, v) in pairs {
+                    out.push((key(&k), v));
+                    spare::give(k);
+                }
+            }
+            Some(Filter::Url) => {
+                let mut parts = Vec::new();
+                url_parts(&value, &mut parts);
+                for (k, v) in parts {
+                    out.push((key(&k), v));
+                    if let Cow::Owned(k) = k {
+                        spare::give(k);
+                    }
+                }
+            }
+            Some(Filter::UserAgent) => {
+                let mut parts = Vec::new();
+                user_agent(&value, &mut parts);
+                for (k, v) in parts {
+                    out.push((key(k), v));
+                }
+            }
+        }
+        spare::give(value);
+    }
+
+    /// `key<sep>value` pairs (a value quoted, or up to a space, a comma or a semicolon) into `out`, each
+    /// key under `prefix` where there is one.
+    fn key_values(s: &str, sep: &str, prefix: Option<&str>, out: &mut Vec<(String, String)>) {
+        let mut rest = s;
+        let mut n = 0;
+        while let Some(at) = rest.find(sep) {
+            let before = rest.get(..at).unwrap_or_default();
+            let key = before.rsplit(|c: char| c.is_whitespace() || c == ',' || c == ';').next().unwrap_or_default();
+            let after = rest.get(at + sep.len()..).unwrap_or_default();
+            let (value, used) = match after.chars().next() {
+                Some(q @ ('"' | '\'')) => {
+                    let body = after.get(1..).unwrap_or_default();
+                    let end = body.find(q).unwrap_or(body.len());
+                    (body.get(..end).unwrap_or_default(), (end + 2).min(after.len()))
+                }
+                _ => {
+                    let end = after.find(|c: char| c.is_whitespace() || c == ',' || c == ';').unwrap_or(after.len());
+                    (after.get(..end).unwrap_or_default(), end)
+                }
+            };
+            if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || "_.@-".contains(c)) && n < ATTRS {
+                let key = match prefix {
+                    Some(p) => dotted(p, key),
+                    None => spare::copy(key),
+                };
+                out.push((key, spare::copy(value)));
+                n += 1;
+            }
+            rest = after.get(used..).unwrap_or_default();
+            if used == 0 {
+                break;
+            }
+        }
+    }
+
+    /// `s` with its `%XX` escapes and `+`s decoded.
+    pub(crate) fn decode_uri(s: &str) -> String {
+        if !s.bytes().any(|b| b == b'%' || b == b'+') {
+            return spare::copy(s);
+        }
+        let b = s.as_bytes();
+        let mut out = spare::take().into_bytes();
+        out.reserve(b.len());
+        let mut i = 0;
+        while let Some(&c) = b.get(i) {
+            match c {
+                b'%' => match b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(v) => {
+                        out.push(v);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(c);
+                        i += 1;
+                    }
+                },
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                _ => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        match String::from_utf8(out) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }
+    }
+
+    /// A query string's pairs, decoded, into `out`.
+    fn query_pairs(q: &str, out: &mut Vec<(String, String)>) {
+        for p in q.split('&').filter(|p| !p.is_empty()).take(ATTRS) {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            out.push((decode_uri(k), decode_uri(v)));
+        }
+    }
+
+    /// A URL's parts, as Datadog's URL parser names them, into `out`: `scheme`, `host`, `port`, `path`,
+    /// `queryString.<key>` (the names but a query's key, written in once).
+    pub(crate) fn url_parts(url: &str, out: &mut Vec<(Cow<'static, str>, String)>) {
+        let (scheme, rest) = match url.split_once("://") {
+            Some((s, r)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) => (Some(s), r),
+            _ => (None, url),
+        };
+        if let Some(s) = scheme {
+            out.push((Cow::Borrowed("scheme"), spare::copy(s)));
+        }
+        let (authority, path_query) = if scheme.is_some() {
+            match rest.find(['/', '?', '#']) {
+                Some(i) => (rest.get(..i).unwrap_or_default(), rest.get(i..).unwrap_or_default()),
+                None => (rest, ""),
+            }
+        } else {
+            ("", rest)
+        };
+        if !authority.is_empty() {
+            let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            match host_port.rsplit_once(':').filter(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+                Some((h, p)) => {
+                    out.push((Cow::Borrowed("host"), spare::copy(h.trim_start_matches('[').trim_end_matches(']'))));
+                    out.push((Cow::Borrowed("port"), spare::copy(p)));
+                }
+                None => out.push((Cow::Borrowed("host"), spare::copy(host_port))),
+            }
+        }
+        let path_query = path_query.split('#').next().unwrap_or_default();
+        let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
+        if !path.is_empty() {
+            out.push((Cow::Borrowed("path"), spare::copy(path)));
+        }
+        for p in query.split('&').filter(|p| !p.is_empty()).take(ATTRS) {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            let k = decode_uri(k);
+            out.push((Cow::Owned(dotted("queryString", &k)), decode_uri(v)));
+            spare::give(k);
+        }
+    }
+
+    /// `{prefix}.{key}`, made with its room once.
+    pub(crate) fn dotted(prefix: &str, key: &str) -> String {
+        let mut s = spare::take();
+        s.reserve(prefix.len() + 1 + key.len());
+        s.push_str(prefix);
+        s.push('.');
+        s.push_str(key);
+        s
+    }
+
+    /// An integer's decimal text, without the formatter's machinery.
+    pub(crate) fn int_text(n: i64) -> String {
+        let mut buf = [0u8; 20];
+        let mut at = buf.len();
+        let mut m = n.unsigned_abs();
+        loop {
+            at -= 1;
+            if let Some(d) = buf.get_mut(at) {
+                *d = b'0' + (m % 10) as u8;
+            }
+            m /= 10;
+            if m == 0 {
+                break;
+            }
+        }
+        let digits = buf.get(at..).unwrap_or_default();
+        let mut s = spare::take();
+        if n < 0 {
+            s.push('-');
+        }
+        s.extend(digits.iter().map(|&d| char::from(d)));
+        s
+    }
+
+    /// An integer's text as `i64`'s parse and its text say it (a `+` and leading zeros gone): the text
+    /// as it is when that is already it.
+    fn int_canonical(raw: &str) -> Option<String> {
+        let digits = raw.strip_prefix('-').unwrap_or(raw);
+        let plain = !digits.is_empty() && digits.len() <= 18 && digits.bytes().all(|b| b.is_ascii_digit()) && (digits.len() == 1 || !digits.starts_with('0')) && raw != "-0";
+        if plain {
+            return Some(spare::copy(raw));
+        }
+        raw.trim_start_matches('+').parse::<i64>().ok().map(int_text)
+    }
+
+    /// The user agent's parts as the code before wrote them: through today's (held to
+    /// `user_agent_before` by its own test), as strings of their own.
+    pub(crate) fn user_agent(ua: &str, out: &mut Vec<(&'static str, String)>) {
+        let mut a = Attrs::default();
+        super::user_agent(ua, None, &mut a);
+        for (k, v) in a.iter() {
+            let key: &'static str = ["browser.family", "browser.major", "os.family", "device.category"].into_iter().find(|w| *w == k).unwrap_or("");
+            out.push((key, v.to_owned()));
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -1338,9 +1772,10 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
             .collect();
         let (mut reading, mut matched) = (Reading::default(), 0);
         for line in lines.iter().chain(&cut) {
-            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let (mut a, mut b) = (Attrs::default(), Vec::new());
             let ra = ours.parse_with(line, 1_792_324_800_000_000_000, &mut reading, &mut a).map(str::to_owned);
             let rb = theirs.parse(line, 1_792_324_800_000_000_000, &mut b).map(str::to_owned);
+            let a: Vec<(String, String)> = a.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
             assert_eq!((&ra, &a), (&rb, &b), "{line}");
             matched += usize::from(ra.is_some());
         }
@@ -1453,9 +1888,10 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
             uas.push(ua);
         }
         for ua in &uas {
-            let mut ours = Vec::new();
-            user_agent(ua, &mut ours);
-            assert_eq!(ours, user_agent_before(ua), "{ua:?}");
+            let mut ours = Attrs::default();
+            user_agent(ua, None, &mut ours);
+            let before = user_agent_before(ua);
+            assert_eq!(ours.iter().collect::<Vec<_>>(), before.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>(), "{ua:?}");
         }
     }
 
@@ -1481,10 +1917,14 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
             "1a",
             "٣",
         ] {
-            assert_eq!(int_canonical(raw), raw.trim_start_matches('+').parse::<i64>().ok().map(|i| i.to_string()), "{raw}");
+            let mut s = String::new();
+            let read = int_canonical_into(raw, &mut s);
+            assert_eq!(read.then_some(s), raw.trim_start_matches('+').parse::<i64>().ok().map(|i| i.to_string()), "{raw}");
         }
         for n in [0, 1, -1, 9, 10, -10, i64::MAX, i64::MIN, 1_483_719_397_000] {
-            assert_eq!(int_text(n), n.to_string());
+            let mut s = String::new();
+            int_into(n, &mut s);
+            assert_eq!(s, n.to_string());
         }
     }
 
@@ -1645,5 +2085,110 @@ access.combined %{access.common} (%{number:duration:scale(1000000000)} )?"%{_ref
         let far = DateFmt::compile("yyyyMMdd HHmmss Z", Zone::UTC).unwrap();
         assert_eq!((far.read("22620412 000000 +0000", 0), far.read("71250101 000000 +0000", 0)), (None, None));
         assert!(far.read("22610101 000000 +0000", 0).is_some());
+    }
+
+    /// What a rule's tokens make, written side by side, is what they made as strings of their own
+    /// (`before`, the code it replaced), to the byte and in the same order: every conversion and
+    /// every filter, named and at the root, on values made to trip them (escapes, broken UTF-8 in
+    /// a URL's escapes, JSON past its depth, keys repeated, quotes, URLs of every part).
+    #[test]
+    fn values_extracted_side_by_side_are_what_they_were() {
+        let rules = [
+            "r %{data:a}",
+            "r %{notSpace:a.b} %{data:c}",
+            "r %{number:a}",
+            "r %{numberExt:a}",
+            "r %{integer:a}",
+            "r %{quotedString:a}",
+            "r %{boolean:a}",
+            r#"r %{boolean("yes","no"):a}"#,
+            r#"r %{date("yyyy-MM-dd HH:mm:ss"):a}"#,
+            r#"r %{date("dd/MMM/yyyy:HH:mm:ss Z"):a}"#,
+            "r %{data:a:number}",
+            "r %{data:a:integer}",
+            "r %{data:a:scale(10)}",
+            "r %{data:a:scale(0.001)}",
+            "r %{data:a:boolean}",
+            r#"r %{data:a:nullIf("-")}"#,
+            r#"r %{notSpace:a:nullIf("-")}"#,
+            "r %{data:a:lowercase}",
+            "r %{data:a:uppercase}",
+            "r %{data:a:decodeuricomponent}",
+            "r %{data:a:json}",
+            "r %{data::json}",
+            "r %{data:a:keyvalue}",
+            "r %{data::keyvalue}",
+            r#"r %{data:a:keyvalue(":")}"#,
+            "r %{data:a:querystring}",
+            "r %{data::querystring}",
+            "r %{data:a:url}",
+            "r %{data::url}",
+            "r %{data:a:useragent}",
+            "r %{data::useragent}",
+            "r %{quotedString:a:keyvalue}",
+            "r %{integer:a:scale(2)} %{data:b:json}",
+        ];
+        let fixed = [
+            "",
+            "-",
+            "0",
+            "-0",
+            "+7",
+            "007",
+            "12.50",
+            "1e3",
+            "9223372036854775808",
+            "true",
+            "FALSE",
+            "yes",
+            "\"a \\\"quoted\\\" \\'one\\'\"",
+            "'single'",
+            "2026-10-18 12:00:00",
+            "18/Oct/2026:12:00:00 +0200",
+            "Hello%20W%C3%B6rld+x%FF%C3%28%",
+            r#"{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}},"n":null,"x":[1,"two",{"t":3}],"s":"str","f":1.5,"t":true}"#,
+            r#"{"k":"v","k":"w"}"#,
+            "[1,2]",
+            "k=v k2=\"quoted value\" k3='q' bad key=x k=again a.b=c;d=e,f=g",
+            "k:v other:w",
+            "?a=1&b=%20two&a=3&&c&d=%FF",
+            "https://user:pw@[::1]:8443/a/b//?q=1&r=%2F#frag",
+            "http://example.com",
+            "/just/a/path/?x=y",
+            "ftp+x://host:21",
+            "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+            "curl/8.5.0",
+            "Googlebot/2.1 (+http://www.google.com/bot.html)",
+            "ΣΑΣ ÉÇ ß",
+        ];
+        let alphabet = ["a", "Z", "0", "9", " ", "=", "&", "?", "/", ":", "%", "%2", "%41", "%FF", "+", "\"", "'", "\\", "{", "}", "[", "]", ",", ";", ".", "-", "é", "Σ", "http://", "k=", "\"x\":"];
+        let mut rng = kiln_obs::testkit::Rng::new(41);
+        let mut values: Vec<String> = fixed.iter().map(|v| (*v).to_owned()).collect();
+        for _ in 0..3_000 {
+            let mut v = String::new();
+            for _ in 0..rng.below(24) {
+                v.push_str(alphabet[rng.below(alphabet.len() as u64) as usize]);
+            }
+            values.push(v);
+        }
+        let now_ns = 1_792_324_800_000_000_000;
+        let mut reading = Reading::default();
+        let (mut ours, mut theirs) = (Attrs::default(), Vec::new());
+        let mut made = 0;
+        for rule in rules {
+            let g = Grok::compile(rule, "").unwrap();
+            for v in &values {
+                for line in [v.clone(), format!("{v} {v}")] {
+                    ours.clear();
+                    theirs.clear();
+                    let a = g.parse_with(&line, now_ns, &mut reading, &mut ours).map(str::to_owned);
+                    let b = before::parse(&g, &line, now_ns, &mut Reading::default(), &mut theirs).map(str::to_owned);
+                    let ours: Vec<(String, String)> = ours.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+                    assert_eq!((&a, &ours), (&b, &theirs), "{rule} on {line:?}");
+                    made += ours.len();
+                }
+            }
+        }
+        assert!(made > 20_000, "{made} attributes made");
     }
 }

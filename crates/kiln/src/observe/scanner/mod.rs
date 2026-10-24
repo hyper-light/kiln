@@ -14,12 +14,13 @@
 pub mod kept;
 pub mod patterns;
 
-use kiln_obs::logs::record::Record;
 use kiln_obs::logs::search::{Fields, RowScratch, Search};
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use patterns::{Standard, Validator};
+
+use super::pipeline::Target;
 
 /// Scanning groups at the most, rules a group holds at the most (Datadog's 20 and 50 a group).
 pub const GROUPS: usize = 20;
@@ -470,20 +471,22 @@ impl Scanner {
     /// Every group whose filter matches `r` run on it: each match of a rule (its check passed, a
     /// keyword near it when it needs one) replaced as its rule says, and `r` tagged with each
     /// matching rule's tags. Whether anything matched.
-    pub fn scan(&self, r: &mut Record, s: &mut Scratch) -> bool {
+    pub fn scan<R: Target>(&self, r: &mut R, s: &mut Scratch) -> bool {
         s.hits.clear();
         for (gi, g) in self.groups.iter().enumerate() {
             if let Some(f) = &g.filter
-                && !f.record(r, &mut s.search)
+                && !f.fields(&*r, &mut s.search)
             {
                 continue;
             }
-            if g.looks_in("message") {
-                scan_text(g, gi, "message", &mut r.message, &self.key, s);
+            // Each text it looks in read where it is; one a rule replaces in, its new text set.
+            if g.looks_in("message") && scan_text(g, gi, "message", r.message(), &self.key, s) {
+                r.replace_message(&mut s.out);
             }
-            for (k, v) in &mut r.attrs {
-                if g.looks_in(k) {
-                    scan_text(g, gi, k, v, &self.key, s);
+            for i in 0..r.attr_count() {
+                let Some((k, v)) = r.attr_at(i) else { break };
+                if g.looks_in(k) && scan_text(g, gi, k, v, &self.key, s) {
+                    r.replace_at(i, &mut s.out);
                 }
             }
         }
@@ -498,7 +501,7 @@ impl Scanner {
 
     /// `r` tagged with the tags of the rules `s.hits` names: each key its values, those it held
     /// before first, joined by commas.
-    fn tag(&self, r: &mut Record, s: &mut Scratch) {
+    fn tag<R: Target>(&self, r: &mut R, s: &mut Scratch) {
         let tag = |&(g, i, t): &(usize, usize, usize)| self.groups.get(g).and_then(|g| g.rules.get(i)).and_then(|r| r.tags.get(t)).map(|(k, v)| (k.as_str(), v.as_str()));
         s.tags.clear();
         for &(g, i) in &s.hits {
@@ -513,9 +516,10 @@ impl Scanner {
             let run = s.tags.get(at..).map_or(0, |rest| rest.iter().take_while(|x| tag(x).is_some_and(|(k, _)| k == key)).count()).max(1);
             let values = s.tags.get(at..at + run).unwrap_or_default().iter().filter_map(tag).map(|(_, v)| v);
             s.joined.clear();
-            match r.attrs.iter_mut().find(|(k, _)| k == key) {
+            let held = (0..r.attr_count()).find(|&i| r.attr_at(i).is_some_and(|(k, _)| k == key));
+            match held.and_then(|i| Some((i, r.attr_at(i)?.1))) {
                 // What it held first, then each value it did not.
-                Some((_, held)) => {
+                Some((i, held)) => {
                     s.joined.push_str(held);
                     for v in values {
                         if !held.split(',').any(|h| h == v) {
@@ -525,7 +529,7 @@ impl Scanner {
                             s.joined.push_str(v);
                         }
                     }
-                    std::mem::swap(held, &mut s.joined);
+                    r.replace_at(i, &mut s.joined);
                 }
                 None => {
                     for v in values {
@@ -534,7 +538,7 @@ impl Scanner {
                         }
                         s.joined.push_str(v);
                     }
-                    r.attrs.push((key.to_owned(), s.joined.clone()));
+                    r.push(key, &s.joined);
                 }
             }
             at += run;
@@ -542,12 +546,13 @@ impl Scanner {
     }
 }
 
-/// `text` (the value at `key`) scanned by group `g`: its rules' matches found, those replacing
-/// applied; the rules that matched noted in `s.hits`.
-fn scan_text(g: &Group, gi: usize, key: &str, text: &mut String, hash_key: &[u8], s: &mut Scratch) {
+/// `text` (the value at `key`) scanned by group `g`: its rules' matches found, the rules that
+/// matched noted in `s.hits`; whether one replaces, its new text (those replacing applied) in
+/// `s.out`.
+fn scan_text(g: &Group, gi: usize, key: &str, text: &str, hash_key: &[u8], s: &mut Scratch) -> bool {
     s.found.clear();
     if text.len() < g.min_len {
-        return;
+        return false;
     }
     // The rules without keywords that match somewhere (one pass of the set: none, rarely more).
     match &g.plain {
@@ -578,7 +583,7 @@ fn scan_text(g: &Group, gi: usize, key: &str, text: &mut String, hash_key: &[u8]
         }
     }
     if s.found.is_empty() {
-        return;
+        return false;
     }
     s.hits.extend(s.found.iter().map(|&(_, _, ri)| (gi, ri)));
     // Those that replace, left to right; of two that overlap, the one that starts first (then the
@@ -586,7 +591,7 @@ fn scan_text(g: &Group, gi: usize, key: &str, text: &mut String, hash_key: &[u8]
     let rule = |ri: usize| g.rules.get(ri);
     s.found.retain(|&(_, _, ri)| rule(ri).is_some_and(|r| r.action != Action::None));
     if s.found.is_empty() {
-        return;
+        return false;
     }
     s.found.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| rule(a.2).map(|r| r.priority).cmp(&rule(b.2).map(|r| r.priority))).then_with(|| b.1.cmp(&a.1)));
     s.out.clear();
@@ -601,7 +606,7 @@ fn scan_text(g: &Group, gi: usize, key: &str, text: &mut String, hash_key: &[u8]
         at = b;
     }
     s.out.push_str(text.get(at..).unwrap_or_default());
-    std::mem::swap(text, &mut s.out);
+    true
 }
 
 /// Rule `ri`'s matches in `text` (at `key`, where it looks) into `s.found`: those its check passes
@@ -661,6 +666,7 @@ fn replace(action: &Action, matched: &str, key: &[u8], out: &mut String) {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use kiln_obs::logs::record::Record;
 
     fn rule(json: serde_json::Value) -> RuleDef {
         let mut v = json;
@@ -946,6 +952,41 @@ mod tests {
             touched += usize::from(changed);
         }
         assert!(touched > 500 && read >= touched, "{touched} changed, {read} read");
+    }
+
+    /// A line's record of one buffer is scanned as a record of strings of its own is: the whole
+    /// library hashing, and rules masking, replacing, tagging and only noting, over random texts in
+    /// its message and its attributes (a tag's key one of its attributes, or a record's own field's
+    /// name); twice over, the second finding what the first left.
+    #[test]
+    fn a_record_of_one_buffer_is_scanned_as_a_record_is() {
+        let mut rules: Vec<RuleDef> =
+            patterns::STANDARD.iter().map(|p| rule(serde_json::json!({ "name": p.id, "standard_pattern_id": p.id, "text_replacement": { "type": "hash" }, "tags": ["sensitive_data:x"] }))).collect();
+        rules.push(rule(serde_json::json!({ "name": "names", "pattern": "jane[a-z.]*", "tags": ["sensitive_data:name", "service:named", "detail:tagged"], "text_replacement": { "type": "partial_replacement_from_end", "number_of_chars": 3 }, "priority": 5 })));
+        rules.push(rule(
+            serde_json::json!({ "name": "ids", "pattern": "id-[0-9]+", "text_replacement": { "type": "replacement_string", "replacement_string": "ID" }, "namespaces": ["@detail", "@other"] }),
+        ));
+        rules.push(rule(serde_json::json!({ "name": "note", "pattern": "GET", "tags": ["seen:get"], "text_replacement": { "type": "none" } })));
+        let s = Scanner::compile(&[GroupDef { name: "all".into(), description: String::new(), filter: FilterDef::default(), is_enabled: true, rules }], b"k");
+        let pieces = ["4111 1111 1111 1111", "a@b.io", "078-05-1120", "AKIAIOSFODNN7EXAMPLE", "10.0.0.1", "GET /x 200", " ", "token=", "jane.doe", "id-42", "é", "Σ"];
+        let mut rng = kiln_obs::testkit::Rng::new(5);
+        let text = |rng: &mut kiln_obs::testkit::Rng| (0..rng.below(5)).map(|_| pieces[rng.below(pieces.len() as u64) as usize]).collect::<Vec<_>>().join(" ");
+        let (mut ours, mut buf) = (Scratch::default(), Scratch::default());
+        let mut b = kiln_obs::logs::buf::RecordBuf::default();
+        let mut changed = 0;
+        for _ in 0..3_000 {
+            let (m, d, o, t) = (text(&mut rng), text(&mut rng), text(&mut rng), text(&mut rng));
+            let mut r = rec(&m, &[("detail", &d), ("other", &o), ("sensitive_data", &t)]);
+            b.set_from(&r);
+            for _ in 0..2 {
+                let a = s.scan(&mut r, &mut ours);
+                let c = s.scan(&mut b, &mut buf);
+                assert_eq!(a, c, "{m:?}");
+                assert_eq!(b.to_record(), r, "{m:?} {d:?} {o:?} {t:?}");
+                changed += usize::from(a);
+            }
+        }
+        assert!(changed > 1_000, "{changed} scans changed something");
     }
 
     /// What does not compile, or is not a rule, is refused, saying why.
