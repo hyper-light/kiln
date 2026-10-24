@@ -2379,7 +2379,7 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
         hub.store.set_repo_public(repo.id.clone(), r.public).await?;
     }
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
-    hub.gitops_kick.notify();
+    crate::gitops::want(hub, &repo.id);
     let mut body = serde_json::to_value(&repo).unwrap_or_default();
     if let Some(o) = body.as_object_mut() {
         o.insert("public".into(), json!(native && r.public));
@@ -3626,7 +3626,7 @@ async fn github_hook(hub: &Arc<Hub>, req: Request) -> R {
     crate::rt::spawn(async move {
         if let Err(e) = crate::ci::hooks::github(&hub, &event, delivery, &body).await {
             tracing::warn!(event = %event, error = %format!("{e:#}"), "webhook");
-            hub.gitops_kick.notify();
+            crate::ci::hooks::want_github(&hub, &body).await;
         }
     });
     Ok(srv::status(StatusCode::ACCEPTED))

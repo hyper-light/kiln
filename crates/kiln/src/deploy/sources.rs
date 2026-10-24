@@ -442,9 +442,9 @@ pub async fn merge(d: &Deploy, who: &Who, id: &str, repo: Option<&str>) -> Resul
         p.state = "merged".to_owned();
         store::put_proposal(&*d.records, &p).await.map_err(internal)?;
         audit(d, &who.name, "deploy.fleet.merge", format!("{id} into {}'s {}", p.repo, p.into)).await;
+        // What a push of it starts (its CI) starts.
+        crate::gitops::want_named(&d.hub, &p.repo).await;
     }
-    // What a push of it starts (its CI) starts.
-    d.hub.gitops_kick.notify();
     status(d, id).await?.ok_or_else(|| missing(format!("no fleet change {id}")))
 }
 
