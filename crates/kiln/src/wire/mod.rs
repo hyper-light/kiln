@@ -12,6 +12,7 @@ pub mod channel;
 pub mod commands;
 pub mod keep;
 pub mod link;
+pub mod sums;
 pub mod uplink;
 
 use crate::harness::core::Update;
@@ -247,6 +248,7 @@ classes! {
         ServerMsg::Caps { .. } => Class::Handshake,
         ServerMsg::Wire(..) => CHANNEL,
         ServerMsg::Cluster { .. } => CLUSTER,
+        ServerMsg::Kept { .. } => Class::State,
     }
 }
 

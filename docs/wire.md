@@ -141,6 +141,33 @@ It gets the whole session (`open`) only when the copy can't resume it: another i
 up the same way, from the last revision it was sent, and the live frames that catch-up already
 holds are skipped.
 
+## Restarts
+
+A runner that starts again starts each session's stream anew (its streams' names carry its boot).
+Each new stream sends the server only what its copy of the session lacks, not the session whole:
+
+- Before `Welcome`, the server says what each of its copies of the runner's sessions has (`Kept`):
+  the copy's epoch, its oldest and newest events' numbers, a digest of each run of 64 events from
+  its oldest on, and a digest of each of its newest 64 events. A digest is of an event as the copy
+  keeps it: its JSON as it went over the wire (cut to fit), read back. The copy keeps each event's
+  digest and makes it again once the event changes.
+- The runner works out the same of its own timeline. It sends an `Open` whose `since` says through
+  which event the copy keeps its own, then the newest meta, state and changes, then those events
+  through `since` whose digest differs, then every event after it. No `Reset` goes: the copy keeps
+  the rest as it has it.
+- `since` is the copy's newest, or the runner's own when it has fewer: the copy then lets go of the
+  events after it. It had what the runner lost: a store that hadn't kept them yet when the runner
+  stopped.
+- An event sent again under a number the copy has under another id takes that one's place (the
+  timeline went another way). The copy's viewers start over from it then, as they do when it lets
+  go of events. Otherwise an `Open` with `since` isn't one to them: they go on with what they have.
+- The session goes whole when there's no copy, when the copy is of another epoch, or when there's a
+  gap between the copy's newest and the runner's oldest. It also goes whole when its announcement
+  comes after the runner's `Welcome`: its stream starts with the announcement then.
+
+Before its `Welcome`, a runner sends no session's updates outside the channel: the `Welcome` brings
+the server what it lacks of each (or, to a server from before the channel, all of each).
+
 ## Runner to server: `AgentMsg`
 
 | Message | Class | Why | Today |
@@ -255,6 +282,7 @@ holds are skipped.
 | `Caps` | handshake | What the server can do, in 64 bits, to a runner that said `CAP_WIRE`. | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel, as the runner's. | New: `crate::wire::channel`. |
 | `Cluster` | carried (the cluster group) | To the runner's learner: join or leave the group (said again on every connect), hyper-raft's messages, and where the server's records are. | As its class says. |
+| `Kept` | state | What the server's copy of each of the runner's sessions has, said in digests, so a stream the runner starts sends only what the copy lacks ("Restarts", above). | Sent before `Welcome` to a runner that keeps the channel, 32 sessions a frame. |
 
 ## Commands to a session: `Command`
 
@@ -305,7 +333,7 @@ From wherever a session runs to the server, inside `Harness`, and on to its view
 
 | Update | Class | Why | Today |
 |---|---|---|---|
-| `Open` | stream | A session's first item, and its first again after a reset. | As `Harness` (above). |
+| `Open` | stream | A session's first item, and its first again after a reset. With `since`, it goes on from the copy the server has ("Restarts"). | As `Harness` (above). |
 | `Closed` | stream | Its last item. | As `Harness`. |
 | `State` | state | Its state: the newest wins. | As `Harness`. |
 | `Meta` | state | Its harness's settings: the newest wins. | As `Harness`. |

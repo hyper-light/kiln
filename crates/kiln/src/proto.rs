@@ -572,6 +572,30 @@ pub enum ServerMsg {
     /// runner's learner. Only to runners announcing [`CAP_CLUSTER`]. Appended last: postcard
     /// encodes variants by index.
     Cluster { json: String, raft: Vec<u8> },
+    /// What the server's copy of each of this runner's agent sessions has: sent before `Welcome`
+    /// to a runner that keeps the channel (as many of these as it takes), so a stream it starts
+    /// (it started again, or the server lost its streams) sends only what the copy lacks
+    /// (docs/wire.md, "Restarts"). Appended last: postcard encodes variants by index.
+    Kept { sessions: Vec<KeptSession> },
+}
+
+/// What the server's copy of one agent session has of its events, said in digests
+/// ([`ServerMsg::Kept`], `crate::wire::sums`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeptSession {
+    pub session: String,
+    /// The epoch its copy is of: a session that went on elsewhere since starts over whole.
+    pub epoch: u64,
+    /// Its newest event's number in the copy (0: it has none).
+    pub seq: u64,
+    /// Its oldest event's number in the copy.
+    pub from: u64,
+    /// How many events a digest in `runs` covers.
+    pub run: u64,
+    /// A digest of each run of `run` events from `from` on, up to the events `last` has one of each.
+    pub runs: Vec<u64>,
+    /// A digest of each of its newest events, through `seq` (0: the copy lacks that one).
+    pub last: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -668,7 +692,8 @@ mod tests {
             assert_eq!(decode::<AgentMsg>(&b)?, m);
             assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
         }
-        let server = [(ServerMsg::Caps { caps: CAP_WIRE }, 53u8)].into_iter().chain(frames.into_iter().map(|f| (ServerMsg::Wire(f), 54)));
+        let kept = ServerMsg::Kept { sessions: vec![KeptSession { session: "s".into(), epoch: 2, seq: 40, from: 1, run: 64, runs: Vec::new(), last: vec![7; 40] }] };
+        let server = [(ServerMsg::Caps { caps: CAP_WIRE }, 53u8)].into_iter().chain(frames.into_iter().map(|f| (ServerMsg::Wire(f), 54))).chain([(kept, 56)]);
         for (m, idx) in server {
             let b = encode(&m)?;
             assert_eq!(b.first(), Some(&idx), "{m:?} is ServerMsg variant {idx} on the wire");

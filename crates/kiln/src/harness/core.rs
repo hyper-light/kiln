@@ -71,8 +71,14 @@ pub const MAX_EVENTS: usize = 4_000;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Update {
-    /// A session appeared, or is announced again after a reconnect (a snapshot follows).
-    Open { info: Box<super::session::Info> },
+    /// A session appeared, or is announced again after a reconnect (a snapshot follows). `since`:
+    /// the server's copy keeps its events through that number and only what's after them follows
+    /// (a runner that started again, `crate::wire::uplink`); None: the whole snapshot follows.
+    Open {
+        info: Box<super::session::Info>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+    },
     /// The session is gone.
     Closed,
     State { state: Box<State> },

@@ -65,6 +65,11 @@ struct Mirror {
     reset_at: u64,
     /// The revision each event last changed at, by its id.
     changed: HashMap<String, u64>,
+    /// The Open being taken starts the copy over (a whole snapshot follows it).
+    started_over_pending: bool,
+    /// Each event's digest as a runner that starts again compares it (`crate::wire::sums`), by
+    /// its id: made when first asked for, and again once the event changes.
+    sums: HashMap<String, u64>,
 }
 
 /// This server process's incarnation: viewers resume from a copy's revision only under it. 53
@@ -90,6 +95,8 @@ impl Mirror {
             rev: 0,
             reset_at: 0,
             changed: HashMap::new(),
+            started_over_pending: false,
+            sums: HashMap::new(),
         }
     }
 
@@ -115,14 +122,45 @@ impl Mirror {
         self.index = self.events.iter().enumerate().filter_map(|(i, e)| Some((e.get("id")?.as_str()?.to_owned(), i))).collect();
         let index = &self.index;
         self.changed.retain(|id, _| index.contains_key(id));
+        self.sums.retain(|id, _| index.contains_key(id));
     }
 
-    fn upsert(&mut self, e: Value) {
-        let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_owned) else { return };
+    /// Lets go of every event.
+    fn clear_events(&mut self) {
+        self.events.clear();
+        self.index.clear();
+        self.sums.clear();
+    }
+
+    /// Takes in an event, by its id. One it hasn't had numbered before its newest (a runner that
+    /// started again sends it again: the copy's differed, `crate::wire::sums`) goes in its place
+    /// by number, instead of one the copy has under that number: true when that one had another id
+    /// (the timeline went another way), which its viewers can't see from the event alone.
+    fn upsert(&mut self, e: Value) -> bool {
+        let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_owned) else { return false };
         self.changed.insert(id.clone(), self.rev);
+        self.sums.remove(&id);
         if let Some(slot) = self.index.get(&id).and_then(|i| self.events.get_mut(*i)) {
             *slot = e;
-            return;
+            return false;
+        }
+        let seq = |v: &Value| v.get("seq").and_then(Value::as_u64);
+        if let (Some(q), Some(top)) = (seq(&e), self.events.last().and_then(seq))
+            && q <= top
+        {
+            let at = self.events.partition_point(|x| seq(x).is_some_and(|s| s < q));
+            let displaced = match self.events.get_mut(at) {
+                Some(slot) if seq(slot) == Some(q) => {
+                    *slot = e;
+                    true
+                }
+                _ => {
+                    self.events.insert(at, e);
+                    false
+                }
+            };
+            self.reindex();
+            return displaced;
         }
         self.index.insert(id, self.events.len());
         self.events.push(e);
@@ -131,6 +169,7 @@ impl Mirror {
             self.events.drain(..drop);
             self.reindex();
         }
+        false
     }
 
     fn append(&mut self, id: &str, text: &str) {
@@ -139,6 +178,38 @@ impl Mirror {
         {
             s.push_str(text);
             self.changed.insert(id.to_owned(), self.rev);
+            self.sums.remove(id);
+        }
+    }
+
+    /// What this copy has of its events, said in digests (`crate::wire::sums`).
+    fn kept(&mut self, session: &str) -> crate::proto::KeptSession {
+        let sums = &mut self.sums;
+        let mut events: Vec<(u64, u64)> = self
+            .events
+            .iter()
+            .filter_map(|e| {
+                let seq = e.get("seq").and_then(Value::as_u64)?;
+                let id = e.get("id").and_then(Value::as_str)?;
+                let sum = match sums.get(id) {
+                    Some(d) => *d,
+                    None => *sums.entry(id.to_owned()).or_insert_with(|| crate::wire::sums::event(e)),
+                };
+                Some((seq, sum))
+            })
+            .collect();
+        events.sort_unstable_by_key(|(seq, _)| *seq);
+        crate::wire::sums::kept(session.to_owned(), self.info.epoch, &events)
+    }
+
+    /// Its viewers start over from the copy as it is (its events went another way than they have
+    /// them): a snapshot to each, and none resumes from before it.
+    fn resync(&mut self) {
+        self.started_over();
+        if self.out.receiver_count() > 0 {
+            for text in self.snapshot(None) {
+                self.send(Frame::of(text));
+            }
         }
     }
 
@@ -923,6 +994,8 @@ impl Registry {
     pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let mut changed: Option<Info> = None;
         let mut gone = false;
+        // The copy's events went another way than its viewers have them: they start over from it.
+        let mut resync = false;
         // Finished messages' mentions of files, to keep once the mirrors are let go.
         let mut jobs: Vec<Job> = Vec::new();
         // The plan it proposed (plan mode) in these events, to keep as one of kiln's plans.
@@ -937,19 +1010,19 @@ impl Registry {
         // machine and its name). The machine's own name is kept aside: it counts once it changes it.
         let mut reported = String::new();
         let u = match u {
-            Update::Open { mut info } => {
+            Update::Open { mut info, since } => {
                 info.target = from.target();
                 own_name(&info.name, &info.kind_name).unwrap_or_default().clone_into(&mut reported);
                 if let Some(n) = self.names.lock().get(id) {
                     info.name.clone_from(n);
                 }
                 info.keep_off = self.keep_off.lock().contains(id);
-                Update::Open { info }
+                Update::Open { info, since }
             }
             other => other,
         };
         match &u {
-            Update::Open { info } if info.epoch > 0 => self.raise_epoch(id, info.epoch),
+            Update::Open { info, .. } if info.epoch > 0 => self.raise_epoch(id, info.epoch),
             Update::Open { .. } => {}
             // Only the machine a session runs on speaks for it: a copy left behind where it went
             // on from says nothing more of it.
@@ -964,9 +1037,15 @@ impl Registry {
         }
         {
             let mut g = self.mirrors.lock();
-            if let Update::Open { info } = &u {
+            if let Update::Open { info, since } = &u {
+                // A runner that started again goes on from what this copy has of the same epoch:
+                // its events through `since` stay; what's after them comes again.
+                let keep = since.filter(|_| g.get(id).is_some_and(|m| m.info.epoch == info.epoch));
                 if let Location::Machine(machine) = from {
-                    tracing::info!(session = id, %machine, "an agent session's copy starts from its machine's Open");
+                    match keep {
+                        Some(n) => tracing::info!(session = id, %machine, after = n, "an agent session's copy goes on from its machine's Open after event"),
+                        None => tracing::info!(session = id, %machine, "an agent session's copy starts from its machine's Open"),
+                    }
                 }
                 let mut info = (**info).clone();
                 // What its goals wait on a person for is the server's to say (`goals::held_stacks`): kept.
@@ -975,8 +1054,20 @@ impl Registry {
                 m.info = info.clone();
                 m.reported = reported;
                 m.location = from.clone();
-                m.events.clear();
-                m.index.clear();
+                match keep {
+                    Some(n) => {
+                        let had = m.events.len();
+                        m.events.retain(|e| e.get("seq").and_then(Value::as_u64).is_some_and(|q| q <= n));
+                        m.reindex();
+                        // Past its machine's newest it had what the machine no longer has: its
+                        // viewers let go of that too.
+                        resync = m.events.len() != had;
+                    }
+                    None => {
+                        m.clear_events();
+                        m.started_over_pending = true;
+                    }
+                }
                 m.changes = Value::Null;
                 changed = Some(info);
             }
@@ -992,12 +1083,17 @@ impl Registry {
             };
             m.rev = m.rev.saturating_add(1);
             match &u {
-                Update::Open { .. } => m.started_over(),
+                // A whole snapshot follows (not one that goes on from what the copy has): its
+                // viewers from before start over too.
+                Update::Open { .. } => {
+                    if std::mem::take(&mut m.started_over_pending) {
+                        m.started_over();
+                    }
+                }
                 Update::Reply { .. } => {}
                 Update::Closed => gone = true,
                 Update::Reset { .. } => {
-                    m.events.clear();
-                    m.index.clear();
+                    m.clear_events();
                     m.started_over();
                 }
                 Update::State { state } => {
@@ -1048,14 +1144,21 @@ impl Registry {
                             proposed = Some(plan);
                         }
                         if let Ok(v) = serde_json::to_value(e) {
-                            m.upsert(v);
+                            resync |= m.upsert(v);
                         }
                     }
                 }
                 Update::Stream { id, text } => m.append(id, text),
             }
-            // A state goes out with the name given here in it (the machine's may lack it).
+            // A state goes out with the name given here in it (the machine's may lack it). An Open
+            // that goes on from what the copy has isn't one to its viewers: they go on with what
+            // they have, unless the copy's events went another way than theirs.
             let frame = match &u {
+                _ if resync => {
+                    m.resync();
+                    None
+                }
+                Update::Open { since: Some(_), .. } => None,
                 Update::State { .. } => m.state_frame(),
                 _ if m.out.receiver_count() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
                 _ => None,
@@ -1207,6 +1310,15 @@ impl Registry {
         for info in infos {
             hub.emit(&json!({"type": "harness", "info": info}));
         }
+    }
+
+    /// What this server's copy of each session on `machine` has, said in digests: what a stream
+    /// it starts sends only what the copy lacks of (`ServerMsg::Kept`, `crate::wire::sums`). One
+    /// copy at a time, so taking in updates waits for no more than one.
+    pub fn kept_on(&self, machine: &str) -> Vec<crate::proto::KeptSession> {
+        let at = Location::Machine(machine.to_owned());
+        let ids: Vec<String> = self.mirrors.lock().iter().filter(|(_, m)| m.location == at).map(|(id, _)| id.clone()).collect();
+        ids.into_iter().filter_map(|id| self.mirrors.lock().get_mut(&id).filter(|m| m.location == at).map(|m| m.kept(&id))).collect()
     }
 
     /// Join a session's stream. None when there is no such session.
@@ -1682,7 +1794,7 @@ mod tests {
     use super::*;
 
     /// One update taken by a copy, as `Registry::ingest_from` takes it: its revision first.
-    fn took(m: &mut Mirror, f: impl FnOnce(&mut Mirror)) {
+    fn took<R>(m: &mut Mirror, f: impl FnOnce(&mut Mirror) -> R) {
         m.rev += 1;
         f(m);
     }
@@ -1726,8 +1838,7 @@ mod tests {
         took(&mut m, |m| m.upsert(event("e1", "x")));
         let had = m.rev;
         took(&mut m, |m| {
-            m.events.clear();
-            m.index.clear();
+            m.clear_events();
             m.started_over();
         });
         took(&mut m, |m| m.upsert(event("e9", "after")));
@@ -1831,6 +1942,64 @@ mod tests {
         assert!(frame.patch.is_none());
         assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(true))?, json!({"t": "state", "state": m.state}));
         Ok(())
+    }
+
+    /// The ids of the events a viewer attaching to `id` gets, in order.
+    fn copy_of(hub: &Hub, id: &str) -> Vec<String> {
+        hub.harness.attach(id).map(|a| ids(&a.frames)).unwrap_or_default()
+    }
+
+    /// What a live viewer was sent since it last looked.
+    fn sent(live: &mut async_broadcast::Receiver<Frame>) -> Vec<String> {
+        std::iter::from_fn(|| live.try_recv().ok()).map(|f| f.text.to_string()).collect()
+    }
+
+    /// A runner that started again goes on from what the copy has (`crate::wire::sums`): the copy
+    /// keeps its events through the Open's `since` and its viewers go on with what they have. Past
+    /// the runner's newest the copy lets go, and an event under a number the copy has under
+    /// another id takes its place: its viewers start over from the copy then.
+    #[test]
+    fn a_copy_goes_on_from_its_machines_open_and_its_viewers_with_it() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let open = |since| Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 3, ..Info::default() }), since };
+            let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
+            let names = |r: std::ops::RangeInclusive<u64>| r.map(|n| format!("m{n}")).collect::<Vec<_>>();
+            hub.harness.ingest(&hub, &there, "s", open(None));
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=10).map(said).collect() });
+            let mut viewer = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?.live;
+            // Its machine again, with all ten: the copy goes on, and its viewer only hears what follows.
+            hub.harness.ingest(&hub, &there, "s", open(Some(10)));
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(11)] });
+            let heard = sent(&mut viewer);
+            anyhow::ensure!(heard.len() == 1 && !heard.iter().any(|f| f.contains(r#""t":"open""#)), "the viewer goes on: {heard:?}");
+            anyhow::ensure!(copy_of(&hub, "s") == names(1..=11));
+            // Again, with only eight of them (its store hadn't kept the rest): the copy lets go of
+            // nine and up, and its viewer starts over from the copy.
+            hub.harness.ingest(&hub, &there, "s", open(Some(8)));
+            anyhow::ensure!(copy_of(&hub, "s") == names(1..=8));
+            let heard = sent(&mut viewer);
+            anyhow::ensure!(heard.first().is_some_and(|f| f.contains(r#""t":"open""#)) && ids(&heard) == names(1..=8), "the viewer starts over: {heard:?}");
+            let kept = hub.harness.kept_on("box");
+            anyhow::ensure!(kept.len() == 1 && kept.iter().all(|k| (k.epoch, k.from, k.seq, k.last.len()) == (3, 1, 8, 8)), "{kept:?}");
+            // An event sent again under a number the copy has under another id: in its place.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![Event { id: "other".into(), ..said(5) }] });
+            let mut want = names(1..=8);
+            if let Some(slot) = want.get_mut(4) {
+                "other".clone_into(slot);
+            }
+            anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
+            anyhow::ensure!(sent(&mut viewer).first().is_some_and(|f| f.contains(r#""t":"open""#)), "the viewer starts over");
+            // One it lacks under a number before its newest: in among the others, by number.
+            hub.harness.ingest(&hub, &there, "s", open(Some(8)));
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(12), said(14)] });
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(13)] });
+            want.extend(names(12..=14));
+            anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
     }
 
     #[test]

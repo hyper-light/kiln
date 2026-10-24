@@ -38,6 +38,8 @@ pub(crate) const LOG_WITHIN: Duration = Duration::from_secs(300);
 pub const COMMAND_WITHIN: Duration = Duration::from_secs(30);
 /// How often the server says again what it has of each runner's channel streams.
 const HAVE_AGAIN: Duration = Duration::from_secs(5);
+/// How many sessions' digests one `ServerMsg::Kept` carries at the most.
+const KEPT_A_FRAME: usize = 32;
 /// How soon a refused pod launch is tried again.
 const LAUNCH_RETRY: Duration = Duration::from_secs(15);
 
@@ -1652,7 +1654,7 @@ impl Hub {
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
                 // A copy of a session that went on elsewhere since (an older epoch): its machine
                 // lets go of it, and nothing it says of it counts.
-                Ok(crate::harness::core::Update::Open { info }) if self.harness.stale(&session, info.epoch) => {
+                Ok(crate::harness::core::Update::Open { info, .. }) if self.harness.stale(&session, info.epoch) => {
                     tracing::info!(%agent, %session, epoch = info.epoch, "an agent session that went on elsewhere: this machine lets go of its copy");
                     // A runner from before letting go stops its copy instead (what it says of it
                     // doesn't count either way).
@@ -1893,6 +1895,11 @@ impl Hub {
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
         self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS }).await;
+        // What its sessions' copies have here, so a stream it starts sends only what they lack
+        // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
+        for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
+            self.send_peer(peer, &ServerMsg::Kept { sessions: part.to_vec() }).await;
+        }
         self.send_peer(
             peer,
             &ServerMsg::Welcome {
