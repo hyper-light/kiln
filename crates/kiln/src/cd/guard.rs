@@ -13,7 +13,11 @@
 //!    status doesn't show), and the app's after checks must pass. Anything failing puts the
 //!    previous image back. The annotation `kiln.dev/guard` says how the watch goes, then how it
 //!    ended and why.
-//! 4. The server that runs afterwards (the new version, or the previous one again) finishes the
+//! 4. A rollback is a rollout too (docs/resilience.md, G1): the guard watches the version it put
+//!    back until it's available again. When that one can't start (2026-10-24: a newer kiln had
+//!    widened a table the older one couldn't write), and the new version had served, the guard
+//!    puts the new version forward again; when neither can start, it says so.
+//! 5. The server that runs afterwards (the new version, or the previous one again) finishes the
 //!    record once the guard has said: a deployment that succeeded, or one that failed with the
 //!    guard's reason. A failed one is remembered as attempted, so automation doesn't deploy it
 //!    again.
@@ -55,6 +59,8 @@ const CRASH_LOOP: i64 = 3;
 /// The guard starts before the change is applied: for this long, a Deployment still asking for
 /// the previous image hasn't been changed yet, rather than changed back.
 const APPLY_GRACE: Duration = Duration::from_secs(120);
+/// How long the version a guard put back (or forward again) has to be available.
+const ROLLBACK_DEADLINE: Duration = Duration::from_secs(180);
 /// Reads in a row that find the new pods unavailable while watching, before that fails it.
 const UNAVAILABLE_READS: u32 = 3;
 /// How often the annotation says how the watch goes.
@@ -184,7 +190,7 @@ pub fn judge(d: &Value, container: &str, expect: &str) -> Verdict {
 /// does.
 pub fn job(m: &Marker, template: &Value) -> Value {
     let pod = obj::get(template, &["spec"]).cloned().unwrap_or(Value::Null);
-    let deadline = DEADLINE.as_secs() + m.watch.window_s;
+    let deadline = DEADLINE.as_secs() + m.watch.window_s + 2 * ROLLBACK_DEADLINE.as_secs();
     let mut command = vec![
         json!("/kiln"), json!("cd"), json!("guard"),
         json!("--namespace"), json!(m.namespace), json!("--deployment"), json!(m.deployment), json!("--container"), json!(m.container),
@@ -271,7 +277,7 @@ pub async fn run(a: &Args) -> Result<()> {
     match Box::pin(until_up(&c, a)).await {
         Start::Up => {}
         Start::Moved => return Ok(()),
-        Start::Failed(reason) => return Box::pin(roll_back(&c, a, &reason, Vec::new())).await,
+        Start::Failed(reason) => return Box::pin(roll_back(&c, a, &reason, Vec::new(), false)).await,
     }
     if a.watch.window_s == 0 {
         println!("{} is available: the deploy of {} took", a.deployment, a.expect);
@@ -289,7 +295,14 @@ pub async fn run(a: &Args) -> Result<()> {
             println!("{} no longer asks for {}: someone changed it since; nothing to guard", a.deployment, a.expect);
             Ok(())
         }
-        Seen::Failed(reason, checks) => Box::pin(roll_back(&c, a, &reason, checks)).await,
+        Seen::Failed(reason, checks) => Box::pin(roll_back(&c, a, &reason, checks, true)).await,
+        // A check that holds: what runs stays, and the note says why (docs/resilience.md, G3).
+        // Nobody can answer a guard yet, so a hold keeps the new version, as Ada chose.
+        Seen::Held(reason, checks) => {
+            println!("{} held ({reason}): keeping it", a.expect);
+            let _ = Box::pin(annotate(&c, a, "held", &reason, &checks, None)).await;
+            Ok(())
+        }
     }
 }
 
@@ -336,6 +349,8 @@ enum Seen {
     Healthy(Vec<Value>),
     Moved,
     Failed(String, Vec<Value>),
+    /// A check that holds failed: keep what runs.
+    Held(String, Vec<Value>),
 }
 
 /// Watches the new version for its window: its pods, kiln's server in them, and the app's
@@ -392,6 +407,7 @@ async fn watch(c: &Cluster, a: &Args) -> Seen {
             Watched::Watching => {}
             Watched::Passed => return Seen::Healthy(w.summary()),
             Watched::Failed(why) => return Seen::Failed(why, w.summary()),
+            Watched::Held(why) => return Seen::Held(why, w.summary()),
         }
         if said.is_none_or(|t| t.elapsed() >= SAY) {
             said = Some(Instant::now());
@@ -537,14 +553,65 @@ async fn annotate(c: &Cluster, a: &Args, result: &str, reason: &str, checks: &[V
     patch(c, &a.namespace, &a.deployment, &json!({ "metadata": { "annotations": { ANNOTATION: note(a, result, reason, checks, until) } } })).await
 }
 
-async fn roll_back(c: &Cluster, a: &Args, reason: &str, checks: Vec<Value>) -> Result<()> {
-    eprintln!("{} didn't take ({reason}): putting {} back", a.expect, a.previous);
+/// What a guard does once the version it put back has had its chance: it's up again; someone
+/// changed the Deployment since; it couldn't start either, and the new version, which had served,
+/// goes forward again; or neither starts.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterRollback {
+    Back,
+    Moved,
+    Forward(String),
+    Neither(String),
+}
+
+fn after_rollback(back: Start, served: bool) -> AfterRollback {
+    match back {
+        Start::Up => AfterRollback::Back,
+        Start::Moved => AfterRollback::Moved,
+        Start::Failed(why) if served => AfterRollback::Forward(why),
+        Start::Failed(why) => AfterRollback::Neither(why),
+    }
+}
+
+/// Puts `image` in kiln's container, with the guard's note.
+async fn put(c: &Cluster, a: &Args, image: &str, note: String) -> Result<()> {
     let body = json!({
-        "metadata": { "annotations": { ANNOTATION: note(a, "rolled-back", reason, &checks, None) } },
-        "spec": { "template": { "spec": { "containers": [{ "name": a.container, "image": a.previous }] } } },
+        "metadata": { "annotations": { ANNOTATION: note } },
+        "spec": { "template": { "spec": { "containers": [{ "name": a.container, "image": image }] } } },
     });
-    patch(c, &a.namespace, &a.deployment, &body).await.context("putting the previous image back")?;
-    bail!("{} didn't take ({reason}); {} is back", a.expect, a.previous)
+    patch(c, &a.namespace, &a.deployment, &body).await
+}
+
+/// Puts the previous image back, then watches it come up (`served`: the new version was up and
+/// serving before it failed, so it's the one to go back to when the previous can't start).
+async fn roll_back(c: &Cluster, a: &Args, reason: &str, checks: Vec<Value>, served: bool) -> Result<()> {
+    eprintln!("{} didn't take ({reason}): putting {} back", a.expect, a.previous);
+    put(c, a, &a.previous, note(a, "rolling-back", reason, &checks, None)).await.context("putting the previous image back")?;
+    let back = Args { previous: a.expect.clone(), expect: a.previous.clone(), deadline: ROLLBACK_DEADLINE, watch: Watch::default(), ..a.clone() };
+    match after_rollback(Box::pin(until_up(c, &back)).await, served) {
+        AfterRollback::Back => {
+            let _ = Box::pin(annotate(c, a, "rolled-back", reason, &checks, None)).await;
+            bail!("{} didn't take ({reason}); {} is back", a.expect, a.previous)
+        }
+        AfterRollback::Moved => bail!("{} didn't take ({reason}); someone changed {} while {} was put back", a.expect, a.deployment, a.previous),
+        AfterRollback::Forward(why) => {
+            let said = format!("{reason}; then {} couldn't start either ({why})", a.previous);
+            eprintln!("{said}: putting {} forward again", a.expect);
+            put(c, a, &a.expect, note(a, "rolled-forward", &said, &checks, None)).await.context("putting the new image forward again")?;
+            let forward = Args { deadline: ROLLBACK_DEADLINE, watch: Watch::default(), ..a.clone() };
+            let how = match Box::pin(until_up(c, &forward)).await {
+                Start::Up => "it serves again".to_owned(),
+                Start::Moved => format!("someone changed {} since", a.deployment),
+                Start::Failed(w) => format!("it didn't come back either ({w})"),
+            };
+            bail!("{} didn't take ({said}), so the guard put {} forward again: {how}", a.expect, a.expect)
+        }
+        AfterRollback::Neither(why) => {
+            let said = format!("{reason}; then {} couldn't start either ({why})", a.previous);
+            let _ = Box::pin(annotate(c, a, "rollback-failed", &said, &checks, None)).await;
+            bail!("neither starts: {} didn't take ({said})", a.expect)
+        }
+    }
 }
 
 /// `5m`, `90s`, `1h`.
@@ -662,7 +729,7 @@ impl Cd {
         let Some(m) = self.store.read(|d| d.settings.get(SETTING).cloned()).filter(|v| !v.is_null()).and_then(|v| serde_json::from_value::<Marker>(v).ok()) else { return };
         // A guard that watches says when it's done; until then the deploy isn't over. One that
         // never says (it was stopped) is given its whole time, then the Deployment decides.
-        let give_up = m.started_ms + (DEADLINE + m.watch.window() + Duration::from_secs(300)).as_millis() as u64;
+        let give_up = m.started_ms + (DEADLINE + m.watch.window() + 2 * ROLLBACK_DEADLINE + Duration::from_secs(300)).as_millis() as u64;
         let live = loop {
             let read = cluster.request(Method::GET, &deployment_path(&m.namespace, &m.deployment), None, None).await;
             let Ok((200, bytes)) = read else {
@@ -671,7 +738,7 @@ impl Cd {
             };
             let Ok(live) = serde_json::from_slice::<Value>(&bytes) else { return };
             let (now, guard) = seen(&m, &live);
-            let said = guard.as_ref().and_then(|g| g.get("result")).and_then(Value::as_str).is_some_and(|r| r == "ready" || r == "rolled-back");
+            let said = guard.as_ref().and_then(|g| g.get("result")).and_then(Value::as_str).is_some_and(|r| matches!(r, "ready" | "held" | "rolled-back" | "rolled-forward" | "rollback-failed"));
             if m.watch.window_s == 0 || said || now != m.to || super::now_ms() >= give_up {
                 break live;
             }
@@ -750,8 +817,15 @@ fn seen(m: &Marker, live: &Value) -> (String, Option<Value>) {
 fn outcome(m: &Marker, live: &Value, ended: Option<&str>) -> (bool, String) {
     let (now, guard) = seen(m, live);
     let watched = guard.as_ref().and_then(|g| g.get("checks")).and_then(Value::as_array).map(|cs| cs.iter().filter_map(|c| c.get("check").and_then(Value::as_str)).collect::<Vec<_>>().join(", ")).filter(|s| !s.is_empty());
-    let ready = guard.as_ref().and_then(|g| g.get("result")).and_then(Value::as_str) == Some("ready");
-    if now == m.to {
+    let result = guard.as_ref().and_then(|g| g.get("result")).and_then(Value::as_str);
+    let ready = result == Some("ready");
+    let reason = guard.as_ref().and_then(|g| g.get("reason").and_then(Value::as_str)).filter(|r| !r.is_empty());
+    if now == m.to && result == Some("rolled-forward") {
+        // It runs, but it failed its watch: not a deploy that took, so automation doesn't count it.
+        (false, format!("{} didn't take ({}); the guard put it forward again", m.to, reason.unwrap_or("its watch failed")))
+    } else if now == m.to && result == Some("held") {
+        (true, format!("kiln restarted into {}; its guard held it ({}) and kept it", m.to, reason.unwrap_or("a check that holds failed")))
+    } else if now == m.to {
         let how = match (m.watch.window_s, ready, watched, ended) {
             (_, false, _, Some(newer)) => format!("; deploying {newer} ended its watch"),
             (0, _, _, _) => String::new(),
@@ -868,7 +942,7 @@ mod tests {
         let given = given.unwrap_or("");
         assert_eq!(serde_json::from_str::<Watch>(given).ok(), Some(watch), "{cmd:?}");
         assert!(cmd.windows(2).any(|w| w == ["--deadline", "600"]), "the deadline to be up stays its own");
-        assert_eq!(j.pointer("/spec/activeDeadlineSeconds").and_then(Value::as_u64), Some(600 + 600 + 300), "the Job lives through the window");
+        assert_eq!(j.pointer("/spec/activeDeadlineSeconds").and_then(Value::as_u64), Some(600 + 600 + 2 * 180 + 300), "the Job lives through the window, and a rollback or a roll forward after it");
         // A record kept before windows reads as one with none, and its guard isn't told to watch.
         let old: Marker = serde_json::from_value(json!({ "app": "kiln", "op": 1, "revision": null, "key": null, "content": null, "commits": [], "artifacts": [], "trigger": "manual", "by": null, "started_ms": 1, "namespace": "kiln", "deployment": "kiln", "container": "kiln", "from": "a", "to": "b", "job": null })).unwrap_or_default();
         assert_eq!((old.to.as_str(), old.watch.window_s), ("b", 0));
@@ -946,6 +1020,11 @@ mod tests {
         assert_eq!(verdict("steady", &with("/json/restarts", json!(2))), V::Fail, "its supervisor started it again");
         assert_eq!(verdict("steady", &with("/json/memory/oom_kills", json!(1))), V::Fail, "the OOM killer struck");
         assert_eq!(verdict("memory", &with("/json/memory/share", json!(0.93))), V::Fail, "near its limit");
+        assert_eq!(verdict("memory", &with("/json/memory/share", json!(0.85))), V::Pass, "high, not near");
+        // Memory holds, never rolls back, and only when it stays high: near a limit, it rolled a
+        // serving kiln back into a crash loop on 2026-10-24 (docs/resilience.md, G3-G5).
+        let memory = w.checks.get("memory").and_then(|c| c.timing(true).ok());
+        assert!(memory.is_some_and(|t| t.severity == kiln_cd::rollout::Severity::Hold && t.fail_rule == kiln_cd::rollout::FailRule::For(120_000)), "{memory:?}");
         assert_eq!(verdict("commit", &with("/json/commit", json!(""))), V::Fail, "built knowing no commit");
         assert_eq!(verdict("commit", &with("/json/commit", json!("2bd78af9737dfedded412ad22fafe56de7adfdbe"))), V::Fail, "another commit");
         assert_eq!(verdict("runners", &with("/json/runners/back", json!(0.25))), V::Fail, "most runners didn't come back");
@@ -975,7 +1054,31 @@ mod tests {
         let other = live("kiln:old", json!({ "result": "rolled-back", "to": "kiln:else", "reason": "no" }));
         assert_eq!(outcome(&m, &other, None).1, "kiln:new didn't take (it didn't start); the guard put kiln:old back");
         assert!(outcome(&m, &live("kiln:else", json!({})), None).1.contains("someone changed it since"));
+        // Put forward again: it runs, but it didn't take.
+        let reason = "memory: failed; then kiln:old couldn't start either (its container restarted 3 times before it was up (last ended: Error, exit 1))";
+        let forward = live("kiln:new", json!({ "result": "rolled-forward", "to": "kiln:new", "reason": reason }));
+        assert_eq!(outcome(&m, &forward, None), (false, format!("kiln:new didn't take ({reason}); the guard put it forward again")));
+        let held = live("kiln:new", json!({ "result": "held", "to": "kiln:new", "reason": "memory: failed: … (failing for 2m)" }));
+        assert_eq!(outcome(&m, &held, None), (true, "kiln restarted into kiln:new; its guard held it (memory: failed: … (failing for 2m)) and kept it".into()));
+        let neither = live("kiln:old", json!({ "result": "rollback-failed", "to": "kiln:new", "reason": reason }));
+        assert_eq!(outcome(&m, &neither, None), (false, format!("kiln:new didn't take ({reason}); the guard put kiln:old back")));
         let before_windows = Marker { watch: Watch::default(), ..m };
         assert_eq!(outcome(&before_windows, &live("kiln:new", json!({})), None), (true, "kiln restarted into kiln:new".into()));
+    }
+
+    /// A rollback is a rollout too (docs/resilience.md, G1). On 2026-10-24 the version put back
+    /// couldn't open the database the new one had widened, and crash-looped while the guard,
+    /// its work done, had gone: now it puts back the version that served.
+    #[test]
+    fn a_rollback_that_cant_start_goes_forward_again() {
+        assert_eq!(after_rollback(Start::Up, true), AfterRollback::Back);
+        assert_eq!(after_rollback(Start::Moved, true), AfterRollback::Moved);
+        assert_eq!(after_rollback(Start::Failed("crash loop".into()), true), AfterRollback::Forward("crash loop".into()));
+        // The new version never came up: going forward again helps nothing.
+        assert_eq!(after_rollback(Start::Failed("crash loop".into()), false), AfterRollback::Neither("crash loop".into()));
+        // Its Job lives long enough to watch both.
+        let m = Marker { namespace: "kiln".into(), deployment: "kiln".into(), container: "kiln".into(), from: "kiln:old".into(), to: "kiln:new".into(), watch: Watch { window_s: 600, ..Watch::default() }, ..Marker::default() };
+        let deadline = job(&m, &json!({ "spec": {} })).pointer("/spec/activeDeadlineSeconds").and_then(Value::as_u64);
+        assert_eq!(deadline, Some(600 + 600 + 2 * 180 + 300));
     }
 }

@@ -116,12 +116,12 @@ changes and admission under contention. Nothing calls `sup::jitter` any more.
 **G4. Two strikes over the whole window is coarse.**
 
 - **Design:** a check states when it fails, in one of three ways:
-  - `fail-after: { in-a-row: 3 }`: consecutive samples, the new default.
+  - `fail-after: { in-a-row: 3 }`: consecutive samples.
   - `fail-after: { of: 4, in: 2m }`: a rolling window.
   - `fail-after: { for: 1m }`: the condition held continuously for that long.
 - **More changes:**
-  - `failures: N` keeps its meaning for deploy files that use it, and the UI marks it as
-    cumulative.
+  - `failures: N` keeps its meaning (and stays the default, so no deploy file changes
+    behaviour under it); the UI marks it as cumulative.
   - `warmup` (today's `delay`, renamed and defaulted to 60 s for `http` and `metric` checks)
     skips start-up spikes.
   - `aggregate: max | mean | p95` over the samples in a rolling window, when one reading is too
