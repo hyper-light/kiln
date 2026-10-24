@@ -1,8 +1,8 @@
 # Resilience: guarded deploys, overload, breakers and recovery
 
 > **Proposed 2026-10-24, for Ada's review.** Written after three outages that day, from a read
-> of main at a34c9139. Each gap below has an id (G, O, R, C, U, M, P), the incident it caused or
-> made worse, a design, and a test that says it's done. §8 orders the work.
+> of main at a34c9139. Each gap below has an id (G, O, R, C, F, U, M, P), the incident it caused or
+> made worse, a design, and a test that says it's done. §9 orders the work.
 
 ## The incidents
 
@@ -383,7 +383,153 @@ resources` would have been reverted by the next sync.
 - **Done when:** a child that stops ticking is reported and restarted, and shard lag shows in
   metrics.
 
-## 6. UI
+**R6. A sender ignores the receiver's budget** (found 2026-10-24 at 20:35): production refused
+1,332 frames from one peer, on one lane, in two bursts ("the budget cannot fund the bytes"), and
+requests through that runner timed out.
+
+- **Design:** refusal becomes backpressure, not loss.
+  - A refused frame tells the sender how much budget is left and when it refills. The sender
+    holds that lane's frames until then instead of sending and losing them.
+  - Lanes have priorities: control and request lanes are never starved by a bulk lane (lane 6
+    here). A busy runner's sessions share its budget fairly.
+  - The refusal rate is a metric per peer and lane, with an alert.
+- **Done when:** a runner flooding one lane in a test sees its other lanes' requests answered, with
+  no refused frames, only slower bulk.
+
+## 6. Front door takeover
+
+Today a front door is one runner that answers DNS for kiln's names and proxies HTTPS to the
+server (front-door.md). Several runners can serve the same name, and the tailnet's split DNS lists
+each one's nameserver, but:
+
+- each answers DNS with **only its own address**, healthy or not (`frontdoor/zone.rs`);
+- a front door that **can't reach the server** keeps answering, and browsers get errors
+  (`frontdoor/proxy.rs` has no upstream health);
+- on the LAN, DHCP or the router names **one** runner as DNS: when it dies, the whole network
+  loses kiln's names, and in resolver mode all DNS;
+- moving the front door to another runner is a **manual** re-setup: settings, certificate,
+  tailnet DNS.
+
+Taking over the front door is not taking over the server. The server is the one writer
+(P1's group of one voter); approved `p2p.md` P3 (voters on runners) and P4 (leases) make it
+replaceable. This section ships first and works without them:
+
+- before P3, a takeover front door serves **reads** from its learner replica (P2), and writes are
+  refused with a clear "read-only: kiln's server is unreachable";
+- after P3, it serves everything.
+
+**F1. Every front door answers with the healthy ones.**
+
+- **Design:** the front doors serving a name know each other, through the server's push today
+  and the cluster group after P4.
+  - **Answers.** Each front door's DNS answers with **every healthy front door's address** on
+    the asker's network (LAN askers get LAN addresses, tailnet askers get tailnet addresses), its
+    own first when it's healthy. The TTL drops from 60 s to 20 s.
+  - **Failing over.** Browsers try the next address when one refuses or times out, so a dead
+    front door costs one failed connect, not an outage.
+  - **Health** is measured by the front door and reported by its peers. All of these count:
+    - its listeners are bound and its certificate is valid;
+    - it can reach the server (`/readyz` within 2 s, in the last 10 s), or it holds a learner
+      replica less than 30 s behind;
+    - its peers reach its 443 (each front door probes the others every 10 s).
+  - **Withdrawing.** An unhealthy front door drops itself from every answer, its own included,
+    and keeps answering with the healthy ones. A front door its peers can't reach is dropped
+    from their answers within 30 s.
+- **Done when:** with two front doors and one killed, `dig kiln.dev` on the LAN and on the
+  tailnet returns only the live one within 30 s, and a browser test reloads without error.
+
+**F2. The LAN's single DNS server.**
+
+- **Design:** no single address for the network's DNS.
+  - **Two DNS servers.** The setup page tells the person to give DHCP two front doors as DNS
+    servers (most routers allow two or more). For authoritative mode with conditional
+    forwarding, the router forwards the domain to both.
+  - **An optional floating address** (Linux front doors, opt-in, needs `CAP_NET_ADMIN`). One
+    front door holds a LAN address, say 192.168.1.53, through a lease with a fencing number:
+    - it announces the address with gratuitous ARP;
+    - when its lease lapses (no renewal for 10 s), the next front door takes the address;
+    - the router then needs only that one address.
+  - **Resolver mode safety.** A front door in resolver mode that can't reach its upstream
+    resolvers answers SERVFAIL at once, so clients fall back to the second DNS server instead of
+    timing out.
+- **Done when:** with DHCP handing out two front doors, killing one leaves name resolution on a
+  test client working with no change on the client.
+
+**F3. A front door that can't reach the server.**
+
+- **Design:**
+  - **Through a peer.** A front door that can't reach the server, but whose peer front door can,
+    forwards to that peer over the runners' links (reach), before giving up.
+  - **Read-only.** With no path to the server, a front door holding a replica serves reads from
+    it. Writes get 503 with `Retry-After` and a JSON reason. The UI shows a read-only banner
+    (U1's breaker).
+  - **No replica.** It withdraws (F1) and serves a static "kiln is unreachable" page to
+    connections already open.
+- **Done when:** with the server stopped, a front door with a replica serves the runs page and
+  refuses a write with the read-only reason. With the server reachable only through a peer, pages
+  load.
+
+**F4. Moving the front door is manual.**
+
+- **Design:** front-door settings belong to the **name**, not to one runner: a domain has
+  members (runners) with a role each:
+  - **`active`:** serves the name and answers DNS;
+  - **`standby`:** listeners ready, certificate issued, excluded from answers until promoted;
+  - **`off`.**
+- **Taking over.**
+  - **Automatic.** When no `active` member is healthy for 30 s, the healthiest `standby` becomes
+    `active`. One member is allowed to do so at a time, through a lease (the server's grant
+    today, the cluster group's after P4), and the lease carries a fencing number.
+  - **By hand.** "Make this the front door" in the UI promotes a member:
+    1. the new one goes `active`;
+    2. it is checked from the tailnet (`100.100.100.100`) and the LAN;
+    3. only then does the old one go `standby`. There's no gap.
+- **Certificates.**
+  - **Self-signed:** each member gets its own from kiln's root, as today, so a takeover needs
+    nothing.
+  - **Uploaded:** kept for the name and sent to every member, so a standby can serve it.
+- **Tailnet DNS** lists every `active` member's nameserver.
+  - The server's tailnet sync drops a member whose health fails for 2 minutes, as well as
+    removing turned-off ones.
+  - So the route survives the server being down, members hold the Tailscale key sealed (after
+    P5) or a scoped token for the DNS call only (before P5): see the questions below.
+- **Done when:** the runner holding `active` is stopped, a `standby` takes over within 60 s, the
+  tailnet and the LAN resolve to it, and the UI keeps working after one reconnect.
+
+**F5. The UI doesn't know where it is.**
+
+- **Design:**
+  - **Which front door.** Every response carries `kiln-front-door: <runner>` and
+    `kiln-mode: full | read-only`. The UI shows the front door it's on and the mode.
+  - **On loss.** When its front door dies, the UI's breaker (U1) reconnects, and the browser's
+    next connection resolves to a live member (F1).
+  - **Shared links keep working.** Links and sign-in cookies are for the name, not the runner,
+    so they work through any member (sessions are already in the cluster group).
+- **Done when:** a Playwright test against two front doors kills one and sees the banner, the
+  reconnect, and the page working through the other.
+
+**F6. Seeing and choosing front doors.**
+
+- **Design:** Runners → Domain & HTTPS becomes per name:
+  - its members, roles and health (the checks in F1, from each member and its peers);
+  - the lease holder, and the last takeover with its reason;
+  - the actions: promote, stand by, take out;
+  - every change in the audit log (`frontdoor.*`), and a notification on every automatic
+    takeover.
+- **Done when:** a takeover shows in the UI, the audit log and the notifications.
+
+**F7. Today's front door has no second.** adacachy alone serves `kiln.dev`; the Mac and fedora
+refuse 443 over the tailnet.
+
+- **Design (operations, not code):**
+  - Turn on a second front door, as `standby` once F4 exists (until then, a second `active`):
+    fedora is steady and never sleeps.
+  - Add both to DHCP's DNS servers (F2), and trust kiln's root on the devices once, as for
+    adacachy.
+- **Done when:** `dig @fedora kiln.dev` answers and `https://kiln.dev` loads through fedora with
+  adacachy's front door stopped.
+
+## 7. UI
 
 **U1. No fetch timeout or retry; 503, 429 and Retry-After are ignored.**
 
@@ -434,7 +580,7 @@ resources` would have been reverted by the next sync.
   - **Rust forwarder.** A deadline (O2) and a `Breaker` on the UI server. When it is open,
     pages fall back to the shell at once, as they do today when it is down.
 
-## 7. Observability
+## 8. Observability
 
 **M1. Missing metrics.**
 
@@ -457,19 +603,21 @@ resources` would have been reverted by the next sync.
     store p99 over 1 s; runtime lag over 1 s; supervisor `crash-loop`; a held or blocked guard.
 - **Done when:** `promtool` tests feed each incident's series and see the alert.
 
-## 8. Order of work
+## 9. Order of work
 
 Each phase ships on its own, through the usual gate and train. Earlier phases close the gaps
 that caused today's outages.
 
 | Phase | What | Gaps | Why first |
 |---|---|---|---|
-| 0, now | Production's deploy file: memory check `severity: hold` once G3 exists (until then `dry-run: true`); external alerts; probe timeouts in the chart; R3's drop guard; discovery stops kicking after a failed run | C2, O3 (settings only), R2, R3 | Small, safe, stops a repeat of (a), (b) and (c) |
+| 0, now | Production's deploy file: memory check `severity: hold` once G3 exists (until then `dry-run: true`); external alerts; probe timeouts in the chart; R3's drop guard; discovery stops kicking after a failed run; a second front door on fedora and two DNS servers in DHCP | C2, O3 (settings only), R2, R3, F7, F2 (operations) | Small, safe, stops a repeat of (a), (b) and (c), and of a dead front door |
 | 1 | Guard safety: watch the rollback, epochs, severities, `fail-after`, values in the reason, self-reporting, tests | G1–G7, G9 | Today's outage: a soft check became a crash loop |
-| 2 | `resil` primitives; outbound calls through them; network breaker | R1, R4, R5, M1 (outbound) | The storm class of incident, everywhere, not only polls |
-| 3 | Probe split, admission, deadlines, store readers and writer, watchdog, drain, crash-loop state | O1–O6, C1, C3, C4, M1 | Slow disk mustn't look like death |
-| 4 | UI: fetch, shared breaker, backoff, stale marks, reconnects, UI server timeouts | U1–U5 | The UI stops adding load when kiln is down |
-| 5 | Guard controls and policy in the UI; KilnCD pins | G8, P1 | Configure deploys without a commit during an incident |
+| 2 | `resil` primitives; outbound calls through them; network breaker; lane backpressure | R1, R4, R5, R6, M1 (outbound) | The storm class of incident, everywhere, not only polls |
+| 3 | Front doors answer with the healthy ones, reach the server through a peer, serve read-only from a replica, and say where the UI is | F1, F3, F5 | A dead front door or a lost link costs one reconnect, not an outage |
+| 4 | Probe split, admission, deadlines, store readers and writer, watchdog, drain, crash-loop state | O1–O6, C1, C3, C4, M1 | Slow disk mustn't look like death |
+| 5 | UI: fetch, shared breaker, backoff, stale marks, reconnects, UI server timeouts | U1–U5 | The UI stops adding load when kiln is down |
+| 6 | Front door roles and takeover (lease, standby, promote), the floating address; guard controls and policy in the UI; KilnCD pins | F4, F6, F2 (floating address), G8, P1 | Configure and move things without a commit during an incident |
+| then | `p2p.md` P3 (voters on runners) and P4 (leases): a takeover front door serves writes too | — | Taking over the server, not only the front door |
 
 Open questions for Ada:
 
@@ -480,3 +628,10 @@ Open questions for Ada:
    process?
 4. **Pins (P1):** allowed for any field, or only a list of safe ones (resources, replicas,
    env)?
+5. **Front doors and Tailscale's key (F4):** before P5 seals secrets in the cluster group, may
+   front doors hold a token scoped to the tailnet's DNS call, so the routes follow a takeover
+   with the server down? Or do routes wait for the server?
+6. **The floating LAN address (F2):** worth the privilege (`CAP_NET_ADMIN`, Linux only), or are
+   two DNS servers in DHCP enough?
+7. **Automatic or by hand (F4):** should a standby take over by itself after 30 s, or only on a
+   person's word, with a notification asking for it?
