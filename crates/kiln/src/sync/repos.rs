@@ -639,7 +639,9 @@ mod tests {
         std::fs::create_dir_all(&src)?;
         std::fs::create_dir_all(&home)?;
         for args in [&["init", "-q", "-b", "main"][..], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "first"]] {
-            anyhow::ensure!(std::process::Command::new("git").arg("-C").arg(&src).args(args).status()?.success(), "git {}", args.join(" "));
+            let mut git = std::process::Command::new("git");
+            git.arg("-C").arg(&src).args(args).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+            anyhow::ensure!(git.status()?.success(), "git {}", args.join(" "));
         }
         crate::rt::block_on(async move {
             // A look that starts, then waits until the test lets it end.

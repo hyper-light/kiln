@@ -880,8 +880,12 @@ mod tests {
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
             .args(args)
+            // Free of this machine's git config: one that signs tags (fedora's) makes `git tag` start
+            // gpg, whose agent outlives the test.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()?;
         anyhow::ensure!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
